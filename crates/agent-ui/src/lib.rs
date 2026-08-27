@@ -55,24 +55,25 @@ gpui::actions!(
         BackgroundCurrentThread,
         ToggleTurnNavigator,
         CopySelectedTurn,
+        FillComposerTurn,
         ArchiveCurrentThread
     ]
 );
 
-/// Keybindings shadowing the composer Input's own up/down while the
-/// composer wrapper carries the `composer = recall` context — exactly
-/// while a history recall can apply; outside that state the Input's
-/// native caret bindings handle the keys. Registered after
-/// `gpui_component::init`, so the same-depth `composer == recall >
-/// Input` predicate wins the tie when both match.
+/// Keybindings for composer history recall.
+///
+/// Recall lives on `alt-up` / `alt-down` only: the bare arrows belong to the
+/// `Input`'s own `MoveUp` / `MoveDown`, so within the composer they always
+/// move the caret and never jump between past turns — at any caret position,
+/// including the first line's start and the last line's end. The bindings
+/// match the whole composer subtree (`composer > Input`) regardless of the
+/// input's content, because nothing native claims these keystrokes; the
+/// wrapper stops carrying the `composer` context while the completion
+/// popover is open, which is the one state where recall stays out of the way.
 pub fn composer_recall_key_bindings() -> Vec<gpui::KeyBinding> {
     vec![
-        gpui::KeyBinding::new("up", ComposerRecallUp, Some("composer == recall > Input")),
-        gpui::KeyBinding::new(
-            "down",
-            ComposerRecallDown,
-            Some("composer == recall > Input"),
-        ),
+        gpui::KeyBinding::new("alt-up", ComposerRecallUp, Some("composer > Input")),
+        gpui::KeyBinding::new("alt-down", ComposerRecallDown, Some("composer > Input")),
     ]
 }
 
@@ -92,6 +93,16 @@ pub fn turn_navigator_key_bindings() -> Vec<gpui::KeyBinding> {
         gpui::KeyBinding::new("cmd-c", CopySelectedTurn, Some("TurnNavigator > Input")),
         #[cfg(not(target_os = "macos"))]
         gpui::KeyBinding::new("ctrl-c", CopySelectedTurn, Some("TurnNavigator > Input")),
+        // Enter jumps to the selected turn; the secondary modifier refills the
+        // composer with it instead (reuse-and-edit, not locate).
+        #[cfg(target_os = "macos")]
+        gpui::KeyBinding::new("cmd-enter", FillComposerTurn, Some("TurnNavigator > Input")),
+        #[cfg(not(target_os = "macos"))]
+        gpui::KeyBinding::new(
+            "ctrl-enter",
+            FillComposerTurn,
+            Some("TurnNavigator > Input"),
+        ),
         gpui::KeyBinding::new("up", CompletionUp, Some("TurnNavigator > Input")),
         gpui::KeyBinding::new("down", CompletionDown, Some("TurnNavigator > Input")),
         gpui::KeyBinding::new("enter", CompletionConfirm, Some("TurnNavigator > Input")),
@@ -108,6 +119,6 @@ mod tests {
     #[test]
     fn key_bindings_parse() {
         assert_eq!(composer_recall_key_bindings().len(), 2);
-        assert_eq!(turn_navigator_key_bindings().len(), 6);
+        assert_eq!(turn_navigator_key_bindings().len(), 7);
     }
 }

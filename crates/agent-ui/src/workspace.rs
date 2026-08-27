@@ -214,17 +214,13 @@ fn editor_can_submit(
 }
 
 /// Key context for the composer wrapper. `completion = open` shadows the
-/// input's keys for the popover; `composer = recall` is present exactly
-/// while a history recall can apply — mid-walk (`recall_index >= 0`) or on
-/// an empty input, where Up starts one. Anywhere else the recall bindings
-/// must not match: a matched action listener consumes the keystroke even
-/// when it does nothing, so the caret's native movement depends on the
-/// context gate, not on the handler deferring.
-fn composer_key_context(completion_open: bool, recalling: bool, value_empty: bool) -> &'static str {
+/// input's keys for the popover; otherwise the wrapper just says `composer`,
+/// which is what the recall bindings (`alt-up` / `alt-down`) hang off. Recall
+/// never claims the bare arrows, so an open popover is the only state that has
+/// to opt the composer out of it.
+fn composer_key_context(completion_open: bool) -> &'static str {
     if completion_open {
         "completion = open"
-    } else if recalling || value_empty {
-        "composer = recall"
     } else {
         "composer"
     }
@@ -312,11 +308,14 @@ pub struct Workspace {
     /// switching away and restored on return, so each thread keeps its own
     /// in-progress draft instead of a single shared input bleeding across.
     drafts: HashMap<String, String>,
-    /// Composer history-recall position into the newest-first user-turn
-    /// texts; -1 means not recalling. Derived state: any edit that makes
-    /// the input value diverge from `turns[recall_index]` leaves recall
-    /// mode implicitly.
+    /// Composer history-recall position into the newest-first user-turn texts;
+    /// -1 means the walk is not running. Only `alt-up` / `alt-down` move along
+    /// it, so nothing about the text or the caret has to be watched to leave it.
     recall_index: i64,
+    /// The walk's working line: what the composer held when the walk was
+    /// entered, or the last recalled turn once the user has changed it. `Down`
+    /// past the newest turn restores it and ends the walk.
+    recall_draft: Option<String>,
     /// Per-thread right-side editor text, keyed by thread id. The editor pane
     /// is a right-side resource of the thread it was written for: switching
     /// away stashes the outgoing text, switching back restores it, so no
@@ -684,10 +683,14 @@ enum RecallDirection {
     Down,
 }
 
+/// What a recall step does to the composer's content.
 #[derive(Debug)]
 enum RecallStep {
+    /// Leave the input as it is (walk already at the oldest turn).
     None,
+    /// Replace the input with this text — a past turn, or the walk's draft.
     Recall(String),
+    /// The walk ended with an empty draft: clear the input.
     Clear,
 }
 
@@ -789,6 +792,7 @@ impl Workspace {
             project_chip_menu_sub: None,
             completion: None,
             recall_index: -1,
+            recall_draft: None,
             turn_navigator: None,
             turn_navigator_sub: None,
             turn_navigator_previous_focus: None,
@@ -2991,10 +2995,7 @@ impl Workspace {
                 InputEvent::PressEnter { shift: false, .. } => this.submit_input(window, cx),
                 // Shift+Enter inserts a newline inside the input and does not submit.
                 InputEvent::PressEnter { shift: true, .. } => {}
-                InputEvent::Change => {
-                    this.exit_diverged_recall(cx);
-                    this.sync_completion(window, cx);
-                }
+                InputEvent::Change => this.sync_completion(window, cx),
                 InputEvent::Focus | InputEvent::Blur => {}
             },
         )
@@ -3171,6 +3172,11 @@ impl Workspace {
                     let target = *item_ix;
                     this.close_turn_navigator(window, cx);
                     this.reveal_message(target, window, cx);
+                }
+                TurnNavigatorEvent::FillComposer { text } => {
+                    let text = text.clone();
+                    this.close_turn_navigator(window, cx);
+                    this.fill_composer_from_turn(text, window, cx);
                 }
                 TurnNavigatorEvent::Dismiss => this.close_turn_navigator(window, cx),
             },
@@ -3368,14 +3374,15 @@ impl Workspace {
         // Save the outgoing thread's unsent composer text before switching, so
         // a draft survives a round-trip through another thread (Bug 1). A
         // thread that just submitted already cleared its input, storing "".
-        self.drafts.insert(
-            old_id.clone(),
-            self.input_state.read(cx).value().to_string(),
-        );
-        // A recall walk belongs to the outgoing thread's input; the derived
-        // state would self-correct anyway, but the draft stash is the
-        // natural place to drop it.
-        self.recall_index = -1;
+        // While the walk runs the composer holds borrowed history — a recall
+        // step's turn or a navigator fill — so the user's draft is the walk's
+        // working line, not what is on screen.
+        let outgoing = match self.recall_draft.as_deref() {
+            Some(draft) if self.recall_index >= 0 => draft.to_string(),
+            _ => self.input_state.read(cx).value().to_string(),
+        };
+        self.drafts.insert(old_id.clone(), outgoing);
+        self.end_recall_walk();
         // The editor pane is a right-side resource of the outgoing thread:
         // stash its text so a switch-back restores the draft (mirrors the
         // composer `drafts` stash above).
@@ -3842,10 +3849,8 @@ impl Workspace {
             if !text.trim().is_empty() || self.pending_ask_has_selection() {
                 self.input_state
                     .update(cx, |state, cx| state.set_value("", window, cx));
-                // Submission empties the composer; the walk is derived state
-                // an empty value can never satisfy, so drop it explicitly
-                // (set_value emits no Change to trigger the divergence reset).
-                self.recall_index = -1;
+                // Submitting ends the walk: nothing is left to return to.
+                self.end_recall_walk();
                 self.close_completion(cx);
                 self.resolve_ask_with_response(Some(text), cx);
             }
@@ -3863,10 +3868,8 @@ impl Workspace {
         }
         self.input_state
             .update(cx, |state, cx| state.set_value("", window, cx));
-        // Submission empties the composer; the walk is derived state an empty
-        // value can never satisfy, so drop it explicitly (set_value emits no
-        // Change to trigger the divergence reset).
-        self.recall_index = -1;
+        // Submitting ends the walk: nothing is left to return to.
+        self.end_recall_walk();
         self.close_completion(cx);
 
         // Slash commands (line-initial `/name [args]`) are intercepted before
@@ -5841,53 +5844,57 @@ impl Workspace {
         menu
     }
 
-    /// Pure history-recall step for the composer input. `turns` is
-    /// newest-first; `index` -1 means not recalling. Being in recall
-    /// requires the current value to still equal the recalled text, so any
-    /// edit or submit exits recall implicitly.
+    /// Pure history-recall step for the composer. `turns` is newest-first;
+    /// `index` < 0 means no walk is running, and `draft` is the walk's working
+    /// line — the text a `Down` past the newest turn returns to.
+    ///
+    /// Entering and continuing both take an explicit key (`alt-up` /
+    /// `alt-down`), so no text or caret state has to be watched to leave a
+    /// walk and nothing compares the input against the recalled text. Whenever
+    /// a step replaces the input, the text being left behind becomes the
+    /// working line: the draft from walk entry, or a recalled turn the user
+    /// has since changed — readline's history slot at position 0, which is
+    /// what keeps an edit alive across a round trip back down.
     fn recall_step(
         direction: RecallDirection,
         value: &str,
         index: i64,
+        draft: Option<&str>,
         turns: &[String],
-    ) -> (i64, RecallStep) {
-        let in_recall = index >= 0
-            && usize::try_from(index)
-                .ok()
-                .and_then(|ix| turns.get(ix))
-                .is_some_and(|text| value == text);
-        match direction {
-            RecallDirection::Up => {
-                if in_recall {
-                    let ix = index as usize;
-                    if ix + 1 < turns.len() {
-                        (index + 1, RecallStep::Recall(turns[ix + 1].clone()))
-                    } else {
-                        (index, RecallStep::None)
-                    }
-                } else if value.is_empty() {
-                    match turns.first() {
-                        Some(newest) => (0, RecallStep::Recall(newest.clone())),
-                        None => (-1, RecallStep::None),
-                    }
-                } else {
-                    (-1, RecallStep::None)
-                }
-            }
-            RecallDirection::Down => {
-                if in_recall {
-                    if index > 0 {
-                        (
-                            index - 1,
-                            RecallStep::Recall(turns[index as usize - 1].clone()),
-                        )
-                    } else {
-                        (-1, RecallStep::Clear)
-                    }
-                } else {
-                    (-1, RecallStep::None)
-                }
-            }
+    ) -> (i64, Option<String>, RecallStep) {
+        let walked = usize::try_from(index)
+            .ok()
+            .and_then(|ix| turns.get(ix).map(|_| ix));
+        let left = match walked {
+            Some(ix) if turns[ix] != value => Some(value.to_string()),
+            Some(_) => draft.map(str::to_string),
+            None => (!value.is_empty()).then(|| value.to_string()),
+        };
+        match (direction, walked) {
+            (RecallDirection::Up, Some(ix)) => match turns.get(ix + 1) {
+                Some(older) => (ix as i64 + 1, left, RecallStep::Recall(older.clone())),
+                None => (index, left, RecallStep::None),
+            },
+            (RecallDirection::Up, None) => match turns.first() {
+                Some(newest) => (0, left, RecallStep::Recall(newest.clone())),
+                None => (-1, draft.map(str::to_string), RecallStep::None),
+            },
+            (RecallDirection::Down, Some(0)) => (
+                -1,
+                None,
+                match left {
+                    Some(working) => RecallStep::Recall(working),
+                    None => RecallStep::Clear,
+                },
+            ),
+            // A walked index always has a newer slot: `walked` came from
+            // `turns.get(ix)`, and `ix == 0` is the arm above.
+            (RecallDirection::Down, Some(ix)) => (
+                ix as i64 - 1,
+                left,
+                RecallStep::Recall(turns[ix - 1].clone()),
+            ),
+            (RecallDirection::Down, None) => (-1, draft.map(str::to_string), RecallStep::None),
         }
     }
 
@@ -5907,49 +5914,83 @@ impl Workspace {
     ) {
         let turns = self.recall_turns(cx);
         let value = self.input_state.read(cx).value().to_string();
-        let (index, step) = Self::recall_step(direction, &value, self.recall_index, &turns);
+        let (index, draft, step) = Self::recall_step(
+            direction,
+            &value,
+            self.recall_index,
+            self.recall_draft.as_deref(),
+            &turns,
+        );
         self.recall_index = index;
+        self.recall_draft = draft;
         match step {
             RecallStep::None => {}
             RecallStep::Recall(text) => {
-                self.input_state.update(cx, |s, cx| {
-                    s.set_value(text, window, cx);
-                    let pos = RopeExt::offset_to_position(s.text(), s.text().len());
-                    s.set_cursor_position(pos, window, cx);
-                });
+                self.set_composer_text(text, window, cx);
                 cx.stop_propagation();
             }
             RecallStep::Clear => {
-                self.input_state.update(cx, |s, cx| {
-                    s.set_value(String::new(), window, cx);
-                    let pos = RopeExt::offset_to_position(s.text(), 0);
-                    s.set_cursor_position(pos, window, cx);
-                });
+                self.set_composer_text(String::new(), window, cx);
                 cx.stop_propagation();
             }
         }
     }
 
-    /// Leave recall mode as soon as the input value diverges from the
-    /// recalled turn. Recall is derived state keyed on that match, and the
-    /// wrapper's `composer = recall` context must drop back to plain caret
-    /// movement the moment the walk no longer applies — otherwise the next
-    /// arrow key is consumed by a recall that can't act. `set_value` emits
-    /// no Change event, so applying a recall step never cancels itself;
-    /// user edits and completion inserts do fire Change and end the walk.
-    fn exit_diverged_recall(&mut self, cx: &mut Context<Self>) {
-        if self.recall_index < 0 {
-            return;
+    /// Replace the composer's whole content and park the caret at its end.
+    /// `set_value` emits no `Change`, so whatever must react to the new text
+    /// (completion re-sync, recall bookkeeping) is driven by the caller.
+    fn set_composer_text(
+        &mut self,
+        text: impl Into<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input_state.update(cx, |state, cx| {
+            state.set_value(text.into(), window, cx);
+            let end = RopeExt::offset_to_position(state.text(), state.text().len());
+            state.set_cursor_position(end, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// End a running recall walk and drop its working line.
+    fn end_recall_walk(&mut self) {
+        self.recall_index = -1;
+        self.recall_draft = None;
+    }
+
+    /// Refill the composer with a past turn picked in the turn navigator
+    /// (cmd/ctrl-Enter). A fill is a recall landing: the walk moves onto the
+    /// filled turn, so `alt-down` off the newest end hands back whatever the
+    /// fill displaced — `set_value` clears the input's undo history, and that
+    /// working line is otherwise the only surviving copy of the user's draft.
+    /// A turn with no text to recall is no fill at all, and a walk already
+    /// running keeps the draft it started with.
+    fn fill_composer_from_turn(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let landed = self
+            .recall_turns(cx)
+            .iter()
+            .position(|turn| *turn == text)
+            .map(|ix| ix as i64);
+        if let Some(index) = landed {
+            let displaced = self.input_state.read(cx).value().to_string();
+            if self.recall_index < 0 {
+                self.recall_draft =
+                    (!displaced.is_empty() && displaced != text).then(|| displaced.clone());
+            }
+            self.recall_index = index;
+        } else {
+            self.end_recall_walk();
         }
-        let turns = self.recall_turns(cx);
-        let value = self.input_state.read(cx).value().to_string();
-        let in_recall = usize::try_from(self.recall_index)
-            .ok()
-            .and_then(|ix| turns.get(ix))
-            .is_some_and(|text| value == *text);
-        if !in_recall {
-            self.recall_index = -1;
-        }
+        self.close_completion(cx);
+        self.set_composer_text(text, window, cx);
+        self.input_state
+            .update(cx, |state, cx| state.focus(window, cx));
     }
 
     /// Newest-first user-turn texts for recall, mirroring the navigator's
@@ -6072,26 +6113,18 @@ impl Workspace {
                 // `text_base`); family + weight are applied from the wrapper
                 // context.
                 {
-                    let mut wrap = gpui::div()
+                    let wrap = gpui::div()
                         .font_family(theme.mono_font_family.clone())
-                        .font_weight(gpui::FontWeight::LIGHT);
-                    // The wrapper carries exactly one key context: with the
-                    // completion popover open, `completion = open` (so the
-                    // `completion == open > Input` bindings shadow the Input's
-                    // own up/down/enter/tab/escape and drive the popover);
-                    // otherwise `composer = recall` exactly while a history
-                    // recall can apply, so the recall bindings shadow the
-                    // Input's up/down only then. A matched action listener
-                    // consumes the keystroke even when no recall results, so
-                    // outside recall the context stays plain `composer` and
-                    // the Input's native MoveUp/MoveDown move the caret. The
-                    // completion and recall contexts are mutually exclusive,
-                    // so the two same-depth binding sets never both match.
-                    wrap = wrap.key_context(composer_key_context(
-                        self.completion.is_some(),
-                        self.recall_index >= 0,
-                        self.input_state.read(cx).value().is_empty(),
-                    ));
+                        .font_weight(gpui::FontWeight::LIGHT)
+                        // The wrapper carries exactly one key context: the open
+                        // completion popover takes `completion = open` (its
+                        // `completion == open > Input` bindings shadow the
+                        // Input's own up/down/enter/tab/escape), otherwise plain
+                        // `composer` — which is what the recall bindings
+                        // (`composer > Input` on alt-up / alt-down) hang off.
+                        // The bare arrows stay with the Input's native
+                        // MoveUp/MoveDown in every composer state.
+                        .key_context(composer_key_context(self.completion.is_some()));
                     wrap.child(
                         Input::new(&self.input_state)
                             .appearance(false)
@@ -8341,12 +8374,10 @@ impl Workspace {
                     cx.stop_propagation();
                 }),
             )
-            // Composer history recall: fires only via the `composer == recall
-            // > Input` bindings. The wrapper carries that context exactly
-            // while a recall can apply (see `composer_key_context`), so
-            // these listeners never see plain caret movement — a listener
-            // that fires consumes the keystroke whether or not a recall
-            // step results.
+            // Composer history recall: reachable only through the
+            // `composer > Input` bindings on alt-up / alt-down, so these
+            // listeners never see the bare arrows the Input uses to move the
+            // caret.
             .on_action(
                 cx.listener(|this, _: &crate::ComposerRecallUp, window, cx| {
                     this.composer_recall_up(window, cx);
@@ -8875,90 +8906,142 @@ mod tests {
     use gpui::InteractiveElement as _;
     use gpui::prelude::*;
 
+    /// Drives the pure recall step. `applied` is the text the composer holds
+    /// afterwards — `None` means the step left it untouched, `Some("")` means
+    /// it cleared the input.
     fn step(
         direction: RecallDirection,
         value: &str,
         index: i64,
+        draft: Option<&str>,
         turns: &[&str],
-    ) -> (i64, RecallStep) {
+    ) -> (i64, Option<String>, Option<String>) {
         let owned: Vec<String> = turns.iter().map(|t| t.to_string()).collect();
-        Workspace::recall_step(direction, value, index, &owned)
+        let (index, draft, step) = Workspace::recall_step(direction, value, index, draft, &owned);
+        let applied = match step {
+            RecallStep::None => None,
+            RecallStep::Recall(text) => Some(text),
+            RecallStep::Clear => Some(String::new()),
+        };
+        (index, draft, applied)
     }
 
-    fn assert_recall(step: (i64, RecallStep), index: i64, text: &str) {
+    fn assert_recall(step: &(i64, Option<String>, Option<String>), index: i64, text: &str) {
         assert_eq!(step.0, index);
-        match step.1 {
-            RecallStep::Recall(t) => assert_eq!(t, text),
-            other => panic!("expected Recall, got {other:?}"),
-        }
+        assert_eq!(step.2.as_deref(), Some(text));
     }
 
     #[test]
-    fn recall_up_from_empty_starts_at_the_newest_turn() {
+    fn recall_up_from_an_empty_composer_starts_at_the_newest_turn() {
         let turns = ["newest", "oldest"];
-        assert_recall(step(RecallDirection::Up, "", -1, &turns), 0, "newest");
+        let out = step(RecallDirection::Up, "", -1, None, &turns);
+        assert_recall(&out, 0, "newest");
+        // Nothing was left behind, so the walk has no draft to return to.
+        assert_eq!(out.1, None);
+    }
+
+    #[test]
+    fn recall_up_from_a_draft_keeps_it_as_the_working_line() {
+        let turns = ["newest", "oldest"];
+        let out = step(RecallDirection::Up, "typed draft", -1, None, &turns);
+        assert_recall(&out, 0, "newest");
+        assert_eq!(out.1.as_deref(), Some("typed draft"));
     }
 
     #[test]
     fn recall_up_walks_further_back_and_clamps_at_the_oldest() {
         let turns = ["newest", "middle", "oldest"];
-        assert_recall(step(RecallDirection::Up, "newest", 0, &turns), 1, "middle");
-        assert_recall(step(RecallDirection::Up, "middle", 1, &turns), 2, "oldest");
-        let at_oldest = step(RecallDirection::Up, "oldest", 2, &turns);
-        assert_eq!(at_oldest.0, 2);
-        assert!(matches!(at_oldest.1, RecallStep::None));
-    }
-
-    #[test]
-    fn recall_up_with_typed_text_defers_to_native_caret() {
-        let turns = ["newest"];
-        let out = step(RecallDirection::Up, "typed draft", -1, &turns);
-        assert_eq!(out.0, -1);
-        assert!(matches!(out.1, RecallStep::None));
-    }
-
-    #[test]
-    fn recall_up_with_empty_history_defers() {
-        let out = step(RecallDirection::Up, "", -1, &[]);
-        assert_eq!(out.0, -1);
-        assert!(matches!(out.1, RecallStep::None));
-    }
-
-    #[test]
-    fn recall_down_walks_toward_newer_and_clears_at_the_newest() {
-        let turns = ["newest", "middle", "oldest"];
         assert_recall(
-            step(RecallDirection::Down, "oldest", 2, &turns),
+            &step(RecallDirection::Up, "newest", 0, None, &turns),
             1,
             "middle",
         );
         assert_recall(
-            step(RecallDirection::Down, "middle", 1, &turns),
+            &step(RecallDirection::Up, "middle", 1, None, &turns),
+            2,
+            "oldest",
+        );
+        let at_oldest = step(RecallDirection::Up, "oldest", 2, None, &turns);
+        assert_eq!(at_oldest.0, 2);
+        assert_eq!(at_oldest.2, None, "already at the oldest turn");
+    }
+
+    #[test]
+    fn recall_up_without_history_does_nothing() {
+        let out = step(RecallDirection::Up, "", -1, None, &[]);
+        assert_eq!(out.0, -1);
+        assert_eq!(out.2, None);
+    }
+
+    #[test]
+    fn recall_down_walks_toward_newer_and_restores_the_working_line() {
+        let turns = ["newest", "middle", "oldest"];
+        assert_recall(
+            &step(RecallDirection::Down, "oldest", 2, Some("draft"), &turns),
+            1,
+            "middle",
+        );
+        assert_recall(
+            &step(RecallDirection::Down, "middle", 1, Some("draft"), &turns),
             0,
             "newest",
         );
-        let at_newest = step(RecallDirection::Down, "newest", 0, &turns);
-        assert_eq!(at_newest.0, -1);
-        assert!(matches!(at_newest.1, RecallStep::Clear));
+        let at_newest = step(RecallDirection::Down, "newest", 0, Some("draft"), &turns);
+        assert_eq!(at_newest.0, -1, "the walk ends past the newest turn");
+        assert_eq!(at_newest.1, None, "and its draft is spent");
+        assert_eq!(at_newest.2.as_deref(), Some("draft"));
     }
 
     #[test]
-    fn recall_down_outside_recall_defers_to_native_caret() {
+    fn recall_down_at_the_newest_clears_an_empty_working_line() {
         let turns = ["newest"];
-        let out = step(RecallDirection::Down, "", -1, &turns);
+        let out = step(RecallDirection::Down, "newest", 0, None, &turns);
         assert_eq!(out.0, -1);
-        assert!(matches!(out.1, RecallStep::None));
+        assert_eq!(out.2.as_deref(), Some(""), "started from an empty input");
     }
 
     #[test]
-    fn recall_state_is_derived_from_the_value_matching_the_recalled_text() {
-        let turns = ["newest", "oldest"];
-        // An edit after recall makes the value diverge: treated as fresh.
-        let out = step(RecallDirection::Up, "newest edited", 0, &turns);
+    fn recall_down_outside_a_walk_does_nothing() {
+        let turns = ["newest"];
+        let out = step(RecallDirection::Down, "", -1, None, &turns);
         assert_eq!(out.0, -1);
-        assert!(matches!(out.1, RecallStep::None));
-        // A stale index from another thread behaves like a fresh recall.
-        assert_recall(step(RecallDirection::Up, "", 5, &turns), 0, "newest");
+        assert_eq!(out.2, None);
+    }
+
+    #[test]
+    fn an_edited_recalled_turn_becomes_the_working_line() {
+        let turns = ["newest", "middle"];
+        // The walk keeps stepping after an edit, and the edited text is what
+        // comes back when the walk runs off the newest end.
+        let stepped = step(RecallDirection::Up, "newest edited", 0, None, &turns);
+        assert_recall(&stepped, 1, "middle");
+        assert_eq!(stepped.1.as_deref(), Some("newest edited"));
+        let back = step(
+            RecallDirection::Down,
+            "middle",
+            1,
+            Some("newest edited"),
+            &turns,
+        );
+        assert_recall(&back, 0, "newest");
+        assert_eq!(back.1.as_deref(), Some("newest edited"));
+        let home = step(
+            RecallDirection::Down,
+            "newest",
+            0,
+            Some("newest edited"),
+            &turns,
+        );
+        assert_eq!(home.0, -1);
+        assert_eq!(home.2.as_deref(), Some("newest edited"));
+    }
+
+    #[test]
+    fn a_stale_walk_index_starts_a_fresh_walk() {
+        let turns = ["newest", "oldest"];
+        let out = step(RecallDirection::Up, "whatever", 5, None, &turns);
+        assert_recall(&out, 0, "newest");
+        assert_eq!(out.1.as_deref(), Some("whatever"));
     }
 
     #[test]
@@ -8983,29 +9066,19 @@ mod tests {
     }
 
     #[test]
-    fn composer_key_context_admits_recall_only_while_it_can_apply() {
-        // The popover context shadows everything.
-        assert_eq!(composer_key_context(true, false, true), "completion = open");
-        assert_eq!(composer_key_context(true, true, false), "completion = open");
-        // Mid-walk recall and the empty input (where Up starts a recall)
-        // keep the recall bindings matched...
-        assert_eq!(
-            composer_key_context(false, true, false),
-            "composer = recall"
-        );
-        assert_eq!(
-            composer_key_context(false, false, true),
-            "composer = recall"
-        );
-        // ...and any other state leaves the caret to the Input's own keys.
-        assert_eq!(composer_key_context(false, false, false), "composer");
+    fn composer_key_context_is_the_popover_or_the_composer() {
+        // The open popover owns every key the composer subtree sees.
+        assert_eq!(composer_key_context(true), "completion = open");
+        // Closed, the wrapper is plain `composer`: the recall bindings match
+        // its alt-arrows, and nothing else shadows the Input's own keys.
+        assert_eq!(composer_key_context(false), "composer");
     }
 
     /// Minimal composer harness for the recall keybinding tests: a wrapper
     /// carrying a configurable key context around a live input. With
     /// `consume_recall` set it also registers recall listeners like the
-    /// workspace does; a recall action that reaches them is consumed even
-    /// when it does nothing.
+    /// workspace does; an action listener that fires consumes its keystroke
+    /// even when it does nothing.
     struct RecallTestComposer {
         input: gpui::Entity<gpui_component::input::InputState>,
         context: &'static str,
@@ -9028,8 +9101,12 @@ mod tests {
         }
     }
 
+    /// Live key routing for the composer subtree: the bare arrows (and
+    /// Shift+arrows) stay with the Input's caret bindings even though the
+    /// recall listeners are registered on the same wrapper, while `alt-up` /
+    /// `alt-down` belong to recall and never touch the caret.
     #[gpui::test]
-    fn recall_bindings_defer_to_native_caret_with_typed_text(cx: &mut gpui::TestAppContext) {
+    fn bare_arrows_move_caret_and_alt_arrows_recall(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
         cx.update(gpui_component::init);
         cx.update(|cx| cx.bind_keys(crate::composer_recall_key_bindings()));
@@ -9039,8 +9116,8 @@ mod tests {
             let view = cx.new(|cx| RecallTestComposer {
                 input: cx
                     .new(|cx| gpui_component::input::InputState::new(window, cx).multi_line(true)),
-                context: "composer = recall",
-                consume_recall: false,
+                context: "composer",
+                consume_recall: true,
             });
             let input = view.read(cx).input.clone();
             *slot_for_window.borrow_mut() = Some(input);
@@ -9050,11 +9127,8 @@ mod tests {
         let input = slot.borrow().as_ref().expect("input initialized").clone();
         cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
 
-        // A multi-line draft under the static `composer = recall` context:
-        // the recall binding wins every Up, but this harness registers no
-        // recall listener, so the dispatched action stays unhandled and
-        // GPUI falls back to the next matching binding — the Input's
-        // native MoveUp still runs and the caret moves up a line.
+        // A multi-line draft: Up/Down move between its lines. Recall binds
+        // neither arrow, so the listeners below never see this keystroke.
         cx.simulate_input("hello\nworld");
         assert_eq!(
             input.read_with(cx, |state, _| state.selected_range().end),
@@ -9070,16 +9144,26 @@ mod tests {
         });
         assert_eq!(row, 0, "native MoveUp moved the caret to the first line");
         assert!(end < 11);
-        // Shift+Up is a selection, not a recall key, so it still extends the
-        // selection without interference from the recall bindings. Move down
-        // a line first so the selection has somewhere to extend from.
         cx.simulate_keystrokes("down");
-        cx.simulate_keystrokes("shift-up");
-        let (start, end) = input.read_with(cx, |state, _| {
-            let range = state.selected_range();
-            (range.start, range.end)
+        let row = input.read_with(cx, |state, _| {
+            gpui_component::input::RopeExt::offset_to_position(
+                state.text(),
+                state.selected_range().end,
+            )
+            .line
         });
-        assert_ne!(start, end);
+        assert_eq!(row, 1, "native MoveDown moved the caret back down");
+        // Shift+Down extends the selection, untouched by the recall bindings.
+        cx.simulate_keystrokes("shift-down");
+        let selected = input.read_with(cx, |state, _| state.selected_range());
+        assert_ne!(selected.start, selected.end);
+        // Alt+Up is recall's: the wrapper's listener consumes it, so the caret
+        // and selection do not move at all.
+        cx.simulate_keystrokes("alt-up");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.selected_range()),
+            selected
+        );
     }
     #[test]
     fn cap_tab_label_caps_with_ellipsis() {
@@ -9104,6 +9188,7 @@ mod tests {
         use super::{PersistedRightTab, RightTab};
         use gpui::AppContext as _;
 
+        let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path =
             std::env::temp_dir().join(format!("manox-right-pane-test-{}.db", uuid_like_id()));
@@ -9237,6 +9322,18 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
     }
 
+    /// `thread_store::init_for_test` swaps a process-global, and a gpui test
+    /// runs on its own scheduler thread, so every test that builds a real
+    /// `Workspace` against a temp db holds this for its whole body.
+    static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Borrow the store lock and the temp db for one `Workspace` test. The
+    /// poisoned case recovers rather than cascading a failed assertion into
+    /// the other store-backed test.
+    fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Unique-ish id for temp files without pulling in a uuid dependency.
     fn uuid_like_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -9246,58 +9343,124 @@ mod tests {
             .unwrap_or_default();
         format!("{nanos}-{:?}", std::thread::current().id())
     }
-
-    #[gpui::test]
-    fn composer_context_without_recall_moves_caret_natively(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext as _;
-        cx.update(gpui_component::init);
-        cx.update(|cx| cx.bind_keys(crate::composer_recall_key_bindings()));
-        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
-        let slot_for_window = slot.clone();
-        let (_root, cx) = cx.add_window_view(move |window, cx| {
-            let view = cx.new(|cx| RecallTestComposer {
-                input: cx
-                    .new(|cx| gpui_component::input::InputState::new(window, cx).multi_line(true)),
-                // The live composer outside recall: plain context, with the
-                // workspace's recall listeners present.
-                context: "composer",
-                consume_recall: true,
-            });
-            let input = view.read(cx).input.clone();
-            *slot_for_window.borrow_mut() = Some(input);
-            gpui_component::Root::new(view, window, cx)
-        });
-        cx.simulate_resize(gpui::size(gpui::px(640.), gpui::px(480.)));
-        let input = slot.borrow().as_ref().expect("input initialized").clone();
-        cx.update(|window, cx| input.update(cx, |state, cx| state.focus(window, cx)));
-
-        // Without the `composer = recall` context the recall bindings never
-        // match, so Up/Down are the Input's native MoveUp/MoveDown even
-        // though recall listeners are registered and would consume the
-        // keystrokes if they fired.
-        cx.simulate_input("hello\nworld");
-        assert_eq!(
-            input.read_with(cx, |state, _| state.selected_range().end),
-            11
+    /// A walk entered from a non-empty composer hands the user's own text
+    /// back after the whole round trip: the draft is carried through every
+    /// step, not just the first one.
+    #[test]
+    fn draft_survives_a_long_walk() {
+        let turns = ["newest", "middle", "older", "oldest"];
+        let mut value = "my draft".to_string();
+        let mut index = -1i64;
+        let mut draft: Option<String> = None;
+        for expected in ["newest", "middle", "older", "oldest"] {
+            let (next, kept, applied) =
+                step(RecallDirection::Up, &value, index, draft.as_deref(), &turns);
+            assert_eq!(applied.as_deref(), Some(expected));
+            assert_eq!(
+                kept.as_deref(),
+                Some("my draft"),
+                "draft held at {expected}"
+            );
+            index = next;
+            draft = kept;
+            value = applied.unwrap();
+        }
+        for expected in ["older", "middle", "newest"] {
+            let (next, kept, applied) = step(
+                RecallDirection::Down,
+                &value,
+                index,
+                draft.as_deref(),
+                &turns,
+            );
+            assert_eq!(applied.as_deref(), Some(expected));
+            assert_eq!(kept.as_deref(), Some("my draft"));
+            index = next;
+            draft = kept;
+            value = applied.unwrap();
+        }
+        let (ended, spent, applied) = step(
+            RecallDirection::Down,
+            &value,
+            index,
+            draft.as_deref(),
+            &turns,
         );
-        cx.simulate_keystrokes("up");
-        let (row, end) = input.read_with(cx, |state, _| {
-            let end = state.selected_range().end;
-            (
-                gpui_component::input::RopeExt::offset_to_position(state.text(), end).line,
-                end,
-            )
+        assert_eq!(ended, -1, "the walk ends once the draft is restored");
+        assert_eq!(spent, None);
+        assert_eq!(applied.as_deref(), Some("my draft"));
+    }
+
+    /// End to end: a navigator fill lands the recall walk on the turn it
+    /// filled, and `alt-down` off the walk's newest end hands back the draft
+    /// the fill displaced. The composer's own undo history cannot do this —
+    /// `set_value` clears it — so the working line is the only copy.
+    #[gpui::test]
+    async fn navigator_fill_lands_the_walk_and_hands_the_draft_back(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-fill-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|cx| {
+            agent::runtime::init();
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone(), cx);
         });
-        assert_eq!(row, 0, "native MoveUp moved the caret to the first line");
-        assert!(end < 11);
-        cx.simulate_keystrokes("down");
-        let row = input.read_with(cx, |state, _| {
-            gpui_component::input::RopeExt::offset_to_position(
-                state.text(),
-                state.selected_range().end,
-            )
-            .line
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace");
+
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                let weak = cx.entity().downgrade();
+                let meta = || crate::conversation::UserTurnMeta::new(0, String::new(), None);
+                ws.conversation.update(cx, |conv, cx| {
+                    conv.push_user("older turn".into(), vec![], meta(), weak.clone(), cx);
+                    conv.push_user("newest turn".into(), vec![], meta(), weak, cx);
+                });
+                ws.input_state.update(cx, |s, cx| {
+                    s.set_value("half a sentence", window, cx);
+                });
+
+                // ⌘↵ on the older of the two turns.
+                ws.fill_composer_from_turn("older turn".into(), window, cx);
+                assert_eq!(ws.input_state.read(cx).value().as_ref(), "older turn");
+                assert_eq!(ws.recall_index, 1, "newest-first puts it in slot 1");
+                assert_eq!(
+                    ws.recall_draft.as_deref(),
+                    Some("half a sentence"),
+                    "the displaced draft is the walk's working line"
+                );
+
+                // ⌥↓ to the newest turn, ⌥↓ again past it hands the draft back.
+                ws.apply_recall_step(RecallDirection::Down, window, cx);
+                assert_eq!(ws.input_state.read(cx).value().as_ref(), "newest turn");
+                ws.apply_recall_step(RecallDirection::Down, window, cx);
+                assert_eq!(ws.recall_index, -1, "the walk ends at its newest end");
+                assert_eq!(ws.recall_draft, None, "and its draft is spent");
+                assert_eq!(
+                    ws.input_state.read(cx).value().as_ref(),
+                    "half a sentence",
+                    "the user's own text is back in the composer"
+                );
+            });
         });
-        assert_eq!(row, 1, "native MoveDown moved the caret back down");
+
+        agent::thread_store::drop_for_test();
+        let _ = std::fs::remove_file(&db_path);
     }
 }
