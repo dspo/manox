@@ -80,7 +80,7 @@ pub use thread_store::{
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
 /// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
 /// subagent / skill / command / hook registries. Call at App startup.
-pub fn init(cx: &mut App) {
+pub fn init(_cx: &mut App) {
     // Login-shell PATH install (background): GUI processes inherit a minimal
     // launchd PATH, so bash/LSP/MCP/monitor subprocesses would lose Homebrew
     // binaries. Resolved once and applied process-wide; first thing so later
@@ -117,5 +117,5 @@ pub fn init(cx: &mut App) {
     // store over the real one. Skipping this call (the prior `#[cfg(not(…))]`
     // guard) caused a launch-time panic in `Sidebar::new` → `thread_store_global`
     // whenever the binary was built with `test-support` enabled.
-    thread_store::init(cx);
+    thread_store::init();
 }
