@@ -2,10 +2,10 @@
 //!
 //! `Term<T>` calls `EventListener::send_event` for UI-relevant state changes it
 //! cannot represent internally (title, bell, clipboard, …). `ManoxListener`
-//! forwards a filtered subset onto an `async_channel` consumed by the gpui
-//! task in `Terminal::new`. `ClipboardLoad` carries alacritty's response
-//! callback; the gpui task loads the system clipboard, invokes it, and writes
-//! the returned string back to the PTY.
+//! forwards a filtered subset onto an `async_channel` consumed by the event
+//! pump in `Terminal::spawn`. `ClipboardLoad` carries alacritty's response
+//! callback; the pump loads the system clipboard through the capability seam,
+//! invokes it, and writes the returned string back to the PTY.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,15 +13,15 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::vte::ansi::Rgb;
 
-/// Events crossing the gpui boundary. `PtyOutput` is internal (fed back into
-/// the Term by the gpui task); the rest are re-emitted via `EventEmitter` so
-/// the view layer can react.
+/// Events crossing the PTY / listener boundary. `PtyOutput` is internal (fed
+/// back into the Term by the event pump); the rest are re-emitted on the
+/// handle's subscriber channel so the view layer can react.
 ///
 /// `Send` so the bounded `async_channel` can carry these across the PTY
-/// reader thread and the gpui task. Not `Debug`/`Clone` — callbacks and
+/// reader thread and the event pump. Not `Debug`/`Clone` — callbacks and
 /// single-consumer dispatch don't need either.
 pub enum TerminalEvent {
-    /// Raw bytes read from the PTY master. Consumed by the gpui task only.
+    /// Raw bytes read from the PTY master. Consumed by the event pump only.
     PtyOutput(Vec<u8>),
     /// Generic redraw nudge.
     Wakeup,
@@ -89,10 +89,10 @@ impl EventListener for ManoxListener {
             _ => None,
         };
         if let Some(ev) = mapped {
-            // `send_event` runs on the gpui side under the `FairMutex` lock,
-            // inside `Processor::advance`. A blocking send would deadlock the
-            // gpui thread if the channel were ever full (the draining task
-            // also lives on the gpui executor and could not run). Use
+            // `send_event` runs on the event pump under the `FairMutex` lock,
+            // inside `Processor::advance`. A blocking send would self-deadlock
+            // the pump if the channel were ever full (the pump is also the
+            // only drainer). Use
             // `try_send` and drop on backpressure instead — `Wakeup`, the
             // frequent event, is idempotent; rare events re-sync on the next.
             match self.tx.try_send(ev) {

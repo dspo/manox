@@ -16,7 +16,7 @@ use crate::event::TerminalEvent;
 
 /// A live PTY backing a `Terminal`.
 ///
-/// `start` is called once from `Terminal::new` and is the only method that
+/// `start` is called once from `Terminal::spawn` and is the only method that
 /// kicks off the event stream; it takes `&mut self` so the source can move its
 /// read fd / child handle into the reader / waiter threads without interior
 /// mutability. `write` and `resize` are `&self` so the UI thread can call them
@@ -25,7 +25,7 @@ pub trait PtySource: Send + 'static {
     /// Begin forwarding PTY output and child-exit events on `event_tx`.
     ///
     /// The source owns its reader / waiter threads (or equivalent) and detaches
-    /// them so they outlive the source without blocking the gpui task's channel
+    /// them so they outlive the source without blocking the event pump's channel
     /// drain — the threads hold their own reader fd / child handle and channel
     /// sender clones, so they are safe to outlive the `PtySource`.
     fn start(&mut self, event_tx: Sender<TerminalEvent>);

@@ -24,6 +24,18 @@ pub trait CapabilityClient: Send + Sync {
     /// Drive the frontend's browser. Fails closed when the frontend offers no
     /// browser.
     fn browser_op(&self, op: BrowserOp) -> BoxFuture<'static, Result<BrowserReply, String>>;
+    /// Place `text` on the frontend's system clipboard (OSC 52 copy). The
+    /// default fails closed: a frontend that owns no clipboard never sees a
+    /// silent success.
+    fn clipboard_write(&self, _text: String) -> Result<(), String> {
+        Err("clipboard capability not provided".to_string())
+    }
+    /// Read the frontend's system clipboard as plain text (OSC 52 paste /
+    /// bracketed-paste injection). `Ok(None)` means "empty / not text". The
+    /// default fails closed like `clipboard_write`.
+    fn clipboard_read(&self) -> Result<Option<String>, String> {
+        Err("clipboard capability not provided".to_string())
+    }
 }
 
 static PROVIDER: OnceLock<Arc<dyn CapabilityClient>> = OnceLock::new();
@@ -65,5 +77,15 @@ mod tests {
         }))
         .unwrap_err();
         assert_eq!(err, "mock unavailable");
+    }
+
+    // A provider that never overrides the clipboard methods fails closed:
+    // both arms error, so callers (e.g. the terminal's OSC 52 path) must
+    // treat the clipboard as unavailable rather than silently succeed.
+    #[test]
+    fn clipboard_defaults_fail_closed() {
+        let caps: Arc<dyn CapabilityClient> = Arc::new(MockProvider);
+        assert!(caps.clipboard_write("x".into()).is_err());
+        assert!(caps.clipboard_read().is_err());
     }
 }

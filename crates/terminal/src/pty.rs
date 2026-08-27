@@ -14,7 +14,7 @@
 //!   - **waiter**: blocking `child.wait()`, forwarding the exit code as
 //!     `TerminalEvent::ChildExit`.
 //!
-//! The reader never touches `Term`; it only forwards bytes to the gpui side,
+//! The reader never touches `Term`; it only forwards bytes to the event pump,
 //! which feeds them to `Processor::advance(&mut term, ..)` under the
 //! `FairMutex` lock.
 //!
@@ -37,7 +37,7 @@ use crate::shell_kind::{ShellKind, resolve_shell_program};
 
 /// Owns the PTY master. `Box<dyn MasterPty + Send>` cannot be unsized into an
 /// `Arc<dyn MasterPty>`, so this newtype holds the box and derefs to the trait
-/// object. Never shared — the gpui side uses it while the handle lives, then
+/// object. Never shared — the terminal uses it while the handle lives, then
 /// `Drop` moves it onto the teardown thread.
 struct MasterHolder(Box<dyn MasterPty + Send>);
 
@@ -183,7 +183,7 @@ impl PtyHandle {
 
 /// Build a `Box<dyn PtySource>` for the user's shell in `cwd`, sized for the
 /// given cols / rows. Shell and env come from `[terminal]` in settings.toml.
-/// Does not start the source — `Terminal::new` calls `start` once.
+/// Does not start the source — `Terminal::spawn` calls `start` once.
 pub fn default_source(cwd: &Path, cols: u16, rows: u16) -> Result<Box<dyn PtySource>> {
     let settings = crate::settings::load();
     let shell = settings.shell.as_deref();
@@ -193,7 +193,7 @@ pub fn default_source(cwd: &Path, cols: u16, rows: u16) -> Result<Box<dyn PtySou
 
 impl PtySource for PtyHandle {
     fn start(&mut self, event_tx: async_channel::Sender<TerminalEvent>) {
-        // `start` is called exactly once by `Terminal::new`; the reader fd and
+        // `start` is called exactly once by `Terminal::spawn`; the reader fd and
         // child handle are move-only, so a second call would have nothing to
         // feed the threads.
         let mut reader = self.reader.take().expect("PtySource::start called twice");
@@ -281,7 +281,7 @@ impl PtySource for PtyHandle {
 
 impl Drop for PtyHandle {
     fn drop(&mut self) {
-        // Teardown must not block the gpui thread: the killer / child /
+        // Teardown must not block the dropping thread: the killer / child /
         // master / writer move onto a detached thread that scans the tree,
         // SIGTERMs it (plus the foreground process group), grants a short
         // grace, and SIGKILLs survivors. Every master-side fd this handle

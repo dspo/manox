@@ -9832,7 +9832,6 @@ dependencies = [
  "chrono",
  "cx",
  "futures",
- "gpui",
  "libc",
  "parking_lot",
  "portable-pty",
