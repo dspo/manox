@@ -347,9 +347,97 @@ pub struct Thread {
     /// Shared goal state with the engine's goal tools; `None` only when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<GoalBridge>>,    worktree_path: Option<String>,
+    /// Events buffered by cx-free mutations, drained and broadcast to the
+    /// handle's subscribers after each operation (replaces `cx.emit`).
+    pending_events: Vec<ThreadEvent>,
 }
 
-impl EventEmitter<ThreadEvent> for Thread {}
+/// A live-thread registry seam: the kernel looks up / registers live threads
+/// for team/bus routing through this, never touching the gpui thread_store
+/// global directly. The gpui layer wires an impl backed by the thread store.
+pub trait ThreadRegistry: Send + Sync {
+    fn register(&self, id: &str, handle: ThreadHandle);
+    fn lookup(&self, id: &str) -> Option<ThreadHandle>;
+    fn refresh(&self);
+}
+
+static THREAD_REGISTRY: std::sync::OnceLock<Arc<dyn ThreadRegistry>> = std::sync::OnceLock::new();
+
+/// Register the process-wide live-thread registry (App startup). First wins.
+pub fn set_thread_registry(registry: Arc<dyn ThreadRegistry>) {
+    if THREAD_REGISTRY.set(registry).is_err() {
+        tracing::warn!("thread registry already registered; ignoring re-registration");
+    }
+}
+
+/// The registered live-thread registry, or `None` in headless contexts.
+pub fn thread_registry() -> Option<&'static Arc<dyn ThreadRegistry>> {
+    THREAD_REGISTRY.get()
+}
+
+/// The gpui-free handle to a thread. Cheap to clone (`Arc`); state lives
+/// behind a lock and events broadcast to channel subscribers. This is the
+/// kernel-side unit the AgentServer and (transitionally) the frontends hold.
+#[derive(Clone)]
+pub struct ThreadHandle(Arc<ThreadCore>);
+
+pub struct ThreadCore {
+    state: parking_lot::Mutex<Thread>,
+    subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadEvent>>>>,
+}
+
+impl ThreadHandle {
+    /// Wrap a freshly built [`Thread`].
+    pub fn new(thread: Thread) -> Self {
+        Self(Arc::new(ThreadCore {
+            state: parking_lot::Mutex::new(thread),
+            subscribers: parking_lot::Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Subscribe to this thread's event stream.
+    pub fn subscribe(&self) -> async_channel::Receiver<Arc<ThreadEvent>> {
+        let (tx, rx) = async_channel::unbounded();
+        self.0.subscribers.lock().push(tx);
+        rx
+    }
+
+    /// Read-lock the state.
+    pub fn read<R>(&self, f: impl FnOnce(&Thread) -> R) -> R {
+        let state = self.0.state.lock();
+        f(&state)
+    }
+
+    /// Mutate under lock, then broadcast the buffered events. Three-phase:
+    /// lock -> mutate (collecting `pending_events`) -> unlock -> emit. The
+    /// closure must never await.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
+        let (r, events) = {
+            let mut state = self.0.state.lock();
+            let r = f(&mut state);
+            let events = std::mem::take(&mut state.pending_events);
+            (r, events)
+        };
+        self.broadcast(events);
+        r
+    }
+
+    fn broadcast(&self, events: Vec<ThreadEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let subs = self.0.subscribers.lock();
+        if subs.is_empty() {
+            return;
+        }
+        for ev in events {
+            let ev = Arc::new(ev);
+            for tx in subs.iter() {
+                let _ = tx.try_send(ev.clone());
+            }
+        }
+    }
+}
 
 impl Thread {
     /// The startup landing state: a detached thread with no engine. No
@@ -483,7 +571,7 @@ impl Thread {
     /// notice drainer, and replays the stored permission mode / reasoning
     /// effort. `spawn_engine` is infallible (it only queues the actor), so
     /// the engine is always available after this returns.
-    fn ensure_engine(&mut self, project: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn ensure_engine(&mut self, project: Option<PathBuf>) {
         if self.engine.is_some() {
             return;
         }
@@ -523,7 +611,7 @@ impl Thread {
 
     /// Handle one backend notice on the gpui thread: mirror state and re-emit
     /// the UI-facing event.
-    fn handle_notice(&mut self, notice: BackendNotice, cx: &mut Context<Self>) {
+    fn handle_notice(&mut self, notice: BackendNotice) {
         match notice {
             BackendNotice::Event(event) => {
                 // Mirror the gate policy before the chip hears about the
@@ -560,7 +648,7 @@ impl Thread {
                     self.worktree_path = if *active { path.clone() } else { None };
                 }
                 }
-                cx.emit(*event);
+                self.pending_events.push(*event);
             }
             BackendNotice::LiveHistory => {
                 // Mid-run mirror refresh (no UI event): the workspace's
@@ -674,7 +762,7 @@ impl Thread {
                 // this lands, so the projection cannot know about it).
                 if !self.browser_suites_explicitly_set && self.browser_suites != browser_suites {
                     self.browser_suites = browser_suites.clone();
-                    cx.emit(ThreadEvent::BrowserSuitesChanged {
+                    self.pending_events.push(ThreadEvent::BrowserSuitesChanged {
                         suites: browser_suites,
                     });
                 }
@@ -695,7 +783,7 @@ impl Thread {
                         .trim_end_matches("-plan")
                         .to_string();
                     let title = crate::plan_mode::resolve_plan_title(None, &content, &slug);
-                    cx.emit(ThreadEvent::PlanReady { plan_file, title });
+                    self.pending_events.push(ThreadEvent::PlanReady { plan_file, title });
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
@@ -706,13 +794,13 @@ impl Thread {
                 // must return to the hero. Fresh threads skip the rebuild
                 // (nothing changed since attach).
                 if restored || was_loading {
-                    cx.emit(ThreadEvent::HistoryRestored);
+                    self.pending_events.push(ThreadEvent::HistoryRestored);
                 }
             }
             BackendNotice::HistoryProgress => {
                 if self.history_phase.is_loading() {
                     self.refresh_history(cx);
-                    cx.emit(ThreadEvent::HistoryProgress);
+                    self.pending_events.push(ThreadEvent::HistoryProgress);
                 }
             }
             BackendNotice::Settled {
@@ -722,12 +810,12 @@ impl Thread {
                 stranded,
             } => {
                 for message_id in steered {
-                    cx.emit(ThreadEvent::SteerInjected { message_id });
+                    self.pending_events.push(ThreadEvent::SteerInjected { message_id });
                 }
                 self.running = false;
                 self.pending_steers.clear();
                 self.refresh_history(cx);
-                cx.emit(ThreadEvent::TurnFinished {
+                self.pending_events.push(ThreadEvent::TurnFinished {
                     cancelled,
                     failed,
                     stranded_steer_ids: stranded,
@@ -748,8 +836,8 @@ impl Thread {
                 // hero (the error surfaces as a conversation notice).
                 self.history_phase = HistoryPhase::Ready;
                 self.messages.clear();
-                cx.emit(ThreadEvent::HistoryRestored);
-                cx.emit(ThreadEvent::Error(err));
+                self.pending_events.push(ThreadEvent::HistoryRestored);
+                self.pending_events.push(ThreadEvent::Error(err));
             }
             BackendNotice::SessionListDirty => {
                 let store = crate::thread_store::global();
@@ -787,7 +875,7 @@ impl Thread {
     /// the User role on the provider wire but must never inherit prompt chrome.
     /// No-op while the engine is not materialized (a landing thread has no
     /// backend history).
-    fn refresh_history(&mut self, cx: &mut Context<Self>) {
+    fn refresh_history(&mut self) {
         let Some(engine) = &self.engine else {
             return;
         };
@@ -813,7 +901,6 @@ impl Thread {
         }
         self.messages = mapped;
         self.request_usage = engine.request_token_usage();
-        cx.notify();
     }
 
     // ── Thread duck-type: the turn pipeline ────────────────────────────────
@@ -822,7 +909,6 @@ impl Thread {
         &mut self,
         text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         let ordinal = self.user_prompt_ordinal();
         let mut message = Message::user(text.clone());
@@ -831,14 +917,12 @@ impl Thread {
         self.persist_user_attribution(ordinal, &ui);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
-        cx.notify();
     }
 
     pub fn insert_user_message_with_content_and_ui_metadata(
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
@@ -871,14 +955,12 @@ impl Thread {
             self.pending_images.extend(images);
         }
         self.last_user_ui = ui;
-        cx.notify();
     }
 
     pub fn enqueue_steer(
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> String {
         let mut images = Vec::new();
         let text: String = content
@@ -903,14 +985,13 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.steer(text, images);
         }
-        cx.notify();
         // The canonical message joins history at the next refresh (pi owns the
         // transcript); the workspace renders the optimistic bubble until
         // `SteerInjected` confirms.
         id
     }
 
-    pub fn run_turn(&mut self, cx: &mut Context<Self>) {
+    pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
         }
@@ -918,12 +999,11 @@ impl Thread {
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
         self.running = true;
-        cx.emit(ThreadEvent::TurnStarted);
+        self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
             .run(prompt, images);
-        cx.notify();
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -931,7 +1011,7 @@ impl Thread {
     /// semantics, and aborts every spawned TeamMember's active turn — the
     /// member's own `cancel` recurses into its derivatives. Natural turn
     /// settle never reaches this path, so background work survives turns.
-    pub fn cancel(&mut self, _cx: &mut Context<Self>) {
+    pub fn cancel(&mut self) {
         if let Some(engine) = &self.engine {
             engine.abort();
             engine.abort_spawned_members();
@@ -966,7 +1046,6 @@ impl Thread {
         &mut self,
         engine: Arc<dyn ThreadEngine>,
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
-        cx: &mut Context<Self>,
     ) {
         self.engine = Some(engine);
         drain_engine_notices(cx, events);
@@ -1158,7 +1237,6 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.create_goal(objective, token_budget, max_rounds, actor)?;
@@ -1166,7 +1244,7 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged {
+        self.pending_events.push(ThreadEvent::GoalChanged {
             goal: self.goal(),
         });
         Ok(())
@@ -1174,7 +1252,7 @@ impl Thread {
 
     /// Convenience for `/goal <objective>`: create with no budget and no
     /// round cap as the user.
-    pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
+    pub fn set_goal(&mut self, objective: String) -> anyhow::Result<()> {
         self.create_goal(objective, None, None, crate::goal::GoalActor::User, cx)
     }
 
@@ -1185,11 +1263,10 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let goal = bridge.edit_goal(objective, token_budget, max_rounds, actor)?;
-        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
+        self.pending_events.push(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
@@ -1201,7 +1278,6 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.replace_goal(objective, token_budget, max_rounds, actor)?;
@@ -1209,7 +1285,7 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged {
+        self.pending_events.push(ThreadEvent::GoalChanged {
             goal: self.goal(),
         });
         Ok(())
@@ -1222,7 +1298,6 @@ impl Thread {
         status: crate::goal::GoalStatus,
         reason: Option<crate::goal::GoalBlockReason>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let was_active = self.goal().is_some_and(|goal| goal.status == crate::goal::GoalStatus::Active);
@@ -1232,7 +1307,7 @@ impl Thread {
         {
             engine.goal_gate();
         }
-        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
+        self.pending_events.push(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
@@ -1240,11 +1315,10 @@ impl Thread {
     pub fn clear_goal(
         &mut self,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.clear_goal(actor)?;
-        cx.emit(ThreadEvent::GoalChanged { goal: None });
+        self.pending_events.push(ThreadEvent::GoalChanged { goal: None });
         Ok(())
     }
 
@@ -1272,7 +1346,6 @@ impl Thread {
     pub fn deliver_peer_messages(
         &mut self,
         msgs: Vec<crate::team::PeerMessage>,
-        cx: &mut Context<Self>,
     ) {
         if msgs.is_empty() {
             return;
@@ -1294,7 +1367,7 @@ impl Thread {
                 ..Default::default()
             };
             self.insert_user_message_with_ui_metadata(rendered, Some(ui), cx);
-            cx.emit(ThreadEvent::PeerMessage {
+            self.pending_events.push(ThreadEvent::PeerMessage {
                 from: msg.from.clone(),
                 content: msg.content.clone(),
             });
@@ -1422,7 +1495,6 @@ impl Thread {
         plan_file: String,
         seed_text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         self.ensure_engine(self.project.clone(), cx);
         if let Some(engine) = &self.engine {
@@ -1452,7 +1524,7 @@ impl Thread {
 
     /// Persist whether a plan review card is pending, so a restarted
     /// session re-surfaces the card (the card itself is UI-only state).
-    pub fn set_plan_review_pending(&mut self, pending: bool, cx: &mut Context<Self>) {
+    pub fn set_plan_review_pending(&mut self, pending: bool) {
         if let Some(engine) = &self.engine {
             engine.set_plan_review_pending(pending);
         }
@@ -1462,12 +1534,11 @@ impl Thread {
     /// Toggle plan mode: the engine persists the flag in the session
     /// sidecar, wires the read-only gate, and injects the plan-mode
     /// instructions (rendered for the configured agent language) every turn.
-    pub fn set_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    pub fn set_plan_mode(&mut self, enabled: bool) {
         self.plan_mode = enabled;
         if let Some(engine) = &self.engine {
             engine.set_plan_mode(enabled);
         }
-        cx.notify();
     }
 
     /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
@@ -1475,7 +1546,6 @@ impl Thread {
         &mut self,
         suite: crate::pi_engine::BrowserSuite,
         enable: bool,
-        cx: &mut Context<Self>,
     ) {
         self.browser_suites_explicitly_set = true;
         let changed = if enable {
@@ -1496,11 +1566,10 @@ impl Thread {
             engine.set_browser_suite(suite, enable);
         }
         if changed {
-            cx.emit(ThreadEvent::BrowserSuitesChanged {
+            self.pending_events.push(ThreadEvent::BrowserSuitesChanged {
                 suites: self.browser_suites.clone(),
             });
         }
-        cx.notify();
     }
 
     /// The opt-in browser tool suites active on this thread; the workspace
@@ -1518,7 +1587,6 @@ impl Thread {
         compact_instructions: Option<String>,
         seed_text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         self.plan_mode = false;
         // The engine injects the seed into its own transcript; record the
@@ -1528,10 +1596,9 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.approve_plan(compact, compact_instructions, seed_text);
         }
-        cx.notify();
     }
 
-    pub fn set_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+    pub fn set_project(&mut self, dir: PathBuf) {
         if self.has_interacted() {
             return;
         }
@@ -1544,13 +1611,12 @@ impl Thread {
             // one step (no orphaned pre-project session file).
             self.ensure_engine(Some(dir), cx);
         }
-        cx.notify();
     }
 
     /// Manual compaction (`/compact`): no-op while a turn is in flight (the
     /// kernel compacts an idle transcript only); the recap card lands via the
     /// engine's harness-event adaptation.
-    pub fn compact(&mut self, custom_instructions: Option<String>, _cx: &mut Context<Self>) {
+    pub fn compact(&mut self, custom_instructions: Option<String>) {
         if self.running {
             return;
         }
@@ -1559,7 +1625,7 @@ impl Thread {
         }
     }
 
-    pub fn set_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         if self.permission_mode == mode {
             return;
         }
@@ -1572,8 +1638,7 @@ impl Thread {
             // session sidecar; the chip reflects the change immediately.
             engine.set_permission_mode(mode);
         }
-        cx.emit(ThreadEvent::PermissionModeChanged { mode });
-        cx.notify();
+        self.pending_events.push(ThreadEvent::PermissionModeChanged { mode });
     }
 
     /// Deliver the user's answer for a pending interaction card
@@ -1582,7 +1647,6 @@ impl Thread {
         &mut self,
         id: &str,
         response: crate::permission::ToolAuthorizationResponse,
-        _cx: &mut Context<Self>,
     ) {
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
@@ -1598,23 +1662,21 @@ impl Thread {
             .unwrap_or_default()
     }
 
-    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+    pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
-        cx.notify();
     }
 
-    pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
+    pub fn set_model(&mut self, model: PiModel) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
         if let Some(engine) = &self.engine {
             engine.set_model(model);
         }
-        cx.emit(ThreadEvent::ModelChanged { from, to });
-        cx.notify();
+        self.pending_events.push(ThreadEvent::ModelChanged { from, to });
     }
 
-    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
         if self.reasoning_effort == effort {
             return;
         }
@@ -1625,13 +1687,11 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.set_thinking_level(Some(effort.wire_value().to_string()));
         }
-        cx.emit(ThreadEvent::ReasoningEffortChanged { effort });
-        cx.notify();
+        self.pending_events.push(ThreadEvent::ReasoningEffortChanged { effort });
     }
 
-    pub fn set_archived(&mut self, archived: bool, cx: &mut Context<Self>) {
+    pub fn set_archived(&mut self, archived: bool) {
         self.archived = archived;
-        cx.notify();
     }
 }
 
@@ -1707,7 +1767,6 @@ impl Thread {
         name: &str,
         args: &str,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> bool {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
@@ -1724,7 +1783,6 @@ impl Thread {
         key: &str,
         args: &str,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> bool {
         let Some(skill) = crate::skill::global().get(key).cloned() else {
             return false;
@@ -1755,7 +1813,6 @@ impl Thread {
         name: &str,
         args: &str,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> bool {
         match crate::slash_builtins::canonical_builtin(name).map(|meta| meta.name) {
             Some("mode") => {
@@ -1782,7 +1839,7 @@ impl Thread {
                             }
                         }
                         Err(_) => {
-                            cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                            self.pending_events.push(ThreadEvent::Error(anyhow::anyhow!(
                                 "unknown permission mode `{name}` (expected read-only, \
                                  workspace-write, or danger-full-access)"
                             )));
@@ -1820,12 +1877,12 @@ impl Thread {
     /// host's `GoalCommand`; the popover-only forms (bare `/goal`, bare
     /// `edit`/`replace`) are no-ops here — the webview surfaces goal state
     /// through its info card instead.
-    fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>, cx: &mut Context<Self>) {
+    fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>) {
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
             if let Err(error) = self.replace_goal(objective.to_string(), None, None, crate::goal::GoalActor::User, cx)
             {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
@@ -1835,13 +1892,13 @@ impl Thread {
             let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
             if let Err(error) = self.edit_goal(objective.to_string(), budget, max_rounds, crate::goal::GoalActor::User, cx)
             {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
             let Some(goal) = self.goal() else {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                self.pending_events.push(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
                 return;
             };
             let budget = if matches!(value, "none" | "unlimited") {
@@ -1850,20 +1907,20 @@ impl Thread {
                 match value.parse::<u64>() {
                     Ok(value) => Some(value),
                     Err(error) => {
-                        cx.emit(ThreadEvent::Error(error.into()));
+                        self.pending_events.push(ThreadEvent::Error(error.into()));
                         return;
                     }
                 }
             };
             if let Err(error) = self.edit_goal(goal.objective, budget, goal.max_rounds, crate::goal::GoalActor::User, cx)
             {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
         if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
             let Some(goal) = self.goal() else {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                self.pending_events.push(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
                 return;
             };
             let max_rounds = if matches!(value, "none" | "unlimited") {
@@ -1872,14 +1929,14 @@ impl Thread {
                 match value.parse::<u64>() {
                     Ok(value) => Some(value),
                     Err(error) => {
-                        cx.emit(ThreadEvent::Error(error.into()));
+                        self.pending_events.push(ThreadEvent::Error(error.into()));
                         return;
                     }
                 }
             };
             if let Err(error) = self.edit_goal(goal.objective, goal.token_budget, max_rounds, crate::goal::GoalActor::User, cx)
             {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
@@ -1887,7 +1944,7 @@ impl Thread {
             "" | "edit" | "replace" | "rounds" => {}
             "clear" => {
                 if let Err(error) = self.clear_goal(crate::goal::GoalActor::User, cx) {
-                    cx.emit(ThreadEvent::Error(error));
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
             "pause" | "stop" => {
@@ -1900,7 +1957,7 @@ impl Thread {
                     crate::goal::GoalActor::User,
                     cx,
                 ) {
-                    cx.emit(ThreadEvent::Error(error));
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
             "resume" => {
@@ -1910,12 +1967,12 @@ impl Thread {
                     crate::goal::GoalActor::User,
                     cx,
                 ) {
-                    cx.emit(ThreadEvent::Error(error));
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
             _ => match self.set_goal(trimmed.to_string(), cx) {
                 Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui, cx),
-                Err(error) => cx.emit(ThreadEvent::Error(error)),
+                Err(error) => self.pending_events.push(ThreadEvent::Error(error)),
             },
         }
     }
@@ -1926,7 +1983,6 @@ impl Thread {
         &mut self,
         text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         let ordinal = self.user_prompt_ordinal();
         let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
@@ -2018,12 +2074,11 @@ impl Thread {
     }
 
     /// Re-point the backend at an existing session file.
-    pub fn open_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub fn open_session(&mut self, path: PathBuf) {
         if let Some(engine) = &self.engine {
             engine.open_session(path);
         }
         self.running = false;
-        cx.notify();
     }
 
     /// History-loading state (see `HistoryPhase`).
