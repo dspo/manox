@@ -6,7 +6,8 @@
 //! cockpit state (run phase, the model's plan snapshot, per-cell counter
 //! animation state)
 //! that used to live directly on `Workspace`, plus strong handles to the
-//! active [`agent::Thread`] and [`crate::ConversationState`] it renders
+//! active [`ThreadProxy`] (the transitional adapter around the gpui-free
+//! `agent::ThreadHandle`) and [`crate::ConversationState`] it renders
 //! against. Writes to cockpit state flow through `Workspace` →
 //! `self.context_rail.update(cx, |r, cx| …)`.
 //!
@@ -19,8 +20,9 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
+use crate::thread_proxy::ThreadProxy;
+use agent::ThreadEvent;
 use agent::i18n;
-use agent::{Thread, ThreadEvent};
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -59,7 +61,7 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: Entity<Thread>,
+    pub(crate) thread: Entity<ThreadProxy>,
     /// Coarse run phase. Derived from `ThreadEvent`s routed here by
     /// `Workspace`; used to determine the main agent's status indicator.
     pub(crate) cockpit_phase: CockpitPhase,
@@ -90,7 +92,7 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(thread: Entity<Thread>) -> Self {
+    pub(crate) fn new(thread: Entity<ThreadProxy>) -> Self {
         Self {
             thread,
             cockpit_phase: CockpitPhase::Idle,
@@ -266,7 +268,7 @@ impl ContextRail {
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let project = {
             let thread = self.thread.read(cx);
-            thread.project().cloned()
+            thread.project()
         };
 
         let agents_section = self.render_agents_section(theme, cx);
@@ -549,7 +551,7 @@ impl ContextRail {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let display = self.git_branch_display.clone();
-        let worktree_path = self.thread.read(cx).worktree().map(|w| w.path.clone());
+        let worktree_path = self.thread.read(cx).worktree_path();
 
         // Branch label: branch / detached sha + (detached).
         let branch_label: SharedString = match &display {

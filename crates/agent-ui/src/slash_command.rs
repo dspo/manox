@@ -450,7 +450,7 @@ impl SlashCommand for CompactCommand {
             Some(trimmed.to_string())
         };
         let thread = workspace.thread.clone();
-        thread.update(cx, |t, cx| t.compact(instructions, cx));
+        thread.update(cx, |t, _| t.compact(instructions));
         cx.notify();
         SlashResult::Handled
     }
@@ -489,7 +489,6 @@ impl SlashCommand for GoalCommand {
                     None,
                     None,
                     agent::db::GoalActor::User,
-                    cx,
                 ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
@@ -506,7 +505,6 @@ impl SlashCommand for GoalCommand {
                     budget,
                     max_rounds,
                     agent::db::GoalActor::User,
-                    cx,
                 ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
@@ -537,7 +535,6 @@ impl SlashCommand for GoalCommand {
                     budget,
                     goal.max_rounds,
                     agent::db::GoalActor::User,
-                    cx,
                 ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
@@ -568,7 +565,6 @@ impl SlashCommand for GoalCommand {
                     goal.token_budget,
                     max_rounds,
                     agent::db::GoalActor::User,
-                    cx,
                 ) {
                     cx.emit(agent::ThreadEvent::Error(error));
                 }
@@ -586,7 +582,7 @@ impl SlashCommand for GoalCommand {
             }
             "clear" => {
                 thread.update(cx, |t, cx| {
-                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx) {
+                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User) {
                         cx.emit(agent::ThreadEvent::Error(error));
                     }
                 });
@@ -602,7 +598,6 @@ impl SlashCommand for GoalCommand {
                             message: "paused by user".into(),
                         }),
                         agent::db::GoalActor::User,
-                        cx,
                     ) {
                         cx.emit(agent::ThreadEvent::Error(error));
                     }
@@ -615,7 +610,6 @@ impl SlashCommand for GoalCommand {
                         agent::goal::GoalStatus::Active,
                         None,
                         agent::db::GoalActor::User,
-                        cx,
                     ) {
                         cx.emit(agent::ThreadEvent::Error(error));
                     }
@@ -640,14 +634,13 @@ impl SlashCommand for GoalCommand {
                     workspace.begin_goal_replace_with_objective(trimmed, window, cx);
                     return SlashResult::Handled;
                 }
-                let created =
-                    thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string(), cx) {
-                        Ok(()) => true,
-                        Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error));
-                            false
-                        }
-                    });
+                let created = thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string()) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        cx.emit(agent::ThreadEvent::Error(error));
+                        false
+                    }
+                });
                 if !created {
                     return SlashResult::Handled;
                 }

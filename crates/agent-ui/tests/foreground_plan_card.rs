@@ -8,7 +8,8 @@
 
 mod common;
 
-use agent::{Thread, ThreadEvent};
+use agent::ThreadEvent;
+use agent_ui::thread_proxy::ThreadProxy;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -19,7 +20,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let (_dir, plan_file) = write_plan_file();
 
-    let a: gpui::Entity<Thread> = fake_thread(cx, Vec::new());
+    let a: gpui::Entity<ThreadProxy> = fake_thread(cx, Vec::new());
     let a_id = cx.read(|cx| a.read(cx).id.0.clone());
     visual.update(|window, cx| {
         workspace.update(cx, |ws, cx| {
@@ -44,7 +45,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the fresh card is active"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "PlanReady raises the pending-plan badge"
     );
 
@@ -67,7 +68,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the card stays interactive after the proposal turn"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the pending-plan badge survives a normal settle while the verdict is due"
     );
 
@@ -90,7 +91,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the cancelled turn demotes the card to a plain record"
     );
     assert!(
-        !agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        !agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "a cancelled turn clears the pending-plan badge"
     );
     agent::thread_store::drop_global_for_test();

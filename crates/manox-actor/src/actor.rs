@@ -121,8 +121,7 @@ fn handle_command(
         return true;
     };
     if cmd_name != "init" {
-        return cx
-            .update(|app| manox_session_core::session::handle_command(app, state, sink, &cmd));
+        return cx.update(|_app| manox_session_core::session::handle_command(state, sink, &cmd));
     }
     if let Some(cwd) = cmd["cwd"].as_str() {
         state.cwd = PathBuf::from(cwd);
@@ -253,7 +252,7 @@ mod tests {
             let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
             cx.allow_parking();
             init_globals(&mut cx);
-            cx.update(agent::thread_store::init);
+            cx.update(|_| agent::thread_store::init());
             run_command_loop(&mut cx, rx, &sink);
             agent::thread_store::drop_global_for_test();
         });
@@ -359,7 +358,7 @@ mod tests {
 
         // Default host (the native app): the untagged session is the only
         // one visible.
-        cx.update(agent::thread_store::init);
+        cx.update(|_| agent::thread_store::init());
         handle_command(&mut cx, &mut state, &sink, r#"{"cmd":"list_threads"}"#);
         wait_for(&out, &mut cx, &["legacy"]);
         agent::thread_store::drop_global_for_test();
@@ -367,7 +366,7 @@ mod tests {
         // A vscode host: only the tagged session is visible.
         let host_guard = HostGuard(agent::host::current());
         agent::host::set_host(agent::host::Host::Vscode);
-        cx.update(agent::thread_store::init);
+        cx.update(|_| agent::thread_store::init());
         // The store global was rebuilt; re-subscribe so follow-up snapshot
         // pushes land on the new entity.
         state.store_subscription = None;

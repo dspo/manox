@@ -1,6 +1,7 @@
 //! Conversation history sidebar.
 //!
-//! A standalone gpui Entity that subscribes to `ThreadStore` and lists past threads. Clicking a
+//! A standalone gpui Entity that subscribes to the gpui-free `ThreadStore`
+//! (via a `StoreHandle` event pump) and lists past threads. Clicking a
 //! conversation entry emits `OpenThread(id)`; the "Conversations" section header's "+" opens the
 //! flat new-session menu and each project folder header's ellipsis button opens the project
 //! action menu (new session / terminal / VS Code / remove project). Workspace subscribes to
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use agent::i18n;
 use agent::thread::PermissionMode;
-use agent::{ThreadStore, ThreadStoreEvent};
+use agent::thread_store::StoreHandle;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, Transformation,
@@ -299,7 +300,7 @@ fn external_session_is_loose(project: Option<&std::path::Path>, known_projects: 
 }
 
 pub struct Sidebar {
-    store: Entity<ThreadStore>,
+    store: StoreHandle,
     selected: Option<String>,
     /// The thread that was selected immediately before `selected`; its row
     /// plays a fade-out wash while the new row's wash fades in, so selection
@@ -343,7 +344,7 @@ pub struct Sidebar {
     /// Scroll offset + child-bounds reader for the sidebar scroll body; the
     /// sticky section-header overlay reads it to decide which header to show.
     scroll_handle: ScrollHandle,
-    _sub: Subscription,
+    _pump: gpui::Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
@@ -351,14 +352,19 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = agent::thread_store_global();
-        let sub = cx.subscribe(
-            &store,
-            |_this, _store, ev: &ThreadStoreEvent, cx| match ev {
-                ThreadStoreEvent::SummariesUpdated | ThreadStoreEvent::RunningChanged => {
+        // The store is gpui-free: pump its event channel into `cx.notify()`
+        // through a spawned task instead of `cx.subscribe` (transitional;
+        // γ replaces this with a client store + entity subscription).
+        let rx = store.subscribe();
+        let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+            while let Ok(_ev) = rx.recv().await {
+                let _ = this.update(cx, |_, cx| {
+                    // The event value is not needed — any store change
+                    // repaints the list.
                     cx.notify();
-                }
-            },
-        );
+                });
+            }
+        });
         Self {
             store,
             selected: None,
@@ -377,11 +383,11 @@ impl Sidebar {
             row_menu_sub: None,
             width,
             scroll_handle: ScrollHandle::new(),
-            _sub: sub,
+            _pump,
         }
     }
 
-    pub fn store(&self) -> Entity<ThreadStore> {
+    pub fn store(&self) -> StoreHandle {
         self.store.clone()
     }
 
@@ -771,14 +777,15 @@ impl Sidebar {
     }
 
     /// The persisted tag for a row, reading both sidebar partitions.
-    fn summary_tag(&self, id: &str, cx: &App) -> Option<String> {
-        let store = self.store.read(cx);
-        store
-            .summaries()
-            .iter()
-            .chain(store.archived_summaries())
-            .find(|s| s.id == id)
-            .and_then(|s| s.tag.clone())
+    fn summary_tag(&self, id: &str, _cx: &App) -> Option<String> {
+        self.store.read(|store| {
+            store
+                .summaries()
+                .iter()
+                .chain(store.archived_summaries())
+                .find(|s| s.id == id)
+                .and_then(|s| s.tag.clone())
+        })
     }
 
     /// Build the session-menu dropdown anchored below the trigger button
@@ -834,7 +841,7 @@ impl Sidebar {
         path: &str,
         group: &[agent::ThreadSummary],
         selected: Option<&str>,
-        store: &Entity<ThreadStore>,
+        store: &StoreHandle,
         slide: &SlideCtx,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -953,17 +960,17 @@ impl Sidebar {
                     let is_selected = selected == Some(tr.row.id());
                     match tr.row {
                         SidebarRow::Thread(s) => {
-                            let store = store.read(cx);
+                            let live = store.read(|store| ThreadLiveState {
+                                running: store.is_running(&s.id),
+                                pending_auth: store.pending_auth_contains(&s.id),
+                                pending_plan: store.pending_plan_contains(&s.id),
+                                background_work: store.background_work_contains(&s.id),
+                            });
                             render_thread_item(
                                 &SidebarThreadItem::from_thread(
                                     &s,
                                     is_selected,
-                                    ThreadLiveState {
-                                        running: store.is_running(&s.id),
-                                        pending_auth: store.pending_auth_contains(&s.id),
-                                        pending_plan: store.pending_plan_contains(&s.id),
-                                        background_work: store.background_work_contains(&s.id),
-                                    },
+                                    live,
                                     RowNesting {
                                         indent: px(16. + tr.indent),
                                         team_leader: tr.team_leader,
@@ -1001,8 +1008,8 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let summaries = self.store.read(cx).summaries().to_vec();
-        let known_projects = self.store.read(cx).known_projects().to_vec();
+        let summaries = self.store.read(|s| s.summaries().to_vec());
+        let known_projects = self.store.read(|s| s.known_projects().to_vec());
         let selected = self.selected.clone();
         let store = self.store.clone();
 
@@ -1187,20 +1194,20 @@ impl Render for Sidebar {
                                         let is_selected = selected.as_deref() == Some(tr.row.id());
                                         match tr.row {
                                             SidebarRow::Thread(s) => {
-                                                let store = store.read(cx);
+                                                let live = store.read(|store| ThreadLiveState {
+                                                    running: store.is_running(&s.id),
+                                                    pending_auth: store
+                                                        .pending_auth_contains(&s.id),
+                                                    pending_plan: store
+                                                        .pending_plan_contains(&s.id),
+                                                    background_work: store
+                                                        .background_work_contains(&s.id),
+                                                });
                                                 render_thread_item(
                                                     &SidebarThreadItem::from_thread(
                                                         &s,
                                                         is_selected,
-                                                        ThreadLiveState {
-                                                            running: store.is_running(&s.id),
-                                                            pending_auth: store
-                                                                .pending_auth_contains(&s.id),
-                                                            pending_plan: store
-                                                                .pending_plan_contains(&s.id),
-                                                            background_work: store
-                                                                .background_work_contains(&s.id),
-                                                        },
+                                                        live,
                                                         RowNesting {
                                                             indent: px(tr.indent),
                                                             team_leader: tr.team_leader,

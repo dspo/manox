@@ -11,12 +11,14 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent::Thread;
+use agent::ThreadEvent;
 use agent::db::ThreadSummary;
 use agent::language_model::{LanguageModelToolUse, MessageContent, TokenUsage};
 use agent::message::Message;
 use agent::thread_engine::{BackendNotice, ThreadEngine};
-use agent::{Thread, ThreadEvent};
 use agent_ui::Workspace;
+use agent_ui::thread_proxy::ThreadProxy;
 use gpui::{AppContext as _, Entity, TestAppContext, px, size};
 use gpui_component::Theme;
 use pi::types::{ContentBlock, Model as PiModel};
@@ -86,10 +88,10 @@ fn register_lilex(cx: &mut TestAppContext) {
 pub fn init_harness(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     register_lilex(cx);
-    cx.update(|cx| {
+    cx.update(|_cx| {
         agent::runtime::init();
         agent::pi_providers::init();
-        agent::thread_store::init(cx);
+        agent::thread_store::init();
     });
 }
 
@@ -111,26 +113,25 @@ pub fn open_workspace(
 
 /// A thread facade with a fake engine: `Thread::landing` defers engine
 /// creation, so the test swaps in the fake before anything runs.
-pub fn fake_thread(cx: &mut TestAppContext, history: Vec<Message>) -> Entity<Thread> {
+pub fn fake_thread(cx: &mut TestAppContext, history: Vec<Message>) -> Entity<ThreadProxy> {
     let (_, events) = tokio::sync::mpsc::unbounded_channel::<BackendNotice>();
     cx.update(|cx| {
-        let thread = Thread::landing(PathBuf::from("/tmp"), cx);
-        thread.update(cx, |t, cx| {
+        let thread = Thread::landing(PathBuf::from("/tmp"));
+        thread.with_mut(|t| {
             t.set_engine_for_test(
                 Arc::new(FakeEngine {
                     history: std::sync::Mutex::new(history),
                 }),
                 events,
-                cx,
             )
         });
-        thread
+        cx.new(|cx| ThreadProxy::new(thread, cx))
     })
 }
 
 /// Emit a `ThreadEvent` on the thread; the workspace's foreground or
 /// background subscription observes it.
-pub fn emit(thread: &Entity<Thread>, cx: &mut TestAppContext, event: ThreadEvent) {
+pub fn emit(thread: &Entity<ThreadProxy>, cx: &mut TestAppContext, event: ThreadEvent) {
     cx.update(|cx| {
         thread.update(cx, |_t, cx| cx.emit(event));
     });

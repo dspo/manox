@@ -6,7 +6,8 @@
 
 mod common;
 
-use agent::{Thread, ThreadEvent};
+use agent::ThreadEvent;
+use agent_ui::thread_proxy::ThreadProxy;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -17,7 +18,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let (_dir, plan_file) = write_plan_file();
 
-    let a: gpui::Entity<Thread> = fake_thread(cx, Vec::new());
+    let a: gpui::Entity<ThreadProxy> = fake_thread(cx, Vec::new());
     let a_id = cx.read(|cx| a.read(cx).id.0.clone());
     let b = fake_thread(cx, Vec::new());
     // A must look running so attaching B parks it in the background.
@@ -48,7 +49,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "background PlanReady must stash the review"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "sidebar keeps the pending-plan badge"
     );
     emit(
@@ -65,7 +66,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "a normal settle keeps the stashed plan"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the badge survives the settle while the verdict is due"
     );
 
