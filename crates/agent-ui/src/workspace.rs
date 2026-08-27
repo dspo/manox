@@ -7658,7 +7658,7 @@ impl Workspace {
         let right_pane_open = self.right_pane_open();
         let editor_preview = self.editor_preview;
         let editor_width = self.editor_width;
-        // Title text is the active thread's display title (user rename > LLM
+        // Title text is the active thread's display title (persisted/generated
         // title > mechanical summary). Falls back to "manox" so an unselected
         // first screen stays branded before any title is generated.
         let title_text: SharedString = {

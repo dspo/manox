@@ -283,6 +283,9 @@ pub enum ThreadEvent {
     /// The pi backend restored an existing session and the authoritative
     /// history is ready. The workspace rebuilds the conversation view.
     HistoryRestored,
+    /// The persisted display title changed (Title agent result); the facade
+    /// mirrors it so every title surface re-derives from the same source.
+    TitleChanged { title: String },
 }
 
 /// The pi-backed thread facade.
@@ -340,6 +343,10 @@ pub struct Thread {
     /// rebuild-after-compaction fallback (the transcript's plan tool calls
     /// are summarized away, but this survives via the session sidecar).
     persisted_plan: Option<crate::plan::PlanSnapshot>,
+    /// Display title persisted in the session sidecar (mechanical initial
+    /// or Title-agent result). `display_title` prefers it over the live
+    /// first-message derivation, which compaction would rewrite.
+    title: Option<String>,
     /// Member label for team routing: `lead` for the main thread, the
     /// member name for team workers.
     label: String,
@@ -383,6 +390,7 @@ impl Thread {
             browser_suites_explicitly_set: false,
             plan_mode: false,
             persisted_plan: None,
+            title: None,
             label: "lead".into(),
             goal_bridge: None,            worktree_path: None,
         })
@@ -470,6 +478,7 @@ impl Thread {
                 browser_suites_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
+                title: None,
                 label: "lead".into(),
                 goal_bridge,            worktree_path: None,
             }
@@ -533,6 +542,9 @@ impl Thread {
                 }
                 if let ThreadEvent::PlanModeChanged { enabled } = *event {
                     self.plan_mode = enabled;
+                }
+                if let ThreadEvent::TitleChanged { title } = &*event {
+                    self.title = Some(title.clone());
                 }
                 if let ThreadEvent::PlanUpdated { snapshot } = &*event {
                     // Mirror + persist: the sidecar copy is the rail's
@@ -654,12 +666,14 @@ impl Thread {
                     plan_file,
                     plan_review_pending,
                     plan_snapshot,
+                    title,
                 } = *notice;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot
                     .and_then(|v| serde_json::from_value(v).ok());
                 self.restored = restored;
+                self.title = title;
                 if let Some(m) = model {
                     self.model = Some(m);
                 }
@@ -999,6 +1013,9 @@ impl Thread {
     }
 
     pub fn display_title(&self) -> String {
+        if let Some(title) = self.title.as_deref().filter(|t| !t.trim().is_empty()) {
+            return title.to_string();
+        }
         // Mechanical summary like the manox build's fallback: the first user
         // prompt, trimmed to a title-sized prefix.
         self.messages
@@ -1365,6 +1382,7 @@ impl Thread {
                 browser_suites_explicitly_set: true,
                 plan_mode: false,
                 persisted_plan: None,
+                title: None,
                 goal_bridge: None,
                 label: name,
                 worktree_path: None,
@@ -2212,6 +2230,7 @@ pub(crate) mod tests {
                 browser_suites_explicitly_set: false,
                 plan_mode: false,
                 persisted_plan: None,
+                title: None,
                 label: "lead".into(),
                 goal_bridge: None,            worktree_path: None,
             })
@@ -2581,6 +2600,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2665,6 +2685,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2770,6 +2791,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: Some(value),
+                    title: None,
                 })),
                 cx,
             );
@@ -2810,6 +2832,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2846,6 +2869,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2891,6 +2915,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2924,6 +2949,7 @@ pub(crate) mod tests {
                     plan_file: None,
                     plan_review_pending: false,
                     plan_snapshot: None,
+                    title: None,
                 })),
                 cx,
             );
@@ -2952,6 +2978,41 @@ pub(crate) mod tests {
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
         thread.update(cx, |t, cx| t.cancel(cx));
         assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The persisted title (Ready seed and live `TitleChanged`) outranks
+    /// the first-message derivation, which compaction would rewrite.
+    #[gpui::test]
+    fn display_title_prefers_persisted_title(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.messages = vec![Message::user("fix the sidebar title bug".to_string())];
+            assert_eq!(t.display_title(), "fix the sidebar title bug");
+            t.handle_notice(
+                BackendNotice::Ready(Box::new(ReadyInfo {
+                    restored: true,
+                    model: None,
+                    permission_mode: PermissionMode::default(),
+                    reasoning_effort: ReasoningEffort::default(),
+                    browser_suites: Vec::new(),
+                    plan_mode: false,
+                    plan_file: None,
+                    plan_review_pending: false,
+                    plan_snapshot: None,
+                    title: Some("终端标题修复".into()),
+                })),
+                cx,
+            );
+            assert_eq!(t.display_title(), "终端标题修复");
+            t.handle_notice(
+                BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
+                    title: "标题镜像".into(),
+                })),
+                cx,
+            );
+            assert_eq!(t.display_title(), "标题镜像");
+        });
     }
 }
 
