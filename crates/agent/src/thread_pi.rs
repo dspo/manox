@@ -350,6 +350,9 @@ pub struct Thread {
     /// Events buffered by cx-free mutations, drained and broadcast to the
     /// handle's subscribers after each operation (replaces `cx.emit`).
     pending_events: Vec<ThreadEvent>,
+    /// Engine notice channel parked by `ensure_engine` (lazy engine), drained
+    /// onto the handle right after the mutation that materialized it.
+    pending_engine_events: Option<tokio::sync::mpsc::UnboundedReceiver<BackendNotice>>,
 }
 
 /// A live-thread registry seam: the kernel looks up / registers live threads
@@ -412,12 +415,16 @@ impl ThreadHandle {
     /// lock -> mutate (collecting `pending_events`) -> unlock -> emit. The
     /// closure must never await.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
-        let (r, events) = {
+        let (r, events, engine_events) = {
             let mut state = self.0.state.lock();
             let r = f(&mut state);
             let events = std::mem::take(&mut state.pending_events);
-            (r, events)
+            let engine_events = state.pending_engine_events.take();
+            (r, events, engine_events)
         };
+        if let Some(rx) = engine_events {
+            drain_engine_notices(self.clone(), rx);
+        }
         self.broadcast(events);
         r
     }
@@ -444,8 +451,8 @@ impl Thread {
     /// session is loaded at launch — the user picks a conversation from the
     /// sidebar (`open_existing` swaps in its engine) or starts typing
     /// (`run_turn` materializes a fresh engine on first use).
-    pub fn landing(cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        cx.new(|_| Self {
+    pub fn landing(cwd: PathBuf) -> ThreadHandle {
+        ThreadHandle::new(Self {
             id: ThreadId(uuid::Uuid::new_v4().to_string()),
             cwd,
             project: None,
@@ -472,26 +479,29 @@ impl Thread {
             plan_mode: false,
             persisted_plan: None,
             label: "lead".into(),
-            goal_bridge: None,            worktree_path: None,
+            goal_bridge: None,
+            worktree_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
         })
     }
 
     /// A genuinely empty thread (sidebar new-conversation): never restores
     /// the previous session.
-    pub fn new_fresh(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, None, true, cx)
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
+        Self::open(id, cwd, None, None, true)
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
     /// the project as its cwd in one step (no recreate, no restore), so the
     /// sidebar never sees an orphaned pre-project session file.
-    pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, project.clone(), None, Some(project), true, cx)
+    pub fn new_in_project(id: ThreadId, project: PathBuf) -> ThreadHandle {
+        Self::open(id, project.clone(), None, Some(project), true)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
-    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, Some(path), None, false, cx)
+    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf) -> ThreadHandle {
+        Self::open(id, cwd, Some(path), None, false)
     }
 
     fn open(
@@ -500,8 +510,7 @@ impl Thread {
         initial_path: Option<PathBuf>,
         project: Option<PathBuf>,
         fresh: bool,
-        cx: &mut App,
-    ) -> Entity<Self> {
+    ) -> ThreadHandle {
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
         // gate input and render the streaming preview.
@@ -526,42 +535,44 @@ impl Thread {
             None,
         );
 
-        cx.new(|cx| {
-            drain_engine_notices(cx, events);
-            Self {
-                id,
-                cwd,
-                project,
-                model,
-                permission_mode: PermissionMode::default(),
-                messages: Vec::new(),
-                reasoning_effort: ReasoningEffort::default(),
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: if loading {
-                    HistoryPhase::Loading
-                } else {
-                    HistoryPhase::Ready
-                },
-                permission_mode_explicitly_set: false,
-                reasoning_effort_explicitly_set: false,
-                browser_suites: Vec::new(),
-                browser_suites_explicitly_set: false,
-                plan_mode: false,
-                persisted_plan: None,
-                label: "lead".into(),
-                goal_bridge,            worktree_path: None,
-            }
-        })
+        let handle = ThreadHandle::new(Self {
+            id,
+            cwd,
+            project,
+            model,
+            permission_mode: PermissionMode::default(),
+            messages: Vec::new(),
+            reasoning_effort: ReasoningEffort::default(),
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: if loading {
+                HistoryPhase::Loading
+            } else {
+                HistoryPhase::Ready
+            },
+            permission_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
+            browser_suites: Vec::new(),
+            browser_suites_explicitly_set: false,
+            plan_mode: false,
+            persisted_plan: None,
+            label: "lead".into(),
+            goal_bridge,
+            worktree_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
+        });
+        drain_engine_notices(handle.clone(), events);
+        handle
     }
 
     /// Lazily materialize the engine for a landing thread (no engine until
@@ -606,7 +617,7 @@ impl Thread {
             engine.set_browser_suite(suite, true);
         }
         self.engine = Some(engine.clone());
-        drain_engine_notices(cx, events);
+        self.pending_engine_events = Some(events);
     }
 
     /// Handle one backend notice on the gpui thread: mirror state and re-emit
@@ -1048,7 +1059,7 @@ impl Thread {
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
     ) {
         self.engine = Some(engine);
-        drain_engine_notices(cx, events);
+        self.pending_engine_events = Some(events);
     }
 
     /// Test-only: force the running flag so team routing tests can simulate
