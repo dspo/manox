@@ -128,12 +128,12 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     std::fs::create_dir_all(&project).unwrap();
 
     let cx = gpui::TestAppContext::single();
-    cx.update(|cx| {
+    cx.update(|_| {
         agent::runtime::init();
         agent::settings::init_optimization();
         agent::i18n::init();
         agent::pi_providers::init();
-        agent::thread_store::init(cx);
+        agent::thread_store::init();
     });
     // Provider registration runs on a background thread; block until it lands
     // so `default_model` resolves before the thread is constructed.
@@ -175,18 +175,12 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     // The workspace's `TurnFinished` handler persists with `touch=true`,
     // which re-scans the session repository into the store summaries.
-    // Apply the same call, then pump the async refresh.
-    cx.update(agent::refresh_thread_list);
+    // Apply the same call; the scan runs on the agent runtime.
+    agent::refresh_thread_list();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        cx.run_until_parked();
-        let listed = cx.read(|cx| {
-            agent::thread_store_global()
-                .read(cx)
-                .summaries()
-                .iter()
-                .any(|s| s.id == new_id)
-        });
+        let listed = agent::thread_store_global()
+            .read(|s| s.summaries().iter().any(|s| s.id == new_id));
         if listed {
             break;
         }
@@ -201,7 +195,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
                     files.push(entry.path().display().to_string());
                 }
             }
-            let listed = cx.read(|cx| agent::thread_store_global().read(cx).summaries().to_vec());
+            let listed = agent::thread_store_global().read(|s| s.summaries().to_vec());
             panic!(
                 "fresh execution thread {new_id} never surfaced in ThreadStore summaries \
                  (sidebar list) — deferred session file missed by every refresh\n\
@@ -214,10 +208,8 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // The thread must be listed under the SAME id the facade thread carries
     // (the session file header id), so sidebar selection / running / unread
     // marks keyed by the facade id actually reach the row.
-    let listed_id = cx.read(|cx| {
-        agent::thread_store_global()
-            .read(cx)
-            .summaries()
+    let listed_id = agent::thread_store_global().read(|s| {
+        s.summaries()
             .iter()
             .find(|s| s.id == new_id)
             .map(|s| s.id.clone())
@@ -229,7 +221,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
          sidebar row is keyed by a different id and selection/running/unread \
          marks never reach it"
     );
-    let summaries = cx.read(|cx| agent::thread_store_global().read(cx).summaries().to_vec());
+    let summaries = agent::thread_store_global().read(|s| s.summaries().to_vec());
     let summary = summaries
         .iter()
         .find(|s| s.id == new_id)
