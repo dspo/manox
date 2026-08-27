@@ -1706,28 +1706,18 @@ impl Thread {
     }
 }
 
-/// Drain a spawned engine's notice channel on the gpui thread, dispatching
-/// each notice through `Thread::handle_notice`. Shared by `open` (engine
+/// Drain a spawned engine's notice channel on the runtime, dispatching each
+/// notice through [`ThreadHandle::handle_notice`]. Shared by `open` (engine
 /// present at construction) and `ensure_engine` (landing materialization).
 fn drain_engine_notices(
-    this: &mut Context<Thread>,
+    handle: ThreadHandle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
 ) {
-    this.spawn(async move |this, cx| {
+    crate::runtime::handle().spawn(async move {
         while let Some(notice) = events.recv().await {
-            // `update` returns Err only when the Thread entity has been
-            // released (a closure panic would unwind, not become Err) — the
-            // thread is gone, so stop draining instead of looping on a dead
-            // entity while in-flight run tasks keep the sender alive.
-            if this
-                .update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx))
-                .is_err()
-            {
-                break;
-            }
+            handle.handle_notice(notice);
         }
-    })
-    .detach();
+    });
 }
 
 /// Human-readable tool card title from the pi tool name + arguments. The
