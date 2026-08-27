@@ -13,6 +13,7 @@ mod blink;
 pub mod element;
 pub mod grid_renderer;
 mod layout_cache;
+pub mod terminal_proxy;
 pub mod terminal_view;
 pub mod theme;
 

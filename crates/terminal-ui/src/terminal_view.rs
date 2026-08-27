@@ -1,6 +1,6 @@
 //! `TerminalView` — the gpui `Render` wrapper around `TerminalElement`.
 //!
-//! Owns an `Entity<Terminal>`, renders the element full-bleed, and routes
+//! Owns an `Entity<TerminalProxy>`, renders the element full-bleed, and routes
 //! keyboard/mouse/scroll input to the terminal. Key translation goes through
 //! `mappings::keys::to_esc_str`; mouse left-drag does char-granularity
 //! selection + copy-to-clipboard on release; the scroll wheel scrolls the
@@ -17,6 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::terminal_proxy::TerminalProxy;
 use gpui::{
     App, AppContext, Bounds, ClipboardItem, Context, Entity, FocusHandle, Font, FontFeatures,
     FontStyle, FontWeight, InputHandler, InteractiveElement, IntoElement, KeyDownEvent, Keystroke,
@@ -31,7 +32,7 @@ use terminal::alacritty_terminal::vi_mode::ViMotion;
 use terminal::mappings::keys;
 use terminal::mappings::mouse::{self, MouseAction};
 use terminal::settings::{BellMode, CursorBlinkSetting};
-use terminal::{HoverKind, HoverTarget, Rgb, Terminal};
+use terminal::{HoverKind, HoverTarget, Rgb};
 
 use crate::blink::CursorBlink;
 use crate::element::TerminalElement;
@@ -50,7 +51,7 @@ struct Search {
 /// A view that hosts one terminal session. Created by the workspace when the
 /// user opens a terminal tab.
 pub struct TerminalView {
-    terminal: Entity<Terminal>,
+    terminal: Entity<TerminalProxy>,
     focus_handle: FocusHandle,
     font: Font,
     font_size: Pixels,
@@ -114,7 +115,7 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(terminal: Entity<Terminal>, cx: &mut App) -> Entity<Self> {
+    pub fn new(terminal: Entity<TerminalProxy>, cx: &mut App) -> Entity<Self> {
         let terminal_for_view = terminal.clone();
         let s = terminal::settings::load();
         let skip_shell: Vec<Keystroke> = s
@@ -232,7 +233,7 @@ impl TerminalView {
         view
     }
 
-    pub fn terminal(&self) -> &Entity<Terminal> {
+    pub fn terminal(&self) -> &Entity<TerminalProxy> {
         &self.terminal
     }
 
@@ -361,7 +362,7 @@ impl TerminalView {
         // Toggle the terminal's built-in vi mode (alacritty's, not `vim`)
         // on ctrl+shift+v.
         if k.modifiers.control && k.modifiers.shift && k.key == "v" {
-            self.terminal.update(cx, |t, cx| t.toggle_vi_mode(cx));
+            self.terminal.update(cx, |t, _| t.toggle_vi_mode());
             return true;
         }
 
@@ -371,7 +372,7 @@ impl TerminalView {
         // to the PTY; unmapped keys are swallowed.
         if mode.contains(TermMode::VI) {
             if let Some(motion) = vi_motion_for(k) {
-                self.terminal.update(cx, |t, cx| t.vi_motion(motion, cx));
+                self.terminal.update(cx, |t, _| t.vi_motion(motion));
             }
             return true;
         }
@@ -452,7 +453,7 @@ impl TerminalView {
                 t.hyperlink_at(row, col)
                     .map(|url| (url, HoverKind::Url))
                     .or_else(|| t.hover_target(row, col).map(|h| (h.text, h.kind)))
-                    .map(|(text, kind)| (text, kind, t.cwd.clone()))
+                    .map(|(text, kind)| (text, kind, t.cwd()))
             });
             if let Some((text, kind, cwd)) = target {
                 open_target(&text, kind, &cwd);
@@ -469,7 +470,7 @@ impl TerminalView {
                 // user can select text even when the TUI has captured the
                 // mouse.
                 self.terminal
-                    .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
+                    .update(cx, |t, _| t.start_selection(ty, row, col));
                 self.selecting = true;
                 self.hover = None;
                 return;
@@ -489,7 +490,7 @@ impl TerminalView {
             return;
         }
         self.terminal
-            .update(cx, |t, cx| t.start_selection(ty, row, col, cx));
+            .update(cx, |t, _| t.start_selection(ty, row, col));
         self.selecting = true;
         self.hover = None;
     }
@@ -502,7 +503,7 @@ impl TerminalView {
         if self.selecting {
             let (row, col) = self.px_to_grid(ev.position, window);
             self.terminal
-                .update(cx, |t, cx| t.update_selection(row, col, cx));
+                .update(cx, |t, _| t.update_selection(row, col));
             self.copy_selection_live(cx);
             return;
         }
@@ -604,7 +605,7 @@ impl TerminalView {
             self.terminal.update(cx, |t, _| t.alternate_scroll(lines));
             return;
         }
-        self.terminal.update(cx, |t, cx| t.scroll(lines, cx));
+        self.terminal.update(cx, |t, _| t.scroll(lines));
     }
 
     /// Map an element-relative pixel position to `(row, col)` grid coords by
@@ -832,7 +833,7 @@ impl TerminalView {
     /// flashes a brief overlay, `System` is silent here (no audio bridge yet),
     /// `Off` does nothing.
     fn ring_bell(&mut self, cx: &mut Context<Self>) {
-        let mode = self.terminal.read_with(cx, |t, _| t.bell);
+        let mode = self.terminal.read_with(cx, |t, _| t.bell());
         if !matches!(mode, BellMode::Visual) {
             return;
         }
@@ -963,7 +964,7 @@ impl TerminalView {
         }
         let fraction = ((y - track.origin.y) / track.size.height).clamp(0., 1.);
         self.terminal
-            .update(cx, |t, cx| t.scroll_to_fraction(fraction, cx));
+            .update(cx, |t, _| t.scroll_to_fraction(fraction));
     }
 
     /// Record the element's window-space bounds (written back by the element

@@ -13,6 +13,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use futures::future::BoxFuture;
 use gpui::{App, Task};
 use serde::{Deserialize, Serialize};
 
@@ -126,10 +127,22 @@ pub fn host() -> Option<&'static Arc<dyn BrowserHost>> {
     HOST.get()
 }
 
-/// A browser op parked on the capability channel with its reply slot.
+// A browser op parked on the capability channel with its reply slot.
 struct BrowserCapabilityMsg {
     op: crate::thread_engine::BrowserOp,
     reply: futures::channel::oneshot::Sender<Result<crate::thread_engine::BrowserReply, String>>,
+}
+
+/// A clipboard request parked on its own channel: gpui `App` is main-thread
+/// only, so the kernel side hops to the foreground through this channel
+/// rather than holding an `AsyncApp` (which is not `Send`).
+enum ClipboardMsg {
+    Write {
+        text: String,
+    },
+    Read {
+        reply: futures::channel::oneshot::Sender<Result<Option<String>, String>>,
+    },
 }
 
 /// The gpui-backed capability provider. It is `Send + Sync` (it holds only a
@@ -139,6 +152,7 @@ struct BrowserCapabilityMsg {
 /// `&mut App`.
 pub struct GpuiCapability {
     tx: async_channel::Sender<BrowserCapabilityMsg>,
+    clipboard_tx: async_channel::Sender<ClipboardMsg>,
 }
 
 impl GpuiCapability {
@@ -158,11 +172,59 @@ impl GpuiCapability {
             }
         })
         .detach();
-        Arc::new(Self { tx })
+        // Clipboard ops ride their own main-thread loop: `gpui::App` is
+        // confined to the foreground and `AsyncApp` is not `Send`, so the
+        // kernel side reaches the system clipboard through this channel
+        // rather than holding the app.
+        let (clipboard_tx, clipboard_rx) = async_channel::unbounded::<ClipboardMsg>();
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while let Ok(msg) = clipboard_rx.recv().await {
+                match msg {
+                    ClipboardMsg::Write { text } => {
+                        cx.update(|cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text))
+                        });
+                    }
+                    ClipboardMsg::Read { reply } => {
+                        let text =
+                            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+                        let _ = reply.send(Ok(text));
+                    }
+                }
+            }
+        })
+        .detach();
+        Arc::new(Self { tx, clipboard_tx })
     }
 }
 
 impl crate::capability::CapabilityClient for GpuiCapability {
+    /// OSC 52 copy: parked on the clipboard channel and run on the
+    /// foreground; fire-and-forget, so a closed channel is the only failure.
+    fn clipboard_write(&self, text: String) -> Result<(), String> {
+        self.clipboard_tx
+            .try_send(ClipboardMsg::Write { text })
+            .map_err(|_| "clipboard capability closed".to_string())
+    }
+    /// OSC 52 paste: text entries only; an image-only clipboard reads as
+    /// empty rather than failing. Awaits the foreground round-trip — never
+    /// blocks, so it is safe to call from a runtime worker.
+    fn clipboard_read(&self) -> BoxFuture<'static, Result<Option<String>, String>> {
+        let tx = self.clipboard_tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = futures::channel::oneshot::channel();
+            if tx
+                .try_send(ClipboardMsg::Read { reply })
+                .map_err(|_| "clipboard capability closed".to_string())
+                .is_err()
+            {
+                return Err("clipboard capability closed".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("clipboard capability dropped".to_string()))
+        })
+    }
+
     fn browser_op(
         &self,
         op: crate::thread_engine::BrowserOp,
@@ -290,7 +352,8 @@ mod tests {
     fn capability_fails_closed_when_service_channel_closed() {
         let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
         drop(rx); // no service loop
-        let caps = GpuiCapability { tx };
+        let (clipboard_tx, _clipboard_rx) = async_channel::unbounded::<ClipboardMsg>();
+        let caps = GpuiCapability { tx, clipboard_tx };
         let err =
             futures::executor::block_on(caps.browser_op(crate::thread_engine::BrowserOp::Open {
                 url: "https://example.com".into(),
@@ -302,7 +365,8 @@ mod tests {
     #[test]
     fn capability_fails_closed_when_reply_dropped() {
         let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
-        let caps = GpuiCapability { tx };
+        let (clipboard_tx, _clipboard_rx) = async_channel::unbounded::<ClipboardMsg>();
+        let caps = GpuiCapability { tx, clipboard_tx };
         // A "service" that receives the op but drops the reply without
         // answering; the caller must surface a fail-closed error, not hang.
         let service = async move {

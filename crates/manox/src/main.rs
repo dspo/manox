@@ -96,8 +96,11 @@ fn main() {
         // before `agent::init` computes host-scoped state.
         agent::host::set_host(agent::host::Host::ManoxApp);
         agent::init(cx);
+        // `terminal` runs its PTY pumps on the shared process-global tokio
+        // runtime; hand it the handle before `terminal::init` builds the store.
+        terminal::runtime::set_runtime(agent::runtime::handle().clone());
         agent_ui::slash_command::init(cx);
-        terminal::init(cx);
+        terminal::init();
         terminal_ui::init(cx);
 
         // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and

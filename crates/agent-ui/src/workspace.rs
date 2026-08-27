@@ -87,6 +87,7 @@ use crate::{
 use crate::{FocusConversation, OpenSettings};
 use terminal::Terminal;
 use terminal_ui::TerminalView;
+use terminal_ui::terminal_proxy::TerminalProxy;
 
 pub(crate) type ThreadEntity = ThreadProxy;
 
@@ -1881,8 +1882,8 @@ impl Workspace {
                     return;
                 }
             };
-            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, pty, cx) {
-                Ok(t) => t,
+            let terminal = match Terminal::spawn(id, self.cwd.clone(), 80, 24, pty) {
+                Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to spawn terminal");
                     return;
@@ -1985,8 +1986,8 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
-        let terminal = match Terminal::new(id.clone(), cwd.clone(), 80, 24, Box::new(source), cx) {
-            Ok(t) => t,
+        let terminal = match Terminal::spawn(id.clone(), cwd.clone(), 80, 24, Box::new(source)) {
+            Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for external session");
                 window.push_notification(
@@ -2111,8 +2112,8 @@ impl Workspace {
             }
         };
         let id = format!("external:{}:{}", kind.agent_id(), uuid::Uuid::new_v4());
-        let terminal = match Terminal::new(id.clone(), cwd, 80, 24, source, cx) {
-            Ok(t) => t,
+        let terminal = match Terminal::spawn(id.clone(), cwd, 80, 24, source) {
+            Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for plain session");
                 window.push_notification(
@@ -2153,7 +2154,7 @@ impl Workspace {
     /// the session so a later close detaches it before any spurious event.
     fn subscribe_session_terminal(
         &self,
-        terminal: &Entity<Terminal>,
+        terminal: &Entity<TerminalProxy>,
         id: &str,
         cx: &mut Context<Self>,
     ) -> Subscription {
@@ -2353,9 +2354,9 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
                 let terminal =
-                    match terminal::Terminal::new(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source), cx)
+                    match terminal::Terminal::spawn(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source))
                     {
-                        Ok(t) => t,
+                        Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
                         Err(e) => {
                             tracing::error!(error = %e, id, "failed to create resumed session terminal");
                             this.resuming_external.remove(&id);

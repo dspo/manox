@@ -31,10 +31,13 @@ pub trait CapabilityClient: Send + Sync {
         Err("clipboard capability not provided".to_string())
     }
     /// Read the frontend's system clipboard as plain text (OSC 52 paste /
-    /// bracketed-paste injection). `Ok(None)` means "empty / not text". The
-    /// default fails closed like `clipboard_write`.
-    fn clipboard_read(&self) -> Result<Option<String>, String> {
-        Err("clipboard capability not provided".to_string())
+    /// bracketed-paste injection). `Ok(None)` means "empty / not text".
+    /// Asynchronous because the frontend's clipboard lives on its own thread
+    /// (gpui confines `App` to the foreground), so the kernel must await the
+    /// round-trip rather than block a runtime worker on it. The default fails
+    /// closed like `clipboard_write`.
+    fn clipboard_read(&self) -> BoxFuture<'static, Result<Option<String>, String>> {
+        Box::pin(async { Err("clipboard capability not provided".to_string()) })
     }
 }
 
@@ -86,6 +89,7 @@ mod tests {
     fn clipboard_defaults_fail_closed() {
         let caps: Arc<dyn CapabilityClient> = Arc::new(MockProvider);
         assert!(caps.clipboard_write("x".into()).is_err());
-        assert!(caps.clipboard_read().is_err());
+        let err = futures::executor::block_on(caps.clipboard_read()).unwrap_err();
+        assert_eq!(err, "clipboard capability not provided");
     }
 }
