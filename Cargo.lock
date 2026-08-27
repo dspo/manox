@@ -153,6 +153,7 @@ dependencies = [
  "libc",
  "lsp",
  "lsp-types",
+ "parking_lot",
  "pi",
  "pi-extensions",
  "reqwest 0.12.28",
