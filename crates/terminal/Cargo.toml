@@ -25,15 +25,11 @@ sysinfo = { workspace = true }
 alacritty_terminal = { workspace = true }
 portable-pty = { workspace = true }
 
-gpui.workspace = true
 agent.workspace = true
 toml.workspace = true
 
 # cx library —— `SessionHandle` 驱动外部 agent CLI 的 PTY，供 `CxSessionSource` 包裹。
 cx.workspace = true
-
-[dev-dependencies]
-gpui = { workspace = true, features = ["test-support"] }
 
 [features]
 # Enables `store::init_for_test` / `drop_for_test` so cross-crate harness tests

@@ -15,8 +15,8 @@
 //!   initial frame has settled. A longer global fallback covers silent or
 //!   endlessly chatty programs.
 //!
-//! The tracker is a pure state machine — time is passed in — so the gpui
-//! driver (a timer task in `Terminal::new`) and tests share the same logic.
+//! The tracker is a pure state machine — time is passed in — so the readiness
+//! pump (a timer task in `Terminal::spawn`) and tests share the same logic.
 
 use std::time::{Duration, Instant};
 
