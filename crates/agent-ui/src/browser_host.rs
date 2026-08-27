@@ -35,7 +35,8 @@ use async_channel::{Receiver, Sender};
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-use agent::thread::{Thread, ThreadEvent};
+use crate::thread_proxy::ThreadProxy;
+use agent::ThreadEvent;
 use agent::webview_host::{BrowserHost, BrowserNotification as AgentNotification, BrowserTabId};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
@@ -57,7 +58,7 @@ pub(crate) enum HostMessage {
 /// lifetime of the tab; dropped (closing pending senders) when the tab is
 /// closed or the owning thread is released.
 struct TabState {
-    thread: WeakEntity<Thread>,
+    thread: WeakEntity<ThreadProxy>,
     label: String,
     /// Pending eval-script oneshots, keyed by `request_id`. A read op injects
     /// a script that calls `__manox_notify__("eval_result", { request_id,
@@ -360,7 +361,7 @@ impl WorkspaceBrowserHost {
     /// routing table so host evals (`page_title`) can reach it. Tool-opened
     /// tabs register inside `open_tab`; this mirrors that registration half
     /// for the workspace-opened direction. Idempotent — a re-insert replaces.
-    pub(crate) fn register_ui_tab(&self, id: BrowserTabId, thread: WeakEntity<Thread>) {
+    pub(crate) fn register_ui_tab(&self, id: BrowserTabId, thread: WeakEntity<ThreadProxy>) {
         let label = crate::views::browser_view::webview_label_for(id);
         {
             let mut labels = self

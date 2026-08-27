@@ -60,11 +60,11 @@ impl Connection {
 
 /// Detach every live session without cancelling turns: a browser disconnect
 /// must not kill a turn the desktop app may still be showing.
-fn detach_all(app: &mut App, conn: &mut Connection) {
+fn detach_all(conn: &mut Connection) {
     let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();
     for id in ids {
         let cmd = json!({"cmd": "detach_session", "sessionId": id});
-        handle_command(app, &mut conn.state, &conn.sink, &cmd);
+        handle_command(&mut conn.state, &conn.sink, &cmd);
     }
 }
 
@@ -86,9 +86,9 @@ pub fn spawn_pump(cx: &mut App) {
                         conns.push(Connection::new(handle.id, handle.cmd_rx, handle.outbound));
                     }
                     ToMain::Disconnect(id) => {
-                        cx.update(|app| {
+                        cx.update(|_app| {
                             if let Some(conn) = conns.iter_mut().find(|c| c.id == id) {
-                                detach_all(app, conn);
+                                detach_all(conn);
                             }
                         });
                         conns.retain(|c| c.id != id);
@@ -105,9 +105,9 @@ pub fn spawn_pump(cx: &mut App) {
                     }
                 }
                 for cmd in cmds {
-                    cx.update(|app| {
+                    cx.update(|_app| {
                         if let Some(conn) = conns.get_mut(i) {
-                            bridge::process_webui_msg(app, conn, &cmd);
+                            bridge::process_webui_msg(conn, &cmd);
                         }
                     });
                 }
@@ -200,11 +200,11 @@ mod tests {
         let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
         cx.allow_parking();
         init_globals(&mut cx);
-        cx.update(agent::thread_store::init);
+        cx.update(|_cx| agent::thread_store::init());
 
         let (mut conn, outbound, mut frame_rx) = make_connection();
         let msg = json!({"type": "new_session", "sessionId": "s1"});
-        cx.update(|app| bridge::process_webui_msg(app, &mut conn, &msg));
+        cx.update(|_app| bridge::process_webui_msg(&mut conn, &msg));
         cx.run_until_parked();
 
         assert!(conn.state.sessions.contains_key("s1"));
@@ -226,7 +226,7 @@ mod tests {
         let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();
         for id in ids {
             let cmd = json!({"cmd": "dispose_session", "sessionId": id});
-            cx.update(|app| handle_command(app, &mut conn.state, &conn.sink, &cmd));
+            cx.update(|_app| handle_command(&mut conn.state, &conn.sink, &cmd));
         }
         cx.run_until_parked();
         drop(conn);
@@ -243,12 +243,11 @@ mod tests {
         let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
         cx.allow_parking();
         init_globals(&mut cx);
-        cx.update(agent::thread_store::init);
+        cx.update(|_cx| agent::thread_store::init());
 
         let (mut conn, outbound, mut frame_rx) = make_connection();
-        cx.update(|app| {
+        cx.update(|_app| {
             bridge::process_webui_msg(
-                app,
                 &mut conn,
                 &json!({"type": "new_session", "sessionId": "s1"}),
             );
@@ -257,9 +256,8 @@ mod tests {
         outbound.flush();
         drain(&mut frame_rx);
 
-        cx.update(|app| {
+        cx.update(|_app| {
             bridge::process_webui_msg(
-                app,
                 &mut conn,
                 &json!({"type": "open_thread", "sessionId": "s1"}),
             );
@@ -281,7 +279,7 @@ mod tests {
         let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();
         for id in ids {
             let cmd = json!({"cmd": "dispose_session", "sessionId": id});
-            cx.update(|app| handle_command(app, &mut conn.state, &conn.sink, &cmd));
+            cx.update(|_app| handle_command(&mut conn.state, &conn.sink, &cmd));
         }
         cx.run_until_parked();
         drop(conn);
@@ -298,12 +296,11 @@ mod tests {
         let mut cx = HeadlessAppContext::new(Arc::new(gpui::NoopTextSystem));
         cx.allow_parking();
         init_globals(&mut cx);
-        cx.update(agent::thread_store::init);
+        cx.update(|_cx| agent::thread_store::init());
 
         let (mut conn, outbound, mut frame_rx) = make_connection();
-        cx.update(|app| {
+        cx.update(|_app| {
             bridge::process_webui_msg(
-                app,
                 &mut conn,
                 &json!({"type": "new_session", "sessionId": "s1"}),
             );
@@ -342,7 +339,7 @@ mod tests {
         let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();
         for id in ids {
             let cmd = json!({"cmd": "dispose_session", "sessionId": id});
-            cx.update(|app| handle_command(app, &mut conn.state, &conn.sink, &cmd));
+            cx.update(|_app| handle_command(&mut conn.state, &conn.sink, &cmd));
         }
         cx.run_until_parked();
         drop(conn);

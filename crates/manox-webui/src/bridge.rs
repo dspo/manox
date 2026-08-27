@@ -172,9 +172,9 @@ pub(crate) fn on_event(
 
 /// The default project directory for new sessions: the most recently
 /// registered project the thread store knows, falling back to `$HOME`.
-fn resolve_cwd(app: &gpui::App) -> String {
+fn resolve_cwd() -> String {
     if let Some(store) = agent::thread_store::try_global() {
-        let known = store.read(app).known_projects();
+        let known = store.read(|s| s.known_projects().to_vec());
         if let Some(project) = known.last() {
             return project.clone();
         }
@@ -351,8 +351,8 @@ fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, 
 
 /// Translate one `WebviewToHost` message into actor commands and drive them
 /// on the app main thread, pre-registering the `session_ready` announce.
-pub(crate) fn process_webui_msg(app: &mut gpui::App, conn: &mut Connection, msg: &Value) {
-    let cwd = resolve_cwd(app);
+pub(crate) fn process_webui_msg(conn: &mut Connection, msg: &Value) {
+    let cwd = resolve_cwd();
     let (cmds, ready) = translate(msg, &cwd);
     if let Some((id, kind, cwd)) = ready {
         conn.bridge
@@ -362,7 +362,7 @@ pub(crate) fn process_webui_msg(app: &mut gpui::App, conn: &mut Connection, msg:
             .insert(id, (kind, cwd));
     }
     for cmd in cmds {
-        handle_command(app, &mut conn.state, &conn.sink, &cmd);
+        handle_command(&mut conn.state, &conn.sink, &cmd);
     }
 }
 
