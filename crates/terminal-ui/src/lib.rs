@@ -10,12 +10,12 @@
 use gpui::App;
 
 mod blink;
+pub mod block_chars;
 pub mod element;
 pub mod grid_renderer;
 mod layout_cache;
 pub mod terminal_view;
 pub mod theme;
-
 pub use terminal_view::TerminalView;
 
 /// Register terminal UI actions and workspace tab integration.

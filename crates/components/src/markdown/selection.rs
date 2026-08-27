@@ -147,6 +147,10 @@ pub struct DocSelection {
     /// listeners on the events that follow, which always postdate the most
     /// recent paint.
     blocks: Rc<RefCell<Vec<BlockHit>>>,
+    /// Virtual-doc index of the link under the cursor, `None` on plain text.
+    /// Written by the container's mouse-move listener, read by each block's
+    /// paint to draw the hover highlight.
+    hovered: Rc<Cell<Option<usize>>>,
 }
 
 impl DocSelection {
@@ -348,6 +352,23 @@ impl DocSelection {
             }
         }
         None
+    }
+
+    /// The virtual-doc index of the link under the cursor, `None` on plain
+    /// text or while dragging. Read by block paints for the hover highlight.
+    pub(crate) fn hovered(&self) -> Option<usize> {
+        self.hovered.get()
+    }
+
+    /// Record the hovered link index. Returns whether the value changed, so
+    /// the container only notifies on transitions.
+    pub(crate) fn set_hovered(&self, index: Option<usize>) -> bool {
+        if self.hovered.get() != index {
+            self.hovered.set(index);
+            true
+        } else {
+            false
+        }
     }
 
     /// Copy the active selection's text to the clipboard. Builds the doc ranges

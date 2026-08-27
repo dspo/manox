@@ -337,6 +337,18 @@ impl Render for Markdown {
                 this.selection.extend(ix);
                 cx.notify();
             }
+            // Hover highlight: remember the link under the cursor so block
+            // paints can wash it; cleared while dragging or over plain text.
+            let hovered = if this.selection.is_dragging() {
+                None
+            } else {
+                this.selection
+                    .hit(e.position)
+                    .and_then(|ix| this.selection.link_at(ix).map(|_| ix))
+            };
+            if this.selection.set_hovered(hovered) {
+                cx.notify();
+            }
         }))
         .on_mouse_up(
             MouseButton::Left,
@@ -513,6 +525,7 @@ fn paragraph(
                 .code_spans(code_spans(runs, styles))
                 .link_spans(link_spans(runs))
                 .link_color(styles.link_color)
+                .hover_link_bg(styles.hover_link_bg)
                 .selection_bg(styles.selection_bg),
         )
         .into_any_element()
@@ -644,6 +657,7 @@ fn heading(
                 .code_spans(code_spans(runs, styles))
                 .link_spans(link_spans(runs))
                 .link_color(styles.link_color)
+                .hover_link_bg(styles.hover_link_bg)
                 .selection_bg(styles.selection_bg),
         )
         .into_any_element()
@@ -1101,6 +1115,7 @@ fn table_block(
                         .code_spans(code_spans(&cell, styles))
                         .link_spans(link_spans(&cell))
                         .link_color(styles.link_color)
+                        .hover_link_bg(styles.hover_link_bg)
                         .selection_bg(styles.selection_bg),
                 );
             cell_div = match align.get(c).copied().unwrap_or_default() {
