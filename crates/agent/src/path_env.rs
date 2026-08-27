@@ -35,6 +35,11 @@ pub const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 /// the PATH install pending forever.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// The PATH resolution is done; `setenv` has been applied process-wide.
+/// Used by downstream init (LSP probe, MCP spawns) to wait for the correct
+/// PATH before probing.
+static INSTALLED: OnceLock<()> = OnceLock::new();
+
 static RESOLVED: OnceLock<String> = OnceLock::new();
 
 /// The login shell's PATH, resolved once and cached. Falls back to
@@ -68,11 +73,22 @@ pub fn install() {
             // so accepting it is the trade for a single injection point
             // instead of patching every spawn site in the workspace.
             unsafe { std::env::set_var("PATH", path) };
+            INSTALLED.set(()).ok();
             tracing::debug!(len = path.len(), "login shell PATH installed");
         })
         .is_ok();
     if !started {
         tracing::warn!("path-env install thread failed to start; keeping launcher PATH");
+    }
+}
+
+/// Block until the login-shell PATH is installed (bounded by the
+/// [`RESOLVE_TIMEOUT`] inside the install thread).  Used by init steps
+/// that probe PATH (LSP registry, MCP server discovery) and must not
+/// see the launchd minimal PATH.
+pub fn wait_installed() {
+    while INSTALLED.get().is_none() {
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
