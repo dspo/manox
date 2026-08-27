@@ -101,8 +101,8 @@ pub struct ResolvedModelSpec {
 }
 
 /// Split `provider::model` / `provider::model::effort` on `::`. Exactly two
-/// or three parts; the effort, when present, must be a user-facing effort
-/// level (`low`/`medium`/`high`/`max`).
+/// or three parts; the effort, when present, is a wire thinking level —
+/// `off` disables thinking, `low`/`medium`/`high`/`max` set the tier.
 pub fn parse_model_spec(spec: &str) -> Result<ModelSpec, String> {
     let parts: Vec<&str> = spec.split("::").map(str::trim).collect();
     let (provider, model, effort) = match parts.as_slice() {
@@ -118,10 +118,10 @@ pub fn parse_model_spec(spec: &str) -> Result<ModelSpec, String> {
         return Err(format!("provider and model must be non-empty: `{spec}`"));
     }
     if let Some(e) = effort
-        && !matches!(e, "low" | "medium" | "high" | "max")
+        && !matches!(e, "off" | "low" | "medium" | "high" | "max")
     {
         return Err(format!(
-            "unknown effort `{e}` (expected low|medium|high|max)"
+            "unknown effort `{e}` (expected off|low|medium|high|max)"
         ));
     }
     Ok(ModelSpec {
@@ -419,6 +419,10 @@ mod tests {
         assert_eq!(s.provider, "百炼");
         assert_eq!(s.model, "glm-5.3");
         assert_eq!(s.effort, None);
+        // `off` pins the subagent to no thinking; the other tiers are the
+        // wire effort levels.
+        let s = parse_model_spec("DeepSeek::deepseek-v4-flash::off").unwrap();
+        assert_eq!(s.effort.as_deref(), Some("off"));
         let err = parse_model_spec("a::b::c::d").unwrap_err();
         assert!(
             err.contains("expected `provider::model` or `provider::model::effort`"),

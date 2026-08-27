@@ -573,7 +573,33 @@ impl AgentSession {
     /// clamped against the current model and persisted only when it changes
     /// (TS `setThinkingLevel`).
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
-        let desired = Some(level.unwrap_or_else(|| "off".into()));
+        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), true)
+            .await
+    }
+
+    /// Apply a reasoning tier to this session only — the same clamp and
+    /// `thinking_level_change` entry as [`Self::set_thinking_level`], minus
+    /// the write to the agent's global settings default. A subagent session
+    /// applying its pinned effort must not touch the shared
+    /// `~/.pi/agent/settings.json`.
+    pub async fn set_thinking_level_local(
+        &mut self,
+        level: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), false)
+            .await
+    }
+
+    /// Shared reasoning-tier application: clamp the desired level against
+    /// the model's capability, append a `thinking_level_change` entry when
+    /// it changes, and apply it in memory. `persist` additionally writes the
+    /// effective level to the agent's global settings default (the
+    /// persisting setter's contract); the session-local path skips that.
+    async fn apply_thinking(
+        &mut self,
+        desired: Option<String>,
+        persist: bool,
+    ) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
         let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
@@ -584,7 +610,7 @@ impl AgentSession {
                 .session()
                 .append_thinking_level_change(&wire)
                 .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+            if persist && (model.thinking != crate::types::ThinkingKind::None || wire != "off") {
                 self.settings_thinking_default = Some(wire.clone());
                 let default = wire.clone();
                 // Best-effort preference for future sessions; the entry has
@@ -598,31 +624,6 @@ impl AgentSession {
                     tracing::warn!("failed to persist default thinking level: {e:#}");
                 }
             }
-        }
-        self.harness.set_initial_thinking_level(effective);
-        Ok(())
-    }
-
-    /// Apply a reasoning tier to this session only — the same clamp and
-    /// `thinking_level_change` entry as [`Self::set_thinking_level`], minus
-    /// the write to the agent's global settings default. A subagent session
-    /// applying its pinned effort must not touch the shared
-    /// `~/.pi/agent/settings.json`.
-    pub async fn set_thinking_level_local(
-        &mut self,
-        level: Option<String>,
-    ) -> Result<(), anyhow::Error> {
-        let desired = Some(level.unwrap_or_else(|| "off".into()));
-        let model = self.harness.model().clone();
-        let levels = self.runtime.thinking_levels(&model);
-        let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
-        let wire = effective.clone().unwrap_or_else(|| "off".into());
-        let previous = self.harness.agent().state().thinking_level.clone();
-        if effective != previous {
-            self.harness
-                .session()
-                .append_thinking_level_change(&wire)
-                .await?;
         }
         self.harness.set_initial_thinking_level(effective);
         Ok(())

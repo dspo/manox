@@ -195,8 +195,10 @@ impl SubagentTool {
         let def = self.registry.get(subagent_type).ok_or_else(|| {
             ToolError::InvalidArguments(format!("unknown subagent_type: {subagent_type}"))
         })?;
-        let model_override =
-            resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?;
+        // The dedicated config entry is authoritative: resolve it first and
+        // skip the definition's frontmatter override entirely when it lands,
+        // so a broken frontmatter `model:` cannot shadow a valid config
+        // entry. Without a config entry the frontmatter override applies.
         let (configured_model, configured_effort) = match self
             .model_overrides
             .get(subagent_type)
@@ -218,6 +220,11 @@ impl SubagentTool {
                 (Some(resolved.model), resolved.effort)
             }
             None => (None, None),
+        };
+        let model_override = if configured_model.is_some() {
+            None
+        } else {
+            resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?
         };
         let mut selected = select_tools(&self.tools, def);
         selected.extend(extra_tools);
@@ -931,5 +938,28 @@ mod tests {
                 .contains("no provider registry is available to resolve it"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn valid_configured_spec_rescues_broken_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+        let registry = registry_with_model("glm-5.3");
+        let mut agent_registry = AgentRegistry::new();
+        // A broken frontmatter override must not shadow a valid config entry.
+        agent_registry.register(def_with_model(Some("no-such-model")));
+        let tool = SubagentTool::new(Arc::new(agent_registry), vec![])
+            .with_model_runtime(fake_runtime())
+            .with_provider_registry(registry)
+            .with_model_overrides(HashMap::from([(
+                "worker".to_string(),
+                "P::glm-5.3::high".to_string(),
+            )]));
+        let (session, _guard, _worktree) = tool
+            .spawn_subagent_session("worker", None, &ctx, vec![], None)
+            .await
+            .unwrap();
+        assert_eq!(session.model().id, "glm-5.3");
+        assert_eq!(session.model().provider, "p-glm-5.3");
     }
 }
