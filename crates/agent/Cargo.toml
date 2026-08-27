@@ -21,6 +21,7 @@ pi-extensions.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 async-channel.workspace = true
+parking_lot.workspace = true
 futures.workspace = true
 tokio = { workspace = true }
 tokio-util = { workspace = true }
