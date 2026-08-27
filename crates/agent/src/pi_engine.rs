@@ -1203,6 +1203,27 @@ fn build_tools(
         let subagent_background = subagent_background.clone();
         let subagent_description = subagent_description.clone();
         move |model: &PiModel| {
+            // Dedicated per-type models from the cx providers config's
+            // `subagents:` map; an unreadable config warns and leaves
+            // subagents inheriting the thread model.
+            let overrides = pi_extensions::provider::load_subagent_models(
+                pi_extensions::provider::default_config_path(),
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "subagent model config unreadable; subagents inherit the thread model"
+                );
+                HashMap::new()
+            });
+            for key in overrides.keys() {
+                if registry.get(key).is_none() {
+                    tracing::warn!(
+                        subagent_type = %key,
+                        "subagent model config names an unknown subagent type"
+                    );
+                }
+            }
             let subagent = SubagentTool::new(
                 registry.clone(),
                 vec![
@@ -1245,6 +1266,8 @@ fn build_tools(
             // Resolve agent-definition `model` overrides against the live
             // registry (registration has landed before session assembly).
             .with_provider_registry(provider_registry.clone())
+            // Resolve dedicated per-type model specs from the config map.
+            .with_model_overrides(overrides)
             // Subagent transcripts persist under the host session root (a
             // subdirectory the sidebar's non-recursive listing never
             // surfaces) so their usage stays accountable.
