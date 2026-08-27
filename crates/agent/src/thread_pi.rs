@@ -362,10 +362,26 @@ pub struct Thread {
 /// A live-thread registry seam: the kernel looks up / registers live threads
 /// for team/bus routing through this, never touching the gpui thread_store
 /// global directly. The gpui layer wires an impl backed by the thread store.
+///
+/// **Retention contract** — the registry stores only a **weak** reference per
+/// registered thread (`Arc::downgrade`), so registering never by itself keeps
+/// a thread alive. [`Self::lookup`] upgrades the weak reference (`None` once
+/// the thread is dropped); [`Self::refresh`] prunes stale entries;
+/// [`Self::unregister`] removes an entry explicitly (dismiss). The **strong**
+/// reference that keeps a thread alive is owned by the live-thread holder —
+/// the AgentServer, transitionally the gpui workspace — mirroring the original
+/// `downgrade()` + `refresh`-pruning GC. A spawned team member therefore stays
+/// alive exactly as long as its owner holds it, and is reclaimed once dropped.
 pub trait ThreadRegistry: Send + Sync {
-    fn register(&self, id: &str, handle: ThreadHandle);
+    /// Index `handle` under `id`, storing only a weak reference. The caller
+    /// retains strong ownership; the registry never keeps the thread alive.
+    fn register(&self, id: &str, handle: &ThreadHandle);
+    /// Upgrade the weak reference for `id`; `None` if absent or dropped.
     fn lookup(&self, id: &str) -> Option<ThreadHandle>;
+    /// Prune entries whose thread has been dropped.
     fn refresh(&self);
+    /// Drop the entry for `id` (thread dismissed or finished).
+    fn unregister(&self, id: &str);
 }
 
 static THREAD_REGISTRY: std::sync::OnceLock<Arc<dyn ThreadRegistry>> = std::sync::OnceLock::new();
@@ -496,7 +512,9 @@ impl ThreadHandle {
                 let member = self.read(|t| t.new_team_member(name.clone()));
                 let mid = member.read(|t| t.id.0.clone());
                 if let Some(reg) = thread_registry() {
-                    reg.register(&mid, member.clone());
+                    // Weak index only; the AgentServer (live-thread owner) holds
+                    // the strong reference that keeps the member alive.
+                    reg.register(&mid, &member);
                     reg.refresh();
                 }
                 let ui = crate::MessageUiMetadata {
@@ -909,7 +927,11 @@ impl Thread {
             }
             // Bus / browser / session-list arms are dispatched at the handle
             // level (`ThreadHandle::handle_notice`); they never reach here.
-            _ => {}
+            // Listed explicitly (not `_`) so a new `BackendNotice` variant
+            // forces a decision here at compile time.
+            BackendNotice::BusRequest { .. }
+            | BackendNotice::BrowserRequest { .. }
+            | BackendNotice::SessionListDirty => {}
         }
     }
 
