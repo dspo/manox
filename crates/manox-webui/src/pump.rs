@@ -24,8 +24,9 @@ use crate::proto_translate::{
 use manox_protocol::handshake::HookKind;
 use manox_protocol::{
     ClientCall, FromClient, FromServer, InProcessConnection, Initialize, MsgId, RpcConnection,
-    RpcError,
+    RpcError, in_process_pair,
 };
+use manox_session_core::agent_server::AgentServer;
 
 /// Command-direction poll period; event direction is push, so only commands
 /// ride this timer.
@@ -34,6 +35,7 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// One connected browser surface. `state` and the event subscription are
 /// owned by the main thread; the WS worker holds the command sender and the
 /// outbound fan-out.
+#[allow(dead_code)] // legacy handle_command path; retired by δ₁-b spawn_pump; δ₂ removes.
 pub(crate) struct Connection {
     pub(crate) id: u64,
     pub(crate) state: ActorState,
@@ -43,6 +45,7 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
+    #[allow(dead_code)] // legacy; δ₂ removes.
     fn new(id: u64, cmd_rx: UnboundedReceiver<Value>, outbound: Arc<Outbound>) -> Self {
         let pending_ready =
             std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -70,6 +73,7 @@ impl Connection {
 
 /// Detach every live session without cancelling turns: a browser disconnect
 /// must not kill a turn the desktop app may still be showing.
+#[allow(dead_code)] // legacy; δ₂ removes.
 fn detach_all(conn: &mut Connection) {
     let ids: Vec<String> = conn.state.sessions.keys().cloned().collect();
     for id in ids {
@@ -78,8 +82,12 @@ fn detach_all(conn: &mut Connection) {
     }
 }
 
-/// Start the pump and expose its inbound channel to the server. Call once on
-/// the gpui main thread at app startup.
+/// Start the pump and expose its inbound channel to the WS server. Call once
+/// on the gpui main thread at app startup. Each WS connection is handed to
+/// the AgentServer over an in-process pair; a tokio `spawn_shuttle` task
+/// bridges the browser's WebviewToHost/HostToWebview to the protocol (the
+/// legacy `ActorState`/`handle_command` path is retired; its dead remains are
+/// removed in δ₂).
 pub fn spawn_pump(cx: &mut App) {
     let (main_tx, mut main_rx) = unbounded_channel::<ToMain>();
     crate::MAIN_CHANNEL
@@ -87,39 +95,32 @@ pub fn spawn_pump(cx: &mut App) {
         .lock()
         .unwrap()
         .replace(main_tx);
+    let cwd = crate::bridge::resolve_cwd();
+    let server = AgentServer::new(std::path::PathBuf::from(cwd.clone()));
     cx.spawn(async move |cx| {
-        let mut conns: Vec<Connection> = Vec::new();
+        let mut shuttles: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
         loop {
             while let Ok(msg) = main_rx.try_recv() {
                 match msg {
                     ToMain::Connect(handle) => {
-                        conns.push(Connection::new(handle.id, handle.cmd_rx, handle.outbound));
+                        let (client_conn, server_conn) = in_process_pair();
+                        server.accept(Arc::new(server_conn));
+                        let pending_ready = Arc::new(std::sync::Mutex::new(HashMap::new()));
+                        let shuttle = spawn_shuttle(
+                            client_conn,
+                            handle.cmd_rx,
+                            handle.outbound.clone(),
+                            pending_ready,
+                            format!("webui-{}", handle.id),
+                            cwd.clone(),
+                        );
+                        shuttles.insert(handle.id, shuttle);
                     }
                     ToMain::Disconnect(id) => {
-                        cx.update(|_app| {
-                            if let Some(conn) = conns.iter_mut().find(|c| c.id == id) {
-                                detach_all(conn);
-                            }
-                        });
-                        conns.retain(|c| c.id != id);
-                    }
-                }
-            }
-            for i in 0..conns.len() {
-                let mut cmds = Vec::new();
-                {
-                    if let Some(conn) = conns.get_mut(i) {
-                        while let Ok(cmd) = conn.cmd_rx.try_recv() {
-                            cmds.push(cmd);
+                        if let Some(shuttle) = shuttles.remove(&id) {
+                            shuttle.abort();
                         }
                     }
-                }
-                for cmd in cmds {
-                    cx.update(|_app| {
-                        if let Some(conn) = conns.get_mut(i) {
-                            bridge::process_webui_msg(conn, &cmd);
-                        }
-                    });
                 }
             }
             cx.background_executor().timer(POLL).await;
@@ -135,7 +136,6 @@ pub fn spawn_pump(cx: &mut App) {
 /// runtime. The AgentServer notices the disconnect only when its `client_rx`
 /// closes (the pump rewire must not rely on a `Drop` here — `InProcessConnection`
 /// has none; an explicit `disconnect()` is the pump's job on a WS close).
-#[allow(dead_code)] // wired into spawn_pump by the δ₁-b pump rewire (next slice).
 fn spawn_shuttle(
     client: InProcessConnection,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
@@ -160,8 +160,10 @@ fn spawn_shuttle(
             std::sync::Mutex::new(HashMap::new());
         loop {
             tokio::select! {
-                Some(cmd) = cmd_rx.recv() => {
-                    // Share one synthesized id between the ready announce and
+                cmd = cmd_rx.recv() => {
+                    // A None means the WS worker closed (disconnect): tear down
+                    // the pair so the AgentServer's serve loop exits + removes the client.
+                    let Some(cmd) = cmd else { client.disconnect(); break; };
                     // the CreateSession so SessionCreated resolves pending_ready.
                     let ready = crate::proto_translate::webview_ready_metadata(&cmd, &cwd);
                     let id_override = ready.as_ref().map(|(id, _, _)| id.clone());
@@ -192,7 +194,6 @@ fn spawn_shuttle(
 }
 
 /// The session id a `ClientCall` Request targets (for Response→note mapping).
-#[allow(dead_code)] // wired into spawn_shuttle (test-only here until pump rewire).
 fn session_id_of(call: &ClientCall) -> Option<String> {
     match call {
         ClientCall::OpenSession { session_id }
@@ -205,7 +206,6 @@ fn session_id_of(call: &ClientCall) -> Option<String> {
 
 /// Map a query Response onto the legacy store frame its id implies, recovering
 /// the session id from the tracked Request.
-#[allow(dead_code)] // wired into spawn_shuttle (test-only here until pump rewire).
 fn response_to_note(
     id: &MsgId,
     outcome: &Result<Value, RpcError>,
