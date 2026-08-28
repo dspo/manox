@@ -5542,6 +5542,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "manox-protocol",
  "pi",
  "pi-extensions",
  "serde_json",

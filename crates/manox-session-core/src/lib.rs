@@ -14,3 +14,4 @@
 pub mod events;
 pub mod model_chat;
 pub mod session;
+pub mod translate;
