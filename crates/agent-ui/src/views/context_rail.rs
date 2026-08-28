@@ -20,6 +20,7 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
+use crate::client_store_handle::ClientStoreHandle;
 use crate::thread_proxy::ThreadProxy;
 use agent::ThreadEvent;
 use agent::i18n;
@@ -62,6 +63,12 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// conversation.
 pub(crate) struct ContextRail {
     pub(crate) thread: Entity<ThreadProxy>,
+    /// γ-2a transitional read path: the AgentServer-backed store mirroring
+    /// kernel state via `ServerNote`s. `None` when the workspace has not
+    /// created the AgentServer connection; every kernel-state read dual-reads
+    /// this store first and falls back to `self.thread`. Mutations keep going
+    /// through `self.thread`.
+    store: Option<Entity<ClientStoreHandle>>,
     /// Coarse run phase. Derived from `ThreadEvent`s routed here by
     /// `Workspace`; used to determine the main agent's status indicator.
     pub(crate) cockpit_phase: CockpitPhase,
@@ -92,9 +99,13 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(thread: Entity<ThreadProxy>) -> Self {
+    pub(crate) fn new(
+        thread: Entity<ThreadProxy>,
+        store: Option<Entity<ClientStoreHandle>>,
+    ) -> Self {
         Self {
             thread,
+            store,
             cockpit_phase: CockpitPhase::Idle,
             plan: None,
             cockpit_hide_tasks: false,
@@ -328,12 +339,24 @@ impl ContextRail {
     /// and third children.
     fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
-        let total = crate::cockpit::format_tokens(
-            self.thread.read(cx).cumulative_token_usage().total_tokens(),
-        );
+        let total = crate::cockpit::format_tokens(if let Some(store) = &self.store {
+            store
+                .read(cx)
+                .store
+                .cumulative_usage
+                .as_ref()
+                .map(|u| u.input + u.output)
+                .unwrap_or(0)
+        } else {
+            self.thread.read(cx).cumulative_token_usage().total_tokens()
+        });
         // Rate-card cost (#418 wire-boundary pricing); backends/sessions
         // without pricing keep the tokens-only header.
-        let cumulative_cost = self.thread.read(cx).cumulative_cost();
+        let cumulative_cost = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.cumulative_cost)
+            .unwrap_or_else(|| self.thread.read(cx).cumulative_cost());
         let total = if cumulative_cost > 0.0 {
             SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
         } else {
@@ -550,8 +573,20 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Dual-read: the store mirrors the path as a string; the thread
+        // returns a `PathBuf`. The store's shape wins (both branches yield a
+        // string) so the render below is path-agnostic.
+        let worktree_path = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.worktree_path.clone())
+            .or_else(|| {
+                self.thread
+                    .read(cx)
+                    .worktree_path()
+                    .map(|p| p.display().to_string())
+            });
         let display = self.git_branch_display.clone();
-        let worktree_path = self.thread.read(cx).worktree_path();
 
         // Branch label: branch / detached sha + (detached).
         let branch_label: SharedString = match &display {
@@ -601,6 +636,9 @@ impl ContextRail {
 
         let mut block = v_flex().w_full().gap_0p5();
         if let Some(path) = worktree_path {
+            // The dual-read yields a path string; re-path it for the
+            // `file_name`/`display` calls below.
+            let path = PathBuf::from(path);
             let basename = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -693,9 +731,14 @@ impl ContextRail {
     /// but pi sub-agents are ephemeral nested sessions with no child-thread
     /// entity to open.
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .unwrap_or_else(|| self.thread.read(cx).is_running());
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
             agent::ToolCallStatus::Error
-        } else if self.thread.read(cx).is_running() {
+        } else if running {
             agent::ToolCallStatus::Running
         } else {
             agent::ToolCallStatus::Success
