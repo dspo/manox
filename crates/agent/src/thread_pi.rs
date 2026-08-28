@@ -582,8 +582,11 @@ impl ThreadHandle {
             let _ = responder.try_send(Err("browser capability not available".to_string()));
             return;
         };
+        let session_id = self.read(|t| t.id.0.clone());
         crate::runtime::handle().spawn(async move {
-            let result = caps.browser_op(op).await;
+            let result = crate::capability::CURRENT_SESSION
+                .scope(Some(session_id), async { caps.browser_op(op).await })
+                .await;
             let _ = responder.send(result).await;
         });
     }

@@ -5540,8 +5540,10 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "anyhow",
+ "async-channel 2.5.0",
  "async-trait",
  "chrono",
+ "futures",
  "manox-protocol",
  "parking_lot",
  "pi",
