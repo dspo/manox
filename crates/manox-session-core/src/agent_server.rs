@@ -1214,6 +1214,84 @@ fn apply_plan_verdict(
     });
 }
 
+/// Route a capability `ServerCall` (BrowserOp/ClipboardRead/OpenExternal) to the
+/// owning ∩ capable client and return its Reply outcome. Unlike `route_call`,
+/// the reply is returned to the kernel (the engine's capability call awaits
+/// it), not applied internally — there is no engine-side auth/verdict state to
+/// mutate.
+async fn route_capability_call(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    call: ServerCall,
+) -> Result<Value, RpcError> {
+    let kind = hook_kind_for(&call);
+    let id = inner.next_call_id();
+    let target = {
+        let owners = inner.owners(session_id);
+        let clients = inner.clients.lock();
+        owners
+            .iter()
+            .find(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
+            .map(|cid| {
+                let entry = clients.get(cid).expect("just checked");
+                let rx = entry.peer.register(id.clone());
+                let conn = entry.conn.clone();
+                (conn, rx)
+            })
+    };
+    let Some((conn, rx)) = target else {
+        return Err(RpcError::new(
+            -1,
+            "no client can answer this capability call",
+        ));
+    };
+    conn.send_to_client(FromServer::Request { id, call });
+    match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
+        Ok(Ok(o)) => o,
+        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")),
+    }
+}
+
+/// The AgentServer's `CapabilityClient` impl: the kernel's `browser_op` is
+/// routed as a `ServerCall::BrowserOp` to the owning ∩ BrowserOp-capable
+/// client; the reply (a serialized `BrowserReply`) is returned to the engine.
+/// Registered as the provider in γ/δ (replacing the gpui BrowserHost); tested
+/// in-process here.
+pub struct AgentServerCapabilityClient(Arc<AgentServerInner>);
+
+impl AgentServerCapabilityClient {
+    /// Wrap an `AgentServer` so the kernel's `browser_op` routes to its clients.
+    pub fn new(server: &AgentServer) -> Self {
+        Self(server.0.clone())
+    }
+}
+impl agent::capability::CapabilityClient for AgentServerCapabilityClient {
+    fn browser_op(
+        &self,
+        op: agent::thread_engine::BrowserOp,
+    ) -> futures::future::BoxFuture<'static, Result<agent::thread_engine::BrowserReply, String>>
+    {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let session_id = agent::capability::CURRENT_SESSION
+                .try_with(|c| c.clone())
+                .ok()
+                .flatten()
+                .ok_or_else(|| "no session context for browser op".to_string())?;
+            let call = ServerCall::BrowserOp {
+                session_id: session_id.clone(),
+                op: serde_json::to_value(&op).map_err(|e| e.to_string())?,
+            };
+            let outcome = route_capability_call(&inner, &session_id, call).await;
+            match outcome {
+                Ok(v) => serde_json::from_value::<agent::thread_engine::BrowserReply>(v)
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.message),
+            }
+        })
+    }
+}
+
 // ── Event pump. ─────────────────────────────────────────────────────────────
 fn spawn_pump(
     inner: Arc<AgentServerInner>,
@@ -2124,6 +2202,84 @@ mod tests {
         let _ = std::fs::remove_file(&plan_file);
         drop(client);
         drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
+    #[test]
+    fn browser_op_routes_to_client_and_returns_reply() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        agent::thread_store::init();
+        agent::capability::drop_provider_for_test();
+        let (server, client) = harness(vec![HookKind::BrowserOp]);
+        agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "s1".into(),
+                text: "browse".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            )
+        });
+        // Inject a BrowserRequest; the AgentServer's impl routes it to the client.
+        let (tx, rx) = async_channel::bounded(1);
+        engine
+            .notices
+            .send(BackendNotice::BrowserRequest {
+                op: agent::thread_engine::BrowserOp::Open {
+                    url: "https://example.com".into(),
+                },
+                responder: tx,
+            })
+            .unwrap();
+        // The client receives ServerCall::BrowserOp for session s1.
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::BrowserOp { session_id, .. },
+                } if session_id == "s1" => break id,
+                _ => {}
+            }
+        };
+        // Reply with a BrowserReply::TabId(1).
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(
+                serde_json::to_value(agent::thread_engine::BrowserReply::TabId(1)).unwrap(),
+            ),
+        });
+        // The engine's responder got the BrowserReply.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(reply) = rx.try_recv() {
+                assert!(reply.is_ok(), "browser op should succeed, not fail-closed");
+                assert!(matches!(
+                    reply.unwrap(),
+                    agent::thread_engine::BrowserReply::TabId(_)
+                ));
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "browser op reply never arrived"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        agent::capability::drop_provider_for_test();
         agent::thread_store::drop_global_for_test();
     }
 }

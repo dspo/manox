@@ -65,6 +65,13 @@ pub fn drop_provider_for_test() {
     *PROVIDER.lock().unwrap() = None;
 }
 
+// The session id whose turn invoked the current capability call. Set by the
+// kernel (`handle_browser_request`) on the spawn task that runs `browser_op`,
+// so the AgentServer's CapabilityClient impl can route the ServerCall to the
+// owning client. Absent (`None`) in headless contexts with no turn.
+tokio::task_local! {
+    pub static CURRENT_SESSION: Option<String>;
+}
 #[cfg(test)]
 mod tests {
     use super::*;

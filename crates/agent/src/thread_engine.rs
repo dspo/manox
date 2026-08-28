@@ -266,7 +266,7 @@ pub enum BackendNotice {
 }
 
 /// One browser operation a `web_explore_*` tool asks the host to run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BrowserOp {
     Open {
         url: String,
@@ -308,7 +308,7 @@ pub enum BrowserOp {
 }
 
 /// The host's reply payload for a [`BrowserOp`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BrowserReply {
     /// A newly opened tab's id.
     TabId(crate::webview_host::BrowserTabId),
