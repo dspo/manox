@@ -12,11 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use manox_session_core::session::handle_command;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
-
-use crate::pump::Connection;
 
 /// Events accumulated into one frame. Mirrors `EVENT_BATCH_INTERVAL_MS` in
 /// the vscode sidebar provider.
@@ -37,15 +34,6 @@ impl ReadyKind {
             ReadyKind::Restored => "restored",
         }
     }
-}
-
-/// Per-connection wire state owned by the main-thread pump.
-#[allow(dead_code)] // legacy handle_command path; retired by δ₁-b; δ₂ removes.
-pub(crate) struct BridgeState {
-    /// `session_created` is consumed into a `session_ready`; entries record
-    /// the announce metadata for the create/open the connection itself
-    /// initiated. Shared with the connection's `EventSink` closure.
-    pub pending_ready: std::sync::Arc<Mutex<HashMap<String, (ReadyKind, String)>>>,
 }
 
 /// Event fan-out shared with the connection's sender task: session events
@@ -348,24 +336,6 @@ fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, 
         "list_commands" => (vec![json!({"cmd": "list_commands"})], None),
         "request_models" => (vec![json!({"cmd": "list_models"})], None),
         _ => (vec![], None),
-    }
-}
-
-/// Translate one `WebviewToHost` message into actor commands and drive them
-/// on the app main thread, pre-registering the `session_ready` announce.
-#[allow(dead_code)] // legacy process_webui_msg; superseded by the δ₁-b shuttle; δ₂ removes.
-pub(crate) fn process_webui_msg(conn: &mut Connection, msg: &Value) {
-    let cwd = resolve_cwd();
-    let (cmds, ready) = translate(msg, &cwd);
-    if let Some((id, kind, cwd)) = ready {
-        conn.bridge
-            .pending_ready
-            .lock()
-            .unwrap()
-            .insert(id, (kind, cwd));
-    }
-    for cmd in cmds {
-        handle_command(&mut conn.state, &conn.sink, &cmd);
     }
 }
 
