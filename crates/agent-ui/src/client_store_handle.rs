@@ -34,6 +34,41 @@ impl ClientStoreHandle {
             _pump,
         }
     }
+
+    /// Create a handle wired to a live `AgentServer` session: the server
+    /// accepts the in-process connection and the client immediately declares
+    /// itself (handshake + session creation), so the pump starts mirroring
+    /// `ServerNote`s for `session_id`. The desktop's transitional read path —
+    /// views read kernel state from the store instead of `ThreadProxy`.
+    pub fn for_session(
+        server: &manox_session_core::agent_server::AgentServer,
+        session_id: &str,
+        cwd: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        use manox_protocol::*;
+        let (client_conn, server_conn) = in_process_pair();
+        server.accept(std::sync::Arc::new(server_conn));
+        client_conn.send_to_server(FromClient::Request {
+            id: MsgId::new("init"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: format!("desktop-{session_id}"),
+                capabilities: vec![
+                    handshake::HookKind::Approve,
+                    handshake::HookKind::PlanVerdict,
+                    handshake::HookKind::AskUserQuestion,
+                ],
+                sessions: vec![],
+            }),
+        });
+        client_conn.send_to_server(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: session_id.into(),
+                cwd: Some(cwd.into()),
+            },
+        });
+        Self::new(client_conn, cx)
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]

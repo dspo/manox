@@ -53,6 +53,7 @@ cx-providers.workspace = true
 pi = { workspace = true }
 pi-extensions = { workspace = true }
 manox-protocol.workspace = true
+manox-session-core.workspace = true
 
 
 [dev-dependencies]

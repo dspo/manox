@@ -56,6 +56,7 @@ use manox_components::markdown::Markdown;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
+use crate::client_store_handle::ClientStoreHandle;
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
@@ -298,6 +299,20 @@ struct PendingPlanReview {
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: Entity<ThreadEntity>,
+    /// γ-2a transitional read path: the `AgentServer`-backed
+    /// `ClientStoreHandle`, mirroring kernel state via `ServerNote`s. `None`
+    /// until the workspace creates the AgentServer connection (landing
+    /// thread); views dual-read store-if-present else `ThreadProxy`. Held on
+    /// the workspace for the next wiring step (re-handling the store on
+    /// thread switch) — written at landing, read there, so `dead_code` is
+    /// allowed until then.
+    #[allow(dead_code)]
+    pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
+    /// The shared AgentServer this desktop connects to. `None` until the
+    /// landing-thread wiring creates it; the bin may inject its own instance.
+    /// Held for that injection path, so `dead_code` is allowed.
+    #[allow(dead_code)]
+    pub(crate) agent_server: Option<std::sync::Arc<manox_session_core::agent_server::AgentServer>>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -719,6 +734,20 @@ impl Workspace {
         }
         let thread = cx.new(|cx| ThreadProxy::new(Thread::landing(cwd.clone()), cx));
 
+        // γ-2a: the landing thread also gets an AgentServer-backed
+        // ClientStoreHandle — the desktop's transitional read path.
+        let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
+            cwd.clone(),
+        ));
+        let store = cx.new(|cx| {
+            ClientStoreHandle::for_session(
+                &agent_server,
+                &uuid::Uuid::new_v4().to_string(),
+                cwd.to_str().unwrap_or_default(),
+                cx,
+            )
+        });
+
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -739,14 +768,19 @@ impl Workspace {
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
         let conversation = cx.new(|_| ConversationState::new());
-        let context_rail =
-            { cx.new(|_| crate::views::context_rail::ContextRail::new(thread.clone())) };
+        let context_rail = {
+            cx.new(|_| {
+                crate::views::context_rail::ContextRail::new(thread.clone(), Some(store.clone()))
+            })
+        };
         let weak_ws = cx.weak_entity();
         context_rail.update(cx, |r, _| r.set_workspace(weak_ws));
 
         let mut ws = Self {
             cwd,
             thread,
+            store: Some(store),
+            agent_server: Some(agent_server),
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
