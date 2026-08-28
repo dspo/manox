@@ -885,6 +885,7 @@ mod tests {
                 per_model: Default::default(),
                 cumulative_cost: 0.0,
                 per_model_cost: Default::default(),
+                per_request: Default::default(),
             })
             .is_none()
         );
