@@ -307,11 +307,6 @@ pub struct Workspace {
     /// the workspace for the next wiring step (re-handling the store on
     /// thread switch) — written at landing, read there.
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
-    /// The shared AgentServer this desktop connects to. `None` until the
-    /// landing-thread wiring creates it; the bin may inject its own instance.
-    /// Held for that injection path, so `dead_code` is allowed.
-    #[allow(dead_code)]
-    pub(crate) agent_server: Option<std::sync::Arc<manox_session_core::agent_server::AgentServer>>,
     /// γ-3: the client-side connection for sending `FromClient` commands to the
     /// AgentServer (replacing ThreadProxy mutations). None until the landing
     /// thread wires it.
@@ -803,7 +798,6 @@ impl Workspace {
             cwd,
             thread,
             store: Some(store),
-            agent_server: Some(agent_server),
             client_conn: Some(client_conn),
             session_id: Some(session_id),
             background_threads: Vec::new(),
