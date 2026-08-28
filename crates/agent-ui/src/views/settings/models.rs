@@ -695,18 +695,22 @@ impl ModelsPanelState {
             }
         };
         // The `chatgpt_app:` / `vscode_app:` / `subagents:` sections are not
-        // modeled by this form — `subagents:` is consumed by the host's
-        // subagent dispatch, the others by the External Tools panels, which
-        // may save after this panel took its open-time snapshot.
-        // Carry them over from a fresh disk read so this form never
-        // clobbers them. A failed re-read must abort the save (not silently
-        // drop the sections): writing with `None` would erase the other
-        // panels' data, the exact clobber this carry-over exists to prevent.
-        // Mirror the panels' `?` propagation with a toast.
+        // modeled by this form: the first two belong to the External Tools
+        // panels, `subagents:` to the host's subagent dispatch — any of them
+        // may change on disk after this panel took its open-time snapshot.
+        // Carry them over from a fresh disk read so this form never clobbers
+        // them. A failed re-read must abort the save (not silently drop the
+        // sections): writing without them would erase the panels' settings
+        // and the user's subagent model pinning, the exact clobber this
+        // carry-over exists to prevent. Mirror the panels' `?` propagation
+        // with a toast.
         match read_config_file(&path) {
             Ok(fresh) => carry_over_unmodeled_sections(&mut config, &fresh),
             Err(e) => {
-                tracing::warn!(error = %e, "re-read of provider config failed; aborting Models save to preserve chatgpt_app");
+                tracing::warn!(
+                    error = %e,
+                    "re-read of provider config failed; aborting Models save to preserve unmodeled sections"
+                );
                 window.push_notification(
                     Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                     cx,
@@ -2252,11 +2256,13 @@ mod tests {
     use super::carry_over_unmodeled_sections;
     use cx_providers::{ChatGptAppSettings, CxConfig, VsCodeAppSettings, VsCodeExtensionBlock};
 
-    /// Regression: Models 面板 collect() 产出的 CxConfig 三段均为默认空值，
-    /// carry-over 必须把磁盘上的 chatgpt_app / vscode_app / subagents 都带回，
-    /// 否则 autosave 会静默清空外部工具面板与子代理模型钉选的持久化设置。
+    /// Regression: the CxConfig produced by the Models panel's `collect()`
+    /// carries empty values for all three unmodeled sections; the carry-over
+    /// must restore `chatgpt_app` / `vscode_app` / `subagents` from the fresh
+    /// disk read, or autosave silently erases the External Tools panels'
+    /// settings and the host's subagent model pinning.
     #[test]
-    fn carry_over_preserves_external_tool_sections() {
+    fn carry_over_preserves_unmodeled_sections() {
         let mut collected = CxConfig::default();
         let fresh = CxConfig {
             providers: Vec::new(),
@@ -2281,13 +2287,15 @@ mod tests {
         };
         carry_over_unmodeled_sections(&mut collected, &fresh);
         assert!(collected.chatgpt_app.is_some());
-        let vscode = collected.vscode_app.expect("vscode_app 应被 carry-over");
+        let vscode = collected
+            .vscode_app
+            .expect("vscode_app must survive carry-over");
         assert_eq!(vscode.claude_code.provider.as_deref(), Some("百炼"));
         assert!(vscode.codex.disabled);
         assert_eq!(
             collected.subagents.get("Explore").map(String::as_str),
             Some("百炼::qwen3.8-flash::high"),
-            "subagents 段应被 carry-over"
+            "subagents must survive carry-over"
         );
     }
 }

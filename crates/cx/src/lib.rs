@@ -2125,13 +2125,7 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
             .or(existing.chatgpt_app.clone()),
         // vscode_app 段同 chatgpt_app 语义。
         vscode_app: incoming.vscode_app.clone().or(existing.vscode_app.clone()),
-        // `subagents:` is host-owned config, not patch content: only an
-        // explicit non-empty map in the source overrides the local one.
-        subagents: if incoming.subagents.is_empty() {
-            existing.subagents.clone()
-        } else {
-            incoming.subagents.clone()
-        },
+        subagents: merge_subagents(&existing.subagents, &incoming.subagents),
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -2148,6 +2142,21 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
 
 /// Replace providers by `name`; new providers are appended.
 /// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
+/// Merge the top-level `subagents:` map per key: incoming entries override
+/// their own keys, local entries the patch source does not mention survive.
+/// The map is host-owned pinning (manox subagent dispatch consumes it), not
+/// patch content — a patch author carrying their own `subagents:` block must
+/// never silently erase unrelated local pins. Omitting the key cannot
+/// express "clear all": clearing stays a manual edit.
+fn merge_subagents(
+    existing: &BTreeMap<String, String>,
+    incoming: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = existing.clone();
+    merged.extend(incoming.clone());
+    merged
+}
+
 fn merge_providers(
     existing: &[ProviderConfig],
     incoming: &[ProviderConfig],
@@ -5998,6 +6007,48 @@ agents:
         }];
         let merged = merge_agents(&existing, &incoming);
         assert_eq!(merged.len(), 2);
+    }
+
+    fn btree(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn merge_subagents_keeps_local_when_incoming_empty() {
+        let existing = btree(&[("Explore", "百炼::qwen3.8-flash::high")]);
+        let merged = merge_subagents(&existing, &BTreeMap::new());
+        assert_eq!(merged, existing);
+    }
+
+    #[test]
+    fn merge_subagents_overrides_per_key_and_keeps_unrelated_local() {
+        let existing = btree(&[("Sailor", "DeepSeek::deepseek-v4-flash::high")]);
+        let incoming = btree(&[("Explore", "百炼::glm-5.3::medium")]);
+        let merged = merge_subagents(&existing, &incoming);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(
+            merged.get("Sailor").map(String::as_str),
+            Some("DeepSeek::deepseek-v4-flash::high")
+        );
+        assert_eq!(
+            merged.get("Explore").map(String::as_str),
+            Some("百炼::glm-5.3::medium")
+        );
+    }
+
+    #[test]
+    fn merge_subagents_incoming_wins_on_same_key() {
+        let existing = btree(&[("Explore", "百炼::glm-5.3::high")]);
+        let incoming = btree(&[("Explore", "百炼::qwen3.8-flash::high")]);
+        let merged = merge_subagents(&existing, &incoming);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged.get("Explore").map(String::as_str),
+            Some("百炼::qwen3.8-flash::high")
+        );
     }
 
     #[test]

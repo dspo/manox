@@ -1688,7 +1688,12 @@ providers:
             }],
             chatgpt_app: None,
             vscode_app: None,
-            subagents: Default::default(),
+            subagents: [(
+                "Explore".to_string(),
+                "百炼::qwen3.8-flash::high".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         };
 
         write_config_file(&path, &config).unwrap();
@@ -1702,6 +1707,7 @@ providers:
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
 
         let read_back = read_config_file(&path).unwrap();
+        assert_eq!(read_back.subagents, config.subagents);
         assert_eq!(read_back.providers.len(), 1);
         let provider = &read_back.providers[0];
         assert_eq!(provider.name, "Test");

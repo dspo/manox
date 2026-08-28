@@ -57,9 +57,10 @@ vscode_app:
     disabled: "bool (optional; default false; true = 不注入 Codex 扩展)"
 
 # 子代理专属模型钉选（manox 宿主消费，cx 不解释其值，仅随配置一起 round-trip）。
-# key = subagent 类型注册名（Explore / Sailor / 用户与插件定义的 agent），
-# value = "provider::model::effort"（provider 按注册名或展示名匹配；
-# effort ∈ off | low | medium | high | max，缺省 = 会话默认）。
+# key = subagent 类型名（Explore / Sailor / 用户与插件定义的 agent），
+# value = "provider::model::effort"：provider = 本文件中的 provider name（或其
+# "{name}-{wire_api}" 注册形态）；model = 该 provider 下的模型 id；effort ∈
+# off | low | medium | high | max（缺省 = 会话默认）。
 subagents:
   Explore: "string (optional; provider::model::effort)"
 
