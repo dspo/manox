@@ -13,7 +13,7 @@
 //! the AgentServer lands, the provider's implementations become the client side
 //! of those `ServerCall`s and this seam is rewired without touching call sites.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
 
@@ -41,21 +41,28 @@ pub trait CapabilityClient: Send + Sync {
     }
 }
 
-static PROVIDER: OnceLock<Arc<dyn CapabilityClient>> = OnceLock::new();
+/// The process-wide capability provider. Mutable (not OnceLock) so the
+/// AgentServer's provider can replace a prior frontend provider at wiring
+/// time (γ/δ), and tests can reset between cases.
+static PROVIDER: Mutex<Option<Arc<dyn CapabilityClient>>> = Mutex::new(None);
 
-/// Register the process-wide capability provider (App startup). The first
-/// registration wins; a second is ignored (single-workspace, single-process),
-/// but logged rather than dropped silently so a stray re-wire is visible.
+/// Register the process-wide capability provider (App startup). Overwrites
+/// any prior registration — the AgentServer's provider replaces the gpui
+/// BrowserHost when the spine is wired; the first-wins OnceLock could not.
 pub fn set_provider(provider: Arc<dyn CapabilityClient>) {
-    if PROVIDER.set(provider).is_err() {
-        tracing::warn!("capability provider already registered; ignoring re-registration");
-    }
+    *PROVIDER.lock().unwrap() = Some(provider);
 }
 
 /// The registered capability provider, or `None` in headless contexts (no
-/// frontend registered capabilities).
-pub fn provider() -> Option<&'static Arc<dyn CapabilityClient>> {
-    PROVIDER.get()
+/// frontend registered capabilities). Returns a clone of the `Arc`.
+pub fn provider() -> Option<Arc<dyn CapabilityClient>> {
+    PROVIDER.lock().unwrap().clone()
+}
+
+/// Test-only: clear the provider so the next registration starts clean.
+#[cfg(any(test, feature = "test-support"))]
+pub fn drop_provider_for_test() {
+    *PROVIDER.lock().unwrap() = None;
 }
 
 #[cfg(test)]

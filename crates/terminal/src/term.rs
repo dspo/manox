@@ -355,7 +355,7 @@ impl TerminalHandle {
             // provider (or on error) the response is built from empty text,
             // so no clipboard content is ever injected.
             TerminalEvent::ClipboardLoad(cb) => {
-                let Some(p) = agent::capability::provider().cloned() else {
+                let Some(p) = agent::capability::provider() else {
                     tracing::warn!("no clipboard capability provider; OSC 52 paste returns empty");
                     let response = cb("");
                     let _ = self.read(|t| t.input(response.as_bytes()));
