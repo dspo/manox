@@ -6120,7 +6120,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let lang = self.thread.read(cx).agent_language();
+        let lang = agent::settings::load().resolve().agent;
         let seed_text =
             match agent::collaboration_mode::render_plan_mode_approved(lang, &review.plan_file) {
                 Ok(text) => text,
