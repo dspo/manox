@@ -3758,7 +3758,11 @@ impl Workspace {
             .as_ref()
             .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
             .unwrap_or_else(|| self.thread.read(cx).cwd().to_path_buf());
-        let worktree_branch = self.thread.read(cx).worktree_branch();
+        let worktree_branch = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.branch.clone())
+            .or_else(|| self.thread.read(cx).worktree_branch());
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
             // file writes into a single git call.
