@@ -8,10 +8,12 @@
 //! [`ServerCall`] (a round-trip the owning ∩ capable client must answer), so
 //! the kernel stays free of transport and frontend concerns.
 //!
-//! β-3a scope: connection/handshake, session ownership, the full
+//! Scope: connection/handshake, session ownership, the full
 //! `ClientCall`/`ClientNote` dispatch, the `Note` event pump, and the
-//! event-driven `ServerCall::Approve` round-trip. `CapabilityClient` rewiring
-//! and the remaining `ServerCall` kinds are β-3b.
+//! event-driven `ServerCall` round-trips — `Approve` (β-3a) plus
+//! `AskUserQuestion` and `PlanVerdict` (β-3b-i, the latter pump-initiated
+//! on PlanReady). `CapabilityClient` rewiring (BrowserOp/ClipboardRead/
+//! OpenExternal), terminal, and model_chat are β-3b-ii.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -958,15 +960,25 @@ impl AgentServerInner {
     }
 }
 
-// ── ServerCall routing (β-3a: Approve only). ──────────────────────────────────
+// ── ServerCall routing (β-3b: Approve / AskUserQuestion / PlanVerdict). ─────
 async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: ServerCall) {
     let kind = hook_kind_for(&call);
-    let auth_id = match &call {
-        ServerCall::Approve { auth_id, .. } => Some(auth_id.clone()),
-        _ => None,
+    // Per-kind context needed to apply the reply, extracted before `call`
+    // moves into the Request envelope.
+    let ctx = match &call {
+        ServerCall::Approve { auth_id, .. } => ReplyCtx::Approve {
+            auth_id: auth_id.clone(),
+        },
+        ServerCall::AskUserQuestion { auth_id, .. } => ReplyCtx::AskUser {
+            auth_id: auth_id.clone(),
+        },
+        ServerCall::PlanVerdict { plan_file, .. } => ReplyCtx::PlanVerdict {
+            plan_file: plan_file.clone(),
+        },
+        _ => ReplyCtx::Other, // β-3b-ii: BrowserOp/ClipboardRead/OpenExternal (capability seam).
     };
-    // Find an owner that also declared this capability, and register the
-    // waiter under the clients lock (brief — register is synchronous).
+    // Find an owner that also declared this capability; register the waiter
+    // under the clients lock (brief — register is synchronous).
     let target = {
         let owners = inner.owners(session_id);
         let clients = inner.clients.lock();
@@ -982,12 +994,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
             })
     };
     let Some((conn, rx, id)) = target else {
-        // No capable owner: fail closed so the engine does not hang.
-        if let Some(auth_id) = auth_id {
-            respond_auth_fail_closed(inner, session_id, auth_id);
-        } else {
-            tracing::warn!(?call, "ServerCall kind not routable in β-3a");
-        }
+        fail_closed(inner, session_id, &ctx);
         return;
     };
     conn.send_to_client(FromServer::Request { id, call });
@@ -996,8 +1003,8 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         _ => Err(RpcError::new(-1, "capability call timed out or cancelled")),
     };
     if outcome.is_err() {
-        // Plan §5.2: a timed-out / errored call closes the engine with Deny
-        // (below) and must surface the reason, mirroring the no-owner path.
+        // Plan §5.2: a timed-out / errored call must surface the reason,
+        // mirroring the no-owner fail-closed path.
         inner.route_note(
             session_id,
             ServerNote::Error {
@@ -1006,8 +1013,49 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
             },
         );
     }
-    if let Some(auth_id) = auth_id {
-        apply_approve_reply(inner, session_id, auth_id, outcome);
+    apply_reply(inner, session_id, ctx, outcome);
+}
+
+/// Per-`ServerCall` context carried out of the lock to apply the reply.
+enum ReplyCtx {
+    Approve { auth_id: String },
+    AskUser { auth_id: String },
+    PlanVerdict { plan_file: String },
+    Other,
+}
+
+fn fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, ctx: &ReplyCtx) {
+    match ctx {
+        ReplyCtx::Approve { auth_id } => {
+            respond_auth_fail_closed(inner, session_id, auth_id.clone())
+        }
+        ReplyCtx::AskUser { auth_id } => {
+            respond_ask_fail_closed(inner, session_id, auth_id.clone())
+        }
+        ReplyCtx::PlanVerdict { .. } => inner.route_note(
+            session_id,
+            ServerNote::Error {
+                session_id: Some(session_id.into()),
+                message: "no client can review this plan".into(),
+            },
+        ),
+        ReplyCtx::Other => {}
+    }
+}
+
+fn apply_reply(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    ctx: ReplyCtx,
+    outcome: Result<Value, RpcError>,
+) {
+    match ctx {
+        ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
+        ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
+        ReplyCtx::PlanVerdict { plan_file } => {
+            apply_plan_verdict(inner, session_id, plan_file, outcome)
+        }
+        ReplyCtx::Other => {}
     }
 }
 
@@ -1053,6 +1101,106 @@ fn apply_approve_reply(
     if let Some(thread) = inner.session_thread(session_id) {
         thread.with_mut(|t| t.respond_authorization(&auth_id, response));
     }
+}
+
+fn apply_ask_reply(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    auth_id: String,
+    outcome: Result<Value, RpcError>,
+) {
+    let response = match outcome {
+        Ok(v) => agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+            answers: v
+                .get("answers")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            let q = p.get(0).and_then(Value::as_str)?.to_string();
+                            let a = p.get(1).and_then(Value::as_str).unwrap_or("").to_string();
+                            Some((q, a))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            response: v.get("response").and_then(Value::as_str).map(String::from),
+        },
+        Err(_) => agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+            answers: Vec::new(),
+            response: None,
+        },
+    };
+    if let Some(thread) = inner.session_thread(session_id) {
+        thread.with_mut(|t| t.respond_authorization(&auth_id, response));
+    }
+}
+
+fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth_id: String) {
+    if let Some(thread) = inner.session_thread(session_id) {
+        thread.with_mut(|t| {
+            t.respond_authorization(
+                &auth_id,
+                agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+                    answers: Vec::new(),
+                    response: None,
+                },
+            )
+        });
+    }
+    inner.route_note(
+        session_id,
+        ServerNote::Error {
+            session_id: Some(session_id.into()),
+            message: "no client can answer this question".into(),
+        },
+    );
+}
+
+fn apply_plan_verdict(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    plan_file: String,
+    outcome: Result<Value, RpcError>,
+) {
+    let choice = match outcome {
+        Ok(v) => v
+            .get("choice")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => return, // fail-closed: leave plan mode; the engine stays parked.
+    };
+    let Some(thread) = inner.session_thread(session_id) else {
+        return;
+    };
+    // Consume the pending-review flag on every verdict; refine leaves plan
+    // mode on (the user can re-edit) without seeding execution.
+    if choice == "refine" {
+        thread.with_mut(|t| t.set_plan_review_pending(false));
+        return;
+    }
+    let compact = choice == "execute_compact";
+    let lang = thread.read(|t| t.agent_language());
+    let seed_text = match agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
+        Ok(text) => text,
+        Err(e) => {
+            thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+            return;
+        }
+    };
+    let compact_instructions =
+        compact.then(|| agent::collaboration_mode::plan_compact_instructions(lang, &plan_file));
+    thread.with_mut(|t| {
+        t.set_plan_review_pending(false);
+        let ui = MessageUiMetadata {
+            model_id: t.model().map(|m| m.id.clone()),
+            approval_mode: Some(t.permission_mode().as_i64()),
+            author: Some(t.self_author()),
+            ..Default::default()
+        };
+        t.approve_plan(compact, compact_instructions, seed_text, Some(ui));
+    });
 }
 
 // ── Event pump. ─────────────────────────────────────────────────────────────
@@ -1136,12 +1284,25 @@ fn spawn_pump(
                         s.mark_background_work(&id, false);
                     });
                 }
-                ThreadEvent::PlanReady { .. } => {
+                ThreadEvent::PlanReady { plan_file, title } => {
                     let id = session_id.clone();
                     agent::thread_store::global().with_mut(|s| s.mark_pending_plan(&id, true));
                     thread.with_mut(|t| t.set_plan_review_pending(true));
-                    // β-3b enriches PlanReady with the plan body and routes
-                    // PlanVerdict; translate emits the bare note here.
+                    // β-3b: initiate PlanVerdict (carries the plan body) and
+                    // skip translate's bare PlanReady note — the call is the
+                    // actionable review card; the bare note would duplicate.
+                    route_call(
+                        &inner,
+                        &session_id,
+                        ServerCall::PlanVerdict {
+                            session_id: session_id.clone(),
+                            plan_file: plan_file.clone(),
+                            title: title.clone(),
+                            content: std::fs::read_to_string(plan_file).ok(),
+                        },
+                    )
+                    .await;
+                    continue;
                 }
                 ThreadEvent::BackgroundTaskUpdated { .. } => {
                     let id = session_id.clone();
@@ -1446,6 +1607,24 @@ mod tests {
                 std::time::Instant::now() < deadline,
                 "expected message never arrived"
             );
+        }
+    }
+
+    /// Query `ThreadInfo` and return the typed payload.
+    fn thread_info(client: &Client, session_id: &str) -> ThreadInfoPayload {
+        client.send(FromClient::Request {
+            id: MsgId::new(format!("ti-{session_id}")),
+            call: ClientCall::ThreadInfo {
+                session_id: session_id.into(),
+            },
+        });
+        loop {
+            if let FromServer::Notification {
+                note: ServerNote::ThreadInfo { info, .. },
+            } = client.recv()
+            {
+                return *info;
+            }
         }
     }
 
@@ -1774,6 +1953,164 @@ mod tests {
         );
         // The engine recorded exactly one run (no cancel re-run).
         assert_eq!(engine.runs.lock().unwrap().len(), 1);
+        drop(client);
+        drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
+    #[test]
+    fn ask_user_question_round_trips() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "s1".into(),
+                text: "ask me".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            )
+        });
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "q1".into(),
+                    tool_name: agent::tools::ASK_USER_QUESTION.to_string(),
+                    summary: "pick a color".into(),
+                    input: json!({"question": "color?"}),
+                },
+            )))
+            .unwrap();
+        // An AskUser authorization routes as ServerCall::AskUserQuestion, not Approve.
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::AskUserQuestion { auth_id, .. },
+                } if auth_id == "q1" => break id,
+                _ => {}
+            }
+        };
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        });
+        // The engine received the structured answers (not a bare Deny).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+                id == "q1"
+                    && matches!(
+                        r,
+                        agent::permission::ToolAuthorizationResponse::AskUserQuestion { .. }
+                    )
+            });
+            if got {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never received AskUserQuestion answers"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::TurnFinished { .. }
+                }
+            )
+        });
+        drop(client);
+        drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn plan_verdict_round_trips_and_seeds_execution() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::PlanVerdict]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "s1".into(),
+                enabled: true,
+            },
+        });
+        // Before the verdict, plan_mode is on (confirms SetPlanMode applied).
+        assert!(thread_info(&client, "s1").plan_mode);
+        let plan_file =
+            std::env::temp_dir().join(format!("manox-beta3b-plan-{}.md", std::process::id()));
+        std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: plan_file.to_string_lossy().into_owned(),
+                title: "Test plan".into(),
+            })))
+            .unwrap();
+        // PlanReady initiates ServerCall::PlanVerdict carrying the plan body.
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call:
+                        ServerCall::PlanVerdict {
+                            plan_file: pf,
+                            content,
+                            ..
+                        },
+                } if pf == plan_file.to_string_lossy() => {
+                    assert!(content.is_some(), "PlanVerdict must carry the plan body");
+                    break id;
+                }
+                _ => {}
+            }
+        };
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(json!({"choice": "execute_keep"})),
+        });
+        // execute_keep → approve_plan → plan_mode flips off (async: route_call
+        // applies the reply on the pump task; poll rather than race it).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if !thread_info(&client, "s1").plan_mode {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plan_mode never flipped off after execute_keep"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&plan_file);
         drop(client);
         drop(server);
         agent::thread_store::drop_global_for_test();
