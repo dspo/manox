@@ -86,6 +86,7 @@ use crate::{
     ToggleTurnNavigator,
 };
 use crate::{FocusConversation, OpenSettings};
+use manox_protocol::RpcConnection;
 use terminal::Terminal;
 use terminal_ui::TerminalView;
 use terminal_ui::terminal_proxy::TerminalProxy;
@@ -313,6 +314,11 @@ pub struct Workspace {
     /// Held for that injection path, so `dead_code` is allowed.
     #[allow(dead_code)]
     pub(crate) agent_server: Option<std::sync::Arc<manox_session_core::agent_server::AgentServer>>,
+    /// γ-3: the client-side connection for sending `FromClient` commands to the
+    /// AgentServer (replacing ThreadProxy mutations). None until the landing
+    /// thread wires it.
+    #[allow(dead_code)]
+    pub(crate) client_conn: Option<manox_protocol::InProcessConnection>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -739,14 +745,30 @@ impl Workspace {
         let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
             cwd.clone(),
         ));
-        let store = cx.new(|cx| {
-            ClientStoreHandle::for_session(
-                &agent_server,
-                &uuid::Uuid::new_v4().to_string(),
-                cwd.to_str().unwrap_or_default(),
-                cx,
-            )
-        });
+        let (store, client_conn) = {
+            let (client_conn, server_conn) = manox_protocol::in_process_pair();
+            agent_server.accept(std::sync::Arc::new(server_conn));
+            client_conn.send_to_server(manox_protocol::FromClient::Request {
+                id: manox_protocol::MsgId::new("init"),
+                call: manox_protocol::ClientCall::Initialize(manox_protocol::Initialize {
+                    client_id: format!("desktop-{}", uuid::Uuid::new_v4()),
+                    capabilities: vec![
+                        manox_protocol::handshake::HookKind::Approve,
+                        manox_protocol::handshake::HookKind::PlanVerdict,
+                        manox_protocol::handshake::HookKind::AskUserQuestion,
+                    ],
+                    sessions: vec![],
+                }),
+            });
+            client_conn.send_to_server(manox_protocol::FromClient::Notification {
+                note: manox_protocol::ClientNote::CreateSession {
+                    session_id: uuid::Uuid::new_v4().to_string(),
+                    cwd: Some(cwd.to_str().unwrap_or_default().into()),
+                },
+            });
+            let store = cx.new(|cx| ClientStoreHandle::new(client_conn.clone(), cx));
+            (store, client_conn)
+        };
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -781,6 +803,7 @@ impl Workspace {
             thread,
             store: Some(store),
             agent_server: Some(agent_server),
+            client_conn: Some(client_conn),
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,

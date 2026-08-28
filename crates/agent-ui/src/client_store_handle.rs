@@ -39,13 +39,15 @@ impl ClientStoreHandle {
     /// accepts the in-process connection and the client immediately declares
     /// itself (handshake + session creation), so the pump starts mirroring
     /// `ServerNote`s for `session_id`. The desktop's transitional read path —
-    /// views read kernel state from the store instead of `ThreadProxy`.
+    /// Create a handle that pumps `FromServer` notifications into the store,
+    /// and return a clone of the client connection for sending `FromClient`
+    /// commands (γ-3 mutation path).
     pub fn for_session(
         server: &manox_session_core::agent_server::AgentServer,
         session_id: &str,
         cwd: &str,
         cx: &mut Context<Self>,
-    ) -> Self {
+    ) -> (Self, manox_protocol::InProcessConnection) {
         use manox_protocol::*;
         let (client_conn, server_conn) = in_process_pair();
         server.accept(std::sync::Arc::new(server_conn));
@@ -67,7 +69,9 @@ impl ClientStoreHandle {
                 cwd: Some(cwd.into()),
             },
         });
-        Self::new(client_conn, cx)
+        let sender = client_conn.clone();
+        let handle = Self::new(client_conn, cx);
+        (handle, sender)
     }
 }
 
