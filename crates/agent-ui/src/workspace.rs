@@ -5790,7 +5790,17 @@ impl Workspace {
         let mut meta = self.user_turn_meta(cx);
         // The seed is harness-authored: attribute it to the session's own
         // agent so the bubble header names the agent, not the human.
-        meta.author = Some(self.thread.read(cx).self_author());
+        let author = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::message::MessageAuthor>(serde_json::Value::String(
+                    s.read(cx).store.self_author.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).self_author());
+        meta.author = Some(author);
         let ui = Self::message_ui_metadata(&meta);
         if matches!(choice, PlanReviewChoice::ExecuteFresh) {
             // Fresh context: archive this thread and continue on a new one
