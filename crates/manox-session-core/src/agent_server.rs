@@ -614,6 +614,11 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
             // β-3b: route to TerminalHandle.
         }
+        ClientNote::AppendUserMessage {
+            session_id,
+            text,
+            images,
+        } => inner.append_user_message(&session_id, text, images),
         ClientNote::AppendUiNote {
             session_id,
             kind,
@@ -912,6 +917,30 @@ impl AgentServerInner {
         };
         thread.with_mut(|t| {
             t.append_ui_note(agent::db::UiNoteRecord { kind, data });
+        });
+    }
+
+    fn append_user_message(
+        &self,
+        session_id: &str,
+        text: String,
+        images: Vec<manox_protocol::ImageAttachment>,
+    ) {
+        let Some(thread) = self.session_thread(session_id) else {
+            return self.note_error(session_id, "unknown session");
+        };
+        let images: Vec<(String, String)> = images
+            .into_iter()
+            .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
+            .collect();
+        thread.with_mut(|t| {
+            let ui = agent::MessageUiMetadata {
+                model_id: t.model().map(|m| m.id.clone()),
+                approval_mode: Some(t.permission_mode().as_i64()),
+                ..Default::default()
+            };
+            let content = to_message_content(text, images);
+            t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
         });
     }
 

@@ -4517,39 +4517,6 @@ impl Workspace {
         refresh_thread_list();
     }
 
-    /// Push a user turn into the conversation UI and the thread's message
-    /// history without starting a turn. Used to batch drained follow-ups into a
-    /// single follow-up turn.
-    fn append_user_turn(
-        &mut self,
-        turn: DeferredUserTurn,
-        weak: WeakEntity<Workspace>,
-        follow_tail: bool,
-        cx: &mut Context<Self>,
-    ) {
-        use agent::language_model::MessageContent;
-        self.conversation.update(cx, |c, cx| {
-            c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
-        });
-        self.sync_list_count(cx);
-        // Re-engage tail-follow so the streaming reply stays pinned as it grows.
-        if follow_tail {
-            self.follow_message_tail();
-        }
-        self.thread.update(cx, |thread, _| {
-            if turn.images.is_empty() {
-                thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui));
-            } else {
-                let mut content = Vec::with_capacity(turn.images.len() + 1);
-                if !turn.text.trim().is_empty() {
-                    content.push(MessageContent::Text(turn.text));
-                }
-                content.extend(turn.images);
-                thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui));
-            }
-        });
-    }
-
     /// Hand a parked follow-up to the thread's steer queue — the running turn
     /// absorbs it at the next safe join point. No conversation bubble is pushed
     /// here. The caller immediately pushes an optimistic pending bubble; the
@@ -4685,28 +4652,98 @@ impl Workspace {
         if self.queued_follow_ups.is_empty() {
             return;
         }
+        use agent::language_model::MessageContent;
+        use base64::Engine as _;
         let weak = cx.weak_entity();
+        let follow_tail = self.list_state.is_following_tail();
         let mut retain: Vec<QueuedFollowUp> = Vec::new();
-        let mut drained = false;
+        let mut drained_turns: Vec<DeferredUserTurn> = Vec::new();
         while let Some(item) = self.queued_follow_ups.pop_front() {
             match item.state {
                 FollowUpState::Queued => {
-                    self.append_user_turn(
-                        item.turn,
-                        weak.clone(),
-                        self.list_state.is_following_tail(),
-                        cx,
-                    );
-                    drained = true;
+                    self.conversation.update(cx, |c, cx| {
+                        c.push_user(
+                            item.turn.text.clone(),
+                            item.turn.user_images.clone(),
+                            item.turn.meta.clone(),
+                            weak.clone(),
+                            cx,
+                        )
+                    });
+                    self.sync_list_count(cx);
+                    if follow_tail {
+                        self.follow_message_tail();
+                    }
+                    drained_turns.push(item.turn);
                 }
                 _ => retain.push(item),
             }
         }
         self.queued_follow_ups.extend(retain);
-        if drained {
-            self.thread.update(cx, |thread, _| thread.run_turn());
-            refresh_thread_list();
+        if drained_turns.is_empty() {
+            cx.notify();
+            return;
         }
+        // Dual-path: protocol (AppendUserMessage for all-but-last + Submit for
+        // last) vs direct (insert each + run_turn once).
+        let protocol = self.client_conn.is_some() && self.session_id.is_some();
+        if protocol {
+            let n = drained_turns.len();
+            for (i, turn) in drained_turns.into_iter().enumerate() {
+                let attachments: Vec<manox_protocol::ImageAttachment> = turn
+                    .images
+                    .iter()
+                    .filter_map(|c| match c {
+                        MessageContent::Image { data, mime_type } => {
+                            base64::engine::general_purpose::STANDARD
+                                .decode(data.as_bytes())
+                                .ok()
+                                .map(|bytes| manox_protocol::ImageAttachment {
+                                    data: bytes,
+                                    mime_type: mime_type.clone(),
+                                })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if i + 1 < n {
+                    // All but the last: insert without running.
+                    let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUserMessage {
+                        session_id: sid.into(),
+                        text: turn.text.clone(),
+                        images: attachments,
+                    });
+                } else {
+                    // Last: insert + start the turn.
+                    let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+                        session_id: sid.into(),
+                        text: turn.text.clone(),
+                        images: attachments,
+                        client_id: None,
+                    });
+                }
+            }
+        } else {
+            for turn in drained_turns {
+                self.thread.update(cx, |thread, _| {
+                    if turn.images.is_empty() {
+                        thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui));
+                    } else {
+                        let mut content = Vec::with_capacity(turn.images.len() + 1);
+                        if !turn.text.trim().is_empty() {
+                            content.push(MessageContent::Text(turn.text));
+                        }
+                        content.extend(turn.images);
+                        thread.insert_user_message_with_content_and_ui_metadata(
+                            content,
+                            Some(turn.ui),
+                        );
+                    }
+                });
+            }
+            self.thread.update(cx, |thread, _| thread.run_turn());
+        }
+        refresh_thread_list();
         cx.notify();
     }
 
