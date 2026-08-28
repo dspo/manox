@@ -819,6 +819,7 @@ mod tests {
             display_title: "T".into(),
             model_id: None,
             model_name: None,
+            model: None,
             permission_mode: "workspace-write".into(),
             reasoning_effort: "high".into(),
             pinned: false,

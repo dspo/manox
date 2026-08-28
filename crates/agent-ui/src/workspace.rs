@@ -5906,7 +5906,17 @@ impl Workspace {
                         .map(std::path::PathBuf::from)
                 })
                 .or_else(|| self.thread.read(cx).project());
-            let model = self.thread.read(cx).model();
+            let model = self
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .model
+                        .clone()
+                        .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+                })
+                .or_else(|| self.thread.read(cx).model());
             let effort = self
                 .store
                 .as_ref()
@@ -6012,7 +6022,17 @@ impl Workspace {
     /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
-        let model = self.thread.read(cx).model();
+        let model = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read(cx)
+                    .store
+                    .model
+                    .clone()
+                    .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+            })
+            .or_else(|| self.thread.read(cx).model());
         let effort = self
             .store
             .as_ref()

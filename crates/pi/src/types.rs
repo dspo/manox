@@ -501,7 +501,7 @@ pub trait EventSink: Send + Sync {
 // ── Agent context and configuration ─────────────────────────────────────────
 
 /// A model descriptor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Model {
     /// Provider identifier (e.g. "anthropic", "openai").
     pub provider: String,
@@ -527,7 +527,7 @@ pub struct Model {
 /// Distinguishes the two "thinking on" wire shapes: adaptive models take an
 /// effort tier and decide their own depth; enabled models reason when switched
 /// on but take no effort-independent budget (depth via `output_config.effort`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ThinkingKind {
     /// No reasoning support — the thinking field is never sent.
     #[default]
