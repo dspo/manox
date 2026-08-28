@@ -166,6 +166,13 @@ pub enum ClientNote {
         request_id: String,
     },
     Shutdown,
+    /// Persist a UI annotation (error/notice/plan-review) as a custom entry
+    /// in the session jsonl at the current leaf.
+    AppendUiNote {
+        session_id: String,
+        kind: String,
+        data: serde_json::Value,
+    },
 }
 
 #[cfg(test)]

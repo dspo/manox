@@ -614,6 +614,11 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
             // β-3b: route to TerminalHandle.
         }
+        ClientNote::AppendUiNote {
+            session_id,
+            kind,
+            data,
+        } => inner.append_ui_note(&session_id, &kind, data),
         ClientNote::CancelModelChat { .. } | ClientNote::Shutdown => {
             // β-3b: model_chat lifecycle / shutdown signal.
         }
@@ -893,6 +898,21 @@ impl AgentServerInner {
             return self.note_error(session_id, "unknown session");
         };
         thread.with_mut(|t| t.set_project(cwd.into()));
+    }
+
+    fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
+        let Some(thread) = self.session_thread(session_id) else {
+            return self.note_error(session_id, "unknown session");
+        };
+        let kind = match kind {
+            "error" => agent::db::UiNoteKind::Error,
+            "notice" => agent::db::UiNoteKind::Notice,
+            "plan_review" => agent::db::UiNoteKind::PlanReview,
+            _ => return self.note_error(session_id, "unknown ui note kind"),
+        };
+        thread.with_mut(|t| {
+            t.append_ui_note(agent::db::UiNoteRecord { kind, data });
+        });
     }
 
     fn plan_seed(&self, session_id: &str, plan_file: &str) {
