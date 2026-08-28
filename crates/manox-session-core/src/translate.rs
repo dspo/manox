@@ -45,7 +45,10 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             id: id.clone(),
             name: name.clone(),
             title: title.clone(),
-            status: format!("{status:?}").to_lowercase(),
+            status: serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
             input: input.clone(),
         }),
         ThreadEvent::ToolResult {
@@ -68,7 +71,9 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
         }),
         ThreadEvent::Stop(reason) => Note(ServerNote::Stop {
             session_id: session_id.into(),
-            reason: Some(format!("{reason:?}").to_lowercase()),
+            reason: serde_json::to_value(reason)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string)),
         }),
         ThreadEvent::TurnFinished {
             cancelled,
@@ -112,7 +117,10 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
         }),
         ThreadEvent::PermissionModeChanged { mode } => Note(ServerNote::PermissionModeChanged {
             session_id: session_id.into(),
-            mode: format!("{mode:?}").to_lowercase(),
+            mode: serde_json::to_value(mode)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
         }),
         ThreadEvent::ReasoningEffortChanged { effort } => {
             Note(ServerNote::ReasoningEffortChanged {
@@ -187,7 +195,10 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             agent_type: subagent_type.clone(),
             tool_uses: *tool_uses,
             latest_activity: latest_activity.clone(),
-            status: format!("{status:?}").to_lowercase(),
+            status: serde_json::to_value(status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default(),
         }),
         ThreadEvent::SubagentChild { id, child } => Note(ServerNote::SubagentChild {
             session_id: session_id.into(),

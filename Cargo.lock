@@ -5562,6 +5562,7 @@ dependencies = [
  "futures",
  "gpui",
  "include_dir",
+ "manox-protocol",
  "manox-session-core",
  "open",
  "serde",
