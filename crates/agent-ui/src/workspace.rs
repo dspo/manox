@@ -6187,9 +6187,28 @@ impl Workspace {
             let compact_instructions = compact.then(|| {
                 agent::collaboration_mode::plan_compact_instructions(lang, &review.plan_file)
             });
-            self.thread.update(cx, |thread, _| {
-                thread.approve_plan(compact, compact_instructions, seed_text, Some(ui));
-            });
+            let choice_str = match choice {
+                PlanReviewChoice::ExecuteCompact => "execute_compact",
+                PlanReviewChoice::ExecuteKeep => "execute_keep",
+                _ => "execute_keep",
+            };
+            if let Some(msg_id) = self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .pending_plan_verdict
+                    .get(&review.plan_file)
+                    .cloned()
+            }) && let Some(conn) = &self.client_conn
+            {
+                conn.send_to_server(manox_protocol::FromClient::Reply {
+                    id: msg_id,
+                    outcome: Ok(serde_json::json!({ "choice": choice_str })),
+                });
+            } else {
+                self.thread.update(cx, |thread, _| {
+                    thread.approve_plan(compact, compact_instructions, seed_text, Some(ui));
+                });
+            }
         }
         cx.notify();
     }

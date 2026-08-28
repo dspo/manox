@@ -31,7 +31,11 @@ impl ClientStoreHandle {
                     FromServer::Request { id, call } => {
                         let _ = this.update(cx, |h, cx| {
                             if let Some(auth_id) = auth_id_of(&call) {
-                                h.store.pending_auth.insert(auth_id, id);
+                                h.store.pending_auth.insert(auth_id, id.clone());
+                                cx.notify();
+                            }
+                            if let Some(plan_file) = plan_file_of(&call) {
+                                h.store.pending_plan_verdict.insert(plan_file, id);
                                 cx.notify();
                             }
                         });
@@ -160,6 +164,14 @@ fn auth_id_of(call: &manox_protocol::ServerCall) -> Option<String> {
         ServerCall::Approve { auth_id, .. } | ServerCall::AskUserQuestion { auth_id, .. } => {
             Some(auth_id.clone())
         }
+        _ => None,
+    }
+}
+
+/// Extract the `plan_file` from a `ServerCall::PlanVerdict`.
+fn plan_file_of(call: &manox_protocol::ServerCall) -> Option<String> {
+    match call {
+        manox_protocol::ServerCall::PlanVerdict { plan_file, .. } => Some(plan_file.clone()),
         _ => None,
     }
 }

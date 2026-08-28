@@ -50,6 +50,9 @@ pub struct ClientStore {
     /// Pending adjudication ServerCall (Approve/AskUser) from the AgentServer,
     /// keyed by `auth_id`. The workspace uses the MsgId to send the reply.
     pub pending_auth: HashMap<String, manox_protocol::MsgId>,
+    /// Pending plan-verdict ServerCall from the AgentServer, keyed by
+    /// `plan_file`. The workspace uses the MsgId to send the verdict reply.
+    pub pending_plan_verdict: HashMap<String, manox_protocol::MsgId>,
 }
 
 impl Default for ClientStore {
@@ -90,6 +93,7 @@ impl Default for ClientStore {
             per_model_cost: HashMap::new(),
             per_request_usage: HashMap::new(),
             pending_auth: HashMap::new(),
+            pending_plan_verdict: HashMap::new(),
         }
     }
 }
