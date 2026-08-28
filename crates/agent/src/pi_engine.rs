@@ -1508,16 +1508,14 @@ where
                 }
                 Some(SessionCmd::Shutdown) => *shutdown_after_run = true,
                 Some(SessionCmd::SetModel(new_model)) => {
-                    // Mid-run switch: the harness handle applies it to the
-                    // next provider request immediately and persists a
-                    // model_change entry at the turn boundary (the kernel's
-                    // TS mid-run setModel path). Mirror the shared slot and
-                    // the actor's working model so settlement (title,
-                    // session rebuilds) sees it too. The model already in
-                    // play is never re-queued: the transcript gains an entry
-                    // only where the model actually changed.
-                    if *pi_model != new_model {
-                        handle.set_model(new_model.clone());
+                    // Mid-run switch: the harness handle queues it for the
+                    // next turn boundary (the kernel's TS mid-run `setModel`
+                    // path), where the model_change entry persists. The
+                    // mirrors follow the handle's verdict, not the request: a
+                    // model the fixed stream refuses leaves every mirror on
+                    // the model the run still serves, and the model already in
+                    // play is never re-queued.
+                    if *pi_model != new_model && handle.set_model(new_model.clone()) {
                         *state.model.lock().unwrap() = Some(new_model.clone());
                         *pi_model = new_model;
                     }

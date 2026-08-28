@@ -430,7 +430,11 @@ impl HarnessHandle {
     /// The shared runtime snapshot updates immediately — the next provider
     /// request and the next run both see it — and the change is persisted
     /// once the run settles (the TS mid-run `setModel`).
-    pub fn set_model(&self, model: Model) {
+    ///
+    /// Whether the change was queued is the return value: a model outside the
+    /// one api a fixed stream serves is refused and mutates nothing, so a
+    /// caller's own model mirror follows this result instead of its request.
+    pub fn set_model(&self, model: Model) -> bool {
         if !self
             .control
             .has_resolver
@@ -438,7 +442,7 @@ impl HarnessHandle {
             && !self.control.fixed_api.is_empty()
             && model.api != self.control.fixed_api
         {
-            return;
+            return false;
         }
         self.control.turn_runtime.lock().unwrap().model = model.clone();
         self.control.emit_harness(HarnessEvent::ModelUpdate {
@@ -449,6 +453,7 @@ impl HarnessHandle {
             .lock()
             .unwrap()
             .push(PendingMutation::Model(model));
+        true
     }
 
     /// Queue a thinking-level change for the next turn boundary of the
@@ -5677,6 +5682,73 @@ pub(crate) mod tests {
                 SessionTreeEntry::ModelChange { model_id, .. } if model_id == "claude-opus"
             )),
             "the queued model change was persisted: {entries:?}"
+        );
+    }
+
+    /// Without a resolver the fixed stream serves exactly one api, and the
+    /// handle reports that verdict: a model outside the api is refused and
+    /// mutates nothing, so a caller's own model mirror follows the model the
+    /// run actually serves rather than the model it asked for.
+    #[tokio::test]
+    async fn test_handle_set_model_reports_fixed_stream_refusal() {
+        struct FixedApiStream;
+
+        #[async_trait::async_trait]
+        impl StreamFn for FixedApiStream {
+            fn api(&self) -> &str {
+                "test"
+            }
+
+            async fn stream(
+                &self,
+                _context: &AgentContext,
+                _signal: CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+            ) -> Result<AgentMessage, anyhow::Error> {
+                Ok(scripted_assistant("answer".into(), "test", "test"))
+            }
+        }
+
+        let mut harness = AgentHarness::new(
+            Session::new(MemStorage::new()),
+            "You are a test assistant.",
+            test_model(),
+            Arc::new(FixedApiStream),
+        );
+        let events: Arc<std::sync::Mutex<Vec<HarnessEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_in_listener = Arc::clone(&events);
+        let _subscription = harness.subscribe_harness(Arc::new(move |event| {
+            events_in_listener.lock().unwrap().push(event);
+        }));
+        let handle = harness.handle();
+
+        let foreign_api = Model {
+            api: "openai_responses".into(),
+            ..test_model()
+        };
+        assert!(
+            !handle.set_model(foreign_api),
+            "a model outside the fixed stream's api is refused"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, HarnessEvent::ModelUpdate { .. })),
+            "a refused switch announces and mutates nothing"
+        );
+
+        assert!(
+            handle.set_model(resolved_model()),
+            "a model on the fixed api is queued"
+        );
+        assert!(
+            events.lock().unwrap().iter().any(
+                |e| matches!(e, HarnessEvent::ModelUpdate { model } if model.id == "claude-opus")
+            ),
+            "an accepted switch reaches the runtime snapshot and the event stream"
         );
     }
 
