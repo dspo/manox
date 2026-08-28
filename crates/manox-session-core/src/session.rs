@@ -203,9 +203,6 @@ pub fn handle_command(
                 state.focused.clone(),
                 sink.clone(),
             );
-            if let Some(model) = agent::pi_providers::default_model() {
-                thread.update(app, |t, cx| t.set_model(model, cx));
-            }
             let persisted_mode = thread.read(app).permission_mode();
             state.sessions.insert(
                 id.clone(),

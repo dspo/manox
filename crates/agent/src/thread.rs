@@ -357,6 +357,11 @@ pub struct Thread {
     /// thread; the effort is then not overwritten by the session sidecar's
     /// default when the engine materializes.
     reasoning_effort_explicitly_set: bool,
+    /// Whether the user picked this thread's model. A pick outranks the
+    /// `Ready` projection, which snapshots the model while the engine is still
+    /// assembling: a switch chosen inside that window is only queued to the
+    /// actor, so the projection cannot know about it.
+    model_explicitly_set: bool,
     /// Opt-in browser tool suites the user activated; the composer chips
     /// derive from this mirror. Replayed to the engine when a landing thread
     /// materializes it, so a pre-engine toggle is never dropped.
@@ -417,6 +422,7 @@ impl Thread {
             history_phase: HistoryPhase::Ready,
             permission_mode_explicitly_set: false,
             reasoning_effort_explicitly_set: false,
+            model_explicitly_set: false,
             browser_suites: Vec::new(),
             browser_suites_explicitly_set: false,
             plan_mode: false,
@@ -506,6 +512,7 @@ impl Thread {
                 },
                 permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
+                model_explicitly_set: false,
                 browser_suites: Vec::new(),
                 browser_suites_explicitly_set: false,
                 plan_mode: false,
@@ -705,7 +712,13 @@ impl Thread {
                 self.persisted_plan = plan_snapshot.and_then(|v| serde_json::from_value(v).ok());
                 self.restored = restored;
                 self.title = title;
-                if let Some(m) = model {
+                // The restored session's model is authoritative only until the
+                // user names one: a pick made while the engine assembled is
+                // already queued to the actor, and this boot-time snapshot
+                // predates it.
+                if !self.model_explicitly_set
+                    && let Some(m) = model
+                {
                     self.model = Some(m);
                 }
                 if !self.permission_mode_explicitly_set {
@@ -1409,6 +1422,7 @@ impl Thread {
                 history_phase: HistoryPhase::Ready,
                 permission_mode_explicitly_set: true,
                 reasoning_effort_explicitly_set: true,
+                model_explicitly_set: true,
                 browser_suites: Vec::new(),
                 // Members never mount browser suites; the explicit flag keeps
                 // even an empty-mirror seed from the Ready projection out.
@@ -1654,10 +1668,14 @@ impl Thread {
         cx.notify();
     }
 
+    /// Pick the model this thread runs on. The pick always reaches the engine
+    /// — even one still assembling, where it lands as a queued switch — and
+    /// sticks: no later `Ready` projection overwrites it.
     pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
+        self.model_explicitly_set = true;
         if let Some(engine) = &self.engine {
             engine.set_model(model);
         }
@@ -2287,6 +2305,7 @@ pub(crate) mod tests {
                 history_phase: phase,
                 permission_mode_explicitly_set: false,
                 reasoning_effort_explicitly_set: false,
+                model_explicitly_set: false,
                 browser_suites: Vec::new(),
                 browser_suites_explicitly_set: false,
                 plan_mode: false,
@@ -2944,6 +2963,69 @@ pub(crate) mod tests {
         assert_eq!(
             cx.read(|cx| thread.read(cx).reasoning_effort()),
             ReasoningEffort::Max
+        );
+    }
+
+    /// A model identity for facade tests.
+    fn facade_model(id: &str) -> PiModel {
+        PiModel {
+            provider: "test".into(),
+            api: "anthropic".into(),
+            id: id.into(),
+            context_window: 100_000,
+            max_tokens: 8_192,
+            thinking: pi::types::ThinkingKind::None,
+            metadata: Default::default(),
+        }
+    }
+
+    fn ready_with_model(model: Option<PiModel>) -> BackendNotice {
+        BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: false,
+            model,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        }))
+    }
+
+    /// I6: a model picked while the engine assembles outranks the `Ready`
+    /// projection. The projection snapshots the boot-time model, and the pick
+    /// is still a queued switch at that moment — so adopting it would strand
+    /// the facade on a model the session never runs.
+    #[gpui::test]
+    fn explicit_model_survives_ready_projection(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.set_model(facade_model("picked"), cx);
+        });
+        thread.update(cx, |t, cx| {
+            t.handle_notice(ready_with_model(Some(facade_model("boot"))), cx);
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).model().cloned()),
+            Some(facade_model("picked"))
+        );
+    }
+
+    /// I6 companion: with no pick of its own, the facade takes the session's
+    /// projected model.
+    #[gpui::test]
+    fn ready_seeds_model_without_a_pick(cx: &mut gpui::TestAppContext) {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        thread.update(cx, |t, cx| {
+            t.handle_notice(ready_with_model(Some(facade_model("restored"))), cx);
+        });
+        assert_eq!(
+            cx.read(|cx| thread.read(cx).model().cloned()),
+            Some(facade_model("restored"))
         );
     }
 
