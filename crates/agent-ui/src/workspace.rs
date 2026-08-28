@@ -5749,6 +5749,19 @@ impl Workspace {
         self.pending_ask = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+        let allow = matches!(decision, PermissionDecision::AllowOnce);
+        if let Some(msg_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
+            && let Some(conn) = &self.client_conn
+        {
+            conn.send_to_server(manox_protocol::FromClient::Reply {
+                id: msg_id,
+                outcome: Ok(serde_json::json!({ "allow": allow })),
+            });
+            return;
+        }
         self.thread.update(cx, |thread, _| {
             thread.respond_authorization(&id, agent::ToolAuthorizationResponse::Decision(decision));
         });
@@ -5929,6 +5942,21 @@ impl Workspace {
         self.pending_ask = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
+        if let Some(msg_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
+            && let Some(conn) = &self.client_conn
+        {
+            conn.send_to_server(manox_protocol::FromClient::Reply {
+                id: msg_id,
+                outcome: Ok(serde_json::json!({
+                    "answers": answers,
+                    "response": response,
+                })),
+            });
+            return;
+        }
         self.thread.update(cx, |thread, _| {
             thread.respond_authorization(
                 &id,
