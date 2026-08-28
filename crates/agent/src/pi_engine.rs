@@ -1513,10 +1513,14 @@ where
                     // model_change entry at the turn boundary (the kernel's
                     // TS mid-run setModel path). Mirror the shared slot and
                     // the actor's working model so settlement (title,
-                    // session rebuilds) sees it too.
-                    handle.set_model(new_model.clone());
-                    *state.model.lock().unwrap() = Some(new_model.clone());
-                    *pi_model = new_model;
+                    // session rebuilds) sees it too. The model already in
+                    // play is never re-queued: the transcript gains an entry
+                    // only where the model actually changed.
+                    if *pi_model != new_model {
+                        handle.set_model(new_model.clone());
+                        *state.model.lock().unwrap() = Some(new_model.clone());
+                        *pi_model = new_model;
+                    }
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {
                     // Mid-run switch: the queued mutation lands at the next
@@ -2605,13 +2609,22 @@ async fn run_actor(
                 // registry, so a cross-provider switch reaches the right
                 // endpoint + credential (the old bridge captured the
                 // initial model's credential for every later model).
-                if let Err(err) = session.set_model(new_model.clone()).await {
-                    tracing::warn!("pi set_model failed: {err}");
+                //
+                // Every mirror follows the harness, never the request: a
+                // refused switch (credential preflight, non-idle phase)
+                // leaves the actor on the model the session still runs, and
+                // the model already in play never appends a second
+                // `model_change` entry.
+                if pi_model != new_model {
+                    if let Err(err) = session.set_model(new_model.clone()).await {
+                        tracing::warn!("pi set_model failed: {err}");
+                    } else {
+                        // Keep the actor's working model in sync: Open/NewSession
+                        // below build sessions with it.
+                        pi_model = new_model.clone();
+                        *state.model.lock().unwrap() = Some(new_model);
+                    }
                 }
-                // Keep the actor's working model in sync: Open/NewSession
-                // below build sessions with it.
-                pi_model = new_model.clone();
-                *state.model.lock().unwrap() = Some(new_model);
             }
             SessionCmd::SetPermissionMode(mode) => {
                 state.gate.set_mode(mode);
@@ -5172,6 +5185,11 @@ mod tests {
             cmd_tx
                 .send(SessionCmd::SetModel(new_model.clone()))
                 .unwrap();
+            // A re-pick of the model already in play changes nothing: the
+            // second command must not append another entry.
+            cmd_tx
+                .send(SessionCmd::SetModel(new_model.clone()))
+                .unwrap();
             for _ in 0..10_000 {
                 if state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()) == Some("new") {
                     break;
@@ -5207,12 +5225,14 @@ mod tests {
             "switched-turn usage must enter the per-model stats: {:?}",
             stats.per_model
         );
-        // The switch persisted as a model_change entry, so a reload
+        // The switch persisted as exactly one model_change entry, so a reload
         // attributes the same history the same way.
         let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
-        assert!(
-            jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
-            "the mid-run switch must persist a model_change entry for the new model"
+        assert_eq!(
+            jsonl.matches("\"modelId\":\"new\"").count(),
+            1,
+            "the mid-run switch must persist one model_change entry for the new model, even \
+             when the same model is picked twice: {jsonl}"
         );
     }
 
