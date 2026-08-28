@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 agent = { workspace = true }
 manox-session-core = { workspace = true }
+manox-protocol = { workspace = true }
 gpui = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }

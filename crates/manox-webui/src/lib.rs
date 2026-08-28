@@ -11,6 +11,7 @@
 //! cancelling turns, so a browser refresh never kills a desktop turn.
 
 mod bridge;
+mod proto_translate;
 mod pump;
 mod server;
 
