@@ -6449,9 +6449,18 @@ impl Workspace {
                 })
                 .on_click(move |_, _, cx: &mut gpui::App| {
                     let _ = ws.update(cx, |this, cx| {
-                        this.thread.update(cx, |t, _| {
-                            t.set_reasoning_effort(effort);
-                        });
+                        let effort_str = match effort {
+                            agent::language_model::ReasoningEffort::High => "high",
+                            agent::language_model::ReasoningEffort::Max => "max",
+                        };
+                        if !this.send_note(|sid| manox_protocol::ClientNote::SetReasoningEffort {
+                            session_id: sid.into(),
+                            effort: effort_str.into(),
+                        }) {
+                            this.thread.update(cx, |t, _| {
+                                t.set_reasoning_effort(effort);
+                            });
+                        }
                     });
                 }),
             );
