@@ -576,6 +576,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::SetApprovalMode { session_id, mode } => {
             inner.set_approval_mode(&session_id, &mode)
         }
+        ClientNote::SetCwd { session_id, cwd } => inner.set_cwd(&session_id, &cwd),
         ClientNote::SetPlanMode {
             session_id,
             enabled,
@@ -885,6 +886,13 @@ impl AgentServerInner {
         let mode = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
             .unwrap_or_default();
         thread.with_mut(|t| t.set_permission_mode(mode));
+    }
+
+    fn set_cwd(&self, session_id: &str, cwd: &str) {
+        let Some(thread) = self.session_thread(session_id) else {
+            return self.note_error(session_id, "unknown session");
+        };
+        thread.with_mut(|t| t.set_project(cwd.into()));
     }
 
     fn plan_seed(&self, session_id: &str, plan_file: &str) {

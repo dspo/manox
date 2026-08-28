@@ -7815,7 +7815,14 @@ impl Workspace {
                                     let p = std::path::PathBuf::from(&click_path);
                                     let _ = ws_sel.update(cx, |this, cx| {
                                         this.close_project_chip_menu();
-                                        this.thread.update(cx, |t, _| t.set_project(p.clone()));
+                                        if !this.send_note(|sid| {
+                                            manox_protocol::ClientNote::SetCwd {
+                                                session_id: sid.into(),
+                                                cwd: p.to_str().unwrap_or_default().into(),
+                                            }
+                                        }) {
+                                            this.thread.update(cx, |t, _| t.set_project(p.clone()));
+                                        }
                                         Self::register_project_in_store(&p, cx);
                                         cx.notify();
                                     });
@@ -7989,8 +7996,13 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.thread
-            .update(cx, |t, _| t.set_project(new_path.clone()));
+        if !self.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+            session_id: sid.into(),
+            cwd: new_path.to_str().unwrap_or_default().into(),
+        }) {
+            self.thread
+                .update(cx, |t, _| t.set_project(new_path.clone()));
+        }
         Self::register_project_in_store(&new_path, cx);
         self.blank_project_name_input = None;
         cx.notify();
@@ -8022,7 +8034,12 @@ impl Workspace {
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    this.thread.update(cx, |t, _| t.set_project(path.clone()));
+                    if !this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+                        session_id: sid.into(),
+                        cwd: path.to_str().unwrap_or_default().into(),
+                    }) {
+                        this.thread.update(cx, |t, _| t.set_project(path.clone()));
+                    }
                     Self::register_project_in_store(&path, cx);
                 }
                 cx.notify();
