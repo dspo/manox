@@ -3560,7 +3560,23 @@ impl Workspace {
         self.thread = new_thread;
         // The chips derive from the bound thread's authoritative mirror; the
         // previous thread's suites never bleed across the switch.
-        self.active_browser_suites = self.thread.read(cx).browser_suites();
+        self.active_browser_suites = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .browser_suites
+                    .iter()
+                    .filter_map(|b| {
+                        serde_json::from_value::<agent::pi_engine::BrowserSuite>(
+                            serde_json::Value::String(b.clone()),
+                        )
+                        .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).browser_suites());
         let id = self
             .store
             .as_ref()
@@ -3573,7 +3589,21 @@ impl Workspace {
             .unwrap_or_else(|| self.thread.read(cx).messages().to_vec());
         let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history();
         let usage = self.thread.read(cx).request_token_usage();
-        let background_tasks = self.thread.read(cx).background_task_snapshots();
+        let background_tasks = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .background_tasks
+                    .iter()
+                    .filter_map(|t| {
+                        serde_json::from_value::<agent::background_task::TaskSnapshot>(t.clone())
+                            .ok()
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).background_task_snapshots());
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self
