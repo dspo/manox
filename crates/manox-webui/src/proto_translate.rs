@@ -11,8 +11,36 @@
 //! routing) is the validation target, display polish is follow-up.
 
 use manox_protocol::client::ImageAttachment;
-use manox_protocol::{ClientCall, ClientNote, FromClient, MsgId, ServerNote};
+use manox_protocol::{ClientCall, ClientNote, FromClient, MsgId, ServerCall, ServerNote};
 use serde_json::{Value, json};
+
+use crate::bridge::ReadyKind;
+
+/// The `session_ready` metadata a create/open/plan_execute_fresh message
+/// announces (id, kind, cwd), mirroring `bridge::translate`'s ready tuple so
+/// the δ₁-b shuttle can pre-register `pending_ready` for `on_event`.
+#[allow(dead_code)] // wired into spawn_shuttle; spawn_pump rewire pending.
+pub fn webview_ready_metadata(msg: &Value, cwd: &str) -> Option<(String, ReadyKind, String)> {
+    match msg["type"].as_str()? {
+        "new_session" => {
+            let id = msg["sessionId"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            Some((id, ReadyKind::Fresh, cwd.to_string()))
+        }
+        "open_thread" => {
+            let id = msg["sessionId"].as_str()?.to_string();
+            Some((id, ReadyKind::Restored, cwd.to_string()))
+        }
+        "plan_execute_fresh" => {
+            let fresh = uuid::Uuid::new_v4().to_string();
+            let cwd = msg["cwd"].as_str().unwrap_or(cwd).to_string();
+            Some((fresh, ReadyKind::Fresh, cwd))
+        }
+        _ => None,
+    }
+}
 
 /// Project one `ServerNote` onto the legacy WebUI JSON shape. `None` means
 /// the store does not render this note (consumed or unsupported).
@@ -403,13 +431,73 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
     })
 }
 
+/// Project a `ServerCall` (an adjudication/capability request the host must
+/// surface to the user) onto the legacy browser-card JSON the store renders.
+/// The WebUI answers via `webview_to_from_client` (`approve`/`plan_verdict`/
+/// `answer_question`), correlating by the id the AgentServer used as MsgId.
+#[allow(dead_code)] // wired into spawn_shuttle; spawn_pump rewire pending.
+pub fn server_call_to_webview_json(call: &ServerCall) -> Option<Value> {
+    Some(match call {
+        ServerCall::Approve {
+            session_id,
+            auth_id,
+            tool_name,
+            summary,
+            input,
+        } => json!({
+            "type": "tool_call_authorization",
+            "sessionId": session_id,
+            "id": auth_id,
+            "tool_name": tool_name,
+            "summary": summary,
+            "input": input,
+        }),
+        // AskUserQuestion shares the authorization-card surface; the store
+        // keys the ask card off `tool_name == "AskUserQuestion"`.
+        ServerCall::AskUserQuestion {
+            session_id,
+            auth_id,
+            input,
+        } => json!({
+            "type": "tool_call_authorization",
+            "sessionId": session_id,
+            "id": auth_id,
+            "tool_name": "AskUserQuestion",
+            "summary": "",
+            "input": input,
+        }),
+        ServerCall::PlanVerdict {
+            session_id,
+            plan_file,
+            title,
+            content,
+        } => json!({
+            "type": "plan_ready",
+            "sessionId": session_id,
+            "plan_file": plan_file,
+            "title": title,
+            "content": content.clone().unwrap_or_default(),
+        }),
+        // BrowserOp/ClipboardRead/OpenExternal: the WebUI declares no such
+        // capability, so the AgentServer never routes these to it. If one
+        // arrives, drop (fail-closed is the AgentServer's concern).
+        ServerCall::BrowserOp { .. }
+        | ServerCall::ClipboardRead { .. }
+        | ServerCall::OpenExternal { .. } => return None,
+    })
+}
+
 /// Translate one `WebviewToHost` message into the protocol `FromClient`
 /// sequence it maps to. Pure (no bridge state): adjudication replies echo the
 /// id the host already has — `approve`/`answer_question` use the auth_id,
 /// `plan_verdict` the session id — matching the AgentServer's deterministic
 /// `MsgId` per `ServerCall` kind, so no pending-id table is needed.
 #[allow(dead_code)] // consumed by the δ₁-b bridge rewire (pump.rs), not yet wired.
-pub fn webview_to_from_client(msg: &Value, cwd: &str) -> Vec<FromClient> {
+pub fn webview_to_from_client(
+    msg: &Value,
+    cwd: &str,
+    id_override: Option<&str>,
+) -> Vec<FromClient> {
     let ty = msg["type"].as_str().unwrap_or("");
     let sid = msg["sessionId"].as_str().map(str::to_string);
     fn img(msg: &Value) -> Vec<ImageAttachment> {
@@ -569,7 +657,9 @@ pub fn webview_to_from_client(msg: &Value, cwd: &str) -> Vec<FromClient> {
             ]
         }
         "new_session" => {
-            let id = sid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let id = sid
+                .or(id_override.map(str::to_string))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let mut out = vec![FromClient::Notification {
                 note: ClientNote::CreateSession {
                     session_id: id.clone(),
@@ -617,7 +707,9 @@ pub fn webview_to_from_client(msg: &Value, cwd: &str) -> Vec<FromClient> {
             else {
                 return vec![];
             };
-            let fresh = uuid::Uuid::new_v4().to_string();
+            let fresh = id_override
+                .map(str::to_string)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             let mut out = Vec::new();
             if let Some(old) = sid {
                 out.push(FromClient::Notification {
@@ -799,7 +891,7 @@ mod tests {
     #[test]
     fn forward_submit_maps_to_client_note() {
         let msg = json!({"type":"submit","sessionId":"s1","text":"hi","clientId":"c1"});
-        let out = webview_to_from_client(&msg, "/");
+        let out = webview_to_from_client(&msg, "/", None);
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
@@ -810,7 +902,7 @@ mod tests {
     #[test]
     fn forward_approve_is_reply_with_auth_id() {
         let msg = json!({"type":"approve","sessionId":"s1","id":"a1","allow":true});
-        let out = webview_to_from_client(&msg, "/");
+        let out = webview_to_from_client(&msg, "/", None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             FromClient::Reply { id, outcome } => {
@@ -824,7 +916,7 @@ mod tests {
     #[test]
     fn forward_plan_verdict_uses_session_id_as_msgid() {
         let msg = json!({"type":"plan_verdict","sessionId":"pg","choice":"execute_keep"});
-        let out = webview_to_from_client(&msg, "/");
+        let out = webview_to_from_client(&msg, "/", None);
         match &out[0] {
             FromClient::Reply { id, .. } => assert_eq!(id.0, "pg"),
             _ => panic!("expected Reply"),
@@ -834,7 +926,7 @@ mod tests {
     #[test]
     fn forward_new_session_orchestrates() {
         let msg = json!({"type":"new_session","sessionId":"n1","modelId":"m1","text":"go"});
-        let out = webview_to_from_client(&msg, "/");
+        let out = webview_to_from_client(&msg, "/", None);
         assert!(out.len() >= 3); // CreateSession + SetModel + GetCurrentModel + Submit
         assert!(matches!(
             out[0],
@@ -934,11 +1026,61 @@ mod tests {
             ),
         ];
         for (ty, msg) in cases {
-            let out = webview_to_from_client(msg, cwd);
+            let out = webview_to_from_client(msg, cwd, None);
             assert!(
                 !out.is_empty(),
                 "WebviewToHost `{ty}` produced no FromClient"
             );
         }
+    }
+    #[test]
+    fn server_call_approve_card_shape() {
+        let call = ServerCall::Approve {
+            session_id: "s1".into(),
+            auth_id: "a1".into(),
+            tool_name: "Bash".into(),
+            summary: "run ls".into(),
+            input: serde_json::json!({"cmd": "ls"}),
+        };
+        let v = server_call_to_webview_json(&call).unwrap();
+        assert_eq!(v["type"], "tool_call_authorization");
+        assert_eq!(v["id"], "a1");
+        assert_eq!(v["tool_name"], "Bash");
+        assert_eq!(v["input"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn server_call_ask_user_card_shape() {
+        let call = ServerCall::AskUserQuestion {
+            session_id: "s1".into(),
+            auth_id: "q1".into(),
+            input: serde_json::json!({"q": "color?"}),
+        };
+        let v = server_call_to_webview_json(&call).unwrap();
+        assert_eq!(v["type"], "tool_call_authorization");
+        assert_eq!(v["id"], "q1");
+        assert_eq!(v["tool_name"], "AskUserQuestion");
+    }
+
+    #[test]
+    fn server_call_plan_verdict_card_shape() {
+        let call = ServerCall::PlanVerdict {
+            session_id: "s1".into(),
+            plan_file: "/p.md".into(),
+            title: "T".into(),
+            content: Some("# Plan".into()),
+        };
+        let v = server_call_to_webview_json(&call).unwrap();
+        assert_eq!(v["type"], "plan_ready");
+        assert_eq!(v["plan_file"], "/p.md");
+        assert_eq!(v["content"], "# Plan");
+        // Missing content falls back to "" (legacy shape), not null.
+        let none = ServerCall::PlanVerdict {
+            session_id: "s1".into(),
+            plan_file: "/p.md".into(),
+            title: "T".into(),
+            content: None,
+        };
+        assert_eq!(server_call_to_webview_json(&none).unwrap()["content"], "");
     }
 }
