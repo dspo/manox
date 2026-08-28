@@ -4412,11 +4412,28 @@ impl Workspace {
         self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
-        let hit = self.thread.update(cx, |thread, _| match kind {
-            RegistryTurnKind::Command => thread.submit_command(key, args, Some(ui.clone())),
-            RegistryTurnKind::Skill => thread.submit_skill(key, args, Some(ui)),
-        });
-        if !hit {
+        let hit = match kind {
+            RegistryTurnKind::Command => {
+                agent::command::try_global().is_some_and(|r| r.get(key).is_some())
+            }
+            RegistryTurnKind::Skill => {
+                agent::skill::try_global().is_some_and(|r| r.get(key).is_some())
+            }
+        };
+        if hit {
+            let submit_text = format!("/{key} {args}");
+            if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+                session_id: sid.into(),
+                text: submit_text,
+                images: Vec::new(),
+                client_id: None,
+            }) {
+                self.thread.update(cx, |thread, _| match kind {
+                    RegistryTurnKind::Command => thread.submit_command(key, args, Some(ui.clone())),
+                    RegistryTurnKind::Skill => thread.submit_skill(key, args, Some(ui)),
+                });
+            }
+        } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
                 RegistryTurnKind::Skill => "workspace-unknown-skill",
