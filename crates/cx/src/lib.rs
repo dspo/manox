@@ -340,6 +340,7 @@ fn available_agents_for_add(config: &CxConfig) -> Vec<ResolvedAgent> {
         agents: default_agent_configs(),
         chatgpt_app: None,
         vscode_app: None,
+        subagents: Default::default(),
     })
     .into_iter()
     .filter(|a| !a.hidden)
@@ -933,6 +934,7 @@ fn load_config_for_add() -> Result<(CxConfig, PathBuf)> {
             agents: default_agent_configs(),
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         }
     };
     Ok((config, path))
@@ -2123,6 +2125,13 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
             .or(existing.chatgpt_app.clone()),
         // vscode_app 段同 chatgpt_app 语义。
         vscode_app: incoming.vscode_app.clone().or(existing.vscode_app.clone()),
+        // `subagents:` is host-owned config, not patch content: only an
+        // explicit non-empty map in the source overrides the local one.
+        subagents: if incoming.subagents.is_empty() {
+            existing.subagents.clone()
+        } else {
+            incoming.subagents.clone()
+        },
     };
 
     let yaml = serde_yaml::to_string(&merged).context("序列化配置失败")?;
@@ -4600,6 +4609,7 @@ mod tests {
             ],
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         }
     }
 
@@ -4666,6 +4676,7 @@ mod tests {
             agents: default_agent_configs(),
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         }
     }
 
@@ -5528,6 +5539,7 @@ agents:
             agents: default_agent_configs(),
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         }
     }
 
@@ -5840,6 +5852,7 @@ agents:
             agents: default_agent_configs(),
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         };
         let endpoints = provider.normalized_endpoints();
         let model = &endpoints[0].models[0];
@@ -6156,6 +6169,7 @@ agents:
             agents: default_agent_configs(),
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         };
         let provider = &config.providers[0];
         assert!(provider_supports_agent(&config, provider, "copilot"));
@@ -6926,6 +6940,7 @@ trust_level = "trusted"
             ],
             chatgpt_app: None,
             vscode_app: None,
+            subagents: Default::default(),
         };
         let agents = resolved_agents(&config);
         assert_eq!(agents.iter().filter(|agent| agent.id == "codex").count(), 1);
