@@ -5751,9 +5751,20 @@ impl Workspace {
         if let Some(id) = tool_call_id {
             data["tool_call_id"] = serde_json::Value::String(id.to_owned());
         }
-        self.thread.update(cx, |t, _| {
-            t.append_ui_note(agent::db::UiNoteRecord { kind, data })
-        });
+        let kind_str = match kind {
+            agent::db::UiNoteKind::Error => "error",
+            agent::db::UiNoteKind::Notice => "notice",
+            agent::db::UiNoteKind::PlanReview => "plan_review",
+        };
+        if !self.send_note(|sid| manox_protocol::ClientNote::AppendUiNote {
+            session_id: sid.into(),
+            kind: kind_str.into(),
+            data: data.clone(),
+        }) {
+            self.thread.update(cx, |t, _| {
+                t.append_ui_note(agent::db::UiNoteRecord { kind, data })
+            });
+        }
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
