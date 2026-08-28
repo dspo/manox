@@ -1030,7 +1030,7 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.running)
             .unwrap_or_else(|| self.thread.read(cx).is_running());
-        let cwd = thread_cwd(&self.thread, cx);
+        let cwd = thread_cwd(&self.thread, &self.store, cx);
         let new_conv = cx.new(|cx| {
             ConversationState::rebuild_from_display(
                 &display,
@@ -1161,8 +1161,17 @@ impl Workspace {
                         .as_ref()
                         .map(|s| s.read(cx).store.messages.clone())
                         .unwrap_or_else(|| this.thread.read(cx).messages().to_vec());
-                    if let Some(snapshot) = agent::plan::rebuild_from_messages(&messages)
-                        .or_else(|| this.thread.read(cx).persisted_plan())
+                    if let Some(snapshot) =
+                        agent::plan::rebuild_from_messages(&messages).or_else(|| {
+                            this.store
+                                .as_ref()
+                                .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
+                                .and_then(|v| {
+                                    serde_json::from_value::<agent::plan::PlanSnapshot>(v.clone())
+                                        .ok()
+                                })
+                                .or_else(|| this.thread.read(cx).persisted_plan())
+                        })
                     {
                         this.context_rail
                             .update(cx, |r, cx| r.set_plan(snapshot, cx));
@@ -1174,7 +1183,18 @@ impl Workspace {
                 // keeping the list pinned at the tail while the user waits.
                 // Input stays gated on the thread's `HistoryPhase::Loading`.
                 ThreadEvent::HistoryProgress => {
-                    if this.thread.read(cx).history_phase().is_loading() {
+                    if this
+                        .store
+                        .as_ref()
+                        .and_then(|s| {
+                            serde_json::from_value::<agent::thread::HistoryPhase>(
+                                serde_json::Value::String(s.read(cx).store.history_phase.clone()),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_else(|| this.thread.read(cx).history_phase())
+                        .is_loading()
+                    {
                         let messages: Vec<agent::Message> = this
                             .store
                             .as_ref()
@@ -1184,7 +1204,7 @@ impl Workspace {
                             let new_messages = messages[this.history_rendered..].to_vec();
                             let usage = this.thread.read(cx).request_token_usage();
                             let role = this.model_label(cx);
-                            let cwd = thread_cwd(&this.thread, cx);
+                            let cwd = thread_cwd(&this.thread, &this.store, cx);
                             let weak = cx.weak_entity();
                             let outcome = this.conversation.update(cx, |c, cx| {
                                 c.append_history_messages(
@@ -1249,7 +1269,7 @@ impl Workspace {
                     // a segment above the new user bubble.
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -1315,7 +1335,7 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -1363,7 +1383,16 @@ impl Workspace {
                                     .await;
                                 let still = entity.read_with(cx, |this, cx| {
                                     this.goal_ticker_gen == ticker_gen
-                                        && this.thread.read(cx).goal().is_some()
+                                        && this
+                                            .store
+                                            .as_ref()
+                                            .and_then(|s| s.read(cx).store.goal.clone())
+                                            .and_then(|v| {
+                                                serde_json::from_value::<agent::goal::ThreadGoal>(v)
+                                                    .ok()
+                                            })
+                                            .or_else(|| this.thread.read(cx).goal())
+                                            .is_some()
                                 });
                                 if !still {
                                     break;
@@ -1555,7 +1584,7 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.thread.read(cx).last_request_token_usage();
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -3552,7 +3581,7 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.running)
             .unwrap_or_else(|| self.thread.read(cx).is_running());
-        let cwd = thread_cwd(&self.thread, cx);
+        let cwd = thread_cwd(&self.thread, &self.store, cx);
         let new_conv = cx.new(|cx| {
             let mut conversation = ConversationState::rebuild_from_display(
                 &display,
@@ -3635,8 +3664,13 @@ impl Workspace {
         // calls, falling back to the independent sidecar snapshot (the facade
         // mirrors the persisted copy on every `PlanUpdated` / `Ready`).
         let new_thread_for_rail = self.thread.clone();
-        let restored_plan = agent::plan::rebuild_from_messages(&messages)
-            .or_else(|| self.thread.read(cx).persisted_plan());
+        let restored_plan = agent::plan::rebuild_from_messages(&messages).or_else(|| {
+            self.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
+                .and_then(|v| serde_json::from_value::<agent::plan::PlanSnapshot>(v.clone()).ok())
+                .or_else(|| self.thread.read(cx).persisted_plan())
+        });
         self.context_rail.update(cx, |r, cx| {
             // Rebind the rail to the incoming thread. Without this the rail
             // keeps reading the construction-time thread's `per_model` usage /
@@ -3719,7 +3753,11 @@ impl Workspace {
         let entity = cx.entity().clone();
         let refresh_gen = self.git_status_gen;
         let rail = self.context_rail.clone();
-        let cwd = self.thread.read(cx).cwd().to_path_buf();
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .unwrap_or_else(|| self.thread.read(cx).cwd().to_path_buf());
         let worktree_branch = self.thread.read(cx).worktree_branch();
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
@@ -3877,11 +3915,43 @@ impl Workspace {
             return;
         }
         let old = self.thread.clone();
-        let cwd = old.read(cx).cwd().to_path_buf();
-        let project = old.read(cx).project();
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .unwrap_or_else(|| old.read(cx).cwd().to_path_buf());
+        let project = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read(cx)
+                    .store
+                    .project
+                    .clone()
+                    .map(std::path::PathBuf::from)
+            })
+            .or_else(|| old.read(cx).project());
         let model = old.read(cx).model();
-        let effort = old.read(cx).reasoning_effort();
-        let permission = old.read(cx).permission_mode();
+        let effort = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::language_model::ReasoningEffort>(
+                    serde_json::Value::String(s.read(cx).store.reasoning_effort.clone()),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| old.read(cx).reasoning_effort());
+        let permission = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::PermissionMode>(serde_json::Value::String(
+                    s.read(cx).store.permission_mode.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| old.read(cx).permission_mode());
         let new = match &project {
             Some(dir) => cx.new(|cx| {
                 ThreadProxy::new(
@@ -3922,7 +3992,17 @@ impl Workspace {
         {
             return;
         }
-        let project = self.thread.read(cx).project();
+        let project = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read(cx)
+                    .store
+                    .project
+                    .clone()
+                    .map(std::path::PathBuf::from)
+            })
+            .or_else(|| self.thread.read(cx).project());
         self.start_new_thread(project, window, cx);
     }
 
@@ -3949,7 +4029,18 @@ impl Workspace {
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // History is still loading: nothing may be submitted (the composer is
         // hidden, this guard covers keyboard paths that bypass the render).
-        if self.thread.read(cx).history_phase().is_loading() {
+        if self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::HistoryPhase>(serde_json::Value::String(
+                    s.read(cx).store.history_phase.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).history_phase())
+            .is_loading()
+        {
             return;
         }
         let text = self.input_state.read(cx).value().to_string();
@@ -4904,11 +4995,15 @@ impl Workspace {
     /// spawn paths fall back to the workspace cwd, parity with the
     /// Conversations-header spawns).
     fn launcher_thread_cwd(&self, cx: &App) -> Option<PathBuf> {
-        let cwd = self.thread.read(cx).cwd();
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .unwrap_or_else(|| self.thread.read(cx).cwd().to_path_buf());
         if cwd.as_os_str().is_empty() {
             None
         } else {
-            Some(cwd.to_path_buf())
+            Some(cwd)
         }
     }
 
@@ -5263,7 +5358,16 @@ impl Workspace {
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
         if !editor_can_submit(
-            self.thread.read(cx).history_phase().is_loading(),
+            self.store
+                .as_ref()
+                .and_then(|s| {
+                    serde_json::from_value::<agent::thread::HistoryPhase>(
+                        serde_json::Value::String(s.read(cx).store.history_phase.clone()),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| self.thread.read(cx).history_phase())
+                .is_loading(),
             self.store
                 .as_ref()
                 .map(|s| s.read(cx).store.running)
@@ -5308,7 +5412,16 @@ impl Workspace {
     }
 
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
-        let permission_mode = self.thread.read(cx).permission_mode();
+        let permission_mode = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::PermissionMode>(serde_json::Value::String(
+                    s.read(cx).store.permission_mode.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).permission_mode());
         UserTurnMeta::new(
             chrono::Utc::now().timestamp(),
             self.model_label(cx),
@@ -5485,7 +5598,18 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
-        if self.thread.read(cx).history_phase().is_loading() {
+        if self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::HistoryPhase>(serde_json::Value::String(
+                    s.read(cx).store.history_phase.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).history_phase())
+            .is_loading()
+        {
             return false;
         }
         if running {
@@ -5678,11 +5802,43 @@ impl Workspace {
                 .as_ref()
                 .map(|s| s.read(cx).store.id.0.clone())
                 .unwrap_or_else(|| self.thread.read(cx).id.0.clone());
-            let cwd = self.thread.read(cx).cwd().to_path_buf();
-            let project = self.thread.read(cx).project();
+            let cwd = self
+                .store
+                .as_ref()
+                .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+                .unwrap_or_else(|| self.thread.read(cx).cwd().to_path_buf());
+            let project = self
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .project
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                })
+                .or_else(|| self.thread.read(cx).project());
             let model = self.thread.read(cx).model();
-            let effort = self.thread.read(cx).reasoning_effort();
-            let permission = self.thread.read(cx).permission_mode();
+            let effort = self
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    serde_json::from_value::<agent::language_model::ReasoningEffort>(
+                        serde_json::Value::String(s.read(cx).store.reasoning_effort.clone()),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| self.thread.read(cx).reasoning_effort());
+            let permission = self
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    serde_json::from_value::<agent::thread::PermissionMode>(
+                        serde_json::Value::String(s.read(cx).store.permission_mode.clone()),
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| self.thread.read(cx).permission_mode());
             let new = match &project {
                 Some(dir) => cx.new(|cx| {
                     ThreadProxy::new(
@@ -5769,7 +5925,16 @@ impl Workspace {
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
         let model = self.thread.read(cx).model();
-        let effort = self.thread.read(cx).reasoning_effort();
+        let effort = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::language_model::ReasoningEffort>(
+                    serde_json::Value::String(s.read(cx).store.reasoning_effort.clone()),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).reasoning_effort());
 
         let trigger = h_flex()
             .id("model-trigger")
@@ -5832,7 +5997,18 @@ impl Workspace {
                     this.model_menu_sub = None;
                 } else {
                     this.model_open = true;
-                    let current_effort = this.thread.read(cx).reasoning_effort();
+                    let current_effort = this
+                        .store
+                        .as_ref()
+                        .and_then(|s| {
+                            serde_json::from_value::<agent::language_model::ReasoningEffort>(
+                                serde_json::Value::String(
+                                    s.read(cx).store.reasoning_effort.clone(),
+                                ),
+                            )
+                            .ok()
+                        })
+                        .unwrap_or_else(|| this.thread.read(cx).reasoning_effort());
                     let workspace = cx.entity().downgrade();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
                         Self::build_model_popup_menu_pi(menu, workspace, current_effort, window, cx)
@@ -6402,9 +6578,11 @@ impl Workspace {
     /// explicit, inspectable update rather than an ephemeral popover field.
     pub fn begin_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(objective) = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
+            .or_else(|| self.thread.read(cx).goal())
             .map(|goal| goal.objective.clone())
         else {
             self.goal_popover_open = true;
@@ -6419,9 +6597,11 @@ impl Workspace {
 
     pub fn begin_goal_budget_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
+            .or_else(|| self.thread.read(cx).goal())
             .and_then(|goal| goal.token_budget)
             .map(|budget| budget.to_string())
             .unwrap_or_else(|| "none".into());
@@ -6433,9 +6613,11 @@ impl Workspace {
 
     pub fn begin_goal_rounds_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
+            .or_else(|| self.thread.read(cx).goal())
             .and_then(|goal| goal.max_rounds)
             .map(|max| max.to_string())
             .unwrap_or_else(|| "none".into());
@@ -6471,7 +6653,12 @@ impl Workspace {
     }
 
     fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let g = self.thread.read(cx).goal()?;
+        let g = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
+            .or_else(|| self.thread.read(cx).goal())?;
         let accent = theme.accent;
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
@@ -6822,7 +7009,16 @@ impl Workspace {
     /// on the right). The popover is `w(360)` to fit the longest bilingual
     /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.thread.read(cx).permission_mode();
+        let mode = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::PermissionMode>(serde_json::Value::String(
+                    s.read(cx).store.permission_mode.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).permission_mode());
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
         // capture `theme` (which only lives for the method body) — closures
@@ -7205,7 +7401,17 @@ impl Workspace {
     /// allowed on empty threads (same guard as the manox chip). Data source
     /// is the pi thread store only.
     fn render_project_chip_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = self.thread.read(cx).project();
+        let project = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read(cx)
+                    .store
+                    .project
+                    .clone()
+                    .map(std::path::PathBuf::from)
+            })
+            .or_else(|| self.thread.read(cx).project());
         let open = self.project_chip_open;
         let workspace = cx.entity().downgrade();
 
@@ -7728,9 +7934,16 @@ impl Workspace {
         // `TerminalElement`.
         if matches!(self.view_mode, ViewMode::Terminal) {
             let title_text: SharedString = self
-                .thread
-                .read(cx)
-                .project()
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .project
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                })
+                .or_else(|| self.thread.read(cx).project())
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
@@ -7840,7 +8053,17 @@ impl Workspace {
         // immediately, while submission remains gated until the transcript is
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        let loading = self.thread.read(cx).history_phase().is_loading();
+        let loading = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::HistoryPhase>(serde_json::Value::String(
+                    s.read(cx).store.history_phase.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).history_phase())
+            .is_loading();
         let composer_placement = composer_placement(editor_open && right_pane_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
@@ -8736,8 +8959,15 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
         )
 }
 
-fn thread_cwd(thread: &Entity<ThreadEntity>, cx: &App) -> Option<SharedString> {
-    let cwd = thread.read(cx).cwd();
+fn thread_cwd(
+    thread: &Entity<ThreadEntity>,
+    store: &Option<gpui::Entity<ClientStoreHandle>>,
+    cx: &App,
+) -> Option<SharedString> {
+    let cwd = store
+        .as_ref()
+        .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+        .unwrap_or_else(|| thread.read(cx).cwd().to_path_buf());
     if cwd.as_os_str().is_empty() {
         None
     } else {
@@ -8979,7 +9209,17 @@ impl Workspace {
     /// change notice rides `apply_permission_mode` so the conversation shows
     /// the switch.
     pub(crate) fn cycle_mode(&mut self, cx: &mut Context<Self>) {
-        let next = match self.thread.read(cx).permission_mode() {
+        let next = match self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<agent::thread::PermissionMode>(serde_json::Value::String(
+                    s.read(cx).store.permission_mode.clone(),
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).permission_mode())
+        {
             PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
             PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
             PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
