@@ -108,8 +108,11 @@ impl ClientStore {
                 display_history,
                 ..
             } => {
-                if let Ok(msgs) = serde_json::from_value::<Vec<Message>>(messages.clone()) {
-                    self.messages = msgs;
+                match serde_json::from_value::<Vec<Message>>(messages.clone()) {
+                    Ok(msgs) => self.messages = msgs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "ThreadHistory parse failed; keeping stale messages")
+                    }
                 }
                 self.display_history = display_history.clone();
             }
@@ -133,6 +136,9 @@ impl ClientStore {
                 self.worktree_path = path.clone();
             }
             ServerNote::Branch { branch, .. } => self.branch = Some(branch.clone()),
+            ServerNote::BrowserSuitesChanged { suites, .. } => {
+                self.browser_suites = suites.clone();
+            }
             ServerNote::BackgroundTaskUpdated { snapshot, .. } => {
                 if let Some(obj) = snapshot.as_object()
                     && let Some(id) = obj.get("task_id").and_then(Value::as_str)
