@@ -59,7 +59,10 @@ pub trait RpcConnection: Send + Sync {
     fn disconnect(&self);
 }
 
-/// In-process [`RpcConnection`] over bounded channels.
+/// In-process [`RpcConnection`] over bounded channels. Cloneable: each clone
+/// shares the channel pair, so both the pump (reading server→client) and the
+/// workspace (sending client→server) can hold a reference.
+#[derive(Clone)]
 pub struct InProcessConnection {
     c2s_tx: Sender<FromClient>,
     c2s_rx: Receiver<FromClient>,
