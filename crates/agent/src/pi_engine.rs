@@ -748,7 +748,7 @@ fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
 /// An opt-in browser tool suite toggled from the composer `+` menu. The
 /// engine applies the toggle atomically against the session's authoritative
 /// active-tool set, so callers never compute the merged set themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BrowserSuite {
     ChromeUse,
     WebExplore,
