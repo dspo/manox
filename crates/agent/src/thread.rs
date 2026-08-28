@@ -90,7 +90,8 @@ impl HistoryPhase {
 /// One streamed child-session observation from a running sub-agent (pi path:
 /// bridged from the child's `AgentEvent`s through the Agent tool's progress
 /// channel). Text/thinking deltas append to the drill-down transcript; tool
-/// start/end render as activity lines.
+/// start/end render as activity lines; message stops and terminal errors
+/// carry the boundary signals the panel mirrors from the main thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubagentChildEvent {
     /// Assistant text delta from the child.
@@ -105,12 +106,24 @@ pub enum SubagentChildEvent {
         /// (argument key, truncated value) hint, e.g. `("path", "src/x.rs")`.
         hint: Option<(String, String)>,
     },
-    /// The child's tool call finished.
+    /// The child's tool call finished, with the result text for display.
     ToolEnd {
         id: String,
         name: String,
         is_error: bool,
+        output: String,
     },
+    /// The child's assistant message finished streaming. Mirrors the main
+    /// thread's `Stop` boundary: the panel finalizes the bubble (clearing the
+    /// streaming cursor), freezes or keeps the activity segment per the stop
+    /// reason, and stamps the message's token usage onto the reply.
+    Stop {
+        reason: StopReason,
+        usage: Option<TokenUsage>,
+    },
+    /// The child's run surfaced a terminal provider error; the message text
+    /// renders as an error card like the main thread's `Error` event.
+    Error(String),
 }
 
 #[derive(Debug)]

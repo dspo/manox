@@ -164,11 +164,27 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
                         .as_ref()
                         .map(|(k, v)| json!({"key": k, "value": v})),
                 }),
-                agent::SubagentChildEvent::ToolEnd { id, name, is_error } => json!({
+                agent::SubagentChildEvent::ToolEnd {
+                    id,
+                    name,
+                    is_error,
+                    output,
+                    ..
+                } => json!({
                     "kind": "tool_end",
                     "id": id,
                     "name": name,
                     "is_error": is_error,
+                    "output": output,
+                }),
+                agent::SubagentChildEvent::Stop { reason, usage } => json!({
+                    "kind": "stop",
+                    "reason": format!("{reason:?}"),
+                    "usage": usage,
+                }),
+                agent::SubagentChildEvent::Error(text) => json!({
+                    "kind": "error",
+                    "text": text,
                 }),
             };
             json!({"type": "subagent_child", "id": id, "event": event})
@@ -430,9 +446,18 @@ mod tests {
                     id: "t1".into(),
                     name: "Grep".into(),
                     is_error: false,
+                    output: "matches".into(),
                 },
                 "tool_end",
             ),
+            (
+                agent::SubagentChildEvent::Stop {
+                    reason: agent::language_model::StopReason::ToolUse,
+                    usage: None,
+                },
+                "stop",
+            ),
+            (agent::SubagentChildEvent::Error("boom".into()), "error"),
         ];
         for (child, kind) in cases {
             let json = thread_event_to_json(

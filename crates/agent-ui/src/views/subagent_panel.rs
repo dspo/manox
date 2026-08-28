@@ -33,29 +33,43 @@ use crate::views::subagents::status_indicator;
 /// Translate one bridged child event into the shared [`ThreadEvent`]
 /// contract. Tool titles go through the same `tool_title` derivation as the
 /// main conversation, and the child call id pairs start/end under parallel
-/// child tool execution.
-fn thread_event_of(child: &SubagentChildEvent) -> ThreadEvent {
+/// child tool execution. A message stop carries the child message's token
+/// usage, consumed by the `Stop` arm to label the just-finished reply.
+fn thread_event_of(child: &SubagentChildEvent) -> (ThreadEvent, Option<TokenUsage>) {
     match child {
-        SubagentChildEvent::Text(text) => ThreadEvent::AgentText(text.clone()),
-        SubagentChildEvent::Thinking(text) => ThreadEvent::AgentThinking(text.clone()),
+        SubagentChildEvent::Text(text) => (ThreadEvent::AgentText(text.clone()), None),
+        SubagentChildEvent::Thinking(text) => (ThreadEvent::AgentThinking(text.clone()), None),
         SubagentChildEvent::ToolStart { id, name, hint } => {
             let input = hint
                 .as_ref()
                 .map(|(key, value)| serde_json::json!({ key: value }));
             let title_value = input.clone().unwrap_or_default();
-            ThreadEvent::ToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                title: agent::thread::tool_title(name, &title_value, None),
-                status: ToolCallStatus::Running,
-                input,
-            }
+            (
+                ThreadEvent::ToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    title: agent::thread::tool_title(name, &title_value, None),
+                    status: ToolCallStatus::Running,
+                    input,
+                },
+                None,
+            )
         }
-        SubagentChildEvent::ToolEnd { id, is_error, .. } => ThreadEvent::ToolResult {
-            id: id.clone(),
-            output: String::new(),
-            is_error: *is_error,
-        },
+        SubagentChildEvent::ToolEnd {
+            id,
+            is_error,
+            output,
+            ..
+        } => (
+            ThreadEvent::ToolResult {
+                id: id.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+            },
+            None,
+        ),
+        SubagentChildEvent::Stop { reason, usage } => (ThreadEvent::Stop(*reason), *usage),
+        SubagentChildEvent::Error(text) => (ThreadEvent::Error(anyhow::anyhow!("{text}")), None),
     }
 }
 
@@ -120,13 +134,8 @@ impl SubagentPanel {
                 cx,
             );
             for child in backfill {
-                conversation.apply(
-                    &thread_event_of(child),
-                    &role_for_conv,
-                    None,
-                    ctx.clone(),
-                    cx,
-                );
+                let (event, usage) = thread_event_of(child);
+                conversation.apply(&event, &role_for_conv, usage, ctx.clone(), cx);
             }
             conversation
         });
@@ -143,14 +152,14 @@ impl SubagentPanel {
     }
 
     pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
-        let event = thread_event_of(child);
+        let (event, usage) = thread_event_of(child);
         let role = self.role.clone();
         let ctx = ApplyCtx {
             weak: self.weak_workspace.clone(),
             cwd: None,
         };
         self.conversation
-            .update(cx, |c, cx| c.apply(&event, &role, None, ctx, cx));
+            .update(cx, |c, cx| c.apply(&event, &role, usage, ctx, cx));
         // Re-arm tail-follow only while the viewport is still near the
         // bottom; a user who scrolled up to read history must not be yanked
         // back by the next delta.
@@ -288,11 +297,13 @@ mod tests {
 
     #[test]
     fn child_events_translate_to_shared_thread_events() {
-        match thread_event_of(&SubagentChildEvent::ToolStart {
+        let (event, usage) = thread_event_of(&SubagentChildEvent::ToolStart {
             id: "c1".into(),
             name: "Read".into(),
             hint: Some(("path".into(), "src/x.rs".into())),
-        }) {
+        });
+        assert!(usage.is_none());
+        match event {
             ThreadEvent::ToolCall {
                 id,
                 name,
@@ -309,25 +320,67 @@ mod tests {
             other => panic!("expected ToolCall, got {other:?}"),
         }
 
-        match thread_event_of(&SubagentChildEvent::ToolEnd {
+        let (event, usage) = thread_event_of(&SubagentChildEvent::ToolEnd {
             id: "c1".into(),
             name: "Read".into(),
             is_error: true,
-        }) {
-            ThreadEvent::ToolResult { id, is_error, .. } => {
+            output: "ok".into(),
+        });
+        assert!(usage.is_none());
+        match event {
+            ThreadEvent::ToolResult {
+                id,
+                is_error,
+                output,
+                ..
+            } => {
                 assert_eq!(id, "c1");
                 assert!(is_error);
+                assert_eq!(output, "ok");
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
 
         assert!(matches!(
             thread_event_of(&SubagentChildEvent::Text("hi".into())),
-            ThreadEvent::AgentText(t) if t == "hi"
+            (ThreadEvent::AgentText(t), None) if t == "hi"
         ));
         assert!(matches!(
             thread_event_of(&SubagentChildEvent::Thinking("hmm".into())),
-            ThreadEvent::AgentThinking(t) if t == "hmm"
+            (ThreadEvent::AgentThinking(t), None) if t == "hmm"
         ));
+    }
+
+    /// A message stop maps onto the shared `Stop` boundary with the child
+    /// message's usage; a terminal provider error maps onto `Error`.
+    #[test]
+    fn stop_and_error_events_translate_to_thread_boundaries() {
+        let (event, usage) = thread_event_of(&SubagentChildEvent::Stop {
+            reason: agent::language_model::StopReason::ToolUse,
+            usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+        });
+        assert!(matches!(
+            event,
+            ThreadEvent::Stop(agent::language_model::StopReason::ToolUse)
+        ));
+        assert_eq!(usage.unwrap().input_tokens, 10);
+
+        let (event, usage) = thread_event_of(&SubagentChildEvent::Stop {
+            reason: agent::language_model::StopReason::EndTurn,
+            usage: None,
+        });
+        assert!(matches!(
+            event,
+            ThreadEvent::Stop(agent::language_model::StopReason::EndTurn)
+        ));
+        assert!(usage.is_none());
+
+        let (event, usage) = thread_event_of(&SubagentChildEvent::Error("boom".into()));
+        assert!(usage.is_none());
+        assert!(matches!(event, ThreadEvent::Error(e) if e.to_string() == "boom"));
     }
 }
