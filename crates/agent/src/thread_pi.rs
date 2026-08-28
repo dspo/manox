@@ -578,7 +578,7 @@ impl ThreadHandle {
         op: crate::thread_engine::BrowserOp,
         responder: async_channel::Sender<Result<crate::thread_engine::BrowserReply, String>>,
     ) {
-        let Some(caps) = crate::capability::provider().cloned() else {
+        let Some(caps) = crate::capability::provider() else {
             let _ = responder.try_send(Err("browser capability not available".to_string()));
             return;
         };
