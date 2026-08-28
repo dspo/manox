@@ -32,6 +32,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent::{PlanSnapshot, PlanStepStatus};
@@ -277,10 +278,11 @@ impl ContextRail {
     /// `Render` impl positions this as an absolute overlay over the
     /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = {
-            let thread = self.thread.read(cx);
-            thread.project()
-        };
+        let project = self
+            .store
+            .as_ref()
+            .map(|s| Some(std::path::PathBuf::from(s.read(cx).store.cwd.clone())))
+            .unwrap_or_else(|| self.thread.read(cx).project());
 
         let agents_section = self.render_agents_section(theme, cx);
 
@@ -407,10 +409,47 @@ impl ContextRail {
         };
 
         // Per-model token breakdown tree with context budget integrated.
-        let thread = self.thread.read(cx);
-        let per_model = thread.per_model_token_usage();
-        let per_model_cost = thread.per_model_cost();
-        let per_model_last = thread.per_model_last_request_usage();
+        let (per_model, per_model_cost, per_model_last) = if let Some(store) = &self.store {
+            let s = &store.read(cx).store;
+            let per_model = s
+                .per_model_usage
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        agent::TokenUsage {
+                            input_tokens: v.input,
+                            output_tokens: v.output,
+                            cache_creation_input_tokens: v.cache_creation,
+                            cache_read_input_tokens: v.cache_read,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            let per_model_last = s
+                .per_request_usage
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        agent::TokenUsage {
+                            input_tokens: v.input,
+                            output_tokens: v.output,
+                            cache_creation_input_tokens: v.cache_creation,
+                            cache_read_input_tokens: v.cache_read,
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+            (per_model, s.per_model_cost.clone(), per_model_last)
+        } else {
+            let thread = self.thread.read(cx);
+            (
+                thread.per_model_token_usage(),
+                thread.per_model_cost(),
+                thread.per_model_last_request_usage(),
+            )
+        };
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
