@@ -1021,7 +1021,16 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.messages.clone())
             .unwrap_or_else(|| self.thread.read(cx).messages().to_vec());
-        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history();
+        let display: Vec<agent::db::HistoryEntry> = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<Vec<agent::db::HistoryEntry>>(
+                    s.read(cx).store.display_history.clone(),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).display_history());
         let usage = self.thread.read(cx).request_token_usage();
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
@@ -3587,7 +3596,16 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.messages.clone())
             .unwrap_or_else(|| self.thread.read(cx).messages().to_vec());
-        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history();
+        let display: Vec<agent::db::HistoryEntry> = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<Vec<agent::db::HistoryEntry>>(
+                    s.read(cx).store.display_history.clone(),
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).display_history());
         let usage = self.thread.read(cx).request_token_usage();
         let background_tasks = self
             .store
