@@ -1343,7 +1343,20 @@ impl Workspace {
                 ThreadEvent::Stop(reason) => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let usage = this.thread.read(cx).last_request_token_usage();
+                    let usage =
+                        this.store
+                            .as_ref()
+                            .and_then(|s| {
+                                s.read(cx).store.last_token_usage.as_ref().map(|u| {
+                                    agent::TokenUsage {
+                                        input_tokens: u.input,
+                                        output_tokens: u.output,
+                                        cache_creation_input_tokens: u.cache_creation,
+                                        cache_read_input_tokens: u.cache_read,
+                                    }
+                                })
+                            })
+                            .or_else(|| this.thread.read(cx).last_request_token_usage());
                     let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
@@ -1592,7 +1605,20 @@ impl Workspace {
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let usage = this.thread.read(cx).last_request_token_usage();
+                    let usage =
+                        this.store
+                            .as_ref()
+                            .and_then(|s| {
+                                s.read(cx).store.last_token_usage.as_ref().map(|u| {
+                                    agent::TokenUsage {
+                                        input_tokens: u.input,
+                                        output_tokens: u.output,
+                                        cache_creation_input_tokens: u.cache_creation,
+                                        cache_read_input_tokens: u.cache_read,
+                                    }
+                                })
+                            })
+                            .or_else(|| this.thread.read(cx).last_request_token_usage());
                     let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
