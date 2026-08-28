@@ -218,13 +218,26 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             tool_name,
             summary,
             input,
-        } => Call(ServerCall::Approve {
-            session_id: session_id.into(),
-            auth_id: id.clone(),
-            tool_name: tool_name.clone(),
-            summary: summary.clone(),
-            input: input.clone(),
-        }),
+        } => {
+            // AskUserQuestion's authorization is an interactive question, not a
+            // bare allow/deny: route it as its own ServerCall kind so the
+            // client renders the ask card and returns structured answers.
+            if tool_name == agent::tools::ASK_USER_QUESTION {
+                Call(ServerCall::AskUserQuestion {
+                    session_id: session_id.into(),
+                    auth_id: id.clone(),
+                    input: input.clone(),
+                })
+            } else {
+                Call(ServerCall::Approve {
+                    session_id: session_id.into(),
+                    auth_id: id.clone(),
+                    tool_name: tool_name.clone(),
+                    summary: summary.clone(),
+                    input: input.clone(),
+                })
+            }
+        }
         ThreadEvent::PrefixStability { .. }
         | ThreadEvent::CacheInvalidation { .. }
         | ThreadEvent::SideCallMetricsUpdated(_)
