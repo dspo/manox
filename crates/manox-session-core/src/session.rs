@@ -1561,7 +1561,7 @@ fn git_branch(dir: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, Once};
     use std::thread;
@@ -1569,14 +1569,14 @@ mod tests {
 
     /// Session-creating tests mutate `HOME` and initialize `OnceLock`
     /// globals, so they must not interleave with each other.
-    static GLOBALS_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static GLOBALS_LOCK: Mutex<()> = Mutex::new(());
     static HOME_ONCE: Once = Once::new();
     static INIT_ONCE: Once = Once::new();
 
     /// Take the suite serialization lock. A panic in one test poisons the
     /// mutex; recovering the guard keeps the failure contained instead of
     /// cascading into every later test in the process.
-    fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
         GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1584,7 +1584,7 @@ mod tests {
     /// config lookups stay out of the developer's real config. Never
     /// restored: the test process is disposable and provider registration
     /// reads `HOME` from a background thread.
-    fn hermetic_home() {
+    pub(crate) fn hermetic_home() {
         HOME_ONCE.call_once(|| {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1601,7 +1601,7 @@ mod tests {
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
     /// (`agent::init` would also boot MCP/LSP/plugin subsystems).
-    fn init_globals() {
+    pub(crate) fn init_globals() {
         INIT_ONCE.call_once(|| {
             agent::runtime::init();
             agent::pi_providers::init();

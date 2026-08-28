@@ -5543,11 +5543,13 @@ dependencies = [
  "async-trait",
  "chrono",
  "manox-protocol",
+ "parking_lot",
  "pi",
  "pi-extensions",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

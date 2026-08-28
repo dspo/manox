@@ -19,6 +19,8 @@ chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 manox-protocol.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 # The session tests swap scripted engines via `set_engine_for_test` and tear

@@ -11,6 +11,7 @@
 //! wire JSON; `model_chat` is the stateless bare-model completion channel
 //! shared with the VS Code language-model provider.
 
+pub mod agent_server;
 pub mod events;
 pub mod model_chat;
 pub mod session;
