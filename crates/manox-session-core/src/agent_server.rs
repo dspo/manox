@@ -343,6 +343,9 @@ impl AgentServerInner {
                 display_title: t.display_title(),
                 model_id: t.model().map(|m| m.id.clone()),
                 model_name: t.model().map(agent::pi_providers::display_name),
+                model: t
+                    .model()
+                    .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null)),
                 permission_mode: serde_json::to_value(t.permission_mode())
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_string))

@@ -19,6 +19,7 @@ pub struct ClientStore {
     pub display_title: String,
     pub model_id: Option<String>,
     pub model_name: Option<String>,
+    pub model: Option<serde_json::Value>,
     pub permission_mode: String,
     pub reasoning_effort: String,
     pub pinned: bool,
@@ -56,6 +57,7 @@ impl Default for ClientStore {
             display_title: String::new(),
             model_id: None,
             model_name: None,
+            model: None,
             permission_mode: String::new(),
             reasoning_effort: String::new(),
             pinned: false,
@@ -172,6 +174,7 @@ impl ClientStore {
         self.display_title = info.display_title.clone();
         self.model_id = info.model_id.clone();
         self.model_name = info.model_name.clone();
+        self.model = info.model.clone();
         self.permission_mode = info.permission_mode.clone();
         self.reasoning_effort = info.reasoning_effort.clone();
         self.pinned = info.pinned;
@@ -203,6 +206,7 @@ mod tests {
             display_title: "Test".into(),
             model_id: Some("claude-sonnet".into()),
             model_name: Some("Sonnet".into()),
+            model: None,
             permission_mode: "workspace-write".into(),
             reasoning_effort: "high".into(),
             pinned: false,

@@ -68,6 +68,8 @@ pub struct ThreadInfoPayload {
     pub display_title: String,
     pub model_id: Option<String>,
     pub model_name: Option<String>,
+    /// Full model descriptor serialized (provider, api, context_window, etc.).
+    pub model: Option<serde_json::Value>,
     pub permission_mode: String,
     pub reasoning_effort: String,
     pub pinned: bool,
@@ -413,6 +415,7 @@ mod tests {
             display_title: "Test".into(),
             model_id: Some("m1".into()),
             model_name: Some("Test Model".into()),
+            model: None,
             permission_mode: "read-only".into(),
             reasoning_effort: "low".into(),
             pinned: false,
