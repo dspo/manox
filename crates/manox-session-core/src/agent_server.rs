@@ -987,7 +987,18 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
             .find(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
             .map(|cid| {
                 let entry = clients.get(cid).expect("just checked");
-                let id = inner.next_call_id();
+                // Deterministic MsgId per kind so a client without bridge state
+                // can correlate its Reply: Approve/AskUser echo the auth_id the
+                // card carries; PlanVerdict uses the session id (one pending
+                // review per session); Other (β-3b-ii capability calls) mints a
+                // fresh opaque id.
+                let id = match &ctx {
+                    ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => {
+                        MsgId::new(auth_id.clone())
+                    }
+                    ReplyCtx::PlanVerdict { .. } => MsgId::new(session_id.to_string()),
+                    ReplyCtx::Other => inner.next_call_id(),
+                };
                 let rx = entry.peer.register(id.clone());
                 let conn = entry.conn.clone();
                 (conn, rx, id)
