@@ -42,6 +42,7 @@ pub struct ClientStore {
     pub background_tasks: Vec<Value>,
     pub cumulative_usage: Option<TokenUsageSnapshot>,
     pub per_model_usage: HashMap<String, TokenUsageSnapshot>,
+    pub last_token_usage: Option<TokenUsageSnapshot>,
     pub cumulative_cost: f64,
     pub per_model_cost: HashMap<String, f64>,
 }
@@ -78,6 +79,7 @@ impl Default for ClientStore {
             background_tasks: Vec::new(),
             cumulative_usage: None,
             per_model_usage: HashMap::new(),
+            last_token_usage: None,
             cumulative_cost: 0.0,
             per_model_cost: HashMap::new(),
         }
@@ -145,6 +147,20 @@ impl ClientStore {
                 self.per_model_usage = per_model.clone();
                 self.cumulative_cost = *cumulative_cost;
                 self.per_model_cost = per_model_cost.clone();
+            }
+            ServerNote::TokenUsage {
+                input,
+                output,
+                cache_creation,
+                cache_read,
+                ..
+            } => {
+                self.last_token_usage = Some(TokenUsageSnapshot {
+                    input: *input,
+                    output: *output,
+                    cache_creation: *cache_creation,
+                    cache_read: *cache_read,
+                });
             }
             _ => {}
         }
