@@ -46,6 +46,7 @@ pub struct ClientStore {
     pub last_token_usage: Option<TokenUsageSnapshot>,
     pub cumulative_cost: f64,
     pub per_model_cost: HashMap<String, f64>,
+    pub per_request_usage: HashMap<String, TokenUsageSnapshot>,
 }
 
 impl Default for ClientStore {
@@ -84,6 +85,7 @@ impl Default for ClientStore {
             last_token_usage: None,
             cumulative_cost: 0.0,
             per_model_cost: HashMap::new(),
+            per_request_usage: HashMap::new(),
         }
     }
 }
@@ -139,16 +141,18 @@ impl ClientStore {
                 }
             }
             ServerNote::UsageSnapshot {
+                session_id: _,
                 cumulative,
                 per_model,
                 cumulative_cost,
                 per_model_cost,
-                ..
+                per_request,
             } => {
                 self.cumulative_usage = Some(cumulative.clone());
                 self.per_model_usage = per_model.clone();
                 self.cumulative_cost = *cumulative_cost;
                 self.per_model_cost = per_model_cost.clone();
+                self.per_request_usage = per_request.clone();
             }
             ServerNote::TokenUsage {
                 input,
@@ -284,6 +288,7 @@ mod tests {
             per_model: HashMap::new(),
             cumulative_cost: 0.01,
             per_model_cost: HashMap::new(),
+            per_request: HashMap::new(),
         });
         assert_eq!(store.cumulative_usage.as_ref().unwrap().input, 100);
         assert!((store.cumulative_cost - 0.01).abs() < f64::EPSILON);

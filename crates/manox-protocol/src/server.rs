@@ -204,6 +204,7 @@ pub enum ServerNote {
         per_model: HashMap<String, TokenUsageSnapshot>,
         cumulative_cost: f64,
         per_model_cost: HashMap<String, f64>,
+        per_request: HashMap<String, TokenUsageSnapshot>,
     },
     CurrentModel {
         session_id: String,
@@ -460,6 +461,7 @@ mod tests {
             per_model: HashMap::new(),
             cumulative_cost: 0.01,
             per_model_cost: HashMap::new(),
+            per_request: HashMap::new(),
         };
         let json = serde_json::to_value(&note).unwrap();
         assert_eq!(json["method"], "usageSnapshot");
