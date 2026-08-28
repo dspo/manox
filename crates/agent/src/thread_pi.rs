@@ -32,7 +32,7 @@ use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
 /// Stable `Thread` id used for persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadId(pub String);
 
 /// Tool call status.
@@ -75,10 +75,11 @@ pub struct WorktreeState {
 }
 
 /// History-loading state of a thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HistoryPhase {
     /// No history pending (fresh / landing threads); the message list is
     /// final as soon as it exists.
+    #[default]
     Ready,
     /// An existing session is being restored. Display-only preview batches
     /// may stream into `messages` while the authoritative restore runs; the

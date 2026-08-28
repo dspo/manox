@@ -52,6 +52,7 @@ cx-providers.workspace = true
 # pi harness backend.
 pi = { workspace = true }
 pi-extensions = { workspace = true }
+manox-protocol.workspace = true
 
 
 [dev-dependencies]
