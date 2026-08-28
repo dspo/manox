@@ -166,6 +166,13 @@ pub enum ClientNote {
         request_id: String,
     },
     Shutdown,
+    /// Insert a user message without starting a turn (for batched flush:
+    /// multiple `AppendUserMessage` followed by one `Submit`).
+    AppendUserMessage {
+        session_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
     /// Persist a UI annotation (error/notice/plan-review) as a custom entry
     /// in the session jsonl at the current leaf.
     AppendUiNote {
