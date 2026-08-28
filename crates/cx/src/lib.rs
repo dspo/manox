@@ -2140,23 +2140,26 @@ async fn async_run_patch(source: Option<String>, url: Option<String>, refresh: b
     Ok(())
 }
 
-/// Replace providers by `name`; new providers are appended.
-/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
 /// Merge the top-level `subagents:` map per key: incoming entries override
 /// their own keys, local entries the patch source does not mention survive.
 /// The map is host-owned pinning (manox subagent dispatch consumes it), not
 /// patch content — a patch author carrying their own `subagents:` block must
-/// never silently erase unrelated local pins. Omitting the key cannot
-/// express "clear all": clearing stays a manual edit.
+/// never silently erase unrelated local pins. An empty map — whether the key
+/// is omitted or written explicitly as `subagents: {}` — cannot express
+/// "clear all"; clearing stays a manual edit.
 fn merge_subagents(
     existing: &BTreeMap<String, String>,
     incoming: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut merged = existing.clone();
-    merged.extend(incoming.clone());
+    for (key, value) in incoming {
+        merged.insert(key.clone(), value.clone());
+    }
     merged
 }
 
+/// Replace providers by `name`; new providers are appended.
+/// Preserves existing order; incoming replacements stay in-place, new items are appended at end.
 fn merge_providers(
     existing: &[ProviderConfig],
     incoming: &[ProviderConfig],

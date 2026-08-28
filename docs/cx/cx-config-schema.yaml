@@ -60,7 +60,8 @@ vscode_app:
 # key = subagent 类型名（Explore / Sailor / 用户与插件定义的 agent），
 # value = "provider::model::effort"：provider = 本文件中的 provider name（或其
 # "{name}-{wire_api}" 注册形态）；model = 该 provider 下的模型 id；effort ∈
-# off | low | medium | high | max（缺省 = 会话默认）。
+# off | low | medium | high | max（缺省 = 子会话默认，即 default_thinking_level
+# 按模型钳制）。
 subagents:
   Explore: "string (optional; provider::model::effort)"
 
@@ -85,3 +86,4 @@ subagents:
 #    - copilot + completions -> COPILOT_PROVIDER_TYPE=openai + WIRE_API=completions
 #    - claude  + anthropic   -> ANTHROPIC_BASE_URL / ANTHROPIC_MODEL
 #    - codex   + responses   -> 注入 synthetic provider config 后启动
+
