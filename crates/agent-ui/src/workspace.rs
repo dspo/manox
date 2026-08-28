@@ -4610,11 +4610,57 @@ impl Workspace {
         weak: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        self.append_user_turn(turn, weak, true, cx);
-        self.thread.update(cx, |thread, _| thread.run_turn());
-        // Persist on submit so the sidebar shows the new entry immediately.
-        refresh_thread_list();
-        cx.notify();
+        use agent::language_model::MessageContent;
+        use base64::Engine as _;
+        // UI state tracking (always) — conversation bubble + list housekeeping.
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(
+                turn.text.clone(),
+                turn.user_images.clone(),
+                turn.meta.clone(),
+                weak,
+                cx,
+            )
+        });
+        self.sync_list_count(cx);
+        self.follow_message_tail();
+        // Dual-path: protocol Submit (kernel inserts + runs) vs direct insert + run.
+        let attachments: Vec<manox_protocol::ImageAttachment> = turn
+            .images
+            .iter()
+            .filter_map(|c| match c {
+                MessageContent::Image { data, mime_type } => {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .ok()
+                        .map(|bytes| manox_protocol::ImageAttachment {
+                            data: bytes,
+                            mime_type: mime_type.clone(),
+                        })
+                }
+                _ => None,
+            })
+            .collect();
+        if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+            session_id: sid.into(),
+            text: turn.text.clone(),
+            images: attachments,
+            client_id: None,
+        }) {
+            self.thread.update(cx, |thread, _| {
+                if turn.images.is_empty() {
+                    thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui));
+                } else {
+                    let mut content = Vec::with_capacity(turn.images.len() + 1);
+                    if !turn.text.trim().is_empty() {
+                        content.push(MessageContent::Text(turn.text));
+                    }
+                    content.extend(turn.images);
+                    thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui));
+                }
+            });
+            self.thread.update(cx, |thread, _| thread.run_turn());
+        }
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -5567,10 +5613,17 @@ impl Workspace {
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        self.thread.update(cx, |thread, _| {
-            thread.insert_user_message_with_ui_metadata(text, Some(ui));
-            thread.run_turn();
-        });
+        if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+            session_id: sid.into(),
+            text: text.clone(),
+            images: Vec::new(),
+            client_id: None,
+        }) {
+            self.thread.update(cx, |thread, _| {
+                thread.insert_user_message_with_ui_metadata(text, Some(ui));
+                thread.run_turn();
+            });
+        }
         refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
