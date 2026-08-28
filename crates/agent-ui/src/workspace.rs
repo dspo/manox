@@ -319,6 +319,10 @@ pub struct Workspace {
     /// thread wires it.
     #[allow(dead_code)]
     pub(crate) client_conn: Option<manox_protocol::InProcessConnection>,
+    /// γ-3: the AgentServer session_id for the landing thread. Used as the
+    /// `session_id` field in `FromClient` commands.
+    #[allow(dead_code)]
+    pub(crate) session_id: Option<String>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -745,13 +749,14 @@ impl Workspace {
         let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
             cwd.clone(),
         ));
-        let (store, client_conn) = {
+        let (store, client_conn, session_id) = {
+            let session_id = uuid::Uuid::new_v4().to_string();
             let (client_conn, server_conn) = manox_protocol::in_process_pair();
             agent_server.accept(std::sync::Arc::new(server_conn));
             client_conn.send_to_server(manox_protocol::FromClient::Request {
                 id: manox_protocol::MsgId::new("init"),
                 call: manox_protocol::ClientCall::Initialize(manox_protocol::Initialize {
-                    client_id: format!("desktop-{}", uuid::Uuid::new_v4()),
+                    client_id: format!("desktop-{session_id}"),
                     capabilities: vec![
                         manox_protocol::handshake::HookKind::Approve,
                         manox_protocol::handshake::HookKind::PlanVerdict,
@@ -762,12 +767,12 @@ impl Workspace {
             });
             client_conn.send_to_server(manox_protocol::FromClient::Notification {
                 note: manox_protocol::ClientNote::CreateSession {
-                    session_id: uuid::Uuid::new_v4().to_string(),
+                    session_id: session_id.clone(),
                     cwd: Some(cwd.to_str().unwrap_or_default().into()),
                 },
             });
             let store = cx.new(|cx| ClientStoreHandle::new(client_conn.clone(), cx));
-            (store, client_conn)
+            (store, client_conn, session_id)
         };
 
         let input_state = cx.new(|cx| {
@@ -804,6 +809,7 @@ impl Workspace {
             store: Some(store),
             agent_server: Some(agent_server),
             client_conn: Some(client_conn),
+            session_id: Some(session_id),
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
@@ -1971,7 +1977,12 @@ impl Workspace {
                     store.with_mut(|s| s.archive_thread(id, *archived));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
-                    if is_current {
+                    if is_current
+                        && !this.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+                            session_id: sid.into(),
+                            archived: *archived,
+                        })
+                    {
                         this.thread.update(cx, |t, _| t.set_archived(*archived));
                     }
                     // Archiving the active thread navigates away to a fresh
@@ -4061,7 +4072,12 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.id.0.clone())
             .unwrap_or_else(|| self.thread.read(cx).id.0.clone());
-        self.thread.update(cx, |t, _| t.set_archived(true));
+        if !self.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+            session_id: sid.into(),
+            archived: true,
+        }) {
+            self.thread.update(cx, |t, _| t.set_archived(true));
+        }
         let store = agent::thread_store_global();
         store.with_mut(|s| s.archive_thread(&id, true));
         true
@@ -5895,9 +5911,26 @@ impl Workspace {
             .unwrap_or_else(|| self.thread.read(cx).plan_mode())
     }
 
+    /// Send a `ClientNote` to the AgentServer when the landing-thread
+    /// connection is available (γ-3 mutation path). Returns `true` when the
+    /// note was sent; the caller falls back to `self.thread.update` when `false`.
+    fn send_note(&self, note_fn: impl FnOnce(&str) -> manox_protocol::ClientNote) -> bool {
+        if let (Some(conn), Some(sid)) = (&self.client_conn, &self.session_id) {
+            conn.send_to_server(manox_protocol::FromClient::Notification { note: note_fn(sid) });
+            true
+        } else {
+            false
+        }
+    }
+
     /// Toggle plan mode on the current thread (persisted by the engine).
     pub(crate) fn set_thread_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.thread.update(cx, |t, _| t.set_plan_mode(enabled));
+        if !self.send_note(|sid| manox_protocol::ClientNote::SetPlanMode {
+            session_id: sid.into(),
+            enabled,
+        }) {
+            self.thread.update(cx, |t, _| t.set_plan_mode(enabled));
+        }
     }
 
     /// The user's verdict on a proposed plan (oh-my-pi's four options):
@@ -6314,7 +6347,12 @@ impl Workspace {
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             let model = model.clone();
                             let _ = ws.update(cx, |this, cx| {
-                                this.thread.update(cx, |t, _| t.set_model(model));
+                                if !this.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                                    session_id: sid.into(),
+                                    id: model.id.clone(),
+                                }) {
+                                    this.thread.update(cx, |t, _| t.set_model(model));
+                                }
                             });
                         }),
                     );
@@ -9446,7 +9484,12 @@ impl Workspace {
             PermissionMode::WorkspaceWrite => "workspacewrite",
             PermissionMode::DangerFullAccess => "dangerfullaccess",
         };
-        self.thread.update(cx, |t, _| t.set_permission_mode(mode));
+        if !self.send_note(|sid| manox_protocol::ClientNote::SetApprovalMode {
+            session_id: sid.into(),
+            mode: mode_key.into(),
+        }) {
+            self.thread.update(cx, |t, _| t.set_permission_mode(mode));
+        }
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
             NoticeAnchor::TurnEnd,
