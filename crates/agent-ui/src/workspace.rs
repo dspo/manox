@@ -1031,7 +1031,28 @@ impl Workspace {
                 .ok()
             })
             .unwrap_or_else(|| self.thread.read(cx).display_history());
-        let usage = self.thread.read(cx).request_token_usage();
+        let usage = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .per_request_usage
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            agent::TokenUsage {
+                                input_tokens: v.input,
+                                output_tokens: v.output,
+                                cache_creation_input_tokens: v.cache_creation,
+                                cache_read_input_tokens: v.cache_read,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).request_token_usage().clone());
         let role = self.model_label(cx);
         let weak = cx.weak_entity();
         let running = self
@@ -1211,7 +1232,30 @@ impl Workspace {
                             .unwrap_or_else(|| this.thread.read(cx).messages().to_vec());
                         if messages.len() > this.history_rendered {
                             let new_messages = messages[this.history_rendered..].to_vec();
-                            let usage = this.thread.read(cx).request_token_usage();
+                            let usage = this
+                                .store
+                                .as_ref()
+                                .map(|s| {
+                                    s.read(cx)
+                                        .store
+                                        .per_request_usage
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (
+                                                k.clone(),
+                                                agent::TokenUsage {
+                                                    input_tokens: v.input,
+                                                    output_tokens: v.output,
+                                                    cache_creation_input_tokens: v.cache_creation,
+                                                    cache_read_input_tokens: v.cache_read,
+                                                },
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| {
+                                    this.thread.read(cx).request_token_usage().clone()
+                                });
                             let role = this.model_label(cx);
                             let cwd = thread_cwd(&this.thread, &this.store, cx);
                             let weak = cx.weak_entity();
@@ -3632,7 +3676,28 @@ impl Workspace {
                 .ok()
             })
             .unwrap_or_else(|| self.thread.read(cx).display_history());
-        let usage = self.thread.read(cx).request_token_usage();
+        let usage = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .per_request_usage
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            agent::TokenUsage {
+                                input_tokens: v.input,
+                                output_tokens: v.output,
+                                cache_creation_input_tokens: v.cache_creation,
+                                cache_read_input_tokens: v.cache_read,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|| self.thread.read(cx).request_token_usage().clone());
         let background_tasks = self
             .store
             .as_ref()
