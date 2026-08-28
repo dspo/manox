@@ -7,6 +7,7 @@
 pub mod assets;
 pub mod browser_host;
 pub mod chatgpt_app;
+pub mod client_store;
 pub mod cockpit;
 pub mod conversation;
 pub mod dispatch;

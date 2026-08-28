@@ -196,6 +196,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "manox-components",
+ "manox-protocol",
  "manox-webview",
  "open",
  "pi",
