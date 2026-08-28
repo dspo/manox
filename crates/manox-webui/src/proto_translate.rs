@@ -19,7 +19,6 @@ use crate::bridge::ReadyKind;
 /// The `session_ready` metadata a create/open/plan_execute_fresh message
 /// announces (id, kind, cwd), mirroring `bridge::translate`'s ready tuple so
 /// the δ₁-b shuttle can pre-register `pending_ready` for `on_event`.
-#[allow(dead_code)] // wired into spawn_shuttle; spawn_pump rewire pending.
 pub fn webview_ready_metadata(msg: &Value, cwd: &str) -> Option<(String, ReadyKind, String)> {
     match msg["type"].as_str()? {
         "new_session" => {
@@ -44,7 +43,6 @@ pub fn webview_ready_metadata(msg: &Value, cwd: &str) -> Option<(String, ReadyKi
 
 /// Project one `ServerNote` onto the legacy WebUI JSON shape. `None` means
 /// the store does not render this note (consumed or unsupported).
-#[allow(dead_code)] // consumed by the δ₁-b bridge rewire (pump.rs), not yet wired.
 pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
     Some(match note {
         ServerNote::Ready => return None,
@@ -435,7 +433,6 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
 /// surface to the user) onto the legacy browser-card JSON the store renders.
 /// The WebUI answers via `webview_to_from_client` (`approve`/`plan_verdict`/
 /// `answer_question`), correlating by the id the AgentServer used as MsgId.
-#[allow(dead_code)] // wired into spawn_shuttle; spawn_pump rewire pending.
 pub fn server_call_to_webview_json(call: &ServerCall) -> Option<Value> {
     Some(match call {
         ServerCall::Approve {
@@ -492,7 +489,6 @@ pub fn server_call_to_webview_json(call: &ServerCall) -> Option<Value> {
 /// id the host already has — `approve`/`answer_question` use the auth_id,
 /// `plan_verdict` the session id — matching the AgentServer's deterministic
 /// `MsgId` per `ServerCall` kind, so no pending-id table is needed.
-#[allow(dead_code)] // consumed by the δ₁-b bridge rewire (pump.rs), not yet wired.
 pub fn webview_to_from_client(
     msg: &Value,
     cwd: &str,

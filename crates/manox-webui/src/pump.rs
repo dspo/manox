@@ -42,7 +42,13 @@ pub fn spawn_pump(cx: &mut App) {
     let cwd = crate::bridge::resolve_cwd();
     let server = AgentServer::new(std::path::PathBuf::from(cwd.clone()));
     cx.spawn(async move |cx| {
-        let mut shuttles: HashMap<u64, tokio::task::JoinHandle<()>> = HashMap::new();
+        let mut shuttles: HashMap<
+            u64,
+            (
+                tokio::task::JoinHandle<()>,
+                manox_protocol::InProcessConnection,
+            ),
+        > = HashMap::new();
         loop {
             while let Ok(msg) = main_rx.try_recv() {
                 match msg {
@@ -51,17 +57,18 @@ pub fn spawn_pump(cx: &mut App) {
                         server.accept(Arc::new(server_conn));
                         let pending_ready = Arc::new(std::sync::Mutex::new(HashMap::new()));
                         let shuttle = spawn_shuttle(
-                            client_conn,
+                            client_conn.clone(),
                             handle.cmd_rx,
                             handle.outbound.clone(),
                             pending_ready,
                             format!("webui-{}", handle.id),
                             cwd.clone(),
                         );
-                        shuttles.insert(handle.id, shuttle);
+                        shuttles.insert(handle.id, (shuttle, client_conn));
                     }
                     ToMain::Disconnect(id) => {
-                        if let Some(shuttle) = shuttles.remove(&id) {
+                        if let Some((shuttle, conn)) = shuttles.remove(&id) {
+                            conn.disconnect();
                             shuttle.abort();
                         }
                     }
