@@ -47,6 +47,9 @@ pub struct ClientStore {
     pub cumulative_cost: f64,
     pub per_model_cost: HashMap<String, f64>,
     pub per_request_usage: HashMap<String, TokenUsageSnapshot>,
+    /// Pending adjudication ServerCall (Approve/AskUser) from the AgentServer,
+    /// keyed by `auth_id`. The workspace uses the MsgId to send the reply.
+    pub pending_auth: HashMap<String, manox_protocol::MsgId>,
 }
 
 impl Default for ClientStore {
@@ -86,6 +89,7 @@ impl Default for ClientStore {
             cumulative_cost: 0.0,
             per_model_cost: HashMap::new(),
             per_request_usage: HashMap::new(),
+            pending_auth: HashMap::new(),
         }
     }
 }

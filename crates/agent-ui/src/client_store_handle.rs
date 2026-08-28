@@ -21,11 +21,22 @@ impl ClientStoreHandle {
         let server_rx = client.server_rx();
         let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
             while let Ok(msg) = server_rx.recv().await {
-                if let FromServer::Notification { note } = msg {
-                    let _ = this.update(cx, |h, cx| {
-                        h.store.apply_server_note(&note);
-                        cx.notify();
-                    });
+                match msg {
+                    FromServer::Notification { note } => {
+                        let _ = this.update(cx, |h, cx| {
+                            h.store.apply_server_note(&note);
+                            cx.notify();
+                        });
+                    }
+                    FromServer::Request { id, call } => {
+                        let _ = this.update(cx, |h, cx| {
+                            if let Some(auth_id) = auth_id_of(&call) {
+                                h.store.pending_auth.insert(auth_id, id);
+                                cx.notify();
+                            }
+                        });
+                    }
+                    FromServer::Response { .. } => {}
                 }
             }
         });
@@ -139,5 +150,16 @@ mod tests {
         );
         assert_eq!(entity.update(cx, |h, _| h.store.cwd.clone()), "/proj");
         assert!(!entity.update(cx, |h, _| h.store.running));
+    }
+}
+
+/// Extract the `auth_id` from an adjudication ServerCall (Approve/AskUser).
+fn auth_id_of(call: &manox_protocol::ServerCall) -> Option<String> {
+    use manox_protocol::ServerCall;
+    match call {
+        ServerCall::Approve { auth_id, .. } | ServerCall::AskUserQuestion { auth_id, .. } => {
+            Some(auth_id.clone())
+        }
+        _ => None,
     }
 }
