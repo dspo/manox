@@ -350,11 +350,20 @@ impl TerminalHandle {
             },
             // OSC 52 read: load the clipboard, let the TUI's callback format
             // its response, write that back to the PTY so the application can
-            // read it. Fail closed: without a provider the response is built
-            // from empty text, so no clipboard content is ever injected.
+            // read it. The read is a frontend round-trip, so it runs on its
+            // own task rather than blocking this pump. Fail closed: without a
+            // provider (or on error) the response is built from empty text,
+            // so no clipboard content is ever injected.
             TerminalEvent::ClipboardLoad(cb) => {
-                let text = match agent::capability::provider() {
-                    Some(p) => match p.clipboard_read() {
+                let Some(p) = agent::capability::provider().cloned() else {
+                    tracing::warn!("no clipboard capability provider; OSC 52 paste returns empty");
+                    let response = cb("");
+                    let _ = self.read(|t| t.input(response.as_bytes()));
+                    return;
+                };
+                let handle = self.clone();
+                crate::runtime::handle().spawn(async move {
+                    let text = match p.clipboard_read().await {
                         Ok(Some(s)) => s,
                         Ok(None) => String::new(),
                         Err(e) => {
@@ -364,16 +373,10 @@ impl TerminalHandle {
                             );
                             String::new()
                         }
-                    },
-                    None => {
-                        tracing::warn!(
-                            "no clipboard capability provider; OSC 52 paste returns empty"
-                        );
-                        String::new()
-                    }
-                };
-                let response = cb(&text);
-                let _ = self.read(|t| t.input(response.as_bytes()));
+                    };
+                    let response = cb(&text);
+                    let _ = handle.read(|t| t.input(response.as_bytes()));
+                });
             }
             // Bytes the TUI emitted via the terminal (rare; e.g. some DCS
             // responses). Forward to the PTY verbatim.
