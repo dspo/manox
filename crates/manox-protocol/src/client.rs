@@ -117,6 +117,10 @@ pub enum ClientNote {
         session_id: String,
         mode: String,
     },
+    SetCwd {
+        session_id: String,
+        cwd: String,
+    },
     SetPlanMode {
         session_id: String,
         enabled: bool,
