@@ -26,7 +26,7 @@ pub mod msg;
 pub mod server;
 pub mod transport;
 
-pub use client::{ClientCall, ClientNote};
+pub use client::{ClientCall, ClientNote, ImageAttachment};
 pub use handshake::{ClientHello, HookKind, Initialize};
 pub use msg::{FromClient, FromServer, MsgId, RpcError};
 pub use server::{ServerCall, ServerNote};
