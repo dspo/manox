@@ -10,7 +10,8 @@
 //! (noted inline) and pass through best-effort — the spine (dispatch + pump +
 //! routing) is the validation target, display polish is follow-up.
 
-use manox_protocol::ServerNote;
+use manox_protocol::client::ImageAttachment;
+use manox_protocol::{ClientCall, ClientNote, FromClient, MsgId, ServerNote};
 use serde_json::{Value, json};
 
 /// Project one `ServerNote` onto the legacy WebUI JSON shape. `None` means
@@ -402,6 +403,254 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
     })
 }
 
+/// Translate one `WebviewToHost` message into the protocol `FromClient`
+/// sequence it maps to. Pure (no bridge state): adjudication replies echo the
+/// id the host already has — `approve`/`answer_question` use the auth_id,
+/// `plan_verdict` the session id — matching the AgentServer's deterministic
+/// `MsgId` per `ServerCall` kind, so no pending-id table is needed.
+#[allow(dead_code)] // consumed by the δ₁-b bridge rewire (pump.rs), not yet wired.
+pub fn webview_to_from_client(msg: &Value, cwd: &str) -> Vec<FromClient> {
+    let ty = msg["type"].as_str().unwrap_or("");
+    let sid = msg["sessionId"].as_str().map(str::to_string);
+    fn img(msg: &Value) -> Vec<ImageAttachment> {
+        msg.get("images")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|i| {
+                        let data = i.get("data")?.as_str().and_then(base64_decode)?;
+                        Some(ImageAttachment {
+                            data,
+                            mime_type: i
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .into(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    match ty {
+        "submit" => vec![FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: sid.unwrap_or_default(),
+                text: msg["text"].as_str().unwrap_or_default().to_string(),
+                images: img(msg),
+                client_id: msg["clientId"].as_str().map(str::to_string),
+            },
+        }],
+        "steer" => vec![FromClient::Notification {
+            note: ClientNote::Steer {
+                session_id: sid.unwrap_or_default(),
+                client_id: msg["clientId"].as_str().unwrap_or_default().to_string(),
+                text: msg["text"].as_str().unwrap_or_default().to_string(),
+                images: img(msg),
+            },
+        }],
+        "drop_queued" => vec![FromClient::Notification {
+            note: ClientNote::DropQueued {
+                session_id: sid.unwrap_or_default(),
+                client_id: msg["clientId"].as_str().unwrap_or_default().to_string(),
+            },
+        }],
+        // The client answers a ServerCall::Approve; the id is the auth_id the
+        // AgentServer used as the MsgId.
+        "approve" => vec![FromClient::Reply {
+            id: MsgId::new(msg["id"].as_str().unwrap_or_default()),
+            outcome: Ok(json!({"allow": msg["allow"]})),
+        }],
+        "answer_question" => vec![FromClient::Reply {
+            id: MsgId::new(msg["id"].as_str().unwrap_or_default()),
+            outcome: Ok(json!({"answers": msg["answers"], "response": msg["response"]})),
+        }],
+        // plan_verdict has no id; the AgentServer used the session id as the MsgId.
+        "plan_verdict" => vec![FromClient::Reply {
+            id: MsgId::new(sid.clone().unwrap_or_default()),
+            outcome: Ok(json!({"choice": msg["choice"]})),
+        }],
+        "cancel" => vec![FromClient::Notification {
+            note: ClientNote::CancelTurn {
+                session_id: sid.unwrap_or_default(),
+            },
+        }],
+        "set_model" => vec![FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: sid.unwrap_or_default(),
+                id: msg["id"].as_str().unwrap_or_default().to_string(),
+            },
+        }],
+        "set_reasoning_effort" => vec![FromClient::Notification {
+            note: ClientNote::SetReasoningEffort {
+                session_id: sid.unwrap_or_default(),
+                effort: msg["effort"].as_str().unwrap_or_default().to_string(),
+            },
+        }],
+        "set_approval_mode" => vec![FromClient::Notification {
+            note: ClientNote::SetApprovalMode {
+                session_id: sid.unwrap_or_default(),
+                mode: msg["mode"].as_str().unwrap_or_default().to_string(),
+            },
+        }],
+        "set_plan_mode" => vec![FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: sid.unwrap_or_default(),
+                enabled: msg["enabled"].as_bool().unwrap_or(false),
+            },
+        }],
+        "goal" => vec![FromClient::Notification {
+            note: ClientNote::Goal {
+                session_id: sid.unwrap_or_default(),
+                action: msg["action"].as_str().unwrap_or_default().to_string(),
+                objective: msg["objective"].as_str().map(str::to_string),
+                budget: msg["budget"].as_u64(),
+                max_rounds: None,
+            },
+        }],
+        "stop_background_task" => vec![FromClient::Notification {
+            note: ClientNote::StopBackgroundTask {
+                task_id: msg["taskId"].as_str().unwrap_or_default().to_string(),
+                session_id: sid.unwrap_or_default(),
+            },
+        }],
+        "archive_thread" => vec![FromClient::Notification {
+            note: ClientNote::ArchiveThread {
+                session_id: sid.unwrap_or_default(),
+                archived: msg["archived"].as_bool().unwrap_or(true),
+            },
+        }],
+        "pin_thread" => vec![FromClient::Notification {
+            note: ClientNote::PinThread {
+                session_id: sid.unwrap_or_default(),
+                pinned: msg["pinned"].as_bool().unwrap_or(true),
+            },
+        }],
+        "focus_thread" => vec![FromClient::Notification {
+            note: ClientNote::FocusThread { session_id: sid },
+        }],
+        "request_models" => vec![FromClient::Request {
+            id: MsgId::new("list_models"),
+            call: ClientCall::ListModels,
+        }],
+        "request_usage" => vec![FromClient::Request {
+            id: MsgId::new("get_usage"),
+            call: ClientCall::GetUsage {
+                session_id: sid.unwrap_or_default(),
+            },
+        }],
+        "request_thread_info" => vec![FromClient::Request {
+            id: MsgId::new("thread_info"),
+            call: ClientCall::ThreadInfo {
+                session_id: sid.unwrap_or_default(),
+            },
+        }],
+        "list_threads" => vec![FromClient::Request {
+            id: MsgId::new("list_threads"),
+            call: ClientCall::ListThreads,
+        }],
+        "list_commands" => vec![FromClient::Request {
+            id: MsgId::new("list_commands"),
+            call: ClientCall::ListCommands,
+        }],
+        "open_thread" => {
+            let Some(id) = sid else { return vec![] };
+            vec![
+                FromClient::Request {
+                    id: MsgId::new("open"),
+                    call: ClientCall::OpenSession {
+                        session_id: id.clone(),
+                    },
+                },
+                FromClient::Request {
+                    id: MsgId::new("cur_model"),
+                    call: ClientCall::GetCurrentModel { session_id: id },
+                },
+            ]
+        }
+        "new_session" => {
+            let id = sid.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let mut out = vec![FromClient::Notification {
+                note: ClientNote::CreateSession {
+                    session_id: id.clone(),
+                    cwd: Some(cwd.to_string()),
+                },
+            }];
+            if let Some(model) = msg["modelId"].as_str() {
+                out.push(FromClient::Notification {
+                    note: ClientNote::SetModel {
+                        session_id: id.clone(),
+                        id: model.to_string(),
+                    },
+                });
+            }
+            out.push(FromClient::Request {
+                id: MsgId::new("cur_model"),
+                call: ClientCall::GetCurrentModel {
+                    session_id: id.clone(),
+                },
+            });
+            if msg["text"].as_str().is_some()
+                || msg
+                    .get("images")
+                    .is_some_and(|a| a.as_array().is_some_and(|a| !a.is_empty()))
+            {
+                out.push(FromClient::Notification {
+                    note: ClientNote::Submit {
+                        session_id: id,
+                        text: msg["text"].as_str().unwrap_or_default().to_string(),
+                        images: img(msg),
+                        client_id: None,
+                    },
+                });
+            }
+            out
+        }
+        "plan_execute_fresh" => {
+            let Some(plan_file) = msg["planFile"].as_str() else {
+                return vec![];
+            };
+            let Some(cwd) = msg["cwd"]
+                .as_str()
+                .map(str::to_string)
+                .or(Some(cwd.to_string()))
+            else {
+                return vec![];
+            };
+            let fresh = uuid::Uuid::new_v4().to_string();
+            let mut out = Vec::new();
+            if let Some(old) = sid {
+                out.push(FromClient::Notification {
+                    note: ClientNote::ArchiveThread {
+                        session_id: old,
+                        archived: true,
+                    },
+                });
+            }
+            out.push(FromClient::Notification {
+                note: ClientNote::CreateSession {
+                    session_id: fresh.clone(),
+                    cwd: Some(cwd),
+                },
+            });
+            out.push(FromClient::Notification {
+                note: ClientNote::PlanSeedExecution {
+                    session_id: fresh,
+                    plan_file: plan_file.to_string(),
+                },
+            });
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// Decode a base64 data-URL/standalone string into bytes (the WebUI ships
+/// image bytes base64-encoded; the protocol `ImageAttachment.data` is raw).
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).ok()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +795,150 @@ mod tests {
             })
             .is_none()
         );
+    }
+    #[test]
+    fn forward_submit_maps_to_client_note() {
+        let msg = json!({"type":"submit","sessionId":"s1","text":"hi","clientId":"c1"});
+        let out = webview_to_from_client(&msg, "/");
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out[0],
+            FromClient::Notification { note: ClientNote::Submit { ref session_id, .. } } if session_id == "s1"
+        ));
+    }
+
+    #[test]
+    fn forward_approve_is_reply_with_auth_id() {
+        let msg = json!({"type":"approve","sessionId":"s1","id":"a1","allow":true});
+        let out = webview_to_from_client(&msg, "/");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            FromClient::Reply { id, outcome } => {
+                assert_eq!(id.0, "a1");
+                assert!(outcome.is_ok());
+            }
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn forward_plan_verdict_uses_session_id_as_msgid() {
+        let msg = json!({"type":"plan_verdict","sessionId":"pg","choice":"execute_keep"});
+        let out = webview_to_from_client(&msg, "/");
+        match &out[0] {
+            FromClient::Reply { id, .. } => assert_eq!(id.0, "pg"),
+            _ => panic!("expected Reply"),
+        }
+    }
+
+    #[test]
+    fn forward_new_session_orchestrates() {
+        let msg = json!({"type":"new_session","sessionId":"n1","modelId":"m1","text":"go"});
+        let out = webview_to_from_client(&msg, "/");
+        assert!(out.len() >= 3); // CreateSession + SetModel + GetCurrentModel + Submit
+        assert!(matches!(
+            out[0],
+            FromClient::Notification {
+                note: ClientNote::CreateSession { .. }
+            }
+        ));
+    }
+    #[test]
+    fn forward_maps_each_message_type() {
+        // Every WebviewToHost type must produce at least one FromClient.
+        let cwd = "/proj";
+        let cases: &[(&str, Value)] = &[
+            (
+                "submit",
+                json!({"type":"submit","sessionId":"s1","text":"hi"}),
+            ),
+            (
+                "steer",
+                json!({"type":"steer","sessionId":"s1","clientId":"c1","text":"hi"}),
+            ),
+            (
+                "drop_queued",
+                json!({"type":"drop_queued","sessionId":"s1","clientId":"c1"}),
+            ),
+            (
+                "approve",
+                json!({"type":"approve","sessionId":"s1","id":"a1","allow":true}),
+            ),
+            (
+                "answer_question",
+                json!({"type":"answer_question","sessionId":"s1","id":"q1","answers":[["a","b"]],"response":"r"}),
+            ),
+            (
+                "plan_verdict",
+                json!({"type":"plan_verdict","sessionId":"s1","choice":"execute_keep"}),
+            ),
+            ("cancel", json!({"type":"cancel","sessionId":"s1"})),
+            (
+                "set_model",
+                json!({"type":"set_model","sessionId":"s1","id":"m1"}),
+            ),
+            (
+                "set_reasoning_effort",
+                json!({"type":"set_reasoning_effort","sessionId":"s1","effort":"high"}),
+            ),
+            (
+                "set_approval_mode",
+                json!({"type":"set_approval_mode","sessionId":"s1","mode":"danger-full-access"}),
+            ),
+            (
+                "set_plan_mode",
+                json!({"type":"set_plan_mode","sessionId":"s1","enabled":true}),
+            ),
+            (
+                "goal",
+                json!({"type":"goal","sessionId":"s1","action":"create","objective":"x"}),
+            ),
+            (
+                "stop_background_task",
+                json!({"type":"stop_background_task","sessionId":"s1","taskId":"t1"}),
+            ),
+            (
+                "archive_thread",
+                json!({"type":"archive_thread","sessionId":"s1","archived":true}),
+            ),
+            (
+                "pin_thread",
+                json!({"type":"pin_thread","sessionId":"s1","pinned":true}),
+            ),
+            (
+                "focus_thread",
+                json!({"type":"focus_thread","sessionId":"s1"}),
+            ),
+            ("request_models", json!({"type":"request_models"})),
+            (
+                "request_usage",
+                json!({"type":"request_usage","sessionId":"s1"}),
+            ),
+            (
+                "request_thread_info",
+                json!({"type":"request_thread_info","sessionId":"s1"}),
+            ),
+            ("list_threads", json!({"type":"list_threads"})),
+            ("list_commands", json!({"type":"list_commands"})),
+            (
+                "open_thread",
+                json!({"type":"open_thread","sessionId":"s1"}),
+            ),
+            (
+                "new_session",
+                json!({"type":"new_session","sessionId":"n1"}),
+            ),
+            (
+                "plan_execute_fresh",
+                json!({"type":"plan_execute_fresh","sessionId":"old","planFile":"/p.md","cwd":"/proj"}),
+            ),
+        ];
+        for (ty, msg) in cases {
+            let out = webview_to_from_client(msg, cwd);
+            assert!(
+                !out.is_empty(),
+                "WebviewToHost `{ty}` produced no FromClient"
+            );
+        }
     }
 }
