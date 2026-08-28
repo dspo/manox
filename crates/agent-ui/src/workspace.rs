@@ -305,9 +305,7 @@ pub struct Workspace {
     /// until the workspace creates the AgentServer connection (landing
     /// thread); views dual-read store-if-present else `ThreadProxy`. Held on
     /// the workspace for the next wiring step (re-handling the store on
-    /// thread switch) — written at landing, read there, so `dead_code` is
-    /// allowed until then.
-    #[allow(dead_code)]
+    /// thread switch) — written at landing, read there.
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
     /// The shared AgentServer this desktop connects to. `None` until the
     /// landing-thread wiring creates it; the bin may inject its own instance.
@@ -317,11 +315,9 @@ pub struct Workspace {
     /// γ-3: the client-side connection for sending `FromClient` commands to the
     /// AgentServer (replacing ThreadProxy mutations). None until the landing
     /// thread wires it.
-    #[allow(dead_code)]
     pub(crate) client_conn: Option<manox_protocol::InProcessConnection>,
     /// γ-3: the AgentServer session_id for the landing thread. Used as the
     /// `session_id` field in `FromClient` commands.
-    #[allow(dead_code)]
     pub(crate) session_id: Option<String>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
