@@ -32,18 +32,13 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             _ => Vec::new(),
         },
         AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
-            Some(PiStopReason::Stop) => vec![ThreadEvent::Stop(ManoxStopReason::EndTurn)],
-            Some(PiStopReason::Length) => vec![ThreadEvent::Stop(ManoxStopReason::MaxTokens)],
-            Some(PiStopReason::ToolUse) => vec![ThreadEvent::Stop(ManoxStopReason::ToolUse)],
-            Some(PiStopReason::Aborted) => {
-                vec![ThreadEvent::Stop(ManoxStopReason::Cancelled)]
-            }
             Some(PiStopReason::Error) => {
                 vec![ThreadEvent::Error(anyhow::anyhow!(
                     "{}",
                     message_error_text(message)
                 ))]
             }
+            Some(reason) => vec![ThreadEvent::Stop(manox_stop_reason_of(&reason))],
             None => Vec::new(),
         },
         AgentEvent::ToolExecutionStart {
@@ -169,6 +164,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
                                 id: child_id,
                                 name: name.to_string(),
                                 is_error,
+                                output: String::new(),
                             },
                         });
                         events.push(activity(format!(
@@ -451,6 +447,18 @@ fn message_error_text(message: &AgentMessage) -> String {
             .clone()
             .unwrap_or_else(|| "the pi session hit an error".to_string()),
         _ => "the pi session hit an error".to_string(),
+    }
+}
+
+/// Map a pi stop reason onto the manox shape. `Error` never routes through
+/// this helper: callers surface it as an `Error` event instead of a stop.
+fn manox_stop_reason_of(reason: &PiStopReason) -> ManoxStopReason {
+    match reason {
+        PiStopReason::Stop => ManoxStopReason::EndTurn,
+        PiStopReason::Length => ManoxStopReason::MaxTokens,
+        PiStopReason::ToolUse => ManoxStopReason::ToolUse,
+        PiStopReason::Aborted => ManoxStopReason::Cancelled,
+        PiStopReason::Error => ManoxStopReason::EndTurn,
     }
 }
 
@@ -739,6 +747,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,
+            result,
             is_error,
             ..
         } => vec![ThreadEvent::SubagentChild {
@@ -747,6 +756,41 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
                 id: tool_call_id.clone(),
                 name: tool_name.clone(),
                 is_error: *is_error,
+                output: tool_result_text(result),
+            },
+        }],
+        // The child's assistant message finished streaming. The stop reason
+        // mirrors the main thread's `MessageEnd` mapping; the message usage
+        // rides along so the panel can stamp the just-finished reply.
+        AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
+            Some(PiStopReason::Error) => vec![ThreadEvent::SubagentChild {
+                id: id.to_string(),
+                child: crate::thread::SubagentChildEvent::Error(message_error_text(message)),
+            }],
+            Some(reason) => {
+                let usage = match &**message {
+                    AgentMessage::Assistant { usage, .. } => Some(super::to_token_usage(usage)),
+                    _ => None,
+                };
+                vec![ThreadEvent::SubagentChild {
+                    id: id.to_string(),
+                    child: crate::thread::SubagentChildEvent::Stop {
+                        reason: manox_stop_reason_of(&reason),
+                        usage,
+                    },
+                }]
+            }
+            None => Vec::new(),
+        },
+        // Run boundary the panel needs even though the main thread's facade
+        // owns it: the last `MessageEnd` already sealed the tail, so this is
+        // an idempotent backstop for runs that ended without one (provider
+        // error streams that only emitted `Error`, aborts).
+        AgentEvent::AgentEnd { .. } => vec![ThreadEvent::SubagentChild {
+            id: id.to_string(),
+            child: crate::thread::SubagentChildEvent::Stop {
+                reason: ManoxStopReason::EndTurn,
+                usage: None,
             },
         }],
         _ => Vec::new(),
@@ -1058,5 +1102,181 @@ mod tests {
         let long = "y".repeat(50);
         let title = tool_title("mcp_long", &json!({"text": long}));
         assert_eq!(title, format!("mcp_long {}…", "y".repeat(40)));
+    }
+
+    fn assistant_msg(
+        stop_reason: Option<pi::types::StopReason>,
+        input_tokens: u64,
+    ) -> pi::types::AgentMessage {
+        pi::types::AgentMessage::Assistant {
+            content: vec![],
+            model: "m".into(),
+            provider: "p".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason,
+            raw_stop_reason: None,
+            usage: Box::new(pi::types::Usage {
+                input_tokens,
+                output_tokens: 7,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                total_tokens: 0,
+                reasoning_tokens: None,
+                cost: None,
+                cache_write_1h: None,
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn child_events_of_msg_end(stop_reason: pi::types::StopReason) -> Vec<ThreadEvent> {
+        child_events_of(
+            "sub-1",
+            &pi::types::AgentEvent::MessageEnd {
+                message: Box::new(assistant_msg(Some(stop_reason), 11)),
+            },
+        )
+    }
+
+    /// The child's message boundary maps onto `Stop` with the manox reason
+    /// and the message's token usage, mirroring the main thread's mapping.
+    #[test]
+    fn child_message_end_maps_to_stop_with_usage() {
+        let events = child_events_of_msg_end(pi::types::StopReason::ToolUse);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::thread::ThreadEvent::SubagentChild {
+                id,
+                child: crate::thread::SubagentChildEvent::Stop { reason, usage },
+            } => {
+                assert_eq!(id, "sub-1");
+                assert_eq!(*reason, ManoxStopReason::ToolUse);
+                let usage = usage.as_ref().unwrap();
+                assert_eq!(usage.input_tokens, 11);
+                assert_eq!(usage.output_tokens, 7);
+            }
+            other => panic!("expected Stop, got {other:?}"),
+        }
+
+        let events = child_events_of_msg_end(pi::types::StopReason::Stop);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::EndTurn,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let events = child_events_of_msg_end(pi::types::StopReason::Length);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::MaxTokens,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let events = child_events_of_msg_end(pi::types::StopReason::Aborted);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::Cancelled,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    /// A terminal provider error message maps onto `Error` with its text.
+    #[test]
+    fn child_error_message_maps_to_error_event() {
+        let message = pi::types::AgentMessage::Assistant {
+            content: vec![],
+            model: "m".into(),
+            provider: "p".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            stop_reason: Some(pi::types::StopReason::Error),
+            raw_stop_reason: None,
+            usage: Box::new(pi::types::Usage::default()),
+            error_message: Some("context window exhausted".into()),
+            timestamp: chrono::Utc::now(),
+        };
+        let events = child_events_of(
+            "sub-1",
+            &pi::types::AgentEvent::MessageEnd {
+                message: Box::new(message),
+            },
+        );
+        match &events[0] {
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Error(text),
+                ..
+            } => assert_eq!(text, "context window exhausted"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A finished tool call carries the result text for the tool card, and
+    /// the run boundary seals the transcript (idempotent with the last
+    /// `MessageEnd` stop).
+    #[test]
+    fn child_tool_end_carries_output_and_agent_end_seals() {
+        let events = child_events_of(
+            "sub-1",
+            &pi::types::AgentEvent::ToolExecutionEnd {
+                tool_call_id: "c1".into(),
+                tool_name: "Read".into(),
+                result: pi::tool::AgentToolResult::text("found it"),
+                is_error: false,
+            },
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            crate::thread::ThreadEvent::SubagentChild {
+                child:
+                    crate::thread::SubagentChildEvent::ToolEnd {
+                        id,
+                        output,
+                        is_error,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(id, "c1");
+                assert_eq!(output, "found it");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolEnd, got {other:?}"),
+        }
+
+        let events = child_events_of(
+            "sub-1",
+            &pi::types::AgentEvent::AgentEnd { messages: vec![] },
+        );
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::EndTurn,
+                    usage: None,
+                },
+                ..
+            }
+        ));
     }
 }
