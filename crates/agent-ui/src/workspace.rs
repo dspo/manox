@@ -5891,9 +5891,13 @@ impl Workspace {
 
     /// Abort the current turn.
     pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        self.thread.update(cx, |thread, _| {
-            thread.cancel();
-        });
+        if !self.send_note(|sid| manox_protocol::ClientNote::CancelTurn {
+            session_id: sid.into(),
+        }) {
+            self.thread.update(cx, |thread, _| {
+                thread.cancel();
+            });
+        }
         cx.notify();
     }
 
@@ -7016,18 +7020,26 @@ impl Workspace {
                                 .small()
                                 .label(pause_label)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.thread.update(cx, |t, cx| {
-                                        if let Err(error) = t.set_goal_status(
-                                            agent::goal::GoalStatus::Paused,
-                                            Some(agent::goal::GoalBlockReason {
-                                                code: "user-paused".into(),
-                                                message: "paused by user".into(),
-                                            }),
-                                            agent::db::GoalActor::User,
-                                        ) {
-                                            cx.emit(ThreadEvent::Error(error));
-                                        }
-                                    });
+                                    if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                        session_id: sid.into(),
+                                        action: "pause".into(),
+                                        objective: None,
+                                        budget: None,
+                                        max_rounds: None,
+                                    }) {
+                                        this.thread.update(cx, |t, cx| {
+                                            if let Err(error) = t.set_goal_status(
+                                                agent::goal::GoalStatus::Paused,
+                                                Some(agent::goal::GoalBlockReason {
+                                                    code: "user-paused".into(),
+                                                    message: "paused by user".into(),
+                                                }),
+                                                agent::db::GoalActor::User,
+                                            ) {
+                                                cx.emit(ThreadEvent::Error(error));
+                                            }
+                                        });
+                                    }
                                 })),
                         )
                     })
@@ -7042,15 +7054,23 @@ impl Workspace {
                                     .small()
                                     .label(resume_label)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.thread.update(cx, |t, cx| {
-                                            if let Err(error) = t.set_goal_status(
-                                                agent::goal::GoalStatus::Active,
-                                                None,
-                                                agent::db::GoalActor::User,
-                                            ) {
-                                                cx.emit(ThreadEvent::Error(error));
-                                            }
-                                        });
+                                        if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                            session_id: sid.into(),
+                                            action: "resume".into(),
+                                            objective: None,
+                                            budget: None,
+                                            max_rounds: None,
+                                        }) {
+                                            this.thread.update(cx, |t, cx| {
+                                                if let Err(error) = t.set_goal_status(
+                                                    agent::goal::GoalStatus::Active,
+                                                    None,
+                                                    agent::db::GoalActor::User,
+                                                ) {
+                                                    cx.emit(ThreadEvent::Error(error));
+                                                }
+                                            });
+                                        }
                                     })),
                             )
                         },
@@ -7142,11 +7162,20 @@ impl Workspace {
                             .small()
                             .label(clear_label)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.thread.update(cx, |t, cx| {
-                                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User) {
-                                        cx.emit(ThreadEvent::Error(error));
-                                    }
-                                });
+                                if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                    session_id: sid.into(),
+                                    action: "clear".into(),
+                                    objective: None,
+                                    budget: None,
+                                    max_rounds: None,
+                                }) {
+                                    this.thread.update(cx, |t, cx| {
+                                        if let Err(error) = t.clear_goal(agent::db::GoalActor::User)
+                                        {
+                                            cx.emit(ThreadEvent::Error(error));
+                                        }
+                                    });
+                                }
                                 this.goal_popover_open = false;
                                 cx.notify();
                             })),
