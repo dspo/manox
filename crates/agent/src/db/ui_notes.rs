@@ -51,7 +51,7 @@ pub struct PositionedNote {
 /// One element of the display sequence the engine mirror and the
 /// conversation rebuild share: messages interleaved with the UI annotation
 /// cards that landed between them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HistoryEntry {
     Message(crate::message::Message),
     Note(UiNoteRecord),
