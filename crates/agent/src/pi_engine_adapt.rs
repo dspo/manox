@@ -1173,6 +1173,30 @@ mod tests {
                 ..
             }
         ));
+
+        let events = child_events_of_msg_end(pi::types::StopReason::Length);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::MaxTokens,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let events = child_events_of_msg_end(pi::types::StopReason::Aborted);
+        assert!(matches!(
+            &events[0],
+            crate::thread::ThreadEvent::SubagentChild {
+                child: crate::thread::SubagentChildEvent::Stop {
+                    reason: ManoxStopReason::Cancelled,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     /// A terminal provider error message maps onto `Error` with its text.

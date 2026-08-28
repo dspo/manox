@@ -179,7 +179,7 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
                 }),
                 agent::SubagentChildEvent::Stop { reason, usage } => json!({
                     "kind": "stop",
-                    "reason": format!("{reason:?}"),
+                    "reason": serde_json::to_value(reason).unwrap_or(Value::Null),
                     "usage": usage,
                 }),
                 agent::SubagentChildEvent::Error(text) => json!({
