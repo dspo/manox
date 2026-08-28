@@ -40,6 +40,7 @@ impl ReadyKind {
 }
 
 /// Per-connection wire state owned by the main-thread pump.
+#[allow(dead_code)] // legacy handle_command path; retired by δ₁-b; δ₂ removes.
 pub(crate) struct BridgeState {
     /// `session_created` is consumed into a `session_ready`; entries record
     /// the announce metadata for the create/open the connection itself
@@ -172,7 +173,7 @@ pub(crate) fn on_event(
 
 /// The default project directory for new sessions: the most recently
 /// registered project the thread store knows, falling back to `$HOME`.
-fn resolve_cwd() -> String {
+pub(crate) fn resolve_cwd() -> String {
     if let Some(store) = agent::thread_store::try_global() {
         let known = store.read(|s| s.known_projects().to_vec());
         if let Some(project) = known.last() {
@@ -189,6 +190,7 @@ fn resolve_cwd() -> String {
 /// Pure pass-through commands map one-to-one; `new_session` /
 /// `plan_execute_fresh` orchestrate a sequence. Kept side-effect-free so the
 /// wire mapping is unit-testable against the `messages.ts` contract.
+#[allow(dead_code)] // legacy WebviewToHost→cmds; superseded by proto_translate::webview_to_from_client; δ₂ removes.
 fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, String)>) {
     let ty = msg["type"].as_str().unwrap_or("");
     let sid = msg["sessionId"].as_str().map(str::to_string);
@@ -351,6 +353,7 @@ fn translate(msg: &Value, cwd: &str) -> (Vec<Value>, Option<(String, ReadyKind, 
 
 /// Translate one `WebviewToHost` message into actor commands and drive them
 /// on the app main thread, pre-registering the `session_ready` announce.
+#[allow(dead_code)] // legacy process_webui_msg; superseded by the δ₁-b shuttle; δ₂ removes.
 pub(crate) fn process_webui_msg(conn: &mut Connection, msg: &Value) {
     let cwd = resolve_cwd();
     let (cmds, ready) = translate(msg, &cwd);
