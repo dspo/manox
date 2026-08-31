@@ -1075,7 +1075,7 @@ impl ConversationState {
             ThreadEvent::GoalChanged { .. } => ApplyOutcome::Unchanged,
             // Worktree binding is session state (facade mirror), not a
             // conversation item.
-            ThreadEvent::WorktreeChanged { .. } => ApplyOutcome::Unchanged,
+            ThreadEvent::CwdChanged { .. } => ApplyOutcome::Unchanged,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(

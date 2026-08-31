@@ -88,6 +88,10 @@ impl AgentTool for EditTool {
                 "patch": {
                     "type": "string",
                     "description": PATCH_DOC
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths in the patch resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
                 }
             },
             "required": ["patch"]
@@ -117,8 +121,10 @@ impl AgentTool for EditTool {
             .clear();
 
         let mut results: Vec<String> = Vec::new();
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
         for fp in parsed.files {
-            let path = resolve_path(ctx, &fp.path);
+            let path = resolve_path(&fp.path, &cwd);
             let path_display = path.display().to_string();
 
             // Hold the mutation lock across all operations so concurrent
@@ -180,7 +186,7 @@ impl AgentTool for EditTool {
                         continue;
                     }
                     hashline::FileOp::Move { dest } => {
-                        let dest_path = resolve_path(ctx, std::path::Path::new(dest));
+                        let dest_path = resolve_path(std::path::Path::new(dest), &cwd);
                         ctx.env().write_file(&dest_path, &raw).await.map_err(|e| {
                             ToolError::ExecutionFailed(format!(
                                 "edit MV write failed {path_display}: {e}"
@@ -333,12 +339,13 @@ impl AgentTool for EditTool {
     }
 }
 
-/// Resolve a patch section path against the tool cwd when it is relative.
-fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
+/// Resolve a patch section path against the call's effective working directory
+/// when it is relative.
+fn resolve_path(path: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        ctx.cwd().join(path)
+        cwd.join(path)
     }
 }
 

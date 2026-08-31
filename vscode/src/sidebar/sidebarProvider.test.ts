@@ -91,7 +91,7 @@ const setup = (): Harness => {
 
 const threadInfo: ThreadInfoSnapshot = {
   reasoning_effort: 'high',
-  worktree_path: null,
+  cwd_path: null,
   plan: null,
   goal: null,
   usage: {},

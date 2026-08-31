@@ -291,7 +291,7 @@ describe('requestThreadInfo', () => {
       sessionId: 't1',
       info: {
         reasoning_effort: 'high',
-        worktree_path: null,
+        cwd_path: null,
         plan: null,
         goal: null,
         usage: {},
@@ -301,7 +301,7 @@ describe('requestThreadInfo', () => {
       },
     });
     await expect(pending).resolves.toEqual(
-      expect.objectContaining({ worktree_path: null, cost: 0 }),
+      expect.objectContaining({ cwd_path: null, cost: 0 }),
     );
     unsubscribe();
   });

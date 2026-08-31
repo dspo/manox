@@ -37,6 +37,12 @@ pub struct ToolState {
     /// again produces no change increments the count so the edit tool can
     /// escalate out of a spin.
     pub noop_edits: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u32)>>,
+    /// The directory the last tool call ran in — the `sticky cwd` every path
+    /// tool inherits when its call omits an explicit `cwd`. Advanced by
+    /// `path_utils::resolve_effective_cwd` (and by the bash shell's
+    /// post-command directory); `None` until the first tool call resolves, so
+    /// resolution starts from the session cwd.
+    pub sticky_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
 }
 
 impl ToolState {
@@ -46,6 +52,7 @@ impl ToolState {
             mutation_queue: FileMutationQueue::new(),
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sticky_cwd: std::sync::Mutex::new(None),
         }
     }
 
@@ -57,6 +64,7 @@ impl ToolState {
             mutation_queue: FileMutationQueue::new(),
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
+            sticky_cwd: std::sync::Mutex::new(None),
         }
     }
 }
@@ -699,6 +707,19 @@ mod tests {
         async fn exec(
             &self,
             _command: &str,
+            _timeout: Duration,
+            _signal: CancellationToken,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: "ok".into(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn exec_at(
+            &self,
+            _command: &str,
+            _cwd: &Path,
             _timeout: Duration,
             _signal: CancellationToken,
         ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {

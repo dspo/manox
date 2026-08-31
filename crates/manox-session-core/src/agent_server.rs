@@ -336,7 +336,7 @@ impl AgentServerInner {
         _session_id: &str,
     ) -> ThreadInfoPayload {
         thread.read(|t| {
-            let worktree_path = t.worktree_path().map(str::to_string);
+            let cwd_path = t.cwd_path().map(str::to_string);
             ThreadInfoPayload {
                 cwd: t.cwd().to_string_lossy().into_owned(),
                 project: t.project().map(|p| p.to_string_lossy().into_owned()),
@@ -356,8 +356,7 @@ impl AgentServerInner {
                 depth: t.depth(),
                 agent_label: t.agent_label().to_string(),
                 self_author: t.self_author().routing().to_string(),
-                worktree_active: worktree_path.is_some(),
-                worktree_path,
+                cwd_path,
                 branch: None, // β-3b: async git lookup → ServerNote::Branch.
                 goal: serde_json::to_value(t.goal()).ok(),
                 goal_elapsed_seconds: t.goal_elapsed_seconds(),
@@ -906,7 +905,19 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        thread.with_mut(|t| t.set_project(cwd.into()));
+        thread.with_mut(|t| {
+            // Two distinct semantics, deliberately split:
+            // - Project binding is initial-only: a not-yet-interacted
+            //   thread adopts the directory as its project (the
+            //   `has_interacted` guard in `set_project` is correct for
+            //   binding — a conversation's project never re-binds).
+            // - The working-directory switch applies at ANY interaction
+            //   state, through the same per-call cwd machinery the model's
+            //   tools use: sticky advance + a durable `cwd_change` entry —
+            //   never the header cwd.
+            t.set_project(cwd.into());
+            t.set_cwd(cwd.into());
+        });
     }
 
     fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
@@ -1648,6 +1659,8 @@ mod tests {
         fn set_thinking_level(&self, _: Option<String>) {}
         fn open_session(&self, _: PathBuf) {}
         fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}
+        fn set_cwd(&self, _path: std::path::PathBuf) {}
+
         fn active_session_path(&self) -> Option<PathBuf> {
             None
         }

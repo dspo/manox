@@ -416,11 +416,11 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         </div>
       </Section>
 
-      {info?.worktree_path && (
+      {info?.cwd_path && (
         <div className="text-muted-foreground flex items-center gap-1.5">
           <GitBranch className="size-3.5 shrink-0 opacity-50" />
-          <span className="min-w-0 truncate" title={t('worktree')}>
-            {info.worktree_path}
+          <span className="min-w-0 truncate" title={t('cwd')}>
+            {info.cwd_path}
           </span>
         </div>
       )}

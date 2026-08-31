@@ -85,7 +85,7 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
             "sessionId": session_id,
             "info": {
                 "reasoning_effort": info.reasoning_effort,
-                "worktree_path": info.worktree_path,
+                "cwd_path": info.cwd_path,
                 "plan": null,
                 "goal": info.goal,
                 "usage": {},
@@ -284,14 +284,9 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
             "id": id,
             "event": event,
         }),
-        ServerNote::WorktreeChanged {
-            session_id,
-            active,
-            path,
-        } => json!({
-            "type": "worktree_changed",
+        ServerNote::CwdChanged { session_id, path } => json!({
+            "type": "cwd_changed",
             "sessionId": session_id,
-            "active": active,
             "path": path,
         }),
         ServerNote::PlanReady {
@@ -831,8 +826,7 @@ mod tests {
             depth: 0,
             agent_label: "lead".into(),
             self_author: "lead".into(),
-            worktree_active: false,
-            worktree_path: None,
+            cwd_path: None,
             branch: None,
             goal: None,
             goal_elapsed_seconds: None,

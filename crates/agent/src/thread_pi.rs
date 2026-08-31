@@ -63,17 +63,6 @@ pub struct SideCallMetric {
 /// the host's session/persistence (wire field `approval_mode`, kebab values).
 pub use pi_extensions::sandbox::PermissionMode;
 
-/// Session-scoped state for a thread inside a git worktree. The pi backend
-/// never enters worktrees in this stage, so the type exists only to keep the
-/// facade surface identical to the manox build.
-pub struct WorktreeState {
-    pub path: PathBuf,
-    pub prior_cwd: PathBuf,
-    pub branch: String,
-    pub git_common_dir: PathBuf,
-    pub subagent_created: bool,
-}
-
 /// History-loading state of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -233,8 +222,9 @@ pub enum ThreadEvent {
     GoalChanged {
         goal: Option<crate::goal::ThreadGoal>,
     },
-    /// Git-worktree binding changed: entered (worktree path) or exited.
-    WorktreeChanged { active: bool, path: Option<String> },
+    /// The session's effective working directory moved (per-call cwd
+    /// resolution advanced the sticky cwd; durable as a `cwd_change`).
+    CwdChanged { path: String },
     /// Auto-compaction summarization pass started.
     CompactionStarted { tokens_before: u64 },
     /// A compaction pass landed.
@@ -339,7 +329,7 @@ pub struct Thread {
 
     /// Shared goal state with the engine's goal tools; `None` only when the
     /// threads db is unavailable (goal features degrade off).
-    goal_bridge: Option<Arc<GoalBridge>>,    worktree_path: Option<String>,
+    goal_bridge: Option<Arc<GoalBridge>>,    cwd_path: Option<String>,
     /// Events buffered by cx-free mutations, drained and broadcast to the
     /// handle's subscribers after each operation (replaces `cx.emit`).
     pending_events: Vec<ThreadEvent>,
@@ -624,7 +614,7 @@ impl Thread {
             persisted_plan: None,
             label: "lead".into(),
             goal_bridge: None,
-            worktree_path: None,
+            cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
         })
@@ -711,7 +701,7 @@ impl Thread {
             persisted_plan: None,
             label: "lead".into(),
             goal_bridge,
-            worktree_path: None,
+            cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
         });
@@ -803,8 +793,8 @@ impl Thread {
                 if matches!(&*event, ThreadEvent::TurnStarted) {
                     self.running = true;
                 }
-                if let ThreadEvent::WorktreeChanged { active, path } = &*event {
-                    self.worktree_path = if *active { path.clone() } else { None };
+                if let ThreadEvent::CwdChanged { path } = &*event {
+                    self.cwd_path = Some(path.clone());
                 }
                 self.pending_events.push(*event);
             }
@@ -1285,10 +1275,6 @@ impl Thread {
         }
     }
 
-    pub fn worktree(&self) -> Option<&WorktreeState> {
-        None
-    }
-
     /// The thread's persisted Goal — one shared snapshot with the engine's
     /// goal tools (model-side writes land here too).
     pub fn goal(&self) -> Option<ThreadGoal> {
@@ -1523,7 +1509,7 @@ impl Thread {
             persisted_plan: None,
             goal_bridge: None,
             label: name,
-            worktree_path: None,
+            cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
         });
@@ -1602,10 +1588,10 @@ impl Thread {
         self.persisted_plan.as_ref()
     }
 
-    /// Active git-worktree path for this thread (mirrored from the engine);
-    /// `None` when the session runs in its original directory.
-    pub fn worktree_path(&self) -> Option<&str> {
-        self.worktree_path.as_deref()
+    /// The session's effective working directory (mirrored from the
+    /// engine's `CwdChanged` events); `None` until the engine reports one.
+    pub fn cwd_path(&self) -> Option<&str> {
+        self.cwd_path.as_deref()
     }
 
     /// Persist whether a plan review card is pending, so a restarted
@@ -1680,6 +1666,18 @@ impl Thread {
         self.last_user_ui = ui;
         if let Some(engine) = &self.engine {
             engine.approve_plan(compact, compact_instructions, seed_text);
+        }
+    }
+
+    /// Move the session's working directory at any interaction state —
+    /// the host-driven `SetCwd` path. Unlike [`Thread::set_project`] (an
+    /// initial-only project binding, guarded by `has_interacted`), this
+    /// follows the per-call cwd machinery: the sticky cwd advances and the
+    /// move is durable as a `cwd_change` entry, never touching the header
+    /// cwd or the project binding.
+    pub fn set_cwd(&self, path: PathBuf) {
+        if let Some(engine) = &self.engine {
+            engine.set_cwd(path);
         }
     }
 
@@ -2289,6 +2287,8 @@ pub(crate) mod tests {
 
         fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
 
+        fn set_cwd(&self, _path: PathBuf) {}
+
         fn active_session_path(&self) -> Option<PathBuf> {
             None
         }
@@ -2341,7 +2341,7 @@ pub(crate) mod tests {
             persisted_plan: None,
             label: "lead".into(),
             goal_bridge: None,
-            worktree_path: None,
+            cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
         })

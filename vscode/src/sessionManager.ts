@@ -240,7 +240,7 @@ export class SessionManager {
     return commands.then((ev) => (ev as Extract<ActorEvent, { type: 'commands' }>).commands);
   }
 
-  /** On-demand conversation info snapshot (worktree, plan, usage, agents). */
+  /** On-demand conversation info snapshot (cwd, plan, usage, agents). */
   requestThreadInfo(sessionId: string): Promise<ThreadInfoSnapshot> {
     const info = this.awaitSession(
       sessionId,

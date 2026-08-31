@@ -129,8 +129,8 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             "status": status_str(status),
             "health": health,
         }),
-        ThreadEvent::WorktreeChanged { active, path } => {
-            json!({"type": "worktree_changed", "active": active, "path": path})
+        ThreadEvent::CwdChanged { path } => {
+            json!({"type": "cwd_changed", "path": path})
         }
         // `PlanReady` is enriched (with the plan body) by the actor's
         // subscription; the pure projection would duplicate it bare.
@@ -315,18 +315,16 @@ mod tests {
     }
 
     #[test]
-    fn projects_worktree_changed() {
+    fn projects_cwd_changed() {
         let json = thread_event_to_json(
-            &ThreadEvent::WorktreeChanged {
-                active: true,
-                path: Some("/repo/wt".into()),
+            &ThreadEvent::CwdChanged {
+                path: "/repo/wt".into(),
             },
             Some("s1"),
         )
         .unwrap();
         let v: Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "worktree_changed");
-        assert_eq!(v["active"], true);
+        assert_eq!(v["type"], "cwd_changed");
         assert_eq!(v["path"], "/repo/wt");
     }
 

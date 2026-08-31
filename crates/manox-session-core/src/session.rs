@@ -1210,13 +1210,13 @@ fn emit_thread_info(
         })
         .collect();
     let (info, branch_dir) = thread.read(|t| {
-        let worktree_path = t.worktree_path().map(str::to_string);
-        let branch_dir = worktree_path
+        let cwd_path = t.cwd_path().map(str::to_string);
+        let branch_dir = cwd_path
             .clone()
             .unwrap_or_else(|| t.cwd().to_string_lossy().into_owned());
         let info = json!({
             "reasoning_effort": t.reasoning_effort().wire_value(),
-            "worktree_path": worktree_path,
+            "cwd_path": cwd_path,
             "plan": t.persisted_plan().and_then(|p| serde_json::to_value(p).ok()),
             "goal": serde_json::to_value(t.goal()).unwrap_or(Value::Null),
             "usage": t.cumulative_token_usage(),
@@ -3811,6 +3811,7 @@ pub(crate) mod tests {
         fn open_session(&self, _path: PathBuf) {}
 
         fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
+        fn set_cwd(&self, _path: std::path::PathBuf) {}
 
         fn active_session_path(&self) -> Option<PathBuf> {
             None

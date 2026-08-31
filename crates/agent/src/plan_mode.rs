@@ -537,6 +537,15 @@ mod tests {
         ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
             Err(pi::env::ExecutionError::Other("null env".into()))
         }
+        async fn exec_at(
+            &self,
+            _command: &str,
+            _cwd: &std::path::Path,
+            _timeout: std::time::Duration,
+            _signal: tokio_util::sync::CancellationToken,
+        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
+            Err(pi::env::ExecutionError::Other("null env".into()))
+        }
     }
 
     // The agent loop stops a turn only when every finalized tool call reports

@@ -238,7 +238,7 @@ export interface GitStats {
 /** Conversation info panel snapshot (thread_info event payload). */
 export interface ThreadInfoSnapshot {
 	reasoning_effort: ReasoningEffort;
-	worktree_path: string | null;
+	cwd_path: string | null;
 	plan: PlanSnapshotWire | null;
 	goal: GoalSnapshotWire | null;
 	usage: TokenUsageSnapshot;
@@ -416,12 +416,12 @@ export type ActorEvent =
 	| { type: 'branch'; sessionId: string; branch: string }
 	| { type: 'git_stats'; sessionId: string; stats: GitStats }
 	| { type: 'history_progress'; sessionId: string }
-	// plan / goal / worktree / sub-agents
+	// plan / goal / cwd / sub-agents
 	| { type: 'plan_ready'; sessionId: string; plan_file: string; title: string; content?: string }
 	| { type: 'plan_updated'; sessionId: string; snapshot: PlanSnapshotWire | null }
 	| { type: 'plan_mode_changed'; sessionId: string; enabled: boolean }
 	| { type: 'goal_changed'; sessionId: string; snapshot: GoalSnapshotWire | null }
-	| { type: 'worktree_changed'; sessionId: string; active: boolean; path: string | null }
+	| { type: 'cwd_changed'; sessionId: string; path: string }
 	| { type: 'compaction'; sessionId: string; summary: string }
 	| { type: 'background_task_updated'; sessionId: string; snapshot: BackgroundTaskSnapshotWire }
 	| { type: 'subagent_child'; sessionId: string; id: string; event: SubagentChildWire }

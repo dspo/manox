@@ -153,9 +153,8 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             session_id: session_id.into(),
             snapshot: serde_json::to_value(goal).ok(),
         }),
-        ThreadEvent::WorktreeChanged { active, path } => Note(ServerNote::WorktreeChanged {
+        ThreadEvent::CwdChanged { path } => Note(ServerNote::CwdChanged {
             session_id: session_id.into(),
-            active: *active,
             path: path.clone(),
         }),
         ThreadEvent::CompactionStarted { tokens_before } => Note(ServerNote::CompactionStarted {

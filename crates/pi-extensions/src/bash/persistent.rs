@@ -206,6 +206,15 @@ impl BashOperations for PersistentShellOperations {
             Outcome::Cancelled => Err(ExecutionError::Aborted),
         }
     }
+
+    /// The shell's live working directory — what a `cd` inside the last
+    /// command left behind. `None` before the first command initializes the
+    /// shell, when the seeded `base_cwd` is still the truth.
+    async fn current_dir(&self) -> Option<PathBuf> {
+        let guard = Arc::clone(&self.shell);
+        let lock = guard.lock().await;
+        lock.as_ref().map(|sh| sh.working_dir().to_path_buf())
+    }
 }
 
 /// Reaps the process groups of an abandoned run.

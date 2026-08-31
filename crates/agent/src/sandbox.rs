@@ -50,9 +50,9 @@ const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
 
 /// Confinement policy for one sandboxed invocation: the workspace root whose
 /// `writable_roots()` the `workspace-write` profile allows, plus extra
-/// granted roots (an approved `EnterWorktree` admits the worktree, its git
-/// common dir, and the pre-enter project root — additive on top of the
-/// workspace, never a replacement). The effective mode is supplied per call
+/// granted roots (a same-repo worktree of the call's cwd admits itself;
+/// an escalation-approved root accumulates for the session — additive on
+/// top of the workspace, never a replacement). The effective mode is supplied per call
 /// by the `mode_resolver` on [`SandboxedBashOperations`], not held here.
 #[derive(Clone, Debug)]
 pub struct SandboxPolicy {
@@ -238,22 +238,33 @@ fn login_shell_path() -> String {
 // stub's fields stay unread.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct SandboxedBashOperations {
-    policy: SandboxPolicy,
-    base_cwd: PathBuf,
+    workspace: PathBuf,
+    granted_roots: crate::granted_roots::GrantedRoots,
     mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
 }
 
 impl SandboxedBashOperations {
     pub fn new(
-        base_cwd: impl Into<PathBuf>,
-        policy: SandboxPolicy,
+        workspace: impl Into<PathBuf>,
+        granted_roots: crate::granted_roots::GrantedRoots,
         mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
     ) -> Self {
         Self {
-            policy,
-            base_cwd: base_cwd.into(),
+            workspace: workspace.into(),
+            granted_roots,
             mode_resolver,
         }
+    }
+
+    /// The seatbelt policy for a call running in `cwd`: the session
+    /// workspace profile plus the granted roots derived from that exact
+    /// directory — a linked worktree of the workspace admits itself, an
+    /// escalation-approved root stays for the session. The same derivation
+    /// the fs fence applies, so a call one surface passed the other never
+    /// denies.
+    fn policy_for(&self, cwd: &Path) -> SandboxPolicy {
+        SandboxPolicy::for_project(&self.workspace)
+            .with_extra_roots(self.granted_roots.roots_for(cwd))
     }
 
     /// Build the seatbelt-wrapped command for a background task — the same
@@ -265,7 +276,7 @@ impl SandboxedBashOperations {
         #[cfg(target_os = "macos")]
         {
             let mode = (self.mode_resolver)();
-            self.policy.wrap_command(command, cwd, mode)
+            self.policy_for(cwd).wrap_command(command, cwd, mode)
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -291,9 +302,11 @@ impl BashOperations for SandboxedBashOperations {
             let cwd = request
                 .cwd
                 .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| self.base_cwd.clone());
+                .unwrap_or_else(|| self.workspace.clone());
             let mode = (self.mode_resolver)();
-            let mut cmd = self.policy.wrap_command(request.command, &cwd, mode);
+            let mut cmd = self
+                .policy_for(&cwd)
+                .wrap_command(request.command, &cwd, mode);
             cmd.stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
@@ -560,9 +573,11 @@ mod tests {
     async fn sandboxed_exec_runs_and_confines_writes() {
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
-        let policy = SandboxPolicy::for_project(&root);
-        let ops =
-            SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::WorkspaceWrite));
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(PermissionMode::WorkspaceWrite),
+        );
 
         // A confined write inside the project succeeds.
         let inside = root.join("sandbox-ok.txt");
@@ -609,9 +624,11 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         let root = project_root();
         std::fs::create_dir_all(&root).ok();
-        let policy = SandboxPolicy::for_project(&root);
-        let ops =
-            SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::WorkspaceWrite));
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(PermissionMode::WorkspaceWrite),
+        );
 
         // The manox state home is writable under workspace-write (plan files
         // and scratch state need no escalation).
@@ -648,8 +665,11 @@ mod tests {
         std::fs::create_dir_all(&root).ok();
         let inside = root.join("ro-target.txt");
         let _ = std::fs::remove_file(&inside);
-        let policy = SandboxPolicy::for_project(&root);
-        let ops = SandboxedBashOperations::new(&root, policy, resolver(PermissionMode::ReadOnly));
+        let ops = SandboxedBashOperations::new(
+            &root,
+            crate::granted_roots::GrantedRoots::new(&root),
+            resolver(PermissionMode::ReadOnly),
+        );
 
         // A write inside the project is denied under read-only.
         let req = BashExecRequest {

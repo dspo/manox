@@ -278,7 +278,7 @@ export interface GitStats {
 /** Conversation info panel snapshot (thread_info event payload). */
 export interface ThreadInfoSnapshot {
     reasoning_effort: ReasoningEffort;
-    worktree_path: string | null;
+    cwd_path: string | null;
     plan: PlanSnapshotWire | null;
     goal: GoalSnapshotWire | null;
     usage: TokenUsageSnapshot;
@@ -557,10 +557,9 @@ export type ActorEvent = {
     sessionId: string;
     snapshot: GoalSnapshotWire | null;
 } | {
-    type: 'worktree_changed';
+    type: 'cwd_changed';
     sessionId: string;
-    active: boolean;
-    path: string | null;
+    path: string;
 } | {
     type: 'compaction';
     sessionId: string;

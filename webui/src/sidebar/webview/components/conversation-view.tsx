@@ -51,7 +51,7 @@ export const ConversationView = memo(({
   );
 
   // Restore the info snapshot whenever a thread comes into view; live
-  // plan/worktree/sub-agent events keep it fresh afterwards.
+  // plan/cwd/sub-agent events keep it fresh afterwards.
   useEffect(() => {
     const threadApi = new ThreadApi(thread.sessionId);
     threadApi.requestThreadInfo();

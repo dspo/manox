@@ -27,8 +27,7 @@ pub struct ClientStore {
     pub depth: u32,
     pub agent_label: String,
     pub self_author: agent::MessageAuthor,
-    pub worktree_active: bool,
-    pub worktree_path: Option<String>,
+    pub cwd_path: Option<String>,
     pub branch: Option<String>,
     pub goal: Option<Value>,
     pub goal_elapsed_seconds: Option<u64>,
@@ -72,8 +71,7 @@ impl Default for ClientStore {
             depth: 0,
             agent_label: String::new(),
             self_author: agent::MessageAuthor::default(),
-            worktree_active: false,
-            worktree_path: None,
+            cwd_path: None,
             branch: None,
             goal: None,
             goal_elapsed_seconds: None,
@@ -143,9 +141,8 @@ impl ClientStore {
             ServerNote::PlanModeChanged { enabled, .. } => self.plan_mode = *enabled,
             ServerNote::PlanUpdated { snapshot, .. } => self.persisted_plan = snapshot.clone(),
             ServerNote::GoalChanged { snapshot, .. } => self.goal = snapshot.clone(),
-            ServerNote::WorktreeChanged { active, path, .. } => {
-                self.worktree_active = *active;
-                self.worktree_path = path.clone();
+            ServerNote::CwdChanged { path, .. } => {
+                self.cwd_path = Some(path.clone());
             }
             ServerNote::Branch { branch, .. } => self.branch = Some(branch.clone()),
             ServerNote::BrowserSuitesChanged { suites, .. } => {
@@ -226,8 +223,7 @@ impl ClientStore {
         self.depth = info.depth;
         self.agent_label = info.agent_label.clone();
         self.self_author = agent::MessageAuthor::from_routing(&info.self_author);
-        self.worktree_active = info.worktree_active;
-        self.worktree_path = info.worktree_path.clone();
+        self.cwd_path = info.cwd_path.clone();
         self.branch = info.branch.clone();
         self.goal = info.goal.clone();
         self.goal_elapsed_seconds = info.goal_elapsed_seconds;
@@ -268,8 +264,7 @@ mod tests {
             depth: 0,
             agent_label: "lead".into(),
             self_author: "lead".into(),
-            worktree_active: false,
-            worktree_path: None,
+            cwd_path: None,
             branch: None,
             goal: None,
             goal_elapsed_seconds: None,

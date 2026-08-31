@@ -124,7 +124,7 @@ const DICT = {
     zh: '仅调研——计划获批前工作区保持只读。',
   },
   plan_mode_exit: { en: 'Exit plan mode', zh: '退出计划模式' },
-  worktree: { en: 'Worktree', zh: '工作树' },
+  cwd: { en: 'Working dir', zh: '工作目录' },
   goal: { en: 'Goal', zh: '目标' },
   goal_active: { en: 'Active', zh: '进行中' },
   goal_paused: { en: 'Paused', zh: '已暂停' },
