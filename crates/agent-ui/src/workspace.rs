@@ -1986,13 +1986,11 @@ impl Workspace {
                     store.with_mut(|s| s.archive_thread(id, *archived));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
-                    if is_current
-                        && !this.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+                    if is_current {
+                        let _ = this.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
                             session_id: sid.into(),
                             archived: *archived,
-                        })
-                    {
-                        this.thread.with_mut(|t| t.set_archived(*archived));
+                        });
                     }
                     // Archiving the active thread navigates away to a fresh
                     // empty thread (Hero view) so the user doesn't stare at a
@@ -4239,7 +4237,6 @@ impl Workspace {
         let Some(loaded) = store.with_mut(|s| s.load_thread(&id)) else {
             return;
         };
-        let loaded = loaded;
         self.attach_thread(loaded, true, window, cx);
     }
 
@@ -4689,64 +4686,40 @@ impl Workspace {
             cx.notify();
             return;
         }
-        // Dual-path: protocol (AppendUserMessage for all-but-last + Submit for
-        // last) vs direct (insert each + run_turn once).
-        let protocol = self.client_conn.is_some() && self.session_id.is_some();
-        if protocol {
-            let n = drained_turns.len();
-            for (i, turn) in drained_turns.into_iter().enumerate() {
-                let attachments: Vec<manox_protocol::ImageAttachment> = turn
-                    .images
-                    .iter()
-                    .filter_map(|c| match c {
-                        MessageContent::Image { data, mime_type } => {
-                            base64::engine::general_purpose::STANDARD
-                                .decode(data.as_bytes())
-                                .ok()
-                                .map(|bytes| manox_protocol::ImageAttachment {
-                                    data: bytes,
-                                    mime_type: mime_type.clone(),
-                                })
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if i + 1 < n {
-                    // All but the last: insert without running.
-                    let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUserMessage {
-                        session_id: sid.into(),
-                        text: turn.text.clone(),
-                        images: attachments,
-                    });
-                } else {
-                    // Last: insert + start the turn.
-                    let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                        session_id: sid.into(),
-                        text: turn.text.clone(),
-                        images: attachments,
-                        client_id: None,
-                    });
-                }
-            }
-        } else {
-            for turn in drained_turns {
-                self.thread.with_mut(|thread| {
-                    if turn.images.is_empty() {
-                        thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui));
-                    } else {
-                        let mut content = Vec::with_capacity(turn.images.len() + 1);
-                        if !turn.text.trim().is_empty() {
-                            content.push(MessageContent::Text(turn.text));
-                        }
-                        content.extend(turn.images);
-                        thread.insert_user_message_with_content_and_ui_metadata(
-                            content,
-                            Some(turn.ui),
-                        );
+        let n = drained_turns.len();
+        for (i, turn) in drained_turns.into_iter().enumerate() {
+            let attachments: Vec<manox_protocol::ImageAttachment> = turn
+                .images
+                .iter()
+                .filter_map(|c| match c {
+                    MessageContent::Image { data, mime_type } => {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data.as_bytes())
+                            .ok()
+                            .map(|bytes| manox_protocol::ImageAttachment {
+                                data: bytes,
+                                mime_type: mime_type.clone(),
+                            })
                     }
+                    _ => None,
+                })
+                .collect();
+            if i + 1 < n {
+                // All but the last: insert without running.
+                let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUserMessage {
+                    session_id: sid.into(),
+                    text: turn.text.clone(),
+                    images: attachments,
+                });
+            } else {
+                // Last: insert + start the turn.
+                let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+                    session_id: sid.into(),
+                    text: turn.text.clone(),
+                    images: attachments,
+                    client_id: None,
                 });
             }
-            self.thread.with_mut(|thread| thread.run_turn());
         }
         refresh_thread_list();
         cx.notify();
@@ -6437,12 +6410,11 @@ impl Workspace {
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             let model = model.clone();
                             let _ = ws.update(cx, |this, _cx| {
-                                if !this.send_note(|sid| manox_protocol::ClientNote::SetModel {
-                                    session_id: sid.into(),
-                                    id: model.id.clone(),
-                                }) {
-                                    this.thread.with_mut(|t| t.set_model(model));
-                                }
+                                let _ =
+                                    this.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                                        session_id: sid.into(),
+                                        id: model.id.clone(),
+                                    });
                             });
                         }),
                     );
@@ -6486,14 +6458,11 @@ impl Workspace {
                             agent::language_model::ReasoningEffort::High => "high",
                             agent::language_model::ReasoningEffort::Max => "max",
                         };
-                        if !this.send_note(|sid| manox_protocol::ClientNote::SetReasoningEffort {
-                            session_id: sid.into(),
-                            effort: effort_str.into(),
-                        }) {
-                            this.thread.with_mut(|t| {
-                                t.set_reasoning_effort(effort);
+                        let _ =
+                            this.send_note(|sid| manox_protocol::ClientNote::SetReasoningEffort {
+                                session_id: sid.into(),
+                                effort: effort_str.into(),
                             });
-                        }
                     });
                 }),
             );
@@ -7110,26 +7079,14 @@ impl Workspace {
                                 .small()
                                 .label(pause_label)
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
-                                    if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
-                                        session_id: sid.into(),
-                                        action: "pause".into(),
-                                        objective: None,
-                                        budget: None,
-                                        max_rounds: None,
-                                    }) {
-                                        this.thread.with_mut(|t| {
-                                            if let Err(error) = t.set_goal_status(
-                                                agent::goal::GoalStatus::Paused,
-                                                Some(agent::goal::GoalBlockReason {
-                                                    code: "user-paused".into(),
-                                                    message: "paused by user".into(),
-                                                }),
-                                                agent::db::GoalActor::User,
-                                            ) {
-                                                tracing::warn!(error = %error, "goal op failed");
-                                            }
+                                    let _ =
+                                        this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                            session_id: sid.into(),
+                                            action: "pause".into(),
+                                            objective: None,
+                                            budget: None,
+                                            max_rounds: None,
                                         });
-                                    }
                                 })),
                         )
                     })
@@ -7144,23 +7101,15 @@ impl Workspace {
                                     .small()
                                     .label(resume_label)
                                     .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
-                                        if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
-                                            session_id: sid.into(),
-                                            action: "resume".into(),
-                                            objective: None,
-                                            budget: None,
-                                            max_rounds: None,
-                                        }) {
-                                            this.thread.with_mut(|t| {
-                                            if let Err(error) = t.set_goal_status(
-                                                agent::goal::GoalStatus::Active,
-                                                None,
-                                                agent::db::GoalActor::User,
-                                            ) {
-                                                tracing::warn!(error = %error, "goal op failed");
+                                        let _ = this.send_note(|sid| {
+                                            manox_protocol::ClientNote::Goal {
+                                                session_id: sid.into(),
+                                                action: "resume".into(),
+                                                objective: None,
+                                                budget: None,
+                                                max_rounds: None,
                                             }
                                         });
-                                        }
                                     })),
                             )
                         },
@@ -7252,20 +7201,13 @@ impl Workspace {
                             .small()
                             .label(clear_label)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if !this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                let _ = this.send_note(|sid| manox_protocol::ClientNote::Goal {
                                     session_id: sid.into(),
                                     action: "clear".into(),
                                     objective: None,
                                     budget: None,
                                     max_rounds: None,
-                                }) {
-                                    this.thread.with_mut(|t| {
-                                        if let Err(error) = t.clear_goal(agent::db::GoalActor::User)
-                                        {
-                                            tracing::warn!(error = %error, "goal op failed");
-                                        }
-                                    });
-                                }
+                                });
                                 this.goal_popover_open = false;
                                 cx.notify();
                             })),
@@ -7894,14 +7836,12 @@ impl Workspace {
                                     let p = std::path::PathBuf::from(&click_path);
                                     let _ = ws_sel.update(cx, |this, cx| {
                                         this.close_project_chip_menu();
-                                        if !this.send_note(|sid| {
+                                        let _ = this.send_note(|sid| {
                                             manox_protocol::ClientNote::SetCwd {
                                                 session_id: sid.into(),
                                                 cwd: p.to_str().unwrap_or_default().into(),
                                             }
-                                        }) {
-                                            this.thread.with_mut(|t| t.set_project(p.clone()));
-                                        }
+                                        });
                                         Self::register_project_in_store(&p, cx);
                                         cx.notify();
                                     });
@@ -8110,12 +8050,10 @@ impl Workspace {
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    if !this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+                    let _ = this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
                         session_id: sid.into(),
                         cwd: path.to_str().unwrap_or_default().into(),
-                    }) {
-                        this.thread.with_mut(|t| t.set_project(path.clone()));
-                    }
+                    });
                     Self::register_project_in_store(&path, cx);
                 }
                 cx.notify();
@@ -8408,7 +8346,6 @@ impl Workspace {
         // immediately, while submission remains gated until the transcript is
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        // The wire `history_phase` is the lowercase Debug form (`"ready"` /
         // Typed store: `history_phase` is `HistoryPhase`; read directly.
         let loading = self
             .store

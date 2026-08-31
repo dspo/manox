@@ -516,43 +516,35 @@ impl SlashCommand for GoalCommand {
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
-            let Some(goal) = &current_goal else {
-                return SlashResult::Handled;
-            };
             let budget = if matches!(value, "none" | "unlimited") {
                 None
             } else {
-                match value.parse::<u64>() {
-                    Ok(value) => Some(value),
-                    Err(_) => return SlashResult::Handled,
-                }
+                value.parse::<u64>().ok()
             };
+            let objective = current_goal.as_ref().map(|g| g.objective.clone());
+            let max_rounds = current_goal.as_ref().and_then(|g| g.max_rounds);
             let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
                 session_id: sid.into(),
                 action: "edit".into(),
-                objective: Some(goal.objective.clone()),
+                objective,
                 budget,
-                max_rounds: goal.max_rounds,
+                max_rounds,
             });
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
-            let Some(goal) = &current_goal else {
-                return SlashResult::Handled;
-            };
             let max_rounds = if matches!(value, "none" | "unlimited") {
                 None
             } else {
-                match value.parse::<u64>() {
-                    Ok(value) => Some(value),
-                    Err(_) => return SlashResult::Handled,
-                }
+                value.parse::<u64>().ok()
             };
+            let objective = current_goal.as_ref().map(|g| g.objective.clone());
+            let budget = current_goal.as_ref().and_then(|g| g.token_budget);
             let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
                 session_id: sid.into(),
                 action: "edit".into(),
-                objective: Some(goal.objective.clone()),
-                budget: goal.token_budget,
+                objective,
+                budget,
                 max_rounds,
             });
             return SlashResult::Handled;
