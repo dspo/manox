@@ -1,11 +1,11 @@
-// Transport backed by the manox-napi native binding: the actor runs
-// in-process on its own thread, and events arrive through a napi
-// threadsafe function in Node callback style `(err, eventJson)`.
+// Transport backed by the manox-napi native binding: the agent server runs
+// in-process on its own tokio runtime, and FromServer messages arrive through
+// a napi threadsafe function in Node callback style `(err, eventJson)`.
 
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import type { ActorEvent } from '../../dist/protocol';
+import type { FromServer } from '../../dist/protocol';
 import type { Transport } from './transport';
 
 interface NapiBinding {
@@ -51,7 +51,7 @@ export class NapiTransport implements Transport {
     this.readyPromise = Promise.resolve();
   }
 
-  /** Load the binding and start the actor thread. */
+  /** Load the binding and start the agent server connection. */
   static load(): NapiTransport {
     const transport = new NapiTransport(loadBinding());
     transport.binding.start((err, raw) => {
@@ -60,9 +60,10 @@ export class NapiTransport implements Transport {
         return;
       }
       try {
-        transport.events.emit('event', JSON.parse(raw) as ActorEvent);
+        const msg = JSON.parse(raw) as FromServer;
+        transport.events.emit('event', msg);
       } catch (e) {
-        console.error('manox: malformed actor event:', raw, e);
+        console.error('manox: malformed FromServer event:', raw, e);
       }
     });
     return transport;
@@ -72,7 +73,7 @@ export class NapiTransport implements Transport {
     return this.readyPromise;
   }
 
-  onEvent(handler: (ev: ActorEvent) => void): () => void {
+  onEvent(handler: (ev: FromServer) => void): () => void {
     this.events.on('event', handler);
     return () => this.events.off('event', handler);
   }

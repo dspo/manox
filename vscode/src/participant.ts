@@ -3,7 +3,8 @@
 // runs its own session on the same actor; the two never share a turn.
 
 import * as vscode from 'vscode';
-import type { ActorEvent } from '../dist/protocol';
+import type { FromServer } from '../dist/protocol';
+import { notification } from './protocolHelpers';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const TURN_TIMEOUT_MS = 120_000;
@@ -33,6 +34,7 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
         settled = true;
         clearTimeout(timer);
         cancelSub.dispose();
+        serverCallSub();
         resolveDone();
       };
       const timer = setTimeout(finish, TURN_TIMEOUT_MS);
@@ -42,30 +44,24 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
       // ProposePlan follow the same rule — the native chat cannot render
       // the review card, so the body streams here and the verdict happens
       // in the sidebar.
-      const off = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
-        switch (ev.type) {
-          case 'agent_text':
-            stream.markdown(ev.text);
+      const off = manager.onSessionEvent(sessionId, (ev: Record<string, unknown>) => {
+        switch (ev.method) {
+          case 'agentText':
+            stream.markdown(ev.text as string);
             break;
-          case 'agent_thinking':
-            stream.progress(ev.text.trim());
+          case 'agentThinking':
+            stream.progress((ev.text as string).trim());
             break;
-          case 'tool_call':
-            stream.progress(`🔧 ${ev.title || ev.name}…`);
+          case 'toolCall':
+            stream.progress(`\u{1F527} ${(ev.title as string) || (ev.name as string)}...`);
             break;
-          case 'tool_call_authorization':
-            manager.send({ cmd: 'approve', sessionId, id: ev.id, allow: false });
-            stream.markdown(
-              `_${ev.tool_name} requires approval — denied in chat. Use the manox sidebar to approve interactively._`,
-            );
-            break;
-          case 'plan_ready':
-            stream.markdown(`### ${ev.title}\n\n${ev.content}`);
+          case 'planReady':
+            stream.markdown(`### ${ev.title as string}\n\n${ev.content as string}`);
             stream.markdown(
               `_The plan is awaiting your verdict. Open the **manox sidebar**, select this conversation, and choose Execute / Refine there — plan mode stays on until then._`,
             );
             break;
-          case 'plan_mode_changed':
+          case 'planModeChanged':
             stream.markdown(
               ev.enabled
                 ? `_Plan mode is on: research is read-only until the submitted plan is approved._`
@@ -73,25 +69,46 @@ export function registerManoxParticipant(context: vscode.ExtensionContext): void
             );
             break;
           case 'error':
-            stream.markdown(`**Error:** ${ev.message}`);
+            stream.markdown(`**Error:** ${ev.message as string}`);
             finish();
             break;
-          case 'turn_finished':
+          case 'turnFinished':
             finish();
             break;
+        }
+      });
+      // Handle ServerCall requests (approve / askUserQuestion / planVerdict).
+      const serverCallSub = manager.onSessionServerCall(sessionId, (ev) => {
+        if (ev.call.method === 'approve') {
+          const call = ev.call as { method: 'approve'; sessionId: string; authId: string; toolName: string; summary: string; input: unknown };
+          manager.fromClientReply({
+            kind: 'reply',
+            id: ev.id,
+            outcome: { Ok: { allow: false } },
+          });
+          stream.markdown(
+            `_${call.toolName} requires approval — denied in chat. Use the manox sidebar to approve interactively._`,
+          );
         }
       });
       const cancelSub = token.onCancellationRequested(finish);
 
       try {
         if (token.isCancellationRequested) return { metadata: { cancelled: true } };
-        manager.send({ cmd: 'submit', sessionId, text: request.prompt });
+        manager.send(notification({
+          method: 'submit',
+          sessionId,
+          text: request.prompt,
+          images: [],
+          clientId: null,
+        }));
         await done;
         return { metadata: { participant: 'manox' } };
       } finally {
         finish();
         off();
-        // Disposal cancels an in-flight turn on the actor side as well.
+        serverCallSub();
+        // Disposal cancels an in-flight turn on the server side as well.
         manager.disposeSession(sessionId);
       }
     },

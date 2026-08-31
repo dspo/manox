@@ -5523,10 +5523,13 @@ dependencies = [
 name = "manox-napi"
 version = "0.1.0"
 dependencies = [
- "manox-actor",
+ "agent",
+ "manox-protocol",
+ "manox-session-core",
  "napi",
  "napi-build",
  "napi-derive",
+ "serde_json",
 ]
 
 [[package]]

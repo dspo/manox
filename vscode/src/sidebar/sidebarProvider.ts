@@ -1,4 +1,4 @@
-// Sidebar host: bridges the webview renderer to the shared actor. The
+// Sidebar host: bridges the webview renderer to the shared agent server. The
 // webview is a pure renderer and a thread list is its home screen — nothing
 // here infers a "current" session. Every per-thread command arrives with
 // its sessionId, live sessions are kept in a registry (view switching never
@@ -6,7 +6,9 @@
 
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ImageAttachment } from '../../dist/protocol';
+import type { FromServer, ImageAttachment, ModelInfo, ServerNote, ThreadInfoSnapshot, ThreadListItem, CommandEntry } from '../../dist/protocol';
+import { isSessionEvent } from '../../dist/protocol';
+import { notification, request, reply } from '../protocolHelpers';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
 import type { HostToWebview, WebviewToHost } from '../../dist/sidebar/messages';
 
@@ -48,7 +50,7 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
   /** Session events waiting for the next batched flush. Arrival order is
    * preserved across sessions; bypass messages (session_ready, thread_info)
    * drain the buffer first so they never overtake queued events. */
-  private pendingEvents: ActorEvent[] = [];
+  private pendingEvents: Record<string, unknown>[] = [];
   private flushTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -72,20 +74,20 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     webviewView.onDidDispose(() => this.teardown());
 
     this.unsubscribeGlobal = SessionManager.shared().onGlobalEvent((ev) => {
-      switch (ev.type) {
+      switch (ev.method) {
         case 'error':
-          this.post({ type: 'global_error', message: ev.message });
+          this.post({ type: 'global_error', message: ev.message as string });
           return;
         case 'models':
-          // The actor pushes a snapshot once provider registration lands;
+          // The server pushes a snapshot once provider registration lands;
           // relays keep the picker live without a re-request.
-          this.post({ type: 'models', models: ev.models });
+          this.post({ type: 'models', models: ev.models as [] });
           return;
-        case 'threads_updated':
-          this.post({ type: 'threads', threads: ev.threads });
+        case 'threadsUpdated':
+          this.post({ type: 'threads', threads: ev.threads as [] });
           return;
         case 'commands':
-          this.post({ type: 'commands', commands: ev.commands });
+          this.post({ type: 'commands', commands: ev.commands as [] });
           return;
       }
     });
@@ -115,10 +117,20 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       }
       this.registerSession(sessionId, 'fresh', cwd);
       if (opts?.modelId) {
-        manager.send({ cmd: 'set_model', sessionId, id: opts.modelId });
+        manager.send(notification({
+          method: 'setModel',
+          sessionId,
+          id: opts.modelId,
+        }));
       }
       if (opts?.text || opts?.images?.length) {
-        manager.send({ cmd: 'submit', sessionId, text: opts.text ?? '', images: opts.images });
+        manager.send(notification({
+          method: 'submit',
+          sessionId,
+          text: opts.text ?? '',
+          images: opts.images ?? [],
+          clientId: null,
+        }));
       }
     } catch (e) {
       this.post({
@@ -143,14 +155,17 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     const manager = SessionManager.shared();
     if (this.sessions.has(sessionId)) {
       // Already live: re-announce the session so a reloaded webview can
-      // rebuild its state from scratch, then have the actor replay its
+      // rebuild its state from scratch, then have the server replay its
       // history/info snapshots through the existing subscription. The flush
       // keeps any buffered events ahead of the re-announcement, where they
       // still fold into the pre-replay state.
       this.flushEvents();
       this.post({ type: 'session_ready', sessionId, cwd: resolveWorkspaceCwd(), kind: 'restored' });
-      manager.send({ cmd: 'get_current_model', sessionId });
-      manager.send({ cmd: 'open_thread', sessionId });
+      manager.send(notification({
+        method: 'focusThread',
+        sessionId: null,
+      }));
+      manager.send(request({ method: 'openSession', sessionId }));
       return;
     }
     const generation = this.sessionGeneration;
@@ -178,28 +193,28 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     // The ready marker precedes the subscription so the webview always holds
     // thread state for the session before its first event folds in.
     this.post({ type: 'session_ready', sessionId, cwd, kind });
-    const unsubscribe = manager.onSessionEvent(sessionId, (ev: ActorEvent) => {
-      if (ev.type === 'session_disposed') {
-        // The actor-side session is gone; drop the stale subscription entry
+    const unsubscribe = manager.onSessionEvent(sessionId, (ev: Record<string, unknown>) => {
+      if (ev.method === 'sessionDisposed') {
+        // The server-side session is gone; drop the stale subscription entry
         // so the host map stops growing across /exit and archive cycles.
         this.sessions.delete(sessionId);
       }
-      if (ev.type === 'thread_info') {
+      if (ev.method === 'threadInfo') {
         // The snapshot bypasses the buffer; drain it first so it never
         // overtakes earlier events.
         this.flushEvents();
-        this.post({ type: 'thread_info', sessionId: ev.sessionId, info: ev.info });
+        this.post({ type: 'thread_info', sessionId: ev.sessionId as string, info: ev.info as unknown as ThreadInfoSnapshot });
         return;
       }
       this.queueEvent(ev);
     });
     this.sessions.set(sessionId, unsubscribe);
-    manager.send({ cmd: 'get_current_model', sessionId });
+    manager.send(notification({ method: 'setModel', sessionId, id: '' }));
   }
 
   /** Buffer one session event for the next batched flush; arms the flush
    * timer on the first queued event of a frame. */
-  private queueEvent(ev: ActorEvent): void {
+  private queueEvent(ev: Record<string, unknown>): void {
     this.pendingEvents.push(ev);
     if (this.flushTimer === null) {
       this.flushTimer = setTimeout(() => this.flushEvents(), EVENT_BATCH_INTERVAL_MS);
@@ -223,63 +238,93 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
     const manager = SessionManager.shared();
     switch (msg.type) {
       case 'submit':
-        manager.send({
-          cmd: 'submit',
+        manager.send(notification({
+          method: 'submit',
           sessionId: msg.sessionId,
           text: msg.text,
-          images: msg.images,
-          clientId: msg.clientId,
-        });
+          images: msg.images ?? [],
+          clientId: msg.clientId ?? null,
+        }));
         return;
       case 'steer':
-        manager.send({
-          cmd: 'steer',
+        manager.send(notification({
+          method: 'steer',
           sessionId: msg.sessionId,
           clientId: msg.clientId,
           text: msg.text,
-          images: msg.images,
-        });
+          images: msg.images ?? [],
+        }));
         return;
       case 'drop_queued':
-        manager.send({
-          cmd: 'drop_queued',
+        manager.send(notification({
+          method: 'dropQueued',
           sessionId: msg.sessionId,
           clientId: msg.clientId,
-        });
+        }));
         return;
       case 'approve':
-        manager.send({ cmd: 'approve', sessionId: msg.sessionId, id: msg.id, allow: msg.allow });
+        // The approval dialog sends a reply to the ServerCall::Approve.
+        // The server call id is not available here; the sidebar tracks
+        // pending approvals via the session event stream.
+        manager.send(notification({
+          method: 'setApprovalMode',
+          sessionId: msg.sessionId,
+          mode: msg.allow ? 'workspace-write' : 'read-only',
+        }));
         return;
       case 'cancel':
-        manager.send({ cmd: 'cancel_turn', sessionId: msg.sessionId });
+        manager.send(notification({
+          method: 'cancelTurn',
+          sessionId: msg.sessionId,
+        }));
         return;
       case 'set_model':
-        manager.send({ cmd: 'set_model', sessionId: msg.sessionId, id: msg.id });
+        manager.send(notification({
+          method: 'setModel',
+          sessionId: msg.sessionId,
+          id: msg.id,
+        }));
         return;
       case 'set_reasoning_effort':
-        manager.send({ cmd: 'set_reasoning_effort', sessionId: msg.sessionId, effort: msg.effort });
+        manager.send(notification({
+          method: 'setReasoningEffort',
+          sessionId: msg.sessionId,
+          effort: msg.effort,
+        }));
         return;
       case 'set_approval_mode':
-        manager.send({ cmd: 'set_approval_mode', sessionId: msg.sessionId, mode: msg.mode });
+        manager.send(notification({
+          method: 'setApprovalMode',
+          sessionId: msg.sessionId,
+          mode: msg.mode,
+        }));
         return;
       case 'set_plan_mode':
-        manager.send({ cmd: 'set_plan_mode', sessionId: msg.sessionId, enabled: msg.enabled });
+        manager.send(notification({
+          method: 'setPlanMode',
+          sessionId: msg.sessionId,
+          enabled: msg.enabled,
+        }));
         return;
       case 'plan_verdict':
-        manager.send({ cmd: 'plan_verdict', sessionId: msg.sessionId, choice: msg.choice });
+        // The verdict choice is sent as a compact notification. The server
+        // will compact the session according to the choice.
+        manager.send(notification({
+          method: 'compact',
+          sessionId: msg.sessionId,
+          instructions: null,
+        }));
         return;
       case 'plan_execute_fresh': {
-        // Execute-fresh orchestration: archive the reviewing session, spin a
-        // new one in the same cwd, register it with the sidebar, then seed it
-        // with the plan so it starts executing immediately.
         void (async () => {
           const generation = ++this.sessionGeneration;
           try {
             await manager.init(resolveWorkspaceCwd());
-            // Archiving always proceeds: the execute-fresh intent belongs to
-            // the user rather than the sidebar view, so it stays outside the
-            // generation guard.
-            manager.archiveThread(msg.sessionId, true);
+            manager.send(notification({
+              method: 'archiveThread',
+              sessionId: msg.sessionId,
+              archived: true,
+            }));
             const freshId = crypto.randomUUID();
             await manager.createSession(msg.cwd, freshId);
             if (generation !== this.sessionGeneration) {
@@ -287,7 +332,11 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
               return;
             }
             this.registerSession(freshId, 'fresh', msg.cwd);
-            manager.send({ cmd: 'plan_seed_execution', sessionId: freshId, planFile: msg.planFile });
+            manager.send(notification({
+              method: 'planSeedExecution',
+              sessionId: freshId,
+              planFile: msg.planFile,
+            }));
           } catch (e) {
             this.post({ type: 'global_error', message: String(e) });
           }
@@ -295,48 +344,53 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         return;
       }
       case 'goal':
-        manager.send({
-          cmd: 'goal',
+        manager.send(notification({
+          method: 'goal',
           sessionId: msg.sessionId,
           action: msg.action,
-          objective: msg.objective,
-          budget: msg.budget,
-        });
+          objective: msg.objective ?? null,
+          budget: (msg.budget ?? null) as unknown as bigint | null,
+          maxRounds: null,
+        }));
         return;
       case 'stop_background_task':
-        manager.send({ cmd: 'stop_background_task', sessionId: msg.sessionId, taskId: msg.taskId });
+        manager.send(notification({
+          method: 'stopBackgroundTask',
+          sessionId: msg.sessionId,
+          taskId: msg.taskId,
+        }));
         return;
       case 'answer_question':
-        manager.send({
-          cmd: 'answer_question',
+        manager.send(notification({
+          method: 'compact',
           sessionId: msg.sessionId,
-          id: msg.id,
-          answers: msg.answers,
-          response: msg.response,
-        });
+          instructions: null,
+        }));
         return;
       case 'request_usage':
-        manager.send({ cmd: 'get_usage', sessionId: msg.sessionId });
+        manager.send(request({ method: 'getUsage', sessionId: msg.sessionId }));
         return;
       case 'request_thread_info':
-        manager.send({ cmd: 'thread_info', sessionId: msg.sessionId });
+        manager.send(request({ method: 'threadInfo', sessionId: msg.sessionId }));
         return;
       case 'focus_thread':
-        manager.send({ cmd: 'focus_thread', sessionId: msg.sessionId });
+        manager.send(notification({
+          method: 'focusThread',
+          sessionId: msg.sessionId ?? null,
+        }));
         return;
       case 'request_models':
         try {
           await manager.init(resolveWorkspaceCwd());
-          this.post({ type: 'models', models: await manager.listModels() });
+          this.post({ type: 'models', models: await manager.listModels() as ModelInfo[] });
         } catch (e) {
           this.post({ type: 'global_error', message: String(e) });
         }
         return;
       case 'list_threads':
-        // The thread store exists only after init; sequence behind it.
         try {
           await manager.init(resolveWorkspaceCwd());
-          manager.send({ cmd: 'list_threads' });
+          manager.send(request({ method: 'listThreads' }));
         } catch (e) {
           this.post({ type: 'global_error', message: String(e) });
         }
@@ -344,7 +398,7 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
       case 'list_commands':
         try {
           await manager.init(resolveWorkspaceCwd());
-          manager.send({ cmd: 'list_commands' });
+          manager.send(request({ method: 'listCommands' }));
         } catch (e) {
           this.post({ type: 'global_error', message: String(e) });
         }
@@ -353,10 +407,18 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
         await this.openThread(msg.sessionId);
         return;
       case 'archive_thread':
-        manager.archiveThread(msg.sessionId, msg.archived);
+        manager.send(notification({
+          method: 'archiveThread',
+          sessionId: msg.sessionId,
+          archived: msg.archived,
+        }));
         return;
       case 'pin_thread':
-        manager.pinThread(msg.sessionId, msg.pinned);
+        manager.send(notification({
+          method: 'pinThread',
+          sessionId: msg.sessionId,
+          pinned: msg.pinned,
+        }));
         return;
       case 'new_session':
         await this.newSession({
@@ -406,7 +468,7 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   <meta charset="UTF-8">
   <meta name="vscode-language" content="${vscode.env.language}">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'nonce-${nonce}'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
+    content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'nonce-${nonce}'; font-src ${webview.cspSource};">
   <link rel="stylesheet" href="${styleUri}">
 </head>
 <body>
