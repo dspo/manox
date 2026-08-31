@@ -10,23 +10,24 @@ import type { HostToWebview, WebviewToHost } from '../../dist/sidebar/messages';
 import { registerManoxSidebar } from './sidebarProvider';
 
 const { managerMock } = vi.hoisted(() => {
-  const handlers = new Map<string, (ev: unknown) => void>();
+  const handlers = new Map<string, (ev: Record<string, unknown>) => void>();
   const managerMock = {
     handlers,
     sent: [] as Record<string, unknown>[],
     init: vi.fn(async () => {}),
     createSession: vi.fn(async (_cwd: string, id?: string) => id ?? 'generated'),
-    onSessionEvent(sessionId: string, handler: (ev: unknown) => void): () => void {
+    onSessionEvent(sessionId: string, handler: (ev: Record<string, unknown>) => void): () => void {
       handlers.set(sessionId, handler);
       return () => handlers.delete(sessionId);
     },
     onGlobalEvent: vi.fn(() => () => {}),
     archiveThread: vi.fn(),
-    send(command: Record<string, unknown>): void {
-      this.sent.push(command);
+    send(msg: Record<string, unknown>): void {
+      this.sent.push(msg);
     },
+    fromClientReply: vi.fn(),
     disposeSession: vi.fn(),
-    emit(sessionId: string, ev: unknown): void {
+    emit(sessionId: string, ev: Record<string, unknown>): void {
       handlers.get(sessionId)?.(ev);
     },
   };
@@ -117,8 +118,8 @@ describe('sidebar event batching', () => {
   it('posts session_ready before any buffered event of that session', async () => {
     const { provider, posted } = setup();
     await provider.newSession({ sessionId: 's1' });
-    expect(managerMock.sent.at(-1)).toMatchObject({ cmd: 'get_current_model', sessionId: 's1' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'a' });
+    expect(managerMock.sent.at(-1)).toMatchObject({ kind: 'notification', note: { method: 'setModel', sessionId: 's1' } });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'a' });
     vi.advanceTimersByTime(33);
     expect(posted.map((m) => m.type)).toEqual(['session_ready', 'events']);
   });
@@ -126,16 +127,16 @@ describe('sidebar event batching', () => {
   it('coalesces a frame of events into one events message in arrival order', async () => {
     const { provider, posted } = setup();
     await provider.newSession({ sessionId: 's1' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'a' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'b' });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'a' });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'b' });
     expect(posted).toHaveLength(1);
     vi.advanceTimersByTime(33);
     expect(posted).toHaveLength(2);
     expect(posted[1]).toEqual({
       type: 'events',
       events: [
-        { type: 'agent_text', sessionId: 's1', text: 'a' },
-        { type: 'agent_text', sessionId: 's1', text: 'b' },
+        { method: 'agentText', sessionId: 's1', text: 'a' },
+        { method: 'agentText', sessionId: 's1', text: 'b' },
       ],
     });
   });
@@ -143,15 +144,15 @@ describe('sidebar event batching', () => {
   it('drains the buffer before a thread_info bypass so it never overtakes events', async () => {
     const { provider, posted } = setup();
     await provider.newSession({ sessionId: 's1' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'x' });
-    managerMock.emit('s1', { type: 'thread_info', sessionId: 's1', info: threadInfo });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'x' });
+    managerMock.emit('s1', { method: 'threadInfo', sessionId: 's1', info: threadInfo });
     expect(posted.map((m) => m.type)).toEqual(['session_ready', 'events', 'thread_info']);
   });
 
   it('flushes buffered events before re-announcing an already-live session', async () => {
     const { provider, posted } = setup();
     await provider.newSession({ sessionId: 's1' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'x' });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'x' });
     await (provider as unknown as { openThread(id: string): Promise<void> }).openThread('s1');
     expect(posted.map((m) => m.type)).toEqual(['session_ready', 'events', 'session_ready']);
     expect(posted[2]).toMatchObject({ kind: 'restored' });
@@ -160,7 +161,7 @@ describe('sidebar event batching', () => {
   it('drops the buffer and timer on teardown without posting', async () => {
     const { provider, posted, disposeView } = setup();
     await provider.newSession({ sessionId: 's1' });
-    managerMock.emit('s1', { type: 'agent_text', sessionId: 's1', text: 'x' });
+    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'x' });
     disposeView();
     vi.advanceTimersByTime(100);
     expect(posted.map((m) => m.type)).toEqual(['session_ready']);
@@ -189,16 +190,23 @@ describe('plan_execute_fresh', () => {
     onMessage(message);
     await settle();
 
-    const seed = managerMock.sent.find((c) => c.cmd === 'plan_seed_execution') as
-      | { cmd: string; sessionId: string; planFile: string }
-      | undefined;
+    const seed = managerMock.sent.find(
+      (c) => typeof c === 'object' && c !== null && 'kind' in c && (c as Record<string, unknown>).kind === 'notification' &&
+        (c as { note: { method: string } }).note.method === 'planSeedExecution'
+    ) as { note: { method: string; sessionId: string; planFile: string } } | undefined;
     expect(seed).toBeDefined();
-    const freshId = seed!.sessionId;
-    expect(managerMock.sent.map((c) => c.cmd)).toEqual([
-      'get_current_model',
-      'plan_seed_execution',
-    ]);
-    expect(managerMock.archiveThread).toHaveBeenCalledWith('s1', true);
+    const freshId = seed!.note.sessionId;
+    const planExecCmds = managerMock.sent.filter(
+      (c) => typeof c === 'object' && c !== null && 'kind' in c && (c as Record<string, unknown>).kind === 'notification' &&
+        (c as { note: { method: string } }).note.method === 'planSeedExecution'
+    );
+    expect(planExecCmds).toHaveLength(1);
+    const archiveCmd = managerMock.sent.find(
+      (c) => typeof c === 'object' && c !== null && 'kind' in c && (c as Record<string, unknown>).kind === 'notification' &&
+        (c as { note: { method: string } }).note.method === 'archiveThread'
+    );
+    expect(archiveCmd).toBeDefined();
+    expect(archiveCmd).toMatchObject({ note: { method: 'archiveThread', sessionId: 's1', archived: true } });
     expect(managerMock.createSession).toHaveBeenCalledWith('/w', freshId);
     expect(posted).toEqual([
       { type: 'session_ready', sessionId: freshId, cwd: '/w', kind: 'fresh' },
@@ -207,11 +215,11 @@ describe('plan_execute_fresh', () => {
 
     // The core symptom regression: the fresh session's events reach the
     // webview without the user manually opening the thread.
-    managerMock.emit(freshId, { type: 'agent_text', sessionId: freshId, text: 'seed' });
+    managerMock.emit(freshId, { method: 'agentText', sessionId: freshId, text: 'seed' });
     vi.advanceTimersByTime(33);
     expect(posted.at(-1)).toEqual({
       type: 'events',
-      events: [{ type: 'agent_text', sessionId: freshId, text: 'seed' }],
+      events: [{ method: 'agentText', sessionId: freshId, text: 'seed' }],
     });
   });
 
@@ -232,7 +240,11 @@ describe('plan_execute_fresh', () => {
     const freshId = managerMock.createSession.mock.calls[0][1];
     expect(freshId).toBeDefined();
     expect(managerMock.disposeSession).toHaveBeenCalledWith(freshId);
-    expect(managerMock.sent.some((c) => c.cmd === 'plan_seed_execution')).toBe(false);
+    const planExecCmds = managerMock.sent.filter(
+      (c) => typeof c === 'object' && c !== null && 'kind' in c && (c as Record<string, unknown>).kind === 'notification' &&
+        (c as { note: { method: string } }).note.method === 'planSeedExecution'
+    );
+    expect(planExecCmds).toHaveLength(0);
     expect(posted).toEqual([]);
   });
 });

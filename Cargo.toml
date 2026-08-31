@@ -27,13 +27,12 @@ members = [
     "crates/http_proxy",
     "crates/webview-macros",
     "crates/cx",
-    "crates/cx-providers",
-    "crates/manox-actor",
-    "crates/manox-session-core",
-    "crates/manox-napi",
-    "crates/manox-webui",
-    "crates/manox-protocol",
-    "crates/hyperlinks",
+"crates/cx-providers",
+	    "crates/manox-session-core",
+	    "crates/manox-napi",
+	    "crates/manox-webui",
+	    "crates/manox-protocol",
+	    "crates/hyperlinks",
 ]
 resolver = "2"
 
@@ -56,8 +55,7 @@ lsp = { path = "crates/lsp" }
 manox-webview = { path = "crates/webview" }
 manox-webview-macros = { path = "crates/webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
-manox-actor = { path = "crates/manox-actor" }
-manox-session-core = { path = "crates/manox-session-core" }
+	manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
 pi = { path = "crates/pi" }

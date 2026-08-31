@@ -68,7 +68,7 @@ vi.mock('vscode', () => {
 });
 
 import * as vscode from 'vscode';
-import type { ActorEvent } from '../dist/protocol';
+import type { FromClient, FromServer } from '../dist/protocol';
 import { ManoxModelProvider, partToText, toWireMessages } from './modelProvider';
 import { SessionManager } from './sessionManager';
 import type { Transport } from './transport/transport';
@@ -76,9 +76,9 @@ import type { Transport } from './transport/transport';
 class FakeTransport implements Transport {
   readonly ready = Promise.resolve();
   sent: string[] = [];
-  private handler: ((ev: ActorEvent) => void) | null = null;
+  private handler: ((ev: FromServer) => void) | null = null;
 
-  onEvent(handler: (ev: ActorEvent) => void): () => void {
+  onEvent(handler: (ev: FromServer) => void): () => void {
     this.handler = handler;
     return () => {
       this.handler = null;
@@ -91,16 +91,16 @@ class FakeTransport implements Transport {
 
   async dispose(): Promise<void> {}
 
-  emit(ev: ActorEvent): void {
+  emit(ev: FromServer): void {
     this.handler?.(ev);
   }
 
-  lastCommand(): Record<string, unknown> {
-    return JSON.parse(this.sent[this.sent.length - 1]) as Record<string, unknown>;
+  lastCommand(): FromClient {
+    return JSON.parse(this.sent[this.sent.length - 1]) as FromClient;
   }
 
-  commands(): Record<string, unknown>[] {
-    return this.sent.map((s) => JSON.parse(s) as Record<string, unknown>);
+  commands(): FromClient[] {
+    return this.sent.map((s) => JSON.parse(s) as FromClient);
   }
 }
 
@@ -160,6 +160,11 @@ const flush = async (times = 5) => {
   for (let i = 0; i < times; i++) await Promise.resolve();
 };
 
+/** Helper: make a FromServer::Notification with the given method and fields. */
+function note(method: string, fields: Record<string, unknown> = {}): FromServer {
+  return { kind: 'notification', note: { method, ...fields } as never } as FromServer;
+}
+
 /** Start a response, drive init to completion, and resolve the request id. */
 async function openChat(
   provider: ManoxModelProvider,
@@ -167,7 +172,7 @@ async function openChat(
   messages: readonly vscode.LanguageModelChatRequestMessage[],
   options: vscode.ProvideLanguageModelChatResponseOptions = emptyOptions,
   token = fakeToken(),
-): Promise<{ pending: Promise<void>; requestId: string; modelChat: Record<string, unknown> }> {
+): Promise<{ pending: Promise<void>; requestId: string; modelChat: FromClient }> {
   const pending = provider.provideLanguageModelChatResponse(
     modelInfo('anthropic/x'),
     messages,
@@ -176,11 +181,13 @@ async function openChat(
     token,
   );
   await flush();
-  expect(transport.lastCommand()).toEqual(expect.objectContaining({ cmd: 'init' }));
-  transport.emit({ type: 'ready' });
+  // init now waits for the ready notification, no init command sent.
+  transport.emit(note('ready'));
   await flush();
-  const modelChat = transport.commands().find((c) => c.cmd === 'model_chat')!;
-  return { pending, requestId: modelChat.requestId as string, modelChat };
+  const modelChat = transport.commands().find(
+    (c) => c.kind === 'request' && (c as { call: { method: string } }).call.method === 'modelChat',
+  )!;
+  return { pending, requestId: (modelChat as { call: { requestId: string } }).call.requestId, modelChat };
 }
 
 afterEach(() => {
@@ -211,9 +218,9 @@ describe('provideLanguageModelChatInformation', () => {
       fakeToken(),
     );
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     await expect(pending).resolves.toEqual([
       expect.objectContaining({
         id: 'a',
@@ -234,12 +241,11 @@ describe('provideLanguageModelChatInformation', () => {
       fakeToken(),
     );
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({
-      type: 'models',
+    transport.emit(note('models', {
       models: [{ id: 'a', name: 'A', provider: 'p1', api: 'anthropic', context_window: 0, provider_name: 'DeepSeek' }],
-    });
+    }));
     await expect(pending).resolves.toEqual([
       expect.objectContaining({ maxInputTokens: 200_000, maxOutputTokens: 32_000 }),
     ]);
@@ -250,9 +256,9 @@ describe('provideLanguageModelChatInformation', () => {
     const provider = new ManoxModelProvider(manager);
     const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     // Named groups will now serve the models; the ungrouped bucket stays empty.
     await expect(pending).resolves.toEqual([]);
     expect(lastWrite()).toEqual(
@@ -269,9 +275,9 @@ describe('provideLanguageModelChatInformation', () => {
     setCfg(JSON.stringify([{ vendor: 'manox', name: 'Manox-DeepSeek', provider: 'DeepSeek' }]));
     const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     await expect(pending).resolves.toEqual([]);
     // The pre-existing group is preserved and the new provider is appended.
     expect(lastWrite()).toEqual(
@@ -288,9 +294,9 @@ describe('provideLanguageModelChatInformation', () => {
     const provider = new ManoxModelProvider(manager);
     const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     await expect(pending).resolves.toHaveLength(2);
     expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
   });
@@ -304,9 +310,9 @@ describe('provideLanguageModelChatInformation', () => {
     ]));
     const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     // Named groups serve the models; the groupless call contributes nothing.
     await expect(pending).resolves.toEqual([]);
   });
@@ -317,7 +323,7 @@ describe('provideLanguageModelChatInformation', () => {
     const provider = new ManoxModelProvider(manager);
     const pending = provider.provideLanguageModelChatInformation({ silent: false }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     // listModels budgets the cold-boot registration (INIT_TIMEOUT_MS).
     await vi.advanceTimersByTimeAsync(30_001);
     await expect(pending).resolves.toEqual([]);
@@ -331,9 +337,9 @@ describe('provideLanguageModelChatInformation', () => {
       fakeToken(),
     );
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     await expect(pending).resolves.toEqual([expect.objectContaining({ id: 'a' })]);
   });
 
@@ -345,15 +351,14 @@ describe('provideLanguageModelChatInformation', () => {
       fakeToken(),
     );
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({
-      type: 'models',
+    transport.emit(note('models', {
       models: [
         { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-anthropic', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
         { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-responses', api: 'openai_responses', context_window: 100000, provider_name: 'DeepSeek' },
       ],
-    });
+    }));
     // The bucket holds wire variants sharing an id; VS Code registers by id,
     // so only the first survives.
     await expect(pending).resolves.toEqual([expect.objectContaining({ id: 'deepseek-v4-pro' })]);
@@ -365,15 +370,14 @@ describe('provideLanguageModelChatInformation', () => {
     const provider = new ManoxModelProvider(manager);
     const pending = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({
-      type: 'models',
+    transport.emit(note('models', {
       models: [
         { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-anthropic', api: 'anthropic', context_window: 100000, provider_name: 'DeepSeek' },
         { id: 'deepseek-v4-pro', name: 'deepseek-v4-pro', provider: 'DeepSeek-responses', api: 'openai_responses', context_window: 100000, provider_name: 'DeepSeek' },
       ],
-    });
+    }));
     await expect(pending).resolves.toHaveLength(1);
     expect(vscode.workspace.fs.writeFile).not.toHaveBeenCalled();
   });
@@ -407,13 +411,13 @@ describe('provideLanguageModelChatInformation', () => {
     const provider = new ManoxModelProvider(manager);
     const first = provider.provideLanguageModelChatInformation({ silent: true }, fakeToken());
     await flush();
-    transport.emit({ type: 'ready' });
+    transport.emit(note('ready'));
     await flush();
-    transport.emit({ type: 'models', models: providerModels() });
+    transport.emit(note('models', { models: providerModels() }));
     await first;
-    const listCalls = () => transport.commands().filter((c) => c.cmd === 'list_models').length;
+    const listCalls = () => transport.commands().filter((c) => c.kind === 'request' && (c as { call: { method: string } }).call.method === 'listModels').length;
     const before = listCalls();
-    // A second silent enumeration inside the TTL must not re-query the actor.
+    // A second silent enumeration inside the TTL must not re-query the server.
     await expect(
       provider.provideLanguageModelChatInformation({ silent: true }, fakeToken()),
     ).resolves.toEqual([]);
@@ -429,30 +433,30 @@ describe('provideLanguageModelChatResponse', () => {
       userMsg('list files'),
     ]);
 
-    expect(modelChat).toMatchObject({
-      cmd: 'model_chat',
+    const call = modelChat as { kind: 'request'; call: { method: string; model: string; messages: unknown[]; tools: unknown[] } };
+    expect(call.call).toMatchObject({
+      method: 'modelChat',
       model: 'anthropic/x',
       messages: [{ role: 'user', content: [{ type: 'text', text: 'list files' }] }],
       tools: [],
     });
 
-    transport.emit({ type: 'model_text', requestId, text: 'Here are ' });
+    transport.emit(note('modelText', { requestId, text: 'Here are ' }));
     expect(progress.report.mock.calls[0][0]).toBeInstanceOf(vscode.LanguageModelTextPart);
     expect(progress.report.mock.calls[0][0].value).toBe('Here are ');
 
-    transport.emit({ type: 'model_thinking', requestId, text: 'reasoning' });
+    transport.emit(note('modelThinking', { requestId, text: 'reasoning' }));
     expect(progress.report.mock.calls[1][0]).toBeInstanceOf(
       vscode.LanguageModelThinkingPart,
     );
     expect(progress.report.mock.calls[1][0].value).toBe('reasoning');
 
-    transport.emit({
-      type: 'model_tool_call',
+    transport.emit(note('modelToolCall', {
       requestId,
       id: 'c1',
       name: 'listDir',
       input: { path: '.' },
-    });
+    }));
     const toolCall = progress.report.mock.calls[2][0];
     expect(toolCall).toBeInstanceOf(vscode.LanguageModelToolCallPart);
     expect(toolCall.callId).toBe('c1');
@@ -461,7 +465,7 @@ describe('provideLanguageModelChatResponse', () => {
 
     // A tool-use stop settles the request normally: VS Code executes the
     // relayed tools and calls back on the next request.
-    transport.emit({ type: 'model_chat_done', requestId, stop: 'toolUse', error: null });
+    transport.emit(note('modelChatDone', { requestId, stop: 'toolUse', error: null }));
     await expect(pending).resolves.toBeUndefined();
   });
 
@@ -477,18 +481,19 @@ describe('provideLanguageModelChatResponse', () => {
       [userMsg('hi')],
       options,
     );
-    expect(modelChat.tools).toEqual([
+    const call = modelChat as { kind: 'request'; call: { tools: unknown[] } };
+    expect(call.call.tools).toEqual([
       { name: 'listDir', description: 'List a directory', inputSchema: { type: 'object' } },
     ]);
-    transport.emit({ type: 'model_chat_done', requestId, stop: 'stop', error: null });
+    transport.emit(note('modelChatDone', { requestId, stop: 'stop', error: null }));
     await pending;
   });
 
-  it('rejects with the actor error message', async () => {
+  it('rejects with the server error message', async () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
     const { pending, requestId } = await openChat(provider, transport, [userMsg('hi')]);
-    transport.emit({ type: 'model_chat_done', requestId, stop: null, error: 'boom' });
+    transport.emit(note('modelChatDone', { requestId, stop: null, error: 'boom' }));
     await expect(pending).rejects.toThrow('boom');
   });
 
@@ -504,10 +509,12 @@ describe('provideLanguageModelChatResponse', () => {
       token,
     );
     token.cancel();
-    expect(transport.lastCommand()).toEqual({ cmd: 'cancel_model_chat', requestId });
-    // The actor settles a cancelled stream with stop "aborted" and no error
-    // (the provider returns Err(ProviderError::Aborted) on signal).
-    transport.emit({ type: 'model_chat_done', requestId, stop: 'aborted', error: null });
+    expect(transport.lastCommand()).toMatchObject({
+      kind: 'notification',
+      note: { method: 'cancelModelChat', requestId },
+    });
+    // The server settles a cancelled stream with stop "aborted" and no error.
+    transport.emit(note('modelChatDone', { requestId, stop: 'aborted', error: null }));
     await expect(pending).resolves.toBeUndefined();
   });
 
@@ -515,10 +522,10 @@ describe('provideLanguageModelChatResponse', () => {
     const { transport, manager } = create();
     const provider = new ManoxModelProvider(manager);
     const { pending, requestId } = await openChat(provider, transport, [userMsg('hi')]);
-    transport.emit({ type: 'model_text', requestId: 'other', text: 'intruder' });
-    transport.emit({ type: 'threads_updated', threads: [] });
+    transport.emit(note('modelText', { requestId: 'other', text: 'intruder' }));
+    transport.emit(note('threadsUpdated', { threads: [] }));
     expect(progress.report).not.toHaveBeenCalled();
-    transport.emit({ type: 'model_chat_done', requestId, stop: 'stop', error: null });
+    transport.emit(note('modelChatDone', { requestId, stop: 'stop', error: null }));
     await pending;
   });
 });
