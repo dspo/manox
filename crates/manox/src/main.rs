@@ -402,8 +402,8 @@ fn main() {
             });
 
             // Wire the process-wide browser host: bind it to the main
-            // Workspace, register it in both the agent trait registry (so the
-            // `web_explore_*` tools reach it via `agent::webview_host::host()`)
+            // Workspace, register it as the `CapabilityClient` provider (so the
+            // `web_explore_*` tools reach it via `agent::capability::provider()`)
             // and the agent-ui concrete registry (so `BrowserView` attaches the
             // notify/inbound bridges at build), then spawn the notify/inbound
             // drainer on the Workspace — a notify ships through the OnceLock
