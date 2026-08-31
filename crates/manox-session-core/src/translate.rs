@@ -251,9 +251,7 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
         }
         ThreadEvent::PrefixStability { .. }
         | ThreadEvent::SideCallMetricsUpdated(_)
-        | ThreadEvent::MainCallMetricsUpdated(_)
-        | ThreadEvent::BrowserNotification { .. }
-        | ThreadEvent::InboundAuthorization { .. } => Skip,
+        | ThreadEvent::MainCallMetricsUpdated(_) => Skip,
         ThreadEvent::CacheInvalidation { reprocessed_tokens } => {
             Note(ServerNote::CacheInvalidation {
                 session_id: session_id.into(),

@@ -2,21 +2,27 @@
 //! `RpcConnection` into the store. γ-1b: the Entity wrapper + pump; γ-2 wires
 //! the views to read from this instead of `ThreadProxy`.
 
-use gpui::{Context, Task};
+use agent::ThreadEvent;
+use gpui::{Context, EventEmitter, Task};
 use manox_protocol::{FromServer, RpcConnection};
 
 use crate::client_store::ClientStore;
+use crate::server_note_translate::{server_call_to_thread_event, server_note_to_thread_event};
 
 /// A gpui entity that owns a `ClientStore` and a background pump. The pump
-/// reads `FromServer::Notification` from the connection's server channel and
-/// applies each `ServerNote` to the store, then calls `cx.notify()`.
+/// reads `FromServer` messages from the connection's server channel, applies
+/// each `ServerNote` to the store, re-emits the note as the `ThreadEvent` the
+/// workspace's conversation layer consumes, and calls `cx.notify()`.
 pub struct ClientStoreHandle {
     pub store: ClientStore,
     _pump: Task<()>,
 }
 
+impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
+
 impl ClientStoreHandle {
-    /// Create a handle that pumps `FromServer` notifications into the store.
+    /// Create a handle that pumps `FromServer` messages into the store and
+    /// re-emits them as `ThreadEvent`s.
     pub fn new(client: manox_protocol::InProcessConnection, cx: &mut Context<Self>) -> Self {
         let server_rx = client.server_rx();
         let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
@@ -25,6 +31,9 @@ impl ClientStoreHandle {
                     FromServer::Notification { note } => {
                         let _ = this.update(cx, |h, cx| {
                             h.store.apply_server_note(&note);
+                            if let Some(ev) = server_note_to_thread_event(&note) {
+                                cx.emit(ev);
+                            }
                             cx.notify();
                         });
                     }
@@ -35,8 +44,11 @@ impl ClientStoreHandle {
                                 cx.notify();
                             }
                             if let Some(plan_file) = plan_file_of(&call) {
-                                h.store.pending_plan_verdict.insert(plan_file, id);
+                                h.store.pending_plan_verdict.insert(plan_file, id.clone());
                                 cx.notify();
+                            }
+                            if let Some(ev) = server_call_to_thread_event(&call) {
+                                cx.emit(ev);
                             }
                         });
                     }

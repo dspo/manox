@@ -14,10 +14,8 @@
 //!   `read_dom` / `screenshot`) inject an extraction script and await its
 //!   `EvalResult` notification, paired by `request_id`.
 //! - Inbound (page → agent): `__manox_request_write__` is fire-and-forget on
-//!   the page side; the host routes it to a `ThreadEvent::InboundAuthorization`
-//!   whose resolution is parked in `Thread::pending_inbound`. This axis ignores
-//!   `PermissionMode` — a page must never gain a write path just because the
-//!   agent runs with broad permissions.
+//!   the page side; the host observes and drops the request (an untrusted
+//!   page gains no write path regardless of `PermissionMode`).
 //!
 //! The webview crate's notify/inbound bridges fire on the gpui main thread via
 //! `PlatformDispatcher::dispatch_on_main_thread`, whose runnable carries no
@@ -35,9 +33,7 @@ use async_channel::{Receiver, Sender};
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-use crate::thread_proxy::ThreadProxy;
-use agent::ThreadEvent;
-use agent::webview_host::{BrowserHost, BrowserNotification as AgentNotification, BrowserTabId};
+use agent::webview_host::{BrowserHost, BrowserTabId};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;
@@ -47,10 +43,6 @@ use crate::workspace::Workspace;
 /// directly in the notify handler (no cx needed) and never reach the channel;
 /// only page-state notifications and inbound-write requests travel here.
 pub(crate) enum HostMessage {
-    Notify {
-        tab_id: BrowserTabId,
-        notification: AgentNotification,
-    },
     InboundWrite,
 }
 
@@ -58,7 +50,6 @@ pub(crate) enum HostMessage {
 /// lifetime of the tab; dropped (closing pending senders) when the tab is
 /// closed or the owning thread is released.
 struct TabState {
-    thread: WeakEntity<ThreadProxy>,
     label: String,
     /// Pending eval-script oneshots, keyed by `request_id`. A read op injects
     /// a script that calls `__manox_notify__("eval_result", { request_id,
@@ -107,12 +98,6 @@ impl WorkspaceBrowserHost {
         (host, rx)
     }
 
-    /// The shared routing state, for the drainer to resolve a tab back to its
-    /// owning thread.
-    pub(crate) fn routes(&self) -> &Arc<Routes> {
-        &self.routes
-    }
-
     /// Register the host in the agent-ui concrete registry. Called once at App
     /// startup, after the Workspace exists. A second registration is a no-op —
     /// the first host wins (single-workspace, single-process model).
@@ -137,7 +122,6 @@ impl WorkspaceBrowserHost {
     /// `AsyncApp`) is the cx-bearing sink that emits onto the owning thread.
     pub fn install(workspace: Entity<Workspace>, cx: &mut AsyncApp) {
         let (host, rx) = Self::new(workspace.clone());
-        let routes = host.routes().clone();
         Self::set_concrete(host.clone());
         agent::webview_host::set_host(host);
         // Register the capability provider on the same seam: the kernel drives
@@ -147,8 +131,8 @@ impl WorkspaceBrowserHost {
         agent::capability::set_provider(agent::webview_host::GpuiCapability::start(cx));
         cx.update(|cx| {
             workspace.update(cx, |_, cx| {
-                cx.spawn(async move |_, cx: &mut AsyncApp| {
-                    Self::drain(rx, routes, cx).await;
+                cx.spawn(async move |_, _| {
+                    Self::drain(rx).await;
                 })
                 .detach();
             });
@@ -165,58 +149,26 @@ impl WorkspaceBrowserHost {
         match Self::concrete() {
             Some(host) => {
                 let routes_n = host.routes.clone();
-                let tx_n = host.tx.clone();
                 let routes_i = host.routes.clone();
                 let tx_i = host.tx.clone();
                 builder
-                    .on_notify(move |label, n| handle_notify(&routes_n, &tx_n, label, n))
+                    .on_notify(move |label, n| handle_notify(&routes_n, label, n))
                     .on_inbound_write(move |label, w| handle_inbound(&routes_i, &tx_i, label, w))
             }
             None => builder,
         }
     }
 
-    /// Drain the notify/inbound channel, dispatching each message to its owning
-    /// thread. Spawned once on the Workspace at App startup; runs for the
-    /// process lifetime. Page-state notifications become
-    /// `ThreadEvent::BrowserNotification`; inbound-write requests register a
-    /// pending decision oneshot on the owning thread and emit
-    /// `ThreadEvent::InboundAuthorization`. The decision await is parked in a
-    /// detached `Task` per request so a never-answered confirmation overlay
-    /// cannot block subsequent notifications (which would deadlock an
-    /// in-flight read eval).
-    pub(crate) async fn drain(rx: Receiver<HostMessage>, routes: Arc<Routes>, cx: &mut AsyncApp) {
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                HostMessage::Notify {
-                    tab_id,
-                    notification,
-                } => {
-                    let thread = routes
-                        .tabs
-                        .lock()
-                        .expect("routes lock poisoned")
-                        .get(&tab_id)
-                        .and_then(|t| t.thread.upgrade());
-                    let Some(thread) = thread else {
-                        continue;
-                    };
-                    thread.update(cx, |_, cx| {
-                        cx.emit(ThreadEvent::BrowserNotification {
-                            tab_id,
-                            notification,
-                        });
-                    });
-                }
-                HostMessage::InboundWrite => {
-                    // Inbound-write confirmation was manox-harness chrome;
-                    // the pi backend has no write surface for browser pages
-                    // yet, so the request is observed and dropped.
-                }
-            }
+    /// Drain the inbound-write channel. Spawned once on the Workspace at App
+    /// startup; runs for the process lifetime, keeping the channel senders
+    /// alive (a dropped receiver makes `try_send` fail).
+    pub(crate) async fn drain(rx: Receiver<HostMessage>) {
+        while let Ok(_msg) = rx.recv().await {
+            // Inbound-write confirmation was manox-harness chrome; the pi
+            // backend has no write surface for browser pages yet, so each
+            // request is observed and dropped.
         }
     }
-
     /// Inject `js` into the tab's webview and return immediately
     /// (fire-and-forget). Reaches the `wry::WebView` via `Entity::read_with`
     /// (eval is a read-only `&self` op on wry) — no window required.
@@ -361,7 +313,7 @@ impl WorkspaceBrowserHost {
     /// routing table so host evals (`page_title`) can reach it. Tool-opened
     /// tabs register inside `open_tab`; this mirrors that registration half
     /// for the workspace-opened direction. Idempotent — a re-insert replaces.
-    pub(crate) fn register_ui_tab(&self, id: BrowserTabId, thread: WeakEntity<ThreadProxy>) {
+    pub(crate) fn register_ui_tab(&self, id: BrowserTabId) {
         let label = crate::views::browser_view::webview_label_for(id);
         {
             let mut labels = self
@@ -376,7 +328,6 @@ impl WorkspaceBrowserHost {
             tabs.insert(
                 id,
                 TabState {
-                    thread,
                     label,
                     pending_evals: Mutex::new(HashMap::new()),
                     pending_yield: Mutex::new(None),
@@ -441,7 +392,7 @@ fn stringify_value(v: &serde_json::Value) -> String {
 /// for the drainer to emit as a `ThreadEvent`. Runs on the gpui main thread
 /// without an `AsyncApp`, so it touches only the shared `Routes` (lock-guarded)
 /// and the channel sender.
-fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, n: WvNotification) {
+fn handle_notify(routes: &Arc<Routes>, label: String, n: WvNotification) {
     let tab_id = match routes
         .label_to_tab
         .lock()
@@ -472,33 +423,23 @@ fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, 
             {
                 let _ = sender.send(payload);
             }
-            return;
         }
         WvNotification::UserHandback => {
             // Deliberately ignored on the page side. An untrusted page must
             // not resume a parked `web_explore_yield` — that would let it
             // drive the agent's turn flow unprompted. Only the user's chrome
             // "Done" button resolves a yield, via `resolve_handback`.
-            return;
         }
-        _ => {}
-    }
-    let agent_n = match n {
-        WvNotification::PageLoaded => AgentNotification::PageLoaded,
-        WvNotification::DomChanged => AgentNotification::DomChanged,
-        WvNotification::Navigation(url) => AgentNotification::Navigation { url },
-        WvNotification::UserHandback | WvNotification::EvalResult { .. } => unreachable!(),
-    };
-    if let Err(e) = tx.try_send(HostMessage::Notify {
-        tab_id,
-        notification: agent_n,
-    }) {
-        tracing::warn!(error = %e, "browser host: notify channel full, dropping page-state notification");
+        _ => {
+            // Non-EvalResult page-state notifications are deliberately
+            // dropped: no UI surface consumes them (the workspace never
+            // handled `ThreadEvent::BrowserNotification`).
+        }
     }
 }
 
 /// The inbound-handler side: resolve label → tab and enqueue the write for
-/// the drainer to surface as a `ThreadEvent::InboundAuthorization`. Runs on the
+/// the drainer to observe and drop. Runs on the
 /// gpui main thread without an `AsyncApp`; the actual confirmation overlay and
 /// the parked decision oneshot are wired by the drainer (which has an
 /// `AsyncApp`).
@@ -529,13 +470,9 @@ impl BrowserHost for WorkspaceBrowserHost {
             .weak_ws
             .upgrade()
             .ok_or_else(|| "browser host: workspace dropped".to_string())?;
-        let (tab_id, thread) = handle
+        let tab_id = handle
             .update(cx, |_, window, cx| {
-                ws.update(cx, |ws, cx| {
-                    let tab_id = ws.open_browser_tab(url, window, cx);
-                    let thread = ws.thread.clone();
-                    (tab_id, thread)
-                })
+                ws.update(cx, |ws, cx| ws.open_browser_tab(url, window, cx))
             })
             .map_err(|e| format!("browser host: window update failed: {e}"))?;
         let label = crate::views::browser_view::webview_label_for(tab_id);
@@ -552,7 +489,6 @@ impl BrowserHost for WorkspaceBrowserHost {
             tabs.insert(
                 tab_id,
                 TabState {
-                    thread: thread.downgrade(),
                     label,
                     pending_evals: Mutex::new(HashMap::new()),
                     pending_yield: Mutex::new(None),

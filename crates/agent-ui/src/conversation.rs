@@ -1729,12 +1729,6 @@ impl ConversationState {
                     ApplyOutcome::Unchanged
                 }
             }
-            ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
-                // Browser-axis signals are routed for the UI chrome (overlay,
-                // hint, tab state), not rendered as conversation items. The
-                // owning Workspace subscriber handles the surface.
-                ApplyOutcome::Unchanged
-            }
             ThreadEvent::BackgroundTaskUpdated { snapshot } => {
                 // Find an existing BackgroundTask card with this task_id and
                 // update it in-place; otherwise push a new card.

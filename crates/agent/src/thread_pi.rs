@@ -262,17 +262,6 @@ pub enum ThreadEvent {
     PeerMessage { from: String, content: String },
     /// A queued steer follow-up was drained into `messages`.
     SteerInjected { message_id: String },
-    /// A page-state notification from a built-in browser tab.
-    BrowserNotification {
-        tab_id: crate::webview_host::BrowserTabId,
-        notification: crate::webview_host::BrowserNotification,
-    },
-    /// An untrusted page requested an inbound write.
-    InboundAuthorization {
-        id: String,
-        intent: String,
-        payload: serde_json::Value,
-    },
     /// A background task's state changed.
     BackgroundTaskUpdated {
         snapshot: TaskSnapshot,
