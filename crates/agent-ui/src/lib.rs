@@ -15,6 +15,7 @@ pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
 pub(crate) mod overlap_diag;
+pub mod server_note_translate;
 pub mod slash_command;
 pub mod thread_proxy;
 pub mod views;

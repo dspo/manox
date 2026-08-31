@@ -9,7 +9,7 @@
 //! when the host grows the matching UI): `Retry`,
 //! `PrefixStability`, `CacheInvalidation`, `SideCallMetricsUpdated`,
 //! `MainCallMetricsUpdated`, `CompactionStarted`, `PeerMessage`,
-//! `BrowserNotification`, `InboundAuthorization`, `HistoryRestored`.
+//! `HistoryRestored`.
 //! `HistoryRestored` stays out of this pure projection: the actor pairs it
 //! with a full `thread_history` snapshot that reads the thread's messages.
 //! `GoalChanged` likewise pairs with a rich `goal_changed` snapshot emitted

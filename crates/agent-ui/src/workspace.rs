@@ -5153,7 +5153,7 @@ impl Workspace {
             cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
         self.browser_views.insert(tab_id, view);
         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-            host.register_ui_tab(tab_id, self.thread.downgrade());
+            host.register_ui_tab(tab_id);
         }
         self.spawn_browser_title_ticker(cx);
         tab_id
