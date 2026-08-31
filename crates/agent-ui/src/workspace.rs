@@ -1,7 +1,7 @@
 //! Top-level workspace view.
 //!
 //! Holds a gpui-free `ThreadHandle` plus the AgentServer-backed
-//! gpui-free `agent::ThreadHandle`, see `thread_proxy`) + `Entity<Sidebar>`;
+//! `ClientStoreHandle` mirror + `Entity<Sidebar>`;
 //! `cx.subscribe` handles:
 //! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens the question card;
 //!   the terminal `Stop` (non-ToolUse) triggers `refresh_thread_list`.
@@ -4131,12 +4131,10 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.id.0.clone())
             .expect("foreground store present");
-        if !self.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
             session_id: sid.into(),
             archived: true,
-        }) {
-            self.thread.with_mut(|t| t.set_archived(true));
-        }
+        });
         let store = agent::thread_store_global();
         store.with_mut(|s| s.archive_thread(&id, true));
         true
@@ -4437,10 +4435,6 @@ impl Workspace {
         // body is the model-facing text, and `display_text` keeps the bubble
         // showing the compact `/key args` invocation after a reload — the same
         // form the live view shows at send time.
-        let ui = agent::MessageUiMetadata {
-            display_text: Some(display_text.clone()),
-            ..Self::message_ui_metadata(&meta)
-        };
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
@@ -4458,17 +4452,12 @@ impl Workspace {
         };
         if hit {
             let submit_text = format!("/{key} {args}");
-            if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+            let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
                 session_id: sid.into(),
                 text: submit_text,
                 images: Vec::new(),
                 client_id: None,
-            }) {
-                self.thread.with_mut(|thread| match kind {
-                    RegistryTurnKind::Command => thread.submit_command(key, args, Some(ui.clone())),
-                    RegistryTurnKind::Skill => thread.submit_skill(key, args, Some(ui)),
-                });
-            }
+            });
         } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
@@ -4651,26 +4640,12 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
             session_id: sid.into(),
             text: turn.text.clone(),
             images: attachments,
             client_id: None,
-        }) {
-            self.thread.with_mut(|thread| {
-                if turn.images.is_empty() {
-                    thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui));
-                } else {
-                    let mut content = Vec::with_capacity(turn.images.len() + 1);
-                    if !turn.text.trim().is_empty() {
-                        content.push(MessageContent::Text(turn.text));
-                    }
-                    content.extend(turn.images);
-                    thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui));
-                }
-            });
-            self.thread.with_mut(|thread| thread.run_turn());
-        }
+        });
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -5681,24 +5656,18 @@ impl Workspace {
             return;
         }
         let meta = self.user_turn_meta(cx);
-        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
             c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        if !self.send_note(|sid| manox_protocol::ClientNote::Submit {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
             session_id: sid.into(),
             text: text.clone(),
             images: Vec::new(),
             client_id: None,
-        }) {
-            self.thread.with_mut(|thread| {
-                thread.insert_user_message_with_ui_metadata(text, Some(ui));
-                thread.run_turn();
-            });
-        }
+        });
         refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -5812,14 +5781,11 @@ impl Workspace {
             agent::db::UiNoteKind::Notice => "notice",
             agent::db::UiNoteKind::PlanReview => "plan_review",
         };
-        if !self.send_note(|sid| manox_protocol::ClientNote::AppendUiNote {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUiNote {
             session_id: sid.into(),
             kind: kind_str.into(),
             data: data.clone(),
-        }) {
-            self.thread
-                .with_mut(|t| t.append_ui_note(agent::db::UiNoteRecord { kind, data }));
-        }
+        });
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
@@ -6046,13 +6012,9 @@ impl Workspace {
 
     /// Abort the current turn.
     pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        if !self.send_note(|sid| manox_protocol::ClientNote::CancelTurn {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::CancelTurn {
             session_id: sid.into(),
-        }) {
-            self.thread.with_mut(|thread| {
-                thread.cancel();
-            });
-        }
+        });
         cx.notify();
     }
 
@@ -6087,12 +6049,10 @@ impl Workspace {
 
     /// Toggle plan mode on the current thread (persisted by the engine).
     pub(crate) fn set_thread_plan_mode(&mut self, enabled: bool, _cx: &mut Context<Self>) {
-        if !self.send_note(|sid| manox_protocol::ClientNote::SetPlanMode {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetPlanMode {
             session_id: sid.into(),
             enabled,
-        }) {
-            self.thread.with_mut(|t| t.set_plan_mode(enabled));
-        }
+        });
     }
 
     /// The user's verdict on a proposed plan (oh-my-pi's four options):
@@ -8115,12 +8075,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if !self.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetCwd {
             session_id: sid.into(),
             cwd: new_path.to_str().unwrap_or_default().into(),
-        }) {
-            self.thread.with_mut(|t| t.set_project(new_path.clone()));
-        }
+        });
         Self::register_project_in_store(&new_path, cx);
         self.blank_project_name_input = None;
         cx.notify();
@@ -9638,12 +9596,17 @@ impl Workspace {
             PermissionMode::WorkspaceWrite => "workspacewrite",
             PermissionMode::DangerFullAccess => "dangerfullaccess",
         };
-        if !self.send_note(|sid| manox_protocol::ClientNote::SetApprovalMode {
+        // The wire value is the serde (kebab-case) form so the AgentServer's
+        // `from_value::<PermissionMode>` round-trips; `mode_key` stays the
+        // lowercase form the i18n `workspace-mode-notice` selector keys on.
+        let mode_wire = serde_json::to_value(mode)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetApprovalMode {
             session_id: sid.into(),
-            mode: mode_key.into(),
-        }) {
-            self.thread.with_mut(|t| t.set_permission_mode(mode));
-        }
+            mode: mode_wire,
+        });
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
             NoticeAnchor::TurnEnd,
