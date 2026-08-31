@@ -1,5 +1,5 @@
 ---
-description: Run a full built-in tool regression check. The LLM exercises every built-in tool group (FS, shell, user interaction, metadata, monitor, web, subagent, goal, plan, worktree, task, browser), collects PASS/FAIL/SKIP results, and reports a summary table.
+description: Run a full built-in tool regression check. The LLM exercises every built-in tool group (FS, shell, user interaction, metadata, monitor, web, subagent, goal, plan, task, browser), collects PASS/FAIL/SKIP results, and reports a summary table.
 ---
 You are running a **health check** (`/healthz`) on the manox built-in toolset. Your job is to systematically exercise every built-in tool group, record PASS/FAIL/SKIP for each tool, and produce a final summary table. This is a regression test — run every group even if an earlier one fails.
 
@@ -23,7 +23,6 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 | Subagent | Agent |
 | Goal | GetGoal, CreateGoal, UpdateGoal |
 | Plan | UpdatePlan |
-| Worktree | EnterWorktree, ExitWorktree |
 | Task | TaskCreate, TaskList, TaskGet, TaskUpdate |
 | Browser | WebExploreOpen, WebExploreNavigate, WebExploreReadText, WebExploreReadDom, WebExploreClick, WebExploreType, WebExploreScroll, WebExploreScreenshot, WebExploreYield, WebExploreClose |
 
@@ -40,7 +39,7 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 2. **Self-contained fixtures.** Create all test files in a temp directory (via `Bash` → `mktemp -d`). Never read project-specific files.
 3. **Clean up side effects.** Tools with persistent state must be cleaned up after verification:
    - Write/Edit: write to the temp dir, verify, then delete.
-   - EnterWorktree/ExitWorktree: enter a worktree, verify cwd changed, then exit with `remove` to clean it up.
+   - Per-call cwd: run a Bash call with `cwd` set to a scratch directory, verify a relative-path Read resolves there, and verify the sticky cwd is inherited by the next call without `cwd`.
    - CreateGoal: create a goal, verify, then clear it via UpdateGoal(complete) and verify.
    - Browser: open a tab, exercise read-only tools, then close it with WebExploreClose.
 4. **Parallel calls.** When tools in the same group are independent (e.g. Read + List + Grep + Glob), call them in parallel in one turn.
@@ -133,8 +132,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 20 | **EnterWorktree** | Enter a new worktree named `healthz-smoke` | cwd changes to a path under `.claude/worktrees/` |
-| 21 | **ExitWorktree** | Exit with `action: remove` | Success, cwd returns to original, worktree cleaned up |
+| 20 | **Bash+Read per-call cwd** | `mkdir -p <tmp>/healthz-cwd && echo hi > <tmp>/healthz-cwd/f` via Bash with `cwd`; Read `f` without `cwd` | Bash runs in the directory; Read resolves `f` through the sticky cwd |
 
 ### Group: Task (sequential)
 

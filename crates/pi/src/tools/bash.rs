@@ -45,6 +45,15 @@ pub struct BashExecRequest<'a> {
 pub trait BashOperations: Send + Sync {
     /// Execute a command, returning the aggregated output.
     async fn exec(&self, request: BashExecRequest<'_>) -> Result<CommandResult, ExecutionError>;
+
+    /// The backend's current working directory, when it keeps one across
+    /// calls (a persistent shell). `None` for one-shot backends — their
+    /// directory is fully described by each request's `cwd`. The bash tool
+    /// writes this back as the session's sticky cwd after a run, so a `cd`
+    /// inside a command moves the default directory for every tool.
+    async fn current_dir(&self) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 pub struct BashTool {
@@ -106,6 +115,10 @@ impl AgentTool for BashTool {
                     "type": "string",
                     "description": "The command to execute"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                },
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in milliseconds (default: 120000)"
@@ -165,16 +178,18 @@ impl BashTool {
         };
 
         let timeout = Duration::from_millis(timeout_ms);
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
         let result = match &self.operations {
             None => ctx
                 .env()
-                .exec(&command, timeout, signal)
+                .exec_at(&command, &cwd, timeout, signal)
                 .await
                 .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?,
             Some(ops) => ops
                 .exec(BashExecRequest {
                     command: &command,
-                    cwd: Some(ctx.cwd()),
+                    cwd: Some(&cwd),
                     timeout: Some(timeout),
                     signal,
                     on_data,
@@ -286,10 +301,23 @@ mod tests {
         ) -> Result<CommandResult, crate::env::ExecutionError> {
             Ok(self.result.clone())
         }
+        async fn exec_at(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _timeout: Duration,
+            _signal: CancellationToken,
+        ) -> Result<CommandResult, crate::env::ExecutionError> {
+            Ok(self.result.clone())
+        }
     }
 
     fn ctx_with_env(env: Arc<dyn ExecutionEnv>) -> LocalToolContext {
-        LocalToolContext::new(env, PathBuf::from("/mock"), Arc::new(ToolState::new()))
+        // A real directory: sticky-cwd resolution rejects a working directory
+        // that does not exist. The tempdir is intentionally kept for the
+        // process lifetime — it outlives the context it backs.
+        let cwd = tempfile::tempdir().expect("tempdir").keep();
+        LocalToolContext::new(env, cwd, Arc::new(ToolState::new()))
     }
 
     #[tokio::test]
@@ -359,18 +387,19 @@ mod tests {
             },
         });
         let tool = BashTool::with_operations(Some("export A=1".into()), ops.clone());
+        let ctx = ctx_with_env(Arc::new(MockEnv {
+            result: CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            },
+        }));
         let result = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "echo hi", "timeout": 5000}),
                 CancellationToken::new(),
-                &ctx_with_env(Arc::new(MockEnv {
-                    result: CommandResult {
-                        stdout: String::new(),
-                        stderr: String::new(),
-                        exit_code: 0,
-                    },
-                })),
+                &ctx,
             )
             .await
             .unwrap();
@@ -380,7 +409,8 @@ mod tests {
         assert_eq!(calls.len(), 1);
         // The prefix is folded into the command before dispatch.
         assert_eq!(calls[0].0, "export A=1 echo hi");
-        assert_eq!(calls[0].1, PathBuf::from("/mock"));
+        // Without an explicit `cwd` the call inherits the context baseline.
+        assert_eq!(calls[0].1, ctx.cwd().to_path_buf());
         assert_eq!(calls[0].2, Some(Duration::from_millis(5000)));
     }
 

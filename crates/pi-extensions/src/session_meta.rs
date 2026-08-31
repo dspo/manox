@@ -50,12 +50,6 @@ pub struct SessionMeta {
     /// after the model clears its plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_snapshot: Option<serde_json::Value>,
-    /// Active git-worktree binding (`EnterWorktree`/`ExitWorktree`): the
-    /// session is a fork whose cwd is the worktree; the original session
-    /// file + cwd are kept so `ExitWorktree` can return. Absent = not in a
-    /// worktree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<WorktreeMeta>,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default)]
@@ -97,22 +91,6 @@ pub struct UserAttributionMeta {
     /// The reload path re-attaches it so restored bubbles match the live view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_text: Option<String>,
-}
-
-/// Active git-worktree binding persisted in the session sidecar (see
-/// `SessionMeta.worktree`). `original_session_path`/`original_cwd` are the
-/// pre-enter state `ExitWorktree` returns to; `worktree_path`/`branch` name
-/// the bound git worktree; `git_common_dir` is the owning repository's git
-/// common dir (where linked-worktree commits write and `ExitWorktree`
-/// removal runs — the worktree may belong to another repository than the
-/// session cwd).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorktreeMeta {
-    pub worktree_path: String,
-    pub branch: String,
-    pub original_session_path: String,
-    pub original_cwd: String,
-    pub git_common_dir: String,
 }
 
 /// The sidecar path for a session file: `<dir>/<id>.meta.json`.

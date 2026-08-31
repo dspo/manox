@@ -713,7 +713,8 @@ fn resolve_depths(list: &mut [ThreadSummary]) {
 }
 
 /// Collapse each thread's sessions into the single row the user sees: a
-/// thread IS the sidebar unit, its sessions (base + worktree forks) internal
+/// thread IS the sidebar unit, its sessions (base + historical
+/// worktree-era forks) internal
 /// storage. The surfaced session is the registry's active pointer when it
 /// hits, else the newest; the row carries the THREAD's id (stable across
 /// swaps and restarts) and the active session's fields. Sessions without a
@@ -831,8 +832,8 @@ fn session_info_to_summary(
         model_id: String::new(),
         provider_id: None,
         approval_mode: PermissionMode::default().as_i64(),
-        // The bound project (sidecar) wins over the header cwd: a worktree
-        // fork's header cwd is the worktree dir, but the thread stays under
+        // The bound project (sidecar) wins over the header cwd: a fork's
+        // header cwd may be another directory, but the thread stays under
         // its source project; a `/` header cwd (GUI-launched bound session)
         // classifies the same way.
         project: meta
@@ -841,7 +842,7 @@ fn session_info_to_summary(
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| info.cwd.clone()),
         depth: 0,
-        // Team affiliation is the only rendered hierarchy edge: worktree
+        // Team affiliation is the only rendered hierarchy edge: historical fork
         // forks are a thread's internal sessions (`group_by_thread`
         // collapses them), so their `parentSession` lineage stays raw
         // metadata and never nests.
@@ -1182,7 +1183,7 @@ mod tests {
     }
 
     /// A thread's real session files (base + worktree fork, both stamped
-    /// with the same header `thread` key as `fork_from` leaves them)
+    /// with the same header `thread` key as the retired worktree fork left them)
     /// collapse to ONE sidebar row keyed by the thread id, following the
     /// registry's active pointer in both directions.
     #[tokio::test]
@@ -1201,8 +1202,7 @@ mod tests {
         tokio::fs::write(sessions.join(format!("{fork_id}.jsonl")), header(fork_id, "/tmp/wt"))
             .await
             .unwrap();
-        // Sidecars: the fork wears the source's title/project (seeded by
-        // `fork_sidecar_inherit` at enter time) plus its worktree binding.
+        // Sidecars: the fork wears the source's title/project.
         let base_path = sessions.join(format!("{base_id}.jsonl"));
         let fork_path = sessions.join(format!("{fork_id}.jsonl"));
         pi_extensions::session_meta::update(sessions, &base_path, |m| {
@@ -1214,13 +1214,6 @@ mod tests {
         pi_extensions::session_meta::update(sessions, &fork_path, |m| {
             m.title = Some("the title".into());
             m.project = Some("/proj/a".into());
-            m.worktree = Some(pi_extensions::session_meta::WorktreeMeta {
-                worktree_path: "/tmp/wt".into(),
-                branch: "b".into(),
-                original_session_path: base_path.display().to_string(),
-                original_cwd: "/proj/a".into(),
-                git_common_dir: "/proj/a/.git".into(),
-            });
         })
         .await
         .unwrap();
@@ -1242,7 +1235,7 @@ mod tests {
             Some(fork_path.clone())
         );
 
-        // Pointer back on the base (after ExitWorktree): same single row,
+        // Pointer back on the base: same single row,
         // now addressable at the base session.
         let registry = HashMap::from([(thread_key.to_string(), pointer(base_id))]);
         let (paths, active, _) = group_by_thread(rows, &registry);

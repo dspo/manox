@@ -74,6 +74,17 @@ pub trait ExecutionEnv: Send + Sync {
         timeout: Duration,
         signal: CancellationToken,
     ) -> Result<CommandResult, ExecutionError>;
+
+    /// Execute a shell command in `cwd` with a timeout — the per-call
+    /// directory from sticky-cwd resolution, which may differ from the env's
+    /// pinned session cwd. Semantics otherwise match [`ExecutionEnv::exec`].
+    async fn exec_at(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout: Duration,
+        signal: CancellationToken,
+    ) -> Result<CommandResult, ExecutionError>;
 }
 
 /// Errors from filesystem operations.
@@ -265,6 +276,16 @@ impl ExecutionEnv for TokioExecutionEnv {
         timeout_dur: Duration,
         signal: CancellationToken,
     ) -> Result<CommandResult, ExecutionError> {
+        self.exec_at(command, &self.cwd, timeout_dur, signal).await
+    }
+
+    async fn exec_at(
+        &self,
+        command: &str,
+        cwd: &Path,
+        timeout_dur: Duration,
+        signal: CancellationToken,
+    ) -> Result<CommandResult, ExecutionError> {
         use tokio::io::AsyncReadExt;
 
         if signal.is_cancelled() {
@@ -278,7 +299,7 @@ impl ExecutionEnv for TokioExecutionEnv {
         let mut child = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(&self.cwd)
+            .current_dir(cwd)
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

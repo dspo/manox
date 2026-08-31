@@ -9,7 +9,6 @@ pub mod background;
 pub mod orchestration;
 pub mod persistent;
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -218,7 +217,7 @@ impl AgentTool for BashTool {
         );
         properties.insert(
             "cwd".into(),
-            serde_json::json!({"type": "string", "description": "Working directory; defaults to the session cwd. The shell's cwd persists across calls"}),
+            serde_json::json!({"type": "string", "description": "Working directory for this call. Omit to reuse the previous tool call's directory (the session's start directory initially); a `cd` inside the command moves it for every tool"}),
         );
         properties.insert(
             "run_in_background".into(),
@@ -297,10 +296,13 @@ impl BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("command is required".into()))?;
         let timeout_ms = params["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
-        // An explicit cwd override re-pins the shell; absent, the shell's
-        // current directory (kept across `cd`) is used.
-        let cwd_override = resolve_cwd(params.get("cwd"), ctx.cwd());
-        let run_cwd = cwd_override.as_deref().unwrap_or_else(|| ctx.cwd());
+        // Sticky-cwd resolution: an explicit `cwd` → the directory the last
+        // tool call ran in → the session cwd. Resolving advances the sticky
+        // cwd, so every tool (path tools included) inherits this call's
+        // directory; the shell's post-command directory is written back
+        // after the run.
+        let run_cwd = pi::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
         let run_in_background = params["run_in_background"].as_bool().unwrap_or(false);
         let head_lines = params["head_lines"].as_u64().map(|v| v as usize);
         let tail_lines = params["tail_lines"].as_u64().map(|v| v as usize);
@@ -333,14 +335,14 @@ impl BashTool {
             };
             let id = match &self.manager {
                 Some(manager) if sandboxed => manager
-                    .spawn_sandboxed(&command, run_cwd, shape)
+                    .spawn_sandboxed(&command, &run_cwd, shape)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
                 Some(manager) => manager
-                    .spawn(&command, run_cwd, shape)
+                    .spawn(&command, &run_cwd, shape)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
                 None => self
                     .registry
-                    .spawn(&command, run_cwd)
+                    .spawn(&command, &run_cwd)
                     .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?,
             };
             return Ok(AgentToolResult::text(format!(
@@ -358,13 +360,24 @@ impl BashTool {
         let result = backend
             .exec(BashExecRequest {
                 command: &command,
-                cwd: cwd_override.as_deref(),
+                cwd: Some(&run_cwd),
                 timeout: Some(Duration::from_millis(timeout_ms)),
                 signal,
                 on_data,
             })
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+
+        // Write the shell's post-command directory back as the sticky cwd:
+        // a `cd` inside the command moves the session's default directory
+        // for every tool, matching a developer's terminal. Backends without
+        // a live directory report `None` — the resolved `run_cwd` stands.
+        if let Some(dir) = backend.current_dir().await {
+            *ctx.tool_state()
+                .sticky_cwd
+                .lock()
+                .expect("sticky cwd poisoned") = Some(dir);
+        }
 
         Ok(AgentToolResult::text(assemble_output(
             result, head_lines, tail_lines,
@@ -464,18 +477,6 @@ impl Drop for EscalationGrant<'_> {
     }
 }
 
-/// Resolve a possibly-relative cwd override against the session cwd.
-fn resolve_cwd(cwd: Option<&JsonValue>, base: &Path) -> Option<PathBuf> {
-    cwd.and_then(|v| v.as_str()).map(|p| {
-        let p = Path::new(p);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base.join(p)
-        }
-    })
-}
-
 /// Assemble the model-facing output: stderr merged after stdout, exit code
 /// annotated, head/tail filtered, then truncated.
 fn assemble_output(result: CommandResult, head: Option<usize>, tail: Option<usize>) -> String {
@@ -531,6 +532,7 @@ fn select_lines(text: &str, head: Option<usize>, tail: Option<usize>) -> String 
 mod tests {
     use super::*;
     use pi::tools::bash::BashOperations;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use super::background::BackgroundRegistry;
@@ -665,16 +667,37 @@ mod tests {
                 exit_code: 0,
             })
         }
+        async fn exec_at(
+            &self,
+            _command: &str,
+            _cwd: &Path,
+            _timeout: Duration,
+            _signal: CancellationToken,
+        ) -> Result<CommandResult, pi::env::ExecutionError> {
+            Ok(CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
     }
 
-    fn ctx(cwd: &str) -> pi::tool::LocalToolContext {
+    fn ctx_at(dir: &Path) -> pi::tool::LocalToolContext {
         pi::tool::LocalToolContext::new(
             Arc::new(MockEnv {
-                cwd: PathBuf::from(cwd),
+                cwd: dir.to_path_buf(),
             }),
-            PathBuf::from(cwd),
+            dir.to_path_buf(),
             Arc::new(pi::tool::ToolState::new()),
         )
+    }
+
+    /// A context rooted at a fresh real directory — sticky-cwd resolution
+    /// rejects a working directory that does not exist. The tempdir is kept
+    /// for the test's lifetime.
+    fn ctx() -> (pi::tool::LocalToolContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        (ctx_at(dir.path()), dir)
     }
 
     #[tokio::test]
@@ -683,33 +706,103 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         });
         let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry));
+        let (ctx, _dir) = ctx();
+        let work = tempfile::tempdir().expect("tempdir");
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "echo hi", "cwd": "/work"}),
+                serde_json::json!({
+                    "command": "echo hi",
+                    "cwd": work.path().to_string_lossy(),
+                }),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap();
         let calls = ops.calls.lock().unwrap();
         assert_eq!(
             calls[0].1,
-            Some(PathBuf::from("/work")),
+            Some(work.path().to_path_buf()),
             "cwd override reaches the backend"
         );
         assert!(!result.is_error);
+        // Resolving an explicit cwd advances the sticky cwd, so the next
+        // call without one inherits it.
+        assert_eq!(
+            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
+            Some(work.path()),
+            "sticky cwd follows the explicit override"
+        );
+    }
+
+    /// A backend whose live directory differs from the request cwd — the
+    /// shape a persistent shell has after the command's own `cd`.
+    struct DriftingOps {
+        calls: Mutex<Vec<Option<PathBuf>>>,
+        dir: PathBuf,
+    }
+    #[async_trait::async_trait]
+    impl BashOperations for DriftingOps {
+        async fn exec(
+            &self,
+            request: BashExecRequest<'_>,
+        ) -> Result<CommandResult, pi::env::ExecutionError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(request.cwd.map(|c| c.to_path_buf()));
+            Ok(CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
+        async fn current_dir(&self) -> Option<PathBuf> {
+            Some(self.dir.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_drift_writeback_moves_the_sticky_cwd() {
+        let drifted = tempfile::tempdir().expect("tempdir");
+        let ops = Arc::new(DriftingOps {
+            calls: Mutex::new(Vec::new()),
+            dir: drifted.path().to_path_buf(),
+        });
+        let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry));
+        let (ctx, _dir) = ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({"command": "cd somewhere && build"}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        // The backend ran at the resolved base, but its post-command
+        // directory — what a `cd` left behind — becomes the sticky cwd.
+        assert_eq!(
+            ops.calls.lock().unwrap()[0],
+            Some(_dir.path().to_path_buf())
+        );
+        assert_eq!(
+            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
+            Some(drifted.path()),
+            "the shell's post-command directory wins over the request cwd"
+        );
     }
 
     #[tokio::test]
     async fn run_in_background_returns_a_task_id() {
         let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry));
+        let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "sleep 5", "run_in_background": true}),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap();
@@ -772,12 +865,13 @@ mod tests {
         });
         let tool = BashTool::new(sandboxed.clone(), Arc::new(NoopRegistry))
             .with_unsandboxed_operations(unsandboxed.clone());
+        let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "echo hi"}),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap();
@@ -844,12 +938,13 @@ mod tests {
             asked: Arc::clone(&asked),
         });
         let (tool, _) = escalation_tool(PermissionMode::ReadOnly, Some(approver));
+        let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "git push", "sandbox_permissions": "danger-full-access", "justification": "need to push"}),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap();
@@ -871,12 +966,13 @@ mod tests {
             asked: Arc::clone(&asked),
         });
         let (tool, _) = escalation_tool(PermissionMode::WorkspaceWrite, Some(approver));
+        let (ctx, _dir) = ctx();
         let err = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "ls", "sandbox_permissions": "workspace-write", "justification": "x"}),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap_err();
@@ -891,12 +987,13 @@ mod tests {
     #[tokio::test]
     async fn sandbox_permissions_without_approver_fails_closed() {
         let (tool, _) = escalation_tool(PermissionMode::ReadOnly, None);
+        let (ctx, _dir) = ctx();
         let err = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "ls", "sandbox_permissions": "workspace-write", "justification": "x"}),
                 CancellationToken::new(),
-                &ctx("/base"),
+                &ctx,
             )
             .await
             .unwrap_err();
@@ -941,6 +1038,7 @@ mod tests {
         let tool =
             BashTool::new(Arc::new(EchoOps), registry.clone()).with_manager(Arc::clone(&manager));
 
+        let (ctx, _dir) = ctx();
         let result = tool
             .execute(
                 "c1",
@@ -950,7 +1048,7 @@ mod tests {
                     "tail_lines": 2,
                 }),
                 CancellationToken::new(),
-                &ctx("/tmp"),
+                &ctx,
             )
             .await
             .unwrap();

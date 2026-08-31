@@ -113,7 +113,7 @@ const initThread = (sessionId: string, cwd: string): ThreadState => ({
 });
 const emptyInfo = (): ThreadInfoSnapshot => ({
   reasoning_effort: 'high',
-  worktree_path: null,
+  cwd_path: null,
   plan: null,
   goal: null,
   usage: {},
@@ -700,10 +700,10 @@ function foldThreadEvent(t: ThreadState, ev: ActorEvent & { sessionId: string })
       return { ...t, info: { ...(t.info ?? emptyInfo()), plan: ev.snapshot } };
     case 'goal_changed':
       return { ...t, info: { ...(t.info ?? emptyInfo()), goal: ev.snapshot } };
-    case 'worktree_changed':
+    case 'cwd_changed':
       return {
         ...t,
-        info: { ...(t.info ?? emptyInfo()), worktree_path: ev.active ? ev.path : null },
+        info: { ...(t.info ?? emptyInfo()), cwd_path: ev.path },
       };
     case 'compaction':
       return {

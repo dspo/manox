@@ -1,5 +1,5 @@
 //! Persistent thread → active-session pointer. A thread drives one session
-//! at a time; swaps (`EnterWorktree`/`ExitWorktree`/`NewSession`/restore)
+//! at a time; swaps (`NewSession`/restore)
 //! move the pointer, so the sidebar's thread view never depends on file
 //! mtimes. The registry is best-effort UI truth: a failed write degrades the
 //! list to "newest session wins" until the next successful write.

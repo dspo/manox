@@ -73,6 +73,19 @@ pub enum SessionTreeEntry {
         /// Always a string — `null` would drop the field on the wire.
         thinking_level: String,
     },
+    /// A change of the working directory the following tool calls run in.
+    ///
+    /// The header cwd is immutable (append-only file), so this entry is the
+    /// durable witness of the per-call sticky cwd advancing — resolution chain
+    /// `explicit cwd argument → sticky → header cwd`. Restore projects the
+    /// latest one; tools do not project it into the transcript.
+    #[serde(rename = "cwd_change", rename_all = "camelCase")]
+    CwdChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        cwd: String,
+    },
     /// A change in the set of tools mounted for the following turns.
     #[serde(rename = "active_tools_change", rename_all = "camelCase")]
     ActiveToolsChange {
@@ -162,6 +175,7 @@ impl SessionTreeEntry {
             SessionTreeEntry::Message { id, .. }
             | SessionTreeEntry::Compaction { id, .. }
             | SessionTreeEntry::ModelChange { id, .. }
+            | SessionTreeEntry::CwdChange { id, .. }
             | SessionTreeEntry::ThinkingLevelChange { id, .. }
             | SessionTreeEntry::ActiveToolsChange { id, .. }
             | SessionTreeEntry::BranchSummary { id, .. }
@@ -178,6 +192,7 @@ impl SessionTreeEntry {
             SessionTreeEntry::Message { parent_id, .. }
             | SessionTreeEntry::Compaction { parent_id, .. }
             | SessionTreeEntry::ModelChange { parent_id, .. }
+            | SessionTreeEntry::CwdChange { parent_id, .. }
             | SessionTreeEntry::ThinkingLevelChange { parent_id, .. }
             | SessionTreeEntry::ActiveToolsChange { parent_id, .. }
             | SessionTreeEntry::BranchSummary { parent_id, .. }
@@ -194,6 +209,7 @@ impl SessionTreeEntry {
             SessionTreeEntry::Message { timestamp, .. }
             | SessionTreeEntry::Compaction { timestamp, .. }
             | SessionTreeEntry::ModelChange { timestamp, .. }
+            | SessionTreeEntry::CwdChange { timestamp, .. }
             | SessionTreeEntry::ThinkingLevelChange { timestamp, .. }
             | SessionTreeEntry::ActiveToolsChange { timestamp, .. }
             | SessionTreeEntry::BranchSummary { timestamp, .. }
@@ -202,46 +218,6 @@ impl SessionTreeEntry {
             | SessionTreeEntry::Label { timestamp, .. }
             | SessionTreeEntry::SessionInfo { timestamp, .. }
             | SessionTreeEntry::Leaf { timestamp, .. } => *timestamp,
-        }
-    }
-
-    /// Rewrite the entry's parent for path forks that strip label entries —
-    /// the re-chained ancestry keeps the retained path linear.
-    pub(crate) fn set_parent_id(&mut self, parent_id: Option<String>) {
-        match self {
-            SessionTreeEntry::Message {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::Compaction {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::ModelChange {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::ThinkingLevelChange {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::ActiveToolsChange {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::BranchSummary {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::CustomMessage {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::Custom {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::Label {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::SessionInfo {
-                parent_id: slot, ..
-            }
-            | SessionTreeEntry::Leaf {
-                parent_id: slot, ..
-            } => *slot = parent_id,
         }
     }
 
@@ -383,6 +359,26 @@ impl<S: SessionStorage> Session<S> {
         Ok(id)
     }
 
+    /// Append a `cwd_change` entry and return the entry ID.
+    ///
+    /// The sticky cwd a path carries round-trips through these entries:
+    /// restore projects the latest one as the session's effective working
+    /// directory (the header cwd stays the launch directory forever).
+    pub async fn append_cwd_change(&self, cwd: &str) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::CwdChange {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            cwd: cwd.to_string(),
+        };
+        self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
     /// Append an `active_tools_change` entry and return the entry ID.
     pub async fn append_active_tools_change(
         &self,
@@ -499,7 +495,7 @@ impl<S: SessionStorage> Session<S> {
     /// with, plus the settings the active path carries.
     pub async fn build_session_context(&self) -> Result<SessionContext, anyhow::Error> {
         let path = self.get_branch().await?;
-        let (has_thinking_entry, thinking_level, model, active_tool_names) =
+        let (has_thinking_entry, thinking_level, model, active_tool_names, cwd) =
             context_settings(&path);
         let entries = build_context_entries(path);
         let mut messages = Vec::new();
@@ -521,6 +517,7 @@ impl<S: SessionStorage> Session<S> {
             model,
             has_thinking_entry,
             active_tool_names,
+            cwd,
         })
     }
 
@@ -727,6 +724,9 @@ pub struct SessionContext {
     /// The active tool subset from the latest `active_tools_change` entry;
     /// `None` when the path never narrowed the mounted set.
     pub active_tool_names: Option<Vec<String>>,
+    /// The effective working directory from the latest `cwd_change` entry;
+    /// `None` when every tool call ran in the header (launch) directory.
+    pub cwd: Option<String>,
 }
 
 /// A model reference carried by the session path.
@@ -778,8 +778,10 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 /// The settings the active path carries: the reasoning tier from the latest
 /// `thinking_level_change`, the model from the latest `model_change` (an
 /// assistant message's own identity is a fresher witness than an older
-/// `model_change`, matching the TS projection), and the active tool subset
-/// from the latest `active_tools_change`.
+/// `model_change`, matching the TS projection), the active tool subset from
+/// the latest `active_tools_change`, and the effective working directory from
+/// the latest `cwd_change`.
+#[allow(clippy::type_complexity)]
 fn context_settings(
     path: &[SessionTreeEntry],
 ) -> (
@@ -787,11 +789,13 @@ fn context_settings(
     Option<String>,
     Option<SessionModelRef>,
     Option<Vec<String>>,
+    Option<String>,
 ) {
     let mut has_thinking_entry = false;
     let mut thinking_level = None;
     let mut model = None;
     let mut active_tool_names = None;
+    let mut cwd = None;
     for entry in path {
         match entry {
             SessionTreeEntry::ThinkingLevelChange {
@@ -799,6 +803,9 @@ fn context_settings(
             } => {
                 has_thinking_entry = true;
                 thinking_level = (l != "off").then(|| l.clone());
+            }
+            SessionTreeEntry::CwdChange { cwd: c, .. } => {
+                cwd = Some(c.clone());
             }
             SessionTreeEntry::ModelChange {
                 provider, model_id, ..
@@ -829,7 +836,13 @@ fn context_settings(
             _ => {}
         }
     }
-    (has_thinking_entry, thinking_level, model, active_tool_names)
+    (
+        has_thinking_entry,
+        thinking_level,
+        model,
+        active_tool_names,
+        cwd,
+    )
 }
 
 /// Project one session entry into context messages. Display/state entries
@@ -1032,14 +1045,26 @@ mod tests {
                 timestamp: Utc::now(),
                 active_tool_names: vec!["Read".into(), "Bash".into()],
             },
+            SessionTreeEntry::CwdChange {
+                id: "cc1".into(),
+                parent_id: Some("at".into()),
+                timestamp: Utc::now(),
+                cwd: "/tmp/wt-early".into(),
+            },
             SessionTreeEntry::ThinkingLevelChange {
                 id: "t2".into(),
-                parent_id: Some("at".into()),
+                parent_id: Some("cc1".into()),
                 timestamp: Utc::now(),
                 thinking_level: "off".into(),
             },
+            SessionTreeEntry::CwdChange {
+                id: "cc2".into(),
+                parent_id: Some("t2".into()),
+                timestamp: Utc::now(),
+                cwd: "/tmp/wt-late".into(),
+            },
         ];
-        let (has_thinking_entry, thinking_level, model, active_tool_names) =
+        let (has_thinking_entry, thinking_level, model, active_tool_names, cwd) =
             context_settings(&path);
         assert!(
             has_thinking_entry,
@@ -1061,6 +1086,30 @@ mod tests {
             active_tool_names,
             Some(vec!["Read".to_string(), "Bash".to_string()])
         );
+        // The latest cwd_change wins — the sticky cwd the path ends at.
+        assert_eq!(cwd, Some("/tmp/wt-late".to_string()));
+    }
+
+    #[test]
+    fn cwd_change_round_trips_the_wire_form() {
+        let entry = SessionTreeEntry::CwdChange {
+            id: "cc".into(),
+            parent_id: Some("m1".into()),
+            timestamp: Utc::now(),
+            cwd: "/private/tmp/manox--wt".into(),
+        };
+        let wire = serde_json::to_string(&entry).unwrap();
+        // The wire tag and camelCase fields must match the TS Pi v3 shape.
+        assert!(wire.contains(r#""type":"cwd_change""#), "{wire}");
+        assert!(wire.contains(r#""parentId":"m1""#), "{wire}");
+        let back: SessionTreeEntry = serde_json::from_str(&wire).unwrap();
+        match back {
+            SessionTreeEntry::CwdChange { cwd, parent_id, .. } => {
+                assert_eq!(cwd, "/private/tmp/manox--wt");
+                assert_eq!(parent_id.as_deref(), Some("m1"));
+            }
+            other => panic!("expected CwdChange, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1276,6 +1325,7 @@ pub enum EntryType {
     Message,
     Compaction,
     ModelChange,
+    CwdChange,
     ThinkingLevelChange,
     ActiveToolsChange,
     BranchSummary,
@@ -1293,6 +1343,7 @@ impl EntryType {
             EntryType::Message => "message",
             EntryType::Compaction => "compaction",
             EntryType::ModelChange => "model_change",
+            EntryType::CwdChange => "cwd_change",
             EntryType::ThinkingLevelChange => "thinking_level_change",
             EntryType::ActiveToolsChange => "active_tools_change",
             EntryType::BranchSummary => "branch_summary",
@@ -1467,6 +1518,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::Message { .. } => EntryType::Message,
         SessionTreeEntry::Compaction { .. } => EntryType::Compaction,
         SessionTreeEntry::ModelChange { .. } => EntryType::ModelChange,
+        SessionTreeEntry::CwdChange { .. } => EntryType::CwdChange,
         SessionTreeEntry::ThinkingLevelChange { .. } => EntryType::ThinkingLevelChange,
         SessionTreeEntry::ActiveToolsChange { .. } => EntryType::ActiveToolsChange,
         SessionTreeEntry::BranchSummary { .. } => EntryType::BranchSummary,

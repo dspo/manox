@@ -77,8 +77,7 @@ pub struct ThreadInfoPayload {
     pub depth: u32,
     pub agent_label: String,
     pub self_author: String,
-    pub worktree_active: bool,
-    pub worktree_path: Option<String>,
+    pub cwd_path: Option<String>,
     pub branch: Option<String>,
     pub goal: Option<serde_json::Value>,
     pub goal_elapsed_seconds: Option<u64>,
@@ -229,10 +228,11 @@ pub enum ServerNote {
         session_id: String,
         snapshot: Option<serde_json::Value>,
     },
-    WorktreeChanged {
+    /// The session's effective working directory moved (per-call cwd
+    /// resolution advanced the sticky cwd; durable as a `cwd_change`).
+    CwdChanged {
         session_id: String,
-        active: bool,
-        path: Option<String>,
+        path: String,
     },
     PermissionModeChanged {
         session_id: String,
@@ -430,8 +430,7 @@ mod tests {
             depth: 0,
             agent_label: "lead".into(),
             self_author: "captain".into(),
-            worktree_active: false,
-            worktree_path: None,
+            cwd_path: None,
             branch: None,
             goal: None,
             goal_elapsed_seconds: None,

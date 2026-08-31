@@ -221,11 +221,13 @@ pub struct ApprovalGatedTool {
     /// its own escalation inside the tool.
     escalation_approver: Option<Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>>,
     mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
-    /// Live extra writable roots granted by an approved `EnterWorktree`
-    /// (the worktree, its git common dir, the pre-enter project root) —
-    /// resolved per call so a swap between calls is picked up. Absent when
-    /// the session never entered a worktree.
-    worktree_roots: Option<Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>>,
+    /// Session-shared extra writable roots, derived per call from the call's
+    /// effective cwd: a linked worktree of the workspace admits itself
+    /// automatically, any other directory is admitted by an approved
+    /// escalation and accumulates for the session. Shared with the bash
+    /// seatbelt — one derivation, no asymmetry between the two enforcing
+    /// families. Absent in bare constructions (tests) — no extra roots.
+    granted_roots: Option<crate::granted_roots::GrantedRoots>,
 }
 
 pub type AutoAllowResolver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
@@ -239,7 +241,7 @@ impl ApprovalGatedTool {
             auto_allow: None,
             escalation_approver: None,
             mode_resolver: None,
-            worktree_roots: None,
+            granted_roots: None,
         }
     }
 
@@ -270,14 +272,12 @@ impl ApprovalGatedTool {
         self
     }
 
-    /// Attach the live worktree-granted-roots resolver (Write/Edit): the
-    /// verdict admits targets under the roots an approved `EnterWorktree`
-    /// granted, mirroring the seatbelt's additive roots.
-    pub fn with_worktree_roots(
-        mut self,
-        resolver: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync>,
-    ) -> Self {
-        self.worktree_roots = Some(resolver);
+    /// Attach the session-shared granted-roots store (Write/Edit): the
+    /// verdict admits targets under the same-repo worktree roots of the
+    /// call's cwd plus escalation-approved roots — mirroring the seatbelt's
+    /// additive roots exactly.
+    pub fn with_granted_roots(mut self, granted: crate::granted_roots::GrantedRoots) -> Self {
+        self.granted_roots = Some(granted);
         self
     }
 
@@ -341,7 +341,7 @@ impl ApprovalGatedTool {
         // here (auto-allowed).
         let standing = self.standing_mode();
         let grant = self
-            .resolve_escalation(tool_call_id, &signal, &params, standing)
+            .resolve_escalation(tool_call_id, &signal, &params, standing, ctx)
             .await?;
         let mode = grant.unwrap_or(standing);
         match mode {
@@ -377,6 +377,7 @@ impl ApprovalGatedTool {
         signal: &CancellationToken,
         params: &serde_json::Value,
         standing: PermissionMode,
+        ctx: &dyn ToolContext,
     ) -> Result<Option<PermissionMode>, ToolError> {
         let sp = params.get("sandbox_permissions").and_then(|v| v.as_str());
         let just = params.get("justification").and_then(|v| v.as_str());
@@ -415,7 +416,57 @@ impl ApprovalGatedTool {
         )
         .await
         .map_err(ToolError::Other)?;
+        // An approved escalation covers a concrete out-of-workspace target;
+        // its nearest existing ancestor directory joins the session's
+        // granted roots, so the model never re-escalates for the same
+        // directory (approve once, accumulate).
+        if let Some(root) = self.call_target_root(params, ctx)
+            && let Some(granted) = &self.granted_roots
+        {
+            granted.approve(root);
+        }
         Ok(Some(grant))
+    }
+
+    /// The nearest existing ancestor directory of the call's write target —
+    /// the root an approved escalation covers. Resolved with the same chain
+    /// the tool itself will use (explicit `cwd` → sticky → session cwd),
+    /// read-only: the fence must not advance the sticky cwd.
+    fn call_target_root(
+        &self,
+        params: &serde_json::Value,
+        ctx: &dyn ToolContext,
+    ) -> Option<std::path::PathBuf> {
+        let cwd = pi::tools::path_utils::peek_effective_cwd(
+            ctx,
+            params.get("cwd").and_then(|v| v.as_str()),
+        )
+        .ok()?;
+        let target = match self.inner.name() {
+            "Write" => {
+                let path = params.get("path")?.as_str()?;
+                if Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
+                } else {
+                    cwd.join(path)
+                }
+            }
+            "Edit" => {
+                let patch = params.get("patch")?.as_str()?;
+                let first = pi::hashline::parse_patch(patch)
+                    .ok()?
+                    .files
+                    .into_iter()
+                    .next()?;
+                if first.path.is_absolute() {
+                    first.path
+                } else {
+                    cwd.join(first.path)
+                }
+            }
+            _ => return None,
+        };
+        Some(nearest_existing_ancestor(&target))
     }
 
     /// WorkspaceWrite verdict for one gated call: `Ok` when the operation
@@ -428,15 +479,28 @@ impl ApprovalGatedTool {
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
-        let cwd = ctx.cwd();
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
+        // The call's effective cwd — the same chain the tool itself will
+        // resolve (explicit `cwd` → sticky → session cwd), peeked read-only
+        // so the fence does not advance the sticky cwd. A missing directory
+        // is a denial: the tool would fail the same way.
+        let cwd = match pi::tools::path_utils::peek_effective_cwd(
+            ctx,
+            params.get("cwd").and_then(|v| v.as_str()),
+        ) {
+            Ok(cwd) => cwd,
+            Err(_) => return deny(),
+        };
         // Containment against the shared writable-root set (workspace + manox
-        // home + /tmp + tmpdir) plus the worktree-granted roots an approved
-        // `EnterWorktree` added — no `.git` or plans-dir special-casing: the
-        // plans dir is admitted transitively under the manox home.
-        let mut roots = pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, cwd);
-        if let Some(resolver) = &self.worktree_roots {
-            roots.extend(resolver());
+        // home + /tmp + tmpdir) plus the granted roots derived from the
+        // call's cwd: a linked worktree of the workspace admits itself, an
+        // escalation-approved directory stays for the session — no `.git` or
+        // plans-dir special-casing: the plans dir is admitted transitively
+        // under the manox home.
+        let mut roots =
+            pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, &cwd);
+        if let Some(granted) = &self.granted_roots {
+            roots.extend(granted.roots_for(&cwd));
         }
         let contained = |target: &Path| {
             let canon = pi_extensions::sandbox::canonicalize_best_effort(target);
@@ -480,20 +544,29 @@ impl ApprovalGatedTool {
                 Ok(())
             }
             // Session/repo-scoped coordination carries no out-of-workspace
-            // write target: team orchestration, the shared task list, and
-            // worktree enter/exit run under WorkspaceWrite; ReadOnly still
-            // denies them at the mode match, DangerFullAccess never consults this.
-            crate::tools::ENTER_WORKTREE
-            | crate::tools::EXIT_WORKTREE
-            | "TaskCreate"
-            | "TaskList"
-            | "TaskUpdate"
-            | "TaskGet" => Ok(()),
+            // write target: team orchestration and the shared task list run
+            // under WorkspaceWrite; ReadOnly still denies them at the mode
+            // match, DangerFullAccess never consults this.
+            "TaskCreate" | "TaskList" | "TaskUpdate" | "TaskGet" => Ok(()),
             // Every other gated call (escalated bash, unknown mutating
             // tools) has no in-workspace proof.
             _ => deny(),
         }
     }
+}
+
+/// The nearest ancestor of `target` that exists on disk. An escalation
+/// covers a directory the model can keep working in — a not-yet-created
+/// target contributes its closest existing parent instead.
+fn nearest_existing_ancestor(target: &Path) -> PathBuf {
+    let mut current = target.to_path_buf();
+    while !current.is_dir() {
+        match current.parent() {
+            Some(parent) => current = parent.to_path_buf(),
+            None => return target.to_path_buf(),
+        }
+    }
+    current
 }
 
 #[async_trait::async_trait]
@@ -1011,23 +1084,27 @@ mod tests {
         assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
-    /// An approved `EnterWorktree` widens the fs fence with the granted
-    /// roots: while the session cwd is the worktree, a Write to the
-    /// pre-enter project root passes the verdict (orchestration keeps
-    /// writing the main checkout). The target sits outside every default
-    /// writable root so only the resolver can admit it.
+    /// An escalation-approved root widens the fs fence for the rest of the
+    /// session: while the sticky cwd is an unrelated directory, a Write
+    /// under the approved root passes the verdict. The target sits outside
+    /// every default writable root so only the accumulated root can admit
+    /// it.
     #[tokio::test]
-    async fn workspace_write_allows_entered_worktree_roots() {
+    async fn workspace_write_allows_approved_granted_roots() {
         let dir = tempfile::tempdir().unwrap();
-        let wt = dir.path().join("wt");
-        std::fs::create_dir_all(&wt).unwrap();
-        let granted = PathBuf::from("/usr/local/manox-wt-fence-proj");
-        let target = granted.join("probe.txt");
+        // Outside every default writable root (temp areas and the manox home
+        // would admit it regardless); the mock tool never writes, so the
+        // directory needs no on-disk existence.
+        let approved = PathBuf::from("/usr/local/manox-cwd-per-call-fence-probe");
+        let target = approved.join("probe.txt");
         let (gate, _rx) = gate_with_events();
         gate.set_mode(PermissionMode::WorkspaceWrite);
 
-        // With the worktree resolver: the granted root admits the target.
+        // With the granted-roots store holding the approved root: the write
+        // passes.
         let ran = Arc::new(AtomicUsize::new(0));
+        let granted = crate::granted_roots::GrantedRoots::new(dir.path());
+        granted.approve(&approved);
         let tool = ApprovalGatedTool::new(
             Arc::new(MockTool {
                 name: "Write",
@@ -1037,13 +1114,10 @@ mod tests {
             }),
             Arc::clone(&gate),
         )
-        .with_worktree_roots({
-            let granted = granted.clone();
-            Arc::new(move || vec![granted.clone()])
-        });
+        .with_granted_roots(granted);
         let ctx = LocalToolContext::new(
-            Arc::new(TokioExecutionEnv::new(std::env::temp_dir())),
-            wt.clone(),
+            Arc::new(TokioExecutionEnv::new(dir.path())),
+            dir.path().to_path_buf(),
             Arc::new(ToolState::new()),
         );
         let result = tool
@@ -1058,8 +1132,8 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(ran.load(Ordering::SeqCst), 1);
 
-        // Control: the same call without the resolver is denied (the
-        // worktree cwd's default roots never cover the granted path).
+        // Control: the same call without the store is denied (the session
+        // cwd's default roots never cover the approved path).
         let (tool2, ran2) = gated_named("Write", false, false, Arc::clone(&gate));
         let err = tool2
             .execute(
@@ -1072,6 +1146,90 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
         assert_eq!(ran2.load(Ordering::SeqCst), 0);
+    }
+
+    /// A linked worktree of the session workspace admits itself through the
+    /// per-call cwd: an explicit `cwd` pointing into a same-repo worktree
+    /// passes the verdict for targets inside it, with no approval anywhere.
+    #[tokio::test]
+    async fn workspace_write_admits_a_same_repo_worktree_via_call_cwd() {
+        let base = tempfile::tempdir().unwrap();
+        let repo = base.path().join("repo");
+        let wt = base.path().join("wt");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "--initial-branch=main"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        run_git(
+            &repo,
+            &["worktree", "add", wt.to_str().unwrap(), "-b", "probe"],
+        );
+
+        let granted = crate::granted_roots::GrantedRoots::new(&repo);
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::WorkspaceWrite);
+        let ran = Arc::new(AtomicUsize::new(0));
+        let tool = ApprovalGatedTool::new(
+            Arc::new(MockTool {
+                name: "Write",
+                approval: false,
+                read_only: false,
+                ran: Arc::clone(&ran),
+            }),
+            Arc::clone(&gate),
+        )
+        .with_granted_roots(granted);
+        let ctx = LocalToolContext::new(
+            Arc::new(TokioExecutionEnv::new(repo.clone())),
+            repo.clone(),
+            Arc::new(ToolState::new()),
+        );
+        let target = wt.join("src/ok.txt");
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "path": target,
+                    "cwd": wt.to_string_lossy(),
+                    "content": "x",
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "same-repo worktree admitted through the call cwd"
+        );
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// The manox state home is part of the workspace-write writable scope:
@@ -1191,18 +1349,11 @@ mod tests {
     }
 
     /// Session/repo-scoped coordination (team orchestration, shared task
-    /// list, worktree enter/exit) carries no out-of-workspace write target:
-    /// WorkspaceWrite admits it, ReadOnly still denies at the mode match.
+    /// list) carries no out-of-workspace write target: WorkspaceWrite admits
+    /// it, ReadOnly still denies at the mode match.
     #[tokio::test]
     async fn workspace_write_admits_session_scoped_tools() {
-        for name in [
-            crate::tools::ENTER_WORKTREE,
-            crate::tools::EXIT_WORKTREE,
-            "TaskCreate",
-            "TaskList",
-            "TaskUpdate",
-            "TaskGet",
-        ] {
+        for name in ["TaskCreate", "TaskList", "TaskUpdate", "TaskGet"] {
             let (gate, _rx) = gate_with_events();
             gate.set_mode(PermissionMode::WorkspaceWrite);
             let (tool, ran) = gated_named(name, false, false, Arc::clone(&gate));

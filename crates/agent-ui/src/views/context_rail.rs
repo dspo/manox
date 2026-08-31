@@ -88,7 +88,7 @@ pub(crate) struct ContextRail {
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
-    /// `Workspace` on thread attach, terminal stop, and enter/exit worktree.
+    /// `Workspace` on thread attach and terminal stop.
     pub(crate) git_change_stats: Option<GitChangeStats>,
     /// Latest resolved branch display for the thread's cwd. `None` until the
     /// first refresh completes; the changes/branch rows render placeholders
@@ -596,8 +596,8 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Branch block: (1) the worktree directory basename, shown only while the
-    /// thread is inside a worktree — click copies the name, double-click copies
+    /// Branch block: (1) the working-directory basename, shown only while the
+    /// session's effective cwd is reported — click copies the name, double-click copies
     /// the absolute path; (2) the branch row — resolved branch or detached sha
     /// (+ "(detached)") as the label with the changes counts as its right-aligned
     /// trailing. Both rows copy on click with a notification for feedback.
@@ -607,13 +607,11 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Dual-read: the store mirrors the path as a string; the thread
-        // returns a `PathBuf`. The store's shape wins (both branches yield a
-        // string) so the render below is path-agnostic.
-        let worktree_path = self
+        // The store mirrors the session's effective cwd as a string.
+        let cwd_path = self
             .store
             .as_ref()
-            .and_then(|s| s.read(cx).store.worktree_path.clone());
+            .and_then(|s| s.read(cx).store.cwd_path.clone());
         let display = self.git_branch_display.clone();
 
         // Branch label: branch / detached sha + (detached).
@@ -663,7 +661,7 @@ impl ContextRail {
         );
 
         let mut block = v_flex().w_full().gap_0p5();
-        if let Some(path) = worktree_path {
+        if let Some(path) = cwd_path {
             // The dual-read yields a path string; re-path it for the
             // `file_name`/`display` calls below.
             let path = PathBuf::from(path);

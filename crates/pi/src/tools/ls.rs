@@ -39,6 +39,10 @@ impl AgentTool for LsTool {
                     "type": "string",
                     "description": "Directory to list (default: cwd)"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                },
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of entries to return"
@@ -60,7 +64,9 @@ impl AgentTool for LsTool {
             .map(|v| v as usize)
             .unwrap_or(Self::DEFAULT_LIMIT);
 
-        let path = ctx.cwd().join(path_str);
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
+        let path = cwd.join(path_str);
         let entries = ctx
             .env()
             .list_dir(&path)

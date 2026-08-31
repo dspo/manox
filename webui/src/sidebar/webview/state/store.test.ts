@@ -211,7 +211,7 @@ describe('info snapshots', () => {
         sessionId: 'a',
         info: {
           reasoning_effort: 'high',
-          worktree_path: null,
+          cwd_path: null,
           plan: null,
           goal: null,
           usage: {},
@@ -523,7 +523,7 @@ describe('transcript folding', () => {
       sessionId: 's',
       info: {
         reasoning_effort: 'max',
-        worktree_path: null,
+        cwd_path: null,
         plan: null,
         goal: null,
         usage: {},
@@ -595,7 +595,7 @@ describe('global folds', () => {
       sessionId: 's',
       info: {
         reasoning_effort: 'max',
-        worktree_path: '/w',
+        cwd_path: '/w',
         plan: null,
         goal: null,
         usage: {},
@@ -604,7 +604,7 @@ describe('global folds', () => {
         agents: [],
       },
     });
-    expect(thread(store)?.info?.worktree_path).toBe('/w');
+    expect(thread(store)?.info?.cwd_path).toBe('/w');
 
     store.dispatch(event({ type: 'branch', sessionId: 's', branch: 'main' }));
     expect(thread(store)?.branch).toBe('main');
@@ -618,8 +618,8 @@ describe('global folds', () => {
     );
     expect(thread(store)?.info?.plan?.steps).toHaveLength(1);
 
-    store.dispatch(event({ type: 'worktree_changed', sessionId: 's', active: false, path: null }));
-    expect(thread(store)?.info?.worktree_path).toBeNull();
+    store.dispatch(event({ type: 'cwd_changed', sessionId: 's', path: '/back' }));
+    expect(thread(store)?.info?.cwd_path).toBe('/back');
   });
 
   it('carries per-model usage in thread_info and merges async git_stats', () => {
@@ -629,7 +629,7 @@ describe('global folds', () => {
       sessionId: 's',
       info: {
         reasoning_effort: 'high',
-        worktree_path: null,
+        cwd_path: null,
         plan: null,
         goal: null,
         usage: { input_tokens: 10, output_tokens: 4 },

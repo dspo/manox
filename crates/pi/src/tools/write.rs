@@ -38,6 +38,10 @@ impl AgentTool for WriteTool {
                     "type": "string",
                     "description": "Path to the file"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                },
                 "content": {
                     "type": "string",
                     "description": "Content to write"
@@ -61,7 +65,9 @@ impl AgentTool for WriteTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("content is required".into()))?;
 
-        let path = ctx.cwd().join(path_str);
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
+        let path = cwd.join(path_str);
 
         // Serialize against concurrent edits of the same file.
         let _guard = ctx.tool_state().mutation_queue.lock(&path).await;

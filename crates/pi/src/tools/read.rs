@@ -48,6 +48,10 @@ impl AgentTool for ReadTool {
                     "type": "string",
                     "description": "Path to the file"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                },
                 "offset": {
                     "type": "integer",
                     "description": "Line number to start reading from (1-based)"
@@ -74,7 +78,9 @@ impl AgentTool for ReadTool {
         let offset = params["offset"].as_u64().map(|v| v as usize);
         let limit = params["limit"].as_u64().map(|v| v as usize);
 
-        let path = ctx.cwd().join(path_str);
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
+        let path = cwd.join(path_str);
 
         let raw = ctx
             .env()
@@ -166,6 +172,8 @@ fn format_full_read(path_display: &str, text: &str, tag: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::{ToolContext, ToolState};
+    use std::path::PathBuf;
 
     #[test]
     fn small_file_is_not_capped() {
@@ -186,5 +194,105 @@ mod tests {
         assert!(!out.contains("2004:line 2004"));
         assert!(out.contains("Showing lines 1-2000 of 5000"));
         assert!(out.contains("offset 2001"), "paging hint: {out}");
+    }
+
+    struct Ctx {
+        env: crate::env::TokioExecutionEnv,
+        cwd: PathBuf,
+        state: std::sync::Arc<ToolState>,
+    }
+    impl ToolContext for Ctx {
+        fn env(&self) -> &dyn crate::env::ExecutionEnv {
+            &self.env
+        }
+        fn cwd(&self) -> &std::path::Path {
+            &self.cwd
+        }
+        fn tool_state(&self) -> &ToolState {
+            &self.state
+        }
+    }
+
+    fn ctx_at(dir: std::path::PathBuf) -> Ctx {
+        Ctx {
+            env: crate::env::TokioExecutionEnv::new(dir.clone()),
+            cwd: dir,
+            state: std::sync::Arc::new(ToolState::new()),
+        }
+    }
+
+    async fn read(
+        tool: &ReadTool,
+        ctx: &Ctx,
+        params: serde_json::Value,
+    ) -> Result<AgentToolResult, crate::tool::ToolError> {
+        tool.execute(
+            "c1",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            ctx,
+        )
+        .await
+    }
+
+    /// A relative path resolves against the call's explicit `cwd`, and the
+    /// sticky advances so the next call without `cwd` inherits it.
+    #[tokio::test]
+    async fn explicit_cwd_resolves_relative_paths_and_advances_sticky() {
+        let base = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir_in(base.path()).unwrap();
+        std::fs::write(work.path().join("note.txt"), "hello worktree\n").unwrap();
+        let ctx = ctx_at(base.path().to_path_buf());
+
+        let result = read(
+            &ReadTool,
+            &ctx,
+            serde_json::json!({
+                "path": "note.txt",
+                "cwd": work.path().to_string_lossy(),
+            }),
+        )
+        .await
+        .unwrap();
+        match &result.content[0] {
+            crate::types::ContentBlock::Text { text, .. } => {
+                assert!(text.contains("hello worktree"), "{text}");
+            }
+            other => panic!("expected text block, got {other:?}"),
+        }
+
+        // Sticky advanced: the same relative path resolves in the worktree
+        // without repeating the cwd argument.
+        let inherited = read(&ReadTool, &ctx, serde_json::json!({"path": "note.txt"}))
+            .await
+            .unwrap();
+        assert!(!inherited.is_error);
+        assert_eq!(
+            ctx.state.sticky_cwd.lock().unwrap().as_deref(),
+            Some(work.path())
+        );
+    }
+
+    /// A cwd pointing at a directory that does not exist fails before any
+    /// file access and leaves the sticky untouched.
+    #[tokio::test]
+    async fn missing_cwd_fails_without_advancing_sticky() {
+        let base = tempfile::tempdir().unwrap();
+        let gone = base.path().join("gone");
+        let ctx = ctx_at(base.path().to_path_buf());
+        let err = read(
+            &ReadTool,
+            &ctx,
+            serde_json::json!({"path": "any.txt", "cwd": gone.to_string_lossy()}),
+        )
+        .await
+        .unwrap_err();
+        match err {
+            crate::tool::ToolError::InvalidArguments(msg) => {
+                assert!(msg.contains("working directory does not exist"), "{msg}");
+            }
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
+        assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
     }
 }

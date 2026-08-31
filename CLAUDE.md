@@ -46,7 +46,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - 单一状态根：`~/.manox/`（`agent::paths::manox_config_dir()` 与 `cx_providers::cx_state_dir()` 均指向它）
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/cx-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；EnterWorktree/ExitWorktree/Open/NewSession/恢复等 swap 移动指针，侧栏按 thread 折叠其 sessions 为单行，`agent::thread_registry`）
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`agent::thread_registry`）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork。
 - pi 会话（.jsonl）：`~/.manox/pi-sessions/`
 - 子代理会话：`~/.manox/pi-sessions/subagents/`（持久化、不进侧栏；cx stats 计入 manox）
 - 外部会话：`~/.manox/external-sessions/`

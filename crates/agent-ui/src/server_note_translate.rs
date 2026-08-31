@@ -134,10 +134,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
                 .as_ref()
                 .and_then(|s| serde_json::from_value(s.clone()).ok()),
         },
-        WorktreeChanged { active, path, .. } => ThreadEvent::WorktreeChanged {
-            active: *active,
-            path: path.clone(),
-        },
+        CwdChanged { path, .. } => ThreadEvent::CwdChanged { path: path.clone() },
         CompactionStarted { tokens_before, .. } => ThreadEvent::CompactionStarted {
             tokens_before: *tokens_before,
         },
@@ -414,8 +411,7 @@ mod tests {
                 depth: 0,
                 agent_label: String::new(),
                 self_author: String::new(),
-                worktree_active: false,
-                worktree_path: None,
+                cwd_path: None,
                 branch: None,
                 goal: None,
                 goal_elapsed_seconds: None,
