@@ -168,6 +168,7 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
         } => Note(ServerNote::Compaction {
             session_id: session_id.into(),
             summary: format!("{summary} ({messages_compacted} msgs, {tokens_before} tokens)"),
+            retained: serde_json::Value::Array(Vec::new()),
         }),
         ThreadEvent::SubagentStarted {
             id,
