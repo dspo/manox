@@ -691,10 +691,12 @@ pub fn handle_command(
                 let compact_instructions = compact.then(|| {
                     agent::collaboration_mode::plan_compact_instructions(lang, &pending.plan_file)
                 });
+                // The execution seed is harness-authored, not the session's own
+                // agent speaking: the turn header says so.
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),
                     approval_mode: Some(t.permission_mode().as_i64()),
-                    author: Some(t.self_author()),
+                    author: Some(agent::MessageAuthor::Harness),
                     ..Default::default()
                 };
                 t.approve_plan(compact, compact_instructions, seed_text, Some(ui), cx);
@@ -709,7 +711,7 @@ pub fn handle_command(
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),
                     approval_mode: Some(t.permission_mode().as_i64()),
-                    author: Some(t.self_author()),
+                    author: Some(agent::MessageAuthor::Harness),
                     ..Default::default()
                 };
                 let lang = t.agent_language();

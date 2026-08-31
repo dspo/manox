@@ -14,6 +14,7 @@ import { ThreadApi } from '../../api/client';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { store } from '../../state/bridge';
+import { userTurnHeader } from '../../state/transcript';
 import type { TranscriptItem } from '../../state/store';
 import { MarkdownContent } from '../ai/markdown-content';
 import { CopyOnHover } from './copy-on-hover';
@@ -101,19 +102,11 @@ export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageP
     >
       <div className="bg-background pointer-events-none absolute bottom-[-2px] left-1/2 h-[2px] w-2/5 -translate-x-1/2" />
       <div className="text-muted-foreground mb-1 flex items-center gap-1.5 text-xs">
-        <span className="text-foreground font-medium">{t('you')}</span>
-        {time && (
-          <>
-            <span>›</span>
-            <span>{time}</span>
-          </>
-        )}
-        {item.modelId && (
-          <>
-            <span>›</span>
-            <span className="truncate">{item.modelId}</span>
-          </>
-        )}
+        {/* The webview's conversation owner is always Captain, so `to` is
+         * fixed while `from` follows the turn's author. */}
+        <span className="text-foreground font-medium truncate">
+          {userTurnHeader(item.author, t('captain'), item.modelId, time)}
+        </span>
         <CopyOnHover className="ml-auto" text={item.text} />
       </div>
       {(chip || actions) && (

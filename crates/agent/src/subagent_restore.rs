@@ -26,6 +26,10 @@ pub struct RestoredSubagent {
     pub subagent_type: String,
     /// The Captain's dispatch prompt.
     pub prompt: String,
+    /// Unix seconds of the dispatch turn: the timestamp of the parent message
+    /// carrying the Steer tool call. The sub-agent panel's opening bubble
+    /// header shows the send time, not the time the panel was opened.
+    pub dispatched_at: i64,
     /// `Error` for a failure or timeout delivery; `Success` for a completion
     /// delivery; `Cancelled` when the run ended without any delivery
     /// (quit-time kill and explicit abort are indistinguishable after the
@@ -57,7 +61,7 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
             if let MessageContent::ToolUse(tu) = c
                 && tu.name.as_ref() == "Steer"
                 && !errored.contains(tu.id.as_str())
-                && let Some(row) = parse_dispatch(&tu.input)
+                && let Some(row) = parse_dispatch(&tu.input, m.timestamp)
             {
                 match rows.iter_mut().find(|r| r.address == row.address) {
                     Some(existing) => *existing = row,
@@ -104,7 +108,7 @@ pub fn rebuild_from_messages(messages: &[Message]) -> Vec<RestoredSubagent> {
 /// One subagent dispatch a Steer tool call describes, when it is one: a
 /// `Dispatch` whose `to.spawn` names a capability definition (`TeamMember`
 /// spawns a real thread and is not a subagent). Inject/Abort carry no spawn.
-fn parse_dispatch(input: &serde_json::Value) -> Option<RestoredSubagent> {
+fn parse_dispatch(input: &serde_json::Value, dispatched_at: i64) -> Option<RestoredSubagent> {
     if input.get("reason").and_then(|v| v.as_str()) != Some("Dispatch") {
         return None;
     }
@@ -126,6 +130,7 @@ fn parse_dispatch(input: &serde_json::Value) -> Option<RestoredSubagent> {
         address,
         subagent_type: spawn.to_string(),
         prompt,
+        dispatched_at,
         status: ToolCallStatus::Running,
         final_text: None,
     })
@@ -220,6 +225,10 @@ mod tests {
         assert_eq!(row.prompt, "fix the bug");
         assert_eq!(row.status, ToolCallStatus::Success);
         assert_eq!(row.final_text.as_deref(), Some("all done"));
+        assert_eq!(
+            row.dispatched_at, messages[0].timestamp,
+            "the row carries the dispatch turn's own timestamp"
+        );
     }
 
     #[test]

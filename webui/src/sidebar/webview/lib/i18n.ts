@@ -42,6 +42,7 @@ const DICT = {
   reasoning_high: { en: 'High', zh: '高' },
   reasoning_max: { en: 'Max', zh: '最高' },
   you: { en: 'You', zh: '你' },
+  harness: { en: 'Harness', zh: 'Harness' },
   no_messages_title: { en: 'No messages yet', zh: '暂无消息' },
   no_messages_desc: { en: 'Send a message to start', zh: '发送消息以开始' },
   threads_empty: { en: 'No conversations yet', zh: '暂无对话' },

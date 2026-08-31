@@ -124,6 +124,9 @@ pub enum SubagentChildEvent {
     /// The child's run surfaced a terminal provider error; the message text
     /// renders as an error card like the main thread's `Error` event.
     Error(String),
+    /// The child session's resolved model display name, reported once at
+    /// dispatch; the sub-agent panel's turn header shows it.
+    Model(String),
 }
 
 #[derive(Debug)]
@@ -634,9 +637,10 @@ impl Thread {
                             s.register_live_thread(&mid, member.downgrade());
                             s.refresh(cx);
                         });
+                        let from = self.self_author();
                         member.update(cx, |t, cx| {
                             let ui = crate::MessageUiMetadata {
-                                author: Some(crate::team::author_for("captain")),
+                                author: Some(from.clone()),
                                 ..Default::default()
                             };
                             t.insert_user_message_with_ui_metadata(prompt, Some(ui), cx);
@@ -851,24 +855,28 @@ impl Thread {
         let Some(engine) = &self.engine else {
             return;
         };
-        let seq = engine.history();
-        self.display = seq.clone();
-        let mut mapped: Vec<Message> = seq
-            .into_iter()
-            .filter_map(|entry| match entry {
-                HistoryEntry::Message(message) => Some(message),
-                HistoryEntry::Note(_) => None,
-            })
-            .collect();
+        let mut display = engine.history();
+        // The send-time chrome of the last inserted user turn rides the
+        // mirrored transcript itself: its sidecar write is asynchronous, so a
+        // rebuild driven off `display_history` before that write lands would
+        // otherwise show an agent-authored turn as human input.
         if let Some(ui) = self.last_user_ui.clone()
-            && let Some(last_user) = mapped.iter_mut().rev().find(|m| {
-                matches!(m.role, crate::language_model::Role::User)
-                    && m.provenance == crate::message::MessageProvenance::User
+            && let Some(HistoryEntry::Message(last_user)) = display.iter_mut().rev().find(|entry| {
+                matches!(entry, HistoryEntry::Message(m)
+                        if m.role == crate::language_model::Role::User
+                            && m.provenance == crate::message::MessageProvenance::User)
             })
         {
             last_user.ui = Some(ui);
         }
-        self.messages = mapped;
+        self.messages = display
+            .iter()
+            .filter_map(|entry| match entry {
+                HistoryEntry::Message(message) => Some(message.clone()),
+                HistoryEntry::Note(_) => None,
+            })
+            .collect();
+        self.display = display;
         self.request_usage = engine.request_token_usage();
         cx.notify();
     }
@@ -2505,6 +2513,7 @@ pub(crate) mod tests {
                 "expanded registry prompt".to_string(),
                 Some(MessageUiMetadata {
                     display_text: Some("/gitwork:deliver fast".to_string()),
+                    author: Some(crate::message::MessageAuthor::Harness),
                     ..Default::default()
                 }),
                 cx,
@@ -2521,6 +2530,17 @@ pub(crate) mod tests {
             assert!(
                 t.messages[1].ui.is_none(),
                 "tool-result user messages must not inherit prompt UI metadata"
+            );
+            // `display_history` is the conversation's rebuild surface: it must
+            // carry the same send-time chrome as the mirrored messages, or an
+            // injected turn reads as human input until the sidecar lands.
+            let HistoryEntry::Message(display_prompt) = &t.display_history()[0] else {
+                panic!("first display entry is the prompt message");
+            };
+            assert_eq!(
+                display_prompt.ui.as_ref().and_then(|ui| ui.author.as_ref()),
+                Some(&crate::message::MessageAuthor::Harness),
+                "the display mirror keeps the injected turn's attribution"
             );
         });
     }
