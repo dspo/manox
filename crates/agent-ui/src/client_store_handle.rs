@@ -1,6 +1,6 @@
 //! gpui wrapper around `ClientStore` that pumps `FromServer` messages from an
 //! `RpcConnection` into the store. γ-1b: the Entity wrapper + pump; γ-2 wires
-//! the views to read from this instead of `ThreadProxy`.
+//! the views read from this.
 
 use agent::ThreadEvent;
 use gpui::{Context, EventEmitter, Task};

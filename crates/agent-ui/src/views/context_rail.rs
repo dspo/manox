@@ -6,8 +6,8 @@
 //! cockpit state (run phase, the model's plan snapshot, per-cell counter
 //! animation state)
 //! that used to live directly on `Workspace`, plus strong handles to the
-//! active [`ThreadProxy`] (the transitional adapter around the gpui-free
-//! `agent::ThreadHandle`) and [`crate::ConversationState`] it renders
+//! active gpui-free `ThreadHandle` and the
+//! AgentServer-backed store mirror [`crate::ConversationState`] it renders
 //! against. Writes to cockpit state flow through `Workspace` →
 //! `self.context_rail.update(cx, |r, cx| …)`.
 //!
@@ -21,7 +21,6 @@
 //! conversation reclaims its width.
 
 use crate::client_store_handle::ClientStoreHandle;
-use crate::thread_proxy::ThreadProxy;
 use agent::ThreadEvent;
 use agent::i18n;
 use gpui::{
@@ -63,7 +62,7 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: Entity<ThreadProxy>,
+    pub(crate) thread: agent::thread::ThreadHandle,
     /// γ-2a transitional read path: the AgentServer-backed store mirroring
     /// kernel state via `ServerNote`s. `None` when the workspace has not
     /// created the AgentServer connection; every kernel-state read dual-reads
@@ -101,7 +100,7 @@ pub(crate) struct ContextRail {
 
 impl ContextRail {
     pub(crate) fn new(
-        thread: Entity<ThreadProxy>,
+        thread: agent::thread::ThreadHandle,
         store: Option<Entity<ClientStoreHandle>>,
     ) -> Self {
         Self {
@@ -281,9 +280,7 @@ impl ContextRail {
         let project = self
             .store
             .as_ref()
-            .map(|s| Some(std::path::PathBuf::from(s.read(cx).store.cwd.clone())))
-            .unwrap_or_else(|| self.thread.read(cx).project());
-
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()));
         let agents_section = self.render_agents_section(theme, cx);
 
         v_flex()
@@ -341,24 +338,26 @@ impl ContextRail {
     /// and third children.
     fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
-        let total = crate::cockpit::format_tokens(if let Some(store) = &self.store {
-            store
-                .read(cx)
-                .store
-                .cumulative_usage
+        let total = crate::cockpit::format_tokens(
+            self.store
                 .as_ref()
-                .map(|u| u.input + u.output)
-                .unwrap_or(0)
-        } else {
-            self.thread.read(cx).cumulative_token_usage().total_tokens()
-        });
+                .map(|s| {
+                    s.read(cx)
+                        .store
+                        .cumulative_usage
+                        .as_ref()
+                        .map(|u| u.input + u.output)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
+        );
         // Rate-card cost (#418 wire-boundary pricing); backends/sessions
         // without pricing keep the tokens-only header.
         let cumulative_cost = self
             .store
             .as_ref()
             .map(|s| s.read(cx).store.cumulative_cost)
-            .unwrap_or_else(|| self.thread.read(cx).cumulative_cost());
+            .unwrap_or(0.0);
         let total = if cumulative_cost > 0.0 {
             SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
         } else {
@@ -409,47 +408,43 @@ impl ContextRail {
         };
 
         // Per-model token breakdown tree with context budget integrated.
-        let (per_model, per_model_cost, per_model_last) = if let Some(store) = &self.store {
-            let s = &store.read(cx).store;
-            let per_model = s
-                .per_model_usage
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        agent::TokenUsage {
-                            input_tokens: v.input,
-                            output_tokens: v.output,
-                            cache_creation_input_tokens: v.cache_creation,
-                            cache_read_input_tokens: v.cache_read,
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            let per_model_last = s
-                .per_request_usage
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        agent::TokenUsage {
-                            input_tokens: v.input,
-                            output_tokens: v.output,
-                            cache_creation_input_tokens: v.cache_creation,
-                            cache_read_input_tokens: v.cache_read,
-                        },
-                    )
-                })
-                .collect::<HashMap<_, _>>();
-            (per_model, s.per_model_cost.clone(), per_model_last)
-        } else {
-            let thread = self.thread.read(cx);
-            (
-                thread.per_model_token_usage(),
-                thread.per_model_cost(),
-                thread.per_model_last_request_usage(),
-            )
-        };
+        let s = &self
+            .store
+            .as_ref()
+            .expect("foreground store present")
+            .read(cx)
+            .store;
+        let per_model = s
+            .per_model_usage
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    agent::TokenUsage {
+                        input_tokens: v.input,
+                        output_tokens: v.output,
+                        cache_creation_input_tokens: v.cache_creation,
+                        cache_read_input_tokens: v.cache_read,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let per_model_last = s
+            .per_request_usage
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    agent::TokenUsage {
+                        input_tokens: v.input,
+                        output_tokens: v.output,
+                        cache_creation_input_tokens: v.cache_creation,
+                        cache_read_input_tokens: v.cache_read,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let per_model_cost = s.per_model_cost.clone();
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
@@ -618,13 +613,7 @@ impl ContextRail {
         let worktree_path = self
             .store
             .as_ref()
-            .and_then(|s| s.read(cx).store.worktree_path.clone())
-            .or_else(|| {
-                self.thread
-                    .read(cx)
-                    .worktree_path()
-                    .map(|p| p.display().to_string())
-            });
+            .and_then(|s| s.read(cx).store.worktree_path.clone());
         let display = self.git_branch_display.clone();
 
         // Branch label: branch / detached sha + (detached).
@@ -774,7 +763,7 @@ impl ContextRail {
             .store
             .as_ref()
             .map(|s| s.read(cx).store.running)
-            .unwrap_or_else(|| self.thread.read(cx).is_running());
+            .unwrap_or(false);
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
             agent::ToolCallStatus::Error
         } else if running {

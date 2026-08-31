@@ -450,7 +450,7 @@ impl SlashCommand for CompactCommand {
             Some(trimmed.to_string())
         };
         let thread = workspace.thread.clone();
-        thread.update(cx, |t, _| t.compact(instructions));
+        thread.with_mut(|t| t.compact(instructions));
         cx.notify();
         SlashResult::Handled
     }
@@ -483,20 +483,20 @@ impl SlashCommand for GoalCommand {
         let thread = workspace.thread.clone();
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
-            thread.update(cx, |t, cx| {
+            thread.with_mut(|t| {
                 if let Err(error) = t.replace_goal(
                     objective.to_string(),
                     None,
                     None,
                     agent::db::GoalActor::User,
                 ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    tracing::warn!(error = %error, "goal op failed");
                 }
             });
             return SlashResult::Handled;
         }
         if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
-            thread.update(cx, |t, cx| {
+            thread.with_mut(|t| {
                 let current = t.goal();
                 let budget = current.as_ref().and_then(|goal| goal.token_budget);
                 let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
@@ -506,17 +506,15 @@ impl SlashCommand for GoalCommand {
                     max_rounds,
                     agent::db::GoalActor::User,
                 ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    tracing::warn!(error = %error, "goal op failed");
                 }
             });
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
-            thread.update(cx, |t, cx| {
+            thread.with_mut(|t| {
                 let Some(goal) = t.goal() else {
-                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
-                        "thread has no Goal"
-                    )));
+                    tracing::warn!("thread has no Goal");
                     return;
                 };
                 let budget = if matches!(value, "none" | "unlimited") {
@@ -525,7 +523,7 @@ impl SlashCommand for GoalCommand {
                     match value.parse::<u64>() {
                         Ok(value) => Some(value),
                         Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            tracing::warn!(error = %error, "goal op failed");
                             return;
                         }
                     }
@@ -536,17 +534,15 @@ impl SlashCommand for GoalCommand {
                     goal.max_rounds,
                     agent::db::GoalActor::User,
                 ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    tracing::warn!(error = %error, "goal op failed");
                 }
             });
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
-            thread.update(cx, |t, cx| {
+            thread.with_mut(|t| {
                 let Some(goal) = t.goal() else {
-                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
-                        "thread has no Goal"
-                    )));
+                    tracing::warn!("thread has no Goal");
                     return;
                 };
                 let max_rounds = if matches!(value, "none" | "unlimited") {
@@ -555,7 +551,7 @@ impl SlashCommand for GoalCommand {
                     match value.parse::<u64>() {
                         Ok(value) => Some(value),
                         Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error.into()));
+                            tracing::warn!(error = %error, "goal op failed");
                             return;
                         }
                     }
@@ -566,14 +562,14 @@ impl SlashCommand for GoalCommand {
                     max_rounds,
                     agent::db::GoalActor::User,
                 ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
+                    tracing::warn!(error = %error, "goal op failed");
                 }
             });
             return SlashResult::Handled;
         }
         match trimmed.to_lowercase().as_str() {
             "" => {
-                if thread.read(cx).goal().is_some() {
+                if thread.read(|t| t.goal().is_some()) {
                     workspace.open_goal_popover(cx);
                 } else {
                     workspace.begin_goal_new(window, cx);
@@ -581,16 +577,16 @@ impl SlashCommand for GoalCommand {
                 SlashResult::Handled
             }
             "clear" => {
-                thread.update(cx, |t, cx| {
+                thread.with_mut(|t| {
                     if let Err(error) = t.clear_goal(agent::db::GoalActor::User) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        tracing::warn!(error = %error, "goal op failed");
                     }
                 });
                 cx.notify();
                 SlashResult::Handled
             }
             "pause" | "stop" => {
-                thread.update(cx, |t, cx| {
+                thread.with_mut(|t| {
                     if let Err(error) = t.set_goal_status(
                         agent::goal::GoalStatus::Paused,
                         Some(agent::goal::GoalBlockReason {
@@ -599,19 +595,19 @@ impl SlashCommand for GoalCommand {
                         }),
                         agent::db::GoalActor::User,
                     ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        tracing::warn!(error = %error, "goal op failed");
                     }
                 });
                 SlashResult::Handled
             }
             "resume" => {
-                thread.update(cx, |t, cx| {
+                thread.with_mut(|t| {
                     if let Err(error) = t.set_goal_status(
                         agent::goal::GoalStatus::Active,
                         None,
                         agent::db::GoalActor::User,
                     ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        tracing::warn!(error = %error, "goal op failed");
                     }
                 });
                 SlashResult::Handled
@@ -627,17 +623,16 @@ impl SlashCommand for GoalCommand {
             }
             _ => {
                 let needs_confirmation = thread
-                    .read(cx)
-                    .goal()
+                    .read(|t| t.goal())
                     .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
                 if needs_confirmation {
                     workspace.begin_goal_replace_with_objective(trimmed, window, cx);
                     return SlashResult::Handled;
                 }
-                let created = thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string()) {
+                let created = thread.with_mut(|t| match t.set_goal(trimmed.to_string()) {
                     Ok(()) => true,
                     Err(error) => {
-                        cx.emit(agent::ThreadEvent::Error(error));
+                        tracing::warn!(error = %error, "goal op failed");
                         false
                     }
                 });

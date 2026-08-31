@@ -9,7 +9,6 @@
 mod common;
 
 use agent::ThreadEvent;
-use agent_ui::thread_proxy::ThreadProxy;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -20,17 +19,19 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let (_dir, plan_file) = write_plan_file();
 
-    let a: gpui::Entity<ThreadProxy> = fake_thread(cx, Vec::new());
-    let a_id = cx.read(|cx| a.read(cx).id.0.clone());
+    let a = fake_thread(cx, Vec::new());
+    let a_id = a.read(|t| t.id.0.clone());
     visual.update(|window, cx| {
         workspace.update(cx, |ws, cx| {
             ws.diagnostic_attach_thread(a.clone(), window, cx)
         });
     });
+    cx.run_until_parked();
 
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::PlanReady {
             plan_file,
             title: "Audit".into(),
@@ -51,8 +52,9 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
 
     // The proposal turn settles normally; the card must survive.
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::TurnFinished {
             cancelled: false,
             failed: false,
@@ -74,8 +76,9 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
 
     // An abnormal end demotes it — the verdict is moot.
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::TurnFinished {
             cancelled: true,
             failed: false,

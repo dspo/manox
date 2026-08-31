@@ -749,6 +749,7 @@ fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
 /// engine applies the toggle atomically against the session's authoritative
 /// active-tool set, so callers never compute the merged set themselves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BrowserSuite {
     ChromeUse,
     WebExplore,

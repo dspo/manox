@@ -1,8 +1,8 @@
 //! manox UI layer, built on gpui-component.
 //!
 //! Workspace top-level view + `ConversationState` + views. Holds an
-//! `Entity<ThreadProxy>` (the transitional gpui adapter around the
-//! gpui-free `agent::ThreadHandle`, see `thread_proxy`) and subscribes to
+//! the AgentServer-backed `ClientStoreHandle` (the data mirror around the
+//! gpui-free `agent::ThreadHandle`) and subscribes to
 //! `ThreadEvent` for incremental rendering.
 pub mod assets;
 pub mod browser_host;
@@ -17,7 +17,6 @@ pub mod git_status;
 pub(crate) mod overlap_diag;
 pub mod server_note_translate;
 pub mod slash_command;
-pub mod thread_proxy;
 pub mod views;
 pub mod vscode_app;
 pub mod workspace;
