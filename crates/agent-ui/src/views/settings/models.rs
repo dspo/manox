@@ -739,7 +739,7 @@ impl ModelsPanelState {
                 .background_spawn(async move { agent::pi_providers::reload() })
                 .await;
             let _ = this.update_in(cx, |_this, window, cx| match result {
-                Ok(()) => i18n::rebuild_menus(cx),
+                Ok(()) => crate::menu::rebuild_menus(cx),
                 Err(e) => {
                     tracing::warn!(error = %e, "provider registry reload failed after settings save");
                     window.push_notification(

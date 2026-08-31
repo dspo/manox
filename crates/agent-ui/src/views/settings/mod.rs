@@ -321,7 +321,9 @@ impl SettingsView {
         }
         self.ui_language = resolved.ui.endonym().into();
         self.agent_language = resolved.agent.endonym().into();
-        i18n::set_ui_language(resolved.ui, cx);
+        i18n::set_ui_language(resolved.ui);
+        cx.refresh_windows();
+        crate::menu::rebuild_menus(cx);
         cx.notify();
         Ok(())
     }
