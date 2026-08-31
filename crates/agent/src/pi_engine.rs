@@ -100,23 +100,16 @@ pub(crate) enum SessionCmd {
     },
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Fork the current session into a worktree-cwd session and switch to
-    /// it (`EnterWorktree` tool's git phase already ran).
-    EnterWorktree {
-        worktree_path: PathBuf,
-        branch: String,
-        original_cwd: PathBuf,
-        git_common_dir: PathBuf,
-    },
-    /// Return to the pre-worktree session (`ExitWorktree` tool's git
-    /// cleanup already ran).
-    ExitWorktree,
     /// Create a fresh session in the given directory, optionally bound to a
     /// project (persisted in the session sidecar).
     NewSession {
         cwd: PathBuf,
         project: Option<PathBuf>,
     },
+    /// Move the session's working directory (host-driven `SetCwd`): the
+    /// sticky cwd advances and the move is durable as a `cwd_change`
+    /// entry — never the header cwd or the project binding.
+    SetCwd { path: PathBuf },
     /// Append a host UI annotation as a `custom` entry at the session leaf.
     /// The single actor queue makes send order the persist order, so a note
     /// dispatched before a prompt lands before the prompt's user entry.
@@ -161,8 +154,9 @@ struct EngineState {
     /// session, so the toggle parks here and lands right after settle.
     pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
     /// Session cmds that arrived mid-run but are not serviceable until the
-    /// turn settles (e.g. `EnterWorktree`/`ExitWorktree`/`NewSession`/`Open` —
-    /// they rebuild the session, which the running turn owns). drive_run
+    /// turn settles (e.g. `NewSession`/`Open`/`SetCwd` — the first two
+    /// rebuild the session, the third moves the sticky cwd a running turn's
+    /// tools are resolving against). drive_run
     /// parks them here instead of dropping; the idle loop drains and
     /// re-queues them so the post-settle cmd dispatch runs the handler.
     pending_session_cmds: Mutex<Vec<SessionCmd>>,
@@ -188,9 +182,14 @@ struct EngineState {
     /// the first user turn. Restored sessions arm it at Ready (they already
     /// "started"); Open/NewSession re-arm per session switch.
     session_start_fired: AtomicBool,
-    /// Active git-worktree binding shared with the worktree tools (nest
-    /// guard + exit routing); persisted in the session sidecar on swap.
-    worktree: crate::worktree::WorktreeState,
+    /// Session-shared extra writable roots, derived per call from the
+    /// effective cwd (same-repo worktree auto-admission + escalation
+    /// accumulation). Feeds both the fs fence and the bash seatbelt.
+    granted_roots: crate::granted_roots::GrantedRoots,
+    /// The cwd last reported through a `CwdChanged` event. A settle emits
+    /// one event per durable move, so the UI's directory display tracks the
+    /// session tail without per-turn chatter.
+    last_cwd_note: Mutex<Option<String>>,
 }
 
 /// Live transcript snapshot maintained by the session listener so the engine
@@ -262,7 +261,8 @@ pub fn spawn_engine(
         goal_continuation_reserved: AtomicBool::new(false),
         goal_continuation_round: Mutex::new(None),
         session_start_fired: AtomicBool::new(false),
-        worktree: crate::worktree::new_state(),
+        granted_roots: crate::granted_roots::GrantedRoots::new(cwd.clone()),
+        last_cwd_note: Mutex::new(None),
     });
     crate::runtime::handle().spawn(run_actor(
         cwd,
@@ -498,6 +498,10 @@ impl ThreadEngine for PiEngine {
 
     fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
         let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
+    }
+
+    fn set_cwd(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(SessionCmd::SetCwd { path });
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -748,7 +752,8 @@ fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
 /// An opt-in browser tool suite toggled from the composer `+` menu. The
 /// engine applies the toggle atomically against the session's authoritative
 /// active-tool set, so callers never compute the merged set themselves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BrowserSuite {
     ChromeUse,
     WebExplore,
@@ -781,8 +786,7 @@ fn build_tools(
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
-    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
-    worktree: &crate::worktree::WorktreeState,
+    granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
     Vec<Arc<dyn PiAgentTool>>,
@@ -796,8 +800,8 @@ fn build_tools(
     // persistent brush shell (permission-gated as always). Background tasks
     // reuse this backend's `wrap_command`, so a non-escalated background
     // task is confined exactly like a foreground call. The per-call effective
-    // mode reaches the seatbelt via the `mode_resolver`; a worktree session
-    // scopes the workspace root to the worktree.
+    // mode reaches the seatbelt via the `mode_resolver`; the writable roots
+    // follow the call's cwd through the shared granted-roots store.
     let sandbox_available = crate::sandbox::is_available();
     let mut background = Arc::new(BackgroundRegistry::new());
     // Shared per-call grant cell: an approved sandbox-escalation stamps the
@@ -807,7 +811,6 @@ fn build_tools(
         std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT),
     );
     let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if sandbox_available {
-        let policy = worktree_policy(cwd, worktree);
         let sandbox_mode_gate = Arc::clone(gate);
         let cell_for_resolver = Arc::clone(&grant_cell);
         let sandbox_mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
@@ -821,7 +824,7 @@ fn build_tools(
             });
         let ops = Arc::new(crate::sandbox::SandboxedBashOperations::new(
             cwd,
-            policy,
+            granted_roots.clone(),
             sandbox_mode_resolver,
         ));
         let wrap_ops = Arc::clone(&ops);
@@ -926,24 +929,16 @@ fn build_tools(
     // Write/Edit carry the host escalation config (shared approver + standing
     // resolver); the per-call grant is a local return value in the gate (no
     // shared cell — Write/Edit run `Parallel`). Every gated wrapper also
-    // sees the live worktree-granted roots so an approved `EnterWorktree`
-    // widens the fs fence exactly like the seatbelt.
-    let wt_for_roots = Arc::clone(worktree);
-    let worktree_roots: Arc<dyn Fn() -> Vec<PathBuf> + Send + Sync> = Arc::new(move || {
-        wt_for_roots
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(pi_extensions::sandbox::worktree_granted_roots)
-            .unwrap_or_default()
-    });
+    // sees the shared granted roots so the fs fence widens exactly like the
+    // seatbelt: same-repo worktree auto-admission plus escalation
+    // accumulation, both derived from the call's effective cwd.
     let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
         .into_iter()
         .map(|tool| {
             let name = tool.name().to_string();
             let mut wrapper = ApprovalGatedTool::new(tool, Arc::clone(gate))
                 .with_plan_policy(Arc::clone(&plan_policy))
-                .with_worktree_roots(Arc::clone(&worktree_roots));
+                .with_granted_roots(granted_roots.clone());
             if let Some(allow) = &confined_bash_auto_allow
                 && matches!(name.as_str(), "Bash" | "Monitor")
             {
@@ -1081,25 +1076,6 @@ fn build_tools(
                     .with_plan_policy(Arc::clone(&plan_policy)),
             ));
         }
-    }
-    // Git worktree management: the tools run the git phase and queue the
-    // session swap (actor-side, between turns). Gated like other mutating
-    // tools: repo-scoped, so WorkspaceWrite admits (see
-    // `workspace_write_verdict`), ReadOnly denies, DangerFullAccess ungated.
-    for tool in [
-        Arc::new(crate::worktree::EnterWorktreeTool::new(
-            cmd_tx.clone(),
-            Arc::clone(worktree),
-        )) as Arc<dyn PiAgentTool>,
-        Arc::new(crate::worktree::ExitWorktreeTool::new(
-            cmd_tx.clone(),
-            Arc::clone(worktree),
-        )),
-    ] {
-        tools.push(Arc::new(
-            ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy)),
-        ));
     }
     // LSP code-intel tools: read-only, ride ungated. Registered once the
     // registry probe landed and at least one server spec is available;
@@ -1318,29 +1294,6 @@ fn build_tools(
     )
 }
 
-/// The sandbox policy for a session cwd: when the session runs inside the
-/// active worktree, the worktree's granted roots (the worktree, its git
-/// common dir, and the pre-enter project root) are admitted ON TOP of the
-/// workspace — additive, so orchestration keeps writing the original repo.
-/// The cwd comparison canonicalizes both sides so the policy follows the
-/// session's actual directory — a stale pre-swap state or an Exit back to
-/// the original repo both classify correctly.
-fn worktree_policy(
-    cwd: &Path,
-    worktree: &crate::worktree::WorktreeState,
-) -> crate::sandbox::SandboxPolicy {
-    let Some(meta) = worktree.lock().unwrap().clone() else {
-        return crate::sandbox::SandboxPolicy::for_project(cwd);
-    };
-    let wt = crate::sandbox::canonicalize_best_effort(Path::new(&meta.worktree_path));
-    let current = crate::sandbox::canonicalize_best_effort(cwd);
-    if current == wt {
-        crate::sandbox::SandboxPolicy::for_project(cwd)
-            .with_extra_roots(pi_extensions::sandbox::worktree_granted_roots(&meta))
-    } else {
-        crate::sandbox::SandboxPolicy::for_project(cwd)
-    }
-}
 struct SessionOrchestrators {
     monitor: Arc<MonitorManager>,
     background: Arc<BackgroundManager>,
@@ -1613,6 +1566,20 @@ async fn settle_run(
         ))));
     }
     state.running.store(false, Ordering::Relaxed);
+    // The sticky cwd may have moved during the run (a tool call with an
+    // explicit `cwd`, or a `cd` inside a command): report one `CwdChanged`
+    // per durable move so the facade mirror and the UI track the session
+    // tail. The projected cwd comes from the session path — the flush has
+    // already made the move durable at this point.
+    let projected = session.projected_cwd().await;
+    let projected_str = projected.to_string_lossy().into_owned();
+    let last = state.last_cwd_note.lock().unwrap().clone();
+    if last.as_deref() != Some(projected_str.as_str()) {
+        *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+            path: projected_str,
+        })));
+    }
     // Mid-run appends parked their persistence (the run owned the session);
     // persist before the authoritative sync so the rebuilt mirror keeps them.
     let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
@@ -1933,10 +1900,12 @@ fn subscribe_harness_events(
             // prompt. Fire-and-forget: the manual `/compact` path awaits the
             // same clear before mirroring.
             clear_user_chrome_spawn(sessions_dir.clone(), session_path.clone());
+            let retained_tail = adapt::harness_messages_to_messages(&result.retained_tail);
             let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
                 summary: result.summary,
                 messages_compacted: 0,
                 tokens_before: result.tokens_before,
+                retained_tail,
             })));
         }
         _ => {}
@@ -1944,9 +1913,9 @@ fn subscribe_harness_events(
 }
 
 /// Session header metadata: the creating host's identity, the owning thread
-/// id (forks inherit it — `fork_from` copies the header metadata verbatim —
-/// so a thread's sessions stay grouped across worktree swaps), plus (for a
-/// team worker) the leader's session id. The links persist with the jsonl
+/// id (the retired worktree fork copied it verbatim, so historical fork
+/// files still group under one thread), plus (for a team worker) the
+/// leader's session id. The links persist with the jsonl
 /// file, so they survive restarts and outlive the in-memory team.
 fn session_metadata(thread_id: &str, parent_session: Option<&str>) -> serde_json::Value {
     let mut metadata = serde_json::json!({
@@ -1971,8 +1940,7 @@ fn session_builder(
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
-    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
-    worktree: &crate::worktree::WorktreeState,
+    granted_roots: &crate::granted_roots::GrantedRoots,
     thread_id: &str,
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
@@ -1989,8 +1957,7 @@ fn session_builder(
         plan,
         notice_tx,
         goal_bridge,
-        cmd_tx,
-        worktree,
+        granted_roots,
         bus,
     );
     let default_active = default_active_tool_names(&tools);
@@ -2177,9 +2144,6 @@ async fn run_actor(
     };
     let mut restored = false;
     let mut session = None;
-    // The restored worktree meta (if any) drives both the sandbox policy
-    // (hydrated before the session build) and the post-Ready chip event.
-    let mut worktree_restored: Option<pi_extensions::session_meta::WorktreeMeta> = None;
     if let Some(info) = latest {
         // Sessions created by a GUI launch (process cwd `/`) persisted a
         // useless cwd; heal them to this launch's default instead.
@@ -2187,15 +2151,6 @@ async fn run_actor(
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
-        // Hydrate the worktree state BEFORE `session_builder` runs: it
-        // calls `build_tools`, which derives the sandbox policy from the
-        // active-worktree state (worktree-scoped confinement with the bound
-        // repo's `.git` re-opened). Without this, a worktree session
-        // restored after an app restart boots with the project policy and
-        // commit/push fail until the next session swap.
-        let meta = load_worktree_state(&sessions_dir, &info.path).await;
-        worktree_restored = meta.clone();
-        *state.worktree.lock().unwrap() = meta;
         // The restore path passes no model override: `builder.open()`
         // projects the session's own model only when the builder carries
         // none (TS `options.model > restored model`), and the actor adopts
@@ -2209,8 +2164,7 @@ async fn run_actor(
             &state.plan,
             &notice_tx,
             state.goal_bridge.as_ref(),
-            &cmd_tx,
-            &state.worktree,
+            &state.granted_roots,
             &thread_id,
             None,
             &bus,
@@ -2234,10 +2188,6 @@ async fn run_actor(
             }
             Err(err) => {
                 tracing::warn!("pi session restore failed ({err}); starting fresh");
-                // The failed restore never materialized the worktree
-                // session; clear the hydrated state so the fresh session
-                // boots with the project policy.
-                *state.worktree.lock().unwrap() = None;
             }
         }
     }
@@ -2253,8 +2203,7 @@ async fn run_actor(
                 &state.plan,
                 &notice_tx,
                 state.goal_bridge.as_ref(),
-                &cmd_tx,
-                &state.worktree,
+                &state.granted_roots,
                 &thread_id,
                 parent_session.as_deref(),
                 &bus,
@@ -2406,17 +2355,17 @@ async fn run_actor(
     if restored {
         state.session_start_fired.store(true, Ordering::SeqCst);
     }
-    // Restore the worktree chip after `Ready` so the facade mirror exists
-    // before the event lands (same ordering as plan-mode restore).
-    if let Some(meta) = worktree_restored {
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::WorktreeChanged {
-                active: true,
-                path: Some(meta.worktree_path),
-            },
-        )));
-    }
-
+    // Seed the cwd display right after `Ready`: a resumed session may
+    // project an effective cwd (a `cwd_change` tail) that differs from the
+    // launch directory, and the facade mirror starts empty. Seeding here
+    // (and only here — settles handle the steady state) makes the first
+    // `thread_info` already carry the directory the session works in.
+    let projected = session.projected_cwd().await;
+    let projected_str = projected.to_string_lossy().into_owned();
+    *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+        path: projected_str,
+    })));
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
 
@@ -2434,7 +2383,7 @@ async fn run_actor(
         if let Some((suite, enable)) = parked_suite {
             apply_browser_suite(&mut session, suite, enable).await;
         }
-        // Mid-run non-serviceable cmds (EnterWorktree/ExitWorktree/...) parked
+        // Mid-run non-serviceable cmds (NewSession/Open/...) parked
         // themselves for the same reason; re-queue so the post-settle dispatch
         // runs their handler.
         let parked_cmds = std::mem::take(&mut *state.pending_session_cmds.lock().unwrap());
@@ -2895,8 +2844,7 @@ async fn run_actor(
                     &state.gate,
                     &state.plan,
                     state.goal_bridge.as_ref(),
-                    &cmd_tx,
-                    &state.worktree,
+                    &state.granted_roots,
                     &thread_id,
                     &bus,
                 )
@@ -2925,7 +2873,6 @@ async fn run_actor(
                     &wakeup_tx,
                 );
                 resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
-                resync_worktree_state(&sessions_dir, &path, &state.worktree, &notice_tx).await;
                 // The opened file becomes the thread's active session.
                 let opened_id = path
                     .file_stem()
@@ -2941,171 +2888,38 @@ async fn run_actor(
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
             }
-            SessionCmd::EnterWorktree {
-                worktree_path,
-                branch,
-                original_cwd,
-                git_common_dir,
-            } => {
-                let Some(current_path) = state.active_path.lock().unwrap().clone() else {
+            SessionCmd::SetCwd { path } => {
+                if !path.is_dir() {
                     let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!("enter_worktree: no active session"),
+                        anyhow::anyhow!(
+                            "set_cwd: working directory does not exist: {}",
+                            path.display()
+                        ),
                     ))));
                     continue;
-                };
-                // Kernel-native `forkFrom`: the forked session carries the
-                // transcript verbatim with the worktree as its header cwd.
-                let fork_path = match repo
-                    .fork_from(&current_path, &worktree_path.display().to_string())
-                    .await
-                {
-                    Ok(forked) => forked.storage().path().to_path_buf(),
-                    Err(err) => {
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                            anyhow::anyhow!("enter_worktree fork failed: {err:#}"),
-                        ))));
-                        continue;
-                    }
-                };
-                // The fork becomes the thread's active session; the thread
-                // id stamp rides the forked header metadata, so the sidebar
-                // keeps both sessions under one row.
-                let fork_id = fork_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default();
-                crate::thread_registry::set_active(&thread_id, fork_id).await;
-                // The worktree sidecar + shared state must be in place
-                // BEFORE the session rebuild: `build_tools` derives the
-                // sandbox policy from the active-worktree state
-                // (worktree-scoped confinement plus the owning repo's git
-                // common dir admitted). The WorktreeChanged notice fires
-                // early here; the final refresh_session_list repaints
-                // everything.
-                let meta = pi_extensions::session_meta::WorktreeMeta {
-                    worktree_path: worktree_path.display().to_string(),
-                    branch,
-                    original_session_path: current_path.display().to_string(),
-                    original_cwd: original_cwd.display().to_string(),
-                    git_common_dir: git_common_dir.display().to_string(),
-                };
-                if let Err(err) =
-                    fork_sidecar_inherit(&sessions_dir, &current_path, &fork_path, meta).await
-                {
-                    tracing::warn!(error = %err, "failed to persist the worktree fork sidecar");
                 }
-                resync_worktree_state(&sessions_dir, &fork_path, &state.worktree, &notice_tx).await;
-                rebuild_session(
-                    &mut session,
-                    &fork_path,
-                    &sessions_dir,
-                    &runtime,
-                    &mut pi_model,
-                    &state,
-                    &cwd,
-                    &notice_tx,
-                    &state.gate,
-                    &state.plan,
-                    state.goal_bridge.as_ref(),
-                    &cmd_tx,
-                    &state.worktree,
-                    &thread_id,
-                    &bus,
-                )
-                .await;
-                title_scheduler.retarget(
-                    fork_path.clone(),
-                    worktree_path.clone(),
-                    load_title_scheduler(
-                        &sessions_dir,
-                        &fork_path,
-                        successful_provider_responses(session.harness_messages()),
-                    )
-                    .await,
-                );
-                _subscription = subscribe_session(
-                    &session,
-                    &notice_tx,
-                    Arc::clone(&live_mirror),
-                    title_scheduler.clone(),
-                );
-                _harness_subscription = subscribe_harness_events(
-                    &mut session,
-                    sessions_dir.to_path_buf(),
-                    fork_path.clone(),
-                    &notice_tx,
-                    &wakeup_tx,
-                );
-                resync_plan_state(&sessions_dir, &fork_path, &state.plan, &notice_tx).await;
-                *state.active_path.lock().unwrap() = Some(fork_path);
-                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
-                sync_history(&session, &sessions_dir, &state).await;
-                sync_usage(&session, &state).await;
-                refresh_session_list(&repo, &state).await;
-            }
-            SessionCmd::ExitWorktree => {
-                let Some(meta) = state.worktree.lock().unwrap().clone() else {
+                // A no-op switch (the projected cwd already matches) only
+                // refreshes the note — no duplicate `cwd_change` entry.
+                if session.projected_cwd().await == path {
+                    let path_str = path.to_string_lossy().into_owned();
+                    *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+                    let _ =
+                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                            path: path_str,
+                        })));
                     continue;
-                };
-                let original = PathBuf::from(&meta.original_session_path);
-                rebuild_session(
-                    &mut session,
-                    &original,
-                    &sessions_dir,
-                    &runtime,
-                    &mut pi_model,
-                    &state,
-                    &cwd,
-                    &notice_tx,
-                    &state.gate,
-                    &state.plan,
-                    state.goal_bridge.as_ref(),
-                    &cmd_tx,
-                    &state.worktree,
-                    &thread_id,
-                    &bus,
-                )
-                .await;
-                title_scheduler.retarget(
-                    original.clone(),
-                    PathBuf::from(&meta.original_cwd),
-                    load_title_scheduler(
-                        &sessions_dir,
-                        &original,
-                        successful_provider_responses(session.harness_messages()),
-                    )
-                    .await,
-                );
-                _subscription = subscribe_session(
-                    &session,
-                    &notice_tx,
-                    Arc::clone(&live_mirror),
-                    title_scheduler.clone(),
-                );
-                _harness_subscription = subscribe_harness_events(
-                    &mut session,
-                    sessions_dir.to_path_buf(),
-                    original.clone(),
-                    &notice_tx,
-                    &wakeup_tx,
-                );
-                resync_plan_state(&sessions_dir, &original, &state.plan, &notice_tx).await;
-                if let Err(err) = write_worktree_sidecar(&sessions_dir, &original, None).await {
-                    tracing::warn!(error = %err, "failed to clear worktree sidecar");
                 }
-                resync_worktree_state(&sessions_dir, &original, &state.worktree, &notice_tx).await;
-                // The pointer returns to the pre-worktree session.
-                let original_id = original
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                crate::thread_registry::set_active(&thread_id, &original_id).await;
-                *state.active_path.lock().unwrap() = Some(original);
-                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
-                sync_history(&session, &sessions_dir, &state).await;
-                sync_usage(&session, &state).await;
-                refresh_session_list(&repo, &state).await;
+                if let Err(err) = session.set_session_cwd(path.clone()).await {
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!("set_cwd failed: {err:#}"),
+                    ))));
+                    continue;
+                }
+                let path_str = path.to_string_lossy().into_owned();
+                *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                    path: path_str,
+                })));
             }
             SessionCmd::NewSession { cwd, project } => {
                 let (builder, orchestrators, read_only_subagent) = session_builder(
@@ -3117,8 +2931,7 @@ async fn run_actor(
                     &state.plan,
                     &notice_tx,
                     state.goal_bridge.as_ref(),
-                    &cmd_tx,
-                    &state.worktree,
+                    &state.granted_roots,
                     &thread_id,
                     parent_session.as_deref(),
                     &bus,
@@ -3144,14 +2957,6 @@ async fn run_actor(
                         state.plan.set_active_instructions(None);
                         // …and earns its own SessionStart on the first turn.
                         state.session_start_fired.store(false, Ordering::SeqCst);
-                        // …nor an active worktree binding.
-                        *state.worktree.lock().unwrap() = None;
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                            ThreadEvent::WorktreeChanged {
-                                active: false,
-                                path: None,
-                            },
-                        )));
                         session = s;
                         // The fresh session is pinned to the facade thread's id.
                         crate::thread_registry::set_active(&thread_id, &thread_id).await;
@@ -3235,8 +3040,7 @@ async fn rebuild_session(
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
-    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
-    worktree: &crate::worktree::WorktreeState,
+    granted_roots: &crate::granted_roots::GrantedRoots,
     thread_id: &str,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) {
@@ -3272,8 +3076,7 @@ async fn rebuild_session(
         plan,
         notice_tx,
         goal_bridge,
-        cmd_tx,
-        worktree,
+        granted_roots,
         thread_id,
         None,
         bus,
@@ -3288,7 +3091,7 @@ async fn rebuild_session(
                 thread_id.to_string(),
             );
             attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
-            // Session swaps (Open/EnterWorktree/ExitWorktree) must carry the
+            // Session swaps (Open) must carry the
             // same plugin lifecycle hooks as fresh builds, or the swapped
             // session's PreToolUse/PostToolUse fire-and-forget shell-outs
             // never attach (write confinement is now in ApprovalGatedTool).
@@ -3706,73 +3509,6 @@ async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<
         Ok(meta) => meta.plan_snapshot,
         Err(_) => None,
     }
-}
-
-/// The active worktree binding persisted in a session's sidecar (forked
-/// worktree sessions carry it; originals and plain sessions don't).
-async fn load_worktree_state(
-    sessions_dir: &Path,
-    session_path: &Path,
-) -> Option<pi_extensions::session_meta::WorktreeMeta> {
-    pi_extensions::session_meta::load(sessions_dir, session_path)
-        .await
-        .ok()
-        .and_then(|meta| meta.worktree)
-}
-
-/// Persist (or clear) the worktree binding in the session sidecar.
-async fn write_worktree_sidecar(
-    sessions_dir: &Path,
-    session_path: &Path,
-    worktree: Option<pi_extensions::session_meta::WorktreeMeta>,
-) -> Result<(), anyhow::Error> {
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.worktree = worktree;
-    })
-    .await
-}
-
-/// Seed a worktree fork's sidecar: the worktree binding plus the source
-/// session's title and project, which the fork wears as the thread's
-/// identity while it is the active session (thread view title, sidebar
-/// grouping). The fork's sidecar is fresh — it carries no identity of its
-/// own, so the source's is adopted unconditionally. A missing/unreadable
-/// source sidecar degrades to the binding alone.
-async fn fork_sidecar_inherit(
-    sessions_dir: &Path,
-    source_path: &Path,
-    fork_path: &Path,
-    worktree: pi_extensions::session_meta::WorktreeMeta,
-) -> Result<(), anyhow::Error> {
-    let source = pi_extensions::session_meta::load(sessions_dir, source_path)
-        .await
-        .ok();
-    pi_extensions::session_meta::update(sessions_dir, fork_path, |meta| {
-        if let Some(src) = &source {
-            meta.title = src.title.clone();
-            meta.project = src.project.clone();
-        }
-        meta.worktree = Some(worktree);
-    })
-    .await
-}
-
-/// Re-sync the active-worktree state after a session switch: the binding
-/// follows the opened session's sidecar. Emits `WorktreeChanged` so the
-/// facade mirror tracks the session it now mirrors.
-async fn resync_worktree_state(
-    sessions_dir: &Path,
-    session_path: &Path,
-    worktree: &crate::worktree::WorktreeState,
-    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-) {
-    let meta = load_worktree_state(sessions_dir, session_path).await;
-    let active = meta.is_some();
-    let path = meta.as_ref().map(|m| m.worktree_path.clone());
-    *worktree.lock().unwrap() = meta;
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::WorktreeChanged { active, path },
-    )));
 }
 
 async fn write_plan_review_pending_sidecar(
@@ -4898,6 +4634,7 @@ mod tests {
     }
 
     fn test_engine_state() -> Arc<EngineState> {
+        let cwd = std::env::temp_dir();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
         let model_slot = Arc::new(Mutex::new(None));
         let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
@@ -4924,7 +4661,8 @@ mod tests {
             goal_bridge: None,
             goal_continuation_reserved: AtomicBool::new(false),
             goal_continuation_round: Mutex::new(None),
-            worktree: crate::worktree::new_state(),
+            granted_roots: crate::granted_roots::GrantedRoots::new(cwd.clone()),
+            last_cwd_note: Mutex::new(None),
         })
     }
 
@@ -5495,58 +5233,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn worktree_policy_scopes_to_the_active_worktree_and_falls_back() {
-        let base = crate::sandbox::canonicalize_best_effort(&std::env::temp_dir())
-            .join("manox-wt-policy-proj");
-        let wt = base.join("wt");
-        let git = base.join(".git");
-        let state = crate::worktree::new_state();
-        // No active worktree → plain project policy, no granted extras: the
-        // worktree/common-dir roots are absent from the seatbelt profile.
-        let p = worktree_policy(&wt, &state);
-        let sb_none = p.render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
-        assert!(
-            !sb_none.contains(&format!(
-                "(allow file-write* (subpath \"{}\"))",
-                crate::sandbox::canonicalize_best_effort(&git).display()
-            )),
-            "no worktree roots without a binding: {sb_none}"
-        );
-        // Active worktree matching the session cwd → additive roots: the
-        // workspace-write profile admits the worktree, its git common dir,
-        // and the pre-enter project root.
-        *state.lock().unwrap() = Some(pi_extensions::session_meta::WorktreeMeta {
-            worktree_path: wt.display().to_string(),
-            branch: "b".into(),
-            original_session_path: "x".into(),
-            original_cwd: base.display().to_string(),
-            git_common_dir: git.display().to_string(),
-        });
-        let sb = worktree_policy(&wt, &state)
-            .render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
-        for root in [&wt, &base, &git] {
-            assert!(
-                sb.contains(&format!(
-                    "(allow file-write* (subpath \"{}\"))",
-                    crate::sandbox::canonicalize_best_effort(root).display()
-                )),
-                "worktree root admitted: {sb}"
-            );
-        }
-        // Session cwd back at the original repo (Exit) → no worktree extras
-        // again, not the stale granted roots.
-        let sb_back = worktree_policy(&base, &state)
-            .render_seatbelt(crate::thread::PermissionMode::WorkspaceWrite);
-        assert!(
-            !sb_back.contains(&format!(
-                "(allow file-write* (subpath \"{}\"))",
-                crate::sandbox::canonicalize_best_effort(&git).display()
-            )),
-            "no stale worktree roots after exit: {sb_back}"
-        );
-    }
-
     #[tokio::test]
     async fn reasoning_effort_sidecar_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -5963,54 +5649,5 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.is_some(), "uninjected spawn keeps the tempdir guard");
-    }
-
-    fn worktree_fixture() -> pi_extensions::session_meta::WorktreeMeta {
-        pi_extensions::session_meta::WorktreeMeta {
-            worktree_path: "/tmp/wt".into(),
-            branch: "b".into(),
-            original_session_path: "/sessions/source.jsonl".into(),
-            original_cwd: "/proj/a".into(),
-            git_common_dir: "/proj/a/.git".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn fork_sidecar_inherit_seeds_source_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source.jsonl");
-        let fork = dir.path().join("fork.jsonl");
-        pi_extensions::session_meta::update(dir.path(), &source, |m| {
-            m.title = Some("the title".into());
-            m.project = Some("/proj/a".into());
-        })
-        .await
-        .unwrap();
-        fork_sidecar_inherit(dir.path(), &source, &fork, worktree_fixture())
-            .await
-            .unwrap();
-        let meta = pi_extensions::session_meta::load(dir.path(), &fork)
-            .await
-            .unwrap();
-        assert_eq!(meta.title.as_deref(), Some("the title"));
-        assert_eq!(meta.project.as_deref(), Some("/proj/a"));
-        assert_eq!(meta.worktree, Some(worktree_fixture()));
-    }
-
-    #[tokio::test]
-    async fn fork_sidecar_inherit_degrades_without_source() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("missing.jsonl");
-        let fork = dir.path().join("fork.jsonl");
-        // No source sidecar on disk: the binding lands alone, no error.
-        fork_sidecar_inherit(dir.path(), &source, &fork, worktree_fixture())
-            .await
-            .unwrap();
-        let meta = pi_extensions::session_meta::load(dir.path(), &fork)
-            .await
-            .unwrap();
-        assert!(meta.title.is_none());
-        assert!(meta.project.is_none());
-        assert_eq!(meta.worktree, Some(worktree_fixture()));
     }
 }

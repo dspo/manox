@@ -6,7 +6,7 @@
 
 mod common;
 
-use agent::{Thread, ThreadEvent};
+use agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -17,11 +17,11 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let (_dir, plan_file) = write_plan_file();
 
-    let a: gpui::Entity<Thread> = fake_thread(cx, Vec::new());
-    let a_id = cx.read(|cx| a.read(cx).id.0.clone());
+    let a = fake_thread(cx, Vec::new());
+    let a_id = a.read(|t| t.id.0.clone());
     let b = fake_thread(cx, Vec::new());
     // A must look running so attaching B parks it in the background.
-    a.update(&mut visual.cx, |t, _| t.set_running_for_test(true));
+    a.with_mut(|t| t.set_running_for_test(true));
 
     visual.update(|window, cx| {
         workspace.update(cx, |ws, cx| {
@@ -36,8 +36,9 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
 
     // The parked thread proposes a plan; the turn then settles normally.
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::PlanReady {
             plan_file: plan_file.clone(),
             title: "Audit".into(),
@@ -48,12 +49,13 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "background PlanReady must stash the review"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "sidebar keeps the pending-plan badge"
     );
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::TurnFinished {
             cancelled: false,
             failed: false,
@@ -65,7 +67,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "a normal settle keeps the stashed plan"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the badge survives the settle while the verdict is due"
     );
 

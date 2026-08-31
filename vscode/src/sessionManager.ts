@@ -1,4 +1,4 @@
-// Session multiplexer over the shared actor transport. Routes session-tagged
+// Session multiplexer over the shared transport. Routes session-tagged
 // events to per-session subscribers and global events (ready, models,
 // untagged errors) to manager-level subscribers, so host surfaces like the
 // chat participant and the sidebar each own their session and never see one
@@ -8,15 +8,15 @@ import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import type {
-  ActorEvent,
   ApprovalMode,
-  Command,
   CommandEntry,
+  FromClient,
+  FromServer,
   ModelInfo,
   ThreadInfoSnapshot,
   ThreadListItem,
 } from '../dist/protocol';
-import { isSessionEvent } from '../dist/protocol';
+import { isSessionEvent, notification, request } from './protocolHelpers';
 import type { Transport } from './transport/transport';
 import { NapiTransport } from './transport/napiTransport';
 
@@ -40,7 +40,7 @@ export function configuredApprovalMode(): ApprovalMode {
 export class SessionManager {
   private static instance: SessionManager | null = null;
 
-  /** Process-wide manager: the actor thread is shared by every host surface. */
+  /** Process-wide manager: the agent server is shared by every host surface. */
   static shared(): SessionManager {
     if (!SessionManager.instance) {
       SessionManager.instance = new SessionManager(NapiTransport.load());
@@ -48,7 +48,7 @@ export class SessionManager {
     return SessionManager.instance;
   }
 
-  /** Tear down the shared actor if one exists; used from `deactivate`. */
+  /** Tear down the shared transport if one exists; used from `deactivate`. */
   static async disposeShared(): Promise<void> {
     const instance = SessionManager.instance;
     SessionManager.instance = null;
@@ -60,32 +60,77 @@ export class SessionManager {
   private initPhase: 'idle' | 'starting' | 'ready' = 'idle';
   private readyPromise: Promise<void> | null = null;
   private approvalMode: ApprovalMode = configuredApprovalMode();
+  /** Map of request id → resolve/reject for outstanding ClientCall responses. */
+  private readonly pendingRequests = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timeout: NodeJS.Timeout }>();
 
   private constructor(private readonly transport: Transport) {
     this.global.setMaxListeners(0);
-    transport.onEvent((ev) => this.route(ev));
+    transport.onEvent((msg) => this.route(msg));
   }
 
-  private route(ev: ActorEvent): void {
-    if (isSessionEvent(ev)) {
-      if (ev.type === 'session_disposed') {
-        // Keep the emitter alive until the confirmation lands so late
-        // events of an in-flight turn still reach their handlers.
-        this.sessions.get(ev.sessionId)?.emit('event', ev);
-        this.sessions.delete(ev.sessionId);
+  private route(msg: FromServer): void {
+    switch (msg.kind) {
+      case 'notification': {
+        const note = msg.note as { method: string; [key: string]: unknown };
+        // Map ServerNote method names to the legacy event type names used by
+        // the rest of the codebase. The wire uses camelCase (from Rust serde);
+        // the internal dispatch uses the same method-based routing.
+        if (note.method === 'sessionCreated' || note.method === 'sessionDisposed') {
+          const sessionId = note.sessionId as string;
+          if (note.method === 'sessionDisposed') {
+            this.sessions.get(sessionId)?.emit('event', note);
+            this.sessions.delete(sessionId);
+            return;
+          }
+          this.sessions.get(sessionId)?.emit('event', note);
+          return;
+        }
+        if (isSessionEvent(note as { sessionId?: string | null })) {
+          this.sessions.get(note.sessionId as string)?.emit('event', note);
+          return;
+        }
+        if (note.method === 'ready' && this.initPhase === 'starting') {
+          this.initPhase = 'ready';
+        }
+        this.global.emit('event', note);
         return;
       }
-      this.sessions.get(ev.sessionId)?.emit('event', ev);
-      return;
+      case 'request': {
+        // ServerCall: adjudication / capability calls. The TS side routes
+        // these to the session subscribers.
+        const call = msg.call;
+        if (call.method === 'approve' || call.method === 'askUserQuestion' || call.method === 'planVerdict') {
+          // Forward the ServerCall as a session event so the handler (sidebar
+          // or participant) can answer via fromClientReply().
+          const sessionId = 'sessionId' in call ? (call as { sessionId: string }).sessionId : undefined;
+          if (sessionId) {
+            // Emit as a special event type the handlers know to look for.
+            this.sessions.get(sessionId)?.emit('serverCall', { id: msg.id, call });
+          }
+        }
+        return;
+      }
+      case 'response': {
+        // Response to a ClientCall request. Resolve the pending request.
+        const id = msg.id;
+        const pending = this.pendingRequests.get(id);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this.pendingRequests.delete(id);
+          if ('Ok' in msg.outcome) {
+            pending.resolve(msg.outcome.Ok as Record<string, unknown>);
+          } else {
+            pending.reject(new Error(`request failed: ${msg.outcome.Err.message}`));
+          }
+        }
+        return;
+      }
     }
-    if (ev.type === 'ready' && this.initPhase === 'starting') {
-      this.initPhase = 'ready';
-    }
-    this.global.emit('event', ev);
   }
 
-  /** Initialize the actor with a working directory; idempotent per process. */
-  init(cwd: string): Promise<void> {
+  /** Initialize the manager. The transport's start() already sends the
+   * Initialize handshake; this method waits for the Ready notification. */
+  init(_cwd?: string): Promise<void> {
     if (this.initPhase === 'ready') return Promise.resolve();
     if (this.initPhase === 'starting') return this.readyPromise!;
     this.initPhase = 'starting';
@@ -93,11 +138,10 @@ export class SessionManager {
       try {
         await this.transport.ready;
         const ready = this.awaitGlobal(
-          (ev) => ev.type === 'ready',
+          (ev) => ev.method === 'ready',
           'init ready',
           INIT_TIMEOUT_MS,
         );
-        this.send({ cmd: 'init', cwd, host: 'vscode' });
         await ready;
       } catch (e) {
         this.initPhase = 'idle';
@@ -108,34 +152,41 @@ export class SessionManager {
     return this.readyPromise;
   }
 
-  /** Create a session and resolve once the actor confirms it. The id is
-   * generated unless the caller already chose one (a surface rendering an
-   * optimistic draft before the session exists). */
+  /** Create a session and resolve once the server confirms it. */
   async createSession(cwd: string, sessionId: string = randomUUID()): Promise<string> {
     const emitter = new EventEmitter();
     emitter.setMaxListeners(0);
     this.sessions.set(sessionId, emitter);
     const created = this.awaitSession(
       sessionId,
-      (ev) => ev.type === 'session_created',
+      (ev) => ev.method === 'sessionCreated',
       'session_created',
     );
-    this.send({ cmd: 'create_session', sessionId, cwd });
+    this.send(notification({
+      method: 'createSession',
+      sessionId,
+      cwd,
+    }));
     try {
       await created;
     } catch (e) {
       this.sessions.delete(sessionId);
-      // Reclaim the actor-side session as well: the actor may still process
-      // the queued create_session after this side has given up waiting.
-      this.send({ cmd: 'dispose_session', sessionId });
+      this.send(notification({
+        method: 'disposeSession',
+        sessionId,
+      }));
       throw e;
     }
-    // Fresh threads start on the actor's default policy; enforce the host's.
-    this.send({ cmd: 'set_approval_mode', sessionId, mode: this.approvalMode });
+    // Fresh threads start on the server's default policy; enforce the host's.
+    this.send(notification({
+      method: 'setApprovalMode',
+      sessionId,
+      mode: this.approvalMode,
+    }));
     return sessionId;
   }
 
-  /** Open a persisted thread as a session and resolve once the actor
+  /** Open a persisted thread as a session and resolve once the server
    * confirms. The restored thread keeps its persisted approval mode. */
   async openThread(sessionId: string): Promise<string> {
     const emitter = new EventEmitter();
@@ -143,17 +194,23 @@ export class SessionManager {
     this.sessions.set(sessionId, emitter);
     const created = this.awaitSession(
       sessionId,
-      (ev) => ev.type === 'session_created',
+      (ev) => ev.method === 'sessionCreated',
       'session_created',
     );
-    this.send({ cmd: 'open_thread', sessionId });
+    // OpenSession is a ClientCall (request), not a notification.
+    const openRequest = request({
+      method: 'openSession',
+      sessionId,
+    });
+    this.send(openRequest);
     try {
       await created;
     } catch (e) {
       this.sessions.delete(sessionId);
-      // Reclaim the actor-side session as well: the actor may still process
-      // the queued open_thread after this side has given up waiting.
-      this.send({ cmd: 'dispose_session', sessionId });
+      this.send(notification({
+        method: 'disposeSession',
+        sessionId,
+      }));
       throw e;
     }
     return sessionId;
@@ -163,24 +220,35 @@ export class SessionManager {
   setApprovalMode(mode: ApprovalMode): void {
     this.approvalMode = mode;
     for (const sessionId of this.sessions.keys()) {
-      this.send({ cmd: 'set_approval_mode', sessionId, mode });
+      this.send(notification({
+        method: 'setApprovalMode',
+        sessionId,
+        mode,
+      }));
     }
   }
 
   /**
-   * Ask the actor to tear a session down. The emitter is removed when the
-   * `session_disposed` confirmation arrives, not here.
+   * Ask the server to tear a session down. The emitter is removed when the
+   * `sessionDisposed` confirmation arrives, not here.
    */
   disposeSession(sessionId: string): void {
-    this.send({ cmd: 'dispose_session', sessionId });
+    this.send(notification({
+      method: 'disposeSession',
+      sessionId,
+    }));
   }
 
-  send(command: Command): void {
-    this.transport.send(JSON.stringify(command));
+  fromClientReply(msg: FromClient): void {
+    this.transport.send(JSON.stringify(msg));
+  }
+
+  send(msg: FromClient): void {
+    this.transport.send(JSON.stringify(msg));
   }
 
   /** Subscribe to one session's events; returns an unsubscribe function. */
-  onSessionEvent(sessionId: string, handler: (ev: ActorEvent) => void): () => void {
+  onSessionEvent(sessionId: string, handler: (ev: Record<string, unknown>) => void): () => void {
     let emitter = this.sessions.get(sessionId);
     if (!emitter) {
       emitter = new EventEmitter();
@@ -191,85 +259,96 @@ export class SessionManager {
     return () => emitter!.off('event', handler);
   }
 
+  /** Subscribe to ServerCall requests for a session (approve/askUserQuestion/planVerdict). */
+  onSessionServerCall(sessionId: string, handler: (ev: { id: string; call: Record<string, unknown> }) => void): () => void {
+    const emitter = this.sessions.get(sessionId);
+    if (!emitter) return () => {};
+    emitter.on('serverCall', handler);
+    return () => emitter!.off('serverCall', handler);
+  }
+
   /** Subscribe to global events (ready, models, untagged errors). */
-  onGlobalEvent(handler: (ev: ActorEvent) => void): () => void {
+  onGlobalEvent(handler: (ev: Record<string, unknown>) => void): () => void {
     this.global.on('event', handler);
     return () => this.global.off('event', handler);
   }
 
   listModels(): Promise<ModelInfo[]> {
-    // The actor answers only after its one-shot provider registration
-    // (keychain/shell lookups) completes; budget the cold boot rather than
-    // a plain round trip.
-    const models = this.awaitGlobal((ev) => ev.type === 'models', 'models', INIT_TIMEOUT_MS);
-    this.send({ cmd: 'list_models' });
-    return models.then((ev) => (ev as Extract<ActorEvent, { type: 'models' }>).models);
+    const models = this.awaitGlobal((ev) => ev.method === 'models', 'models', INIT_TIMEOUT_MS);
+    this.send(request({ method: 'listModels' }));
+    return models.then((ev) => (ev as Record<string, unknown> & { models: ModelInfo[] }).models);
   }
 
-  /** Snapshot of this project's threads; the actor also pushes
-   * `threads_updated` on store mutations via the global event stream. */
   listThreads(): Promise<ThreadListItem[]> {
     const threads = this.awaitGlobal(
-      (ev) => ev.type === 'threads_updated',
+      (ev) => ev.method === 'threadsUpdated',
       'threads_updated',
     );
-    this.send({ cmd: 'list_threads' });
+    this.send(request({ method: 'listThreads' }));
     return threads.then(
-      (ev) => (ev as Extract<ActorEvent, { type: 'threads_updated' }>).threads,
+      (ev) => (ev as Record<string, unknown> & { threads: ThreadListItem[] }).threads,
     );
   }
 
-  /** Archive/unarchive a thread; archiving also disposes the actor-side
-   * session (cancelling any in-flight turn), so the thread's resources are
-   * released. The store mutation pushes an updated `threads_updated`
-   * snapshot through the global stream. */
   archiveThread(sessionId: string, archived: boolean): void {
-    this.send({ cmd: 'archive_thread', sessionId, archived });
+    this.send(notification({
+      method: 'archiveThread',
+      sessionId,
+      archived,
+    }));
   }
 
-  /** Pin/unpin a thread; the store mutation pushes an updated
-   * `threads_updated` snapshot through the global stream. */
   pinThread(sessionId: string, pinned: boolean): void {
-    this.send({ cmd: 'pin_thread', sessionId, pinned });
+    this.send(notification({
+      method: 'pinThread',
+      sessionId,
+      pinned,
+    }));
   }
 
-  /** Slash-completion entries: prompt-macro commands plus skills. */
   listCommands(): Promise<CommandEntry[]> {
-    const commands = this.awaitGlobal((ev) => ev.type === 'commands', 'commands');
-    this.send({ cmd: 'list_commands' });
-    return commands.then((ev) => (ev as Extract<ActorEvent, { type: 'commands' }>).commands);
+    const commands = this.awaitGlobal((ev) => ev.method === 'commands', 'commands');
+    this.send(request({ method: 'listCommands' }));
+    return commands.then(
+      (ev) => (ev as Record<string, unknown> & { commands: CommandEntry[] }).commands,
+    );
   }
 
-  /** On-demand conversation info snapshot (worktree, plan, usage, agents). */
   requestThreadInfo(sessionId: string): Promise<ThreadInfoSnapshot> {
     const info = this.awaitSession(
       sessionId,
-      (ev) => ev.type === 'thread_info',
+      (ev) => ev.method === 'threadInfo',
       'thread_info',
     );
-    this.send({ cmd: 'thread_info', sessionId });
-    return info.then((ev) => (ev as Extract<ActorEvent, { type: 'thread_info' }>).info);
+    this.send(request({ method: 'threadInfo', sessionId }));
+    return info.then(
+      (ev) => (ev as Record<string, unknown> & { info: ThreadInfoSnapshot }).info,
+    );
   }
 
-  /** Shut the actor down; `disposeShared` is the public entry point. */
+  /** Shut the transport down; `disposeShared` is the public entry point. */
   private async dispose(): Promise<void> {
+    for (const [, timeout] of this.pendingRequests) {
+      clearTimeout(timeout.timeout);
+    }
+    this.pendingRequests.clear();
     this.sessions.clear();
     await this.transport.dispose();
   }
 
   private awaitGlobal(
-    match: (ev: ActorEvent) => boolean,
+    match: (ev: Record<string, unknown>) => boolean,
     label: string,
     timeoutMs: number = RESPONSE_TIMEOUT_MS,
-  ): Promise<ActorEvent> {
+  ): Promise<Record<string, unknown>> {
     return this.awaitOn(this.global, match, label, timeoutMs);
   }
 
   private awaitSession(
     sessionId: string,
-    match: (ev: ActorEvent) => boolean,
+    match: (ev: Record<string, unknown>) => boolean,
     label: string,
-  ): Promise<ActorEvent> {
+  ): Promise<Record<string, unknown>> {
     const emitter = this.sessions.get(sessionId);
     if (!emitter) return Promise.reject(new Error(`unknown session: ${sessionId}`));
     return this.awaitOn(emitter, match, label);
@@ -277,12 +356,12 @@ export class SessionManager {
 
   private awaitOn(
     emitter: EventEmitter,
-    match: (ev: ActorEvent) => boolean,
+    match: (ev: Record<string, unknown>) => boolean,
     label: string,
     timeoutMs: number = RESPONSE_TIMEOUT_MS,
-  ): Promise<ActorEvent> {
+  ): Promise<Record<string, unknown>> {
     return new Promise((resolve, reject) => {
-      const handler = (ev: ActorEvent) => {
+      const handler = (ev: Record<string, unknown>) => {
         if (!match(ev)) return;
         clearTimeout(timer);
         emitter.off('event', handler);

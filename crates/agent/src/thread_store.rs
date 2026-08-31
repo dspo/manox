@@ -1,16 +1,21 @@
 //! The `ThreadStore` facade — the session-list state the sidebar renders.
 //!
-//! The pi build lists the pi session repository plus a per-session
-//! UI-metadata sidecar. The retired manox SQLite-backed implementation was
-//! removed; see git history (or the `origin/Manox` backup branch) for it.
+//! The sidebar's session list comes from the pi session repository (jsonl)
+//! plus a per-session UI-metadata sidecar (`pi_extensions::session_meta`).
+//! The pi transcript persists itself, so `refresh_thread_list` only refreshes
+//! the sidebar list; manox SQLite timeline/note records are not produced.
+//! Archived sessions are excluded from the sidebar list but stay in
+//! `session_paths` so their sidecar remains addressable. The retired manox
+//! SQLite-backed implementation was removed; see git history (or the
+//! `origin/Manox` backup branch) for it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter, WeakEntity};
+use std::sync::Arc;
 
 use crate::db::ThreadSummary;
-use crate::thread::{PermissionMode, Thread, ThreadId};
+use crate::thread::{PermissionMode, Thread, ThreadCore, ThreadHandle, ThreadId};
 
 /// Events emitted by `ThreadStore` to the sidebar.
 #[derive(Debug, Clone)]
@@ -49,19 +54,142 @@ pub struct ThreadStore {
     /// running-task check.
     background_work: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
-    live_threads: HashMap<String, WeakEntity<Thread>>,
+    live_threads: HashMap<String, std::sync::Weak<ThreadCore>>,
     sessions_dir: PathBuf,
+    /// Events buffered under the state lock; [`StoreHandle::with_mut`]
+    /// drains and broadcasts them once the mutation closure returns.
+    pending_events: Vec<ThreadStoreEvent>,
+    /// Sidecar writes queued under the state lock; [`StoreHandle::with_mut`]
+    /// drains and dispatches them on the agent runtime once the mutation
+    /// closure returns.
+    pending_meta_writes: Vec<MetaWrite>,
 }
 
-impl EventEmitter<ThreadStoreEvent> for ThreadStore {}
+/// One queued sidecar write, drained by [`StoreHandle::with_mut`] once the
+/// state lock releases and dispatched on the agent runtime.
+struct MetaWrite {
+    dir: PathBuf,
+    path: PathBuf,
+    update: Box<dyn FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + Sync + 'static>,
+}
+
+/// The gpui-free handle to the thread store. Cheap to clone (`Arc`); state
+/// lives behind a lock and events broadcast to channel subscribers. This is
+/// the kernel-side unit the AgentServer and (transitionally) the frontends
+/// hold.
+#[derive(Clone)]
+pub struct StoreHandle(Arc<StoreCore>);
+
+pub struct StoreCore {
+    state: parking_lot::RwLock<ThreadStore>,
+    /// Event subscribers. Carries `Arc<ThreadStoreEvent>` for parity with
+    /// the `ThreadHandle` channel shape; the event is `Clone`, so the `Arc`
+    /// can come off once the consumers settle.
+    subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadStoreEvent>>>>,
+}
+
+impl StoreHandle {
+    /// Wrap a freshly built [`ThreadStore`].
+    pub fn new(thread_store: ThreadStore) -> Self {
+        Self(Arc::new(StoreCore {
+            state: parking_lot::RwLock::new(thread_store),
+            subscribers: parking_lot::Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Subscribe to this store's event stream.
+    pub fn subscribe(&self) -> async_channel::Receiver<Arc<ThreadStoreEvent>> {
+        let (tx, rx) = async_channel::unbounded();
+        self.0.subscribers.lock().push(tx);
+        rx
+    }
+
+    /// Shared-read the state.
+    pub fn read<R>(&self, f: impl FnOnce(&ThreadStore) -> R) -> R {
+        let state = self.0.state.read();
+        f(&state)
+    }
+
+    /// Mutate under the write lock, then broadcast the buffered events and
+    /// dispatch the queued sidecar writes. Three-phase: lock -> mutate
+    /// (collecting `pending_events` / `pending_meta_writes`) -> unlock ->
+    /// emit. The closure must never await.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut ThreadStore) -> R) -> R {
+        let (r, events, writes) = {
+            let mut state = self.0.state.write();
+            let r = f(&mut state);
+            let events = std::mem::take(&mut state.pending_events);
+            let writes = std::mem::take(&mut state.pending_meta_writes);
+            (r, events, writes)
+        };
+        for write in writes {
+            self.spawn_meta_write(write);
+        }
+        self.broadcast(events);
+        r
+    }
+
+    fn broadcast(&self, events: Vec<ThreadStoreEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut subs = self.0.subscribers.lock();
+        // Drop subscribers whose receiver is gone (view unmount); otherwise
+        // the list grows without bound on a long-lived store.
+        subs.retain(|tx| !tx.is_closed());
+        if subs.is_empty() {
+            return;
+        }
+        for ev in events {
+            let ev = Arc::new(ev);
+            for tx in subs.iter() {
+                let _ = tx.try_send(ev.clone());
+            }
+        }
+    }
+
+    /// Re-read the session directory and refresh the summary list. Runs on
+    /// the agent runtime so a large session folder cannot stall the caller;
+    /// `SummariesUpdated` broadcasts when the scan lands.
+    pub fn refresh(&self) {
+        let dir = self.read(|s| s.sessions_dir.clone());
+        let this = self.clone();
+        crate::runtime::handle().spawn(async move {
+            let rows = load_summaries(&dir).await;
+            let registry = crate::thread_registry::load().await;
+            this.with_mut(|s| {
+                let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
+                resolve_depths(&mut summaries);
+                s.session_paths = session_paths;
+                s.summaries = summaries;
+                s.archived_summaries = archived;
+                s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            });
+        });
+    }
+
+    /// Persist one queued sidecar write on the agent runtime. The rescan
+    /// follows the write — a rescan racing the write would re-read stale
+    /// sidecar flags and revert the in-memory state.
+    fn spawn_meta_write(&self, write: MetaWrite) {
+        let this = self.clone();
+        crate::runtime::handle().spawn(async move {
+            let saved = pi_extensions::session_meta::update(&write.dir, &write.path, write.update)
+                .await
+                .is_ok();
+            if saved {
+                this.refresh();
+            }
+        });
+    }
+}
 
 /// `Mutex<Option<_>>` (not a `OnceLock`) so test-support can reset the
-/// global between gpui test apps — the store entity otherwise leaks past the
-/// test context's leak detector.
-static GLOBAL: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
+/// global between tests.
+static GLOBAL: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(None);
 
 #[cfg(any(test, feature = "test-support"))]
-static TEST_OVERRIDE: std::sync::Mutex<Option<Entity<ThreadStore>>> = std::sync::Mutex::new(None);
+static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(None);
 
 /// Resolve the pi session directory under the manox config dir.
 pub(crate) fn sessions_dir() -> PathBuf {
@@ -70,17 +198,17 @@ pub(crate) fn sessions_dir() -> PathBuf {
         .join("pi-sessions")
 }
 
-/// Open the session directory, seed the summary list, and register the global
-/// `Entity`. Call at App startup.
-pub fn init(cx: &mut App) {
+/// Open the session directory, seed the summary list, and register the
+/// process-global handle. Call at App startup.
+pub fn init() {
     let dir = sessions_dir();
     let db_path = crate::db::default_db_path().expect("Failed to resolve threads.db path");
-    let db = std::sync::Arc::new(
+    let db = Arc::new(
         crate::db::ThreadsDatabase::open(&db_path)
             .unwrap_or_else(|e| panic!("Failed to open threads db ({}): {e}", db_path.display())),
     );
     let known_projects = db.list_projects().unwrap_or_default();
-    let entity = cx.new(|_| ThreadStore {
+    let handle = StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
@@ -92,29 +220,31 @@ pub fn init(cx: &mut App) {
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
+        pending_events: Vec::new(),
+        pending_meta_writes: Vec::new(),
     });
-    entity.update(cx, |s, cx| s.refresh(cx));
-    *GLOBAL.lock().unwrap() = Some(entity);
+    handle.refresh();
+    *GLOBAL.lock().unwrap() = Some(handle);
 }
 
-/// Returns the global `ThreadStore` `Entity`. Panics if `init` was not called.
-pub fn global() -> Entity<ThreadStore> {
+/// Returns the global [`StoreHandle`]. Panics if `init` was not called.
+pub fn global() -> StoreHandle {
     try_global().expect("ThreadStore not initialized; call agent::init first")
 }
 
 /// The global store when initialized (`agent::init`, or `init_for_test`);
 /// `None` before init so teardown paths (team disband) can skip archival
 /// instead of panicking in store-less environments.
-pub fn try_global() -> Option<Entity<ThreadStore>> {
+pub fn try_global() -> Option<StoreHandle> {
     #[cfg(any(test, feature = "test-support"))]
-    if let Some(entity) = TEST_OVERRIDE.lock().unwrap().clone() {
-        return Some(entity);
+    if let Some(handle) = TEST_OVERRIDE.lock().unwrap().clone() {
+        return Some(handle);
     }
     GLOBAL.lock().unwrap().clone()
 }
 
-/// Drop the global store entity — test-support only, so a gpui test app can
-/// tear down without the leak detector tripping on the process-global entity.
+/// Drop the global store handle — test-support only, so a test can tear down
+/// without the process-global slot leaking into other tests.
 #[cfg(any(test, feature = "test-support"))]
 pub fn drop_global_for_test() {
     *GLOBAL.lock().unwrap() = None;
@@ -162,7 +292,7 @@ impl ThreadStore {
     /// Register a project path: in-memory list + persisted to the db
     /// `projects` table so sidebar folders survive restarts even when all
     /// their threads are archived.
-    pub fn register_project(&mut self, path: String, cx: &mut Context<Self>) {
+    pub fn register_project(&mut self, path: String) {
         if path.is_empty() || self.known_projects.contains(&path) {
             return;
         }
@@ -170,15 +300,14 @@ impl ThreadStore {
         if let Err(e) = self.db.register_project(&path) {
             tracing::warn!(error = %e, "failed to persist project registration");
         }
-        cx.emit(ThreadStoreEvent::SummariesUpdated);
-        cx.notify();
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
     /// Unregister a project path: the sidebar folder disappears and threads
     /// bound to the path fall back to the loose Conversations list. The
     /// conversation history itself is never touched. No-op for an unknown
     /// path.
-    pub fn remove_project(&mut self, path: &str, cx: &mut Context<Self>) {
+    pub fn remove_project(&mut self, path: &str) {
         if !self.known_projects.iter().any(|p| p == path) {
             return;
         }
@@ -186,8 +315,7 @@ impl ThreadStore {
         if let Err(e) = self.db.remove_project(path) {
             tracing::warn!(error = %e, "failed to persist project removal");
         }
-        cx.emit(ThreadStoreEvent::SummariesUpdated);
-        cx.notify();
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
     /// Whether the given thread id is currently running a turn.
@@ -196,23 +324,21 @@ impl ThreadStore {
     }
 
     /// Mark a thread as running (turn started).
-    pub fn mark_running(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub fn mark_running(&mut self, id: &str) {
         if self.running.insert(id.to_string()) {
-            cx.emit(ThreadStoreEvent::RunningChanged);
-            cx.notify();
+            self.pending_events.push(ThreadStoreEvent::RunningChanged);
         }
     }
 
     /// Mark a thread as idle (turn ended).
-    pub fn mark_idle(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub fn mark_idle(&mut self, id: &str) {
         if self.running.remove(id) {
-            cx.emit(ThreadStoreEvent::RunningChanged);
-            cx.notify();
+            self.pending_events.push(ThreadStoreEvent::RunningChanged);
         }
     }
 
     /// Set the unread flag on a session (persisted in its sidecar).
-    pub fn set_unread(&mut self, id: &str, unread: bool, cx: &mut Context<Self>) {
+    pub fn set_unread(&mut self, id: &str, unread: bool) {
         if let Some(s) = self.summary_mut(id)
             && s.has_unread == unread
         {
@@ -221,7 +347,7 @@ impl ThreadStore {
         if let Some(s) = self.summary_mut(id) {
             s.has_unread = unread;
         }
-        self.write_meta(id, move |meta| meta.unread = unread, cx);
+        self.write_meta(id, move |meta| meta.unread = unread);
     }
 
     /// Whether a thread has a tool authorization pending a user verdict.
@@ -233,15 +359,14 @@ impl ThreadStore {
     /// `SummariesUpdated` so the sidebar badge appears without waiting for a
     /// rescan. In-memory only — the badge is a live-state signal, never
     /// persisted.
-    pub fn mark_pending_auth(&mut self, id: &str, pending: bool, cx: &mut Context<Self>) {
+    pub fn mark_pending_auth(&mut self, id: &str, pending: bool) {
         let changed = if pending {
             self.pending_auth.insert(id.to_string())
         } else {
             self.pending_auth.remove(id)
         };
         if changed {
-            cx.emit(ThreadStoreEvent::SummariesUpdated);
-            cx.notify();
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
     }
 
@@ -253,15 +378,14 @@ impl ThreadStore {
     /// Mark/unmark a thread as awaiting a plan-review verdict. Same lifecycle
     /// and event as `mark_pending_auth`: the sidebar's blue static icon (not
     /// the spinner) signals the wait until the user decides.
-    pub fn mark_pending_plan(&mut self, id: &str, pending: bool, cx: &mut Context<Self>) {
+    pub fn mark_pending_plan(&mut self, id: &str, pending: bool) {
         let changed = if pending {
             self.pending_plan.insert(id.to_string())
         } else {
             self.pending_plan.remove(id)
         };
         if changed {
-            cx.emit(ThreadStoreEvent::SummariesUpdated);
-            cx.notify();
+            self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         }
     }
 
@@ -274,20 +398,19 @@ impl ThreadStore {
     /// Mark/unmark a thread as carrying live background work. Fires
     /// `RunningChanged` (the spinner-driving event) so the sidebar re-evaluates
     /// the rotating state without a list rescan.
-    pub fn mark_background_work(&mut self, id: &str, active: bool, cx: &mut Context<Self>) {
+    pub fn mark_background_work(&mut self, id: &str, active: bool) {
         let changed = if active {
             self.background_work.insert(id.to_string())
         } else {
             self.background_work.remove(id)
         };
         if changed {
-            cx.emit(ThreadStoreEvent::RunningChanged);
-            cx.notify();
+            self.pending_events.push(ThreadStoreEvent::RunningChanged);
         }
     }
 
     /// Set the errored flag on a session (persisted in its sidecar).
-    pub fn set_errored(&mut self, id: &str, errored: bool, cx: &mut Context<Self>) {
+    pub fn set_errored(&mut self, id: &str, errored: bool) {
         if let Some(s) = self.summary_mut(id)
             && s.errored == errored
         {
@@ -296,71 +419,43 @@ impl ThreadStore {
         if let Some(s) = self.summary_mut(id) {
             s.errored = errored;
         }
-        self.write_meta(id, move |meta| meta.errored = errored, cx);
-    }
-
-    /// Re-read the session directory and refresh the summary list. Runs off
-    /// the UI thread so a large session folder cannot stall the main thread.
-    pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let dir = self.sessions_dir.clone();
-        let this = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            // The session directory scan uses tokio::fs, which needs a tokio
-            // runtime context; the gpui executor is not one, so hop onto the
-            // agent runtime and await the result back here.
-            let (list, registry) = crate::runtime::handle()
-                .spawn(async move {
-                    let rows = load_summaries(&dir).await;
-                    let registry = crate::thread_registry::load().await;
-                    (rows, registry)
-                })
-                .await
-                .unwrap_or_default();
-            this.update(cx, |s, cx| {
-                let (session_paths, mut summaries, archived) = group_by_thread(list, &registry);
-                resolve_depths(&mut summaries);
-                s.session_paths = session_paths;
-                s.summaries = summaries;
-                s.archived_summaries = archived;
-                cx.emit(ThreadStoreEvent::SummariesUpdated);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+        self.write_meta(id, move |meta| meta.errored = errored);
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry).
-    pub fn load_thread(&mut self, id: &str, cx: &mut App) -> Option<Entity<Thread>> {
-        if let Some(entity) = self.live_threads.get(id).and_then(WeakEntity::upgrade) {
-            return Some(entity);
+    pub fn load_thread(&mut self, id: &str) -> Option<ThreadHandle> {
+        if let Some(weak) = self.live_threads.get(id)
+            && let Some(handle) = ThreadHandle::upgrade(weak)
+        {
+            return Some(handle);
         }
         let path = self.session_paths.get(id)?.clone();
         let cwd = self
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let entity = Thread::open_existing(ThreadId(id.to_string()), cwd, path, cx);
+        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path);
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
         {
             let dir = PathBuf::from(&sum.project);
-            entity.update(cx, |t, _| t.restore_project(dir));
+            handle.with_mut(|t| t.restore_project(dir));
         }
-        self.live_threads.insert(id.to_string(), entity.downgrade());
-        Some(entity)
+        self.live_threads.insert(id.to_string(), handle.downgrade());
+        Some(handle)
     }
 
-    /// The live (in-memory) thread for `id`, if its entity is still alive.
-    /// Unlike [`ThreadStore::load_thread`], never restores from disk.
-    pub fn live_thread(&self, id: &str) -> Option<Entity<Thread>> {
-        self.live_threads.get(id).and_then(WeakEntity::upgrade)
+    /// The live (in-memory) thread for `id`, if it is still alive. Unlike
+    /// [`ThreadStore::load_thread`], never restores from disk.
+    pub fn live_thread(&self, id: &str) -> Option<ThreadHandle> {
+        self.live_threads.get(id).and_then(ThreadHandle::upgrade)
     }
 
-    /// Track a live thread so the facade can address it by id alone.
-    pub fn register_live_thread(&mut self, id: &str, t: WeakEntity<Thread>) {
-        self.live_threads.insert(id.to_string(), t);
+    /// Track a live thread so the facade can address it by id alone. Stores
+    /// only a weak reference; the caller keeps the thread alive.
+    pub fn register_live_thread(&mut self, id: &str, t: &ThreadHandle) {
+        self.live_threads.insert(id.to_string(), t.downgrade());
     }
 
     /// Seed an active summary row without touching disk — lets foreign test
@@ -397,7 +492,7 @@ impl ThreadStore {
     /// one hierarchy rule); unarchiving moves only the requested row.
     /// Re-asserting the current state is a no-op: no partition move, meta
     /// write, or lifecycle hook.
-    pub fn archive_thread(&mut self, id: &str, archived: bool, cx: &mut Context<Self>) {
+    pub fn archive_thread(&mut self, id: &str, archived: bool) {
         if self
             .summary_by_id(id)
             .is_some_and(|s| s.archived == archived)
@@ -430,7 +525,7 @@ impl ThreadStore {
                 summary.archived = false;
                 self.summaries.push(summary);
             }
-            self.write_meta(&tid, move |meta| meta.archived = archived, cx);
+            self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
                 // (the retired harness fired on thread deletion; the pi path
@@ -461,17 +556,17 @@ impl ThreadStore {
     }
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
-    pub fn pin_thread(&mut self, id: &str, pinned: bool, cx: &mut Context<Self>) {
+    pub fn pin_thread(&mut self, id: &str, pinned: bool) {
         if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
-        self.write_meta(id, move |meta| meta.pinned = pinned, cx);
+        self.write_meta(id, move |meta| meta.pinned = pinned);
     }
 
     /// Set the user tag on a session (persisted in its sidecar); `None`
     /// removes it. Re-asserting the current value is a no-op — no sidecar
     /// write, no rescan.
-    pub fn set_thread_tag(&mut self, id: &str, tag: Option<String>, cx: &mut Context<Self>) {
+    pub fn set_thread_tag(&mut self, id: &str, tag: Option<String>) {
         if let Some(s) = self.summary_mut(id)
             && s.tag == tag
         {
@@ -480,19 +575,12 @@ impl ThreadStore {
         if let Some(s) = self.summary_mut(id) {
             s.tag = tag.clone();
         }
-        self.write_meta(id, move |meta| meta.tag = tag, cx);
+        self.write_meta(id, move |meta| meta.tag = tag);
     }
 
     /// Append a `model_change` event. The pi transcript records model changes
     /// itself; nothing to do here.
-    pub fn record_model_change(
-        &self,
-        _thread_id: &str,
-        _from: Option<&str>,
-        _to: &str,
-        _cx: &mut Context<Self>,
-    ) {
-    }
+    pub fn record_model_change(&self, _thread_id: &str, _from: Option<&str>, _to: &str) {}
 
     /// Append a typed event to the thread's timeline. The manox SQLite
     /// timeline is not produced by the pi backend.
@@ -501,50 +589,35 @@ impl ThreadStore {
         _thread_id: &str,
         _event_type: crate::db::ThreadEventType,
         _data: &serde_json::Value,
-        _cx: &mut Context<Self>,
     ) {
     }
 
-    /// Persist a sidecar change for a session. The caller's in-memory update
+    /// Queue a sidecar change for a session. The caller's in-memory update
     /// is the render source of truth, so `SummariesUpdated` fires up front;
-    /// the sidecar write is best-effort. The list is rescanned only after
-    /// the write lands — a rescan racing the write would re-read stale
-    /// sidecar flags and revert the in-memory state.
+    /// the write itself is queued for [`StoreHandle::with_mut`] to dispatch
+    /// on the agent runtime once the state lock releases (best-effort).
     fn write_meta(
-        &self,
+        &mut self,
         id: &str,
-        update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + 'static,
-        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + Sync + 'static,
     ) {
-        cx.emit(ThreadStoreEvent::SummariesUpdated);
-        cx.notify();
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         let Some(path) = self.session_paths.get(id).cloned() else {
             return;
         };
-        let dir = self.sessions_dir.clone();
-        let this = cx.weak_entity();
-        cx.spawn(async move |_, cx| {
-            let saved = crate::runtime::handle()
-                .spawn(async move {
-                    pi_extensions::session_meta::update(&dir, &path, update)
-                        .await
-                        .is_ok()
-                })
-                .await
-                .unwrap_or(false);
-            if saved {
-                this.update(cx, |s, cx| s.refresh(cx)).ok();
-            }
-        })
-        .detach();
+        self.pending_meta_writes.push(MetaWrite {
+            dir: self.sessions_dir.clone(),
+            path,
+            update: Box::new(update),
+        });
     }
 }
 
 /// Refresh the sidebar summary list from the store (new threads surface at
 /// send time, not at turn end). The transcript and its UI annotation entries
 /// persist themselves; nothing else rides this path.
-pub fn refresh_thread_list(cx: &mut App) {
-    global().update(cx, |s, cx| s.refresh(cx));
+pub fn refresh_thread_list() {
+    global().refresh();
 }
 
 /// One loaded session: the sidebar summary plus the grouping input — the
@@ -652,7 +725,8 @@ fn resolve_depths(list: &mut [ThreadSummary]) {
 }
 
 /// Collapse each thread's sessions into the single row the user sees: a
-/// thread IS the sidebar unit, its sessions (base + worktree forks) internal
+/// thread IS the sidebar unit, its sessions (base + historical
+/// worktree-era forks) internal
 /// storage. The surfaced session is the registry's active pointer when it
 /// hits, else the newest; the row carries the THREAD's id (stable across
 /// swaps and restarts) and the active session's fields. Sessions without a
@@ -769,8 +843,8 @@ fn session_info_to_summary(
         model_id: String::new(),
         provider_id: None,
         approval_mode: PermissionMode::default().as_i64(),
-        // The bound project (sidecar) wins over the header cwd: a worktree
-        // fork's header cwd is the worktree dir, but the thread stays under
+        // The bound project (sidecar) wins over the header cwd: a fork's
+        // header cwd may be another directory, but the thread stays under
         // its source project; a `/` header cwd (GUI-launched bound session)
         // classifies the same way.
         project: meta
@@ -779,7 +853,7 @@ fn session_info_to_summary(
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| info.cwd.clone()),
         depth: 0,
-        // Team affiliation is the only rendered hierarchy edge: worktree
+        // Team affiliation is the only rendered hierarchy edge: historical fork
         // forks are a thread's internal sessions (`group_by_thread`
         // collapses them), so their `parentSession` lineage stays raw
         // metadata and never nests.
@@ -797,22 +871,24 @@ fn session_info_to_summary(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn init_for_test(db: std::sync::Arc<crate::db::ThreadsDatabase>, cx: &mut App) {
+pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-    let entity = cx.new(|_| ThreadStore {
+    let handle = StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects: Vec::new(),
-        db: db.clone(),
+        db,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         pending_plan: HashSet::new(),
         background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
+        pending_events: Vec::new(),
+        pending_meta_writes: Vec::new(),
     });
-    *TEST_OVERRIDE.lock().unwrap() = Some(entity);
+    *TEST_OVERRIDE.lock().unwrap() = Some(handle);
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -844,41 +920,35 @@ mod tests {
         (db, path)
     }
 
-    fn store_entity(
-        cx: &mut gpui::TestAppContext,
-        db: std::sync::Arc<crate::db::ThreadsDatabase>,
-    ) -> gpui::Entity<ThreadStore> {
+    fn store_handle(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         let known_projects = db.list_projects().unwrap_or_default();
-        cx.update(|cx| {
-            cx.new(|_| ThreadStore {
-                summaries: Vec::new(),
-                archived_summaries: Vec::new(),
-                session_paths: HashMap::new(),
-                known_projects,
-                db,
-                running: HashSet::new(),
-                pending_auth: HashSet::new(),
-                pending_plan: HashSet::new(),
-                background_work: HashSet::new(),
-                live_threads: HashMap::new(),
-                sessions_dir: std::env::temp_dir(),
-            })
+        StoreHandle::new(ThreadStore {
+            summaries: Vec::new(),
+            archived_summaries: Vec::new(),
+            session_paths: HashMap::new(),
+            known_projects,
+            db,
+            running: HashSet::new(),
+            pending_auth: HashSet::new(),
+            pending_plan: HashSet::new(),
+            background_work: HashSet::new(),
+            live_threads: HashMap::new(),
+            sessions_dir: std::env::temp_dir(),
+            pending_events: Vec::new(),
+            pending_meta_writes: Vec::new(),
         })
     }
 
     #[test]
     fn register_project_persists_and_survives_reopen() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.register_project("/p/a".into(), cx));
-        });
+        let store = store_handle(db.clone());
+        store.with_mut(|s| s.register_project("/p/a".into()));
         // Persisted to the db...
         assert!(db.list_projects().unwrap().contains(&"/p/a".to_string()));
         // ...and a freshly initialized store (simulated restart) sees it.
-        let reopened = store_entity(&mut cx, db.clone());
-        let known = cx.update(|cx| reopened.read(cx).known_projects().to_vec());
+        let reopened = store_handle(db.clone());
+        let known = reopened.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
         std::fs::remove_file(path).ok();
     }
@@ -886,16 +956,13 @@ mod tests {
     #[test]
     fn register_project_dedupes() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        cx.update(|cx| {
-            store.update(cx, |s, cx| {
-                s.register_project("/p/a".into(), cx);
-                s.register_project("/p/a".into(), cx);
-                s.register_project(String::new(), cx);
-            });
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.register_project("/p/a".into());
+            s.register_project("/p/a".into());
+            s.register_project(String::new());
         });
-        let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
+        let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/a".to_string()]);
         assert_eq!(db.list_projects().unwrap().len(), 1);
         std::fs::remove_file(path).ok();
@@ -904,24 +971,21 @@ mod tests {
     #[test]
     fn remove_project_persists_and_survives_reopen() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        cx.update(|cx| {
-            store.update(cx, |s, cx| {
-                s.register_project("/p/a".into(), cx);
-                s.register_project("/p/b".into(), cx);
-                s.remove_project("/p/a", cx);
-                // Removing an unknown path is a no-op.
-                s.remove_project("/p/missing", cx);
-            });
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.register_project("/p/a".into());
+            s.register_project("/p/b".into());
+            s.remove_project("/p/a");
+            // Removing an unknown path is a no-op.
+            s.remove_project("/p/missing");
         });
         // Persisted to the db...
         assert_eq!(db.list_projects().unwrap(), vec!["/p/b".to_string()]);
-        let known = cx.update(|cx| store.read(cx).known_projects().to_vec());
+        let known = store.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/b".to_string()]);
         // ...and a freshly initialized store (simulated restart) sees it.
-        let reopened = store_entity(&mut cx, db.clone());
-        let known = cx.update(|cx| reopened.read(cx).known_projects().to_vec());
+        let reopened = store_handle(db.clone());
+        let known = reopened.read(|s| s.known_projects().to_vec());
         assert_eq!(known, vec!["/p/b".to_string()]);
         std::fs::remove_file(path).ok();
     }
@@ -931,32 +995,17 @@ mod tests {
     #[test]
     fn mark_pending_auth_toggles_marker() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let sub = {
-            let events = std::sync::Arc::clone(&events);
-            cx.update(|cx| {
-                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
-                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-        };
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_auth("t1", true, cx));
-        });
-        assert!(cx.update(|cx| store.read(cx).pending_auth_contains("t1")));
+        let store = store_handle(db.clone());
+        let events = store.subscribe();
+        store.with_mut(|s| s.mark_pending_auth("t1", true));
+        assert!(store.read(|s| s.pending_auth_contains("t1")));
+        assert_eq!(events.len(), 1);
         // Idempotent mark: no event, no duplicate work.
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_auth("t1", true, cx));
-        });
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_auth("t1", false, cx));
-        });
-        assert!(!cx.update(|cx| store.read(cx).pending_auth_contains("t1")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
-        drop(sub);
+        store.with_mut(|s| s.mark_pending_auth("t1", true));
+        assert_eq!(events.len(), 1);
+        store.with_mut(|s| s.mark_pending_auth("t1", false));
+        assert!(!store.read(|s| s.pending_auth_contains("t1")));
+        assert_eq!(events.len(), 2);
         std::fs::remove_file(path).ok();
     }
 
@@ -967,40 +1016,22 @@ mod tests {
     #[test]
     fn mark_running_toggles_marker() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let sub = {
-            let events = std::sync::Arc::clone(&events);
-            cx.update(|cx| {
-                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
-                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-        };
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_running("t1", cx));
-        });
-        assert!(cx.update(|cx| store.read(cx).is_running("t1")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let store = store_handle(db.clone());
+        let events = store.subscribe();
+        store.with_mut(|s| s.mark_running("t1"));
+        assert!(store.read(|s| s.is_running("t1")));
+        assert_eq!(events.len(), 1);
         // Idempotent mark: no event, no duplicate work.
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_running("t1", cx));
-        });
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 1);
+        store.with_mut(|s| s.mark_running("t1"));
+        assert_eq!(events.len(), 1);
         // A second thread marks independently.
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_running("t2", cx));
-        });
-        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_idle("t1", cx));
-        });
-        assert!(!cx.update(|cx| store.read(cx).is_running("t1")));
-        assert!(cx.update(|cx| store.read(cx).is_running("t2")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
-        drop(sub);
+        store.with_mut(|s| s.mark_running("t2"));
+        assert!(store.read(|s| s.is_running("t2")));
+        assert_eq!(events.len(), 2);
+        store.with_mut(|s| s.mark_idle("t1"));
+        assert!(!store.read(|s| s.is_running("t1")));
+        assert!(store.read(|s| s.is_running("t2")));
+        assert_eq!(events.len(), 3);
         std::fs::remove_file(path).ok();
     }
 
@@ -1010,44 +1041,32 @@ mod tests {
     #[test]
     fn plan_and_background_markers_toggle() {
         let (db, path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db.clone());
-        let events = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let sub = {
-            let events = std::sync::Arc::clone(&events);
-            cx.update(|cx| {
-                cx.subscribe(&store, move |_, _: &ThreadStoreEvent, _| {
-                    events.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                })
-            })
-        };
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
-            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        let store = store_handle(db.clone());
+        let events = store.subscribe();
+        store.with_mut(|s| {
+            s.mark_pending_plan("t1", true);
+            s.mark_background_work("t1", true);
         });
-        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
-        assert!(cx.update(|cx| store.read(cx).background_work_contains("t1")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(store.read(|s| s.pending_plan_contains("t1")));
+        assert!(store.read(|s| s.background_work_contains("t1")));
+        assert_eq!(events.len(), 2);
         // Idempotent marks: no duplicate events.
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_plan("t1", true, cx));
-            store.update(cx, |s, cx| s.mark_background_work("t1", true, cx));
+        store.with_mut(|s| {
+            s.mark_pending_plan("t1", true);
+            s.mark_background_work("t1", true);
         });
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(events.len(), 2);
         // A second thread marks independently; clearing only removes its own.
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_plan("t2", true, cx));
+        store.with_mut(|s| s.mark_pending_plan("t2", true));
+        assert_eq!(events.len(), 3);
+        store.with_mut(|s| {
+            s.mark_pending_plan("t1", false);
+            s.mark_background_work("t1", false);
         });
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 3);
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.mark_pending_plan("t1", false, cx));
-            store.update(cx, |s, cx| s.mark_background_work("t1", false, cx));
-        });
-        assert!(!cx.update(|cx| store.read(cx).pending_plan_contains("t1")));
-        assert!(!cx.update(|cx| store.read(cx).background_work_contains("t1")));
-        assert!(cx.update(|cx| store.read(cx).pending_plan_contains("t2")));
-        assert_eq!(events.load(std::sync::atomic::Ordering::SeqCst), 5);
-        drop(sub);
+        assert!(!store.read(|s| s.pending_plan_contains("t1")));
+        assert!(!store.read(|s| s.background_work_contains("t1")));
+        assert!(store.read(|s| s.pending_plan_contains("t2")));
+        assert_eq!(events.len(), 5);
         std::fs::remove_file(path).ok();
     }
 
@@ -1177,7 +1196,7 @@ mod tests {
     }
 
     /// A thread's real session files (base + worktree fork, both stamped
-    /// with the same header `thread` key as `fork_from` leaves them)
+    /// with the same header `thread` key as the retired worktree fork left them)
     /// collapse to ONE sidebar row keyed by the thread id, following the
     /// registry's active pointer in both directions.
     #[tokio::test]
@@ -1202,8 +1221,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Sidecars: the fork wears the source's title/project (seeded by
-        // `fork_sidecar_inherit` at enter time) plus its worktree binding.
+        // Sidecars: the fork wears the source's title/project.
         let base_path = sessions.join(format!("{base_id}.jsonl"));
         let fork_path = sessions.join(format!("{fork_id}.jsonl"));
         pi_extensions::session_meta::update(sessions, &base_path, |m| {
@@ -1215,13 +1233,6 @@ mod tests {
         pi_extensions::session_meta::update(sessions, &fork_path, |m| {
             m.title = Some("the title".into());
             m.project = Some("/proj/a".into());
-            m.worktree = Some(pi_extensions::session_meta::WorktreeMeta {
-                worktree_path: "/tmp/wt".into(),
-                branch: "b".into(),
-                original_session_path: base_path.display().to_string(),
-                original_cwd: "/proj/a".into(),
-                git_common_dir: "/proj/a/.git".into(),
-            });
         })
         .await
         .unwrap();
@@ -1240,7 +1251,7 @@ mod tests {
         assert_eq!(active[0].project, "/proj/a");
         assert_eq!(paths.get(thread_key).cloned(), Some(fork_path.clone()));
 
-        // Pointer back on the base (after ExitWorktree): same single row,
+        // Pointer back on the base: same single row,
         // now addressable at the base session.
         let registry = HashMap::from([(thread_key.to_string(), pointer(base_id))]);
         let (paths, active, _) = group_by_thread(rows, &registry);
@@ -1370,24 +1381,18 @@ mod tests {
     #[test]
     fn archive_survives_concurrent_pinned_write() {
         let (db, db_path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
         crate::runtime::init();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
-        let store = store_entity(&mut cx, db.clone());
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                s.session_paths.insert("t1".to_string(), session.clone());
-                s.sessions_dir = dir.path().to_path_buf();
-            });
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.session_paths.insert("t1".to_string(), session.clone());
+            s.sessions_dir = dir.path().to_path_buf();
         });
-        cx.update(|cx| {
-            store.update(cx, |s, cx| {
-                s.archive_thread("t1", true, cx);
-                s.write_meta("t1", |meta| meta.pinned = true, cx);
-            });
+        store.with_mut(|s| {
+            s.archive_thread("t1", true);
+            s.write_meta("t1", |meta| meta.pinned = true);
         });
-        cx.executor().run_until_parked();
         let mut settled = false;
         // Generous budget: the two sidecar writes run on the process-wide
         // tokio runtime shared with every parallel test in the binary — a
@@ -1415,33 +1420,29 @@ mod tests {
     #[test]
     fn set_thread_tag_persists_to_sidecar() {
         let (db, db_path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
         crate::runtime::init();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
-        let store = store_entity(&mut cx, db.clone());
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                s.session_paths.insert("t1".to_string(), session.clone());
-                s.sessions_dir = dir.path().to_path_buf();
-                s.insert_summary_for_test("t1", None);
-            });
+        // A real session file so the post-write rescan keeps the row (and
+        // its `session_paths` entry) addressable for follow-up writes.
+        std::fs::write(
+            &session,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"t1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{\"host\":\"manox\"}}\n",
+        )
+        .unwrap();
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.session_paths.insert("t1".to_string(), session.clone());
+            s.sessions_dir = dir.path().to_path_buf();
+            s.insert_summary_for_test("t1", None);
         });
-        cx.update(|cx| {
-            store.update(cx, |s, cx| {
-                s.set_thread_tag("t1", Some("urgent".into()), cx)
-            });
-        });
-        // Drive the gpui executor so `write_meta`'s background task runs.
-        cx.executor().run_until_parked();
+        store.with_mut(|s| s.set_thread_tag("t1", Some("urgent".into())));
         // In-memory flip is immediate.
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                assert_eq!(
-                    s.summary_by_id("t1").and_then(|s| s.tag.clone()),
-                    Some("urgent".into())
-                );
-            });
+        store.read(|s| {
+            assert_eq!(
+                s.summary_by_id("t1").and_then(|s| s.tag.clone()),
+                Some("urgent".into())
+            );
         });
         let wait_for = |expected: Option<&str>| {
             for _ in 0..1500 {
@@ -1456,10 +1457,7 @@ mod tests {
             false
         };
         assert!(wait_for(Some("urgent")), "tag never reached the sidecar");
-        cx.update(|cx| {
-            store.update(cx, |s, cx| s.set_thread_tag("t1", None, cx));
-        });
-        cx.executor().run_until_parked();
+        store.with_mut(|s| s.set_thread_tag("t1", None));
         assert!(wait_for(None), "cleared tag never reached the sidecar");
         std::fs::remove_file(db_path).ok();
     }
@@ -1495,29 +1493,23 @@ mod tests {
     #[test]
     fn archive_cascades_to_descendants() {
         let (db, db_path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db);
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                s.summaries.push(cascade_summary("lead", None));
-                s.summaries.push(cascade_summary("member", Some("lead")));
-                s.summaries.push(cascade_summary("grand", Some("member")));
-                s.summaries.push(cascade_summary("sibling", None));
-            });
+        let store = store_handle(db);
+        store.with_mut(|s| {
+            s.summaries.push(cascade_summary("lead", None));
+            s.summaries.push(cascade_summary("member", Some("lead")));
+            s.summaries.push(cascade_summary("grand", Some("member")));
+            s.summaries.push(cascade_summary("sibling", None));
         });
-        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", true, cx)));
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                // lead + member + grand archived; unrelated row untouched.
-                assert_eq!(s.summaries.len(), 1);
-                assert_eq!(s.summaries[0].id, "sibling");
-                let archived: Vec<&str> =
-                    s.archived_summaries.iter().map(|s| s.id.as_str()).collect();
-                for id in ["lead", "member", "grand"] {
-                    assert!(archived.contains(&id), "{id} not archived");
-                }
-                assert!(s.archived_summaries.iter().all(|s| s.archived));
-            });
+        store.with_mut(|s| s.archive_thread("lead", true));
+        store.read(|s| {
+            // lead + member + grand archived; unrelated row untouched.
+            assert_eq!(s.summaries.len(), 1);
+            assert_eq!(s.summaries[0].id, "sibling");
+            let archived: Vec<&str> = s.archived_summaries.iter().map(|s| s.id.as_str()).collect();
+            for id in ["lead", "member", "grand"] {
+                assert!(archived.contains(&id), "{id} not archived");
+            }
+            assert!(s.archived_summaries.iter().all(|s| s.archived));
         });
         std::fs::remove_file(db_path).ok();
     }
@@ -1526,25 +1518,20 @@ mod tests {
     #[test]
     fn unarchive_does_not_cascade() {
         let (db, db_path) = temp_db();
-        let mut cx = gpui::TestAppContext::single();
-        let store = store_entity(&mut cx, db);
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                s.summaries.push(cascade_summary("lead", None));
-                s.summaries.push(cascade_summary("member", Some("lead")));
-            });
+        let store = store_handle(db);
+        store.with_mut(|s| {
+            s.summaries.push(cascade_summary("lead", None));
+            s.summaries.push(cascade_summary("member", Some("lead")));
         });
-        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", true, cx)));
-        cx.update(|cx| store.update(cx, |s, cx| s.archive_thread("lead", false, cx)));
-        cx.update(|cx| {
-            store.update(cx, |s, _| {
-                assert!(s.summaries.iter().any(|s| s.id == "lead" && !s.archived));
-                assert!(
-                    s.archived_summaries
-                        .iter()
-                        .any(|s| s.id == "member" && s.archived)
-                );
-            });
+        store.with_mut(|s| s.archive_thread("lead", true));
+        store.with_mut(|s| s.archive_thread("lead", false));
+        store.read(|s| {
+            assert!(s.summaries.iter().any(|s| s.id == "lead" && !s.archived));
+            assert!(
+                s.archived_summaries
+                    .iter()
+                    .any(|s| s.id == "member" && s.archived)
+            );
         });
         std::fs::remove_file(db_path).ok();
     }

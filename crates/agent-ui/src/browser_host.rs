@@ -1,12 +1,17 @@
-//! `WorkspaceBrowserHost` — the concrete `BrowserHost` driving the built-in
+//! `WorkspaceBrowserHost` — the concrete browser host driving the built-in
 //! browser, plus the routing that connects an untrusted page's notifications
 //! and inbound-write requests back to the owning thread.
 //!
-//! The host is a process-wide singleton (`set_host` at App startup) reached by
-//! the `web_explore_*` tools through `agent::webview_host::host()`. It owns a
-//! `WeakEntity<Workspace>` for the outbound operations (open/navigate/eval,
-//! which touch the live `BrowserView` entities) and a routing table that maps
-//! each tab's webview label to its owning `Thread`.
+//! The host is a process-wide singleton registered as the `CapabilityClient`
+//! provider at App startup, reached by the `web_explore_*` tools through
+//! `agent::capability::provider()`. It owns a `WeakEntity<Workspace>` for the
+//! outbound operations (open/navigate/eval, which touch the live `BrowserView`
+//! entities) and a routing table that maps each tab's webview label to its
+//! owning `Thread`.
+//!
+//! This module also contains `GpuiCapability`, the gpui-backed `CapabilityClient`
+//! that bridges browser ops and clipboard requests from the kernel (tokio) to the
+//! gpui main thread (the `WorkspaceBrowserHost`).
 //!
 //! Two trust axes meet here:
 //! - Outbound (agent → page): `eval_script` / `click` / `type_text` / `scroll`
@@ -14,10 +19,8 @@
 //!   `read_dom` / `screenshot`) inject an extraction script and await its
 //!   `EvalResult` notification, paired by `request_id`.
 //! - Inbound (page → agent): `__manox_request_write__` is fire-and-forget on
-//!   the page side; the host routes it to a `ThreadEvent::InboundAuthorization`
-//!   whose resolution is parked in `Thread::pending_inbound`. This axis ignores
-//!   `PermissionMode` — a page must never gain a write path just because the
-//!   agent runs with broad permissions.
+//!   the page side; the host observes and drops the request (an untrusted
+//!   page gains no write path regardless of `PermissionMode`).
 //!
 //! The webview crate's notify/inbound bridges fire on the gpui main thread via
 //! `PlatformDispatcher::dispatch_on_main_thread`, whose runnable carries no
@@ -32,11 +35,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
+use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-use agent::thread::{Thread, ThreadEvent};
-use agent::webview_host::{BrowserHost, BrowserNotification as AgentNotification, BrowserTabId};
+use agent::capability::CapabilityClient;
+use agent::thread_engine::{BrowserOp, BrowserReply, BrowserTabId};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;
@@ -46,10 +50,6 @@ use crate::workspace::Workspace;
 /// directly in the notify handler (no cx needed) and never reach the channel;
 /// only page-state notifications and inbound-write requests travel here.
 pub(crate) enum HostMessage {
-    Notify {
-        tab_id: BrowserTabId,
-        notification: AgentNotification,
-    },
     InboundWrite,
 }
 
@@ -57,7 +57,6 @@ pub(crate) enum HostMessage {
 /// lifetime of the tab; dropped (closing pending senders) when the tab is
 /// closed or the owning thread is released.
 struct TabState {
-    thread: WeakEntity<Thread>,
     label: String,
     /// Pending eval-script oneshots, keyed by `request_id`. A read op injects
     /// a script that calls `__manox_notify__("eval_result", { request_id,
@@ -106,12 +105,6 @@ impl WorkspaceBrowserHost {
         (host, rx)
     }
 
-    /// The shared routing state, for the drainer to resolve a tab back to its
-    /// owning thread.
-    pub(crate) fn routes(&self) -> &Arc<Routes> {
-        &self.routes
-    }
-
     /// Register the host in the agent-ui concrete registry. Called once at App
     /// startup, after the Workspace exists. A second registration is a no-op —
     /// the first host wins (single-workspace, single-process model).
@@ -128,26 +121,25 @@ impl WorkspaceBrowserHost {
     }
 
     /// One-shot App-startup wiring: build the host bound to `workspace`,
-    /// register it in both the agent trait registry (`web_explore_*` tools
-    /// reach it via `agent::webview_host::host()`) and the agent-ui concrete
-    /// registry (`BrowserView` attaches the notify/inbound bridges at build),
-    /// then spawn the notify/inbound drainer on the Workspace. The OnceLock
-    /// notify/inbound closures run with no `&mut App`; the drainer (owning an
-    /// `AsyncApp`) is the cx-bearing sink that emits onto the owning thread.
+    /// register it in the agent-ui concrete registry (`BrowserView` attaches
+    /// the notify/inbound bridges at build), register the `GpuiCapability`
+    /// provider so the kernel drives the browser through
+    /// `capability::provider()`, then spawn the notify/inbound drainer on the
+    /// Workspace. The OnceLock notify/inbound closures run with no `&mut App`;
+    /// the drainer (owning an `AsyncApp`) is the cx-bearing sink that emits
+    /// onto the owning thread.
     pub fn install(workspace: Entity<Workspace>, cx: &mut AsyncApp) {
         let (host, rx) = Self::new(workspace.clone());
-        let routes = host.routes().clone();
-        Self::set_concrete(host.clone());
-        agent::webview_host::set_host(host);
+        Self::set_concrete(host);
         // Register the capability provider on the same seam: the kernel drives
         // the browser through `capability::provider()` without holding an
         // `&mut App` (capability inversion; protocol `ServerCall::BrowserOp`
         // later).
-        agent::capability::set_provider(agent::webview_host::GpuiCapability::start(cx));
+        agent::capability::set_provider(GpuiCapability::start(cx));
         cx.update(|cx| {
             workspace.update(cx, |_, cx| {
-                cx.spawn(async move |_, cx: &mut AsyncApp| {
-                    Self::drain(rx, routes, cx).await;
+                cx.spawn(async move |_, _| {
+                    Self::drain(rx).await;
                 })
                 .detach();
             });
@@ -164,58 +156,26 @@ impl WorkspaceBrowserHost {
         match Self::concrete() {
             Some(host) => {
                 let routes_n = host.routes.clone();
-                let tx_n = host.tx.clone();
                 let routes_i = host.routes.clone();
                 let tx_i = host.tx.clone();
                 builder
-                    .on_notify(move |label, n| handle_notify(&routes_n, &tx_n, label, n))
+                    .on_notify(move |label, n| handle_notify(&routes_n, label, n))
                     .on_inbound_write(move |label, w| handle_inbound(&routes_i, &tx_i, label, w))
             }
             None => builder,
         }
     }
 
-    /// Drain the notify/inbound channel, dispatching each message to its owning
-    /// thread. Spawned once on the Workspace at App startup; runs for the
-    /// process lifetime. Page-state notifications become
-    /// `ThreadEvent::BrowserNotification`; inbound-write requests register a
-    /// pending decision oneshot on the owning thread and emit
-    /// `ThreadEvent::InboundAuthorization`. The decision await is parked in a
-    /// detached `Task` per request so a never-answered confirmation overlay
-    /// cannot block subsequent notifications (which would deadlock an
-    /// in-flight read eval).
-    pub(crate) async fn drain(rx: Receiver<HostMessage>, routes: Arc<Routes>, cx: &mut AsyncApp) {
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                HostMessage::Notify {
-                    tab_id,
-                    notification,
-                } => {
-                    let thread = routes
-                        .tabs
-                        .lock()
-                        .expect("routes lock poisoned")
-                        .get(&tab_id)
-                        .and_then(|t| t.thread.upgrade());
-                    let Some(thread) = thread else {
-                        continue;
-                    };
-                    thread.update(cx, |_, cx| {
-                        cx.emit(ThreadEvent::BrowserNotification {
-                            tab_id,
-                            notification,
-                        });
-                    });
-                }
-                HostMessage::InboundWrite => {
-                    // Inbound-write confirmation was manox-harness chrome;
-                    // the pi backend has no write surface for browser pages
-                    // yet, so the request is observed and dropped.
-                }
-            }
+    /// Drain the inbound-write channel. Spawned once on the Workspace at App
+    /// startup; runs for the process lifetime, keeping the channel senders
+    /// alive (a dropped receiver makes `try_send` fail).
+    pub(crate) async fn drain(rx: Receiver<HostMessage>) {
+        while let Ok(_msg) = rx.recv().await {
+            // Inbound-write confirmation was manox-harness chrome; the pi
+            // backend has no write surface for browser pages yet, so each
+            // request is observed and dropped.
         }
     }
-
     /// Inject `js` into the tab's webview and return immediately
     /// (fire-and-forget). Reaches the `wry::WebView` via `Entity::read_with`
     /// (eval is a read-only `&self` op on wry) — no window required.
@@ -332,7 +292,7 @@ impl WorkspaceBrowserHost {
     }
 
     /// Reclaim the routing state for a tab closed from the UI side (the tab's
-    /// close button) — without re-entering [`BrowserHost::close_tab`], which
+    /// close button) — without re-entering [`close_tab`], which
     /// itself calls `close_browser_tab` and would recurse. Mirrors the reclaim
     /// half of `close_tab`: drops the per-tab `TabState` (closing any parked
     /// eval/yield oneshots) and the label entry, so a stale label on a late
@@ -360,7 +320,7 @@ impl WorkspaceBrowserHost {
     /// routing table so host evals (`page_title`) can reach it. Tool-opened
     /// tabs register inside `open_tab`; this mirrors that registration half
     /// for the workspace-opened direction. Idempotent — a re-insert replaces.
-    pub(crate) fn register_ui_tab(&self, id: BrowserTabId, thread: WeakEntity<Thread>) {
+    pub(crate) fn register_ui_tab(&self, id: BrowserTabId) {
         let label = crate::views::browser_view::webview_label_for(id);
         {
             let mut labels = self
@@ -375,7 +335,6 @@ impl WorkspaceBrowserHost {
             tabs.insert(
                 id,
                 TabState {
-                    thread,
                     label,
                     pending_evals: Mutex::new(HashMap::new()),
                     pending_yield: Mutex::new(None),
@@ -440,7 +399,7 @@ fn stringify_value(v: &serde_json::Value) -> String {
 /// for the drainer to emit as a `ThreadEvent`. Runs on the gpui main thread
 /// without an `AsyncApp`, so it touches only the shared `Routes` (lock-guarded)
 /// and the channel sender.
-fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, n: WvNotification) {
+fn handle_notify(routes: &Arc<Routes>, label: String, n: WvNotification) {
     let tab_id = match routes
         .label_to_tab
         .lock()
@@ -471,33 +430,23 @@ fn handle_notify(routes: &Arc<Routes>, tx: &Sender<HostMessage>, label: String, 
             {
                 let _ = sender.send(payload);
             }
-            return;
         }
         WvNotification::UserHandback => {
             // Deliberately ignored on the page side. An untrusted page must
             // not resume a parked `web_explore_yield` — that would let it
             // drive the agent's turn flow unprompted. Only the user's chrome
             // "Done" button resolves a yield, via `resolve_handback`.
-            return;
         }
-        _ => {}
-    }
-    let agent_n = match n {
-        WvNotification::PageLoaded => AgentNotification::PageLoaded,
-        WvNotification::DomChanged => AgentNotification::DomChanged,
-        WvNotification::Navigation(url) => AgentNotification::Navigation { url },
-        WvNotification::UserHandback | WvNotification::EvalResult { .. } => unreachable!(),
-    };
-    if let Err(e) = tx.try_send(HostMessage::Notify {
-        tab_id,
-        notification: agent_n,
-    }) {
-        tracing::warn!(error = %e, "browser host: notify channel full, dropping page-state notification");
+        _ => {
+            // Non-EvalResult page-state notifications are deliberately
+            // dropped: no UI surface consumes them (the workspace never
+            // handled `ThreadEvent::BrowserNotification`).
+        }
     }
 }
 
 /// The inbound-handler side: resolve label → tab and enqueue the write for
-/// the drainer to surface as a `ThreadEvent::InboundAuthorization`. Runs on the
+/// the drainer to observe and drop. Runs on the
 /// gpui main thread without an `AsyncApp`; the actual confirmation overlay and
 /// the parked decision oneshot are wired by the drainer (which has an
 /// `AsyncApp`).
@@ -520,21 +469,179 @@ fn handle_inbound(
     }
 }
 
-impl BrowserHost for WorkspaceBrowserHost {
-    fn open_tab(&self, url: &str, cx: &mut App) -> Result<BrowserTabId, String> {
+// ─── GpuiCapability: the gpui-backed capability provider ──────────────────
+
+/// A browser op parked on the capability channel with its reply slot.
+struct BrowserCapabilityMsg {
+    op: BrowserOp,
+    reply: futures::channel::oneshot::Sender<Result<BrowserReply, String>>,
+}
+
+/// A clipboard request parked on its own channel: gpui `App` is main-thread
+/// only, so the kernel side hops to the foreground through this channel
+/// rather than holding an `AsyncApp` (which is not `Send`).
+enum ClipboardMsg {
+    Write {
+        text: String,
+    },
+    Read {
+        reply: futures::channel::oneshot::Sender<Result<Option<String>, String>>,
+    },
+}
+
+/// The gpui-backed capability provider. It is `Send + Sync` (it holds only a
+/// channel sender); the browser work itself runs on a main-thread service loop
+/// that owns the [`gpui::AsyncApp`], bridged by the channel. The kernel
+/// invokes [`agent::capability::CapabilityClient`] without holding an
+/// `&mut App`.
+pub struct GpuiCapability {
+    tx: async_channel::Sender<BrowserCapabilityMsg>,
+    clipboard_tx: async_channel::Sender<ClipboardMsg>,
+}
+
+impl GpuiCapability {
+    /// Create the provider and spawn its main-thread service loop on `cx`.
+    pub fn start(cx: &gpui::AsyncApp) -> Arc<Self> {
+        let (tx, rx) = async_channel::unbounded::<BrowserCapabilityMsg>();
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while let Ok(msg) = rx.recv().await {
+                // One task per op so a suspending op (e.g. `YieldToUser`,
+                // parked until the user hands the tab back) does not serialize
+                // later ops — parity with the prior per-request `cx.spawn`.
+                cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+                    let result = execute_browser_op(msg.op, cx).await;
+                    let _ = msg.reply.send(result);
+                })
+                .detach();
+            }
+        })
+        .detach();
+        // Clipboard ops ride their own main-thread loop: `gpui::App` is
+        // confined to the foreground and `AsyncApp` is not `Send`, so the
+        // kernel side reaches the system clipboard through this channel
+        // rather than holding the app.
+        let (clipboard_tx, clipboard_rx) = async_channel::unbounded::<ClipboardMsg>();
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            while let Ok(msg) = clipboard_rx.recv().await {
+                match msg {
+                    ClipboardMsg::Write { text } => {
+                        cx.update(|cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text))
+                        });
+                    }
+                    ClipboardMsg::Read { reply } => {
+                        let text =
+                            cx.update(|cx| cx.read_from_clipboard().and_then(|item| item.text()));
+                        let _ = reply.send(Ok(text));
+                    }
+                }
+            }
+        })
+        .detach();
+        Arc::new(Self { tx, clipboard_tx })
+    }
+}
+
+impl CapabilityClient for GpuiCapability {
+    /// OSC 52 copy: parked on the clipboard channel and run on the
+    /// foreground; fire-and-forget, so a closed channel is the only failure.
+    fn clipboard_write(&self, text: String) -> Result<(), String> {
+        self.clipboard_tx
+            .try_send(ClipboardMsg::Write { text })
+            .map_err(|_| "clipboard capability closed".to_string())
+    }
+    /// OSC 52 paste: text entries only; an image-only clipboard reads as
+    /// empty rather than failing. Awaits the foreground round-trip — never
+    /// blocks, so it is safe to call from a runtime worker.
+    fn clipboard_read(&self) -> BoxFuture<'static, Result<Option<String>, String>> {
+        let tx = self.clipboard_tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = futures::channel::oneshot::channel();
+            if tx
+                .try_send(ClipboardMsg::Read { reply })
+                .map_err(|_| "clipboard capability closed".to_string())
+                .is_err()
+            {
+                return Err("clipboard capability closed".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("clipboard capability dropped".to_string()))
+        })
+    }
+
+    fn browser_op(&self, op: BrowserOp) -> BoxFuture<'static, Result<BrowserReply, String>> {
+        let tx = self.tx.clone();
+        Box::pin(async move {
+            let (reply, rx) = futures::channel::oneshot::channel();
+            if tx.send(BrowserCapabilityMsg { op, reply }).await.is_err() {
+                return Err("browser capability channel closed".to_string());
+            }
+            rx.await
+                .unwrap_or_else(|_| Err("browser capability dropped".to_string()))
+        })
+    }
+}
+
+/// Execute one browser op on the main thread through the registered host.
+async fn execute_browser_op(op: BrowserOp, app: &gpui::AsyncApp) -> Result<BrowserReply, String> {
+    let Some(host) = WorkspaceBrowserHost::concrete() else {
+        return Err("browser host not available".to_string());
+    };
+    match op {
+        BrowserOp::Open { url } => {
+            app.update(|cx| host.open_tab(&url, cx).map(BrowserReply::TabId))
+        }
+        BrowserOp::Navigate { id, url } => {
+            app.update(|cx| host.navigate(id, &url, cx).map(|_| BrowserReply::Unit))
+        }
+        BrowserOp::Close { id } => {
+            app.update(|cx| host.close_tab(id, cx).map(|_| BrowserReply::Unit))
+        }
+        BrowserOp::ReadText { id } => app
+            .update(|cx| host.read_text(id, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::ReadDom { id, selector } => app
+            .update(|cx| host.read_dom(id, selector, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::Click { id, selector } => app
+            .update(|cx| host.click(id, &selector, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::TypeText { id, selector, text } => app
+            .update(|cx| host.type_text(id, &selector, &text, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::Scroll { id, dx, dy } => app
+            .update(|cx| host.scroll(id, dx, dy, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+        BrowserOp::Screenshot { id } => app
+            .update(|cx| host.screenshot(id, cx))
+            .await
+            .map(BrowserReply::Text),
+        BrowserOp::YieldToUser { id } => app
+            .update(|cx| host.yield_to_user(id, cx))
+            .await
+            .map(|_| BrowserReply::Unit),
+    }
+}
+
+// ─── BrowserHost methods ──────────────────────────────────────────────────
+
+impl WorkspaceBrowserHost {
+    /// Open a new browser tab navigated to `url`; return its id.
+    pub(crate) fn open_tab(&self, url: &str, cx: &mut App) -> Result<BrowserTabId, String> {
         let handle = crate::dispatch::window_global()
             .ok_or_else(|| "browser host: main window not available".to_string())?;
         let ws = self
             .weak_ws
             .upgrade()
             .ok_or_else(|| "browser host: workspace dropped".to_string())?;
-        let (tab_id, thread) = handle
+        let tab_id = handle
             .update(cx, |_, window, cx| {
-                ws.update(cx, |ws, cx| {
-                    let tab_id = ws.open_browser_tab(url, window, cx);
-                    let thread = ws.thread.clone();
-                    (tab_id, thread)
-                })
+                ws.update(cx, |ws, cx| ws.open_browser_tab(url, window, cx))
             })
             .map_err(|e| format!("browser host: window update failed: {e}"))?;
         let label = crate::views::browser_view::webview_label_for(tab_id);
@@ -551,7 +658,6 @@ impl BrowserHost for WorkspaceBrowserHost {
             tabs.insert(
                 tab_id,
                 TabState {
-                    thread: thread.downgrade(),
                     label,
                     pending_evals: Mutex::new(HashMap::new()),
                     pending_yield: Mutex::new(None),
@@ -561,7 +667,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         Ok(tab_id)
     }
 
-    fn navigate(&self, id: BrowserTabId, url: &str, cx: &mut App) -> Result<(), String> {
+    pub(crate) fn navigate(&self, id: BrowserTabId, url: &str, cx: &mut App) -> Result<(), String> {
         let handle = crate::dispatch::window_global()
             .ok_or_else(|| "browser host: main window not available".to_string())?;
         let ws = self
@@ -601,31 +707,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         Ok(())
     }
 
-    fn eval_script(
-        &self,
-        id: BrowserTabId,
-        js: &str,
-        cx: &mut App,
-    ) -> Task<Result<String, String>> {
-        // Embed the caller's JS as a JSON-escaped string literal (a valid JS
-        // string) and indirect-eval it so it runs in global scope, returning
-        // its value as the eval_result payload.
-        let body = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".to_string());
-        self.eval_awaiting(
-            id,
-            move |rid| {
-                format!(
-                    "(function(){{try{{var payload=(0,eval)({body});window.__manox_notify__('eval_result',{{request_id:{rid},payload:payload===undefined?null:payload}});}}catch(e){{window.__manox_notify__('eval_result',{{request_id:{rid},payload:{{__error:String(e&&e.message||e)}}}});}}}})();",
-                    body = body,
-                    rid = rid,
-                )
-            },
-            true,
-            cx,
-        )
-    }
-
-    fn read_text(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<String, String>> {
+    pub(crate) fn read_text(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<String, String>> {
         self.eval_awaiting(
             id,
             |rid| {
@@ -639,7 +721,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         )
     }
 
-    fn read_dom(
+    pub(crate) fn read_dom(
         &self,
         id: BrowserTabId,
         selector: Option<String>,
@@ -668,7 +750,12 @@ impl BrowserHost for WorkspaceBrowserHost {
         )
     }
 
-    fn click(&self, id: BrowserTabId, selector: &str, cx: &mut App) -> Task<Result<(), String>> {
+    pub(crate) fn click(
+        &self,
+        id: BrowserTabId,
+        selector: &str,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
         let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
         let js = format!(
             "(function(){{var el=document.querySelector({sel});if(el){{el.click();}}}})();",
@@ -678,7 +765,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         cx.background_spawn(async move { res })
     }
 
-    fn type_text(
+    pub(crate) fn type_text(
         &self,
         id: BrowserTabId,
         selector: &str,
@@ -696,13 +783,23 @@ impl BrowserHost for WorkspaceBrowserHost {
         cx.background_spawn(async move { res })
     }
 
-    fn scroll(&self, id: BrowserTabId, dx: i32, dy: i32, cx: &mut App) -> Task<Result<(), String>> {
+    pub(crate) fn scroll(
+        &self,
+        id: BrowserTabId,
+        dx: i32,
+        dy: i32,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
         let js = format!("window.scrollBy({dx},{dy});", dx = dx, dy = dy);
         let res = self.inject_script(id, &js, cx);
         cx.background_spawn(async move { res })
     }
 
-    fn screenshot(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<String, String>> {
+    pub(crate) fn screenshot(
+        &self,
+        id: BrowserTabId,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
         // A DOM snapshot of the visible state (structure + metadata), not a
         // pixel image — the agent needs page structure, and a true pixel
         // snapshot needs a platform-specific wry extension not in scope here.
@@ -719,7 +816,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         )
     }
 
-    fn yield_to_user(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<(), String>> {
+    pub(crate) fn yield_to_user(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<(), String>> {
         let (tx, rx) = oneshot::channel::<()>();
         let registered = self
             .routes
@@ -757,7 +854,7 @@ impl BrowserHost for WorkspaceBrowserHost {
         })
     }
 
-    fn close_tab(&self, id: BrowserTabId, cx: &mut App) -> Result<(), String> {
+    pub(crate) fn close_tab(&self, id: BrowserTabId, cx: &mut App) -> Result<(), String> {
         // Reclaim the routing state first so any in-flight notify for this tab
         // finds no entry and is dropped (no orphaned oneshot resolution).
         let label = self

@@ -46,7 +46,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - 单一状态根：`~/.manox/`（`agent::paths::manox_config_dir()` 与 `cx_providers::cx_state_dir()` 均指向它）
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/cx-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；EnterWorktree/ExitWorktree/Open/NewSession/恢复等 swap 移动指针，侧栏按 thread 折叠其 sessions 为单行，`agent::thread_registry`）
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`agent::thread_registry`）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork。
 - pi 会话（.jsonl）：`~/.manox/pi-sessions/`
 - 子代理会话：`~/.manox/pi-sessions/subagents/`（持久化、不进侧栏；cx stats 计入 manox）
 - 外部会话：`~/.manox/external-sessions/`
@@ -103,7 +103,7 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 
 - 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
 - 每 PR 门禁：`cargo clippy -D warnings --all-targets` + 全量 `cargo test` + `cargo fmt`。
-- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归；整机并发 timing flake（manox-actor actor 套件、`agent::monitor_bridge::monitor_spawn_bridges_snapshots`：全量跑偶发失败、单独跑恒过）同样不计回归。
+- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、cx IPC socket 测试）记录在案、不计回归；整机并发 timing flake（`agent::monitor_bridge::monitor_spawn_bridges_snapshots`：全量跑偶发失败、单独跑恒过）同样不计回归。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
 
 ## 项目规则
@@ -129,3 +129,10 @@ manox 处于开发早期，不维护 v0→v1 升级路径，不背历史负债�
 - **不写 `v0`/`legacy_`/`backward_compat` 模块**：任何以向后兼容为名的子模块/helper/trait/wrapper 直接拒。新枚举/新 schema 原地替换，删代码时同步删测试。
 
 > 不确定要不要保留兼容层时，问：当前有没有外部用户的数据会因此被破坏？答案是「没有 / 用户可接受丢」——就按激进方向走。
+
+## δ₂: manox-actor retired + VS Code protocol migration (v4 delta 2)
+
+- manox-actor crate deleted (2026-08-31).
+- manox-napi now uses AgentServer + InProcessConnection instead of manox-actor.
+- VS Code extension adapted to FromClient/FromServer protocol (AgentServer wire).
+- handle_command/ActorState/SessionState/EventSink/thread_event_to_json/spawn_models_push deleted from session-core.

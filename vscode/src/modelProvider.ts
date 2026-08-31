@@ -1,5 +1,5 @@
 // LanguageModelChatProvider that exposes manox as a bare chat model in the
-// native chat. Each request is one stateless completion over the actor's
+// native chat. Each request is one stateless completion over the agent's
 // provider layer (`model_chat`): wire messages and tool definitions go to the
 // pi provider runtime, text/thinking deltas stream back as response parts,
 // and tool calls the model emits are relayed as `LanguageModelToolCallPart`s
@@ -9,13 +9,14 @@
 
 import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
-import type { ActorEvent, ModelChatBlock, ModelChatMessage, ModelChatTool, ModelInfo } from '../dist/protocol';
+import type { JsonValue, ModelChatBlock, ModelChatMessage, ModelChatTool, ModelInfo } from '../dist/protocol';
+import { request, notification } from './protocolHelpers';
 import { SessionManager, resolveWorkspaceCwd } from './sessionManager';
 
 const DEFAULT_MAX_INPUT_TOKENS = 200_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
 // Groupless (silent) enumerations run on every picker open / default-model
-// lookup; re-booting the actor each time has real cost. Reuse the last sync
+// lookup; re-booting the server each time has real cost. Reuse the last sync
 // within this window — cx providers added afterwards are picked up on the next
 // window, an acceptable delay for the silent path.
 const SYNC_TTL_MS = 60_000;
@@ -97,7 +98,7 @@ export interface ManoxGroup {
  * resolvable user-data root. */
 export function manoxConfigFile(): string | undefined {
   // Editor forks keep their own app dir; map the common uriSchemes so the
-  // write lands where the running workbench watches. Unknown forks fall back
+  // write lands where the running workbench watches it. Unknown forks fall back
   // to 'Code' (they'd otherwise resolve to a non-existent dir).
   const appDir = (() => {
     switch (vscode.env.uriScheme) {
@@ -163,14 +164,14 @@ export function parseManoxGroups(json: string): ManoxGroup[] {
   }
 }
 
-/** One actor model → picker-visible model information. */
+/** One server model → picker-visible model information. */
 function toModelInfo(m: ModelInfo): vscode.LanguageModelChatInformation {
   return {
     id: m.id,
     name: m.name,
     family: m.provider,
     version: '1.0.0',
-    // The actor reports the provider's real context window; a missing
+    // The server reports the provider's real context window; a missing
     // value falls back to the placeholder.
     maxInputTokens: m.context_window || DEFAULT_MAX_INPUT_TOKENS,
     maxOutputTokens: m.max_tokens || DEFAULT_MAX_OUTPUT_TOKENS,
@@ -210,8 +211,8 @@ async function syncManoxGroups(
     await manager.init(resolveWorkspaceCwd());
     models = await manager.listModels();
   } catch {
-    // A failing actor must not break the model picker; the vendor simply
-    // does not show up until the actor responds.
+    // A failing server must not break the model picker; the vendor simply
+    // does not show up until the server responds.
     return { models: [], grouped: false };
   }
   const all = await readConfigGroups();
@@ -248,7 +249,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
   constructor(private readonly manager: SessionManager) {}
 
   /** Groupless resolution with a short-lived in-memory cache so repeated
-   * silent enumerations do not re-init the actor (see SYNC_TTL_MS). */
+   * silent enumerations do not re-init the server (see SYNC_TTL_MS). */
   private async resolveGroupless(): Promise<{ models: ModelInfo[]; grouped: boolean }> {
     const now = Date.now();
     if (this.syncCache && now - this.syncCache.at < SYNC_TTL_MS) return this.syncCache;
@@ -317,51 +318,54 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
       resolveDone = resolve;
       rejectDone = reject;
     });
-    const off = this.manager.onGlobalEvent((ev: ActorEvent) => {
+    const off = this.manager.onGlobalEvent((ev: Record<string, unknown>) => {
       if (!('requestId' in ev) || ev.requestId !== requestId) return;
-      switch (ev.type) {
-        case 'model_text':
-          progress.report(new vscode.LanguageModelTextPart(ev.text));
+      switch (ev.method) {
+        case 'modelText':
+          progress.report(new vscode.LanguageModelTextPart(ev.text as string));
           break;
-        case 'model_thinking':
+        case 'modelThinking':
           // The thinking part is a proposed type kept out of the stable
           // `LanguageModelResponsePart` union; the report target accepts it
           // on hosts that declare the proposal.
           progress.report(
             new vscode.LanguageModelThinkingPart(
-              ev.text,
+              ev.text as string,
             ) as unknown as vscode.LanguageModelResponsePart,
           );
           break;
-        case 'model_tool_call':
+        case 'modelToolCall':
           progress.report(
-            new vscode.LanguageModelToolCallPart(ev.id, ev.name, ev.input as object),
+            new vscode.LanguageModelToolCallPart(ev.id as string, ev.name as string, ev.input as object),
           );
           break;
-        case 'model_chat_done':
+        case 'modelChatDone':
           if (settled) return;
           settled = true;
           off();
           cancelSub.dispose();
           // A tool-use stop is a normal end: VS Code executes the relayed
           // tools and calls back with their results on the next request.
-          if (ev.error !== null) rejectDone(new Error(ev.error));
+          if (ev.error !== null) rejectDone(new Error(ev.error as string));
           else resolveDone();
           break;
       }
     });
     const cancelSub = token.onCancellationRequested(() => {
-      this.manager.send({ cmd: 'cancel_model_chat', requestId });
+      this.manager.send(notification({
+        method: 'cancelModelChat',
+        requestId,
+      }));
     });
 
     try {
-      this.manager.send({
-        cmd: 'model_chat',
+      this.manager.send(request({
+        method: 'modelChat',
         requestId,
         model: model.id,
-        messages: toWireMessages(messages),
-        tools,
-      });
+        messages: toWireMessages(messages) as unknown as JsonValue,
+        tools: tools as unknown as JsonValue,
+      }));
       await done;
     } finally {
       if (!settled) {
@@ -377,7 +381,7 @@ export class ManoxModelProvider implements vscode.LanguageModelChatProvider {
     text: string | vscode.LanguageModelChatRequestMessage,
     _token: vscode.CancellationToken,
   ): Promise<number> {
-    // Heuristic (chars/4): the actor exposes no standalone tokenizer; the
+    // Heuristic (chars/4): the server exposes no standalone tokenizer; the
     // approximation is only consumed by UI affordances.
     const value = typeof text === 'string' ? text : text.content.map(partToText).join('');
     return Math.ceil(value.length / 4);

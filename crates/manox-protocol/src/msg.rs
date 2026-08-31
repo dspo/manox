@@ -138,4 +138,194 @@ mod tests {
         let back: FromServer = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
     }
+
+    /// ε: transmission consistency — verify every `FromClient` and
+    /// `FromServer` variant survives a serde JSON round-trip. The single
+    /// protocol surface guarantee means in-process (typed) and serde
+    /// (JSON) paths must produce identical messages.
+    #[test]
+    fn all_from_client_variants_serde_round_trip() {
+        let msgs = vec![
+            FromClient::Request {
+                id: MsgId::new("r-1"),
+                call: crate::client::ClientCall::Initialize(crate::handshake::Initialize {
+                    client_id: "test".into(),
+                    capabilities: vec![crate::handshake::HookKind::Approve],
+                    sessions: vec![],
+                }),
+            },
+            FromClient::Request {
+                id: MsgId::new("r-2"),
+                call: crate::client::ClientCall::ListThreads,
+            },
+            FromClient::Request {
+                id: MsgId::new("r-3"),
+                call: crate::client::ClientCall::ThreadInfo {
+                    session_id: "s1".into(),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::CreateSession {
+                    session_id: "s1".into(),
+                    cwd: Some("/proj".into()),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::Submit {
+                    session_id: "s1".into(),
+                    text: "hello".into(),
+                    images: vec![],
+                    client_id: None,
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::CancelTurn {
+                    session_id: "s1".into(),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::SetModel {
+                    session_id: "s1".into(),
+                    id: "claude-sonnet-4".into(),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::SetCwd {
+                    session_id: "s1".into(),
+                    cwd: "/new".into(),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::AppendUserMessage {
+                    session_id: "s1".into(),
+                    text: "batched".into(),
+                    images: vec![],
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::AppendUiNote {
+                    session_id: "s1".into(),
+                    kind: "error".into(),
+                    data: serde_json::json!({"text": "oops"}),
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::ArchiveThread {
+                    session_id: "s1".into(),
+                    archived: true,
+                },
+            },
+            FromClient::Notification {
+                note: crate::client::ClientNote::Goal {
+                    session_id: "s1".into(),
+                    action: "create".into(),
+                    objective: Some("do thing".into()),
+                    budget: Some(1000),
+                    max_rounds: Some(10),
+                },
+            },
+            FromClient::Reply {
+                id: MsgId::new("rep-1"),
+                outcome: Ok(serde_json::json!({"allow": true})),
+            },
+            FromClient::Reply {
+                id: MsgId::new("rep-2"),
+                outcome: Err(RpcError::new(-1, "denied")),
+            },
+        ];
+        for msg in &msgs {
+            let json = serde_json::to_string(msg).unwrap();
+            let back: FromClient = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, &back, "FromClient serde round-trip failed: {json}");
+        }
+    }
+
+    #[test]
+    fn all_from_server_variants_serde_round_trip() {
+        let msgs = vec![
+            FromServer::Response {
+                id: MsgId::new("r-1"),
+                outcome: Ok(serde_json::json!({"threads": []})),
+            },
+            FromServer::Response {
+                id: MsgId::new("r-2"),
+                outcome: Err(RpcError::new(1, "bad request")),
+            },
+            FromServer::Request {
+                id: MsgId::new("adj-1"),
+                call: crate::server::ServerCall::Approve {
+                    session_id: "s1".into(),
+                    auth_id: "auth-1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "rm -rf".into(),
+                    input: serde_json::json!({"command": "rm"}),
+                },
+            },
+            FromServer::Request {
+                id: MsgId::new("adj-2"),
+                call: crate::server::ServerCall::AskUserQuestion {
+                    session_id: "s1".into(),
+                    auth_id: "auth-2".into(),
+
+                    input: serde_json::json!({}),
+                },
+            },
+            FromServer::Request {
+                id: MsgId::new("adj-3"),
+                call: crate::server::ServerCall::PlanVerdict {
+                    session_id: "s1".into(),
+                    plan_file: "/plan.md".into(),
+                    title: "Plan".into(),
+                    content: Some("# Plan".into()),
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::Ready,
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::SessionCreated {
+                    session_id: "s1".into(),
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::TurnStarted {
+                    session_id: "s1".into(),
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::CacheInvalidation {
+                    session_id: "s1".into(),
+                    reprocessed_tokens: 12345,
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::TurnFinished {
+                    cancelled: false,
+                    failed: false,
+                    stranded_steer_ids: vec![],
+                    session_id: "s1".into(),
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::UsageSnapshot {
+                    session_id: "s1".into(),
+                    cumulative: crate::server::TokenUsageSnapshot {
+                        input: 100,
+                        output: 50,
+                        cache_creation: 0,
+                        cache_read: 0,
+                    },
+                    per_model: std::collections::HashMap::new(),
+                    cumulative_cost: 0.01,
+                    per_model_cost: std::collections::HashMap::new(),
+                    per_request: std::collections::HashMap::new(),
+                },
+            },
+        ];
+        for msg in &msgs {
+            let json = serde_json::to_string(msg).unwrap();
+            let back: FromServer = serde_json::from_str(&json).unwrap();
+            assert_eq!(msg, &back, "FromServer serde round-trip failed: {json}");
+        }
+    }
 }

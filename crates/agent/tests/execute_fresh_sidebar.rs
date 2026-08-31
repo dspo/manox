@@ -127,13 +127,13 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     let project = home.join("project");
     std::fs::create_dir_all(&project).unwrap();
 
-    let mut cx = gpui::TestAppContext::single();
-    cx.update(|cx| {
+    let cx = gpui::TestAppContext::single();
+    cx.update(|_| {
         agent::runtime::init();
         agent::settings::init_optimization();
         agent::i18n::init();
         agent::pi_providers::init();
-        agent::thread_store::init(cx);
+        agent::thread_store::init();
     });
     // Provider registration runs on a background thread; block until it lands
     // so `default_model` resolves before the thread is constructed.
@@ -143,36 +143,31 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     // Mirror `respond_plan_review`'s ExecuteFresh arm: spawn a fresh
     // project-bound thread and seed the execution turn.
-    let thread: gpui::Entity<Thread> = cx.update(|cx| {
-        Thread::new_in_project(
-            ThreadId(uuid::Uuid::new_v4().to_string()),
-            project.clone(),
-            cx,
-        )
-    });
-    let new_id = cx.read(|cx| thread.read(cx).id.0.clone());
-    thread.update(&mut cx, |t, cx| {
+    let thread =
+        Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), project.clone());
+    let new_id = thread.read(|t| t.id.0.clone());
+    thread.with_mut(|t| {
         t.seed_plan_execution(
             "/tmp/test-plan.md".to_string(),
             "Reply with just OK.".to_string(),
             None,
-            cx,
         );
     });
 
     // Wait for the seeded turn to settle (the actor streams through the fake
     // endpoint, materializing the deferred session file on the first
-    // assistant message). The facade flips `running` false on `Settled`.
+    // assistant message). The facade flips `running` false on `Settled`. The
+    // engine pump runs on the tokio runtime, so poll `is_running` rather than
+    // park the gpui context.
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
-        cx.run_until_parked();
-        let done = cx.read(|cx| !thread.read(cx).is_running());
+        let done = thread.read(|t| !t.is_running());
         if done || Instant::now() > deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let running = cx.read(|cx| thread.read(cx).is_running());
+    let running = thread.read(|t| t.is_running());
     assert!(
         !running,
         "seeded execution turn did not settle within 120s (fake endpoint broken?)"
@@ -180,18 +175,12 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     // The workspace's `TurnFinished` handler persists with `touch=true`,
     // which re-scans the session repository into the store summaries.
-    // Apply the same call, then pump the async refresh.
-    cx.update(agent::refresh_thread_list);
+    // Apply the same call; the scan runs on the agent runtime.
+    agent::refresh_thread_list();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        cx.run_until_parked();
-        let listed = cx.read(|cx| {
-            agent::thread_store_global()
-                .read(cx)
-                .summaries()
-                .iter()
-                .any(|s| s.id == new_id)
-        });
+        let listed =
+            agent::thread_store_global().read(|s| s.summaries().iter().any(|s| s.id == new_id));
         if listed {
             break;
         }
@@ -206,7 +195,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
                     files.push(entry.path().display().to_string());
                 }
             }
-            let listed = cx.read(|cx| agent::thread_store_global().read(cx).summaries().to_vec());
+            let listed = agent::thread_store_global().read(|s| s.summaries().to_vec());
             panic!(
                 "fresh execution thread {new_id} never surfaced in ThreadStore summaries \
                  (sidebar list) — deferred session file missed by every refresh\n\
@@ -219,10 +208,8 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // The thread must be listed under the SAME id the facade thread carries
     // (the session file header id), so sidebar selection / running / unread
     // marks keyed by the facade id actually reach the row.
-    let listed_id = cx.read(|cx| {
-        agent::thread_store_global()
-            .read(cx)
-            .summaries()
+    let listed_id = agent::thread_store_global().read(|s| {
+        s.summaries()
             .iter()
             .find(|s| s.id == new_id)
             .map(|s| s.id.clone())
@@ -234,7 +221,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
          sidebar row is keyed by a different id and selection/running/unread \
          marks never reach it"
     );
-    let summaries = cx.read(|cx| agent::thread_store_global().read(cx).summaries().to_vec());
+    let summaries = agent::thread_store_global().read(|s| s.summaries().to_vec());
     let summary = summaries
         .iter()
         .find(|s| s.id == new_id)

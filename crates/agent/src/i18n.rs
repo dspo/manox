@@ -16,11 +16,10 @@
 //! can run concurrently.
 
 use std::cell::RefCell;
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 use anyhow::Result;
 use fluent::{FluentArgs, FluentBundle, FluentResource, FluentValue};
-use gpui::{App, SharedString};
 
 pub use crate::language::Language;
 
@@ -46,33 +45,6 @@ thread_local! {
     static L10N: RefCell<Option<L10n>> = const { RefCell::new(None) };
 }
 
-/// A menu rebuilder registered by the bin (which owns the native-menu
-/// construction — `Quit` action and `Menu`/`MenuItem` live there). When the UI
-/// locale changes the native menus must be re-`set_menus`'d with fresh
-/// `t()`-resolved labels; this indirection keeps the rebuilder out of the
-/// `agent` crate (it can't depend on the bin) without scattering menu-rebuild
-/// calls across the UI layer.
-type MenuRebuild = Box<dyn Fn(&mut App) + Send + Sync>;
-static MENU_REBUILDER: OnceLock<MenuRebuild> = OnceLock::new();
-
-/// Register the native-menu rebuilder. Called once from the bin at startup,
-/// after [`init`]. Subsequent [`set_ui_language`] calls invoke it so menu labels
-/// re-localize live.
-pub fn set_menu_rebuilder(rebuild: impl Fn(&mut App) + Send + Sync + 'static) {
-    let _ = MENU_REBUILDER.set(Box::new(rebuild));
-}
-
-/// Re-run the registered native-menu rebuilder. The menu tree embeds dynamic
-/// content beyond localized labels (the `工具 → ChatGPT.app` / `工具 → VS Code`
-/// provider/model cascades mirror the provider registry), so callers that swap the registry —
-/// or otherwise change what the menus should show — rebuild through this.
-/// No-op before [`set_menu_rebuilder`] registers the closure.
-pub fn rebuild_menus(cx: &mut App) {
-    if let Some(rebuild) = MENU_REBUILDER.get() {
-        rebuild(cx);
-    }
-}
-
 /// Read `settings.toml`, resolve the UI locale, and build the bundle on the
 /// calling (startup) thread. Called once from `agent::init` before any UI
 /// render or system-prompt build. Any failure is non-fatal: warn and fall back
@@ -87,23 +59,16 @@ pub fn init() {
     }
 }
 
-/// Swap the UI locale live: update the global, drop every thread's cached
-/// bundle so the next [`t`] rebuilds against the new locale, refresh all
-/// windows so chrome re-renders, and rebuild native menus via the registered
-/// rebuilder. Existing notifications and user content are not rewritten — only
-/// chrome re-localizes from this point forward.
-///
-/// Callers must have already persisted the new locale to `settings.toml` (or be
-/// the persist path itself); this function touches only in-memory state and UI.
-pub fn set_ui_language(lang: Language, cx: &mut App) {
+/// Swap the UI locale in memory: update the global, drop every thread's
+/// cached bundle so the next [`t`] rebuilds against the new locale.
+/// Callers must refresh windows and rebuild native menus after this call
+/// (the `cx.refresh_windows()` and menu rebuild are gpui-dependent and
+/// live in `agent-ui`).
+pub fn set_ui_language(lang: Language) {
     *LANG.write().expect("i18n LANG lock poisoned") = lang;
     // Drop this thread's bundle; other threads' bundles rebuild lazily on
     // their next `t()` call, reading the new locale from `LANG`.
     L10N.with(|cell| *cell.borrow_mut() = None);
-    cx.refresh_windows();
-    if let Some(rebuild) = MENU_REBUILDER.get() {
-        rebuild(cx);
-    }
 }
 
 fn primary_resource(lang: Language) -> &'static str {
@@ -178,13 +143,13 @@ fn read_lang() -> Language {
 
 /// Resolve `key` with no arguments. Missing keys render as the key itself so
 /// leaks surface during development rather than silently empty strings.
-pub fn t(key: &str) -> SharedString {
+pub fn t(key: &str) -> String {
     format(key, None)
 }
 
 /// Resolve `key` with string arguments (e.g. `workspace-unknown-command`'s
 /// `$name`). Arguments borrow the caller's slices for the duration of the call.
-pub fn t_str(key: &str, args: &[(&str, &str)]) -> SharedString {
+pub fn t_str(key: &str, args: &[(&str, &str)]) -> String {
     let mut fa = FluentArgs::new();
     for (k, v) in args {
         fa.set(*k, FluentValue::String(std::borrow::Cow::Borrowed(*v)));
@@ -194,7 +159,7 @@ pub fn t_str(key: &str, args: &[(&str, &str)]) -> SharedString {
 
 /// Resolve `key` with a numeric `$count` argument, used for plural-aware
 /// strings like relative time formatting.
-pub fn t_count(key: &str, count: i64) -> SharedString {
+pub fn t_count(key: &str, count: i64) -> String {
     let mut fa = FluentArgs::new();
     fa.set("count", FluentValue::from(count));
     format(key, Some(&fa))
@@ -202,7 +167,7 @@ pub fn t_count(key: &str, count: i64) -> SharedString {
 
 /// Resolve `key` with string arguments plus a numeric `$count`, for
 /// plural-aware messages that also carry named string args.
-pub fn t_str_count(key: &str, args: &[(&str, &str)], count: i64) -> SharedString {
+pub fn t_str_count(key: &str, args: &[(&str, &str)], count: i64) -> String {
     let mut fa = FluentArgs::new();
     for (k, v) in args {
         fa.set(*k, FluentValue::String(std::borrow::Cow::Borrowed(*v)));
@@ -211,12 +176,12 @@ pub fn t_str_count(key: &str, args: &[(&str, &str)], count: i64) -> SharedString
     format(key, Some(&fa))
 }
 
-fn format(key: &str, args: Option<&FluentArgs>) -> SharedString {
+fn format(key: &str, args: Option<&FluentArgs>) -> String {
     ensure_init();
     L10N.with(|cell| {
         let mut guard = cell.borrow_mut();
         let Some(l10n) = guard.as_mut() else {
-            return SharedString::from(key);
+            return key.to_string();
         };
         if let Some(s) = format_in(&mut l10n.bundle, key, args) {
             return s;
@@ -226,7 +191,7 @@ fn format(key: &str, args: Option<&FluentArgs>) -> SharedString {
         {
             return s;
         }
-        SharedString::from(key)
+        key.to_string()
     })
 }
 
@@ -236,7 +201,7 @@ fn format_in(
     bundle: &mut FluentBundle<FluentResource>,
     key: &str,
     args: Option<&FluentArgs>,
-) -> Option<SharedString> {
+) -> Option<String> {
     let msg = bundle.get_message(key)?;
     let value = msg.value()?;
     let mut errors = vec![];
@@ -244,7 +209,7 @@ fn format_in(
     if !errors.is_empty() {
         tracing::warn!(key, ?errors, "fluent format errors");
     }
-    Some(SharedString::from(formatted.into_owned()))
+    Some(formatted.into_owned())
 }
 
 #[cfg(test)]
@@ -268,23 +233,23 @@ mod tests {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
         let v = t("does-not-exist-xyz");
-        assert_eq!(v.as_ref(), "does-not-exist-xyz");
+        assert_eq!(v.as_str(), "does-not-exist-xyz");
     }
 
     #[test]
     fn en_plural_minutes() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
-        assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 minute ago");
-        assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 minutes ago");
+        assert_eq!(t_count("sidebar-time-minutes", 1).as_str(), "1 minute ago");
+        assert_eq!(t_count("sidebar-time-minutes", 5).as_str(), "5 minutes ago");
     }
 
     #[test]
     fn zh_cn_no_plural_minutes() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::ZhCn);
-        assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 分钟前");
-        assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 分钟前");
+        assert_eq!(t_count("sidebar-time-minutes", 1).as_str(), "1 分钟前");
+        assert_eq!(t_count("sidebar-time-minutes", 5).as_str(), "5 分钟前");
     }
 
     #[test]

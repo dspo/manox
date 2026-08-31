@@ -1078,7 +1078,7 @@ impl ConversationState {
             ThreadEvent::GoalChanged { .. } => ApplyOutcome::Unchanged,
             // Worktree binding is session state (facade mirror), not a
             // conversation item.
-            ThreadEvent::WorktreeChanged { .. } => ApplyOutcome::Unchanged,
+            ThreadEvent::CwdChanged { .. } => ApplyOutcome::Unchanged,
             ThreadEvent::AgentText(delta) => {
                 let needs_new = match self.items.last() {
                     Some(e) => !matches!(
@@ -1745,12 +1745,6 @@ impl ConversationState {
                 } else {
                     ApplyOutcome::Unchanged
                 }
-            }
-            ThreadEvent::BrowserNotification { .. } | ThreadEvent::InboundAuthorization { .. } => {
-                // Browser-axis signals are routed for the UI chrome (overlay,
-                // hint, tab state), not rendered as conversation items. The
-                // owning Workspace subscriber handles the surface.
-                ApplyOutcome::Unchanged
             }
             ThreadEvent::BackgroundTaskUpdated { snapshot } => {
                 // Find an existing BackgroundTask card with this task_id and

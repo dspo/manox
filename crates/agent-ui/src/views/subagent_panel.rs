@@ -15,9 +15,9 @@
 
 use std::collections::HashMap;
 
+use crate::i18n;
 use agent::Message;
 use agent::ToolCallStatus;
-use agent::i18n;
 use agent::language_model::{MessageContent, TokenUsage};
 use agent::thread::{SubagentChildEvent, ThreadEvent};
 use gpui::prelude::*;

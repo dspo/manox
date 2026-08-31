@@ -31,6 +31,10 @@ pub enum MessageContent {
     /// An inline image carried as base64-encoded bytes plus its MIME type, sent to
     /// providers that accept multimodal content blocks.
     Image {
+        /// Base64-encoded image bytes. Stripped to `byte_len` for wire
+        /// transport; `#[serde(default)]` lets the store deserialize
+        /// wire-stripped history without failing.
+        #[serde(default)]
         data: String,
         mime_type: String,
     },

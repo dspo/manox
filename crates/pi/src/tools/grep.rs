@@ -54,6 +54,10 @@ impl AgentTool for GrepTool {
                     "type": "string",
                     "description": "Directory or file to search (default: cwd)"
                 },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                },
                 "glob": {
                     "type": "string",
                     "description": "File glob pattern to filter files (e.g. '*.rs')"
@@ -114,8 +118,10 @@ impl AgentTool for GrepTool {
                 .map_err(|e| ToolError::InvalidArguments(format!("invalid regex: {e}")))?
         };
 
-        // Resolve the search path.
-        let search_path = resolve_path(ctx, path_str);
+        // Resolve the effective cwd and the search path against it.
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
+        let search_path = resolve_path(path_str, &cwd);
 
         // Build the file glob filter.
         let glob_set = build_glob_filter(glob_pattern)?;
@@ -184,13 +190,13 @@ impl AgentTool for GrepTool {
     }
 }
 
-/// Resolve a path string to an absolute path.
-fn resolve_path(ctx: &dyn ToolContext, path_str: &str) -> PathBuf {
+/// Resolve a path string against the call's effective working directory.
+fn resolve_path(path_str: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(path_str);
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        ctx.cwd().join(path)
+        cwd.join(path)
     }
 }
 

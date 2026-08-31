@@ -9,7 +9,7 @@
 
 use std::rc::Rc;
 
-use agent::i18n;
+use crate::i18n;
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 

@@ -5,6 +5,10 @@
 //! it; [`in_process_pair`] wires two ends over bounded `async_channel`s for the
 //! gpui desktop app. [`RpcPeer`] correlates outstanding request/response and
 //! call/reply pairs by [`crate::MsgId`].
+//!
+//! Scope decision (ε closeout, 2026-08-31): no tauri transport is planned —
+//! the transport surface stays in-process (desktop) and serde-serialized
+//! (napi/webui). A tauri shell, if ever pursued, opens its own plan.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,7 +63,10 @@ pub trait RpcConnection: Send + Sync {
     fn disconnect(&self);
 }
 
-/// In-process [`RpcConnection`] over bounded channels.
+/// In-process [`RpcConnection`] over bounded channels. Cloneable: each clone
+/// shares the channel pair, so both the pump (reading server→client) and the
+/// workspace (sending client→server) can hold a reference.
+#[derive(Clone)]
 pub struct InProcessConnection {
     c2s_tx: Sender<FromClient>,
     c2s_rx: Receiver<FromClient>,
@@ -69,8 +76,15 @@ pub struct InProcessConnection {
 
 /// Two [`InProcessConnection`] ends sharing one pair of bounded channels.
 pub fn in_process_pair() -> (InProcessConnection, InProcessConnection) {
-    let (c2s_tx, c2s_rx) = async_channel::bounded(BACKPRESSURE_CAPACITY);
-    let (s2c_tx, s2c_rx) = async_channel::bounded(BACKPRESSURE_CAPACITY);
+    in_process_pair_with_capacity(BACKPRESSURE_CAPACITY)
+}
+
+/// Capacity-injectable variant for backpressure tests: a small buffer makes
+/// overflow reachable without flooding. Production callers use
+/// [`in_process_pair`] (the standing [`BACKPRESSURE_CAPACITY`]).
+pub fn in_process_pair_with_capacity(cap: usize) -> (InProcessConnection, InProcessConnection) {
+    let (c2s_tx, c2s_rx) = async_channel::bounded(cap);
+    let (s2c_tx, s2c_rx) = async_channel::bounded(cap);
     let client = InProcessConnection {
         c2s_tx: c2s_tx.clone(),
         c2s_rx: c2s_rx.clone(),
@@ -177,6 +191,55 @@ impl RpcPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Backpressure overflow, deterministic and single-threaded: a full
+    /// buffer silently drops a Drop-policy note and reliably delivers a
+    /// Disconnect-policy one once space frees. "send_blocking blocks" is
+    /// async_channel's own guarantee and is not under test here.
+    #[test]
+    fn backpressure_drop_policy_silently_drops_when_full() {
+        let (client, server) = in_process_pair_with_capacity(1);
+        // Fill the single buffer slot with a Disconnect-policy note —
+        // send_blocking succeeds immediately while space exists.
+        server.send_to_client(FromServer::Notification {
+            note: ServerNote::TurnStarted {
+                session_id: "s1".into(),
+            },
+        });
+        // The buffer is full: a streaming note is dropped by policy, not
+        // queued — the connection stays up.
+        server.send_to_client(FromServer::Notification {
+            note: ServerNote::ModelThinking {
+                request_id: "r1".into(),
+                text: "delta".into(),
+            },
+        });
+        let rx = client.server_rx();
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            FromServer::Notification {
+                note: ServerNote::TurnStarted { .. }
+            }
+        ));
+        // The dropped note never occupied a slot: the next receive is empty
+        // without waiting (try_recv, not a timeout).
+        assert!(rx.try_recv().is_err());
+        // Space freed: a further control note is delivered in order.
+        server.send_to_client(FromServer::Notification {
+            note: ServerNote::TurnFinished {
+                session_id: "s1".into(),
+                cancelled: false,
+                failed: false,
+                stranded_steer_ids: Vec::new(),
+            },
+        });
+        assert!(matches!(
+            rx.recv_blocking().unwrap(),
+            FromServer::Notification {
+                note: ServerNote::TurnFinished { .. }
+            }
+        ));
+    }
 
     #[test]
     fn in_process_pair_delivers_both_directions() {

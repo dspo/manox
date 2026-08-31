@@ -5,6 +5,66 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::tool::ToolContext;
+
+/// Resolve the effective working directory for one tool call without
+/// advancing the sticky cwd — the read-only half of
+/// [`resolve_effective_cwd`], for surfaces that must predict the call's
+/// directory without disturbing it (the approval fence runs before the
+/// tool's own resolution).
+pub fn peek_effective_cwd(
+    ctx: &dyn ToolContext,
+    explicit: Option<&str>,
+) -> Result<PathBuf, String> {
+    let tool_state = ctx.tool_state();
+    let sticky = tool_state
+        .sticky_cwd
+        .lock()
+        .expect("sticky cwd poisoned")
+        .clone();
+    let base = sticky.unwrap_or_else(|| ctx.cwd().to_path_buf());
+    let effective = match explicit.map(expand_tilde) {
+        Some(cwd) => {
+            let path = Path::new(&cwd);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            }
+        }
+        None => base,
+    };
+    if !effective.is_dir() {
+        return Err(format!(
+            "working directory does not exist: {}",
+            effective.display()
+        ));
+    }
+    Ok(effective)
+}
+
+/// Resolve the effective working directory for one tool call and advance the
+/// session's sticky cwd to it.
+///
+/// Resolution chain: an explicit `cwd` argument → the sticky cwd (the
+/// directory the last tool call ran in) → the tool context's baseline (the
+/// session cwd). An explicit relative `cwd` resolves against the sticky cwd
+/// (or the session cwd before any tool call moved it). `~` expands to the
+/// home directory. A resolved directory that does not exist is an error —
+/// every consumer (path joins, shell spawns) needs a real directory, and a
+/// missing target (a removed worktree) must not poison the sticky cwd.
+pub fn resolve_effective_cwd(
+    ctx: &dyn ToolContext,
+    explicit: Option<&str>,
+) -> Result<PathBuf, String> {
+    let effective = peek_effective_cwd(ctx, explicit)?;
+    *ctx.tool_state()
+        .sticky_cwd
+        .lock()
+        .expect("sticky cwd poisoned") = Some(effective.clone());
+    Ok(effective)
+}
+
 /// Resolve a potentially relative path against the working directory.
 ///
 /// Handles:
@@ -89,6 +149,20 @@ pub fn resolve_safe(path_str: &str, cwd: &Path) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tool::{LocalToolContext, ToolState};
+
+    fn ctx_at(dir: &Path) -> (LocalToolContext, std::sync::Arc<ToolState>) {
+        let state = std::sync::Arc::new(ToolState::new());
+        let env = std::sync::Arc::new(crate::env::TokioExecutionEnv::new(dir.to_path_buf()));
+        (
+            LocalToolContext::new(env, dir.to_path_buf(), std::sync::Arc::clone(&state)),
+            state,
+        )
+    }
+
+    fn sticky(state: &ToolState) -> Option<PathBuf> {
+        state.sticky_cwd.lock().unwrap().clone()
+    }
 
     #[test]
     fn test_resolve_absolute_path() {
@@ -113,5 +187,58 @@ mod tests {
     #[test]
     fn test_is_not_within() {
         assert!(!is_within(Path::new("/etc/passwd"), Path::new("/project")));
+    }
+
+    fn setup_dirs() -> (tempfile::TempDir, tempfile::TempDir) {
+        let base = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir_in(base.path()).unwrap();
+        (base, work)
+    }
+
+    #[test]
+    fn effective_cwd_starts_at_session_cwd_without_sticky() {
+        let (base, _work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        let effective = resolve_effective_cwd(&ctx, None).unwrap();
+        assert_eq!(effective, base.path());
+        // The first resolution advances the sticky to the session cwd.
+        assert_eq!(sticky(&state), Some(base.path().to_path_buf()));
+    }
+
+    #[test]
+    fn effective_cwd_explicit_absolute_overrides_and_advances_sticky() {
+        let (base, work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        let effective = resolve_effective_cwd(&ctx, Some(work.path().to_str().unwrap())).unwrap();
+        assert_eq!(effective, work.path());
+        assert_eq!(sticky(&state), Some(work.path().to_path_buf()));
+        // The next call without an argument inherits the advanced sticky.
+        let inherited = resolve_effective_cwd(&ctx, None).unwrap();
+        assert_eq!(inherited, work.path());
+    }
+
+    #[test]
+    fn effective_cwd_explicit_relative_resolves_against_sticky() {
+        let (base, work) = setup_dirs();
+        let sub = work.path().join("nested");
+        std::fs::create_dir(&sub).unwrap();
+        let (ctx, state) = ctx_at(base.path());
+        resolve_effective_cwd(&ctx, Some(work.path().to_str().unwrap())).unwrap();
+        let effective = resolve_effective_cwd(&ctx, Some("nested")).unwrap();
+        assert_eq!(effective, sub);
+        assert_eq!(sticky(&state), Some(sub));
+    }
+
+    #[test]
+    fn effective_cwd_rejects_missing_directory_and_keeps_sticky() {
+        let (base, work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        let gone = work.path().join("gone");
+        let err = resolve_effective_cwd(&ctx, Some(gone.to_str().unwrap())).unwrap_err();
+        assert!(err.contains("working directory does not exist"), "{err}");
+        // A failed resolution must not advance the sticky.
+        assert_eq!(sticky(&state), None);
+        let effective = resolve_effective_cwd(&ctx, None).unwrap();
+        assert_eq!(effective, base.path());
     }
 }

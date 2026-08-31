@@ -16,6 +16,11 @@ pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>
         .decode(s.as_bytes())
         .map_err(serde::de::Error::custom)
 }
+/// Encode raw bytes as a base64 string — the inverse of [`deserialize`].
+pub fn encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
 
 #[cfg(test)]
 mod tests {

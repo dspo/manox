@@ -485,8 +485,8 @@ workspace-env-git-unavailable = git unavailable
 workspace-env-git-not-a-repo = Not a git repo
 workspace-env-git-detached = detached
 workspace-env-git-copied-branch = Branch name copied to clipboard.
-workspace-env-git-copied-worktree-name = Worktree name copied to clipboard.
-workspace-env-git-copied-worktree-path = Worktree path copied to clipboard.
+workspace-env-git-copied-worktree-name = Directory name copied to clipboard.
+workspace-env-git-copied-worktree-path = Directory path copied to clipboard.
 
 # ── Context rail (right sidecar) ────────────────────────────────────────
 context-rail-title = Conversation Info

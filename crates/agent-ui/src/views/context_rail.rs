@@ -6,7 +6,8 @@
 //! cockpit state (run phase, the model's plan snapshot, per-cell counter
 //! animation state)
 //! that used to live directly on `Workspace`, plus strong handles to the
-//! active [`agent::Thread`] and [`crate::ConversationState`] it renders
+//! active gpui-free `ThreadHandle` and the
+//! AgentServer-backed store mirror [`crate::ConversationState`] it renders
 //! against. Writes to cockpit state flow through `Workspace` →
 //! `self.context_rail.update(cx, |r, cx| …)`.
 //!
@@ -19,8 +20,9 @@
 //! the conversation, and while it is open the card stays hidden so the
 //! conversation reclaims its width.
 
-use agent::i18n;
-use agent::{Thread, ThreadEvent};
+use crate::client_store_handle::ClientStoreHandle;
+use crate::i18n;
+use agent::ThreadEvent;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -29,6 +31,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agent::{PlanSnapshot, PlanStepStatus};
@@ -59,7 +62,13 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: Entity<Thread>,
+    pub(crate) thread: agent::thread::ThreadHandle,
+    /// γ-2a transitional read path: the AgentServer-backed store mirroring
+    /// kernel state via `ServerNote`s. `None` when the workspace has not
+    /// created the AgentServer connection; every kernel-state read dual-reads
+    /// this store first and falls back to `self.thread`. Mutations keep going
+    /// through `self.thread`.
+    store: Option<Entity<ClientStoreHandle>>,
     /// Coarse run phase. Derived from `ThreadEvent`s routed here by
     /// `Workspace`; used to determine the main agent's status indicator.
     pub(crate) cockpit_phase: CockpitPhase,
@@ -79,7 +88,7 @@ pub(crate) struct ContextRail {
     pub(crate) side_calls: Vec<agent::SideCallMetric>,
     pub(crate) main_call: Option<agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
-    /// `Workspace` on thread attach, terminal stop, and enter/exit worktree.
+    /// `Workspace` on thread attach and terminal stop.
     pub(crate) git_change_stats: Option<GitChangeStats>,
     /// Latest resolved branch display for the thread's cwd. `None` until the
     /// first refresh completes; the changes/branch rows render placeholders
@@ -90,9 +99,13 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(thread: Entity<Thread>) -> Self {
+    pub(crate) fn new(
+        thread: agent::thread::ThreadHandle,
+        store: Option<Entity<ClientStoreHandle>>,
+    ) -> Self {
         Self {
             thread,
+            store,
             cockpit_phase: CockpitPhase::Idle,
             plan: None,
             cockpit_hide_tasks: false,
@@ -264,11 +277,10 @@ impl ContextRail {
     /// `Render` impl positions this as an absolute overlay over the
     /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = {
-            let thread = self.thread.read(cx);
-            thread.project().cloned()
-        };
-
+        let project = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()));
         let agents_section = self.render_agents_section(theme, cx);
 
         v_flex()
@@ -327,11 +339,25 @@ impl ContextRail {
     fn render_usage_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let muted = theme.muted_foreground;
         let total = crate::cockpit::format_tokens(
-            self.thread.read(cx).cumulative_token_usage().total_tokens(),
+            self.store
+                .as_ref()
+                .map(|s| {
+                    s.read(cx)
+                        .store
+                        .cumulative_usage
+                        .as_ref()
+                        .map(|u| u.input + u.output)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
         );
         // Rate-card cost (#418 wire-boundary pricing); backends/sessions
         // without pricing keep the tokens-only header.
-        let cumulative_cost = self.thread.read(cx).cumulative_cost();
+        let cumulative_cost = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.cumulative_cost)
+            .unwrap_or(0.0);
         let total = if cumulative_cost > 0.0 {
             SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
         } else {
@@ -382,10 +408,43 @@ impl ContextRail {
         };
 
         // Per-model token breakdown tree with context budget integrated.
-        let thread = self.thread.read(cx);
-        let per_model = thread.per_model_token_usage();
-        let per_model_cost = thread.per_model_cost();
-        let per_model_last = thread.per_model_last_request_usage();
+        let s = &self
+            .store
+            .as_ref()
+            .expect("foreground store present")
+            .read(cx)
+            .store;
+        let per_model = s
+            .per_model_usage
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    agent::TokenUsage {
+                        input_tokens: v.input,
+                        output_tokens: v.output,
+                        cache_creation_input_tokens: v.cache_creation,
+                        cache_read_input_tokens: v.cache_read,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let per_model_last = s
+            .per_request_usage
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    agent::TokenUsage {
+                        input_tokens: v.input,
+                        output_tokens: v.output,
+                        cache_creation_input_tokens: v.cache_creation,
+                        cache_read_input_tokens: v.cache_read,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let per_model_cost = s.per_model_cost.clone();
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
@@ -537,8 +596,8 @@ impl ContextRail {
             .into_any_element()
     }
 
-    /// Branch block: (1) the worktree directory basename, shown only while the
-    /// thread is inside a worktree — click copies the name, double-click copies
+    /// Branch block: (1) the working-directory basename, shown only while the
+    /// session's effective cwd is reported — click copies the name, double-click copies
     /// the absolute path; (2) the branch row — resolved branch or detached sha
     /// (+ "(detached)") as the label with the changes counts as its right-aligned
     /// trailing. Both rows copy on click with a notification for feedback.
@@ -548,8 +607,12 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The store mirrors the session's effective cwd as a string.
+        let cwd_path = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.cwd_path.clone());
         let display = self.git_branch_display.clone();
-        let worktree_path = self.thread.read(cx).worktree().map(|w| w.path.clone());
 
         // Branch label: branch / detached sha + (detached).
         let branch_label: SharedString = match &display {
@@ -598,7 +661,10 @@ impl ContextRail {
         );
 
         let mut block = v_flex().w_full().gap_0p5();
-        if let Some(path) = worktree_path {
+        if let Some(path) = cwd_path {
+            // The dual-read yields a path string; re-path it for the
+            // `file_name`/`display` calls below.
+            let path = PathBuf::from(path);
             let basename = path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -691,9 +757,14 @@ impl ContextRail {
     /// but pi sub-agents are ephemeral nested sessions with no child-thread
     /// entity to open.
     fn render_agents_section(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .unwrap_or(false);
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
             agent::ToolCallStatus::Error
-        } else if self.thread.read(cx).is_running() {
+        } else if running {
             agent::ToolCallStatus::Running
         } else {
             agent::ToolCallStatus::Success

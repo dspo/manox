@@ -105,6 +105,10 @@ impl AgentTool for EditTool {
                 "patch": {
                     "type": "string",
                     "description": PATCH_DOC
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for this call; relative paths in the patch resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
                 }
             },
             "required": ["patch"]
@@ -133,6 +137,9 @@ impl AgentTool for EditTool {
             .expect("hashline clipboard poisoned")
             .clear();
 
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+            .map_err(ToolError::InvalidArguments)?;
+
         // All-or-nothing execution: every section is fully prepared (read,
         // tag check, gate, apply/recover, byte transforms) BEFORE any byte is
         // written, so a later section's rejection cannot leave earlier ones
@@ -142,7 +149,7 @@ impl AgentTool for EditTool {
         let mut lock_paths: Vec<PathBuf> = parsed
             .files
             .iter()
-            .map(|fp| resolve_path(ctx, &fp.path))
+            .map(|fp| resolve_path(&fp.path, &cwd))
             .collect();
         lock_paths.sort_by_key(|p| hashline::canonical_path(p));
         lock_paths.dedup_by(|a, b| hashline::canonical_path(a) == hashline::canonical_path(b));
@@ -177,7 +184,7 @@ impl AgentTool for EditTool {
 
         let mut prepared: Vec<Pending> = Vec::with_capacity(parsed.files.len());
         for fp in parsed.files {
-            let path = resolve_path(ctx, &fp.path);
+            let path = resolve_path(&fp.path, &cwd);
             let path_display = path.display().to_string();
 
             // File-level operations (REM/MV) still validate the tag — the
@@ -225,7 +232,7 @@ impl AgentTool for EditTool {
                         continue;
                     }
                     hashline::FileOp::Move { dest } => {
-                        let dest_path = resolve_path(ctx, std::path::Path::new(dest));
+                        let dest_path = resolve_path(std::path::Path::new(dest), &cwd);
                         if hashline::canonical_path(&dest_path) == hashline::canonical_path(&path) {
                             return Err(ToolError::ExecutionFailed(format!(
                                 "edit MV {path_display}: destination is the source file itself"
@@ -532,12 +539,13 @@ fn commit_manifest(written: &[String]) -> String {
     )
 }
 
-/// Resolve a patch section path against the tool cwd when it is relative.
-fn resolve_path(ctx: &dyn ToolContext, path: &std::path::Path) -> PathBuf {
+/// Resolve a patch section path against the call's effective working directory
+/// when it is relative.
+fn resolve_path(path: &std::path::Path, cwd: &std::path::Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        ctx.cwd().join(path)
+        cwd.join(path)
     }
 }
 

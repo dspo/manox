@@ -1,6 +1,8 @@
 //! Top-level workspace view.
 //!
-//! Holds `Entity<agent::Thread>` + `Entity<Sidebar>`; `cx.subscribe` handles:
+//! Holds a gpui-free `ThreadHandle` plus the AgentServer-backed
+//! `ClientStoreHandle` mirror + `Entity<Sidebar>`;
+//! `cx.subscribe` handles:
 //! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens the question card;
 //!   the terminal `Stop` (non-ToolUse) triggers `refresh_thread_list`.
 //! - `SidebarEvent`: new conversation / open history / delete.
@@ -12,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::i18n;
 use crate::views::launcher::LauncherPick;
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
-use agent::i18n;
 use agent::language_model::StopReason;
 use agent::thread::PermissionMode;
-use agent::webview_host::BrowserTabId;
+use agent::thread_engine::BrowserTabId;
 use agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use gpui::DismissEvent;
 use gpui::{
@@ -53,6 +55,7 @@ use manox_components::markdown::Markdown;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 
+use crate::client_store_handle::ClientStoreHandle;
 use crate::cockpit::{CockpitPhase, format_elapsed};
 use crate::conversation::ConvItem;
 use crate::conversation::{ApplyOutcome, ConversationState, NoticeAnchor, UserImage, UserTurnMeta};
@@ -82,10 +85,10 @@ use crate::{
     ToggleTurnNavigator,
 };
 use crate::{FocusConversation, OpenSettings};
+use manox_protocol::RpcConnection;
 use terminal::Terminal;
 use terminal_ui::TerminalView;
-
-pub(crate) type ThreadEntity = agent::Thread;
+use terminal_ui::terminal_proxy::TerminalProxy;
 
 /// A tab in the right observation pane. `Editor` is the markdown composer
 /// (Write/Preview); `Launcher` is the empty-tab launcher offering the
@@ -258,9 +261,15 @@ struct SubagentPrompt {
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
 /// to clear the running indicator, mark the thread unread, and drop it from
 /// `background_threads` — it never touches `conversation`/`self.thread`, so a
-/// background thread's events cannot be misattributed to the foreground thread.
+/// background thread's events cannot be misattributed to the foreground
+/// thread. The store + connection keep the parked thread's AgentServer session
+/// alive (reclaim re-attaches them; no `DisposeSession` is ever sent while
+/// parking — that would cancel a running turn).
 struct BackgroundThread {
-    entity: Entity<ThreadEntity>,
+    entity: agent::thread::ThreadHandle,
+    store: Option<gpui::Entity<ClientStoreHandle>>,
+    client_conn: Option<manox_protocol::InProcessConnection>,
+    session_id: Option<String>,
     _sub: Subscription,
 }
 
@@ -309,7 +318,25 @@ struct PendingPlanReview {
 
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
-    pub(crate) thread: Entity<ThreadEntity>,
+    pub(crate) thread: agent::thread::ThreadHandle,
+    /// γ-2a transitional read path: the `AgentServer`-backed
+    /// `ClientStoreHandle`, mirroring kernel state via `ServerNote`s. `None`
+    /// until the workspace creates the AgentServer connection (landing
+    /// thread); views read the store mirror. Held on
+    /// the workspace for the next wiring step (re-handling the store on
+    /// thread switch) — written at landing, read there.
+    pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
+    /// γ-3: the client-side connection for sending `FromClient` commands to the
+    /// AgentServer. None until the landing
+    /// thread wires it.
+    pub(crate) client_conn: Option<manox_protocol::InProcessConnection>,
+    /// γ-3: the AgentServer session_id for the landing thread. Used as the
+    /// `session_id` field in `FromClient` commands.
+    pub(crate) session_id: Option<String>,
+    /// The shared AgentServer every foreground/background session connects
+    /// to. Created at landing; `attach_thread` opens per-thread sessions on
+    /// it via `ClientStoreHandle::for_session`.
+    pub(crate) agent_server: std::sync::Arc<manox_session_core::agent_server::AgentServer>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -738,7 +765,40 @@ impl Workspace {
         if let Some(home) = agent::paths::home_dir() {
             cwd = home;
         }
-        let thread = { Thread::landing(cwd.clone(), cx) };
+        let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
+            cwd.clone(),
+        ));
+        // The landing thread id doubles as its AgentServer session id
+        // (`CreateSession` uses the session id as the `ThreadId`), so the
+        // thread the workspace renders and the thread the server drives are
+        // the same conversation.
+        let landing_id = uuid::Uuid::new_v4().to_string();
+        let thread = Thread::landing_with_id(agent::ThreadId(landing_id.clone()), cwd.clone());
+        let (store, client_conn, session_id) = {
+            let session_id = landing_id.clone();
+            let (client_conn, server_conn) = manox_protocol::in_process_pair();
+            agent_server.accept(std::sync::Arc::new(server_conn));
+            client_conn.send_to_server(manox_protocol::FromClient::Request {
+                id: manox_protocol::MsgId::new("init"),
+                call: manox_protocol::ClientCall::Initialize(manox_protocol::Initialize {
+                    client_id: format!("desktop-{session_id}"),
+                    capabilities: vec![
+                        manox_protocol::handshake::HookKind::Approve,
+                        manox_protocol::handshake::HookKind::PlanVerdict,
+                        manox_protocol::handshake::HookKind::AskUserQuestion,
+                    ],
+                    sessions: vec![],
+                }),
+            });
+            client_conn.send_to_server(manox_protocol::FromClient::Notification {
+                note: manox_protocol::ClientNote::CreateSession {
+                    session_id: session_id.clone(),
+                    cwd: Some(cwd.to_str().unwrap_or_default().into()),
+                },
+            });
+            let store = cx.new(|cx| ClientStoreHandle::new(client_conn.clone(), cx));
+            (store, client_conn, session_id)
+        };
 
         let input_state = cx.new(|cx| {
             InputState::new(window, cx)
@@ -759,16 +819,23 @@ impl Workspace {
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
-        let recipient = thread.read(cx).self_author();
+        let recipient = thread.read(|t| t.self_author());
         let conversation = cx.new(|_| ConversationState::new(recipient));
-        let context_rail =
-            { cx.new(|_| crate::views::context_rail::ContextRail::new(thread.clone())) };
+        let context_rail = {
+            cx.new(|_| {
+                crate::views::context_rail::ContextRail::new(thread.clone(), Some(store.clone()))
+            })
+        };
         let weak_ws = cx.weak_entity();
         context_rail.update(cx, |r, _| r.set_workspace(weak_ws));
 
         let mut ws = Self {
             cwd,
             thread,
+            store: Some(store),
+            client_conn: Some(client_conn),
+            session_id: Some(session_id),
+            agent_server,
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
@@ -896,11 +963,34 @@ impl Workspace {
     #[cfg(feature = "test-support")]
     pub fn diagnostic_attach_thread(
         &mut self,
-        thread: Entity<ThreadEntity>,
+        thread: agent::thread::ThreadHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.attach_thread(thread, window, cx);
+        self.attach_thread(thread, false, window, cx);
+    }
+    /// Emit a `ThreadEvent` on the store bound to `thread_id` — the foreground
+    /// store when the id is the active thread, otherwise the parked
+    /// background thread's store. Lets tests drive the workspace's subscription
+    /// handler without a live AgentServer round-trip.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_emit_event(
+        &self,
+        thread_id: &str,
+        event: ThreadEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let store = if self.thread.read(|t| t.id.0.as_str() == thread_id) {
+            self.store.as_ref()
+        } else {
+            self.background_threads
+                .iter()
+                .find(|b| b.entity.read(|t| t.id.0.as_str() == thread_id))
+                .and_then(|bg| bg.store.as_ref())
+        };
+        if let Some(store) = store {
+            store.update(cx, |_, cx| cx.emit(event));
+        }
     }
 
     /// Seed a parsed `AskUserQuestion` as the pending ask. Diagnostic-only:
@@ -1059,14 +1149,52 @@ impl Workspace {
     /// session asynchronously, then asks the workspace to re-render once the
     /// restored history lands.
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
-        let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
-        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
-        let usage = self.thread.read(cx).request_token_usage().clone();
+        let messages: Vec<agent::Message> = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.messages.clone())
+            .expect("foreground store present");
+        let display: Vec<agent::db::HistoryEntry> = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<Vec<agent::db::HistoryEntry>>(
+                    s.read(cx).store.display_history.clone(),
+                )
+                .ok()
+            })
+            .expect("foreground store present");
+        let usage = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .per_request_usage
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            agent::TokenUsage {
+                                input_tokens: v.input,
+                                output_tokens: v.output,
+                                cache_creation_input_tokens: v.cache_creation,
+                                cache_read_input_tokens: v.cache_read,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .expect("foreground store present");
         let role = self.model_label(cx);
-        let recipient = self.recipient_author(cx);
+        let recipient = self.recipient_author();
         let weak = cx.weak_entity();
-        let running = self.thread.read(cx).is_running();
-        let cwd = thread_cwd(&self.thread, cx);
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present");
+        let cwd = thread_cwd(&self.thread, &self.store, cx);
         let new_conv = cx.new(|cx| {
             ConversationState::rebuild_from_display(
                 &display,
@@ -1100,8 +1228,11 @@ impl Workspace {
     }
 
     fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
-        let thread = self.thread.clone();
-        cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
+        let store = self
+            .store
+            .clone()
+            .expect("subscribe_thread requires the foreground store");
+        cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
             match ev {
                 ThreadEvent::ToolCallAuthorization {
                     id,
@@ -1129,9 +1260,13 @@ impl Workspace {
                     // The card is visible now, but the marker survives a
                     // switch-away before the verdict: a parked thread blocked
                     // on this authorization still shows the sidebar badge.
-                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let thread_id = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.id.0.clone())
+                        .expect("foreground store present");
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_auth(&thread_id, true, cx));
+                    store.with_mut(|s| s.mark_pending_auth(&thread_id, true));
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
@@ -1148,15 +1283,18 @@ impl Workspace {
                         title: title.clone(),
                         content,
                     });
-                    // Persist the pending verdict so a restart re-surfaces
-                    // the card (the engine re-emits PlanReady on Ready).
-                    this.thread
-                        .update(cx, |t, cx| t.set_plan_review_pending(true, cx));
+                    // The AgentServer pump already persisted the pending
+                    // verdict flag on PlanReady (agent_server.rs), so a
+                    // restart re-emits the card without a UI-side write.
                     // The sidebar row pauses its spinner (blue static) while
                     // the verdict is due; `respond_plan_review` releases it.
-                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let thread_id = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.id.0.clone())
+                        .expect("foreground store present");
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_plan(&thread_id, true, cx));
+                    store.with_mut(|s| s.mark_pending_plan(&thread_id, true));
                     this.sync_list_count(cx);
                     // The finalized plan surfaces at the tail; reveal it like any
                     // user-initiated jump to the live end.
@@ -1197,9 +1335,21 @@ impl Workspace {
                     // an empty transcript and an unfilled sidecar mirror
                     // (`Ready` is async), so a restarted session's plan would
                     // otherwise wait for a manual thread switch.
-                    let messages = this.thread.read(cx).messages().to_vec();
-                    if let Some(snapshot) = agent::plan::rebuild_from_messages(&messages)
-                        .or_else(|| this.thread.read(cx).persisted_plan().cloned())
+                    let messages = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.messages.clone())
+                        .expect("foreground store present");
+                    if let Some(snapshot) =
+                        agent::plan::rebuild_from_messages(&messages).or_else(|| {
+                            this.store
+                                .as_ref()
+                                .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
+                                .and_then(|v| {
+                                    serde_json::from_value::<agent::plan::PlanSnapshot>(v.clone())
+                                        .ok()
+                                })
+                        })
                     {
                         this.context_rail
                             .update(cx, |r, cx| r.set_plan(snapshot, cx));
@@ -1211,14 +1361,44 @@ impl Workspace {
                 // keeping the list pinned at the tail while the user waits.
                 // Input stays gated on the thread's `HistoryPhase::Loading`.
                 ThreadEvent::HistoryProgress => {
-                    if this.thread.read(cx).history_phase().is_loading() {
-                        let messages: Vec<agent::Message> =
-                            this.thread.read(cx).messages().to_vec();
+                    if this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.history_phase)
+                        .expect("foreground store present")
+                        .is_loading()
+                    {
+                        let messages: Vec<agent::Message> = this
+                            .store
+                            .as_ref()
+                            .map(|s| s.read(cx).store.messages.clone())
+                            .expect("foreground store present");
                         if messages.len() > this.history_rendered {
                             let new_messages = messages[this.history_rendered..].to_vec();
-                            let usage = this.thread.read(cx).request_token_usage().clone();
+                            let usage = this
+                                .store
+                                .as_ref()
+                                .map(|s| {
+                                    s.read(cx)
+                                        .store
+                                        .per_request_usage
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            (
+                                                k.clone(),
+                                                agent::TokenUsage {
+                                                    input_tokens: v.input,
+                                                    output_tokens: v.output,
+                                                    cache_creation_input_tokens: v.cache_creation,
+                                                    cache_read_input_tokens: v.cache_read,
+                                                },
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .expect("foreground store present");
                             let role = this.model_label(cx);
-                            let cwd = thread_cwd(&this.thread, cx);
+                            let cwd = thread_cwd(&this.thread, &this.store, cx);
                             let weak = cx.weak_entity();
                             let outcome = this.conversation.update(cx, |c, cx| {
                                 c.append_history_messages(
@@ -1253,11 +1433,15 @@ impl Workspace {
                     // network latency). Terminal `TurnFinished`/`Error` below
                     // clear it. A new turn also supersedes a stale error flag
                     // from the previous turn.
-                    let thread_id = this.thread.read(cx).id.0.clone();
+                    let thread_id = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.id.0.clone())
+                        .expect("foreground store present");
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_running(&thread_id, cx);
-                        s.set_errored(&thread_id, false, cx);
+                    store.with_mut(|s| {
+                        s.mark_running(&thread_id);
+                        s.set_errored(&thread_id, false);
                     });
                     // Drive the Thinking status row's per-second "for Xs"
                     // counter while this turn is live. The ticker polls
@@ -1279,7 +1463,7 @@ impl Workspace {
                     // a segment above the new user bubble.
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -1294,8 +1478,12 @@ impl Workspace {
                     // provider Stop event, `Thread::is_running()` is already
                     // false, so a queued follow-up can safely start a new turn.
                     this.mark_stranded_steers_failed(stranded_steer_ids, cx);
-                    let thread_id = this.thread.read(cx).id.0.clone();
-                    refresh_thread_list(cx);
+                    let thread_id = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.id.0.clone())
+                        .expect("foreground store present");
+                    refresh_thread_list();
                     // Sidebar running indicator: the turn released the running
                     // slot, so the row stops spinning. A successful or
                     // cancelled turn also supersedes a stale error flag. The
@@ -1305,18 +1493,18 @@ impl Workspace {
                     let keep_plan_badge =
                         !(*cancelled || *failed) && this.pending_plan_review.is_some();
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_idle(&thread_id, cx);
+                    store.with_mut(|s| {
+                        s.mark_idle(&thread_id);
                         if !keep_plan_badge {
-                            s.mark_pending_plan(&thread_id, false, cx);
+                            s.mark_pending_plan(&thread_id, false);
                         }
                         if !*failed {
-                            s.set_errored(&thread_id, false, cx);
+                            s.set_errored(&thread_id, false);
                         }
                     });
                     this.turn_active = false;
                     this.background_threads
-                        .retain(|b| b.entity.read(cx).id.0 != thread_id);
+                        .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
                     // Only a cancelled/failed turn demotes an outstanding plan
                     // review — the verdict is moot once the loop released the
                     // turn abnormally. A normal settle right after
@@ -1340,8 +1528,19 @@ impl Workspace {
                 ThreadEvent::Stop(reason) => {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let usage = this.thread.read(cx).last_request_token_usage();
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let usage = this.store.as_ref().and_then(|s| {
+                        s.read(cx)
+                            .store
+                            .last_token_usage
+                            .as_ref()
+                            .map(|u| agent::TokenUsage {
+                                input_tokens: u.input,
+                                output_tokens: u.output,
+                                cache_creation_input_tokens: u.cache_creation,
+                                cache_read_input_tokens: u.cache_read,
+                            })
+                    });
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -1359,7 +1558,7 @@ impl Workspace {
                     // engaged — re-pins to the end on the next layout.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        refresh_thread_list(cx);
+                        refresh_thread_list();
                         // `Stop` is a provider-round boundary. Queue draining,
                         // idle state, and git refresh wait for `TurnFinished`.
                     }
@@ -1389,7 +1588,15 @@ impl Workspace {
                                     .await;
                                 let still = entity.read_with(cx, |this, cx| {
                                     this.goal_ticker_gen == ticker_gen
-                                        && this.thread.read(cx).goal().is_some()
+                                        && this
+                                            .store
+                                            .as_ref()
+                                            .and_then(|s| s.read(cx).store.goal.clone())
+                                            .and_then(|v| {
+                                                serde_json::from_value::<agent::goal::ThreadGoal>(v)
+                                                    .ok()
+                                            })
+                                            .is_some()
                                 });
                                 if !still {
                                     break;
@@ -1414,13 +1621,16 @@ impl Workspace {
                     // even with no turn in flight. The event still falls
                     // through to the conversation's task-card dispatch below.
                     if let ThreadEvent::BackgroundTaskUpdated { .. } = ev {
-                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let thread_id = this
+                            .store
+                            .as_ref()
+                            .map(|s| s.read(cx).store.id.0.clone())
+                            .expect("foreground store present");
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| {
+                        store.with_mut(|s| {
                             s.mark_background_work(
                                 &thread_id,
                                 agent::background_task::thread_has_running_tasks(&thread_id),
-                                cx,
                             );
                         });
                     }
@@ -1439,9 +1649,13 @@ impl Workspace {
                         ev,
                         ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. }
                     ) {
-                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let thread_id = this
+                            .store
+                            .as_ref()
+                            .map(|s| s.read(cx).store.id.0.clone())
+                            .expect("foreground store present");
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| s.mark_pending_auth(&thread_id, false, cx));
+                        store.with_mut(|s| s.mark_pending_auth(&thread_id, false));
                     }
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
@@ -1449,23 +1663,27 @@ impl Workspace {
                     // dedicated arm because the conversation still needs the
                     // generic `apply` below to render the error item.
                     if let ThreadEvent::Error(e) = ev {
-                        let thread_id = this.thread.read(cx).id.0.clone();
+                        let thread_id = this
+                            .store
+                            .as_ref()
+                            .map(|s| s.read(cx).store.id.0.clone())
+                            .expect("foreground store present");
                         // Sidebar running indicator: the turn aborted, so the
                         // row stops spinning, flags the error, and surfaces
                         // the unread state for the failed turn. A dead loop
                         // can no longer self-advance, so any background-work
                         // flag is stale and the row goes fully static.
                         let store = agent::thread_store_global();
-                        store.update(cx, |s, cx| {
-                            s.mark_idle(&thread_id, cx);
-                            s.mark_background_work(&thread_id, false, cx);
-                            s.mark_pending_plan(&thread_id, false, cx);
-                            s.set_errored(&thread_id, true, cx);
-                            s.set_unread(&thread_id, true, cx);
+                        store.with_mut(|s| {
+                            s.mark_idle(&thread_id);
+                            s.mark_background_work(&thread_id, false);
+                            s.mark_pending_plan(&thread_id, false);
+                            s.set_errored(&thread_id, true);
+                            s.set_unread(&thread_id, true);
                         });
                         this.turn_active = false;
                         this.background_threads
-                            .retain(|b| b.entity.read(cx).id.0 != thread_id);
+                            .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong at the failed turn's position. The
                         // append rides the actor queue behind the settling run;
@@ -1574,8 +1792,19 @@ impl Workspace {
                     }
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
-                    let usage = this.thread.read(cx).last_request_token_usage();
-                    let cwd = thread_cwd(&this.thread, cx);
+                    let usage = this.store.as_ref().and_then(|s| {
+                        s.read(cx)
+                            .store
+                            .last_token_usage
+                            .as_ref()
+                            .map(|u| agent::TokenUsage {
+                                input_tokens: u.input,
+                                output_tokens: u.output,
+                                cache_creation_input_tokens: u.cache_creation,
+                                cache_read_input_tokens: u.cache_read,
+                            })
+                    });
+                    let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
                         c.apply(
                             ev,
@@ -1602,126 +1831,122 @@ impl Workspace {
     /// subscription running it.
     fn subscribe_background_thread(
         &self,
-        thread: Entity<ThreadEntity>,
+        store: &gpui::Entity<ClientStoreHandle>,
+        id: String,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        let id = thread.read(cx).id.0.clone();
-        cx.subscribe(
-            &thread,
-            move |this, _thread, ev: &ThreadEvent, cx| match ev {
-                ThreadEvent::TurnStarted => {
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_running(&id, cx));
-                }
-                ThreadEvent::ToolCallAuthorization { .. } => {
-                    // A parked thread's question card is not visible; the
-                    // sidebar badge is the only signal until the user
-                    // switches back and the card re-surfaces.
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_auth(&id, true, cx));
-                }
-                ThreadEvent::ToolCall { status, .. }
-                    if !matches!(status, agent::thread::ToolCallStatus::PendingApproval) =>
-                {
-                    // Tool traffic past a parked authorization proves the run
-                    // resumed (the verdict resolved); drop the badge. The
-                    // `PendingApproval` card itself precedes the authorization
-                    // event and must not clear it.
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_auth(&id, false, cx));
-                }
-                ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_auth(&id, false, cx));
-                }
-                ThreadEvent::SteerInjected { message_id } => {
-                    this.consume_background_steer(&id, message_id);
-                }
-                ThreadEvent::PlanReady { plan_file, title } => {
-                    // A plan proposed while the thread was parked never reaches
-                    // the foreground handler: stash the review so the
-                    // switch-back restore (`attach_thread` drains `pending_plans`)
-                    // re-surfaces the verdict card, and persist the sidecar flag
-                    // so a restart re-emits PlanReady on Ready. The sidebar
-                    // keeps the blue-static wait until the verdict lands.
-                    let content = std::fs::read_to_string(plan_file).unwrap_or_default();
-                    this.pending_plans.insert(
-                        id.clone(),
-                        PendingPlanReview {
-                            plan_file: plan_file.clone(),
-                            title: title.clone(),
-                            content,
-                        },
-                    );
-                    _thread.update(cx, |t, cx| t.set_plan_review_pending(true, cx));
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.mark_pending_plan(&id, true, cx));
-                }
-                ThreadEvent::TurnFinished {
-                    cancelled,
-                    failed,
-                    stranded_steer_ids,
-                    ..
-                } => {
-                    // A cancelled/failed turn voids a stashed plan review
-                    // (mirroring the foreground demote); a normal settle keeps
-                    // it so the switch-back restore re-surfaces the card. The
-                    // pending-plan badge stays up while a review is stashed —
-                    // the card is not visible until the user switches back.
-                    if *cancelled || *failed {
-                        this.pending_plans.remove(&id);
-                    }
-                    let has_stashed_plan = this.pending_plans.contains_key(&id);
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_idle(&id, cx);
-                        if !has_stashed_plan {
-                            s.mark_pending_plan(&id, false, cx);
-                        }
-                        s.mark_pending_auth(&id, false, cx);
-                        if !*failed {
-                            s.set_errored(&id, false, cx);
-                        }
-                        s.set_unread(&id, true, cx);
-                    });
-                    // Mirror the foreground terminal bookkeeping: steers the
-                    // aborted turn never drained flip to `Failed` in the
-                    // parked stash (a late `SteerInjected` can still heal
-                    // them), and queued follow-ups only become the next turn
-                    // on a natural settle — never after a cancel.
-                    this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
-                    if !*cancelled {
-                        this.flush_parked_follow_ups(&id, cx);
-                    }
-                }
-                ThreadEvent::Error(_) => {
-                    // An errored run voids a stashed plan review (the verdict
-                    // is moot once the loop bailed out).
+        let store = store.clone();
+        cx.subscribe(&store, move |this, _store, ev: &ThreadEvent, cx| match ev {
+            ThreadEvent::TurnStarted => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_running(&id));
+            }
+            ThreadEvent::ToolCallAuthorization { .. } => {
+                // A parked thread's question card is not visible; the
+                // sidebar badge is the only signal until the user
+                // switches back and the card re-surfaces.
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, true));
+            }
+            ThreadEvent::ToolCall { status, .. }
+                if !matches!(status, agent::thread::ToolCallStatus::PendingApproval) =>
+            {
+                // Tool traffic past a parked authorization proves the run
+                // resumed (the verdict resolved); drop the badge. The
+                // `PendingApproval` card itself precedes the authorization
+                // event and must not clear it.
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, false));
+            }
+            ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, false));
+            }
+            ThreadEvent::SteerInjected { message_id } => {
+                this.consume_background_steer(&id, message_id);
+            }
+            ThreadEvent::PlanReady { plan_file, title } => {
+                // A plan proposed while the thread was parked never reaches
+                // the foreground handler: stash the review so the
+                // switch-back restore (`attach_thread` drains `pending_plans`)
+                // re-surfaces the verdict card, and persist the sidecar flag
+                // so a restart re-emits PlanReady on Ready. The sidebar
+                // keeps the blue-static wait until the verdict lands.
+                let content = std::fs::read_to_string(plan_file).unwrap_or_default();
+                this.pending_plans.insert(
+                    id.clone(),
+                    PendingPlanReview {
+                        plan_file: plan_file.clone(),
+                        title: title.clone(),
+                        content,
+                    },
+                );
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_plan(&id, true));
+            }
+            ThreadEvent::TurnFinished {
+                cancelled,
+                failed,
+                stranded_steer_ids,
+                ..
+            } => {
+                // A cancelled/failed turn voids a stashed plan review
+                // (mirroring the foreground demote); a normal settle keeps
+                // it so the switch-back restore re-surfaces the card. The
+                // pending-plan badge stays up while a review is stashed —
+                // the card is not visible until the user switches back.
+                if *cancelled || *failed {
                     this.pending_plans.remove(&id);
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_idle(&id, cx);
-                        s.mark_background_work(&id, false, cx);
-                        s.mark_pending_plan(&id, false, cx);
-                        s.mark_pending_auth(&id, false, cx);
-                        s.set_errored(&id, true, cx);
-                        s.set_unread(&id, true, cx);
-                    });
                 }
-                ThreadEvent::BackgroundTaskUpdated { .. } => {
-                    let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| {
-                        s.mark_background_work(
-                            &id,
-                            agent::background_task::thread_has_running_tasks(&id),
-                            cx,
-                        );
-                        s.set_unread(&id, true, cx);
-                    });
+                let has_stashed_plan = this.pending_plans.contains_key(&id);
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_idle(&id);
+                    if !has_stashed_plan {
+                        s.mark_pending_plan(&id, false);
+                    }
+                    s.mark_pending_auth(&id, false);
+                    if !*failed {
+                        s.set_errored(&id, false);
+                    }
+                    s.set_unread(&id, true);
+                });
+                // Mirror the foreground terminal bookkeeping: steers the
+                // aborted turn never drained flip to `Failed` in the
+                // parked stash (a late `SteerInjected` can still heal
+                // them), and queued follow-ups only become the next turn
+                // on a natural settle — never after a cancel.
+                this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
+                if !*cancelled {
+                    this.flush_parked_follow_ups(&id, cx);
                 }
-                _ => {}
-            },
-        )
+            }
+            ThreadEvent::Error(_) => {
+                // An errored run voids a stashed plan review (the verdict
+                // is moot once the loop bailed out).
+                this.pending_plans.remove(&id);
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_idle(&id);
+                    s.mark_background_work(&id, false);
+                    s.mark_pending_plan(&id, false);
+                    s.mark_pending_auth(&id, false);
+                    s.set_errored(&id, true);
+                    s.set_unread(&id, true);
+                });
+            }
+            ThreadEvent::BackgroundTaskUpdated { .. } => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_background_work(
+                        &id,
+                        agent::background_task::thread_has_running_tasks(&id),
+                    );
+                    s.set_unread(&id, true);
+                });
+            }
+            _ => {}
+        })
     }
 
     /// Flip the parked thread's `SteerPending` cards whose steers an aborted
@@ -1762,14 +1987,14 @@ impl Workspace {
     /// switch-back rebuild shows it through the thread mirror). `Queued`
     /// items coalesce into one `run_turn`, matching the foreground flush;
     /// `SteerPending`/`Failed` cards stay parked for the user.
-    fn flush_parked_follow_ups(&mut self, thread_id: &str, cx: &mut Context<Self>) {
+    fn flush_parked_follow_ups(&mut self, thread_id: &str, _cx: &mut Context<Self>) {
         let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
             return;
         };
         let Some(thread) = self
             .background_threads
             .iter()
-            .find(|b| b.entity.read(cx).id.0 == thread_id)
+            .find(|b| b.entity.read(|t| t.id.0 == thread_id))
             .map(|b| b.entity.clone())
         else {
             return;
@@ -1784,8 +2009,8 @@ impl Workspace {
                     vec![agent::language_model::MessageContent::Text(item.turn.text)];
                 content.extend(item.turn.images);
                 let ui = item.turn.ui;
-                thread.update(cx, |t, cx| {
-                    t.insert_user_message_with_content_and_ui_metadata(content, Some(ui), cx);
+                thread.with_mut(|t| {
+                    t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 });
                 flushed = true;
             } else {
@@ -1793,7 +2018,7 @@ impl Workspace {
             }
         }
         if flushed {
-            thread.update(cx, |t, cx| t.run_turn(cx));
+            thread.with_mut(|t| t.run_turn());
         }
         if retain.is_empty() {
             self.queued_follow_ups_by_thread.remove(thread_id);
@@ -1852,14 +2077,20 @@ impl Workspace {
                     this.close_external_session(id, cx);
                 }
                 SidebarEvent::ArchiveThread(id, archived) => {
-                    let is_current = this.thread.read(cx).id.0 == *id;
+                    let is_current = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.id.0 == *id)
+                        .expect("foreground store present");
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.archive_thread(id, *archived, cx));
+                    store.with_mut(|s| s.archive_thread(id, *archived));
                     // Sync the in-memory flag so the title-bar menu label stays
                     // fresh when the sidebar archives the currently active thread.
                     if is_current {
-                        this.thread
-                            .update(cx, |t, cx| t.set_archived(*archived, cx));
+                        let _ = this.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+                            session_id: sid.into(),
+                            archived: *archived,
+                        });
                     }
                     // Archiving the active thread navigates away to a fresh
                     // empty thread (Hero view) so the user doesn't stare at a
@@ -1870,14 +2101,14 @@ impl Workspace {
                 }
                 SidebarEvent::SetThreadTag(id, tag) => {
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.set_thread_tag(id, tag.clone(), cx));
+                    store.with_mut(|s| s.set_thread_tag(id, tag.clone()));
                 }
                 SidebarEvent::RemoveProject(path) => {
                     // Unregister the folder; the sidebar drops the group and
                     // its threads fall back to the loose Conversations list.
                     // Conversation history is never touched.
                     let store = agent::thread_store_global();
-                    store.update(cx, |s, cx| s.remove_project(&path.to_string_lossy(), cx));
+                    store.with_mut(|s| s.remove_project(&path.to_string_lossy()));
                 }
             },
         )
@@ -1895,13 +2126,13 @@ impl Workspace {
     ) {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let new = match &project {
-            Some(dir) => Thread::new_in_project(id, dir.clone(), cx),
-            None => Thread::new_fresh(id, self.cwd.clone(), cx),
+            Some(dir) => Thread::new_in_project(id, dir.clone()),
+            None => Thread::new_fresh(id, self.cwd.clone()),
         };
         if let Some(dir) = &project {
             Self::register_project_in_store(dir, cx);
         }
-        self.attach_thread(new, window, cx);
+        self.attach_thread(new, false, window, cx);
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -1982,8 +2213,8 @@ impl Workspace {
                     return;
                 }
             };
-            let terminal = match Terminal::new(id, self.cwd.clone(), 80, 24, pty, cx) {
-                Ok(t) => t,
+            let terminal = match Terminal::spawn(id, self.cwd.clone(), 80, 24, pty) {
+                Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to spawn terminal");
                     return;
@@ -2086,8 +2317,8 @@ impl Workspace {
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
         let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
-        let terminal = match Terminal::new(id.clone(), cwd.clone(), 80, 24, Box::new(source), cx) {
-            Ok(t) => t,
+        let terminal = match Terminal::spawn(id.clone(), cwd.clone(), 80, 24, Box::new(source)) {
+            Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for external session");
                 window.push_notification(
@@ -2212,8 +2443,8 @@ impl Workspace {
             }
         };
         let id = format!("external:{}:{}", kind.agent_id(), uuid::Uuid::new_v4());
-        let terminal = match Terminal::new(id.clone(), cwd, 80, 24, source, cx) {
-            Ok(t) => t,
+        let terminal = match Terminal::spawn(id.clone(), cwd, 80, 24, source) {
+            Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create terminal for plain session");
                 window.push_notification(
@@ -2254,7 +2485,7 @@ impl Workspace {
     /// the session so a later close detaches it before any spurious event.
     fn subscribe_session_terminal(
         &self,
-        terminal: &Entity<Terminal>,
+        terminal: &Entity<TerminalProxy>,
         id: &str,
         cx: &mut Context<Self>,
     ) -> Subscription {
@@ -2454,9 +2685,9 @@ impl Workspace {
             let _ = this.update_in(cx, |this, window, cx| {
                 let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
                 let terminal =
-                    match terminal::Terminal::new(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source), cx)
+                    match terminal::Terminal::spawn(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source))
                     {
-                        Ok(t) => t,
+                        Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
                         Err(e) => {
                             tracing::error!(error = %e, id, "failed to create resumed session terminal");
                             this.resuming_external.remove(&id);
@@ -3447,17 +3678,23 @@ impl Workspace {
         )
     }
 
-    /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
+    /// Switch to a new thread: persist the current one, build/load the new
+    /// one, re-subscribe, and rebuild the conversation view. Each thread gets
+    /// its own AgentServer session (`reopen` = `OpenSession` on an existing
+    /// thread, else `CreateSession` on a fresh one); parking a running thread
+    /// keeps its store/connection so the session stays alive and is never
+    /// cancelled.
     fn attach_thread(
         &mut self,
-        new_thread: Entity<ThreadEntity>,
+        new_thread: agent::thread::ThreadHandle,
+        reopen: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.close_turn_navigator(window, cx);
         let old_thread = self.thread.clone();
-        let old_id = old_thread.read(cx).id.0.clone();
-        let new_id = new_thread.read(cx).id.0.clone();
+        let old_id = old_thread.read(|t| t.id.0.clone());
+        let new_id = new_thread.read(|t| t.id.0.clone());
 
         // Sub-agent observation is per-thread ephemeral state; drop the
         // outgoing thread's panels and transcripts before rebinding.
@@ -3516,35 +3753,94 @@ impl Workspace {
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
         // held by `self.thread`; overwriting that field would drop it and
         // silently kill the turn via `WeakEntity::upgrade() -> None`).
-        if (old_thread.read(cx).is_running()
+        // Park a still-running old thread in the background. Its store,
+        // connection and session are carried along (never `DisposeSession` —
+        // that would cancel the running turn): reclaim re-attaches them and
+        // the sidebar badges read them. An idle old thread's session has no
+        // activity to preserve, so its store is simply dropped.
+        let old_running = (old_thread.read(|t| t.is_running())
             || agent::background_task::thread_has_running_tasks(&old_id))
-            && old_id != new_id
-        {
+            && old_id != new_id;
+        if old_running {
             // Seed the live-state sets for whatever is still in flight: the
             // background subscription below reacts only to future events, so a
             // turn that started (or a monitor / task that spawned) while this
             // thread was foreground would otherwise never reach the sidebar's
             // running indicator. A task-only thread (no turn) gets the
             // background-work seed, not the running one.
-            if old_thread.read(cx).is_running() {
+            if old_thread.read(|t| t.is_running()) {
                 let store = agent::thread_store_global();
-                store.update(cx, |s, cx| s.mark_running(&old_id, cx));
+                store.with_mut(|s| s.mark_running(&old_id));
             }
             if agent::background_task::thread_has_running_tasks(&old_id) {
                 let store = agent::thread_store_global();
-                store.update(cx, |s, cx| s.mark_background_work(&old_id, true, cx));
+                store.with_mut(|s| s.mark_background_work(&old_id, true));
             }
-            let sub = self.subscribe_background_thread(old_thread.clone(), cx);
+            let old_store = self.store.take();
+            let old_conn = self.client_conn.take();
+            let old_sid = self.session_id.take();
+            let sub = self.subscribe_background_thread(
+                old_store
+                    .as_ref()
+                    .expect("a parked running thread always has a store"),
+                old_id.clone(),
+                cx,
+            );
             self.background_threads.push(BackgroundThread {
                 entity: old_thread,
+                store: old_store,
+                client_conn: old_conn,
+                session_id: old_sid,
                 _sub: sub,
             });
+        } else if old_id != new_id {
+            // Idle switch: the outgoing session has nothing in flight. The
+            // AgentServer removes the owner on disconnect; the thread persists
+            // in the db for a later `OpenSession`.
+            self.store = None;
+            self.client_conn = None;
+            self.session_id = None;
+        }
+
+        // If the new thread was previously parked in the background, reclaim it
+        // (entity + store + connection) so it becomes the foreground thread
+        // and is no longer double-held.
+        if let Some(pos) = self
+            .background_threads
+            .iter()
+            .position(|b| b.entity.read(|t| t.id.0 == new_id))
+        {
+            let bg = self.background_threads.remove(pos);
+            self.store = bg.store;
+            self.client_conn = bg.client_conn;
+            self.session_id = bg.session_id;
+        }
+
+        // A brand-new foreground thread gets its own session: `reopen` binds
+        // an existing thread via `OpenSession` (history arrives as
+        // `ServerNote`s), otherwise a fresh one via `CreateSession`.
+        if self.store.is_none() {
+            let server = self.agent_server.clone();
+            let new_sid = new_id.clone();
+            let cwd = thread_cwd(&new_thread, &None, cx)
+                .unwrap_or_default()
+                .to_string();
+            let mut conn_slot: Option<manox_protocol::InProcessConnection> = None;
+            let store = cx.new(|cx| {
+                let (handle, conn) =
+                    ClientStoreHandle::for_session(&server, &new_sid, &cwd, reopen, cx);
+                conn_slot = Some(conn);
+                handle
+            });
+            self.store = Some(store);
+            self.client_conn = conn_slot;
+            self.session_id = Some(new_sid);
         }
 
         // If the new thread was previously parked in the background, reclaim it
         // so it becomes the foreground thread and is no longer double-held.
         self.background_threads
-            .retain(|b| b.entity.read(cx).id.0 != new_id);
+            .retain(|b| b.entity.read(|t| t.id.0 != new_id));
 
         // Persist the old thread's current state before switching away. The
         // spawned-task save backstop in `run_turn` will persist again when the
@@ -3553,17 +3849,77 @@ impl Workspace {
         self.thread = new_thread;
         // The chips derive from the bound thread's authoritative mirror; the
         // previous thread's suites never bleed across the switch.
-        self.active_browser_suites = self.thread.read(cx).browser_suites().to_vec();
-        let id = self.thread.read(cx).id.0.clone();
-        let messages: Vec<agent::Message> = self.thread.read(cx).messages().to_vec();
-        let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
-        let usage = self.thread.read(cx).request_token_usage().clone();
-        let background_tasks = self.thread.read(cx).background_task_snapshots();
+        self.active_browser_suites = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.browser_suites.clone())
+            .expect("foreground store present");
+        let id = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.id.0.clone())
+            .expect("foreground store present");
+        let messages: Vec<agent::Message> = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.messages.clone())
+            .expect("foreground store present");
+        let display: Vec<agent::db::HistoryEntry> = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                serde_json::from_value::<Vec<agent::db::HistoryEntry>>(
+                    s.read(cx).store.display_history.clone(),
+                )
+                .ok()
+            })
+            .expect("foreground store present");
+        let usage = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .per_request_usage
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            agent::TokenUsage {
+                                input_tokens: v.input,
+                                output_tokens: v.output,
+                                cache_creation_input_tokens: v.cache_creation,
+                                cache_read_input_tokens: v.cache_read,
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .expect("foreground store present");
+        let background_tasks = self
+            .store
+            .as_ref()
+            .map(|s| {
+                s.read(cx)
+                    .store
+                    .background_tasks
+                    .iter()
+                    .filter_map(|t| {
+                        serde_json::from_value::<agent::background_task::TaskSnapshot>(t.clone())
+                            .ok()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .expect("foreground store present");
         let role = self.model_label(cx);
-        let recipient = self.recipient_author(cx);
+        let recipient = self.recipient_author();
         let weak = cx.weak_entity();
-        let running = self.thread.read(cx).is_running();
-        let cwd = thread_cwd(&self.thread, cx);
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present");
+        let cwd = thread_cwd(&self.thread, &self.store, cx);
         let new_conv = cx.new(|cx| {
             let mut conversation = ConversationState::rebuild_from_display(
                 &display,
@@ -3648,8 +4004,12 @@ impl Workspace {
         // calls, falling back to the independent sidecar snapshot (the facade
         // mirrors the persisted copy on every `PlanUpdated` / `Ready`).
         let new_thread_for_rail = self.thread.clone();
-        let restored_plan = agent::plan::rebuild_from_messages(&messages)
-            .or_else(|| self.thread.read(cx).persisted_plan().cloned());
+        let restored_plan = agent::plan::rebuild_from_messages(&messages).or_else(|| {
+            self.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
+                .and_then(|v| serde_json::from_value::<agent::plan::PlanSnapshot>(v.clone()).ok())
+        });
         self.context_rail.update(cx, |r, cx| {
             // Rebind the rail to the incoming thread. Without this the rail
             // keeps reading the construction-time thread's `per_model` usage /
@@ -3676,9 +4036,9 @@ impl Workspace {
         // carried from a prior background completion, and any pending-auth
         // badge (the verdict card re-surfaced below if one is outstanding).
         let store = agent::thread_store_global();
-        store.update(cx, |s, cx| {
-            s.set_unread(&id, false, cx);
-            s.mark_pending_auth(&id, false, cx);
+        store.with_mut(|s| {
+            s.set_unread(&id, false);
+            s.mark_pending_auth(&id, false);
         });
         // The incoming thread's cwd / worktree may differ from the outgoing
         // one; refresh the rail's git stats/branch display for it.
@@ -3732,8 +4092,15 @@ impl Workspace {
         let entity = cx.entity().clone();
         let refresh_gen = self.git_status_gen;
         let rail = self.context_rail.clone();
-        let cwd = self.thread.read(cx).cwd().to_path_buf();
-        let worktree_branch = self.thread.read(cx).worktree().map(|w| w.branch.clone());
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .expect("foreground store present");
+        let worktree_branch = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.branch.clone());
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
             // file writes into a single git call.
@@ -3773,8 +4140,7 @@ impl Workspace {
         // back. Every interaction surfaces as the AskUserQuestion card.
         let entries: Vec<(String, String, String, serde_json::Value)> = self
             .thread
-            .read(cx)
-            .pending_auth_entries()
+            .read(|t| t.pending_auth_entries())
             .into_iter()
             .map(|(id, meta)| (id, meta.tool_name, meta.summary, meta.input))
             .collect();
@@ -3862,13 +4228,25 @@ impl Workspace {
     /// stranding a user verdict). Marks the thread archived and persists via
     /// the store, which refreshes the sidebar list.
     fn archive_active_thread_if_idle(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.thread.read(cx).is_running() {
+        if self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present")
+        {
             return false;
         }
-        let id = self.thread.read(cx).id.0.clone();
-        self.thread.update(cx, |t, cx| t.set_archived(true, cx));
+        let id = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.id.0.clone())
+            .expect("foreground store present");
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::ArchiveThread {
+            session_id: sid.into(),
+            archived: true,
+        });
         let store = agent::thread_store_global();
-        store.update(cx, |s, cx| s.archive_thread(&id, true, cx));
+        store.with_mut(|s| s.archive_thread(&id, true));
         true
     }
 
@@ -3886,25 +4264,47 @@ impl Workspace {
             return;
         }
         let old = self.thread.clone();
-        let cwd = old.read(cx).cwd().to_path_buf();
-        let project = old.read(cx).project().cloned();
-        let model = old.read(cx).model().cloned();
-        let effort = old.read(cx).reasoning_effort();
-        let permission = old.read(cx).permission_mode();
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .unwrap_or_else(|| old.read(|t| t.cwd().to_path_buf()));
+        let project = self
+            .store
+            .as_ref()
+            .and_then(|s| {
+                s.read(cx)
+                    .store
+                    .project
+                    .clone()
+                    .map(std::path::PathBuf::from)
+            })
+            .or_else(|| old.read(|t| t.project().cloned()));
+        let model = old.read(|t| t.model().cloned());
+        let effort = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.reasoning_effort)
+            .unwrap_or_else(|| old.read(|t| t.reasoning_effort()));
+        let permission = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.permission_mode)
+            .unwrap_or_else(|| old.read(|t| t.permission_mode()));
         let new = match &project {
             Some(dir) => {
-                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone(), cx)
+                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
             }
-            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
+            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
         };
-        new.update(cx, |t, cx| {
+        new.with_mut(|t| {
             if let Some(model) = model {
-                t.set_model(model, cx);
+                t.set_model(model.clone());
             }
-            t.set_reasoning_effort(effort, cx);
-            t.set_permission_mode(permission, cx);
+            t.set_reasoning_effort(effort);
+            t.set_permission_mode(permission);
         });
-        self.attach_thread(new, window, cx);
+        self.attach_thread(new, false, window, cx);
     }
 
     /// Park the active thread into the background (preserving its run + event
@@ -3915,10 +4315,21 @@ impl Workspace {
     /// thread is moved into `background_threads` with a terminal-`Stop`/`Error`
     /// subscription that flips its sidebar row to idle + unread when it lands.
     fn background_current_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.thread.read(cx).is_running() {
+        if !self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present")
+        {
             return;
         }
-        let project = self.thread.read(cx).project().cloned();
+        let project = self.store.as_ref().and_then(|s| {
+            s.read(cx)
+                .store
+                .project
+                .clone()
+                .map(std::path::PathBuf::from)
+        });
         self.start_new_thread(project, window, cx);
     }
 
@@ -3928,23 +4339,29 @@ impl Workspace {
         if let Some(pos) = self
             .background_threads
             .iter()
-            .position(|b| b.entity.read(cx).id.0 == id)
+            .position(|b| b.entity.read(|t| t.id.0 == id))
         {
-            let thread = self.background_threads.remove(pos).entity;
-            self.attach_thread(thread, window, cx);
+            let bg = self.background_threads.remove(pos);
+            self.attach_thread(bg.entity, true, window, cx);
             return;
         }
         let store = self.sidebar.read(cx).store();
-        let Some(loaded) = store.update(cx, |s, cx| s.load_thread(&id, cx)) else {
+        let Some(loaded) = store.with_mut(|s| s.load_thread(&id)) else {
             return;
         };
-        self.attach_thread(loaded, window, cx);
+        self.attach_thread(loaded, true, window, cx);
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // History is still loading: nothing may be submitted (the composer is
         // hidden, this guard covers keyboard paths that bypass the render).
-        if self.thread.read(cx).history_phase().is_loading() {
+        if self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.history_phase)
+            .expect("foreground store present")
+            .is_loading()
+        {
             return;
         }
         let text = self.input_state.read(cx).value().to_string();
@@ -3986,7 +4403,11 @@ impl Workspace {
         // while a turn is running is parked in the follow-up queue as raw text
         // rather than interrupting the run (e.g. `/clear` mid-turn would race
         // the streaming conversation). The queued text flushes at turn end.
-        if !self.thread.read(cx).is_running()
+        if !self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present")
             && attachments.is_empty()
             && let Some(parsed) = crate::slash_command::parse(&text)
         {
@@ -4119,10 +4540,6 @@ impl Workspace {
         // body is the model-facing text, and `display_text` keeps the bubble
         // showing the compact `/key args` invocation after a reload — the same
         // form the live view shows at send time.
-        let ui = agent::MessageUiMetadata {
-            display_text: Some(display_text.clone()),
-            ..Self::message_ui_metadata(&meta)
-        };
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
             c.push_user(display_text, Vec::new(), meta, weak, cx)
@@ -4130,24 +4547,31 @@ impl Workspace {
         self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
-        let hit = self.thread.update(cx, |thread, cx| match kind {
-            RegistryTurnKind::Command => thread.submit_command(key, args, Some(ui.clone()), cx),
-            RegistryTurnKind::Skill => thread.submit_skill(key, args, Some(ui), cx),
-        });
-        if !hit {
+        let hit = match kind {
+            RegistryTurnKind::Command => {
+                agent::command::try_global().is_some_and(|r| r.get(key).is_some())
+            }
+            RegistryTurnKind::Skill => {
+                agent::skill::try_global().is_some_and(|r| r.get(key).is_some())
+            }
+        };
+        if hit {
+            let submit_text = format!("/{key} {args}");
+            let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+                session_id: sid.into(),
+                text: submit_text,
+                images: Vec::new(),
+                client_id: None,
+            });
+        } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
                 RegistryTurnKind::Skill => "workspace-unknown-skill",
             };
-            self.thread.update(cx, |_, cx| {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!(
-                    "{}",
-                    i18n::t_str(i18n_key, &[("name", key)])
-                )));
-            });
+            tracing::warn!("unknown {}", i18n::t_str(i18n_key, &[("name", key)]));
         }
         // Persist on submit so the sidebar shows the new entry immediately.
-        refresh_thread_list(cx);
+        refresh_thread_list();
         cx.notify();
     }
 
@@ -4171,7 +4595,12 @@ impl Workspace {
         };
         // A turn is running — every new message first parks as a visible
         // follow-up. Steering is an explicit per-item action.
-        if self.thread.read(cx).is_running() {
+        if self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present")
+        {
             self.queued_follow_ups.push_back(QueuedFollowUp {
                 turn,
                 state: FollowUpState::Queued,
@@ -4186,8 +4615,7 @@ impl Workspace {
         // lingering Implement button would act on the now-outdated plan text.
         let dismissed_plan = self.pending_plan_review.take();
         if let Some(review) = dismissed_plan.as_ref() {
-            self.thread
-                .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
+            self.thread.with_mut(|t| t.set_plan_review_pending(false));
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
             // The demoted plan card stays in place but flips inactive —
@@ -4210,40 +4638,7 @@ impl Workspace {
         // The conversation exists the moment the message is sent: refresh
         // the sidebar list now (the transcript-side refresh on the user
         // MessageEnd notice then fills in the summary text).
-        refresh_thread_list(cx);
-    }
-
-    /// Push a user turn into the conversation UI and the thread's message
-    /// history without starting a turn. Used to batch drained follow-ups into a
-    /// single follow-up turn.
-    fn append_user_turn(
-        &mut self,
-        turn: DeferredUserTurn,
-        weak: WeakEntity<Workspace>,
-        follow_tail: bool,
-        cx: &mut Context<Self>,
-    ) {
-        use agent::language_model::MessageContent;
-        self.conversation.update(cx, |c, cx| {
-            c.push_user(turn.text.clone(), turn.user_images, turn.meta, weak, cx)
-        });
-        self.sync_list_count(cx);
-        // Re-engage tail-follow so the streaming reply stays pinned as it grows.
-        if follow_tail {
-            self.follow_message_tail();
-        }
-        self.thread.update(cx, |thread, cx| {
-            if turn.images.is_empty() {
-                thread.insert_user_message_with_ui_metadata(turn.text, Some(turn.ui), cx);
-            } else {
-                let mut content = Vec::with_capacity(turn.images.len() + 1);
-                if !turn.text.trim().is_empty() {
-                    content.push(MessageContent::Text(turn.text));
-                }
-                content.extend(turn.images);
-                thread.insert_user_message_with_content_and_ui_metadata(content, Some(turn.ui), cx);
-            }
-        });
+        refresh_thread_list();
     }
 
     /// Hand a parked follow-up to the thread's steer queue — the running turn
@@ -4254,7 +4649,7 @@ impl Workspace {
     fn enqueue_steer_pending(
         &mut self,
         turn: &mut DeferredUserTurn,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> String {
         use agent::language_model::MessageContent;
         let mut content = Vec::with_capacity(turn.images.len() + 1);
@@ -4268,7 +4663,7 @@ impl Workspace {
         // later retries as an idle fresh turn carries no badge — it was never
         // actually injected.
         self.thread
-            .update(cx, |thread, cx| thread.enqueue_steer(content, Some(ui), cx))
+            .with_mut(|thread| thread.enqueue_steer(content, Some(ui)))
     }
 
     fn consume_background_steer(&mut self, thread_id: &str, message_id: &str) {
@@ -4319,11 +4714,43 @@ impl Workspace {
         weak: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        self.append_user_turn(turn, weak, true, cx);
-        self.thread.update(cx, |thread, cx| thread.run_turn(cx));
-        // Persist on submit so the sidebar shows the new entry immediately.
-        refresh_thread_list(cx);
-        cx.notify();
+        use agent::language_model::MessageContent;
+        use base64::Engine as _;
+        // UI state tracking (always) — conversation bubble + list housekeeping.
+        self.conversation.update(cx, |c, cx| {
+            c.push_user(
+                turn.text.clone(),
+                turn.user_images.clone(),
+                turn.meta.clone(),
+                weak,
+                cx,
+            )
+        });
+        self.sync_list_count(cx);
+        self.follow_message_tail();
+        // Dual-path: protocol Submit (kernel inserts + runs) vs direct insert + run.
+        let attachments: Vec<manox_protocol::ImageAttachment> = turn
+            .images
+            .iter()
+            .filter_map(|c| match c {
+                MessageContent::Image { data, mime_type } => {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .ok()
+                        .map(|bytes| manox_protocol::ImageAttachment {
+                            data: bytes,
+                            mime_type: mime_type.clone(),
+                        })
+                }
+                _ => None,
+            })
+            .collect();
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+            session_id: sid.into(),
+            text: turn.text.clone(),
+            images: attachments,
+            client_id: None,
+        });
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -4335,28 +4762,74 @@ impl Workspace {
         if self.queued_follow_ups.is_empty() {
             return;
         }
+        use agent::language_model::MessageContent;
+        use base64::Engine as _;
         let weak = cx.weak_entity();
+        let follow_tail = self.list_state.is_following_tail();
         let mut retain: Vec<QueuedFollowUp> = Vec::new();
-        let mut drained = false;
+        let mut drained_turns: Vec<DeferredUserTurn> = Vec::new();
         while let Some(item) = self.queued_follow_ups.pop_front() {
             match item.state {
                 FollowUpState::Queued => {
-                    self.append_user_turn(
-                        item.turn,
-                        weak.clone(),
-                        self.list_state.is_following_tail(),
-                        cx,
-                    );
-                    drained = true;
+                    self.conversation.update(cx, |c, cx| {
+                        c.push_user(
+                            item.turn.text.clone(),
+                            item.turn.user_images.clone(),
+                            item.turn.meta.clone(),
+                            weak.clone(),
+                            cx,
+                        )
+                    });
+                    self.sync_list_count(cx);
+                    if follow_tail {
+                        self.follow_message_tail();
+                    }
+                    drained_turns.push(item.turn);
                 }
                 _ => retain.push(item),
             }
         }
         self.queued_follow_ups.extend(retain);
-        if drained {
-            self.thread.update(cx, |thread, cx| thread.run_turn(cx));
-            refresh_thread_list(cx);
+        if drained_turns.is_empty() {
+            cx.notify();
+            return;
         }
+        let n = drained_turns.len();
+        for (i, turn) in drained_turns.into_iter().enumerate() {
+            let attachments: Vec<manox_protocol::ImageAttachment> = turn
+                .images
+                .iter()
+                .filter_map(|c| match c {
+                    MessageContent::Image { data, mime_type } => {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data.as_bytes())
+                            .ok()
+                            .map(|bytes| manox_protocol::ImageAttachment {
+                                data: bytes,
+                                mime_type: mime_type.clone(),
+                            })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if i + 1 < n {
+                // All but the last: insert without running.
+                let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUserMessage {
+                    session_id: sid.into(),
+                    text: turn.text.clone(),
+                    images: attachments,
+                });
+            } else {
+                // Last: insert + start the turn.
+                let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+                    session_id: sid.into(),
+                    text: turn.text.clone(),
+                    images: attachments,
+                    client_id: None,
+                });
+            }
+        }
+        refresh_thread_list();
         cx.notify();
     }
 
@@ -4428,7 +4901,11 @@ impl Workspace {
     /// immediately move an optimistic bubble into the message list. While idle,
     /// send it as a fresh ordinary turn.
     fn steer_follow_up(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let running = self.thread.read(cx).is_running();
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present");
         let Some(mut item) = self.queued_follow_ups.remove(idx) else {
             return;
         };
@@ -4449,7 +4926,7 @@ impl Workspace {
                 // Drop the stranded message so its id can never drain into a
                 // later turn (no-op if the loop already cleared the queue).
                 self.thread
-                    .update(cx, |thread, _cx| thread.cancel_pending_steer(&message_id));
+                    .with_mut(|thread| thread.cancel_pending_steer(&message_id));
                 if running {
                     let id = self.enqueue_steer_pending(&mut item.turn, cx);
                     self.push_pending_steer_bubble(&item.turn, &id, cx);
@@ -4483,7 +4960,7 @@ impl Workspace {
             };
             if let Some(id) = steer_id {
                 self.thread
-                    .update(cx, |thread, _cx| thread.cancel_pending_steer(&id));
+                    .with_mut(|thread| thread.cancel_pending_steer(&id));
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
@@ -4502,7 +4979,7 @@ impl Workspace {
             };
             if let Some(id) = steer_id {
                 self.thread
-                    .update(cx, |thread, _cx| thread.cancel_pending_steer(&id));
+                    .with_mut(|thread| thread.cancel_pending_steer(&id));
                 self.conversation.update(cx, |conversation, cx| {
                     conversation.rollback_pending_steer(&id, cx);
                 });
@@ -4604,7 +5081,11 @@ impl Workspace {
     /// mutation primitives (tab activate/close, visibility toggle) call this,
     /// so the persisted row tracks the pane on every change.
     fn persist_right_pane(&mut self, cx: &mut Context<Self>) {
-        let thread_id = self.thread.read(cx).id.0.clone();
+        let thread_id = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.id.0.clone())
+            .expect("foreground store present");
         let persisted = self.persisted_right_pane(cx);
         let json = match serde_json::to_string(&persisted) {
             Ok(j) => j,
@@ -4613,7 +5094,7 @@ impl Workspace {
                 return;
             }
         };
-        let db = agent::thread_store_global().read(cx).db().clone();
+        let db = agent::thread_store_global().read(|s| s.db().clone());
         if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
             tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
         }
@@ -4629,7 +5110,7 @@ impl Workspace {
             .inspect_err(|e| tracing::warn!(error = %e, "serialize right pane failed"))
             .ok();
         if let Some(json) = json {
-            let db = agent::thread_store_global().read(cx).db().clone();
+            let db = agent::thread_store_global().read(|s| s.db().clone());
             if let Err(e) = db.upsert_right_pane(&thread_id, &json) {
                 tracing::warn!(error = %e, thread_id = %thread_id, "persist right pane failed");
             }
@@ -4681,10 +5162,8 @@ impl Workspace {
                 }
             }
             None => {
-                let loaded = agent::thread_store_global()
-                    .read(cx)
-                    .db()
-                    .load_right_pane(thread_id);
+                let loaded =
+                    agent::thread_store_global().read(|s| s.db().load_right_pane(thread_id));
                 let persisted = match loaded {
                     Ok(Some(json)) => match serde_json::from_str::<PersistedRightPane>(&json) {
                         Ok(p) => Some(p),
@@ -4766,7 +5245,7 @@ impl Workspace {
             cx.new(|cx| crate::views::browser_view::BrowserView::new(tab_id, url, window, cx));
         self.browser_views.insert(tab_id, view);
         if let Some(host) = crate::browser_host::WorkspaceBrowserHost::concrete() {
-            host.register_ui_tab(tab_id, self.thread.downgrade());
+            host.register_ui_tab(tab_id);
         }
         self.spawn_browser_title_ticker(cx);
         tab_id
@@ -4880,11 +5359,15 @@ impl Workspace {
     /// spawn paths fall back to the workspace cwd, parity with the
     /// Conversations-header spawns).
     fn launcher_thread_cwd(&self, cx: &App) -> Option<PathBuf> {
-        let cwd = self.thread.read(cx).cwd();
+        let cwd = self
+            .store
+            .as_ref()
+            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+            .expect("foreground store present");
         if cwd.as_os_str().is_empty() {
             None
         } else {
-            Some(cwd.to_path_buf())
+            Some(cwd)
         }
     }
 
@@ -5153,9 +5636,10 @@ impl Workspace {
     /// reload when no live transcript was accumulated.
     fn agent_final_text(&self, id: &str, cx: &App) -> Option<String> {
         use agent::language_model::MessageContent;
-        self.thread
-            .read(cx)
-            .messages()
+        self.store
+            .as_ref()
+            .map(|s| s.read(cx).store.messages.clone())
+            .expect("foreground store present")
             .iter()
             .flat_map(|m| m.content.iter())
             .find_map(|c| match c {
@@ -5254,26 +5738,34 @@ impl Workspace {
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
         if !editor_can_submit(
-            self.thread.read(cx).history_phase().is_loading(),
-            self.thread.read(cx).is_running(),
+            self.store
+                .as_ref()
+                .map(|s| s.read(cx).store.history_phase)
+                .expect("foreground store present")
+                .is_loading(),
+            self.store
+                .as_ref()
+                .map(|s| s.read(cx).store.running)
+                .expect("foreground store present"),
             self.pending_ask.is_some(),
             &text,
         ) {
             return;
         }
         let meta = self.user_turn_meta(cx);
-        let ui = Self::message_ui_metadata(&meta);
         let weak = cx.weak_entity();
         self.conversation.update(cx, |c, cx| {
             c.push_user(text.clone(), Vec::new(), meta, weak, cx)
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        self.thread.update(cx, |thread, cx| {
-            thread.insert_user_message_with_ui_metadata(text, Some(ui), cx);
-            thread.run_turn(cx);
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
+            session_id: sid.into(),
+            text: text.clone(),
+            images: Vec::new(),
+            client_id: None,
         });
-        refresh_thread_list(cx);
+        refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -5298,12 +5790,16 @@ impl Workspace {
     /// The agent whose conversation this workspace renders — every user
     /// bubble's header `to`. `lead`-labeled threads show the localized Captain
     /// label; a team member thread shows its own member name.
-    fn recipient_author(&self, cx: &App) -> agent::MessageAuthor {
-        self.thread.read(cx).self_author()
+    fn recipient_author(&self) -> agent::MessageAuthor {
+        self.thread.read(|t| t.self_author())
     }
 
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
-        let permission_mode = self.thread.read(cx).permission_mode();
+        let permission_mode = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.permission_mode)
+            .expect("foreground store present");
         UserTurnMeta::new(
             chrono::Utc::now().timestamp(),
             self.model_label(cx),
@@ -5323,12 +5819,11 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
+    pub(crate) fn model_label(&self, _cx: &mut Context<Self>) -> String {
         {
             self.thread
-                .read(cx)
-                .model()
-                .map(agent::pi_providers::display_name)
+                .read(|t| t.model().cloned())
+                .map(|model| agent::pi_providers::display_name(&model))
                 .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
         }
     }
@@ -5376,7 +5871,7 @@ impl Workspace {
         kind: agent::db::UiNoteKind,
         text: String,
         tool_call_id: Option<&str>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         let mut data = serde_json::json!({ "text": text });
         // A tool-anchored notice carries the tool call id so the rebuild can
@@ -5385,8 +5880,15 @@ impl Workspace {
         if let Some(id) = tool_call_id {
             data["tool_call_id"] = serde_json::Value::String(id.to_owned());
         }
-        self.thread.update(cx, |t, _| {
-            t.append_ui_note(agent::db::UiNoteRecord { kind, data })
+        let kind_str = match kind {
+            agent::db::UiNoteKind::Error => "error",
+            agent::db::UiNoteKind::Notice => "notice",
+            agent::db::UiNoteKind::PlanReview => "plan_review",
+        };
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::AppendUiNote {
+            session_id: sid.into(),
+            kind: kind_str.into(),
+            data: data.clone(),
         });
     }
 
@@ -5403,12 +5905,21 @@ impl Workspace {
         self.pending_auth = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
-        self.thread.update(cx, |thread, cx| {
-            thread.respond_authorization(
-                &id,
-                agent::ToolAuthorizationResponse::Decision(decision),
-                cx,
-            );
+        let allow = matches!(decision, PermissionDecision::AllowOnce);
+        if let Some(msg_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
+            && let Some(conn) = &self.client_conn
+        {
+            conn.send_to_server(manox_protocol::FromClient::Reply {
+                id: msg_id,
+                outcome: Ok(serde_json::json!({ "allow": allow })),
+            });
+            return;
+        }
+        self.thread.with_mut(|thread| {
+            thread.respond_authorization(&id, agent::ToolAuthorizationResponse::Decision(decision));
         });
         cx.notify();
     }
@@ -5487,7 +5998,13 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
-        if self.thread.read(cx).history_phase().is_loading() {
+        if self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.history_phase)
+            .expect("foreground store present")
+            .is_loading()
+        {
             return false;
         }
         if running {
@@ -5576,11 +6093,25 @@ impl Workspace {
         self.pending_ask = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
-        self.thread.update(cx, |thread, cx| {
+        if let Some(msg_id) = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
+            && let Some(conn) = &self.client_conn
+        {
+            conn.send_to_server(manox_protocol::FromClient::Reply {
+                id: msg_id,
+                outcome: Ok(serde_json::json!({
+                    "answers": answers,
+                    "response": response,
+                })),
+            });
+            return;
+        }
+        self.thread.with_mut(|thread| {
             thread.respond_authorization(
                 &id,
                 agent::ToolAuthorizationResponse::AskUserQuestion { answers, response },
-                cx,
             );
         });
         cx.notify();
@@ -5588,8 +6119,8 @@ impl Workspace {
 
     /// Abort the current turn.
     pub(crate) fn cancel_turn(&mut self, cx: &mut Context<Self>) {
-        self.thread.update(cx, |thread, cx| {
-            thread.cancel(cx);
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::CancelTurn {
+            session_id: sid.into(),
         });
         cx.notify();
     }
@@ -5602,12 +6133,33 @@ impl Workspace {
     /// simply keeps typing.
     /// Plan mode active on the current thread (drives the composer chip).
     pub(crate) fn thread_plan_mode(&self, cx: &mut Context<Self>) -> bool {
-        self.thread.read(cx).plan_mode()
+        self.store
+            .as_ref()
+            .map(|s| s.read(cx).store.plan_mode)
+            .expect("foreground store present")
+    }
+
+    /// Send a `ClientNote` to the AgentServer when the landing-thread
+    /// connection is available (γ-3 mutation path). Returns `true` when the
+    /// note was sent; the caller falls back to `self.thread.update` when `false`.
+    pub(crate) fn send_note(
+        &self,
+        note_fn: impl FnOnce(&str) -> manox_protocol::ClientNote,
+    ) -> bool {
+        if let (Some(conn), Some(sid)) = (&self.client_conn, &self.session_id) {
+            conn.send_to_server(manox_protocol::FromClient::Notification { note: note_fn(sid) });
+            true
+        } else {
+            false
+        }
     }
 
     /// Toggle plan mode on the current thread (persisted by the engine).
-    pub(crate) fn set_thread_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.thread.update(cx, |t, cx| t.set_plan_mode(enabled, cx));
+    pub(crate) fn set_thread_plan_mode(&mut self, enabled: bool, _cx: &mut Context<Self>) {
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetPlanMode {
+            session_id: sid.into(),
+            enabled,
+        });
     }
 
     /// The user's verdict on a proposed plan (oh-my-pi's four options):
@@ -5627,10 +6179,13 @@ impl Workspace {
         // Every verdict consumes the card; clear the persisted pending flag
         // and release the sidebar's plan-wait state. Capture the id before
         // `ExecuteFresh` swaps in a new thread below.
-        let thread_id = self.thread.read(cx).id.0.clone();
-        self.thread
-            .update(cx, |t, cx| t.set_plan_review_pending(false, cx));
-        agent::thread_store_global().update(cx, |s, cx| s.mark_pending_plan(&thread_id, false, cx));
+        let thread_id = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.id.0.clone())
+            .expect("foreground store present");
+        self.thread.with_mut(|t| t.set_plan_review_pending(false));
+        agent::thread_store_global().with_mut(|s| s.mark_pending_plan(&thread_id, false));
         if matches!(choice, PlanReviewChoice::Refine) {
             // Keep plan mode ON: demote the card and prompt for feedback.
             // The feedback turn runs under the plan-mode instructions; the
@@ -5647,7 +6202,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let lang = self.thread.read(cx).agent_language();
+        let lang = agent::settings::load().resolve().agent;
         let seed_text =
             match agent::collaboration_mode::render_plan_mode_approved(lang, &review.plan_file) {
                 Ok(text) => text,
@@ -5670,31 +6225,57 @@ impl Workspace {
             // seeded with the execution directive. The plan file persists on
             // disk, so the new thread reads it from the path — no inline
             // plan-text copy in the transcript.
-            let old_id = self.thread.read(cx).id.0.clone();
-            let cwd = self.thread.read(cx).cwd().to_path_buf();
-            let project = self.thread.read(cx).project().cloned();
-            let model = self.thread.read(cx).model().cloned();
-            let effort = self.thread.read(cx).reasoning_effort();
-            let permission = self.thread.read(cx).permission_mode();
-            let new = match &project {
-                Some(dir) => Thread::new_in_project(
-                    ThreadId(uuid::Uuid::new_v4().to_string()),
-                    dir.clone(),
-                    cx,
-                ),
-                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd, cx),
-            };
-            new.update(cx, |t, cx| {
-                if let Some(model) = model {
-                    t.set_model(model, cx);
-                }
-                t.set_reasoning_effort(effort, cx);
-                t.set_permission_mode(permission, cx);
-                t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui), cx);
+            let old_id = self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.id.0.clone())
+                .expect("foreground store present");
+            let cwd = self
+                .store
+                .as_ref()
+                .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+                .expect("foreground store present");
+            let project = self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .project
+                    .clone()
+                    .map(std::path::PathBuf::from)
             });
-            self.attach_thread(new, window, cx);
-            refresh_thread_list(cx);
-            agent::thread_store_global().update(cx, |s, cx| s.archive_thread(&old_id, true, cx));
+            let model = self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .model
+                    .clone()
+                    .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+            });
+            let effort = self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.reasoning_effort)
+                .expect("foreground store present");
+            let permission = self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.permission_mode)
+                .expect("foreground store present");
+            let new = match &project {
+                Some(dir) => {
+                    Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
+                }
+                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
+            };
+            new.with_mut(|t| {
+                if let Some(model) = model {
+                    t.set_model(model);
+                }
+                t.set_reasoning_effort(effort);
+                t.set_permission_mode(permission);
+                t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui));
+            });
+            self.attach_thread(new, false, window, cx);
+            refresh_thread_list();
+            agent::thread_store_global().with_mut(|s| s.archive_thread(&old_id, true));
         } else {
             // Compact/keep-context: the engine exits plan mode, optionally
             // compacts the planning context toward the plan file, then runs
@@ -5715,9 +6296,28 @@ impl Workspace {
             let compact_instructions = compact.then(|| {
                 agent::collaboration_mode::plan_compact_instructions(lang, &review.plan_file)
             });
-            self.thread.update(cx, |thread, cx| {
-                thread.approve_plan(compact, compact_instructions, seed_text, Some(ui), cx);
-            });
+            let choice_str = match choice {
+                PlanReviewChoice::ExecuteCompact => "execute_compact",
+                PlanReviewChoice::ExecuteKeep => "execute_keep",
+                _ => "execute_keep",
+            };
+            if let Some(msg_id) = self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .pending_plan_verdict
+                    .get(&review.plan_file)
+                    .cloned()
+            }) && let Some(conn) = &self.client_conn
+            {
+                conn.send_to_server(manox_protocol::FromClient::Reply {
+                    id: msg_id,
+                    outcome: Ok(serde_json::json!({ "choice": choice_str })),
+                });
+            } else {
+                self.thread.with_mut(|thread| {
+                    thread.approve_plan(compact, compact_instructions, seed_text, Some(ui));
+                });
+            }
         }
         cx.notify();
     }
@@ -5752,8 +6352,18 @@ impl Workspace {
     /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
-        let model = self.thread.read(cx).model().cloned();
-        let effort = self.thread.read(cx).reasoning_effort();
+        let model = self.store.as_ref().and_then(|s| {
+            s.read(cx)
+                .store
+                .model
+                .clone()
+                .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+        });
+        let effort = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.reasoning_effort)
+            .expect("foreground store present");
 
         let trigger = h_flex()
             .id("model-trigger")
@@ -5816,7 +6426,11 @@ impl Workspace {
                     this.model_menu_sub = None;
                 } else {
                     this.model_open = true;
-                    let current_effort = this.thread.read(cx).reasoning_effort();
+                    let current_effort = this
+                        .store
+                        .as_ref()
+                        .map(|s| s.read(cx).store.reasoning_effort)
+                        .expect("foreground store present");
                     let workspace = cx.entity().downgrade();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
                         Self::build_model_popup_menu_pi(menu, workspace, current_effort, window, cx)
@@ -5925,8 +6539,12 @@ impl Workspace {
                         })
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             let model = model.clone();
-                            let _ = ws.update(cx, |this, cx| {
-                                this.thread.update(cx, |t, cx| t.set_model(model, cx));
+                            let _ = ws.update(cx, |this, _cx| {
+                                let _ =
+                                    this.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                                        session_id: sid.into(),
+                                        id: model.id.clone(),
+                                    });
                             });
                         }),
                     );
@@ -5965,10 +6583,16 @@ impl Workspace {
                         })
                 })
                 .on_click(move |_, _, cx: &mut gpui::App| {
-                    let _ = ws.update(cx, |this, cx| {
-                        this.thread.update(cx, |t, cx| {
-                            t.set_reasoning_effort(effort, cx);
-                        });
+                    let _ = ws.update(cx, |this, _cx| {
+                        let effort_str = match effort {
+                            agent::language_model::ReasoningEffort::High => "high",
+                            agent::language_model::ReasoningEffort::Max => "max",
+                        };
+                        let _ =
+                            this.send_note(|sid| manox_protocol::ClientNote::SetReasoningEffort {
+                                session_id: sid.into(),
+                                effort: effort_str.into(),
+                            });
                     });
                 }),
             );
@@ -6421,9 +7045,10 @@ impl Workspace {
     /// explicit, inspectable update rather than an ephemeral popover field.
     pub fn begin_goal_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(objective) = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
             .map(|goal| goal.objective.clone())
         else {
             self.goal_popover_open = true;
@@ -6438,9 +7063,10 @@ impl Workspace {
 
     pub fn begin_goal_budget_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
             .and_then(|goal| goal.token_budget)
             .map(|budget| budget.to_string())
             .unwrap_or_else(|| "none".into());
@@ -6452,9 +7078,10 @@ impl Workspace {
 
     pub fn begin_goal_rounds_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let value = self
-            .thread
-            .read(cx)
-            .goal()
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())
             .and_then(|goal| goal.max_rounds)
             .map(|max| max.to_string())
             .unwrap_or_else(|| "none".into());
@@ -6490,7 +7117,11 @@ impl Workspace {
     }
 
     fn render_goal_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let g = self.thread.read(cx).goal()?;
+        let g = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.clone())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v).ok())?;
         let accent = theme.accent;
         let muted = theme.muted_foreground;
         let fg = theme.foreground;
@@ -6503,8 +7134,7 @@ impl Workspace {
         };
         let elapsed = format_elapsed(std::time::Duration::from_secs(
             self.thread
-                .read(cx)
-                .goal_elapsed_seconds()
+                .read(|t| t.goal_elapsed_seconds())
                 .unwrap_or_default(),
         ));
         let label: SharedString = format!("◎ {} · {}", i18n::t(status_key), elapsed).into();
@@ -6613,20 +7243,15 @@ impl Workspace {
                             Button::new("goal-pause")
                                 .small()
                                 .label(pause_label)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.thread.update(cx, |t, cx| {
-                                        if let Err(error) = t.set_goal_status(
-                                            agent::goal::GoalStatus::Paused,
-                                            Some(agent::goal::GoalBlockReason {
-                                                code: "user-paused".into(),
-                                                message: "paused by user".into(),
-                                            }),
-                                            agent::db::GoalActor::User,
-                                            cx,
-                                        ) {
-                                            cx.emit(ThreadEvent::Error(error));
-                                        }
-                                    });
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
+                                    let _ =
+                                        this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                            session_id: sid.into(),
+                                            action: "pause".into(),
+                                            objective: None,
+                                            budget: None,
+                                            max_rounds: None,
+                                        });
                                 })),
                         )
                     })
@@ -6640,15 +7265,14 @@ impl Workspace {
                                 Button::new("goal-resume")
                                     .small()
                                     .label(resume_label)
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.thread.update(cx, |t, cx| {
-                                            if let Err(error) = t.set_goal_status(
-                                                agent::goal::GoalStatus::Active,
-                                                None,
-                                                agent::db::GoalActor::User,
-                                                cx,
-                                            ) {
-                                                cx.emit(ThreadEvent::Error(error));
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
+                                        let _ = this.send_note(|sid| {
+                                            manox_protocol::ClientNote::Goal {
+                                                session_id: sid.into(),
+                                                action: "resume".into(),
+                                                objective: None,
+                                                budget: None,
+                                                max_rounds: None,
                                             }
                                         });
                                     })),
@@ -6742,11 +7366,12 @@ impl Workspace {
                             .small()
                             .label(clear_label)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.thread.update(cx, |t, cx| {
-                                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User, cx)
-                                    {
-                                        cx.emit(ThreadEvent::Error(error));
-                                    }
+                                let _ = this.send_note(|sid| manox_protocol::ClientNote::Goal {
+                                    session_id: sid.into(),
+                                    action: "clear".into(),
+                                    objective: None,
+                                    budget: None,
+                                    max_rounds: None,
                                 });
                                 this.goal_popover_open = false;
                                 cx.notify();
@@ -6785,7 +7410,12 @@ impl Workspace {
     /// it leaves plan mode — the escape hatch when a review card is missed
     /// or the model stalls in research.
     fn render_plan_chip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.thread.read(cx).plan_mode() {
+        if !self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.plan_mode)
+            .expect("foreground store present")
+        {
             return None;
         }
         Some(
@@ -6839,7 +7469,11 @@ impl Workspace {
     /// on the right). The popover is `w(360)` to fit the longest bilingual
     /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.thread.read(cx).permission_mode();
+        let mode = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.permission_mode)
+            .expect("foreground store present");
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
         // capture `theme` (which only lives for the method body) — closures
@@ -7032,10 +7666,9 @@ impl Workspace {
     fn activate_browser_tool_suite(
         &mut self,
         suite: agent::pi_engine::BrowserSuite,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        self.thread
-            .update(cx, |t, cx| t.set_browser_suite(suite, true, cx));
+        self.thread.with_mut(|t| t.set_browser_suite(suite, true));
     }
 
     /// Deactivate a browser tool suite on the bound thread; the chip follows
@@ -7043,10 +7676,9 @@ impl Workspace {
     fn deactivate_browser_tool_suite(
         &mut self,
         suite: agent::pi_engine::BrowserSuite,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        self.thread
-            .update(cx, |t, cx| t.set_browser_suite(suite, false, cx));
+        self.thread.with_mut(|t| t.set_browser_suite(suite, false));
     }
 
     /// Open the native file picker and add chosen paths as pending
@@ -7133,7 +7765,11 @@ impl Workspace {
             })
             .disabled(disabled)
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.thread.read(cx).is_running()
+                if this
+                    .store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.running)
+                    .expect("foreground store present")
                     && this.pending_plan_review.is_none()
                     && this.pending_ask.is_none()
                 {
@@ -7218,7 +7854,13 @@ impl Workspace {
     /// allowed on empty threads (same guard as the manox chip). Data source
     /// is the pi thread store only.
     fn render_project_chip_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = self.thread.read(cx).project().cloned();
+        let project = self.store.as_ref().and_then(|s| {
+            s.read(cx)
+                .store
+                .project
+                .clone()
+                .map(std::path::PathBuf::from)
+        });
         let open = self.project_chip_open;
         let workspace = cx.entity().downgrade();
 
@@ -7271,7 +7913,11 @@ impl Workspace {
                     return;
                 }
                 // Only allow project selection on empty threads.
-                let can_set = this.thread.read(cx).messages().is_empty();
+                let can_set = this
+                    .store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.messages.is_empty())
+                    .expect("foreground store present");
                 if !can_set {
                     return;
                 }
@@ -7282,7 +7928,7 @@ impl Workspace {
                 let ws_blank = ws.clone();
                 let ws_folder = ws.clone();
 
-                let menu = PopupMenu::build(window, cx, move |menu, _window, cx| {
+                let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
                     let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
                     menu = menu.label(i18n::t("sidebar-section-projects"));
 
@@ -7291,9 +7937,8 @@ impl Workspace {
                     let store = agent::thread_store_global();
                     let mut recent_projects: Vec<String> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
-                    {
-                        let store_ref = store.read(cx);
-                        for path in store_ref.known_projects().iter().rev() {
+                    store.read(|store| {
+                        for path in store.known_projects().iter().rev() {
                             if seen.insert(path.clone()) {
                                 recent_projects.push(path.clone());
                             }
@@ -7302,7 +7947,7 @@ impl Workspace {
                             }
                         }
                         if recent_projects.len() < 20 {
-                            for sum in store_ref.summaries() {
+                            for sum in store.summaries() {
                                 if sum.project.is_empty() || !seen.insert(sum.project.clone()) {
                                     continue;
                                 }
@@ -7312,7 +7957,7 @@ impl Workspace {
                                 }
                             }
                         }
-                    }
+                    });
 
                     let ws_recent = ws.clone();
                     let theme_recent = theme.clone();
@@ -7356,8 +8001,12 @@ impl Workspace {
                                     let p = std::path::PathBuf::from(&click_path);
                                     let _ = ws_sel.update(cx, |this, cx| {
                                         this.close_project_chip_menu();
-                                        this.thread
-                                            .update(cx, |t, cx| t.set_project(p.clone(), cx));
+                                        let _ = this.send_note(|sid| {
+                                            manox_protocol::ClientNote::SetCwd {
+                                                session_id: sid.into(),
+                                                cwd: p.to_str().unwrap_or_default().into(),
+                                            }
+                                        });
                                         Self::register_project_in_store(&p, cx);
                                         cx.notify();
                                     });
@@ -7466,9 +8115,9 @@ impl Workspace {
 
     /// Register a bound project on the active variant's thread store so the
     /// sidebar keeps its folder (persisted; survives restarts and archives).
-    fn register_project_in_store(path: &std::path::Path, cx: &mut Context<Self>) {
+    fn register_project_in_store(path: &std::path::Path, _cx: &mut Context<Self>) {
         let path = path.to_string_lossy().to_string();
-        agent::thread_store_global().update(cx, |s, cx| s.register_project(path, cx));
+        agent::thread_store_global().with_mut(|s| s.register_project(path));
     }
 
     /// Open the blank-project flow: pick a parent directory, then prompt for name.
@@ -7531,8 +8180,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.thread
-            .update(cx, |t, cx| t.set_project(new_path.clone(), cx));
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+            session_id: sid.into(),
+            cwd: new_path.to_str().unwrap_or_default().into(),
+        });
         Self::register_project_in_store(&new_path, cx);
         self.blank_project_name_input = None;
         cx.notify();
@@ -7564,8 +8215,10 @@ impl Workspace {
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    this.thread
-                        .update(cx, |t, cx| t.set_project(path.clone(), cx));
+                    let _ = this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+                        session_id: sid.into(),
+                        cwd: path.to_str().unwrap_or_default().into(),
+                    });
                     Self::register_project_in_store(&path, cx);
                 }
                 cx.notify();
@@ -7828,9 +8481,16 @@ impl Workspace {
         // `TerminalElement`.
         if matches!(self.view_mode, ViewMode::Terminal) {
             let title_text: SharedString = self
-                .thread
-                .read(cx)
-                .project()
+                .store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .project
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                })
+                .as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|s| s.to_str())
                 .unwrap_or("manox")
@@ -7904,7 +8564,11 @@ impl Workspace {
             cx.notify();
         }
         let theme = cx.theme().clone();
-        let running = self.thread.read(cx).is_running();
+        let running = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .expect("foreground store present");
 
         self.ensure_blank_project_input(window, cx);
 
@@ -7920,7 +8584,11 @@ impl Workspace {
         // title > mechanical summary). Falls back to "manox" so an unselected
         // first screen stays branded before any title is generated.
         let title_text: SharedString = {
-            let s = self.thread.read(cx).display_title();
+            let s = self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.display_title.clone())
+                .expect("foreground store present");
             if s.is_empty() { "manox".to_string() } else { s }
         }
         .into();
@@ -7931,7 +8599,12 @@ impl Workspace {
         // immediately, while submission remains gated until the transcript is
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        let loading = self.thread.read(cx).history_phase().is_loading();
+        // Typed store: `history_phase` is `HistoryPhase`; read directly.
+        let loading = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.history_phase.is_loading())
+            .expect("foreground store present");
         let composer_placement = composer_placement(editor_open && right_pane_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
@@ -7943,7 +8616,11 @@ impl Workspace {
             };
         let show_rail = !first_screen
             && (!editor_open || !right_pane_open)
-            && self.thread.read(cx).has_interacted()
+            && self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.has_interacted)
+                .expect("foreground store present")
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
         let overlay = self
             .render_blank_project_overlay(window, &theme, cx)
@@ -8823,8 +9500,15 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
         )
 }
 
-fn thread_cwd(thread: &Entity<ThreadEntity>, cx: &App) -> Option<SharedString> {
-    let cwd = thread.read(cx).cwd();
+fn thread_cwd(
+    thread: &agent::thread::ThreadHandle,
+    store: &Option<gpui::Entity<ClientStoreHandle>>,
+    cx: &App,
+) -> Option<SharedString> {
+    let cwd = store
+        .as_ref()
+        .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()))
+        .unwrap_or_else(|| thread.read(|t| t.cwd().to_path_buf()));
     if cwd.as_os_str().is_empty() {
         None
     } else {
@@ -9066,7 +9750,12 @@ impl Workspace {
     /// change notice rides `apply_permission_mode` so the conversation shows
     /// the switch.
     pub(crate) fn cycle_mode(&mut self, cx: &mut Context<Self>) {
-        let next = match self.thread.read(cx).permission_mode() {
+        let next = match self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.permission_mode)
+            .expect("foreground store present")
+        {
             PermissionMode::ReadOnly => PermissionMode::WorkspaceWrite,
             PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
             PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
@@ -9097,8 +9786,17 @@ impl Workspace {
             PermissionMode::WorkspaceWrite => "workspacewrite",
             PermissionMode::DangerFullAccess => "dangerfullaccess",
         };
-        self.thread
-            .update(cx, |t, cx| t.set_permission_mode(mode, cx));
+        // The wire value is the serde (kebab-case) form so the AgentServer's
+        // `from_value::<PermissionMode>` round-trips; `mode_key` stays the
+        // lowercase form the i18n `workspace-mode-notice` selector keys on.
+        let mode_wire = serde_json::to_value(mode)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let _ = self.send_note(|sid| manox_protocol::ClientNote::SetApprovalMode {
+            session_id: sid.into(),
+            mode: mode_wire,
+        });
         self.add_info_message(
             i18n::t_str("workspace-mode-notice", &[("mode", mode_key)]).to_string(),
             NoticeAnchor::TurnEnd,
@@ -9126,6 +9824,9 @@ fn truncate_follow_up(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Serializes tests that init/replace the process-wide `thread_store`
+    /// global; without it parallel tests clobber each other's store.
+    static GLOBALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::{
         ComposerPlacement, RecallDirection, RecallStep, Workspace, composer_key_context,
         composer_placement, editor_can_submit,
@@ -9414,6 +10115,7 @@ mod tests {
     async fn right_pane_state_machine(cx: &mut gpui::TestAppContext) {
         use super::{PersistedRightTab, RightTab};
         use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
 
         let _store = store_test_guard();
         cx.update(gpui_component::init);
@@ -9422,10 +10124,10 @@ mod tests {
         let db = std::sync::Arc::new(
             agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
         );
-        cx.update(|cx| {
+        cx.update(|_cx| {
             agent::runtime::init();
             agent::pi_providers::init();
-            agent::thread_store::init_for_test(db.clone(), cx);
+            agent::thread_store::init_for_test(db.clone());
         });
 
         let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
@@ -9625,16 +10327,17 @@ mod tests {
     #[gpui::test]
     async fn navigator_fill_lands_the_walk_and_hands_the_draft_back(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-fill-test-{}.db", uuid_like_id()));
         let db = std::sync::Arc::new(
             agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
         );
-        cx.update(|cx| {
+        cx.update(|_cx| {
             agent::runtime::init();
             agent::pi_providers::init();
-            agent::thread_store::init_for_test(db.clone(), cx);
+            agent::thread_store::init_for_test(db.clone());
         });
         let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -9689,5 +10392,79 @@ mod tests {
 
         agent::thread_store::drop_for_test();
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[gpui::test]
+    fn attach_thread_rebinds_store_to_new_session(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-attach-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            agent::runtime::init();
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone());
+        });
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+        let landing_id = ws.read_with(&visual, |ws, _| ws.thread.read(|t| t.id.0.clone()));
+
+        // The landing thread's session is bound to its own id.
+        let session_id = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+        assert_eq!(session_id, Some(landing_id.clone()), "landing session id");
+
+        // Attach a fresh thread: a new session is created for it, so the
+        // foreground store now mirrors the new thread (not the old one).
+        let new_id = "t-attach-2".to_string();
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                let new = agent::Thread::new_fresh(agent::ThreadId(new_id.clone()), "/".into());
+                ws.attach_thread(new, false, _window, cx);
+            });
+        });
+        cx.run_until_parked();
+        // Give the new session's pump a beat to deliver ThreadInfo.
+        cx.run_until_parked();
+        let rebound = ws.read_with(&visual, |ws, cx| {
+            let store_id = ws.store.as_ref().map(|s| s.read(cx).store.id.0.clone());
+            (
+                ws.session_id.clone(),
+                store_id,
+                ws.thread.read(|t| t.id.0.clone()),
+            )
+        });
+        cx.run_until_parked();
+        // Give the new session's pump a beat to deliver ThreadInfo.
+        assert_eq!(
+            rebound.0.as_deref(),
+            Some(new_id.as_str()),
+            "session rebound"
+        );
+        assert_eq!(
+            rebound.1.as_deref(),
+            Some(new_id.as_str()),
+            "store mirrors new thread"
+        );
+        assert_eq!(rebound.2, new_id, "foreground thread swapped");
+        drop(ws);
+        drop(visual);
+        agent::thread_store::drop_global_for_test();
     }
 }

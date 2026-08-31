@@ -16,10 +16,10 @@ use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 use crate::harness::{AgentHarness, HarnessResources, NavigateTreeOptions};
+use crate::session::SessionTreeEntry;
 use crate::session::jsonl::JsonlSessionMetadata;
 use crate::session::repository::SessionRepository;
-use crate::session::{SessionStorage, SessionTreeEntry};
-use crate::tool::{AgentTool, ToolState};
+use crate::tool::AgentTool;
 use crate::tools::bash::BashTool;
 use crate::tools::edit::EditTool;
 use crate::tools::glob::GlobTool;
@@ -69,71 +69,6 @@ pub struct ContextUsage {
     pub percent: Option<f64>,
 }
 
-/// Where a fork attaches the new session: at the selected entry, or before
-/// the selected user message (which focuses its parent and reports its text).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForkPosition {
-    /// Keep the selected entry as the fork's leaf.
-    AtEntry,
-    /// Fork the path ending at the selected user message's parent; the
-    /// message text rides on the result.
-    BeforeUser,
-}
-
-/// The result of a fork: the new session plus the selected user text when
-/// forking `BeforeUser`.
-pub struct ForkResult {
-    pub session: AgentSession,
-    pub selected_text: Option<String>,
-}
-
-/// The runtime assembly state of a session, captured from the harness so a
-/// fork rebuilds an identical environment: tool set + active selection,
-/// resources, stream options, queue modes, and policies.
-#[derive(Clone)]
-struct AssemblyConfig {
-    tools: Vec<Arc<dyn AgentTool>>,
-    active_tool_names: Option<Vec<String>>,
-    resources: HarnessResources,
-    stream_options: crate::types::StreamOptions,
-    steering_mode: crate::agent::QueueMode,
-    follow_up_mode: crate::agent::QueueMode,
-    compaction: crate::compaction::CompactionSettings,
-    retry: crate::harness::RetrySettings,
-}
-
-impl AssemblyConfig {
-    fn capture(harness: &AgentHarness<crate::session::jsonl::JsonlSessionStorage>) -> Self {
-        AssemblyConfig {
-            tools: harness.tools().to_vec(),
-            active_tool_names: harness.active_tool_names().map(|n| n.to_vec()),
-            resources: harness.resources().clone(),
-            stream_options: harness.stream_options(),
-            steering_mode: harness.steering_mode(),
-            follow_up_mode: harness.follow_up_mode(),
-            compaction: harness.compaction_settings().clone(),
-            retry: *harness.retry_settings(),
-        }
-    }
-
-    async fn apply(
-        self,
-        harness: &mut AgentHarness<crate::session::jsonl::JsonlSessionStorage>,
-    ) -> Result<(), anyhow::Error> {
-        harness.set_tools(Arc::from(self.tools))?;
-        if let Some(names) = self.active_tool_names {
-            harness.set_active_tools(names).await?;
-        }
-        harness.set_resources(self.resources);
-        harness.set_stream_options(self.stream_options);
-        harness.set_steering_mode(self.steering_mode);
-        harness.set_follow_up_mode(self.follow_up_mode);
-        harness.set_compaction_settings(self.compaction);
-        harness.set_retry_settings(self.retry);
-        Ok(())
-    }
-}
-
 /// A live coding session: an open JSONL session plus a harness bound to it.
 pub struct AgentSession {
     harness: AgentHarness<crate::session::jsonl::JsonlSessionStorage>,
@@ -141,15 +76,6 @@ pub struct AgentSession {
     session_dir: PathBuf,
     cwd: PathBuf,
     runtime: ModelRuntime,
-    system_prompt: String,
-    /// The base prompt the system-prompt builder starts from; kept so a
-    /// fork re-installs the builder rather than freezing a rendered prompt.
-    base_prompt: String,
-    /// Consumer-installed system-prompt builder overriding the default
-    /// `build_harness_prompt` fold; kept so a fork re-installs it rather
-    /// than falling back to the kernel default.
-    prompt_builder: Option<crate::harness::SystemPromptBuilder>,
-    tools: Vec<Arc<dyn AgentTool>>,
     /// The facade's pending next-turn messages (TS coding-agent
     /// `_pendingNextTurnMessages`): delivered AFTER the prompt's own user
     /// message as asides, distinct from the harness's queued-first queue.
@@ -161,16 +87,10 @@ pub struct AgentSession {
     /// model switch moves from a non-thinking model to a thinking one (TS
     /// restores the settings default).
     settings_thinking_default: Option<String>,
-    /// Whether the system prompt is a caller-provided custom prompt (TS
-    /// `customPrompt` replacement semantics), preserved across forks.
-    custom_prompt: bool,
     /// The agent config dir; `set_model`/`set_thinking_level` persist the
     /// default model / thinking level to its global settings file (TS
     /// `setDefaultModelAndProvider`/`setDefaultThinkingLevel`).
     agent_dir: PathBuf,
-    /// Directory persisting hashline snapshots so a forked/rebuilt harness
-    /// rehydrates tags; `None` keeps snapshots memory-only.
-    snapshot_dir: Option<PathBuf>,
     /// Prepended to every `execute_bash` command, so a user-run command sees
     /// the same shell setup as the bash tool's.
     shell_command_prefix: Option<String>,
@@ -940,162 +860,34 @@ impl AgentSession {
         &self.session_path
     }
 
-    /// Fork the session: a new file holds only the root→leaf path (labels
-    /// re-chained, deferred until the first assistant message), and the new
-    /// harness restores its transcript. `BeforeUser` requires a user entry
-    /// and returns its text. The current session is consumed.
-    pub async fn fork(
-        self,
-        entry_id: &str,
-        position: ForkPosition,
-    ) -> Result<ForkResult, anyhow::Error> {
-        let repo = SessionRepository::new(&self.session_dir);
-        let (leaf_id, selected_text) = match position {
-            ForkPosition::AtEntry => (Some(entry_id.to_string()), None),
-            ForkPosition::BeforeUser => {
-                let entry = self
-                    .harness
-                    .session()
-                    .storage()
-                    .get_entry(entry_id)
-                    .await?
-                    .ok_or_else(|| anyhow::anyhow!("entry {entry_id} not found"))?;
-                let SessionTreeEntry::Message {
-                    message: AgentMessage::User { content, .. },
-                    parent_id,
-                    ..
-                } = &entry
-                else {
-                    anyhow::bail!("fork BeforeUser requires a user message entry");
-                };
-                let text = content
-                    .iter()
-                    .filter_map(|b| match b {
-                        crate::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (parent_id.clone(), Some(text))
-            }
-        };
-        let session = match leaf_id {
-            Some(leaf) => {
-                repo.create_branched_session(&self.session_path, &leaf)
-                    .await?
-            }
-            None => {
-                // Forking before the first user message: a fresh empty session
-                // carrying the source as parent.
-                repo.create(JsonlSessionMetadata {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    cwd: self.cwd.to_string_lossy().into_owned(),
-                    created_at: chrono::Utc::now(),
-                    parent_session_path: Some(self.session_path.to_string_lossy().into_owned()),
-                    metadata: self.harness.session().storage().metadata.metadata.clone(),
-                })
-                .await?
-            }
-        };
-        let session_path = session.storage().path().to_path_buf();
-        let config = AssemblyConfig::capture(&self.harness);
-        // Carry the parent's in-memory tool state (snapshots, mutation queue,
-        // clipboard, noop guard) into the fork so edit context survives.
-        let parent_tool_state = self.harness.tool_state_handle();
-        let mut harness = self
-            .build_harness(session, None, config, parent_tool_state)
-            .await?;
-        // The fork's transcript comes from the new session's path.
-        harness.restore().await?;
-        Ok(ForkResult {
-            session: AgentSession {
-                harness,
-                session_path,
-                session_dir: self.session_dir,
-                cwd: self.cwd,
-                runtime: self.runtime,
-                system_prompt: self.system_prompt,
-                base_prompt: self.base_prompt,
-                prompt_builder: self.prompt_builder.clone(),
-                tools: self.tools,
-                pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
-                model_fallback_notice: None,
-                settings_thinking_default: self.settings_thinking_default.clone(),
-                custom_prompt: self.custom_prompt,
-                agent_dir: self.agent_dir.clone(),
-                snapshot_dir: self.snapshot_dir.clone(),
-                shell_command_prefix: self.shell_command_prefix.clone(),
-                bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
-            },
-            selected_text,
-        })
+    /// Close the session: request shutdown, settle, and return the path. The
+    /// The effective working directory the session path carries — the
+    /// header cwd, or the latest `cwd_change` entry when a tool call moved
+    /// the sticky cwd — falling back to the assembly cwd when projection
+    /// fails.
+    pub async fn projected_cwd(&self) -> PathBuf {
+        self.harness
+            .session()
+            .build_session_context()
+            .await
+            .ok()
+            .and_then(|context| context.cwd)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| self.cwd.clone())
     }
 
-    /// Close the session: request shutdown, settle, and return the path. The
+    /// Move the session's working directory (host-driven `SetCwd`): sticky
+    /// advance + an immediately durable `cwd_change` entry. See
+    /// [`AgentHarness::set_session_cwd`].
+    pub async fn set_session_cwd(&mut self, cwd: PathBuf) -> Result<(), anyhow::Error> {
+        self.harness.set_session_cwd(cwd).await
+    }
+
     /// JSONL file remains openable and resumable.
     pub async fn close(self) -> Result<PathBuf, anyhow::Error> {
         self.harness.request_shutdown();
         self.harness.wait_for_shutdown().await;
         Ok(self.session_path)
-    }
-
-    /// Assemble a harness over `session` with this facade's runtime and tools.
-    async fn build_harness(
-        &self,
-        session: crate::session::Session<crate::session::jsonl::JsonlSessionStorage>,
-        model: Option<Model>,
-        config: AssemblyConfig,
-        parent_tool_state: Option<Arc<ToolState>>,
-    ) -> Result<AgentHarness<crate::session::jsonl::JsonlSessionStorage>, anyhow::Error> {
-        let model = model.unwrap_or_else(default_model);
-        let stream_fn = self.runtime.resolver()(&model)?;
-        let resolver = self.runtime.resolver();
-        let mut harness = AgentHarness::new(session, self.system_prompt.clone(), model, stream_fn)
-            .with_stream_resolver(resolver.clone())
-            .with_tool_cwd(self.cwd.clone());
-        // Inherit the parent's in-memory tool state before pointing the store
-        // at disk, so the disk tier lands on the state that actually stays.
-        if let Some(parent_tool_state) = parent_tool_state {
-            harness.set_tool_state(parent_tool_state);
-        }
-        if let Some(snapshot_dir) = self.snapshot_dir.clone() {
-            harness.set_snapshot_dir(snapshot_dir);
-        }
-        // Re-install the system-prompt builder (not just the rendered
-        // prompt), so a fork keeps rebuilding on active-tool/resource
-        // changes.
-        if let Some(builder) = self.prompt_builder.clone() {
-            harness.set_system_prompt_builder(
-                move |active_tools: &[String], resources: &HarnessResources| {
-                    builder(active_tools, resources)
-                },
-            );
-        } else {
-            let base_prompt = self.base_prompt.clone();
-            let cwd = self.cwd.clone();
-            let custom_for_builder = self.custom_prompt;
-            harness.set_system_prompt_builder(
-                move |active_tools: &[String], resources: &HarnessResources| {
-                    crate::system_prompt::build_harness_prompt(
-                        &base_prompt,
-                        &cwd,
-                        active_tools,
-                        &resources.context_files,
-                        &resources.skills,
-                        custom_for_builder,
-                    )
-                },
-            );
-        }
-        // Restore projects the session's own model onto the harness.
-        harness = harness.with_model_resolver(model_resolver(&self.runtime));
-        let observer = harness.request_observer();
-        harness.rebind_stream_resolver(self.runtime.resolver_with_observer(observer));
-        // Re-apply the captured assembly state so a fork is identical to the
-        // session it came from; propagate every error (a fork must never
-        // silently come back half-assembled).
-        config.apply(&mut harness).await?;
-        Ok(harness)
     }
 }
 
@@ -1649,16 +1441,10 @@ impl AgentSessionBuilder {
             session_dir,
             cwd,
             runtime,
-            system_prompt,
-            base_prompt,
-            prompt_builder: self.system_prompt_builder.clone(),
-            tools,
             pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
             model_fallback_notice: fallback_notice,
             settings_thinking_default,
-            custom_prompt,
             agent_dir,
-            snapshot_dir: self.snapshot_dir.clone(),
             shell_command_prefix: settings.shell_command_prefix.clone(),
             bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
@@ -1692,10 +1478,10 @@ impl AgentSessionBuilder {
     }
 
     /// Open an existing session file, restoring its model / thinking /
-    /// active tools and its full assembly (settings, trust, resources,
-    /// system prompt, tools, runtime) before returning — callers must not
-    /// restore manually. Tools and the returned session cwd follow the
-    /// session's own project directory.
+    /// active tools / effective cwd and its full assembly (settings, trust,
+    /// resources, system prompt, tools, runtime) before returning — callers
+    /// must not restore manually. Tools and the returned session cwd follow
+    /// the session's own project directory.
     pub async fn open(self, path: PathBuf) -> Result<AgentSession, anyhow::Error> {
         let session_dir = path
             .parent()
@@ -1703,7 +1489,19 @@ impl AgentSessionBuilder {
             .unwrap_or_default();
         let repo = SessionRepository::new(&session_dir);
         let session = repo.open(&path).await?;
-        let cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
+        // The effective cwd is the latest `cwd_change` on the path, falling
+        // back to the header (launch) directory. A sticky cwd pointing at a
+        // directory that no longer exists (a removed worktree) falls back to
+        // the header rather than assembling tools that cannot run anywhere.
+        let header_cwd = std::path::PathBuf::from(session.storage().metadata.cwd.clone());
+        let cwd = session
+            .build_session_context()
+            .await
+            .ok()
+            .and_then(|context| context.cwd)
+            .map(std::path::PathBuf::from)
+            .filter(|cwd| cwd.is_dir())
+            .unwrap_or(header_cwd);
         self.assemble_common(session, cwd, session_dir, true).await
     }
 }
@@ -1713,6 +1511,7 @@ mod tests {
     use super::*;
     use crate::agent_loop::StreamFn;
     use crate::coding_agent::create_agent_session;
+    use crate::session::SessionStorage;
     use crate::types::{AgentContext, AgentEvent, ContentBlock};
 
     struct Scripted(Arc<std::sync::Mutex<Vec<String>>>);
@@ -1806,155 +1605,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resumed.harness_messages().len(), 4, "two turns restored");
-    }
-
-    #[tokio::test]
-    async fn fork_before_user_returns_selected_text_and_keeps_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_metadata(serde_json::json!({ "host": "vscode" }))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        // The builder-injected header metadata lands on the session file.
-        assert_eq!(
-            session.harness.session().storage().metadata.metadata,
-            Some(serde_json::json!({ "host": "vscode" }))
-        );
-        session.prompt("first question").await.unwrap();
-        session.prompt("second question").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        // The second user message: forking before it keeps the first turn.
-        let second_user = entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::User { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .nth(1)
-            .expect("two user messages");
-        let ForkResult {
-            session: fork,
-            selected_text,
-        } = session
-            .fork(&second_user, ForkPosition::BeforeUser)
-            .await
-            .unwrap();
-        // The selected user message's text rides on the result.
-        assert_eq!(selected_text.as_deref(), Some("second question"));
-        // The fork inherits the parent's header metadata (host identity
-        // survives forking).
-        assert_eq!(
-            fork.harness.session().storage().metadata.metadata,
-            Some(serde_json::json!({ "host": "vscode" }))
-        );
-        // The fork holds only the first turn's path.
-        assert_eq!(fork.harness_messages().len(), 2);
-        assert!(
-            fork.path().exists(),
-            "the fork materialized (its path carries an assistant message)"
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_at_entry_keeps_the_selected_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        session.prompt("first").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let first_assistant = entries
-            .iter()
-            .find_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::Assistant { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let ForkResult {
-            session: fork,
-            selected_text,
-        } = session
-            .fork(&first_assistant, ForkPosition::AtEntry)
-            .await
-            .unwrap();
-        assert!(selected_text.is_none());
-        assert_eq!(fork.harness_messages().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn fork_before_user_requires_a_user_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        session.prompt("first").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let assistant = entries
-            .iter()
-            .find_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::Assistant { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .unwrap();
-        let err = match session.fork(&assistant, ForkPosition::BeforeUser).await {
-            Err(e) => e,
-            Ok(_) => panic!("expected a user-entry error"),
-        };
-        assert!(err.to_string().contains("user message"), "{err}");
     }
 
     /// Tools execute against the session cwd, not the process cwd: a file
@@ -2299,7 +1949,7 @@ mod tests {
     /// cwd wins over the caller-provided one, so tools/resources stay in the
     /// session project.
     #[tokio::test]
-    async fn reopen_and_fork_use_the_session_cwd_over_a_wrong_one() {
+    async fn reopen_uses_the_session_cwd_over_a_wrong_one() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         tokio::fs::create_dir_all(&project).await.unwrap();
@@ -2354,41 +2004,141 @@ mod tests {
             !result.is_error,
             "tools run in the session cwd after reopen"
         );
+    }
 
-        let entries = resumed
+    /// The host-driven directory switch: sticky advances, the move is
+    /// immediately durable, and the next turn's flush does not duplicate
+    /// the entry.
+    #[tokio::test]
+    async fn set_session_cwd_is_durable_without_flush_duplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let work = dir.path().join("work");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        std::fs::write(work.join("marker.txt"), "w").unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&project)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+
+        session.set_session_cwd(work.clone()).await.unwrap();
+        assert_eq!(
+            session.projected_cwd().await,
+            work,
+            "the switch is immediately durable"
+        );
+
+        // A following turn flushes pending mutations — the switch must not
+        // produce a second `cwd_change` entry for the same directory.
+        session.prompt("second").await.unwrap();
+        let cwd_changes = session
             .harness
             .session()
             .storage()
             .get_entries(Default::default())
             .await
-            .unwrap();
-        let first_user = entries
+            .unwrap()
             .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::User { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .next()
-            .unwrap();
-        let ForkResult { session: fork, .. } = resumed
-            .fork(&first_user, ForkPosition::AtEntry)
-            .await
-            .unwrap();
-        let ctx = Arc::clone(fork.harness.agent().tool_context());
+            .filter(|e| matches!(e, SessionTreeEntry::CwdChange { cwd, .. } if cwd.as_str() == work.to_string_lossy()))
+            .count();
+        assert_eq!(
+            cwd_changes, 1,
+            "one durable entry per move, not one per turn"
+        );
+
+        // Tools resolve in the switched directory without an explicit cwd.
+        let read = session
+            .harness
+            .agent()
+            .tools()
+            .iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .clone();
+        let ctx = std::sync::Arc::clone(session.harness.agent().tool_context());
         let result = read
             .execute(
                 "t1",
-                serde_json::json!({ "path": "only-in-project.txt" }),
+                serde_json::json!({ "path": "marker.txt" }),
                 tokio_util::sync::CancellationToken::new(),
                 &*ctx,
             )
             .await
             .unwrap();
-        assert!(!result.is_error, "forked session keeps the project cwd");
+        assert!(!result.is_error, "sticky cwd follows the switch");
+    }
+
+    /// A durable `cwd_change` tail projects onto a reopen: tools resolve in
+    /// the moved-to directory even when the reopen's own cwd is wrong.
+    #[tokio::test]
+    async fn reopen_projects_the_latest_cwd_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let work = dir.path().join("work");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        tokio::fs::write(work.join("only-in-work.txt"), "work file")
+            .await
+            .unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&project)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        // A tool call moved the sticky cwd into the work directory; the move
+        // is durable as a `cwd_change` entry on the session path.
+        session
+            .harness
+            .session()
+            .append_cwd_change(work.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let path = session.close().await.unwrap();
+
+        // Reopen with a wrong cwd: the projected `cwd_change` wins, so a
+        // relative read resolves inside the work directory.
+        let elsewhere = dir.path().join("elsewhere");
+        tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+        let resumed = create_agent_session()
+            .with_cwd(&elsewhere)
+            .with_model_runtime(fake_runtime())
+            .open(path)
+            .await
+            .unwrap();
+        let read = resumed
+            .harness
+            .agent()
+            .tools()
+            .iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .clone();
+        let ctx = Arc::clone(resumed.harness.agent().tool_context());
+        let result = read
+            .execute(
+                "t1",
+                serde_json::json!({ "path": "only-in-work.txt" }),
+                tokio_util::sync::CancellationToken::new(),
+                &*ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error,
+            "reopen resolves in the projected cwd_change directory"
+        );
     }
 
     /// A model id can be served by either protocol; an injected catalog
@@ -2736,58 +2486,6 @@ mod tests {
         );
     }
 
-    /// Fork keeps the prompt builder: changing tools after forking rebuilds
-    /// the fork's prompt.
-    #[tokio::test]
-    async fn fork_keeps_the_prompt_builder() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        session.prompt("first").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let first_user = entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::User { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .next()
-            .unwrap();
-        let ForkResult {
-            session: mut forked,
-            ..
-        } = session
-            .fork(&first_user, ForkPosition::AtEntry)
-            .await
-            .unwrap();
-        // Narrow the fork's tools; the prompt must rebuild (no grep).
-        forked
-            .set_active_tools(vec!["Read".into(), "Edit".into()])
-            .await
-            .unwrap();
-        let prompt = forked.harness.agent().state().system_prompt.clone();
-        assert!(prompt.contains("- Read: Read a file"));
-        assert!(!prompt.contains("- Grep:"), "{prompt}");
-    }
-
     /// A consumer-installed builder owns the initial prompt and every
     /// rebuild, replacing the kernel default fold.
     #[tokio::test]
@@ -2817,57 +2515,6 @@ mod tests {
             session.harness.agent().state().system_prompt,
             "CUSTOM[Read]"
         );
-    }
-
-    /// A fork of a session with a consumer-installed builder re-installs
-    /// THAT builder on the forked harness, not the kernel default fold.
-    #[tokio::test]
-    async fn fork_keeps_custom_prompt_builder() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let builder: crate::harness::SystemPromptBuilder =
-            Arc::new(|tools: &[String], _resources: &HarnessResources| {
-                format!("CUSTOM[{}]", tools.join(","))
-            });
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .with_system_prompt_builder(builder)
-            .build()
-            .await
-            .unwrap();
-        session.prompt("first").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let first_user = entries
-            .iter()
-            .filter_map(|e| match e {
-                SessionTreeEntry::Message {
-                    id,
-                    message: AgentMessage::User { .. },
-                    ..
-                } => Some(id.clone()),
-                _ => None,
-            })
-            .next()
-            .unwrap();
-        let ForkResult {
-            session: mut forked,
-            ..
-        } = session
-            .fork(&first_user, ForkPosition::AtEntry)
-            .await
-            .unwrap();
-        forked.set_active_tools(vec!["Read".into()]).await.unwrap();
-        assert_eq!(forked.harness.agent().state().system_prompt, "CUSTOM[Read]");
     }
 
     /// Facade shutdown clears its pending next-turn queue and refuses more.
@@ -3240,49 +2887,6 @@ mod tests {
             Some("high"),
             "user preference, not the assembly default, survives a round trip"
         );
-
-        // A fork inherits the preference (not the assembly default).
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let leaf = entries
-            .iter()
-            .rev()
-            .find(|e| matches!(e, SessionTreeEntry::ThinkingLevelChange { .. }))
-            .map(|e| e.id().to_string())
-            .unwrap();
-        // A fork needs a materialized session file: the deferred-first
-        // assistant contract writes disk only once an assistant message
-        // exists, so run one prompt before branching.
-        let _ = session.prompt("branch here").await.unwrap();
-        let mut fork = session
-            .fork(&leaf, ForkPosition::AtEntry)
-            .await
-            .unwrap()
-            .session;
-        fork.set_model(Model {
-            thinking: crate::types::ThinkingKind::None,
-            id: "flat-2".into(),
-            ..test_model()
-        })
-        .await
-        .unwrap();
-        fork.set_model(Model {
-            thinking: crate::types::ThinkingKind::Enabled,
-            id: "thinking-d".into(),
-            ..test_model()
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            fork.harness.agent().state().thinking_level.as_deref(),
-            Some("high"),
-            "fork inherits the preference"
-        );
     }
 
     /// `patch_global_settings` preserves fields the typed `Settings` does not
@@ -3642,46 +3246,6 @@ mod tests {
             .unwrap();
         let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(root["defaultThinkingLevel"], "off");
-
-        // A fork inherits the off preference.
-        let _ = session.prompt("branch").await.unwrap();
-        let entries = session
-            .harness
-            .session()
-            .storage()
-            .get_entries(Default::default())
-            .await
-            .unwrap();
-        let leaf = entries
-            .iter()
-            .rev()
-            .find(|e| matches!(e, SessionTreeEntry::Message { .. }))
-            .map(|e| e.id().to_string())
-            .unwrap();
-        let mut fork = session
-            .fork(&leaf, ForkPosition::AtEntry)
-            .await
-            .unwrap()
-            .session;
-        fork.set_model(Model {
-            thinking: crate::types::ThinkingKind::None,
-            id: "fork-flat".into(),
-            ..test_model()
-        })
-        .await
-        .unwrap();
-        fork.set_model(Model {
-            thinking: crate::types::ThinkingKind::Enabled,
-            id: "fork-thinking".into(),
-            ..test_model()
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            fork.harness.agent().state().thinking_level,
-            None,
-            "fork inherits the off preference"
-        );
     }
 
     /// A session-append failure propagates: the caller sees an error and the

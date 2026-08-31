@@ -153,6 +153,7 @@ dependencies = [
  "libc",
  "lsp",
  "lsp-types",
+ "parking_lot",
  "pi",
  "pi-extensions",
  "reqwest 0.12.28",
@@ -195,6 +196,8 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "manox-components",
+ "manox-protocol",
+ "manox-session-core",
  "manox-webview",
  "open",
  "pi",
@@ -5493,16 +5496,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "manox-actor"
-version = "0.1.0"
-dependencies = [
- "agent",
- "gpui",
- "manox-session-core",
- "serde_json",
-]
-
-[[package]]
 name = "manox-components"
 version = "0.1.0"
 dependencies = [
@@ -5520,10 +5513,13 @@ dependencies = [
 name = "manox-napi"
 version = "0.1.0"
 dependencies = [
- "manox-actor",
+ "agent",
+ "manox-protocol",
+ "manox-session-core",
  "napi",
  "napi-build",
  "napi-derive",
+ "serde_json",
 ]
 
 [[package]]
@@ -5544,14 +5540,18 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "anyhow",
+ "async-channel 2.5.0",
  "async-trait",
  "chrono",
- "gpui",
+ "futures",
+ "manox-protocol",
+ "parking_lot",
  "pi",
  "pi-extensions",
  "serde_json",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -5561,9 +5561,11 @@ dependencies = [
  "agent",
  "anyhow",
  "axum",
+ "base64",
  "futures",
  "gpui",
  "include_dir",
+ "manox-protocol",
  "manox-session-core",
  "open",
  "serde",
@@ -9837,7 +9839,6 @@ dependencies = [
  "chrono",
  "cx",
  "futures",
- "gpui",
  "hyperlinks",
  "libc",
  "parking_lot",

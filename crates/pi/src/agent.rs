@@ -1061,6 +1061,19 @@ mod tests {
                 exit_code: 0,
             })
         }
+        async fn exec_at(
+            &self,
+            _command: &str,
+            _cwd: &std::path::Path,
+            _timeout: std::time::Duration,
+            _signal: CancellationToken,
+        ) -> Result<crate::env::CommandResult, crate::env::ExecutionError> {
+            Ok(crate::env::CommandResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+            })
+        }
     }
 
     struct TestToolContext {

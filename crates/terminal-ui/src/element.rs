@@ -16,6 +16,7 @@ use std::cell::{Cell as SharedCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::terminal_proxy::TerminalProxy;
 use gpui::{
     App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, Entity, FocusHandle, Font,
     FontFeatures, FontStyle, FontWeight, GlobalElementId, InspectorElementId, IntoElement,
@@ -26,7 +27,7 @@ use gpui::{
 use terminal::alacritty_terminal::grid::Dimensions as _;
 use terminal::alacritty_terminal::selection::SelectionRange;
 use terminal::alacritty_terminal::vte::ansi::CursorShape;
-use terminal::{Cell, Flags, HoverTarget, Terminal};
+use terminal::{Cell, Flags, HoverTarget};
 
 use crate::block_chars::{BlockRect, COLS, SUBROWS};
 use crate::grid_renderer::{BackgroundRegion, BatchedTextRun, GridPlan, layout_grid};
@@ -36,7 +37,7 @@ use crate::theme::TerminalTheme;
 
 /// The paint-only terminal element. Constructed by `TerminalView::render`.
 pub struct TerminalElement {
-    pub terminal: Entity<Terminal>,
+    pub terminal: Entity<TerminalProxy>,
     pub view: Entity<TerminalView>,
     pub focus_handle: FocusHandle,
     pub theme: TerminalTheme,
@@ -123,7 +124,7 @@ pub struct MarkedPrepaint {
 
 impl TerminalElement {
     pub fn new(
-        terminal: Entity<Terminal>,
+        terminal: Entity<TerminalProxy>,
         view: Entity<TerminalView>,
         focus_handle: FocusHandle,
     ) -> Self {
@@ -320,13 +321,19 @@ impl Element for TerminalElement {
             // reflects the new grid size; TerminalView holds no `observe` on
             // the Terminal, so the inner `cx.notify()` cannot re-enter this
             // render pass.
-            self.terminal.update(cx, |t, cx| t.resize(cols, rows, cx));
+            self.terminal.update(cx, |t, _| t.resize(cols, rows));
         }
 
         // Build the paint plan from the terminal's renderable snapshot, then
         // shape every text run here so paint stays allocation-free.
         let origin = bounds.origin;
         let snapshot = self.terminal.read_with(cx, |t, _cx| {
+            // Read every `TerminalProxy` getter *before* `with_term`: the
+            // proxy's `with_term` already holds the handle's read lock, and
+            // taking it again re-entrantly would deadlock once a writer (the
+            // PTY pump's `with_mut`) is queued — parking_lot's `RwLock` is
+            // task-fair and does not exempt reentrant readers.
+            let term_rows = t.rows();
             t.with_term(|term| {
                 let content = term.renderable_content();
                 let selection = content.selection;
@@ -369,7 +376,7 @@ impl Element for TerminalElement {
                     cursor_shape,
                     display_offset: offset,
                     history,
-                    term_rows: t.rows as i32,
+                    term_rows: term_rows as i32,
                     selection,
                 }
             })

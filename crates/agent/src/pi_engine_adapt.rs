@@ -583,14 +583,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(status) => format!("UpdateGoal {status}"),
             None => "UpdateGoal".to_string(),
         },
-        "EnterWorktree" => match arg("name").or_else(|| arg("path")) {
-            Some(target) => format!("EnterWorktree {target}"),
-            None => "EnterWorktree".to_string(),
-        },
-        "ExitWorktree" => match arg("action") {
-            Some(action) => format!("ExitWorktree {action}"),
-            None => "ExitWorktree".to_string(),
-        },
         "LspStatus" | "LspEnsure" | "LspWaitReady" => match arg("language") {
             Some(language) => format!("{name} {language}"),
             None => name.to_string(),
@@ -1019,14 +1011,6 @@ mod tests {
         assert_eq!(
             tool_title("UpdateGoal", &json!({"status": "complete"})),
             "UpdateGoal complete"
-        );
-        assert_eq!(
-            tool_title("EnterWorktree", &json!({"name": "wt-fix"})),
-            "EnterWorktree wt-fix"
-        );
-        assert_eq!(
-            tool_title("ExitWorktree", &json!({"action": "keep"})),
-            "ExitWorktree keep"
         );
         assert_eq!(
             tool_title("WebFetch", &json!({"url": "https://example.com/doc"})),

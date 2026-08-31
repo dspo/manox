@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 agent = { workspace = true }
 manox-session-core = { workspace = true }
+manox-protocol = { workspace = true }
 gpui = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -15,6 +16,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+base64 = { workspace = true }
 include_dir = { workspace = true }
 open = { workspace = true }
 uuid = { workspace = true }

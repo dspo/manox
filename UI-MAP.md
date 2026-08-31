@@ -681,15 +681,15 @@ Ghost `xsmall` button in the panel header, `IconName::PanelRightClose`, tooltip 
 
 Working-tree diff stat line in the panel body. `env_row` with `Frame` icon, "Changes" label, and a trailing `+added` (green) / `-deleted` (red) / `?untracked` (muted) cluster from `GitChangeStats`. Before the first git refresh lands (or when no project is bound) the trailing slot shows `--` / "No project" so the row keeps its height instead of flickering.
 
-Stats come from `git diff --numstat HEAD` (binary rows `-`/`-` skipped) plus `git ls-files --others --exclude-standard` for untracked, shelled out via [`crate::git_status`](#git_status) on the global tokio runtime. Refreshed (debounced 400ms) by `Workspace` on thread attach, terminal `Stop`, and enter/exit worktree.
+Stats come from `git diff --numstat HEAD` (binary rows `-`/`-` skipped) plus `git ls-files --others --exclude-standard` for untracked, shelled out via [`crate::git_status`](#git_status) on the global tokio runtime. Refreshed (debounced 400ms) by `Workspace` on thread attach and terminal `Stop`.
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_changes_row`)
 
 #### ContextRailBranchRow
 
-Resolved git identity block in the panel body (`render_branch_block`). When the thread is inside a worktree, a leading worktree-name row precedes the branch row; both rows share the same `h_flex` (icon + label) layout, `text_sm` font, and `gap_2` spacing so they read as peer rows.
+Resolved git identity block in the panel body (`render_branch_block`). When the session's effective cwd differs from the launch directory (a worktree entered through a per-call `cwd`), a leading directory-name row precedes the branch row; both rows share the same `h_flex` (icon + label) layout, `text_sm` font, and `gap_2` spacing so they read as peer rows.
 
-- **Worktree row** (rendered only while inside a worktree): lucide `workflow` icon (resolved via [assets](#assets) at `icons/workflow.svg`) + the worktree directory basename as the label. Non-interactive — no trailing, no cursor, no menu.
+- **Working-directory row** (rendered only while the effective cwd is reported): lucide `workflow` icon (resolved via [assets](#assets) at `icons/workflow.svg`) + the directory basename as the label. Non-interactive — no trailing, no cursor, no menu.
 - **Branch row**: `env_row_clickable` with lucide `git-branch` icon (`icons/git-branch.svg`) — the whole row is a pointer cursor that opens [ContextRailBranchMenu](#contextrailbranchmenu). The label shows:
   - The branch name when on a normal branch.
   - The short sha + "(detached)" hint when in detached HEAD.
@@ -697,7 +697,7 @@ Resolved git identity block in the panel body (`render_branch_block`). When the 
   - "git unavailable" when the `git` binary is missing.
   - "--" before the first refresh lands; "No project" when no project is bound.
 
-Both glyphs live in manox's local asset bundle (`ExtrasAssetSource` in `agent-ui/src/assets.rs`), not `gpui-component-assets` — `IconName` is generated at compile time from the latter's directory and cannot reference them, so the rows construct `Icon::default().path("icons/…")` instead of `Icon::new(IconName::…)`. Branch resolution prefers `Thread::worktree().branch` when inside a worktree; otherwise shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
+Both glyphs live in manox's local asset bundle (`ExtrasAssetSource` in `agent-ui/src/assets.rs`), not `gpui-component-assets` — `IconName` is generated at compile time from the latter's directory and cannot reference them, so the rows construct `Icon::default().path("icons/…")` instead of `Icon::new(IconName::…)`. Branch resolution shells out to `git branch --show-current`, falling back to `git rev-parse --short HEAD` for detached HEAD. All via [`crate::git_status`](#git_status).
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_branch_block`)
 
@@ -706,14 +706,13 @@ Both glyphs live in manox's local asset bundle (`ExtrasAssetSource` in `agent-ui
 `PopupMenu` anchored under the branch row, rendered as a `deferred(...).with_priority(1)` overlay so it paints on top of the entire workspace tree and is never occluded by the rail's later-painted siblings (usage/budget/plan rows) nor clipped by the rail's scroll container. Mirrors the title-menu / model-selector pattern: the menu entity + its `DismissEvent` subscription are created lazily on open, dropped on close. Items:
 
 - **Copy branch name** (i18n `workspace-env-git-copy-branch`) — shown when a branch resolved; writes to the clipboard silently.
-- **Copy worktree path** (i18n `workspace-env-git-copy-path`) — shown when the thread is inside a worktree.
-- **Exit worktree** (i18n `workspace-env-git-exit-worktree`) — shown only inside a worktree, behind a separator; calls `Thread::exit_worktree` (the branch row never exits directly, so a stray click cannot destroy the isolation context).
+- **Copy working-directory path** (i18n `workspace-env-git-copy-path`) — shown when an effective cwd is reported.
 
 > Source: `agent-ui/src/views/context_rail.rs` (`render_branch_row`)
 
 #### git_status
 
-Pure parsing + tokio-bridged IO module backing [ContextRailChangesRow](#contextrailchangesrow) / [ContextRailBranchRow](#contextrailbranchrow). Shells out to the system `git` binary (never `git2` — banned by project rule) on the global tokio runtime via `agent::runtime::handle`, delivering results back through an `async_channel` (the same bridge the worktree tool uses).
+Pure parsing + tokio-bridged IO module backing [ContextRailChangesRow](#contextrailchangesrow) / [ContextRailBranchRow](#contextrailbranchrow). Shells out to the system `git` binary (never `git2` — banned by project rule) on the global tokio runtime via `agent::runtime::handle`, delivering results back through an `async_channel`.
 
 - `parse_numstat` / `parse_branch` / `parse_short_sha` / `count_untracked` — pure value-type parsers (unit-tested without a real repo).
 - `gather` — runs `git rev-parse --show-toplevel`, `git branch --show-current` / `git rev-parse --short HEAD`, `git diff --numstat HEAD`, `git ls-files --others --exclude-standard` in one background task; returns `None` when the cwd is not under git.

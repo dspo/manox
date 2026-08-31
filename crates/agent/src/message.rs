@@ -23,10 +23,11 @@ pub enum MessageProvenance {
 /// The value is the agent's routing identity; the UI resolves it to a
 /// display name at render time. New agents (built-in, user-authored,
 /// plugin) flow through `Agent` verbatim — no per-agent code paths.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageAuthor {
     /// The session's main agent (Captain).
+    #[default]
     Lead,
     /// The host harness itself: a turn it injected on the user's behalf
     /// (the plan-execution seed).

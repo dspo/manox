@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use agent::i18n;
+use crate::i18n;
 use gpui::{App, ClickEvent, Window};
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
 

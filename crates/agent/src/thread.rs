@@ -1,15 +1,19 @@
 //! The `Thread` facade — the UI-facing conversation type.
 //!
-//! The pi harness backs the thread through a `ThreadEngine` (see
-//! `pi_engine`), with events drained on the gpui thread. The retired manox
-//! harness implementation was removed; see git history (or the
-//! `origin/Manox` backup branch) for it.
+//! A gpui-free thread owned behind a `ThreadHandle` (`Arc<ThreadCore>`): the
+//! state lives in a lock, and run events from the tokio actor around a pi
+//! `AgentSession` (via the `ThreadEngine` contract) flow back through a
+//! channel, are adapted into `ThreadEvent`s (see `pi_engine::adapt`), and
+//! broadcast to the handle's subscribers. History is exposed as a display
+//! sequence (messages interleaved with persisted UI annotation cards) so the
+//! rebuild path (`ConversationState::rebuild_from_display`) replays it in
+//! order. The retired manox harness implementation was removed; see git
+//! history (or the `origin/Manox` backup branch) for it.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{App, AppContext as _, Context, Entity, EventEmitter};
 use serde::{Deserialize, Serialize};
 
 use crate::background_task::TaskSnapshot;
@@ -23,7 +27,7 @@ use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine
 use pi::types::Model as PiModel;
 
 /// Stable `Thread` id used for persistence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadId(pub String);
 
 /// Tool call status.
@@ -54,22 +58,13 @@ pub struct SideCallMetric {
 /// the host's session/persistence (wire field `approval_mode`, kebab values).
 pub use pi_extensions::sandbox::PermissionMode;
 
-/// Session-scoped state for a thread inside a git worktree. The pi backend
-/// never enters worktrees in this stage, so the type exists only to keep the
-/// facade surface identical to the manox build.
-pub struct WorktreeState {
-    pub path: PathBuf,
-    pub prior_cwd: PathBuf,
-    pub branch: String,
-    pub git_common_dir: PathBuf,
-    pub subagent_created: bool,
-}
-
 /// History-loading state of a thread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HistoryPhase {
     /// No history pending (fresh / landing threads); the message list is
     /// final as soon as it exists.
+    #[default]
     Ready,
     /// An existing session is being restored. Display-only preview batches
     /// may stream into `messages` while the authoritative restore runs; the
@@ -92,7 +87,7 @@ impl HistoryPhase {
 /// channel). Text/thinking deltas append to the drill-down transcript; tool
 /// start/end render as activity lines; message stops and terminal errors
 /// carry the boundary signals the panel mirrors from the main thread.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SubagentChildEvent {
     /// Assistant text delta from the child.
     Text(String),
@@ -156,11 +151,13 @@ pub enum ThreadEvent {
     },
     /// A sub-agent's child thread was constructed. Not produced by the pi
     /// backend in this stage (sub-agent observation panels are not wired).
+    /// Carries the child's [`ThreadId`] (value type) — the event crosses the
+    /// kernel boundary, so no handle/entity rides it.
     SubagentStarted {
         id: String,
         subagent_type: String,
         description: String,
-        child: Entity<Thread>,
+        child: ThreadId,
     },
     /// A spawned sub-agent's aggregated progress.
     SubagentProgress {
@@ -245,20 +242,24 @@ pub enum ThreadEvent {
     GoalChanged {
         goal: Option<crate::goal::ThreadGoal>,
     },
-    /// Git-worktree binding changed: entered (worktree path) or exited.
-    WorktreeChanged {
-        active: bool,
-        path: Option<String>,
+    /// The session's effective working directory moved (per-call cwd
+    /// resolution advanced the sticky cwd; durable as a `cwd_change`).
+    CwdChanged {
+        path: String,
     },
     /// Auto-compaction summarization pass started.
     CompactionStarted {
         tokens_before: u64,
     },
-    /// A compaction pass landed.
+    /// A compaction pass landed. `retained_tail` carries the messages kept
+    /// intact across the boundary (from the kernel's `CompactionResult`) so
+    /// protocol clients can replace — not append — their transcript with
+    /// `summary + tail`.
     Compaction {
         summary: String,
         messages_compacted: usize,
         tokens_before: u64,
+        retained_tail: Vec<crate::message::Message>,
     },
     /// The model submitted a plan file for the user's review verdict via
     /// the `ProposePlan` tool.
@@ -289,17 +290,6 @@ pub enum ThreadEvent {
     /// A queued steer follow-up was drained into `messages`.
     SteerInjected {
         message_id: String,
-    },
-    /// A page-state notification from a built-in browser tab.
-    BrowserNotification {
-        tab_id: crate::webview_host::BrowserTabId,
-        notification: crate::webview_host::BrowserNotification,
-    },
-    /// An untrusted page requested an inbound write.
-    InboundAuthorization {
-        id: String,
-        intent: String,
-        payload: serde_json::Value,
     },
     /// A background task's state changed.
     BackgroundTaskUpdated {
@@ -392,19 +382,266 @@ pub struct Thread {
     /// Shared goal state with the engine's goal tools; `None` only when the
     /// threads db is unavailable (goal features degrade off).
     goal_bridge: Option<Arc<GoalBridge>>,
-    worktree_path: Option<String>,
+    cwd_path: Option<String>,
+    /// Events buffered by cx-free mutations, drained and broadcast to the
+    /// handle's subscribers after each operation (replaces `cx.emit`).
+    pending_events: Vec<ThreadEvent>,
+    /// Engine notice channel parked by `ensure_engine` (lazy engine). `open`
+    /// drains its engine directly at construction (no outer `with_mut` to
+    /// borrow); `ensure_engine` runs inside a `with_mut`, so it parks the
+    /// receiver here and that enclosing call spawns the pump.
+    pending_engine_events: Option<tokio::sync::mpsc::UnboundedReceiver<BackendNotice>>,
 }
 
-impl EventEmitter<ThreadEvent> for Thread {}
+/// A live-thread registry seam: the kernel looks up / registers live threads
+/// for team/bus routing through this, never touching the gpui thread_store
+/// global directly. The gpui layer wires an impl backed by the thread store.
+///
+/// **Retention contract** — the registry stores only a **weak** reference per
+/// registered thread (`Arc::downgrade`), so registering never by itself keeps
+/// a thread alive. [`Self::lookup`] upgrades the weak reference (`None` once
+/// the thread is dropped); [`Self::refresh`] prunes stale entries;
+/// [`Self::unregister`] removes an entry explicitly (dismiss). The **strong**
+/// reference that keeps a thread alive is owned by the live-thread holder —
+/// the AgentServer, transitionally the gpui workspace — mirroring the original
+/// `downgrade()` + `refresh`-pruning GC. A spawned team member therefore stays
+/// alive exactly as long as its owner holds it, and is reclaimed once dropped.
+pub trait ThreadRegistry: Send + Sync {
+    /// Index `handle` under `id`, storing only a weak reference. The caller
+    /// retains strong ownership; the registry never keeps the thread alive.
+    fn register(&self, id: &str, handle: &ThreadHandle);
+    /// Upgrade the weak reference for `id`; `None` if absent or dropped.
+    fn lookup(&self, id: &str) -> Option<ThreadHandle>;
+    /// Prune entries whose thread has been dropped.
+    fn refresh(&self);
+    /// Drop the entry for `id` (thread dismissed or finished).
+    fn unregister(&self, id: &str);
+}
+
+static THREAD_REGISTRY: std::sync::OnceLock<Arc<dyn ThreadRegistry>> = std::sync::OnceLock::new();
+
+/// Register the process-wide live-thread registry (App startup). First wins.
+pub fn set_thread_registry(registry: Arc<dyn ThreadRegistry>) {
+    if THREAD_REGISTRY.set(registry).is_err() {
+        tracing::warn!("thread registry already registered; ignoring re-registration");
+    }
+}
+
+/// The registered live-thread registry, or `None` in headless contexts.
+pub fn thread_registry() -> Option<&'static Arc<dyn ThreadRegistry>> {
+    THREAD_REGISTRY.get()
+}
+
+/// The gpui-free handle to a thread. Cheap to clone (`Arc`); state lives
+/// behind a lock and events broadcast to channel subscribers. This is the
+/// kernel-side unit the AgentServer and (transitionally) the frontends hold.
+#[derive(Clone)]
+pub struct ThreadHandle(Arc<ThreadCore>);
+
+pub struct ThreadCore {
+    /// Read-mostly state: the UI reads 25+ fields per render while the engine
+    /// pump writes during a turn, so reads share the `RwLock` and only
+    /// mutations take the exclusive write lock.
+    state: parking_lot::RwLock<Thread>,
+    /// Event subscribers. Carries `Arc<ThreadEvent>` — a transitional shell
+    /// because `ThreadEvent::Error(anyhow::Error)` (and, until it becomes a
+    /// `ThreadId`, `SubagentStarted.child`) are not `Clone`; once those land
+    /// the event can derive `Clone` and this `Arc` comes off.
+    subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadEvent>>>>,
+}
+
+impl ThreadHandle {
+    /// Wrap a freshly built [`Thread`].
+    pub fn new(thread: Thread) -> Self {
+        Self(Arc::new(ThreadCore {
+            state: parking_lot::RwLock::new(thread),
+            subscribers: parking_lot::Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Downgrade to a weak reference for the live-thread registry index. The
+    /// registry never by itself keeps the thread alive; the strong reference
+    /// sits with the live-thread holder.
+    pub fn downgrade(&self) -> std::sync::Weak<ThreadCore> {
+        Arc::downgrade(&self.0)
+    }
+
+    /// Re-upgrade a weak reference, if the thread is still alive.
+    pub fn upgrade(weak: &std::sync::Weak<ThreadCore>) -> Option<Self> {
+        weak.upgrade().map(Self)
+    }
+
+    /// Subscribe to this thread's event stream.
+    pub fn subscribe(&self) -> async_channel::Receiver<Arc<ThreadEvent>> {
+        let (tx, rx) = async_channel::unbounded();
+        self.0.subscribers.lock().push(tx);
+        rx
+    }
+
+    /// Shared-read the state.
+    pub fn read<R>(&self, f: impl FnOnce(&Thread) -> R) -> R {
+        let state = self.0.state.read();
+        f(&state)
+    }
+
+    /// Mutate under the write lock, then broadcast the buffered events.
+    /// Three-phase: lock -> mutate (collecting `pending_events`) -> unlock ->
+    /// emit. The closure must never await.
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut Thread) -> R) -> R {
+        let (r, events, engine_events) = {
+            let mut state = self.0.state.write();
+            let r = f(&mut state);
+            let events = std::mem::take(&mut state.pending_events);
+            let engine_events = state.pending_engine_events.take();
+            (r, events, engine_events)
+        };
+        if let Some(rx) = engine_events {
+            drain_engine_notices(self.clone(), rx);
+        }
+        self.broadcast(events);
+        r
+    }
+
+    fn broadcast(&self, events: Vec<ThreadEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut subs = self.0.subscribers.lock();
+        // Drop subscribers whose receiver is gone (view unmount); otherwise
+        // the list grows without bound on a long-lived thread.
+        subs.retain(|tx| !tx.is_closed());
+        if subs.is_empty() {
+            return;
+        }
+        for ev in events {
+            let ev = Arc::new(ev);
+            for tx in subs.iter() {
+                let _ = tx.try_send(ev.clone());
+            }
+        }
+    }
+}
+
+impl ThreadHandle {
+    /// Handle one backend notice. State-mutating arms run under `with_mut` so
+    /// the events they buffer broadcast at the call's exit — this closes the
+    /// pump→notice→`pending_events`→broadcast chain. Bus / browser /
+    /// session-list arms are handled at handle level (registry / capability),
+    /// never under the state lock.
+    pub fn handle_notice(&self, notice: BackendNotice) {
+        match notice {
+            BackendNotice::BusRequest { op, responder } => {
+                self.handle_bus_request(op, responder);
+            }
+            BackendNotice::BrowserRequest { op, responder } => {
+                self.handle_browser_request(op, responder);
+            }
+            BackendNotice::SessionListDirty => {
+                if let Some(reg) = thread_registry() {
+                    reg.refresh();
+                }
+            }
+            other => self.with_mut(|t| t.handle_notice_inner(other)),
+        }
+    }
+
+    /// Steer-bus member ops: spawn / inject / abort team member threads through
+    /// the live-thread registry (never the gpui thread_store global).
+    fn handle_bus_request(
+        &self,
+        op: pi_extensions::steer_bus::BusOp,
+        responder: Option<async_channel::Sender<Result<String, String>>>,
+    ) {
+        use pi_extensions::steer_bus::BusOp;
+        let result: Result<String, String> = match op {
+            BusOp::SpawnMember { name, prompt } => {
+                let member = self.read(|t| t.new_team_member(name.clone()));
+                let mid = member.read(|t| t.id.0.clone());
+                if let Some(reg) = thread_registry() {
+                    // Weak index only; the AgentServer (live-thread owner) holds
+                    // the strong reference that keeps the member alive.
+                    reg.register(&mid, &member);
+                    reg.refresh();
+                }
+                let from = self.read(|t| t.self_author());
+                let ui = crate::MessageUiMetadata {
+                    author: Some(from),
+                    ..Default::default()
+                };
+                member.with_mut(|t| {
+                    t.insert_user_message_with_ui_metadata(prompt, Some(ui));
+                    t.run_turn();
+                });
+                Ok(mid)
+            }
+            BusOp::InjectMember { thread_id, payload } => {
+                let Some(member) = thread_registry().and_then(|r| r.lookup(&thread_id)) else {
+                    if let Some(r) = &responder {
+                        let _ = r.try_send(Err(format!("member {thread_id} not found")));
+                    }
+                    return;
+                };
+                member.with_mut(|t| {
+                    t.deliver_peer_messages(vec![crate::team::PeerMessage {
+                        from: "captain".into(),
+                        content: payload,
+                    }]);
+                });
+                Ok("injected".into())
+            }
+            BusOp::AbortMember { thread_id } => {
+                let Some(member) = thread_registry().and_then(|r| r.lookup(&thread_id)) else {
+                    if let Some(r) = &responder {
+                        let _ = r.try_send(Err(format!("member {thread_id} not found")));
+                    }
+                    return;
+                };
+                member.with_mut(|t| t.cancel());
+                Ok("aborted".into())
+            }
+        };
+        if let Some(r) = responder {
+            let _ = r.try_send(result);
+        }
+    }
+
+    /// Browser ops are a frontend capability: hand the op to the registered
+    /// provider and relay its reply on the runtime; fail closed when no
+    /// provider is registered (headless contexts).
+    fn handle_browser_request(
+        &self,
+        op: crate::thread_engine::BrowserOp,
+        responder: async_channel::Sender<Result<crate::thread_engine::BrowserReply, String>>,
+    ) {
+        let Some(caps) = crate::capability::provider() else {
+            let _ = responder.try_send(Err("browser capability not available".to_string()));
+            return;
+        };
+        let session_id = self.read(|t| t.id.0.clone());
+        crate::runtime::handle().spawn(async move {
+            let result = crate::capability::CURRENT_SESSION
+                .scope(Some(session_id), async { caps.browser_op(op).await })
+                .await;
+            let _ = responder.send(result).await;
+        });
+    }
+}
 
 impl Thread {
     /// The startup landing state: a detached thread with no engine. No
     /// session is loaded at launch — the user picks a conversation from the
     /// sidebar (`open_existing` swaps in its engine) or starts typing
     /// (`run_turn` materializes a fresh engine on first use).
-    pub fn landing(cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        cx.new(|_| Self {
-            id: ThreadId(uuid::Uuid::new_v4().to_string()),
+    pub fn landing(cwd: PathBuf) -> ThreadHandle {
+        Self::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd)
+    }
+
+    /// A landing thread with a caller-chosen id, so the desktop can bind its
+    /// AgentServer session to the same id (`CreateSession` uses the session
+    /// id as the `ThreadId`).
+    pub fn landing_with_id(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
+        ThreadHandle::new(Self {
+            id,
             cwd,
             project: None,
             model: crate::pi_providers::default_model(),
@@ -433,26 +670,28 @@ impl Thread {
             title: None,
             label: "lead".into(),
             goal_bridge: None,
-            worktree_path: None,
+            cwd_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
         })
     }
 
     /// A genuinely empty thread (sidebar new-conversation): never restores
     /// the previous session.
-    pub fn new_fresh(id: ThreadId, cwd: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, None, None, true, cx)
+    pub fn new_fresh(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
+        Self::open(id, cwd, None, None, true)
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
     /// the project as its cwd in one step (no recreate, no restore), so the
     /// sidebar never sees an orphaned pre-project session file.
-    pub fn new_in_project(id: ThreadId, project: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, project.clone(), None, Some(project), true, cx)
+    pub fn new_in_project(id: ThreadId, project: PathBuf) -> ThreadHandle {
+        Self::open(id, project.clone(), None, Some(project), true)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
-    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf, cx: &mut App) -> Entity<Self> {
-        Self::open(id, cwd, Some(path), None, false, cx)
+    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf) -> ThreadHandle {
+        Self::open(id, cwd, Some(path), None, false)
     }
 
     fn open(
@@ -461,8 +700,7 @@ impl Thread {
         initial_path: Option<PathBuf>,
         project: Option<PathBuf>,
         fresh: bool,
-        cx: &mut App,
-    ) -> Entity<Self> {
+    ) -> ThreadHandle {
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
         // gate input and render the streaming preview.
@@ -487,45 +725,46 @@ impl Thread {
             None,
         );
 
-        cx.new(|cx| {
-            drain_engine_notices(cx, events);
-            Self {
-                id,
-                cwd,
-                project,
-                model,
-                permission_mode: PermissionMode::default(),
-                messages: Vec::new(),
-                reasoning_effort: ReasoningEffort::default(),
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: if loading {
-                    HistoryPhase::Loading
-                } else {
-                    HistoryPhase::Ready
-                },
-                permission_mode_explicitly_set: false,
-                reasoning_effort_explicitly_set: false,
-                model_explicitly_set: false,
-                browser_suites: Vec::new(),
-                browser_suites_explicitly_set: false,
-                plan_mode: false,
-                persisted_plan: None,
-                title: None,
-                label: "lead".into(),
-                goal_bridge,
-                worktree_path: None,
-            }
-        })
+        let handle = ThreadHandle::new(Self {
+            id,
+            cwd,
+            project,
+            model,
+            permission_mode: PermissionMode::default(),
+            messages: Vec::new(),
+            reasoning_effort: ReasoningEffort::default(),
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: if loading {
+                HistoryPhase::Loading
+            } else {
+                HistoryPhase::Ready
+            },
+            permission_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
+            model_explicitly_set: false,
+            browser_suites: Vec::new(),
+            browser_suites_explicitly_set: false,
+            plan_mode: false,
+            persisted_plan: None,
+            title: None,
+            label: "lead".into(),
+            goal_bridge,
+            cwd_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
+        });
+        drain_engine_notices(handle.clone(), events);
+        handle
     }
 
     /// Lazily materialize the engine for a landing thread (no engine until
@@ -535,7 +774,7 @@ impl Thread {
     /// notice drainer, and replays the stored permission mode / reasoning
     /// effort. `spawn_engine` is infallible (it only queues the actor), so
     /// the engine is always available after this returns.
-    fn ensure_engine(&mut self, project: Option<PathBuf>, cx: &mut Context<Self>) {
+    fn ensure_engine(&mut self, project: Option<PathBuf>) {
         if self.engine.is_some() {
             return;
         }
@@ -570,12 +809,14 @@ impl Thread {
             engine.set_browser_suite(suite, true);
         }
         self.engine = Some(engine.clone());
-        drain_engine_notices(cx, events);
+        self.pending_engine_events = Some(events);
     }
 
-    /// Handle one backend notice on the gpui thread: mirror state and re-emit
-    /// the UI-facing event.
-    fn handle_notice(&mut self, notice: BackendNotice, cx: &mut Context<Self>) {
+    /// Handle one backend notice's state-mutating arms. Invoked by
+    /// [`ThreadHandle::handle_notice`] under `with_mut`, so the events each
+    /// arm buffers broadcast at the call's exit. Bus / browser / session-list
+    /// arms live on the handle (registry / capability) and never reach here.
+    fn handle_notice_inner(&mut self, notice: BackendNotice) {
         match notice {
             BackendNotice::Event(event) => {
                 // Mirror the gate policy before the chip hears about the
@@ -612,11 +853,11 @@ impl Thread {
                 // synchronously before the engine picks up the prompt).
                 if matches!(&*event, ThreadEvent::TurnStarted) {
                     self.running = true;
-                    if let ThreadEvent::WorktreeChanged { active, path } = &*event {
-                        self.worktree_path = if *active { path.clone() } else { None };
-                    }
                 }
-                cx.emit(*event);
+                if let ThreadEvent::CwdChanged { path } = &*event {
+                    self.cwd_path = Some(path.clone());
+                }
+                self.pending_events.push(*event);
             }
             BackendNotice::LiveHistory => {
                 // Mid-run mirror refresh (no UI event): the workspace's
@@ -624,79 +865,7 @@ impl Thread {
                 // while still generating shows current progress instead of the
                 // last settled snapshot. The authoritative `Settled` refresh
                 // replaces this mirror.
-                self.refresh_history(cx);
-            }
-            BackendNotice::BusRequest { op, responder } => {
-                use pi_extensions::steer_bus::BusOp;
-                let result: Result<String, String> = match op {
-                    BusOp::SpawnMember { name, prompt } => {
-                        let member = self.new_team_member(name.clone(), cx);
-                        let mid = member.read(cx).id.0.clone();
-                        let store = crate::thread_store::global();
-                        store.update(cx, |s, cx| {
-                            s.register_live_thread(&mid, member.downgrade());
-                            s.refresh(cx);
-                        });
-                        let from = self.self_author();
-                        member.update(cx, |t, cx| {
-                            let ui = crate::MessageUiMetadata {
-                                author: Some(from.clone()),
-                                ..Default::default()
-                            };
-                            t.insert_user_message_with_ui_metadata(prompt, Some(ui), cx);
-                            t.run_turn(cx);
-                        });
-                        Ok(mid)
-                    }
-                    BusOp::InjectMember { thread_id, payload } => {
-                        let store = crate::thread_store::global();
-                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            if let Some(r) = &responder {
-                                let _ = r.try_send(Err(format!("member {thread_id} not found")));
-                            }
-                            return;
-                        };
-                        thread.update(cx, |t, cx| {
-                            t.deliver_peer_messages(
-                                vec![crate::team::PeerMessage {
-                                    from: "captain".into(),
-                                    content: payload,
-                                }],
-                                cx,
-                            );
-                        });
-                        Ok("injected".into())
-                    }
-                    BusOp::AbortMember { thread_id } => {
-                        let store = crate::thread_store::global();
-                        let Some(thread) = store.read(cx).live_thread(&thread_id) else {
-                            if let Some(r) = &responder {
-                                let _ = r.try_send(Err(format!("member {thread_id} not found")));
-                            }
-                            return;
-                        };
-                        thread.update(cx, |t, cx| t.cancel(cx));
-                        Ok("aborted".into())
-                    }
-                };
-                if let Some(r) = responder {
-                    let _ = r.try_send(result);
-                }
-            }
-            BackendNotice::BrowserRequest { op, responder } => {
-                // The browser is a frontend capability: hand the op to the
-                // registered capability provider (today the gpui host, later the
-                // protocol's `ServerCall::BrowserOp` owner) and relay its reply.
-                // Fail closed when no provider is registered (headless contexts).
-                let Some(caps) = crate::capability::provider().cloned() else {
-                    let _ = responder.try_send(Err("browser capability not available".to_string()));
-                    return;
-                };
-                cx.spawn(async move |_this, _cx| {
-                    let result = caps.browser_op(op).await;
-                    let _ = responder.send(result).await;
-                })
-                .detach();
+                self.refresh_history();
             }
             BackendNotice::Ready(notice) => {
                 let ReadyInfo {
@@ -736,7 +905,7 @@ impl Thread {
                 // this lands, so the projection cannot know about it).
                 if !self.browser_suites_explicitly_set && self.browser_suites != browser_suites {
                     self.browser_suites = browser_suites.clone();
-                    cx.emit(ThreadEvent::BrowserSuitesChanged {
+                    self.pending_events.push(ThreadEvent::BrowserSuitesChanged {
                         suites: browser_suites,
                     });
                 }
@@ -755,24 +924,25 @@ impl Thread {
                         .trim_end_matches("-plan")
                         .to_string();
                     let title = crate::plan_mode::resolve_plan_title(None, &content, &slug);
-                    cx.emit(ThreadEvent::PlanReady { plan_file, title });
+                    self.pending_events
+                        .push(ThreadEvent::PlanReady { plan_file, title });
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
-                self.refresh_history(cx);
+                self.refresh_history();
                 // Rebuild on restore, and also after a failed restore — the
                 // preview may have streamed a corrupt file's partial content
                 // and the fresh fallback session is empty, so the workspace
                 // must return to the hero. Fresh threads skip the rebuild
                 // (nothing changed since attach).
                 if restored || was_loading {
-                    cx.emit(ThreadEvent::HistoryRestored);
+                    self.pending_events.push(ThreadEvent::HistoryRestored);
                 }
             }
             BackendNotice::HistoryProgress => {
                 if self.history_phase.is_loading() {
-                    self.refresh_history(cx);
-                    cx.emit(ThreadEvent::HistoryProgress);
+                    self.refresh_history();
+                    self.pending_events.push(ThreadEvent::HistoryProgress);
                 }
             }
             BackendNotice::Settled {
@@ -782,12 +952,13 @@ impl Thread {
                 stranded,
             } => {
                 for message_id in steered {
-                    cx.emit(ThreadEvent::SteerInjected { message_id });
+                    self.pending_events
+                        .push(ThreadEvent::SteerInjected { message_id });
                 }
                 self.running = false;
                 self.pending_steers.clear();
-                self.refresh_history(cx);
-                cx.emit(ThreadEvent::TurnFinished {
+                self.refresh_history();
+                self.pending_events.push(ThreadEvent::TurnFinished {
                     cancelled,
                     failed,
                     stranded_steer_ids: stranded,
@@ -796,7 +967,7 @@ impl Thread {
                 // (pending_prompts non-empty), start a follow-up turn.
                 // Mirrors manox-actor pending_submits drain.
                 if !self.pending_prompts.is_empty() {
-                    self.run_turn(cx);
+                    self.run_turn();
                 }
             }
             BackendNotice::Fatal(err) => {
@@ -808,12 +979,8 @@ impl Thread {
                 // hero (the error surfaces as a conversation notice).
                 self.history_phase = HistoryPhase::Ready;
                 self.messages.clear();
-                cx.emit(ThreadEvent::HistoryRestored);
-                cx.emit(ThreadEvent::Error(err));
-            }
-            BackendNotice::SessionListDirty => {
-                let store = crate::thread_store::global();
-                store.update(cx, |s, cx| s.refresh(cx));
+                self.pending_events.push(ThreadEvent::HistoryRestored);
+                self.pending_events.push(ThreadEvent::Error(err));
             }
             BackendNotice::SteerDelivered {
                 from,
@@ -828,14 +995,18 @@ impl Thread {
                     pi_extensions::steer_bus::AgentId::Captain => "captain".to_string(),
                     pi_extensions::steer_bus::AgentId::User => "user".to_string(),
                 };
-                self.deliver_peer_messages(
-                    vec![crate::team::PeerMessage {
-                        from: sender,
-                        content: payload.text,
-                    }],
-                    cx,
-                );
+                self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                    from: sender,
+                    content: payload.text,
+                }]);
             }
+            // Bus / browser / session-list arms are dispatched at the handle
+            // level (`ThreadHandle::handle_notice`); they never reach here.
+            // Listed explicitly (not `_`) so a new `BackendNotice` variant
+            // forces a decision here at compile time.
+            BackendNotice::BusRequest { .. }
+            | BackendNotice::BrowserRequest { .. }
+            | BackendNotice::SessionListDirty => {}
         }
     }
 
@@ -851,7 +1022,7 @@ impl Thread {
     /// the User role on the provider wire but must never inherit prompt chrome.
     /// No-op while the engine is not materialized (a landing thread has no
     /// backend history).
-    fn refresh_history(&mut self, cx: &mut Context<Self>) {
+    fn refresh_history(&mut self) {
         let Some(engine) = &self.engine else {
             return;
         };
@@ -863,8 +1034,8 @@ impl Thread {
         if let Some(ui) = self.last_user_ui.clone()
             && let Some(HistoryEntry::Message(last_user)) = display.iter_mut().rev().find(|entry| {
                 matches!(entry, HistoryEntry::Message(m)
-                        if m.role == crate::language_model::Role::User
-                            && m.provenance == crate::message::MessageProvenance::User)
+                            if m.role == crate::language_model::Role::User
+                                && m.provenance == crate::message::MessageProvenance::User)
             })
         {
             last_user.ui = Some(ui);
@@ -878,7 +1049,6 @@ impl Thread {
             .collect();
         self.display = display;
         self.request_usage = engine.request_token_usage();
-        cx.notify();
     }
 
     // ── Thread duck-type: the turn pipeline ────────────────────────────────
@@ -887,7 +1057,6 @@ impl Thread {
         &mut self,
         text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         let ordinal = self.user_prompt_ordinal();
         let mut message = Message::user(text.clone());
@@ -896,14 +1065,12 @@ impl Thread {
         self.persist_user_attribution(ordinal, &ui);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
-        cx.notify();
     }
 
     pub fn insert_user_message_with_content_and_ui_metadata(
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         // Text blocks join the prompt text; image blocks ride the next
         // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
@@ -936,14 +1103,12 @@ impl Thread {
             self.pending_images.extend(images);
         }
         self.last_user_ui = ui;
-        cx.notify();
     }
 
     pub fn enqueue_steer(
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> String {
         let mut images = Vec::new();
         let text: String = content
@@ -968,27 +1133,25 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.steer(text, images);
         }
-        cx.notify();
         // The canonical message joins history at the next refresh (pi owns the
         // transcript); the workspace renders the optimistic bubble until
         // `SteerInjected` confirms.
         id
     }
 
-    pub fn run_turn(&mut self, cx: &mut Context<Self>) {
+    pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
         }
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
         self.running = true;
-        cx.emit(ThreadEvent::TurnStarted);
+        self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
             .run(prompt, images);
-        cx.notify();
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -996,7 +1159,7 @@ impl Thread {
     /// semantics, and aborts every spawned TeamMember's active turn — the
     /// member's own `cancel` recurses into its derivatives. Natural turn
     /// settle never reaches this path, so background work survives turns.
-    pub fn cancel(&mut self, _cx: &mut Context<Self>) {
+    pub fn cancel(&mut self) {
         if let Some(engine) = &self.engine {
             engine.abort();
             engine.abort_spawned_members();
@@ -1031,10 +1194,9 @@ impl Thread {
         &mut self,
         engine: Arc<dyn ThreadEngine>,
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
-        cx: &mut Context<Self>,
     ) {
         self.engine = Some(engine);
-        drain_engine_notices(cx, events);
+        self.pending_engine_events = Some(events);
     }
 
     /// Test-only: force the running flag so team routing tests can simulate
@@ -1192,10 +1354,6 @@ impl Thread {
         }
     }
 
-    pub fn worktree(&self) -> Option<&WorktreeState> {
-        None
-    }
-
     /// The thread's persisted Goal — one shared snapshot with the engine's
     /// goal tools (model-side writes land here too).
     pub fn goal(&self) -> Option<ThreadGoal> {
@@ -1231,22 +1389,22 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.create_goal(objective, token_budget, max_rounds, actor)?;
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged { goal: self.goal() });
+        self.pending_events
+            .push(ThreadEvent::GoalChanged { goal: self.goal() });
         Ok(())
     }
 
     /// Convenience for `/goal <objective>`: create with no budget and no
     /// round cap as the user.
-    pub fn set_goal(&mut self, objective: String, cx: &mut Context<Self>) -> anyhow::Result<()> {
-        self.create_goal(objective, None, None, crate::goal::GoalActor::User, cx)
+    pub fn set_goal(&mut self, objective: String) -> anyhow::Result<()> {
+        self.create_goal(objective, None, None, crate::goal::GoalActor::User)
     }
 
     /// Edit objective/budget/rounds in place (keeps id and status).
@@ -1256,11 +1414,11 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let goal = bridge.edit_goal(objective, token_budget, max_rounds, actor)?;
-        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
+        self.pending_events
+            .push(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
@@ -1272,15 +1430,15 @@ impl Thread {
         token_budget: Option<u64>,
         max_rounds: Option<u64>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.replace_goal(objective, token_budget, max_rounds, actor)?;
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.goal_started();
         }
-        cx.emit(ThreadEvent::GoalChanged { goal: self.goal() });
+        self.pending_events
+            .push(ThreadEvent::GoalChanged { goal: self.goal() });
         Ok(())
     }
 
@@ -1291,7 +1449,6 @@ impl Thread {
         status: crate::goal::GoalStatus,
         reason: Option<crate::goal::GoalBlockReason>,
         actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         let was_active = self
@@ -1304,19 +1461,17 @@ impl Thread {
         {
             engine.goal_gate();
         }
-        cx.emit(ThreadEvent::GoalChanged { goal: Some(goal) });
+        self.pending_events
+            .push(ThreadEvent::GoalChanged { goal: Some(goal) });
         Ok(())
     }
 
     /// Clear the current Goal (tombstone event; history stays in the stream).
-    pub fn clear_goal(
-        &mut self,
-        actor: crate::goal::GoalActor,
-        cx: &mut Context<Self>,
-    ) -> anyhow::Result<()> {
+    pub fn clear_goal(&mut self, actor: crate::goal::GoalActor) -> anyhow::Result<()> {
         let bridge = self.goal_bridge_or_bail()?;
         bridge.clear_goal(actor)?;
-        cx.emit(ThreadEvent::GoalChanged { goal: None });
+        self.pending_events
+            .push(ThreadEvent::GoalChanged { goal: None });
         Ok(())
     }
 
@@ -1340,11 +1495,7 @@ impl Thread {
     /// and emit [`ThreadEvent::PeerMessage`]. A delivery landing mid-turn
     /// stays in the history until the running turn settles; the model sees
     /// it on the next prompt assembly.
-    pub fn deliver_peer_messages(
-        &mut self,
-        msgs: Vec<crate::team::PeerMessage>,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn deliver_peer_messages(&mut self, msgs: Vec<crate::team::PeerMessage>) {
         if msgs.is_empty() {
             return;
         }
@@ -1364,13 +1515,13 @@ impl Thread {
                 display_text: Some(msg.content.clone()),
                 ..Default::default()
             };
-            self.insert_user_message_with_ui_metadata(rendered, Some(ui), cx);
-            cx.emit(ThreadEvent::PeerMessage {
+            self.insert_user_message_with_ui_metadata(rendered, Some(ui));
+            self.pending_events.push(ThreadEvent::PeerMessage {
                 from: msg.from.clone(),
                 content: msg.content.clone(),
             });
         }
-        self.run_turn(cx);
+        self.run_turn();
     }
 
     /// Construct a team worker thread: a fresh pi session inheriting this
@@ -1380,7 +1531,7 @@ impl Thread {
     /// leader's user-facing conversation. The member session header records
     /// this leader's session id (`team.parent`), persisting the affiliation
     /// with the jsonl file so it survives restarts and team disband.
-    pub fn new_team_member(&self, name: String, cx: &mut App) -> Entity<Self> {
+    pub fn new_team_member(&self, name: String) -> ThreadHandle {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let cwd = self.cwd.clone();
         let model = self.model.clone();
@@ -1406,43 +1557,44 @@ impl Thread {
         if reasoning_effort != ReasoningEffort::default() {
             engine.set_thinking_level(Some(reasoning_effort.wire_value().to_string()));
         }
-        cx.new(|cx| {
-            drain_engine_notices(cx, events);
-            Self {
-                id,
-                cwd,
-                project: None,
-                model,
-                permission_mode,
-                messages: Vec::new(),
-                reasoning_effort,
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: HistoryPhase::Ready,
-                permission_mode_explicitly_set: true,
-                reasoning_effort_explicitly_set: true,
-                model_explicitly_set: true,
-                browser_suites: Vec::new(),
-                // Members never mount browser suites; the explicit flag keeps
-                // even an empty-mirror seed from the Ready projection out.
-                browser_suites_explicitly_set: true,
-                plan_mode: false,
-                persisted_plan: None,
-                title: None,
-                goal_bridge: None,
-                label: name,
-                worktree_path: None,
-            }
-        })
+        let handle = ThreadHandle::new(Self {
+            id,
+            cwd,
+            project: None,
+            model,
+            permission_mode,
+            messages: Vec::new(),
+            reasoning_effort,
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: HistoryPhase::Ready,
+            permission_mode_explicitly_set: true,
+            reasoning_effort_explicitly_set: true,
+            model_explicitly_set: true,
+            browser_suites: Vec::new(),
+            // Members never mount browser suites; the explicit flag keeps
+            // even an empty-mirror seed from the Ready projection out.
+            browser_suites_explicitly_set: true,
+            plan_mode: false,
+            persisted_plan: None,
+            title: None,
+            goal_bridge: None,
+            label: name,
+            cwd_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
+        });
+        drain_engine_notices(handle.clone(), events);
+        handle
     }
     pub fn background_task_snapshots(&self) -> Vec<TaskSnapshot> {
         Vec::new()
@@ -1495,14 +1647,13 @@ impl Thread {
         plan_file: String,
         seed_text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
-        self.ensure_engine(self.project.clone(), cx);
+        self.ensure_engine(self.project.clone());
         if let Some(engine) = &self.engine {
             engine.start_plan_execution(plan_file);
         }
-        self.insert_user_message_with_ui_metadata(seed_text, ui, cx);
-        self.run_turn(cx);
+        self.insert_user_message_with_ui_metadata(seed_text, ui);
+        self.run_turn();
     }
 
     /// Plan mode active for this thread (mirrored from the engine).
@@ -1517,39 +1668,32 @@ impl Thread {
         self.persisted_plan.as_ref()
     }
 
-    /// Active git-worktree path for this thread (mirrored from the engine);
-    /// `None` when the session runs in its original directory.
-    pub fn worktree_path(&self) -> Option<&str> {
-        self.worktree_path.as_deref()
+    /// The session's effective working directory (mirrored from the
+    /// engine's `CwdChanged` events); `None` until the engine reports one.
+    pub fn cwd_path(&self) -> Option<&str> {
+        self.cwd_path.as_deref()
     }
 
     /// Persist whether a plan review card is pending, so a restarted
     /// session re-surfaces the card (the card itself is UI-only state).
-    pub fn set_plan_review_pending(&mut self, pending: bool, cx: &mut Context<Self>) {
+    pub fn set_plan_review_pending(&mut self, pending: bool) {
         if let Some(engine) = &self.engine {
             engine.set_plan_review_pending(pending);
         }
-        let _ = cx;
     }
 
     /// Toggle plan mode: the engine persists the flag in the session
     /// sidecar, wires the read-only gate, and injects the plan-mode
     /// instructions (rendered for the configured agent language) every turn.
-    pub fn set_plan_mode(&mut self, enabled: bool, cx: &mut Context<Self>) {
+    pub fn set_plan_mode(&mut self, enabled: bool) {
         self.plan_mode = enabled;
         if let Some(engine) = &self.engine {
             engine.set_plan_mode(enabled);
         }
-        cx.notify();
     }
 
     /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
-    pub fn set_browser_suite(
-        &mut self,
-        suite: crate::pi_engine::BrowserSuite,
-        enable: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn set_browser_suite(&mut self, suite: crate::pi_engine::BrowserSuite, enable: bool) {
         self.browser_suites_explicitly_set = true;
         let changed = if enable {
             if self.browser_suites.contains(&suite) {
@@ -1569,11 +1713,10 @@ impl Thread {
             engine.set_browser_suite(suite, enable);
         }
         if changed {
-            cx.emit(ThreadEvent::BrowserSuitesChanged {
+            self.pending_events.push(ThreadEvent::BrowserSuitesChanged {
                 suites: self.browser_suites.clone(),
             });
         }
-        cx.notify();
     }
 
     /// The opt-in browser tool suites active on this thread; the workspace
@@ -1591,7 +1734,6 @@ impl Thread {
         compact_instructions: Option<String>,
         seed_text: String,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) {
         self.plan_mode = false;
         // The engine injects the seed into its own transcript; record the
@@ -1601,10 +1743,21 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.approve_plan(compact, compact_instructions, seed_text);
         }
-        cx.notify();
     }
 
-    pub fn set_project(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+    /// Move the session's working directory at any interaction state —
+    /// the host-driven `SetCwd` path. Unlike [`Thread::set_project`] (an
+    /// initial-only project binding, guarded by `has_interacted`), this
+    /// follows the per-call cwd machinery: the sticky cwd advances and the
+    /// move is durable as a `cwd_change` entry, never touching the header
+    /// cwd or the project binding.
+    pub fn set_cwd(&self, path: PathBuf) {
+        if let Some(engine) = &self.engine {
+            engine.set_cwd(path);
+        }
+    }
+
+    pub fn set_project(&mut self, dir: PathBuf) {
         if self.has_interacted() {
             return;
         }
@@ -1615,15 +1768,14 @@ impl Thread {
         } else {
             // Landing thread: materialize a project-bound fresh engine in
             // one step (no orphaned pre-project session file).
-            self.ensure_engine(Some(dir), cx);
+            self.ensure_engine(Some(dir));
         }
-        cx.notify();
     }
 
     /// Manual compaction (`/compact`): no-op while a turn is in flight (the
     /// kernel compacts an idle transcript only); the recap card lands via the
     /// engine's harness-event adaptation.
-    pub fn compact(&mut self, custom_instructions: Option<String>, _cx: &mut Context<Self>) {
+    pub fn compact(&mut self, custom_instructions: Option<String>) {
         if self.running {
             return;
         }
@@ -1632,7 +1784,7 @@ impl Thread {
         }
     }
 
-    pub fn set_permission_mode(&mut self, mode: PermissionMode, cx: &mut Context<Self>) {
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         if self.permission_mode == mode {
             return;
         }
@@ -1645,8 +1797,8 @@ impl Thread {
             // session sidecar; the chip reflects the change immediately.
             engine.set_permission_mode(mode);
         }
-        cx.emit(ThreadEvent::PermissionModeChanged { mode });
-        cx.notify();
+        self.pending_events
+            .push(ThreadEvent::PermissionModeChanged { mode });
     }
 
     /// Deliver the user's answer for a pending interaction card
@@ -1655,7 +1807,6 @@ impl Thread {
         &mut self,
         id: &str,
         response: crate::permission::ToolAuthorizationResponse,
-        _cx: &mut Context<Self>,
     ) {
         if let Some(engine) = &self.engine {
             engine.respond_tool_authorization(id, response);
@@ -1671,15 +1822,14 @@ impl Thread {
             .unwrap_or_default()
     }
 
-    pub fn set_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+    pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
-        cx.notify();
     }
 
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.
-    pub fn set_model(&mut self, model: PiModel, cx: &mut Context<Self>) {
+    pub fn set_model(&mut self, model: PiModel) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
@@ -1687,11 +1837,11 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.set_model(model);
         }
-        cx.emit(ThreadEvent::ModelChanged { from, to });
-        cx.notify();
+        self.pending_events
+            .push(ThreadEvent::ModelChanged { from, to });
     }
 
-    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort, cx: &mut Context<Self>) {
+    pub fn set_reasoning_effort(&mut self, effort: ReasoningEffort) {
         if self.reasoning_effort == effort {
             return;
         }
@@ -1702,38 +1852,28 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.set_thinking_level(Some(effort.wire_value().to_string()));
         }
-        cx.emit(ThreadEvent::ReasoningEffortChanged { effort });
-        cx.notify();
+        self.pending_events
+            .push(ThreadEvent::ReasoningEffortChanged { effort });
     }
 
-    pub fn set_archived(&mut self, archived: bool, cx: &mut Context<Self>) {
+    pub fn set_archived(&mut self, archived: bool) {
         self.archived = archived;
-        cx.notify();
     }
 }
 
-/// Drain a spawned engine's notice channel on the gpui thread, dispatching
-/// each notice through `Thread::handle_notice`. Shared by `open` (engine
-/// present at construction) and `ensure_engine` (landing materialization).
+/// Drain a spawned engine's notice channel on the runtime, dispatching each
+/// notice through the thread's `handle_notice` (re-homed onto the handle in a
+/// later slice). Shared by `open` (engine present at construction) and
+/// `ensure_engine` (landing materialization).
 fn drain_engine_notices(
-    this: &mut Context<Thread>,
+    handle: ThreadHandle,
     mut events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
 ) {
-    this.spawn(async move |this, cx| {
+    crate::runtime::handle().spawn(async move {
         while let Some(notice) = events.recv().await {
-            // `update` returns Err only when the Thread entity has been
-            // released (a closure panic would unwind, not become Err) — the
-            // thread is gone, so stop draining instead of looping on a dead
-            // entity while in-flight run tasks keep the sender alive.
-            if this
-                .update(cx, |t: &mut Thread, cx| t.handle_notice(notice, cx))
-                .is_err()
-            {
-                break;
-            }
+            handle.handle_notice(notice);
         }
-    })
-    .detach();
+    });
 }
 
 /// Human-readable tool card title from the pi tool name + arguments. The
@@ -1784,25 +1924,18 @@ impl Thread {
         name: &str,
         args: &str,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> bool {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
         };
-        self.insert_slash_turn(cmd.render(args), ui, cx);
+        self.insert_slash_turn(cmd.render(args), ui);
         true
     }
 
     /// Run a skill turn: inject the named skill's body (description + body,
     /// the user's args appended) as the user message, mirroring the retired
     /// manox harness's `submit_skill`.
-    pub fn submit_skill(
-        &mut self,
-        key: &str,
-        args: &str,
-        ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub fn submit_skill(&mut self, key: &str, args: &str, ui: Option<MessageUiMetadata>) -> bool {
         let Some(skill) = crate::skill::global().get(key).cloned() else {
             return false;
         };
@@ -1816,7 +1949,7 @@ impl Thread {
             },
         )
         .expect("skill body render");
-        self.insert_slash_turn(rendered, ui, cx);
+        self.insert_slash_turn(rendered, ui);
         true
     }
 
@@ -1832,7 +1965,6 @@ impl Thread {
         name: &str,
         args: &str,
         ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
     ) -> bool {
         match crate::slash_builtins::canonical_builtin(name).map(|meta| meta.name) {
             Some("mode") => {
@@ -1843,7 +1975,7 @@ impl Thread {
                         PermissionMode::WorkspaceWrite => PermissionMode::DangerFullAccess,
                         PermissionMode::DangerFullAccess => PermissionMode::ReadOnly,
                     };
-                    self.set_permission_mode(next, cx);
+                    self.set_permission_mode(next);
                 } else {
                     let (name, rest) = match trimmed.split_once(char::is_whitespace) {
                         Some((head, tail)) => (head, tail.trim()),
@@ -1853,13 +1985,13 @@ impl Thread {
                         serde_json::from_value(serde_json::Value::String(name.to_string()));
                     match parsed {
                         Ok(mode) => {
-                            self.set_permission_mode(mode, cx);
+                            self.set_permission_mode(mode);
                             if !rest.is_empty() {
-                                self.insert_slash_turn(rest.to_string(), ui, cx);
+                                self.insert_slash_turn(rest.to_string(), ui);
                             }
                         }
                         Err(_) => {
-                            cx.emit(ThreadEvent::Error(anyhow::anyhow!(
+                            self.pending_events.push(ThreadEvent::Error(anyhow::anyhow!(
                                 "unknown permission mode `{name}` (expected read-only, \
                                  workspace-write, or danger-full-access)"
                             )));
@@ -1870,11 +2002,11 @@ impl Thread {
             }
             Some("plan") => {
                 if self.plan_mode() {
-                    self.set_plan_mode(false, cx);
+                    self.set_plan_mode(false);
                 } else {
-                    self.set_plan_mode(true, cx);
+                    self.set_plan_mode(true);
                     if !args.trim().is_empty() {
-                        self.insert_slash_turn(args.to_string(), ui, cx);
+                        self.insert_slash_turn(args.to_string(), ui);
                     }
                 }
                 true
@@ -1882,11 +2014,11 @@ impl Thread {
             Some("compact") => {
                 let trimmed = args.trim();
                 let instructions = (!trimmed.is_empty()).then(|| trimmed.to_string());
-                self.compact(instructions, cx);
+                self.compact(instructions);
                 true
             }
             Some("goal") => {
-                self.run_goal_slash(args, ui, cx);
+                self.run_goal_slash(args, ui);
                 true
             }
             _ => false,
@@ -1897,12 +2029,7 @@ impl Thread {
     /// host's `GoalCommand`; the popover-only forms (bare `/goal`, bare
     /// `edit`/`replace`) are no-ops here — the webview surfaces goal state
     /// through its info card instead.
-    fn run_goal_slash(
-        &mut self,
-        args: &str,
-        ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
-    ) {
+    fn run_goal_slash(&mut self, args: &str, ui: Option<MessageUiMetadata>) {
         let trimmed = args.trim();
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
             if let Err(error) = self.replace_goal(
@@ -1910,9 +2037,8 @@ impl Thread {
                 None,
                 None,
                 crate::goal::GoalActor::User,
-                cx,
             ) {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
@@ -1925,15 +2051,15 @@ impl Thread {
                 budget,
                 max_rounds,
                 crate::goal::GoalActor::User,
-                cx,
             ) {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
             let Some(goal) = self.goal() else {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                self.pending_events
+                    .push(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
                 return;
             };
             let budget = if matches!(value, "none" | "unlimited") {
@@ -1942,7 +2068,7 @@ impl Thread {
                 match value.parse::<u64>() {
                     Ok(value) => Some(value),
                     Err(error) => {
-                        cx.emit(ThreadEvent::Error(error.into()));
+                        self.pending_events.push(ThreadEvent::Error(error.into()));
                         return;
                     }
                 }
@@ -1952,15 +2078,15 @@ impl Thread {
                 budget,
                 goal.max_rounds,
                 crate::goal::GoalActor::User,
-                cx,
             ) {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
         if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
             let Some(goal) = self.goal() else {
-                cx.emit(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
+                self.pending_events
+                    .push(ThreadEvent::Error(anyhow::anyhow!("thread has no Goal")));
                 return;
             };
             let max_rounds = if matches!(value, "none" | "unlimited") {
@@ -1969,7 +2095,7 @@ impl Thread {
                 match value.parse::<u64>() {
                     Ok(value) => Some(value),
                     Err(error) => {
-                        cx.emit(ThreadEvent::Error(error.into()));
+                        self.pending_events.push(ThreadEvent::Error(error.into()));
                         return;
                     }
                 }
@@ -1979,17 +2105,16 @@ impl Thread {
                 goal.token_budget,
                 max_rounds,
                 crate::goal::GoalActor::User,
-                cx,
             ) {
-                cx.emit(ThreadEvent::Error(error));
+                self.pending_events.push(ThreadEvent::Error(error));
             }
             return;
         }
         match trimmed.to_lowercase().as_str() {
             "" | "edit" | "replace" | "rounds" => {}
             "clear" => {
-                if let Err(error) = self.clear_goal(crate::goal::GoalActor::User, cx) {
-                    cx.emit(ThreadEvent::Error(error));
+                if let Err(error) = self.clear_goal(crate::goal::GoalActor::User) {
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
             "pause" | "stop" => {
@@ -2000,9 +2125,8 @@ impl Thread {
                         message: "paused by user".into(),
                     }),
                     crate::goal::GoalActor::User,
-                    cx,
                 ) {
-                    cx.emit(ThreadEvent::Error(error));
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
             "resume" => {
@@ -2010,31 +2134,25 @@ impl Thread {
                     crate::goal::GoalStatus::Active,
                     None,
                     crate::goal::GoalActor::User,
-                    cx,
                 ) {
-                    cx.emit(ThreadEvent::Error(error));
+                    self.pending_events.push(ThreadEvent::Error(error));
                 }
             }
-            _ => match self.set_goal(trimmed.to_string(), cx) {
-                Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui, cx),
-                Err(error) => cx.emit(ThreadEvent::Error(error)),
+            _ => match self.set_goal(trimmed.to_string()) {
+                Ok(()) => self.insert_slash_turn(trimmed.to_string(), ui),
+                Err(error) => self.pending_events.push(ThreadEvent::Error(error)),
             },
         }
     }
 
     /// Insert a user turn and run it, persisting the compact `/name args`
     /// display form — the shared tail of registry and built-in slash turns.
-    fn insert_slash_turn(
-        &mut self,
-        text: String,
-        ui: Option<MessageUiMetadata>,
-        cx: &mut Context<Self>,
-    ) {
+    fn insert_slash_turn(&mut self, text: String, ui: Option<MessageUiMetadata>) {
         let ordinal = self.user_prompt_ordinal();
         let display = ui.as_ref().and_then(|ui| ui.display_text.clone());
-        self.insert_user_message_with_ui_metadata(text, ui, cx);
+        self.insert_user_message_with_ui_metadata(text, ui);
         self.persist_registry_display(ordinal, display);
-        self.run_turn(cx);
+        self.run_turn();
     }
 
     /// The ordinal the next inserted user prompt will occupy among user-role
@@ -2119,12 +2237,11 @@ impl Thread {
     }
 
     /// Re-point the backend at an existing session file.
-    pub fn open_session(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub fn open_session(&mut self, path: PathBuf) {
         if let Some(engine) = &self.engine {
             engine.open_session(path);
         }
         self.running = false;
-        cx.notify();
     }
 
     /// History-loading state (see `HistoryPhase`).
@@ -2265,6 +2382,8 @@ pub(crate) mod tests {
 
         fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
 
+        fn set_cwd(&self, _path: PathBuf) {}
+
         fn active_session_path(&self) -> Option<PathBuf> {
             None
         }
@@ -2288,41 +2407,40 @@ pub(crate) mod tests {
     pub(crate) fn thread_with_engine(
         phase: HistoryPhase,
         engine: Arc<dyn ThreadEngine>,
-        cx: &mut gpui::TestAppContext,
-    ) -> Entity<Thread> {
-        cx.update(|cx| {
-            cx.new(|_| Thread {
-                id: ThreadId("test-thread".to_string()),
-                cwd: PathBuf::from("/tmp"),
-                project: None,
-                model: None,
-                permission_mode: PermissionMode::default(),
-                messages: Vec::new(),
-                reasoning_effort: ReasoningEffort::default(),
-                pinned: false,
-                archived: false,
-                running: false,
-                restored: false,
-                display: Vec::new(),
-                request_usage: HashMap::new(),
-                pending_prompts: Vec::new(),
-                pending_images: Vec::new(),
-                pending_steers: VecDeque::new(),
-                last_user_ui: None,
-                engine: Some(engine),
-                history_phase: phase,
-                permission_mode_explicitly_set: false,
-                reasoning_effort_explicitly_set: false,
-                model_explicitly_set: false,
-                browser_suites: Vec::new(),
-                browser_suites_explicitly_set: false,
-                plan_mode: false,
-                persisted_plan: None,
-                title: None,
-                label: "lead".into(),
-                goal_bridge: None,
-                worktree_path: None,
-            })
+    ) -> ThreadHandle {
+        ThreadHandle::new(Thread {
+            id: ThreadId("test-thread".to_string()),
+            cwd: PathBuf::from("/tmp"),
+            project: None,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            messages: Vec::new(),
+            reasoning_effort: ReasoningEffort::default(),
+            pinned: false,
+            archived: false,
+            running: false,
+            restored: false,
+            display: Vec::new(),
+            request_usage: HashMap::new(),
+            pending_prompts: Vec::new(),
+            pending_images: Vec::new(),
+            pending_steers: VecDeque::new(),
+            last_user_ui: None,
+            engine: Some(engine),
+            history_phase: phase,
+            permission_mode_explicitly_set: false,
+            reasoning_effort_explicitly_set: false,
+            model_explicitly_set: false,
+            browser_suites: Vec::new(),
+            browser_suites_explicitly_set: false,
+            plan_mode: false,
+            persisted_plan: None,
+            title: None,
+            label: "lead".into(),
+            goal_bridge: None,
+            cwd_path: None,
+            pending_events: Vec::new(),
+            pending_engine_events: None,
         })
     }
 
@@ -2351,11 +2469,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// Registry turns originate on the GPUI main thread, outside Tokio's
-    /// entered context. Persistence must still dispatch through Manox's
-    /// process-global runtime instead of requiring a current reactor.
-    #[gpui::test]
-    fn registry_display_persistence_dispatches_off_runtime(_cx: &mut gpui::TestAppContext) {
+    /// Persistence must dispatch through Manox's process-global runtime even
+    /// when no Tokio reactor is entered on the calling thread. Kept a plain
+    /// `#[test]` (not `#[tokio::test]`) on purpose: entering a reactor here
+    /// would defeat the very condition under test.
+    #[test]
+    fn registry_display_persistence_dispatches_off_runtime() {
         crate::runtime::init();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2386,10 +2505,8 @@ pub(crate) mod tests {
     /// event; an actor-initiated `TurnStarted` (monitor wakeup, plan-approval
     /// seed) flips the running flag so a switch-away parks the thread instead
     /// of dropping it mid-run, and `Settled` clears it.
-    #[gpui::test]
-    fn live_history_refreshes_mirror_and_actor_turn_started_sets_running(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn live_history_refreshes_mirror_and_actor_turn_started_sets_running() {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::assistant(vec![MessageContent::Text(
                 "partial answer".into(),
@@ -2401,39 +2518,36 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
-        thread.update(cx, |t, cx| {
-            // Mid-run mirror refresh: the live partial lands in `messages`.
-            t.handle_notice(BackendNotice::LiveHistory, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        // Mid-run mirror refresh: the live partial lands in `messages`.
+        thread.handle_notice(BackendNotice::LiveHistory);
+        thread.read(|t| {
             assert_eq!(t.messages.len(), 1);
             assert!(matches!(
                 &t.messages[0].content[0],
                 MessageContent::Text(text) if text == "partial answer"
             ));
             assert!(!t.is_running());
-
-            // Actor-initiated run start mirrors onto the facade running flag.
-            t.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)), cx);
-            assert!(t.is_running());
-
-            // Settlement releases the slot (and refreshes the mirror).
-            t.handle_notice(
-                BackendNotice::Settled {
-                    cancelled: false,
-                    failed: false,
-                    steered: Vec::new(),
-                    stranded: Vec::new(),
-                },
-                cx,
-            );
-            assert!(!t.is_running());
         });
+
+        // Actor-initiated run start mirrors onto the facade running flag.
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        thread.read(|t| assert!(t.is_running()));
+
+        // Settlement releases the slot (and refreshes the mirror).
+        thread.handle_notice(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        });
+        thread.read(|t| assert!(!t.is_running()));
     }
 
     /// The headless slash router drives the same thread state the gpui host
     /// toggles: plan mode, permission mode, compact, and goal lifecycle.
-    #[gpui::test]
-    fn run_slash_builtin_plan_mode_compact_and_unowned(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_slash_builtin_plan_mode_compact_and_unowned() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2443,51 +2557,49 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| {
-            // The prompt form enters plan mode and runs the turn with the
-            // compact display form.
-            let ui = MessageUiMetadata {
-                display_text: Some("/plan fix it".into()),
-                ..Default::default()
-            };
-            assert!(t.run_slash_builtin("plan", "fix it", Some(ui.clone()), cx));
-            assert!(t.plan_mode(), "/plan <prompt> enters plan mode");
-            let runs = engine.runs.lock().unwrap();
-            assert_eq!(runs.len(), 1, "prompt form runs a turn");
-            assert_eq!(runs[0].0, "fix it");
-            drop(runs);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        // The prompt form enters plan mode and runs the turn with the
+        // compact display form.
+        let ui = MessageUiMetadata {
+            display_text: Some("/plan fix it".into()),
+            ..Default::default()
+        };
+        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "fix it", Some(ui.clone()))));
+        thread.read(|t| assert!(t.plan_mode(), "/plan <prompt> enters plan mode"));
+        let runs = engine.runs.lock().unwrap();
+        assert_eq!(runs.len(), 1, "prompt form runs a turn");
+        assert_eq!(runs[0].0, "fix it");
+        drop(runs);
+        thread.read(|t| {
             let last = t.messages().last().expect("turn message inserted");
             assert_eq!(
                 last.ui.as_ref().and_then(|ui| ui.display_text.as_deref()),
                 Some("/plan fix it")
             );
-
-            // A second invocation toggles plan mode back off, no new turn.
-            assert!(t.run_slash_builtin("plan", "", None, cx));
-            assert!(!t.plan_mode(), "/plan bare exits plan mode");
-            assert_eq!(engine.runs.lock().unwrap().len(), 1);
-
-            assert!(t.run_slash_builtin("mode", "", None, cx));
-            assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess);
-            // Named form sets the mode directly.
-            assert!(t.run_slash_builtin("mode", "read-only", None, cx));
-            assert_eq!(t.permission_mode(), PermissionMode::ReadOnly);
-            assert!(t.run_slash_builtin("compact", "focus", None, cx));
-            assert!(t.run_slash_builtin("goal", "clear", None, cx));
-
-            // Session-level commands and unknowns are not owned here.
-            assert!(!t.run_slash_builtin("exit", "", None, cx));
-            assert!(!t.run_slash_builtin("quit", "", None, cx));
-            assert!(!t.run_slash_builtin("new", "", None, cx));
-            assert!(!t.run_slash_builtin("nope", "", None, cx));
         });
+
+        // A second invocation toggles plan mode back off, no new turn.
+        assert!(thread.with_mut(|t| t.run_slash_builtin("plan", "", None)));
+        thread.read(|t| assert!(!t.plan_mode(), "/plan bare exits plan mode"));
+        assert_eq!(engine.runs.lock().unwrap().len(), 1);
+
+        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "", None)));
+        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::DangerFullAccess));
+        // Named form sets the mode directly.
+        assert!(thread.with_mut(|t| t.run_slash_builtin("mode", "read-only", None)));
+        thread.read(|t| assert_eq!(t.permission_mode(), PermissionMode::ReadOnly));
+        assert!(thread.with_mut(|t| t.run_slash_builtin("compact", "focus", None)));
+        assert!(thread.with_mut(|t| t.run_slash_builtin("goal", "clear", None)));
+
+        // Session-level commands and unknowns are not owned here.
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("exit", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("quit", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("new", "", None)));
+        assert!(!thread.with_mut(|t| t.run_slash_builtin("nope", "", None)));
     }
 
-    #[gpui::test]
-    fn live_history_reattaches_ui_metadata_to_prompt_not_tool_result(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn live_history_reattaches_ui_metadata_to_prompt_not_tool_result() {
         let engine = Arc::new(FakeEngine {
             history: vec![
                 Message::user("expanded registry prompt".to_string()),
@@ -2507,8 +2619,8 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
-        thread.update(cx, |t, cx| {
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| {
             t.insert_user_message_with_ui_metadata(
                 "expanded registry prompt".to_string(),
                 Some(MessageUiMetadata {
@@ -2516,10 +2628,11 @@ pub(crate) mod tests {
                     author: Some(crate::message::MessageAuthor::Harness),
                     ..Default::default()
                 }),
-                cx,
             );
-            t.handle_notice(BackendNotice::LiveHistory, cx);
+        });
+        thread.handle_notice(BackendNotice::LiveHistory);
 
+        thread.read(|t| {
             assert_eq!(
                 t.messages[0]
                     .ui
@@ -2555,8 +2668,8 @@ pub(crate) mod tests {
     /// TS parity: images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
-    #[gpui::test]
-    fn run_turn_drains_pending_text_and_images(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_drains_pending_text_and_images() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2566,8 +2679,8 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| {
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| {
             t.insert_user_message_with_content_and_ui_metadata(
                 vec![
                     MessageContent::Text("look at these".to_string()),
@@ -2575,9 +2688,8 @@ pub(crate) mod tests {
                     png_image("aW1hZ2Uy"),
                 ],
                 None,
-                cx,
             );
-            t.run_turn(cx);
+            t.run_turn();
         });
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "exactly one turn ran");
@@ -2585,29 +2697,23 @@ pub(crate) mod tests {
         assert_eq!(prompt, "look at these");
         assert_eq!(images.len(), 2, "both images ride the turn");
         drop(runs);
-        thread.update(cx, |t, _| {
+        thread.read(|t| {
             assert!(t.pending_prompts.is_empty(), "text queue drained");
             assert!(t.pending_images.is_empty(), "image queue drained");
         });
     }
 
-    #[gpui::test]
-    fn sailor_completed_notice_injects_peer_message_and_fires_turn(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn sailor_completed_notice_injects_peer_message_and_fires_turn() {
         let engine = Arc::new(FakeEngine::new());
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::SteerDelivered {
-                    from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
-                    reason: pi_extensions::steer_bus::SteerReason::Complete,
-                    payload: pi_extensions::steer_bus::SteerPayload {
-                        text: "PR #601 LGTM".into(),
-                    },
-                },
-                cx,
-            );
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.handle_notice(BackendNotice::SteerDelivered {
+            from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
+            reason: pi_extensions::steer_bus::SteerReason::Complete,
+            payload: pi_extensions::steer_bus::SteerPayload {
+                text: "PR #601 LGTM".into(),
+            },
         });
-        cx.run_until_parked();
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "the Sailor completion fired one turn");
         assert!(
@@ -2616,7 +2722,7 @@ pub(crate) mod tests {
             runs[0].0
         );
         drop(runs);
-        let has_user = thread.read_with(cx, |t, _| {
+        let has_user = thread.read(|t| {
             t.messages
                 .iter()
                 .any(|m| matches!(m.role, crate::language_model::Role::User))
@@ -2627,8 +2733,8 @@ pub(crate) mod tests {
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
     /// the image (kernel pushes the empty text block, TS parity).
-    #[gpui::test]
-    fn run_turn_image_only_insert_still_starts_turn(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_image_only_insert_still_starts_turn() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2638,14 +2744,10 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| {
-            t.insert_user_message_with_content_and_ui_metadata(
-                vec![png_image("aW1hZ2Ux")],
-                None,
-                cx,
-            );
-            t.run_turn(cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| {
+            t.insert_user_message_with_content_and_ui_metadata(vec![png_image("aW1hZ2Ux")], None);
+            t.run_turn();
         });
         let runs = engine.runs.lock().unwrap();
         assert_eq!(runs.len(), 1, "image-only turn ran");
@@ -2655,8 +2757,8 @@ pub(crate) mod tests {
     }
 
     /// With neither text nor images pending, `run_turn` is a no-op.
-    #[gpui::test]
-    fn run_turn_noop_when_nothing_pending(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn run_turn_noop_when_nothing_pending() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2666,8 +2768,8 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| t.run_turn(cx));
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| t.run_turn());
         assert!(engine.runs.lock().unwrap().is_empty(), "no turn ran");
     }
 
@@ -2675,10 +2777,8 @@ pub(crate) mod tests {
     /// may have streamed before it — replaces the mirror with the engine's
     /// authoritative history and clears `Loading`, so the workspace leaves
     /// the spinner and re-enables input.
-    #[gpui::test]
-    fn ready_replaces_preview_with_authoritative_history_and_clears_loading(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    #[tokio::test]
+    async fn ready_replaces_preview_with_authoritative_history_and_clears_loading() {
         let engine = Arc::new(FakeEngine {
             history: vec![Message::user("authoritative".to_string())],
             shutdown_calls: AtomicUsize::new(0),
@@ -2688,28 +2788,24 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
-        thread.update(cx, |t, cx| {
+        thread.with_mut(|t| {
             t.messages = vec![Message::user("preview-only".to_string())];
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
-            );
         });
-        let (phase, texts) = cx.read(|cx| {
-            let t = thread.read(cx);
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
+        let (phase, texts) = thread.read(|t| {
             let texts: Vec<String> = t
                 .messages()
                 .iter()
@@ -2732,8 +2828,8 @@ pub(crate) mod tests {
     /// failed — the actor bails without `Ready`) must clear `Loading` and
     /// drop any stale preview, so the workspace returns to the hero instead
     /// of spinning forever with input gated.
-    #[gpui::test]
-    fn fatal_before_ready_clears_loading_and_preview(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn fatal_before_ready_clears_loading_and_preview() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2743,18 +2839,12 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
-        thread.update(cx, |t, cx| {
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
+        thread.with_mut(|t| {
             t.messages = vec![Message::user("stale-preview".to_string())];
-            t.handle_notice(
-                BackendNotice::Fatal(anyhow::anyhow!("no model configured")),
-                cx,
-            );
         });
-        let (phase, count) = cx.read(|cx| {
-            let t = thread.read(cx);
-            (t.history_phase(), t.messages().len())
-        });
+        thread.handle_notice(BackendNotice::Fatal(anyhow::anyhow!("no model configured")));
+        let (phase, count) = thread.read(|t| (t.history_phase(), t.messages().len()));
         assert_eq!(phase, HistoryPhase::Ready, "input gate opens");
         assert_eq!(count, 0, "stale preview is dropped");
     }
@@ -2762,8 +2852,8 @@ pub(crate) mod tests {
     /// I3: an explicit user permission-mode choice on a landing thread
     /// survives the sidecar default arriving at `Ready`
     /// (`permission_mode_explicitly_set`).
-    #[gpui::test]
-    fn explicit_permission_mode_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn explicit_permission_mode_survives_ready_sidecar_default() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2773,39 +2863,32 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
-        thread.update(cx, |t, _cx| {
-            t.set_permission_mode(PermissionMode::ReadOnly, _cx);
-        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
         // The fresh session's sidecar reports the default at Ready; the
         // user's ReadOnly choice must not be overwritten.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: false,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
-            );
-        });
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: false,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).permission_mode()),
+            thread.read(|t| t.permission_mode()),
             PermissionMode::ReadOnly
         );
     }
 
     /// P1: `PlanUpdated` mirrors onto the facade and persists through the
     /// engine; an empty snapshot clears both (the model dropped its plan).
-    #[gpui::test]
-    fn plan_updated_mirrors_and_persists(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn plan_updated_mirrors_and_persists() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2816,7 +2899,7 @@ pub(crate) mod tests {
             plan_persists: Mutex::new(Vec::new()),
         });
         let engine_ref = Arc::clone(&engine);
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
 
         let snapshot = crate::plan::PlanSnapshot {
             explanation: None,
@@ -2825,16 +2908,13 @@ pub(crate) mod tests {
                 status: crate::plan::PlanStepStatus::InProgress,
             }],
         };
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
-                    snapshot: snapshot.clone(),
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            crate::thread::ThreadEvent::PlanUpdated {
+                snapshot: snapshot.clone(),
+            },
+        )));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), Some(&snapshot));
         });
         let persists = engine_ref.plan_persists.lock().unwrap();
         assert_eq!(persists.len(), 1);
@@ -2844,19 +2924,16 @@ pub(crate) mod tests {
         drop(persists);
 
         // Empty snapshot = the model cleared its plan → mirror + sidecar clear.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Event(Box::new(crate::thread::ThreadEvent::PlanUpdated {
-                    snapshot: crate::plan::PlanSnapshot {
-                        explanation: None,
-                        steps: Vec::new(),
-                    },
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), None);
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            crate::thread::ThreadEvent::PlanUpdated {
+                snapshot: crate::plan::PlanSnapshot {
+                    explanation: None,
+                    steps: Vec::new(),
+                },
+            },
+        )));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), None);
         });
         let persists = engine_ref.plan_persists.lock().unwrap();
         assert_eq!(persists.len(), 2);
@@ -2865,8 +2942,8 @@ pub(crate) mod tests {
 
     /// P2: `Ready` restores the persisted plan snapshot (post-restart /
     /// thread-switch source for the rail's fallback).
-    #[gpui::test]
-    fn ready_restores_persisted_plan_snapshot(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn ready_restores_persisted_plan_snapshot() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2876,7 +2953,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
         let snapshot = crate::plan::PlanSnapshot {
             explanation: None,
             steps: vec![crate::plan::PlanStep {
@@ -2885,32 +2962,27 @@ pub(crate) mod tests {
             }],
         };
         let value = serde_json::to_value(&snapshot).unwrap();
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: Some(value),
-                    title: None,
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(thread.read(cx).persisted_plan(), Some(&snapshot));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: Some(value),
+            title: None,
+        })));
+        thread.read(|t| {
+            assert_eq!(t.persisted_plan(), Some(&snapshot));
         });
     }
 
     /// I4: an explicit user reasoning-effort choice survives the sidecar
     /// default arriving at `Ready` (`reasoning_effort_explicitly_set`).
-    #[gpui::test]
-    fn explicit_reasoning_effort_survives_ready_sidecar_default(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn explicit_reasoning_effort_survives_ready_sidecar_default() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2920,39 +2992,29 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
-        thread.update(cx, |t, _cx| {
-            t.set_reasoning_effort(ReasoningEffort::Max, _cx);
-        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| t.set_reasoning_effort(ReasoningEffort::Max));
         // The fresh session's sidecar reports High at Ready; the user's Max
         // choice must not be overwritten.
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: false,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
-            );
-        });
-        assert_eq!(
-            cx.read(|cx| thread.read(cx).reasoning_effort()),
-            ReasoningEffort::Max
-        );
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: false,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
+        assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
     }
 
     /// I5: without an explicit choice, `Ready` restores the persisted
     /// effort from the sidecar.
-    #[gpui::test]
-    fn ready_restores_reasoning_effort_when_not_explicitly_set(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn ready_restores_reasoning_effort_when_not_explicitly_set() {
         let engine = Arc::new(FakeEngine {
             history: Vec::new(),
             shutdown_calls: AtomicUsize::new(0),
@@ -2962,28 +3024,139 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
         });
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::Max,
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::Max,
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
+        assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
+    }
+
+    /// P0 regression: a browser-suite toggle on an engine-less landing
+    /// thread parks in the facade mirror (replayed at `ensure_engine`)
+    /// instead of being dropped.
+    #[tokio::test]
+    async fn landing_browser_suite_toggle_parks_in_mirror() {
+        crate::pi_providers::init_for_test();
+        let thread = Thread::landing(PathBuf::from("/tmp"));
+        thread.with_mut(|t| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true);
+        });
+        thread.read(|t| {
+            assert_eq!(
+                t.browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::ChromeUse]
             );
         });
-        assert_eq!(
-            cx.read(|cx| thread.read(cx).reasoning_effort()),
-            ReasoningEffort::Max
-        );
+    }
+
+    /// The `Ready` projection seeds the suite mirror so restored sessions
+    /// surface their active suites (the composer chips derive from it).
+    #[tokio::test]
+    async fn ready_seeds_browser_suites_from_projection() {
+        let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
+        thread.read(|t| {
+            assert_eq!(
+                t.browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::ChromeUse]
+            );
+        });
+    }
+
+    /// A toggle since construction outranks the `Ready` projection: the
+    /// queued engine command has not settled when Ready lands, so the
+    /// projection cannot know about it and must not clobber the mirror.
+    #[tokio::test]
+    async fn explicit_browser_suite_toggle_outranks_ready_projection() {
+        let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()));
+        thread.with_mut(|t| {
+            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true);
+        });
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+        })));
+        thread.read(|t| {
+            assert_eq!(
+                t.browser_suites().to_vec(),
+                vec![crate::pi_engine::BrowserSuite::WebExplore]
+            );
+        });
+    }
+
+    /// `Thread::cancel` aborts the engine; the actor relies on this when
+    /// disposal must not wait for the in-flight turn.
+    #[tokio::test]
+    async fn cancel_aborts_engine() {
+        let engine = Arc::new(FakeEngine {
+            history: Vec::new(),
+            shutdown_calls: AtomicUsize::new(0),
+            abort_calls: AtomicUsize::new(0),
+            permission_mode: Mutex::new(None),
+            thinking_level: Mutex::new(None),
+            runs: Mutex::new(Vec::new()),
+            plan_persists: Mutex::new(Vec::new()),
+        });
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| t.cancel());
+        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The persisted title (Ready seed and live `TitleChanged`) outranks
+    /// the first-message derivation, which compaction would rewrite.
+    #[tokio::test]
+    async fn display_title_prefers_persisted_title() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| {
+            t.messages = vec![Message::user("fix the sidebar title bug".to_string())];
+        });
+        thread.read(|t| assert_eq!(t.display_title(), "fix the sidebar title bug"));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: Some("终端标题修复".into()),
+        })));
+        thread.read(|t| assert_eq!(t.display_title(), "终端标题修复"));
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
+            title: "标题镜像".into(),
+        })));
+        thread.read(|t| assert_eq!(t.display_title(), "标题镜像"));
     }
 
     /// A model identity for facade tests.
@@ -3018,167 +3191,30 @@ pub(crate) mod tests {
     /// projection. The projection snapshots the boot-time model, and the pick
     /// is still a queued switch at that moment — so adopting it would strand
     /// the facade on a model the session never runs.
-    #[gpui::test]
-    fn explicit_model_survives_ready_projection(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn explicit_model_survives_ready_projection() {
         let engine = Arc::new(FakeEngine::new());
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
-        thread.update(cx, |t, cx| {
-            t.set_model(facade_model("picked"), cx);
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
+        thread.with_mut(|t| {
+            t.set_model(facade_model("picked"));
         });
-        thread.update(cx, |t, cx| {
-            t.handle_notice(ready_with_model(Some(facade_model("boot"))), cx);
-        });
+        thread.handle_notice(ready_with_model(Some(facade_model("boot"))));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).model().cloned()),
+            thread.read(|t| t.model().cloned()),
             Some(facade_model("picked"))
         );
     }
 
     /// I6 companion: with no pick of its own, the facade takes the session's
     /// projected model.
-    #[gpui::test]
-    fn ready_seeds_model_without_a_pick(cx: &mut gpui::TestAppContext) {
+    #[tokio::test]
+    async fn ready_seeds_model_without_a_pick() {
         let engine = Arc::new(FakeEngine::new());
-        let thread = thread_with_engine(HistoryPhase::Loading, engine, cx);
-        thread.update(cx, |t, cx| {
-            t.handle_notice(ready_with_model(Some(facade_model("restored"))), cx);
-        });
+        let thread = thread_with_engine(HistoryPhase::Loading, engine);
+        thread.handle_notice(ready_with_model(Some(facade_model("restored"))));
         assert_eq!(
-            cx.read(|cx| thread.read(cx).model().cloned()),
+            thread.read(|t| t.model().cloned()),
             Some(facade_model("restored"))
         );
-    }
-
-    /// P0 regression: a browser-suite toggle on an engine-less landing
-    /// thread parks in the facade mirror (replayed at `ensure_engine`)
-    /// instead of being dropped.
-    #[gpui::test]
-    fn landing_browser_suite_toggle_parks_in_mirror(cx: &mut gpui::TestAppContext) {
-        crate::pi_providers::init_for_test();
-        let thread = cx.update(|cx| Thread::landing(PathBuf::from("/tmp"), cx));
-        thread.update(cx, |t, cx| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true, cx);
-        });
-        cx.read(|cx| {
-            assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::ChromeUse]
-            );
-        });
-    }
-
-    /// The `Ready` projection seeds the suite mirror so restored sessions
-    /// surface their active suites (the composer chips derive from it).
-    #[gpui::test]
-    fn ready_seeds_browser_suites_from_projection(cx: &mut gpui::TestAppContext) {
-        let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()), cx);
-        thread.update(cx, |t, cx| {
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::ChromeUse]
-            );
-        });
-    }
-
-    /// A toggle since construction outranks the `Ready` projection: the
-    /// queued engine command has not settled when Ready lands, so the
-    /// projection cannot know about it and must not clobber the mirror.
-    #[gpui::test]
-    fn explicit_browser_suite_toggle_outranks_ready_projection(cx: &mut gpui::TestAppContext) {
-        let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()), cx);
-        thread.update(cx, |t, cx| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true, cx);
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: None,
-                })),
-                cx,
-            );
-        });
-        cx.read(|cx| {
-            assert_eq!(
-                thread.read(cx).browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::WebExplore]
-            );
-        });
-    }
-
-    /// `Thread::cancel` aborts the engine; the actor relies on this when
-    /// disposal must not wait for the in-flight turn.
-    #[gpui::test]
-    fn cancel_aborts_engine(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(FakeEngine {
-            history: Vec::new(),
-            shutdown_calls: AtomicUsize::new(0),
-            abort_calls: AtomicUsize::new(0),
-            permission_mode: Mutex::new(None),
-            thinking_level: Mutex::new(None),
-            runs: Mutex::new(Vec::new()),
-            plan_persists: Mutex::new(Vec::new()),
-        });
-        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone(), cx);
-        thread.update(cx, |t, cx| t.cancel(cx));
-        assert_eq!(engine.abort_calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// The persisted title (Ready seed and live `TitleChanged`) outranks
-    /// the first-message derivation, which compaction would rewrite.
-    #[gpui::test]
-    fn display_title_prefers_persisted_title(cx: &mut gpui::TestAppContext) {
-        let engine = Arc::new(FakeEngine::new());
-        let thread = thread_with_engine(HistoryPhase::Ready, engine, cx);
-        thread.update(cx, |t, cx| {
-            t.messages = vec![Message::user("fix the sidebar title bug".to_string())];
-            assert_eq!(t.display_title(), "fix the sidebar title bug");
-            t.handle_notice(
-                BackendNotice::Ready(Box::new(ReadyInfo {
-                    restored: true,
-                    model: None,
-                    permission_mode: PermissionMode::default(),
-                    reasoning_effort: ReasoningEffort::default(),
-                    browser_suites: Vec::new(),
-                    plan_mode: false,
-                    plan_file: None,
-                    plan_review_pending: false,
-                    plan_snapshot: None,
-                    title: Some("终端标题修复".into()),
-                })),
-                cx,
-            );
-            assert_eq!(t.display_title(), "终端标题修复");
-            t.handle_notice(
-                BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
-                    title: "标题镜像".into(),
-                })),
-                cx,
-            );
-            assert_eq!(t.display_title(), "标题镜像");
-        });
     }
 }

@@ -117,6 +117,10 @@ pub enum ClientNote {
         session_id: String,
         mode: String,
     },
+    SetCwd {
+        session_id: String,
+        cwd: String,
+    },
     SetPlanMode {
         session_id: String,
         enabled: bool,
@@ -124,6 +128,10 @@ pub enum ClientNote {
     PlanSeedExecution {
         session_id: String,
         plan_file: String,
+    },
+    Compact {
+        session_id: String,
+        instructions: Option<String>,
     },
     Goal {
         session_id: String,
@@ -162,6 +170,20 @@ pub enum ClientNote {
         request_id: String,
     },
     Shutdown,
+    /// Insert a user message without starting a turn (for batched flush:
+    /// multiple `AppendUserMessage` followed by one `Submit`).
+    AppendUserMessage {
+        session_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+    },
+    /// Persist a UI annotation (error/notice/plan-review) as a custom entry
+    /// in the session jsonl at the current leaf.
+    AppendUiNote {
+        session_id: String,
+        kind: String,
+        data: serde_json::Value,
+    },
 }
 
 #[cfg(test)]

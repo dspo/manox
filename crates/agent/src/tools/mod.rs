@@ -35,8 +35,6 @@ pub const TOOL_SEARCH: &str = "ToolSearch";
 pub const UPDATE_PLAN: &str = "UpdatePlan";
 pub const UPDATE_GOAL: &str = "UpdateGoal";
 pub const WEB_FETCH: &str = "WebFetch";
-pub const ENTER_WORKTREE: &str = "EnterWorktree";
-pub const EXIT_WORKTREE: &str = "ExitWorktree";
 pub const TASK_STOP: &str = "TaskStop";
 
 pub const WRITE: &str = "Write";

@@ -8,7 +8,7 @@
 
 mod common;
 
-use agent::{Thread, ThreadEvent};
+use agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -19,17 +19,19 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
     let mut visual = VisualTestContext::from_window(window.into(), cx);
     let (_dir, plan_file) = write_plan_file();
 
-    let a: gpui::Entity<Thread> = fake_thread(cx, Vec::new());
-    let a_id = cx.read(|cx| a.read(cx).id.0.clone());
+    let a = fake_thread(cx, Vec::new());
+    let a_id = a.read(|t| t.id.0.clone());
     visual.update(|window, cx| {
         workspace.update(cx, |ws, cx| {
             ws.diagnostic_attach_thread(a.clone(), window, cx)
         });
     });
+    cx.run_until_parked();
 
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::PlanReady {
             plan_file,
             title: "Audit".into(),
@@ -44,14 +46,15 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the fresh card is active"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "PlanReady raises the pending-plan badge"
     );
 
     // The proposal turn settles normally; the card must survive.
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::TurnFinished {
             cancelled: false,
             failed: false,
@@ -67,14 +70,15 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the card stays interactive after the proposal turn"
     );
     assert!(
-        agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the pending-plan badge survives a normal settle while the verdict is due"
     );
 
     // An abnormal end demotes it — the verdict is moot.
     emit(
-        &a,
+        &workspace,
         &mut visual.cx,
+        &a_id,
         ThreadEvent::TurnFinished {
             cancelled: true,
             failed: false,
@@ -90,7 +94,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the cancelled turn demotes the card to a plain record"
     );
     assert!(
-        !agent::thread_store_global().read_with(&visual.cx, |s, _| s.pending_plan_contains(&a_id)),
+        !agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "a cancelled turn clears the pending-plan badge"
     );
     agent::thread_store::drop_global_for_test();

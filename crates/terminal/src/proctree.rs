@@ -2,7 +2,7 @@
 //!
 //! Closing a terminal must not leak the shell's children — a `sleep 300 &`
 //! outliving its tab is a leak the user cannot see. `PtyHandle::drop` cannot
-//! block (it runs on the gpui thread), so the teardown moves onto a detached
+//! block (it may run on a UI or runtime-worker thread), so the teardown moves onto a detached
 //! thread: SIGTERM the target set, a short grace, SIGKILL the survivors,
 //! reap the child.
 //!
@@ -26,8 +26,8 @@ const TERM_GRACE: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(10);
 
 /// Graceful-then-forceful teardown of a terminal's process tree. Blocks for
-/// up to the grace window — run on a detached thread, never on the gpui
-/// thread.
+/// up to the grace window — run on a detached thread, never inline on a
+/// UI or runtime-worker thread.
 pub fn terminate(
     shell_pid: Option<libc::pid_t>,
     fg_pgid: Option<libc::pid_t>,

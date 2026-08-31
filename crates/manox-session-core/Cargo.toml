@@ -5,28 +5,30 @@ edition.workspace = true
 publish = false
 
 [dependencies]
-# The session core drives `Entity<Thread>`s on whatever `App` the host hands
-# it — the headless actor thread or the app main thread — so the crate must
-# stay out of the gpui/agent test-support feature graph: feature unification
-# would leak `test-support` into a release build that pulls this crate (the
-# WebUI host). The test-support dev-dependencies below keep that graph out of
-# the normal build.
+# The session core drives gpui-free `ThreadHandle`s through the `agent`
+# handles and runtime, so the crate must stay out of the agent test-support
+# feature graph: feature unification would leak `test-support` into a
+# release build that pulls this crate (the WebUI host). The test-support
+# dev-dependency below keeps that graph out of the normal build.
 agent.workspace = true
 pi.workspace = true
 pi-extensions.workspace = true
-gpui.workspace = true
+futures.workspace = true
 serde_json.workspace = true
 async-trait = "0.1"
 chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+manox-protocol.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-# The session tests run on a gpui test app (`HeadlessAppContext`) and tear
+# The session tests swap scripted engines via `set_engine_for_test` and tear
 # the process-global ThreadStore down via `drop_global_for_test`; both
-# require the test-support features. Dev-dependencies never enter the
+# require the agent test-support feature. Dev-dependencies never enter the
 # release dependency graph, so the feature-unification constraint above
 # still holds.
 anyhow.workspace = true
-gpui = { workspace = true, features = ["test-support"] }
 agent = { workspace = true, features = ["test-support"] }
+async-channel = { workspace = true }
