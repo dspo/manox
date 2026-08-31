@@ -106,6 +106,10 @@ pub(crate) enum SessionCmd {
         cwd: PathBuf,
         project: Option<PathBuf>,
     },
+    /// Move the session's working directory (host-driven `SetCwd`): the
+    /// sticky cwd advances and the move is durable as a `cwd_change`
+    /// entry — never the header cwd or the project binding.
+    SetCwd { path: PathBuf },
     /// Append a host UI annotation as a `custom` entry at the session leaf.
     /// The single actor queue makes send order the persist order, so a note
     /// dispatched before a prompt lands before the prompt's user entry.
@@ -150,8 +154,9 @@ struct EngineState {
     /// session, so the toggle parks here and lands right after settle.
     pending_browser_suite: Mutex<Option<(BrowserSuite, bool)>>,
     /// Session cmds that arrived mid-run but are not serviceable until the
-    /// turn settles (e.g. `NewSession`/`Open` — they rebuild the session,
-    /// which the running turn owns). drive_run
+    /// turn settles (e.g. `NewSession`/`Open`/`SetCwd` — the first two
+    /// rebuild the session, the third moves the sticky cwd a running turn's
+    /// tools are resolving against). drive_run
     /// parks them here instead of dropping; the idle loop drains and
     /// re-queues them so the post-settle cmd dispatch runs the handler.
     pending_session_cmds: Mutex<Vec<SessionCmd>>,
@@ -493,6 +498,10 @@ impl ThreadEngine for PiEngine {
 
     fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
         let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
+    }
+
+    fn set_cwd(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(SessionCmd::SetCwd { path });
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -2820,6 +2829,39 @@ async fn run_actor(
                 sync_history(&session, &sessions_dir, &state).await;
                 sync_usage(&session, &state).await;
                 refresh_session_list(&repo, &state).await;
+            }
+            SessionCmd::SetCwd { path } => {
+                if !path.is_dir() {
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!(
+                            "set_cwd: working directory does not exist: {}",
+                            path.display()
+                        ),
+                    ))));
+                    continue;
+                }
+                // A no-op switch (the projected cwd already matches) only
+                // refreshes the note — no duplicate `cwd_change` entry.
+                if session.projected_cwd().await == path {
+                    let path_str = path.to_string_lossy().into_owned();
+                    *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+                    let _ =
+                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                            path: path_str,
+                        })));
+                    continue;
+                }
+                if let Err(err) = session.set_session_cwd(path.clone()).await {
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!("set_cwd failed: {err:#}"),
+                    ))));
+                    continue;
+                }
+                let path_str = path.to_string_lossy().into_owned();
+                *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+                let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                    path: path_str,
+                })));
             }
             SessionCmd::NewSession { cwd, project } => {
                 let (builder, orchestrators, read_only_subagent) = session_builder(

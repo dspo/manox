@@ -1669,6 +1669,18 @@ impl Thread {
         }
     }
 
+    /// Move the session's working directory at any interaction state —
+    /// the host-driven `SetCwd` path. Unlike [`Thread::set_project`] (an
+    /// initial-only project binding, guarded by `has_interacted`), this
+    /// follows the per-call cwd machinery: the sticky cwd advances and the
+    /// move is durable as a `cwd_change` entry, never touching the header
+    /// cwd or the project binding.
+    pub fn set_cwd(&self, path: PathBuf) {
+        if let Some(engine) = &self.engine {
+            engine.set_cwd(path);
+        }
+    }
+
     pub fn set_project(&mut self, dir: PathBuf) {
         if self.has_interacted() {
             return;
@@ -2274,6 +2286,8 @@ pub(crate) mod tests {
         fn open_session(&self, _path: PathBuf) {}
 
         fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
+
+        fn set_cwd(&self, _path: PathBuf) {}
 
         fn active_session_path(&self) -> Option<PathBuf> {
             None

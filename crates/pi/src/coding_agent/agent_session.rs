@@ -850,6 +850,13 @@ impl AgentSession {
             .unwrap_or_else(|| self.cwd.clone())
     }
 
+    /// Move the session's working directory (host-driven `SetCwd`): sticky
+    /// advance + an immediately durable `cwd_change` entry. See
+    /// [`AgentHarness::set_session_cwd`].
+    pub async fn set_session_cwd(&mut self, cwd: PathBuf) -> Result<(), anyhow::Error> {
+        self.harness.set_session_cwd(cwd).await
+    }
+
     /// JSONL file remains openable and resumable.
     pub async fn close(self) -> Result<PathBuf, anyhow::Error> {
         self.harness.request_shutdown();
@@ -1971,6 +1978,75 @@ mod tests {
             !result.is_error,
             "tools run in the session cwd after reopen"
         );
+    }
+
+    /// The host-driven directory switch: sticky advances, the move is
+    /// immediately durable, and the next turn's flush does not duplicate
+    /// the entry.
+    #[tokio::test]
+    async fn set_session_cwd_is_durable_without_flush_duplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let work = dir.path().join("work");
+        tokio::fs::create_dir_all(&project).await.unwrap();
+        tokio::fs::create_dir_all(&work).await.unwrap();
+        std::fs::write(work.join("marker.txt"), "w").unwrap();
+
+        let mut session = create_agent_session()
+            .with_cwd(&project)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+
+        session.set_session_cwd(work.clone()).await.unwrap();
+        assert_eq!(
+            session.projected_cwd().await,
+            work,
+            "the switch is immediately durable"
+        );
+
+        // A following turn flushes pending mutations — the switch must not
+        // produce a second `cwd_change` entry for the same directory.
+        session.prompt("second").await.unwrap();
+        let cwd_changes = session
+            .harness
+            .session()
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, SessionTreeEntry::CwdChange { cwd, .. } if cwd.as_str() == work.to_string_lossy()))
+            .count();
+        assert_eq!(
+            cwd_changes, 1,
+            "one durable entry per move, not one per turn"
+        );
+
+        // Tools resolve in the switched directory without an explicit cwd.
+        let read = session
+            .harness
+            .agent()
+            .tools()
+            .iter()
+            .find(|t| t.name() == "Read")
+            .unwrap()
+            .clone();
+        let ctx = std::sync::Arc::clone(session.harness.agent().tool_context());
+        let result = read
+            .execute(
+                "t1",
+                serde_json::json!({ "path": "marker.txt" }),
+                tokio_util::sync::CancellationToken::new(),
+                &*ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "sticky cwd follows the switch");
     }
 
     /// A durable `cwd_change` tail projects onto a reopen: tools resolve in

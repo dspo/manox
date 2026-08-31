@@ -1106,6 +1106,24 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Point the session's hashline snapshot store at a persistent directory,
     /// so a rebuilt store (app restart, session fork, worktree re-entry) can
     /// rehydrate tags it never minted in memory.
+    /// Move the session's sticky working directory and make the move
+    /// durable immediately — the host-driven `SetCwd` path. Distinct from
+    /// the tool-side resolution (which advances the sticky and lets the
+    /// turn-boundary flush persist in order with the turn's messages):
+    /// a UI switch must survive a crash before any next turn, so the
+    /// `cwd_change` entry is appended here and `persisted_cwd` advances to
+    /// keep the next flush a no-op.
+    pub async fn set_session_cwd(&mut self, cwd: std::path::PathBuf) -> Result<(), anyhow::Error> {
+        if let Some(state) = self.agent.tool_context().tool_state_handle() {
+            *state.sticky_cwd.lock().expect("sticky cwd poisoned") = Some(cwd.clone());
+        }
+        self.session
+            .append_cwd_change(&cwd.to_string_lossy())
+            .await?;
+        self.persisted_cwd = Some(cwd);
+        Ok(())
+    }
+
     pub fn set_snapshot_dir(&mut self, root: std::path::PathBuf) {
         self.agent
             .tool_context()
