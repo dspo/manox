@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use agent::i18n;
+use crate::i18n;
 use gpui::{AnyElement, App, ClickEvent, Entity, SharedString, Window, deferred, prelude::*, px};
 use gpui_component::menu::PopupMenu;
 use gpui_component::{Icon, IconName, Sizable as _, Theme, v_flex};

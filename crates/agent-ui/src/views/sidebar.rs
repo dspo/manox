@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::i18n;
+use crate::i18n;
 use agent::thread::PermissionMode;
 use agent::thread_store::StoreHandle;
 use gpui::{

@@ -49,7 +49,6 @@ base64.workspace = true
 image.workspace = true
 rquickjs.workspace = true
 
-gpui.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 supervisor.workspace = true
 lsp.workspace = true
@@ -68,6 +67,8 @@ rustwright_core = { workspace = true, optional = true }
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
 # `chrome-use` keeps the chrome_use module and its live tests in the suite.
 agent = { path = ".", features = ["test-support", "chrome-use"] }
+# Integration tests (`tests/`) use `gpui::TestAppContext` for the facade
+# layer; the library crate itself is gpui-free.
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 

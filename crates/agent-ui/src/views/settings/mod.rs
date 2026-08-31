@@ -17,7 +17,8 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::{i18n, settings as user_settings, thread::PermissionMode};
+use crate::i18n;
+use agent::{settings as user_settings, thread::PermissionMode};
 
 use crate::views::management_shell::back_control;
 use crate::views::plugin_manager::PluginManagerView;
@@ -321,7 +322,9 @@ impl SettingsView {
         }
         self.ui_language = resolved.ui.endonym().into();
         self.agent_language = resolved.agent.endonym().into();
-        i18n::set_ui_language(resolved.ui, cx);
+        i18n::set_ui_language(resolved.ui);
+        cx.refresh_windows();
+        crate::menu::rebuild_menus(cx);
         cx.notify();
         Ok(())
     }

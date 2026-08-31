@@ -14,13 +14,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::i18n;
 use crate::views::launcher::LauncherPick;
 use agent::PermissionDecision;
 use agent::collaboration_mode::PlanReviewChoice;
-use agent::i18n;
 use agent::language_model::StopReason;
 use agent::thread::PermissionMode;
-use agent::webview_host::BrowserTabId;
+use agent::thread_engine::BrowserTabId;
 use agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use gpui::DismissEvent;
 use gpui::{

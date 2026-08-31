@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent::i18n;
+use crate::i18n;
 use agent::language_model::MessageContent;
 use base64::Engine as _;
 use gpui::{SharedString, prelude::*};

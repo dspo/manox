@@ -5,7 +5,7 @@
 //! chrome) is shared with the slash-command completion popover via
 //! `views::popup_menu`.
 
-use agent::i18n;
+use crate::i18n;
 use gpui::{
     App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, IntoElement, Render,
     ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, prelude::*,

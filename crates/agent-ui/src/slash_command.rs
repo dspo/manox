@@ -26,8 +26,8 @@ use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Context, SharedString, Window};
 
+use crate::i18n;
 use agent::command::CommandDefinition;
-use agent::i18n;
 use agent::skill::SkillDefinition;
 
 use crate::conversation::NoticeAnchor;

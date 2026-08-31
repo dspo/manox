@@ -29,7 +29,7 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::i18n;
+use crate::i18n;
 use agent::thread::PermissionMode;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};

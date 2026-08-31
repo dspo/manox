@@ -95,7 +95,7 @@ fn main() {
         // This binary is the native-app host; the identity must be pinned
         // before `agent::init` computes host-scoped state.
         agent::host::set_host(agent::host::Host::ManoxApp);
-        agent::init(cx);
+        agent::init();
         // `terminal` runs its PTY pumps on the shared process-global tokio
         // runtime; hand it the handle before `terminal::init` builds the store.
         terminal::runtime::set_runtime(agent::runtime::handle().clone());
@@ -345,7 +345,7 @@ fn main() {
         // re-resolve every menu label via the new locale (the bin owns
         // `build_app_menus` — `Quit` and `Menu`/`MenuItem` live here, not in
         // `agent` or `agent-ui`, so the rebuild closure stays in this crate).
-        agent::i18n::set_menu_rebuilder(|cx| {
+        agent_ui::menu::set_menu_rebuilder(|cx| {
             cx.set_menus(build_app_menus());
             tray::rebuild_menus();
         });
@@ -358,7 +358,7 @@ fn main() {
         // populate without waiting for a settings save / manual reload.
         cx.spawn(async move |cx| {
             agent::pi_providers::wait_ready().await;
-            cx.update(agent::i18n::rebuild_menus);
+            cx.update(agent_ui::menu::rebuild_menus);
         })
         .detach();
 
@@ -402,8 +402,8 @@ fn main() {
             });
 
             // Wire the process-wide browser host: bind it to the main
-            // Workspace, register it in both the agent trait registry (so the
-            // `web_explore_*` tools reach it via `agent::webview_host::host()`)
+            // Workspace, register it as the `CapabilityClient` provider (so the
+            // `web_explore_*` tools reach it via `agent::capability::provider()`)
             // and the agent-ui concrete registry (so `BrowserView` attaches the
             // notify/inbound bridges at build), then spawn the notify/inbound
             // drainer on the Workspace — a notify ships through the OnceLock

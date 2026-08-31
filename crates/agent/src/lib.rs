@@ -53,7 +53,6 @@ pub mod tools;
 pub mod version;
 pub mod web_fetch;
 pub mod web_tools;
-pub mod webview_host;
 
 pub mod thread;
 pub mod thread_engine;
@@ -63,7 +62,6 @@ pub mod thread_store;
 pub mod monitor_bridge;
 pub mod pi_approval;
 pub mod pi_engine;
-use gpui::App;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
@@ -80,7 +78,7 @@ pub use thread_store::{
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
 /// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
 /// subagent / skill / command / hook registries. Call at App startup.
-pub fn init(_cx: &mut App) {
+pub fn init() {
     // Login-shell PATH install (background): GUI processes inherit a minimal
     // launchd PATH, so bash/LSP/MCP/monitor subprocesses would lose Homebrew
     // binaries. Resolved once and applied process-wide; first thing so later

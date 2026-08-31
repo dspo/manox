@@ -136,7 +136,7 @@ fn handle_command(
             cmd["host"]
         );
     }
-    cx.update(agent::init);
+    cx.update(|_| agent::init());
     sink.emit(r#"{"type":"ready"}"#.to_string());
     manox_session_core::session::spawn_models_push(sink.clone());
     true

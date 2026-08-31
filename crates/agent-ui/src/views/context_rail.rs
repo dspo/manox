@@ -21,8 +21,8 @@
 //! conversation reclaims its width.
 
 use crate::client_store_handle::ClientStoreHandle;
+use crate::i18n;
 use agent::ThreadEvent;
-use agent::i18n;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,

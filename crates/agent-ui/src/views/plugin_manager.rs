@@ -14,7 +14,7 @@
 //! effect on restart because the runtime registries load at startup — the
 //! notice texts say so.
 
-use agent::i18n;
+use crate::i18n;
 use agent::plugin::PluginManager;
 use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{

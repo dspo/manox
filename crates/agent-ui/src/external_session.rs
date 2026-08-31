@@ -22,7 +22,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agent::i18n;
+use crate::i18n;
 use anyhow::Result;
 use gpui::{Entity, SharedString, Subscription};
 use serde::{Deserialize, Serialize};
