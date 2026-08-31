@@ -449,8 +449,10 @@ impl SlashCommand for CompactCommand {
         } else {
             Some(trimmed.to_string())
         };
-        let thread = workspace.thread.clone();
-        thread.update(cx, |t, _| t.compact(instructions));
+        let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Compact {
+            session_id: sid.into(),
+            instructions,
+        });
         cx.notify();
         SlashResult::Handled
     }
@@ -480,100 +482,76 @@ impl SlashCommand for GoalCommand {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> SlashResult {
-        let thread = workspace.thread.clone();
         let trimmed = args.trim();
+        // The authoritative goal lives in the AgentServer session (mirrored
+        // via the store); edit/budget/rounds read the current values since
+        // `edit_goal` overwrites objective/budget/rounds in place.
+        let current_goal: Option<agent::goal::ThreadGoal> = workspace
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.goal.as_ref())
+            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v.clone()).ok());
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                if let Err(error) = t.replace_goal(
-                    objective.to_string(),
-                    None,
-                    None,
-                    agent::db::GoalActor::User,
-                ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
-                }
+            let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                session_id: sid.into(),
+                action: "replace".into(),
+                objective: Some(objective.to_string()),
+                budget: None,
+                max_rounds: None,
             });
             return SlashResult::Handled;
         }
         if let Some(objective) = trimmed.strip_prefix("edit ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                let current = t.goal();
-                let budget = current.as_ref().and_then(|goal| goal.token_budget);
-                let max_rounds = current.as_ref().and_then(|goal| goal.max_rounds);
-                if let Err(error) = t.edit_goal(
-                    objective.to_string(),
-                    budget,
-                    max_rounds,
-                    agent::db::GoalActor::User,
-                ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
-                }
+            let (budget, max_rounds) = current_goal
+                .as_ref()
+                .map(|g| (g.token_budget, g.max_rounds))
+                .unwrap_or((None, None));
+            let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                session_id: sid.into(),
+                action: "edit".into(),
+                objective: Some(objective.to_string()),
+                budget,
+                max_rounds,
             });
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("budget ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                let Some(goal) = t.goal() else {
-                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
-                        "thread has no Goal"
-                    )));
-                    return;
-                };
-                let budget = if matches!(value, "none" | "unlimited") {
-                    None
-                } else {
-                    match value.parse::<u64>() {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error.into()));
-                            return;
-                        }
-                    }
-                };
-                if let Err(error) = t.edit_goal(
-                    goal.objective,
-                    budget,
-                    goal.max_rounds,
-                    agent::db::GoalActor::User,
-                ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
-                }
+            let budget = if matches!(value, "none" | "unlimited") {
+                None
+            } else {
+                value.parse::<u64>().ok()
+            };
+            let objective = current_goal.as_ref().map(|g| g.objective.clone());
+            let max_rounds = current_goal.as_ref().and_then(|g| g.max_rounds);
+            let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                session_id: sid.into(),
+                action: "edit".into(),
+                objective,
+                budget,
+                max_rounds,
             });
             return SlashResult::Handled;
         }
         if let Some(value) = trimmed.strip_prefix("rounds ").map(str::trim) {
-            thread.update(cx, |t, cx| {
-                let Some(goal) = t.goal() else {
-                    cx.emit(agent::ThreadEvent::Error(anyhow::anyhow!(
-                        "thread has no Goal"
-                    )));
-                    return;
-                };
-                let max_rounds = if matches!(value, "none" | "unlimited") {
-                    None
-                } else {
-                    match value.parse::<u64>() {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            cx.emit(agent::ThreadEvent::Error(error.into()));
-                            return;
-                        }
-                    }
-                };
-                if let Err(error) = t.edit_goal(
-                    goal.objective,
-                    goal.token_budget,
-                    max_rounds,
-                    agent::db::GoalActor::User,
-                ) {
-                    cx.emit(agent::ThreadEvent::Error(error));
-                }
+            let max_rounds = if matches!(value, "none" | "unlimited") {
+                None
+            } else {
+                value.parse::<u64>().ok()
+            };
+            let objective = current_goal.as_ref().map(|g| g.objective.clone());
+            let budget = current_goal.as_ref().and_then(|g| g.token_budget);
+            let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                session_id: sid.into(),
+                action: "edit".into(),
+                objective,
+                budget,
+                max_rounds,
             });
             return SlashResult::Handled;
         }
         match trimmed.to_lowercase().as_str() {
             "" => {
-                if thread.read(cx).goal().is_some() {
+                if current_goal.is_some() {
                     workspace.open_goal_popover(cx);
                 } else {
                     workspace.begin_goal_new(window, cx);
@@ -581,38 +559,33 @@ impl SlashCommand for GoalCommand {
                 SlashResult::Handled
             }
             "clear" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.clear_goal(agent::db::GoalActor::User) {
-                        cx.emit(agent::ThreadEvent::Error(error));
-                    }
+                let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                    session_id: sid.into(),
+                    action: "clear".into(),
+                    objective: None,
+                    budget: None,
+                    max_rounds: None,
                 });
                 cx.notify();
                 SlashResult::Handled
             }
             "pause" | "stop" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.set_goal_status(
-                        agent::goal::GoalStatus::Paused,
-                        Some(agent::goal::GoalBlockReason {
-                            code: "user-paused".into(),
-                            message: "paused by user".into(),
-                        }),
-                        agent::db::GoalActor::User,
-                    ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
-                    }
+                let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                    session_id: sid.into(),
+                    action: "pause".into(),
+                    objective: None,
+                    budget: None,
+                    max_rounds: None,
                 });
                 SlashResult::Handled
             }
             "resume" => {
-                thread.update(cx, |t, cx| {
-                    if let Err(error) = t.set_goal_status(
-                        agent::goal::GoalStatus::Active,
-                        None,
-                        agent::db::GoalActor::User,
-                    ) {
-                        cx.emit(agent::ThreadEvent::Error(error));
-                    }
+                let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                    session_id: sid.into(),
+                    action: "resume".into(),
+                    objective: None,
+                    budget: None,
+                    max_rounds: None,
                 });
                 SlashResult::Handled
             }
@@ -626,24 +599,20 @@ impl SlashCommand for GoalCommand {
                 SlashResult::Handled
             }
             _ => {
-                let needs_confirmation = thread
-                    .read(cx)
-                    .goal()
+                let needs_confirmation = current_goal
+                    .as_ref()
                     .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
                 if needs_confirmation {
                     workspace.begin_goal_replace_with_objective(trimmed, window, cx);
                     return SlashResult::Handled;
                 }
-                let created = thread.update(cx, |t, cx| match t.set_goal(trimmed.to_string()) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        cx.emit(agent::ThreadEvent::Error(error));
-                        false
-                    }
+                let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
+                    session_id: sid.into(),
+                    action: "create".into(),
+                    objective: Some(trimmed.to_string()),
+                    budget: None,
+                    max_rounds: None,
                 });
-                if !created {
-                    return SlashResult::Handled;
-                }
                 cx.notify();
                 SlashResult::InjectUserTurn(trimmed.to_string())
             }

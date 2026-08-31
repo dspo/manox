@@ -76,6 +76,7 @@ pub struct WorktreeState {
 
 /// History-loading state of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum HistoryPhase {
     /// No history pending (fresh / landing threads); the message list is
     /// final as soon as it exists.

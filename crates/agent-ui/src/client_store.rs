@@ -20,13 +20,13 @@ pub struct ClientStore {
     pub model_id: Option<String>,
     pub model_name: Option<String>,
     pub model: Option<serde_json::Value>,
-    pub permission_mode: String,
-    pub reasoning_effort: String,
+    pub permission_mode: agent::thread::PermissionMode,
+    pub reasoning_effort: agent::language_model::ReasoningEffort,
     pub pinned: bool,
     pub archived: bool,
     pub depth: u32,
     pub agent_label: String,
-    pub self_author: String,
+    pub self_author: agent::MessageAuthor,
     pub worktree_active: bool,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
@@ -34,8 +34,8 @@ pub struct ClientStore {
     pub goal_elapsed_seconds: Option<u64>,
     pub plan_mode: bool,
     pub persisted_plan: Option<Value>,
-    pub browser_suites: Vec<String>,
-    pub history_phase: String,
+    pub browser_suites: Vec<agent::pi_engine::BrowserSuite>,
+    pub history_phase: agent::thread::HistoryPhase,
     pub running: bool,
     pub has_interacted: bool,
     pub cwd: String,
@@ -65,13 +65,13 @@ impl Default for ClientStore {
             model_id: None,
             model_name: None,
             model: None,
-            permission_mode: String::new(),
-            reasoning_effort: String::new(),
+            permission_mode: agent::thread::PermissionMode::default(),
+            reasoning_effort: agent::language_model::ReasoningEffort::default(),
             pinned: false,
             archived: false,
             depth: 0,
             agent_label: String::new(),
-            self_author: String::new(),
+            self_author: agent::MessageAuthor::default(),
             worktree_active: false,
             worktree_path: None,
             branch: None,
@@ -80,7 +80,7 @@ impl Default for ClientStore {
             plan_mode: false,
             persisted_plan: None,
             browser_suites: Vec::new(),
-            history_phase: String::new(),
+            history_phase: agent::thread::HistoryPhase::default(),
             running: false,
             has_interacted: false,
             cwd: String::new(),
@@ -129,10 +129,16 @@ impl ClientStore {
                 self.model_name = name.clone();
             }
             ServerNote::PermissionModeChanged { mode, .. } => {
-                self.permission_mode = mode.clone();
+                self.permission_mode = serde_json::from_value::<agent::thread::PermissionMode>(
+                    Value::String(mode.clone()),
+                )
+                .unwrap_or_default();
             }
             ServerNote::ReasoningEffortChanged { effort, .. } => {
-                self.reasoning_effort = effort.clone();
+                self.reasoning_effort = serde_json::from_value::<
+                    agent::language_model::ReasoningEffort,
+                >(Value::String(effort.clone()))
+                .unwrap_or_default();
             }
             ServerNote::PlanModeChanged { enabled, .. } => self.plan_mode = *enabled,
             ServerNote::PlanUpdated { snapshot, .. } => self.persisted_plan = snapshot.clone(),
@@ -143,7 +149,15 @@ impl ClientStore {
             }
             ServerNote::Branch { branch, .. } => self.branch = Some(branch.clone()),
             ServerNote::BrowserSuitesChanged { suites, .. } => {
-                self.browser_suites = suites.clone();
+                self.browser_suites = suites
+                    .iter()
+                    .filter_map(|s| {
+                        serde_json::from_value::<agent::pi_engine::BrowserSuite>(Value::String(
+                            s.clone(),
+                        ))
+                        .ok()
+                    })
+                    .collect();
             }
             ServerNote::BackgroundTaskUpdated { snapshot, .. } => {
                 if let Some(obj) = snapshot.as_object()
@@ -199,21 +213,37 @@ impl ClientStore {
         self.model_id = info.model_id.clone();
         self.model_name = info.model_name.clone();
         self.model = info.model.clone();
-        self.permission_mode = info.permission_mode.clone();
-        self.reasoning_effort = info.reasoning_effort.clone();
+        self.permission_mode = serde_json::from_value::<agent::thread::PermissionMode>(
+            Value::String(info.permission_mode.clone()),
+        )
+        .unwrap_or_default();
+        self.reasoning_effort = serde_json::from_value::<agent::language_model::ReasoningEffort>(
+            Value::String(info.reasoning_effort.clone()),
+        )
+        .unwrap_or_default();
         self.pinned = info.pinned;
         self.archived = info.archived;
         self.depth = info.depth;
         self.agent_label = info.agent_label.clone();
-        self.self_author = info.self_author.clone();
+        self.self_author = agent::MessageAuthor::from_routing(&info.self_author);
         self.worktree_active = info.worktree_active;
         self.worktree_path = info.worktree_path.clone();
         self.branch = info.branch.clone();
         self.goal = info.goal.clone();
         self.goal_elapsed_seconds = info.goal_elapsed_seconds;
         self.plan_mode = info.plan_mode;
-        self.browser_suites = info.browser_suites.clone();
-        self.history_phase = info.history_phase.clone();
+        self.browser_suites = info
+            .browser_suites
+            .iter()
+            .filter_map(|s| {
+                serde_json::from_value::<agent::pi_engine::BrowserSuite>(Value::String(s.clone()))
+                    .ok()
+            })
+            .collect();
+        self.history_phase = serde_json::from_value::<agent::thread::HistoryPhase>(Value::String(
+            info.history_phase.clone(),
+        ))
+        .unwrap_or_default();
         self.running = info.running;
         self.has_interacted = info.has_interacted;
     }
@@ -261,11 +291,17 @@ mod tests {
         assert_eq!(store.cwd, "/proj");
         assert_eq!(store.display_title, "Test");
         assert_eq!(store.model_id.as_deref(), Some("claude-sonnet"));
-        assert_eq!(store.permission_mode, "workspace-write");
-        assert_eq!(store.reasoning_effort, "high");
+        assert_eq!(
+            store.permission_mode,
+            agent::thread::PermissionMode::WorkspaceWrite
+        );
+        assert_eq!(
+            store.reasoning_effort,
+            agent::language_model::ReasoningEffort::High
+        );
         assert!(!store.running);
         assert!(!store.plan_mode);
-        assert_eq!(store.self_author, "lead");
+        assert_eq!(store.self_author.routing(), "lead");
     }
 
     #[test]
