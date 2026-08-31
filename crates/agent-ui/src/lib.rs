@@ -6,7 +6,6 @@
 //! `ThreadEvent` for incremental rendering.
 pub mod assets;
 pub mod browser_host;
-pub mod menu;
 pub mod chatgpt_app;
 pub mod client_store;
 pub mod client_store_handle;
@@ -15,6 +14,8 @@ pub mod conversation;
 pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
+pub mod i18n;
+pub mod menu;
 pub(crate) mod overlap_diag;
 pub mod server_note_translate;
 pub mod slash_command;

@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use agent::i18n;
+use crate::i18n;
 use gpui::{App, Context, Window, prelude::*};
 use gpui_component::{
     Sizable as _, h_flex,

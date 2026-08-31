@@ -30,7 +30,7 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::i18n;
+use crate::i18n;
 use cx_providers::{VsCodeAppSettings, VsCodeExtensionBlock};
 
 use super::SettingsView;

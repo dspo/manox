@@ -17,7 +17,8 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::{i18n, settings as user_settings, thread::PermissionMode};
+use crate::i18n;
+use agent::{settings as user_settings, thread::PermissionMode};
 
 use crate::views::management_shell::back_control;
 use crate::views::plugin_manager::PluginManagerView;

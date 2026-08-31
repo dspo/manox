@@ -26,9 +26,10 @@ use crate::conversation::{
     ActivityEntry, AgentTaskItem, BackgroundTaskItem, ConvItem, ThinkingContainer, ToolCallItem,
     UserImage, UserTurnMeta,
 };
+use crate::i18n;
 use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
 use agent::thread::PermissionMode;
-use agent::{Message, TokenUsage, ToolCallStatus, i18n};
+use agent::{Message, TokenUsage, ToolCallStatus};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;

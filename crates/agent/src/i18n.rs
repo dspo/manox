@@ -70,7 +70,6 @@ pub fn set_ui_language(lang: Language) {
     // their next `t()` call, reading the new locale from `LANG`.
     L10N.with(|cell| *cell.borrow_mut() = None);
 }
-}
 
 fn primary_resource(lang: Language) -> &'static str {
     match lang {
@@ -234,23 +233,23 @@ mod tests {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
         let v = t("does-not-exist-xyz");
-        assert_eq!(v.as_ref(), "does-not-exist-xyz");
+        assert_eq!(v.as_str(), "does-not-exist-xyz");
     }
 
     #[test]
     fn en_plural_minutes() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
-        assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 minute ago");
-        assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 minutes ago");
+        assert_eq!(t_count("sidebar-time-minutes", 1).as_str(), "1 minute ago");
+        assert_eq!(t_count("sidebar-time-minutes", 5).as_str(), "5 minutes ago");
     }
 
     #[test]
     fn zh_cn_no_plural_minutes() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::ZhCn);
-        assert_eq!(t_count("sidebar-time-minutes", 1).as_ref(), "1 分钟前");
-        assert_eq!(t_count("sidebar-time-minutes", 5).as_ref(), "5 分钟前");
+        assert_eq!(t_count("sidebar-time-minutes", 1).as_str(), "1 分钟前");
+        assert_eq!(t_count("sidebar-time-minutes", 5).as_str(), "5 分钟前");
     }
 
     #[test]

@@ -149,7 +149,7 @@ pub fn open_about_window(cx: &mut App) {
         };
         let _handle = cx
             .open_window(options, |window, cx| {
-                window.set_window_title(i18n::t("about-title").as_ref());
+                window.set_window_title(i18n::t("about-title").as_str());
                 let about = cx.new(AboutWindow::new);
                 let focus = about.read(cx).focus_handle.clone();
                 window.focus(&focus, cx);

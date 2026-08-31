@@ -32,7 +32,7 @@ use gpui_component::{
     v_flex,
 };
 
-use agent::i18n;
+use crate::i18n;
 use cx_providers::{
     AgentConfig, ApiKeySourceKind, CxConfig, ProviderConfig, ProviderEndpointDetail,
     ProviderEndpointSpec, ProviderModelConfig, ProviderModels, active_provider_config_path,

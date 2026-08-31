@@ -569,10 +569,7 @@ impl CapabilityClient for GpuiCapability {
         })
     }
 
-    fn browser_op(
-        &self,
-        op: BrowserOp,
-    ) -> BoxFuture<'static, Result<BrowserReply, String>> {
+    fn browser_op(&self, op: BrowserOp) -> BoxFuture<'static, Result<BrowserReply, String>> {
         let tx = self.tx.clone();
         Box::pin(async move {
             let (reply, rx) = futures::channel::oneshot::channel();
@@ -586,10 +583,7 @@ impl CapabilityClient for GpuiCapability {
 }
 
 /// Execute one browser op on the main thread through the registered host.
-async fn execute_browser_op(
-    op: BrowserOp,
-    app: &gpui::AsyncApp,
-) -> Result<BrowserReply, String> {
+async fn execute_browser_op(op: BrowserOp, app: &gpui::AsyncApp) -> Result<BrowserReply, String> {
     let Some(host) = WorkspaceBrowserHost::concrete() else {
         return Err("browser host not available".to_string());
     };
@@ -634,7 +628,10 @@ async fn execute_browser_op(
     }
 }
 
-/// Open a new browser tab navigated to `url`; return its id.
+// ─── BrowserHost methods ──────────────────────────────────────────────────
+
+impl WorkspaceBrowserHost {
+    /// Open a new browser tab navigated to `url`; return its id.
     pub(crate) fn open_tab(&self, url: &str, cx: &mut App) -> Result<BrowserTabId, String> {
         let handle = crate::dispatch::window_global()
             .ok_or_else(|| "browser host: main window not available".to_string())?;
@@ -710,30 +707,6 @@ async fn execute_browser_op(
         Ok(())
     }
 
-    pub(crate) fn eval_script(
-        &self,
-        id: BrowserTabId,
-        js: &str,
-        cx: &mut App,
-    ) -> Task<Result<String, String>> {
-        // Embed the caller's JS as a JSON-escaped string literal (a valid JS
-        // string) and indirect-eval it so it runs in global scope, returning
-        // its value as the eval_result payload.
-        let body = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".to_string());
-        self.eval_awaiting(
-            id,
-            move |rid| {
-                format!(
-                    "(function(){{try{{var payload=(0,eval)({body});window.__manox_notify__('eval_result',{{request_id:{rid},payload:payload===undefined?null:payload}});}}catch(e){{window.__manox_notify__('eval_result',{{request_id:{rid},payload:{{__error:String(e&&e.message||e)}}}});}}}})();",
-                    body = body,
-                    rid = rid,
-                )
-            },
-            true,
-            cx,
-        )
-    }
-
     pub(crate) fn read_text(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<String, String>> {
         self.eval_awaiting(
             id,
@@ -777,7 +750,12 @@ async fn execute_browser_op(
         )
     }
 
-    pub(crate) fn click(&self, id: BrowserTabId, selector: &str, cx: &mut App) -> Task<Result<(), String>> {
+    pub(crate) fn click(
+        &self,
+        id: BrowserTabId,
+        selector: &str,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
         let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_string());
         let js = format!(
             "(function(){{var el=document.querySelector({sel});if(el){{el.click();}}}})();",
@@ -805,13 +783,23 @@ async fn execute_browser_op(
         cx.background_spawn(async move { res })
     }
 
-    pub(crate) fn scroll(&self, id: BrowserTabId, dx: i32, dy: i32, cx: &mut App) -> Task<Result<(), String>> {
+    pub(crate) fn scroll(
+        &self,
+        id: BrowserTabId,
+        dx: i32,
+        dy: i32,
+        cx: &mut App,
+    ) -> Task<Result<(), String>> {
         let js = format!("window.scrollBy({dx},{dy});", dx = dx, dy = dy);
         let res = self.inject_script(id, &js, cx);
         cx.background_spawn(async move { res })
     }
 
-    pub(crate) fn screenshot(&self, id: BrowserTabId, cx: &mut App) -> Task<Result<String, String>> {
+    pub(crate) fn screenshot(
+        &self,
+        id: BrowserTabId,
+        cx: &mut App,
+    ) -> Task<Result<String, String>> {
         // A DOM snapshot of the visible state (structure + metadata), not a
         // pixel image — the agent needs page structure, and a true pixel
         // snapshot needs a platform-specific wry extension not in scope here.

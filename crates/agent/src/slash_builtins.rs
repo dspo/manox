@@ -99,7 +99,7 @@ mod tests {
         for meta in BUILTIN_SLASH_COMMANDS {
             let en = crate::i18n::t(meta.description_key);
             assert_ne!(
-                en.as_ref(),
+                en.as_str(),
                 meta.description_key,
                 "missing fluent copy for {}",
                 meta.description_key
