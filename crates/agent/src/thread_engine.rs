@@ -272,6 +272,11 @@ pub enum BackendNotice {
     },
 }
 
+/// Process-unique handle for an open browser tab. Allocated by the host; tools
+/// pass it back verbatim to address the tab they opened. Opaque to the agent
+/// crate — the host maps it to its real webview identity.
+pub type BrowserTabId = u64;
+
 /// One browser operation a `web_explore_*` tool asks the host to run.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BrowserOp {
@@ -279,38 +284,38 @@ pub enum BrowserOp {
         url: String,
     },
     Navigate {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
         url: String,
     },
     ReadText {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
     },
     ReadDom {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
         selector: Option<String>,
     },
     Click {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
         selector: String,
     },
     TypeText {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
         selector: String,
         text: String,
     },
     Scroll {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
         dx: i32,
         dy: i32,
     },
     Screenshot {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
     },
     YieldToUser {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
     },
     Close {
-        id: crate::webview_host::BrowserTabId,
+        id: BrowserTabId,
     },
 }
 
@@ -318,7 +323,7 @@ pub enum BrowserOp {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum BrowserReply {
     /// A newly opened tab's id.
-    TabId(crate::webview_host::BrowserTabId),
+    TabId(BrowserTabId),
     /// Textual read result (page text / DOM / screenshot snapshot).
     Text(String),
     /// Unit success (navigate / click / type / scroll / yield / close).

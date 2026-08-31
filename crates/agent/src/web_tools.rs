@@ -1,8 +1,8 @@
 //! `WebExplore*` tool set — the agent's outbound surface for driving the
 //! built-in browser (ported from the retired manox harness).
 //!
-//! The browser host (`agent::webview_host::BrowserHost`) is a gpui
-//! main-thread surface; pi tools run on tokio. Each call therefore rides the
+//! The browser capability (`agent::capability::CapabilityClient`) is a
+//! frontend-provided seam; pi tools run on tokio. Each call therefore rides the
 //! same round-trip architecture as the permission gate: the tool sends a
 //! `BackendNotice::BrowserRequest` with a responder channel, the facade
 //! (gpui drainer) executes the op against the host and replies through the
@@ -20,8 +20,7 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::thread_engine::{BackendNotice, BrowserOp, BrowserReply};
-use crate::webview_host::BrowserTabId;
+use crate::thread_engine::{BackendNotice, BrowserOp, BrowserReply, BrowserTabId};
 
 /// Send `op` to the facade and await the host's reply. Clean errors for the
 /// two "nobody is listening" cases (no host registered / engine gone) and
@@ -36,9 +35,9 @@ async fn host_round_trip(
     if signal.is_cancelled() {
         return Err(ToolError::Aborted);
     }
-    if crate::webview_host::host().is_none() {
+    if crate::capability::provider().is_none() {
         return Err(ToolError::ExecutionFailed(
-            "browser host not available (non-UI context)".into(),
+            "browser capability not available (no frontend registered)".into(),
         ));
     }
     let (tx, rx) = async_channel::bounded(1);
@@ -638,7 +637,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("browser host"), "{err}");
+        assert!(err.to_string().contains("browser capability"), "{err}");
         drop(notice_rx);
     }
 
