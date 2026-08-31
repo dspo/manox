@@ -280,7 +280,11 @@ impl AgentTool for EditTool {
             // Position-free ops (pure INS.HEAD/INS.TAIL) land identically no
             // matter how the file drifted around them: applying to live
             // content directly beats failing an edit whose anchors carry no
-            // line numbers to go stale.
+            // line numbers to go stale. `expand_clipboard_ops` above has
+            // already rewritten every PASTE (HEAD/TAIL included, which parse
+            // anchor-less) into its INS equivalent, so the Paste arm below is
+            // defensive — it holds only if a future change lets Paste ops
+            // survive expansion.
             let position_free = expanded_ops.iter().all(|op| {
                 matches!(
                     op,

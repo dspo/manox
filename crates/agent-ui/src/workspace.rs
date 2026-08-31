@@ -914,6 +914,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.pending_ask = parse_pending_ask(id.to_string(), input);
+        // Only AskUserQuestion payloads reach this seeder (the live event
+        // path is `ToolCallAuthorization`, which carries the real tool
+        // name); the fallback exists solely for a malformed ask payload, so
+        // the constant names the tool that actually fired.
         self.pending_auth = self.pending_ask.is_none().then(|| PendingAuth {
             id: id.to_string(),
             tool_name: "AskUserQuestion".to_string(),

@@ -417,6 +417,12 @@ pub fn parse_patch(text: &str) -> Result<ParsedPatch, ParseError> {
 fn merge_same_path_sections(files: Vec<FilePatch>) -> Result<Vec<FilePatch>, ParseError> {
     let mut merged: Vec<FilePatch> = Vec::with_capacity(files.len());
     for section in files {
+        // `find` takes the FIRST accumulated section for the path, not the
+        // immediately preceding one: with identical tags every section for
+        // the path cites the SAME snapshot, so the ops apply together
+        // against that snapshot regardless of which accumulated section
+        // absorbs them. A file-level op (MV/REM) is single — enforced below
+        // — so it can never interleave ambiguously.
         let Some(existing) = merged.iter_mut().find(|f| f.path == section.path) else {
             merged.push(section);
             continue;
