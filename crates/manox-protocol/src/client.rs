@@ -129,6 +129,10 @@ pub enum ClientNote {
         session_id: String,
         plan_file: String,
     },
+    Compact {
+        session_id: String,
+        instructions: Option<String>,
+    },
     Goal {
         session_id: String,
         action: String,

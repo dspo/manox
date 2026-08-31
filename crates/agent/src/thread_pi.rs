@@ -101,7 +101,7 @@ impl HistoryPhase {
 /// bridged from the child's `AgentEvent`s through the Agent tool's progress
 /// channel). Text/thinking deltas append to the drill-down transcript; tool
 /// start/end render as activity lines.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SubagentChildEvent {
     /// Assistant text delta from the child.
     Text(String),

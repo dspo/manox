@@ -203,7 +203,7 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
         ThreadEvent::SubagentChild { id, child } => Note(ServerNote::SubagentChild {
             session_id: session_id.into(),
             id: id.clone(),
-            event: serde_json::json!({ "debug": format!("{child:?}") }),
+            event: serde_json::to_value(child).unwrap_or(serde_json::Value::Null),
         }),
         ThreadEvent::BackgroundTaskUpdated { snapshot } => {
             Note(ServerNote::BackgroundTaskUpdated {
@@ -250,11 +250,16 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             }
         }
         ThreadEvent::PrefixStability { .. }
-        | ThreadEvent::CacheInvalidation { .. }
         | ThreadEvent::SideCallMetricsUpdated(_)
         | ThreadEvent::MainCallMetricsUpdated(_)
         | ThreadEvent::BrowserNotification { .. }
         | ThreadEvent::InboundAuthorization { .. } => Skip,
+        ThreadEvent::CacheInvalidation { reprocessed_tokens } => {
+            Note(ServerNote::CacheInvalidation {
+                session_id: session_id.into(),
+                reprocessed_tokens: *reprocessed_tokens,
+            })
+        }
     }
 }
 

@@ -293,6 +293,12 @@ mod tests {
                 },
             },
             FromServer::Notification {
+                note: crate::server::ServerNote::CacheInvalidation {
+                    session_id: "s1".into(),
+                    reprocessed_tokens: 12345,
+                },
+            },
+            FromServer::Notification {
                 note: crate::server::ServerNote::TurnFinished {
                     cancelled: false,
                     failed: false,

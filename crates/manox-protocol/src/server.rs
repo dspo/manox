@@ -254,6 +254,12 @@ pub enum ServerNote {
         session_id: String,
         summary: String,
     },
+    /// Provider-side prompt cache was lost since the previous turn; the
+    /// client renders a cache-miss divider.
+    CacheInvalidation {
+        session_id: String,
+        reprocessed_tokens: u64,
+    },
     SubagentStarted {
         session_id: String,
         id: String,
