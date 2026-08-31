@@ -2449,4 +2449,424 @@ mod tests {
         drop(server);
         agent::thread_store::drop_global_for_test();
     }
+
+    use manox_protocol::transport::{BACKPRESSURE_CAPACITY, BackpressurePolicy, RpcConnection};
+
+    /// A serde-loopback connection: every message crosses the wire as JSON —
+    /// the serialization shape the napi/webui transports use. Round-trips
+    /// `FromServer`/`FromClient` through `serde_json` inside the send calls
+    /// and applies the same backpressure semantics as the in-process pair.
+    struct SerdeLoopbackConn {
+        c2s_tx: async_channel::Sender<FromClient>,
+        c2s_rx: async_channel::Receiver<FromClient>,
+        s2c_tx: async_channel::Sender<FromServer>,
+        s2c_rx: async_channel::Receiver<FromServer>,
+    }
+
+    fn serde_pair() -> (SerdeLoopbackConn, SerdeLoopbackConn) {
+        let (c2s_tx, c2s_rx) = async_channel::bounded(BACKPRESSURE_CAPACITY);
+        let (s2c_tx, s2c_rx) = async_channel::bounded(BACKPRESSURE_CAPACITY);
+        let client = SerdeLoopbackConn {
+            c2s_tx: c2s_tx.clone(),
+            c2s_rx: c2s_rx.clone(),
+            s2c_tx: s2c_tx.clone(),
+            s2c_rx: s2c_rx.clone(),
+        };
+        let server = SerdeLoopbackConn {
+            c2s_tx,
+            c2s_rx,
+            s2c_tx,
+            s2c_rx,
+        };
+        (client, server)
+    }
+
+    impl RpcConnection for SerdeLoopbackConn {
+        fn send_to_client(&self, msg: FromServer) {
+            let wire = serde_json::to_string(&msg).expect("FromServer serializes");
+            let msg: FromServer = serde_json::from_str(&wire).expect("FromServer deserializes");
+            let drop = matches!(
+                &msg,
+                FromServer::Notification { note }
+                    if note.backpressure_policy() == BackpressurePolicy::Drop
+            );
+            if drop {
+                let _ = self.s2c_tx.try_send(msg);
+            } else {
+                let _ = self.s2c_tx.send_blocking(msg);
+            }
+        }
+        fn send_to_server(&self, msg: FromClient) {
+            let wire = serde_json::to_string(&msg).expect("FromClient serializes");
+            let msg: FromClient = serde_json::from_str(&wire).expect("FromClient deserializes");
+            let _ = self.c2s_tx.send_blocking(msg);
+        }
+        fn client_rx(&self) -> async_channel::Receiver<FromClient> {
+            self.c2s_rx.clone()
+        }
+        fn server_rx(&self) -> async_channel::Receiver<FromServer> {
+            self.s2c_rx.clone()
+        }
+        fn disconnect(&self) {
+            self.c2s_tx.close();
+            self.s2c_tx.close();
+        }
+    }
+
+    /// Test-side handle mirroring the in-process `Client` helper.
+    struct SerdeClient {
+        conn: SerdeLoopbackConn,
+    }
+
+    impl SerdeClient {
+        fn send(&self, msg: FromClient) {
+            self.conn.send_to_server(msg);
+        }
+        fn recv_timeout(&self, timeout: Duration) -> FromServer {
+            let rx = self.conn.server_rx();
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match rx.try_recv() {
+                    Ok(m) => return m,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => panic!("timed out waiting for a serde-path message"),
+                }
+            }
+        }
+    }
+
+    /// ε-1: the SAME client script driven through the in-process pair and
+    /// through the serde loopback must produce identical `FromServer`
+    /// sequences. This is the single-protocol-surface contract in executable
+    /// form: no transport may reinterpret a message.
+    ///
+    /// Determinism: both sessions run the same FakeEngine script with fixed
+    /// ids (`a1`, `call-N` counters start at 0 per fresh server); Drop-policy
+    /// streaming notes are filtered (their loss is policy, not content); the
+    /// two session ids are normalized to one placeholder before comparing.
+    #[test]
+    fn dual_path_transport_consistency() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+
+        // ── Path 1: in-process pair ──
+        let (server, client_ip) = harness(vec![HookKind::Approve]);
+        let (engine_ip, events_ip) = FakeEngine::new();
+        create(&server, &client_ip, "sess-inproc");
+        server.set_session_engine_for_test("sess-inproc", engine_ip.clone(), events_ip);
+
+        // ── Path 2: serde loopback ──
+        let (client_sl_conn, server_sl) = serde_pair();
+        server.accept(std::sync::Arc::new(server_sl));
+        let client_sl = SerdeClient {
+            conn: client_sl_conn,
+        };
+        client_sl.send(FromClient::Request {
+            id: MsgId::new("init"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "serde-test".into(),
+                capabilities: vec![HookKind::Approve],
+                sessions: vec![],
+            }),
+        });
+        assert!(matches!(
+            client_sl.recv_timeout(Duration::from_secs(10)),
+            FromServer::Response { .. }
+        ));
+        assert!(matches!(
+            client_sl.recv_timeout(Duration::from_secs(10)),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+        let (engine_sl, events_sl) = FakeEngine::new();
+        client_sl.send(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: "sess-serde".into(),
+                cwd: Some("/".into()),
+            },
+        });
+        loop {
+            match client_sl.recv_timeout(Duration::from_secs(10)) {
+                FromServer::Notification {
+                    note: ServerNote::SessionCreated { session_id },
+                } if session_id == "sess-serde" => break,
+                _ => {}
+            }
+        }
+        server.set_session_engine_for_test("sess-serde", engine_sl.clone(), events_sl);
+
+        // ── The same script on both sessions ──
+        let notes = |sid: &str| {
+            vec![ClientNote::Submit {
+                session_id: sid.into(),
+                text: "do work".into(),
+                images: vec![],
+                client_id: None,
+            }]
+        };
+        for note in notes("sess-inproc") {
+            client_ip.send(FromClient::Notification { note });
+        }
+        for note in notes("sess-serde") {
+            client_sl.send(FromClient::Notification { note });
+        }
+
+        // Sequence the script: TurnStarted must land on BOTH paths before the
+        // auth notice is injected — otherwise the dispatch task's TurnStarted
+        // and the pump task's Approve interleave non-deterministically (two
+        // concurrent server-side sources, not a transport difference).
+        let mut seq_ip: Vec<FromServer> = Vec::new();
+        loop {
+            let m = client_ip.recv();
+            let hit = matches!(
+                &m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            );
+            seq_ip.push(m);
+            if hit {
+                break;
+            }
+        }
+        let mut seq_sl: Vec<FromServer> = Vec::new();
+        loop {
+            let m = client_sl.recv_timeout(Duration::from_secs(10));
+            let hit = matches!(
+                &m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            );
+            seq_sl.push(m);
+            if hit {
+                break;
+            }
+        }
+
+        // Engine-side script: one authorization round-trip per session,
+        // injected only after both paths settled TurnStarted.
+        for engine in [&engine_ip, &engine_sl] {
+            engine
+                .notices
+                .send(BackendNotice::Event(Box::new(
+                    ThreadEvent::ToolCallAuthorization {
+                        id: "a1".into(),
+                        tool_name: "Bash".into(),
+                        summary: "run ls".into(),
+                        input: json!({}),
+                    },
+                )))
+                .unwrap();
+        }
+
+        // Collect until each path has seen the Approve request; reply, then
+        // collect the remaining tail.
+
+        let call_ip = loop {
+            let m = client_ip.recv();
+            if let FromServer::Request {
+                id,
+                call: ServerCall::Approve { auth_id, .. },
+            } = &m
+                && auth_id == "a1"
+            {
+                seq_ip.push(m.clone());
+                break id.clone();
+            }
+            seq_ip.push(m);
+        };
+        let call_sl = loop {
+            let m = client_sl.recv_timeout(Duration::from_secs(10));
+            if let FromServer::Request {
+                id,
+                call: ServerCall::Approve { auth_id, .. },
+            } = &m
+                && auth_id == "a1"
+            {
+                seq_sl.push(m.clone());
+                break id.clone();
+            }
+            seq_sl.push(m);
+        };
+        for (id, serde_path) in [(&call_ip, false), (&call_sl, true)] {
+            let reply = FromClient::Reply {
+                id: id.clone(),
+                outcome: Ok(json!({"allow": true})),
+            };
+            if serde_path {
+                client_sl.send(reply);
+            } else {
+                client_ip.send(reply);
+            }
+        }
+
+        // Drain both until each has delivered a ThreadInfo response to a
+        // final request (bounded settle, no sleeps beyond the recv polling).
+        for (sid, send_ip) in [("sess-inproc", true), ("sess-serde", false)] {
+            let req = FromClient::Request {
+                id: MsgId::new("info"),
+                call: ClientCall::ThreadInfo {
+                    session_id: sid.into(),
+                },
+            };
+            if send_ip {
+                client_ip.send(req);
+            } else {
+                client_sl.send(req);
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut got_ip_info = false;
+        let mut got_sl_info = false;
+        while std::time::Instant::now() < deadline && !(got_ip_info && got_sl_info) {
+            if !got_ip_info && let Ok(m) = client_ip.conn.server_rx().try_recv() {
+                got_ip_info = matches!(m, FromServer::Response { .. });
+                seq_ip.push(m);
+            }
+            if !got_sl_info && let Ok(m) = client_sl.conn.server_rx().try_recv() {
+                got_sl_info = matches!(m, FromServer::Response { .. });
+                seq_sl.push(m);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_ip_info && got_sl_info, "both paths answered ThreadInfo");
+
+        // ── Normalize + compare ──
+        let normalize = |msgs: Vec<FromServer>| -> Vec<serde_json::Value> {
+            msgs.into_iter()
+                .filter(|m| {
+                    !matches!(
+                        m,
+                        FromServer::Notification { note }
+                            if note.backpressure_policy() == BackpressurePolicy::Drop
+                    )
+                })
+                .map(|m| {
+                    let v = serde_json::to_value(&m).expect("serializable");
+                    let s = v.to_string();
+                    let s = s
+                        .replace("sess-inproc", "SESS")
+                        .replace("sess-serde", "SESS");
+                    serde_json::from_str(&s).expect("re-parses")
+                })
+                .collect()
+        };
+        let (nip, nsl) = (normalize(seq_ip), normalize(seq_sl));
+        assert_eq!(
+            nip, nsl,
+            "in-process and serde paths must produce identical FromServer sequences"
+        );
+
+        drop(client_ip);
+        drop(client_sl);
+        drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
+
+    /// ε-2b: multi-client routing — two clients, two sessions, one server.
+    /// Broadcast notes reach every owner; the spec is the observed behavior.
+    #[test]
+    fn multi_client_broadcast_and_dispose_semantics() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client_a) = harness(vec![]);
+        let (client_b_conn, server_b_conn) = in_process_pair();
+        server.accept(std::sync::Arc::new(server_b_conn));
+        let client_b = Client {
+            conn: client_b_conn,
+        };
+        client_b.send(FromClient::Request {
+            id: MsgId::new("init-b"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "test-b".into(),
+                capabilities: vec![],
+                sessions: vec![],
+            }),
+        });
+        assert!(matches!(client_b.recv(), FromServer::Response { .. }));
+        assert!(matches!(
+            client_b.recv(),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+
+        // Each client owns its own session; both creations land.
+        create(&server, &client_a, "sa");
+        create(&server, &client_b, "sb");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("sa", engine.clone(), events);
+
+        // A note for sa reaches ONLY sa's owner (session routing, not a
+        // global broadcast): client_b must not see it.
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                anyhow::anyhow!("routing probe"),
+            ))))
+            .unwrap();
+        expect(&client_a, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { .. }
+                }
+            )
+        });
+        // Routing spec: b may hold unrelated pending traffic, but never one of
+        // sa's session notes. Drain-and-classify instead of asserting emptiness.
+        let mut b_pending = Vec::new();
+        while let Ok(m) = client_b.conn.server_rx().try_recv() {
+            b_pending.push(m);
+        }
+        let leaked = b_pending.iter().any(|m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { .. }
+                }
+            )
+        });
+        assert!(
+            !leaked,
+            "client_b must never receive sa's notes: {b_pending:?}"
+        );
+
+        // Dispose: each client detaches its own session; the other is
+        // unaffected and the server keeps serving.
+        client_a.send(FromClient::Notification {
+            note: ClientNote::DisposeSession {
+                session_id: "sa".into(),
+            },
+        });
+        client_b.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "sb".into(),
+                text: "still alive".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        // sb has no engine bound; the submit surfaces an error note to b —
+        // proof the server survived a's dispose.
+        expect(&client_b, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { .. }
+                }
+            )
+        });
+
+        drop(client_a);
+        drop(client_b);
+        drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
 }
