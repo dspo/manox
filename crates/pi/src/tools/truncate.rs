@@ -91,6 +91,74 @@ pub fn truncate_tail(output: &str, config: &TruncateConfig) -> TruncatedOutput {
     }
 }
 
+/// Truncate output keeping only its head, contiguously.
+///
+/// File reads carry meaning in line order: the model reading `1:…` through
+/// `N:…` must be able to trust that everything between was shown. A
+/// head+tail hole (see [`truncate`]) silently un-sees the middle of a file
+/// the model believes it fully read — the exact confusion that strands later
+/// edits. Keeps the first `max_lines` lines, then trims to `max_bytes` on
+/// whole-line boundaries (a single over-budget line yields its head bytes).
+pub fn truncate_head(output: &str, config: &TruncateConfig) -> TruncatedOutput {
+    let original_bytes = output.len();
+    let lines: Vec<&str> = output.split('\n').collect();
+    let original_lines = lines.len();
+
+    if original_lines <= config.max_lines && original_bytes <= config.max_bytes {
+        return TruncatedOutput {
+            content: output.to_string(),
+            was_truncated: false,
+            original_bytes,
+            original_lines,
+        };
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut kept_bytes = 0usize;
+    for line in lines.iter() {
+        if kept.len() >= config.max_lines {
+            break;
+        }
+        // Every line but the first also carries its separator.
+        let line_bytes = line.len() + usize::from(!kept.is_empty());
+        if kept_bytes + line_bytes > config.max_bytes {
+            if kept.is_empty() {
+                // The very first line exceeds the whole budget: keep its
+                // head rather than nothing — the longest prefix on a char
+                // boundary that fits, never splitting a code point.
+                let end = line
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|i| *i <= config.max_bytes)
+                    .last()
+                    .unwrap_or(0);
+                kept.push(&line[..end]);
+            }
+            break;
+        }
+        kept.push(line);
+        kept_bytes += line_bytes;
+    }
+
+    let skipped = original_lines.saturating_sub(kept.len());
+    let mut content = kept.join("\n");
+    if skipped > 0 {
+        content.push_str(&format!("\n\n... [{skipped} more lines truncated] ..."));
+    } else {
+        content.push_str(&format!(
+            "\n\n... [{} bytes truncated] ...",
+            original_bytes.saturating_sub(content.len())
+        ));
+    }
+
+    TruncatedOutput {
+        content,
+        was_truncated: true,
+        original_bytes,
+        original_lines,
+    }
+}
+
 /// Truncate output to fit within the configured limits.
 ///
 /// Truncation is applied in this order:
@@ -254,5 +322,64 @@ mod tests {
             "got {} bytes",
             result.content.len()
         );
+    }
+
+    #[test]
+    fn head_truncation_keeps_a_contiguous_head() {
+        // A file-shaped output keeps lines 1..=K in order with no tail: the
+        // model reading numbered rows must trust nothing was skipped between
+        // them.
+        let config = TruncateConfig {
+            max_lines: 5,
+            max_bytes: usize::MAX,
+        };
+        let input = (1..=20)
+            .map(|i| format!("{i}:row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let result = truncate_head(&input, &config);
+        assert!(result.was_truncated);
+        assert!(result.content.contains("1:row 1"));
+        assert!(result.content.contains("5:row 5"));
+        assert!(!result.content.contains("6:row 6"), "{}", result.content);
+        assert!(!result.content.contains("20:row 20"));
+        assert!(result.content.contains("[15 more lines truncated]"));
+    }
+
+    #[test]
+    fn head_truncation_passes_short_output_through() {
+        let result = truncate_head("a\nb", &TruncateConfig::default());
+        assert!(!result.was_truncated);
+        assert_eq!(result.content, "a\nb");
+    }
+
+    #[test]
+    fn head_truncation_by_bytes_cuts_on_line_boundaries() {
+        let config = TruncateConfig {
+            max_lines: usize::MAX,
+            max_bytes: 12,
+        };
+        let input = "alpha\nbeta\ngamma\ndelta";
+        let result = truncate_head(input, &config);
+        assert!(result.was_truncated);
+        assert_eq!(
+            result.content,
+            "alpha\nbeta\n\n... [2 more lines truncated] ..."
+        );
+    }
+
+    #[test]
+    fn head_truncation_never_splits_a_code_point() {
+        // 7 bytes cannot hold three 3-byte characters: the single
+        // over-budget line yields the longest whole-character prefix that
+        // fits (two characters, 6 bytes).
+        let config = TruncateConfig {
+            max_lines: usize::MAX,
+            max_bytes: 7,
+        };
+        let result = truncate_head("日本語テスト", &config);
+        assert!(result.was_truncated);
+        assert!(result.content.starts_with("日本"), "{}", result.content);
+        assert!(result.content.contains("bytes truncated"));
     }
 }

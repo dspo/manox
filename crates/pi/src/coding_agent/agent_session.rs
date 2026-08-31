@@ -1403,7 +1403,7 @@ impl AgentSessionBuilder {
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
                 Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
                     as Arc<dyn AgentTool>,
-                Arc::new(EditTool) as Arc<dyn AgentTool>,
+                Arc::new(EditTool::default()) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
                 Arc::new(GlobTool) as Arc<dyn AgentTool>,

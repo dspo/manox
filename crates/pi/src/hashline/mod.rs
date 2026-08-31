@@ -189,7 +189,10 @@ pub fn assert_seen_lines(
     let mut column_truncated = false;
     for &line in &unseen[..reveal_count] {
         // Out-of-range anchors are caught by apply with a better message;
-        // skip them so they never join the revealed set.
+        // skip them so they never join the revealed set — but they still
+        // count as uncovered: an anchor we cannot reveal must never let the
+        // "straight retry now succeeds" branch merge partial provenance,
+        // or the retry hits the same rejection with a stale invitation.
         if line < 1 || line > source_lines.len() {
             continue;
         }
@@ -206,7 +209,7 @@ pub fn assert_seen_lines(
             revealed.push((line, source.to_string()));
         }
     }
-    let truncated = unseen.len() > reveal_count || column_truncated;
+    let truncated = unseen.len() > revealed.len() || column_truncated;
     // Only merge when the reveal covered every unseen anchor in full width:
     // a truncated reveal would let the model split a blind edit into
     // <=cap-line retries and land it without the required range re-read.

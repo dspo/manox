@@ -403,7 +403,52 @@ pub fn parse_patch(text: &str) -> Result<ParsedPatch, ParseError> {
             message: "patch contains no [PATH#TAG] section".to_string(),
         });
     }
+    let files = merge_same_path_sections(files)?;
     Ok(ParsedPatch { files, warnings })
+}
+
+/// Fuse sections that open the same file. Two `[path#TAG]` sections for one
+/// path apply sequentially as written, but the first one's write re-tags the
+/// file, so the second's tag check would fail and its line numbers anchor on
+/// a stale view — yet both sections cite ONE snapshot (same tag), so their
+/// anchors apply together against that snapshot directly. Matching tags merge
+/// into a single section; mismatched tags mean the model mixed reads and are
+/// rejected with a re-read instruction instead of a mid-flight drift failure.
+fn merge_same_path_sections(files: Vec<FilePatch>) -> Result<Vec<FilePatch>, ParseError> {
+    let mut merged: Vec<FilePatch> = Vec::with_capacity(files.len());
+    for section in files {
+        let Some(existing) = merged.iter_mut().find(|f| f.path == section.path) else {
+            merged.push(section);
+            continue;
+        };
+        if existing.tag != section.tag {
+            return Err(ParseError {
+                line: 0,
+                message: format!(
+                    "two sections open {} with different tags (#{} then #{}) — they cite \
+                     different reads of one file. Re-read it and re-issue the edits under the \
+                     fresh single [path#tag] header, or split them into separate Edit calls.",
+                    section.path.display(),
+                    existing.tag,
+                    section.tag
+                ),
+            });
+        }
+        if existing.file_op.is_some() && section.file_op.is_some() {
+            return Err(ParseError {
+                line: 0,
+                message: format!(
+                    "two sections both declare a file-level operation on {} — declare it once.",
+                    section.path.display()
+                ),
+            });
+        }
+        if let Some(op) = section.file_op {
+            existing.file_op = Some(op);
+        }
+        existing.ops.extend(section.ops);
+    }
+    Ok(merged)
 }
 
 /// Drop every earlier `SWAP` whose range exactly matches a later `SWAP` in the

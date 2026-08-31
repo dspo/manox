@@ -138,7 +138,10 @@ impl AgentTool for SelectorReadTool {
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_lines: Self::DEFAULT_MAX_LINES,
         };
-        let result = truncate::truncate(&formatted, &config);
+        // Head-contiguous truncation: numbered rows must be trusted as fully
+        // shown in order. A head+tail hole would silently un-see the middle
+        // of the range while the model believes it read everything.
+        let result = truncate::truncate_head(&formatted, &config);
 
         // Record the lines the OUTPUT actually shows. Numbered bodies carry
         // their line numbers, so the (possibly truncated) body parses
@@ -184,11 +187,22 @@ impl AgentTool for SelectorReadTool {
                 result.original_lines, result.original_bytes
             ));
             // Selector reads don't get the kernel's offset/limit paging hint;
-            // point the model at the selector continuation instead.
-            let cont = if raw_selector {
-                "continue with a bounded raw selector, e.g. `<path>:raw:FROM-TO`"
+            // point the model at the selector continuation instead, naming
+            // the concrete next row for numbered bodies so paging neither
+            // re-reads nor skips rows.
+            let next = if raw_selector {
+                None
             } else {
-                "continue with a narrower range selector, e.g. `<path>:FROM-TO`"
+                displayed.iter().copied().max().map(|m| m + 1)
+            };
+            let cont = match next {
+                Some(next) => format!(
+                    "continue from line {next}, e.g. `{path_display}:{next}-{}`",
+                    next + 199
+                ),
+                None => {
+                    "continue with a bounded raw selector, e.g. `<path>:raw:FROM-TO`".to_string()
+                }
             };
             output.push_str(&format!("\n[{cont}]"));
         }

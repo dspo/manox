@@ -134,6 +134,17 @@ struct RightPaneSnapshot {
     visible: bool,
 }
 
+/// A non-question authorization parked on the user's decision — a
+/// `sandbox_permissions` escalation from Edit/Write/Bash, or an
+/// `AskUserQuestion` whose payload failed to parse. The ask card only
+/// renders question payloads, so without this surface the pending call
+/// blocks invisibly until the turn is cancelled.
+pub(crate) struct PendingAuth {
+    pub id: String,
+    pub tool_name: String,
+    pub summary: String,
+}
+
 /// A parsed `AskUserQuestion` prompt awaiting the user's selections.
 struct PendingAsk {
     id: String,
@@ -400,6 +411,7 @@ pub struct Workspace {
     sidebar_width: Pixels,
     /// A pending `AskUserQuestion` card rendered inline in the message list.
     pending_ask: Option<PendingAsk>,
+    pending_auth: Option<PendingAuth>,
     /// Tool row currently carrying the Workspace-derived ask snapshot. This is
     /// synchronized before list construction; the row factory itself remains
     /// a read-only projection during measurement and prepaint.
@@ -786,6 +798,7 @@ impl Workspace {
             editor_width: px(EDITOR_PANEL_WIDTH),
             sidebar_width: px(SIDEBAR_WIDTH),
             pending_ask: None,
+            pending_auth: None,
             ask_snapshot_item: None,
             pending_plan_review: None,
             pending_plans: HashMap::new(),
@@ -901,9 +914,58 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.pending_ask = parse_pending_ask(id.to_string(), input);
+        self.pending_auth = self.pending_ask.is_none().then(|| PendingAuth {
+            id: id.to_string(),
+            tool_name: "AskUserQuestion".to_string(),
+            summary: String::new(),
+        });
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         cx.notify();
+    }
+
+    /// Seed a non-question authorization (a sandbox escalation, or an ask
+    /// whose payload failed to parse) as the pending generic card.
+    /// Diagnostic-only: mirrors what the `ToolCallAuthorization` handler
+    /// stores for a non-ask payload.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_seed_auth(
+        &mut self,
+        id: &str,
+        tool_name: &str,
+        summary: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_ask = None;
+        self.pending_auth = Some(PendingAuth {
+            id: id.to_string(),
+            tool_name: tool_name.to_string(),
+            summary: summary.to_string(),
+        });
+        self.ask_step = 0;
+        cx.notify();
+    }
+
+    /// The pending generic-approval card as (id, tool_name, summary).
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_pending_auth(&self) -> Option<(String, String, String)> {
+        self.pending_auth
+            .as_ref()
+            .map(|a| (a.id.clone(), a.tool_name.clone(), a.summary.clone()))
+    }
+
+    /// Whether any blocking overlay (plan review, ask, generic approval,
+    /// blank project) is up.
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_blocking_overlay_active(&self) -> bool {
+        self.blocking_overlay_active()
+    }
+
+    /// Resolve the pending generic-approval card. Diagnostic-only wrapper
+    /// around `resolve_auth`; the fake engine accepts the id.
+    #[cfg(feature = "test-support")]
+    pub fn resolve_auth_for_test(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
+        self.resolve_auth(decision, cx);
     }
 
     /// Run the missing-card synthesis. Diagnostic-only wrapper around the
@@ -1037,11 +1099,23 @@ impl Workspace {
         let thread = self.thread.clone();
         cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
             match ev {
-                ThreadEvent::ToolCallAuthorization { id, input, .. } => {
-                    // Every interaction — AskUserQuestion calls and bubbled
-                    // team-member questions — surfaces as the question card;
-                    // the payload carries the decision options.
+                ThreadEvent::ToolCallAuthorization {
+                    id,
+                    tool_name,
+                    summary,
+                    input,
+                } => {
+                    // AskUserQuestion-shaped payloads surface as the question
+                    // card; everything else (a sandbox_permissions escalation
+                    // from Edit/Write, a malformed ask) surfaces as the
+                    // generic approval card — a parked thread must never wait
+                    // invisibly.
                     this.pending_ask = parse_pending_ask(id.clone(), input.clone());
+                    this.pending_auth = this.pending_ask.is_none().then(|| PendingAuth {
+                        id: id.clone(),
+                        tool_name: tool_name.clone(),
+                        summary: summary.clone(),
+                    });
                     this.ask_step = 0;
                     this.ask_transition_gen = this.ask_transition_gen.wrapping_add(1);
                     this.context_rail.update(cx, |r, cx| {
@@ -3160,6 +3234,7 @@ impl Workspace {
     fn blocking_overlay_active(&self) -> bool {
         self.pending_plan_review.is_some()
             || self.pending_ask.is_some()
+            || self.pending_auth.is_some()
             || self.blank_project_parent.is_some()
     }
 
@@ -3537,6 +3612,7 @@ impl Workspace {
         self.history_rendered = messages.len();
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
+        self.pending_auth = None;
         // Restore the incoming thread's stashed pending plan, if any.
         self.pending_plan_review = self.pending_plans.remove(&new_id);
         if let Some(review) = self.pending_plan_review.as_ref() {
@@ -3691,15 +3767,20 @@ impl Workspace {
         // parked waiting for a user answer while in the background, re-surface
         // the events so the question card appears immediately upon switching
         // back. Every interaction surfaces as the AskUserQuestion card.
-        let entries: Vec<(String, String, serde_json::Value)> = self
+        let entries: Vec<(String, String, String, serde_json::Value)> = self
             .thread
             .read(cx)
             .pending_auth_entries()
             .into_iter()
-            .map(|(id, meta)| (id, meta.summary, meta.input))
+            .map(|(id, meta)| (id, meta.tool_name, meta.summary, meta.input))
             .collect();
-        for (id, summary, input) in entries {
+        for (id, tool_name, summary, input) in entries {
             self.pending_ask = parse_pending_ask(id.clone(), input.clone());
+            self.pending_auth = self.pending_ask.is_none().then(|| PendingAuth {
+                id: id.clone(),
+                tool_name,
+                summary: summary.clone(),
+            });
             self.ask_step = 0;
             self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
             // The card renders on a top-level `ToolCall` item. The rebuilt
@@ -3711,7 +3792,7 @@ impl Workspace {
                 self.ensure_ask_tool_item(&id, &summary, input, cx);
             }
         }
-        if self.pending_ask.is_some() {
+        if self.pending_ask.is_some() || self.pending_auth.is_some() {
             cx.notify();
         }
     }
@@ -5306,13 +5387,16 @@ impl Workspace {
     }
 
     pub(crate) fn resolve_auth(&mut self, decision: PermissionDecision, cx: &mut Context<Self>) {
-        // An AskUserQuestion card's "Cancel" button calls this; the card is
-        // the only pending surface, so resolve its id directly.
-        let Some(ask) = self.pending_ask.as_ref() else {
-            return;
+        // An AskUserQuestion card's "Cancel" button calls this; the generic
+        // approval card's verdicts land here too. Whichever pending surface
+        // is up owns the round-trip id.
+        let id = match (self.pending_ask.as_ref(), self.pending_auth.as_ref()) {
+            (Some(ask), _) => ask.id.clone(),
+            (None, Some(auth)) => auth.id.clone(),
+            (None, None) => return,
         };
-        let id = ask.id.clone();
         self.pending_ask = None;
+        self.pending_auth = None;
         self.ask_step = 0;
         self.ask_transition_gen = self.ask_transition_gen.wrapping_add(1);
         self.thread.update(cx, |thread, cx| {
@@ -6067,8 +6151,10 @@ impl Workspace {
     ) -> AnyElement {
         // Flip the composer placeholder only on mode transitions, so render
         // doesn't churn the InputState every frame.
-        let followup_mode =
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none();
+        let followup_mode = running
+            && self.pending_plan_review.is_none()
+            && self.pending_ask.is_none()
+            && self.pending_auth.is_none();
         let placeholder_mode = if self.pending_ask.is_some() {
             ComposerPlaceholderMode::Ask
         } else if followup_mode {
@@ -6095,7 +6181,10 @@ impl Workspace {
         let access = self.render_access_placeholder(theme, cx);
         let model = self.render_model_selector_pi(theme, cx);
         let send = self.render_send_button(
-            running && self.pending_plan_review.is_none() && self.pending_ask.is_none(),
+            running
+                && self.pending_plan_review.is_none()
+                && self.pending_ask.is_none()
+                && self.pending_auth.is_none(),
             cx,
         );
         // The completion popover overlays the composer; anchoring it on the
@@ -7483,13 +7572,101 @@ impl Workspace {
     }
 
     /// Overlay prompting for the blank-project folder name.
+    /// The generic approval card: a non-question authorization (a
+    /// `sandbox_permissions` escalation, or an ask whose payload failed to
+    /// parse) parked on the user's decision. Without it the pending call
+    /// blocks the thread invisibly — the user sees a stuck tool, not a
+    /// decision that belongs to them.
+    fn render_pending_auth_overlay(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let auth = self.pending_auth.as_ref()?;
+        let detail = if auth.summary.trim().is_empty() {
+            format!("{} · {}", auth.tool_name, i18n::t("pending-auth-waiting"))
+        } else {
+            format!("{} · {}", auth.tool_name, auth.summary)
+        };
+        Some(
+            gpui::div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(theme.foreground.opacity(0.6))
+                .child(
+                    v_flex()
+                        .w(px(480.))
+                        .p_4()
+                        .gap_3()
+                        .rounded(theme.radius)
+                        .bg(theme.background)
+                        .border_1()
+                        .border_color(theme.border)
+                        .shadow_lg()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Icon::new(IconName::Eye)
+                                        .small()
+                                        .text_color(theme.accent_foreground),
+                                )
+                                .child(
+                                    gpui::div()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .child(i18n::t("pending-auth-title")),
+                                ),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .child(detail),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(
+                                    Button::new("pending-auth-deny")
+                                        .ghost()
+                                        .small()
+                                        .label(i18n::t("pending-auth-deny"))
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.resolve_auth(PermissionDecision::Deny, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("pending-auth-allow")
+                                        .primary()
+                                        .small()
+                                        .label(i18n::t("pending-auth-allow"))
+                                        .on_click(cx.listener(move |this, _, _window, cx| {
+                                            this.resolve_auth(PermissionDecision::AllowOnce, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_blank_project_overlay(
         &self,
         _window: &mut Window,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.pending_ask.is_some() || self.pending_plan_review.is_some() {
+        if self.pending_ask.is_some()
+            || self.pending_plan_review.is_some()
+            || self.pending_auth.is_some()
+        {
             return None;
         }
         self.blank_project_parent.as_ref()?;
@@ -7764,7 +7941,9 @@ impl Workspace {
             && (!editor_open || !right_pane_open)
             && self.thread.read(cx).has_interacted()
             && crate::views::context_rail::ContextRail::rail_width_for(main_body_w).is_some();
-        let overlay = self.render_blank_project_overlay(window, &theme, cx);
+        let overlay = self
+            .render_blank_project_overlay(window, &theme, cx)
+            .or_else(|| self.render_pending_auth_overlay(&theme, cx));
         let turn_navigator_overlay =
             self.render_turn_navigator_overlay(window, &theme, right_pane_open, show_rail, cx);
         // The inline composer stays visible while inline AskUserQuestion cards

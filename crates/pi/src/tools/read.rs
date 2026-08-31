@@ -109,7 +109,10 @@ impl AgentTool for ReadTool {
             max_bytes: Self::DEFAULT_MAX_BYTES,
             max_lines: Self::DEFAULT_MAX_LINES,
         };
-        let result = truncate::truncate(&formatted, &config);
+        // Head-contiguous truncation: numbered rows 1..=N must be trusted as
+        // fully shown. A head+tail hole would silently un-see the middle of
+        // the file while the model believes it read the whole thing.
+        let result = truncate::truncate_head(&formatted, &config);
 
         // Record the lines the OUTPUT actually shows, parsed from the possibly
         // truncated body — intent ranges would over-claim when the byte/line
@@ -127,10 +130,20 @@ impl AgentTool for ReadTool {
 
         let mut output = result.content;
         if result.was_truncated {
-            output.push_str(&format!(
-                "\n\n[read: {} lines, {} bytes — output truncated]",
-                result.original_lines, result.original_bytes
-            ));
+            // The highest row number the body still carries names the exact
+            // continuation point, so paging never re-reads or skips rows.
+            let next = displayed.iter().copied().max().map(|m| m + 1);
+            match next {
+                Some(next) => output.push_str(&format!(
+                    "\n\n[read truncated at line {next} of {line_count} — continue with \
+                     offset {next}; everything above it was shown in full]",
+                    line_count = text.lines().count(),
+                )),
+                None => output.push_str(&format!(
+                    "\n\n[read: {} lines, {} bytes — output truncated]",
+                    result.original_lines, result.original_bytes
+                )),
+            }
         }
         if snap.is_none() {
             output.push_str("\n\n[no snapshot: file exceeds 4MB — hashline `Edit` is unavailable; use `Write` for changes]");
