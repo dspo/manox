@@ -23,7 +23,10 @@ use pi::types::{
     StreamOptions,
 };
 
-use crate::session::EventSink;
+/// The typed sink bare-model completions push through: one `ServerNote`
+/// per relayed stream delta or terminal event. `Arc` + `'static` so the
+/// spawned stream task outlives the call that started it.
+pub type NoteSink = Arc<dyn Fn(manox_protocol::ServerNote) + Send + Sync + 'static>;
 
 /// Default system prompt used when the request carries no system-role text.
 const DEFAULT_SYSTEM_PROMPT: &str = "You are manox, a coding assistant running inside VS Code. Use the provided tools when they help answer the request.";
@@ -257,7 +260,7 @@ pub fn build_context(model: &Model, messages: &Value, tools: &Value) -> AgentCon
 }
 
 /// Emit one relayed delta as a wire event.
-fn forward(sink: &EventSink, request_id: &str, ev: AgentEvent) {
+fn forward(sink: &NoteSink, request_id: &str, ev: AgentEvent) {
     let AgentEvent::MessageUpdate {
         assistant_message_event,
         ..
@@ -265,37 +268,30 @@ fn forward(sink: &EventSink, request_id: &str, ev: AgentEvent) {
     else {
         return;
     };
-    match assistant_message_event {
-        AssistantMessageEvent::TextDelta { delta, .. } => {
-            sink.emit(
-                json!({"type": "model_text", "requestId": request_id, "text": delta}).to_string(),
-            );
-        }
-        AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-            sink.emit(
-                json!({"type": "model_thinking", "requestId": request_id, "text": delta})
-                    .to_string(),
-            );
-        }
+    use manox_protocol::ServerNote;
+    let note = match assistant_message_event {
+        AssistantMessageEvent::TextDelta { delta, .. } => ServerNote::ModelText {
+            request_id: request_id.to_string(),
+            text: delta,
+        },
+        AssistantMessageEvent::ThinkingDelta { delta, .. } => ServerNote::ModelThinking {
+            request_id: request_id.to_string(),
+            text: delta,
+        },
         AssistantMessageEvent::ToolCallEnd {
             tool_call: ContentBlock::ToolUse {
                 id, name, input, ..
             },
             ..
-        } => {
-            sink.emit(
-                json!({
-                    "type": "model_tool_call",
-                    "requestId": request_id,
-                    "id": id,
-                    "name": name,
-                    "input": input,
-                })
-                .to_string(),
-            );
-        }
-        _ => {}
-    }
+        } => ServerNote::ModelToolCall {
+            request_id: request_id.to_string(),
+            id,
+            name,
+            input,
+        },
+        _ => return,
+    };
+    sink(note);
 }
 
 /// The wire stop label for a settled assistant message; `None` for every
@@ -327,7 +323,7 @@ pub fn start(
     request_id: String,
     stream: Arc<dyn StreamFn>,
     ctx: AgentContext,
-    sink: EventSink,
+    sink: NoteSink,
     cancels: Arc<Mutex<HashMap<String, CancellationToken>>>,
 ) {
     let token = CancellationToken::new();
@@ -362,35 +358,28 @@ pub fn start(
         match result {
             Ok(message) => {
                 let stop = stop_reason_str(&message);
-                sink.emit(
-                    json!({"type": "model_chat_done", "requestId": rid, "stop": stop, "error": null})
-                        .to_string(),
-                );
+                sink(manox_protocol::ServerNote::ModelChatDone {
+                    request_id: rid,
+                    stop: stop.map(str::to_string),
+                    error: None,
+                });
             }
             Err(_) if token.is_cancelled() => {
                 // The provider streams return Err(ProviderError::Aborted) on
                 // signal; user cancellation is a normal end, so settle the
                 // request with the aborted stop label instead of an error.
-                sink.emit(
-                    json!({
-                        "type": "model_chat_done",
-                        "requestId": rid,
-                        "stop": "aborted",
-                        "error": null,
-                    })
-                    .to_string(),
-                );
+                sink(manox_protocol::ServerNote::ModelChatDone {
+                    request_id: rid,
+                    stop: Some("aborted".into()),
+                    error: None,
+                });
             }
             Err(err) => {
-                sink.emit(
-                    json!({
-                        "type": "model_chat_done",
-                        "requestId": rid,
-                        "stop": null,
-                        "error": err.to_string(),
-                    })
-                    .to_string(),
-                );
+                sink(manox_protocol::ServerNote::ModelChatDone {
+                    request_id: rid,
+                    stop: None,
+                    error: Some(err.to_string()),
+                });
             }
         }
 

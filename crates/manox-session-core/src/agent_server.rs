@@ -81,6 +81,9 @@ struct AgentServerInner {
     session_owners: Mutex<HashMap<String, Vec<String>>>,
     focused: Arc<StdMutex<Option<String>>>,
     call_seq: AtomicU64,
+    /// In-flight bare-model completions by request id (the LanguageModelChat
+    /// provider path); cancellation tokens shared with the spawned streams.
+    model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
 }
 
 impl AgentServer {
@@ -92,6 +95,7 @@ impl AgentServer {
             session_owners: Mutex::new(HashMap::new()),
             focused: Arc::new(StdMutex::new(None)),
             call_seq: AtomicU64::new(0),
+            model_chats: Arc::new(StdMutex::new(HashMap::new())),
         }))
     }
 
@@ -211,6 +215,15 @@ impl AgentServerInner {
             .lock()
             .get(session_id)
             .map(|s| s.thread.clone())
+    }
+
+    /// Deliver a note to one connected client (request-scoped traffic such
+    /// as bare-model stream deltas, which have no session ownership).
+    fn note_to_client(&self, client_id: &str, note: manox_protocol::ServerNote) {
+        let clients = self.clients.lock();
+        if let Some(entry) = clients.get(client_id) {
+            entry.conn.send_to_client(FromServer::Notification { note });
+        }
     }
 
     fn next_call_id(&self) -> MsgId {
@@ -482,7 +495,51 @@ async fn handle_call(
         ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
             Err(RpcError::new(-1, "terminal support lands in β-3b"))
         }
-        ClientCall::ModelChat { .. } => Err(RpcError::new(-1, "model_chat support lands in β-3b")),
+        ClientCall::ModelChat {
+            request_id,
+            model,
+            messages,
+            tools,
+        } => {
+            // Bare-model completion (the VS Code LanguageModelChat provider):
+            // stream deltas back to the CALLING client as request-scoped
+            // notes. Ported from the retired actor command engine.
+            let registry = agent::pi_providers::global();
+            let done = |stop: Option<&str>, error: Option<String>| {
+                inner.note_to_client(
+                    client_id,
+                    manox_protocol::ServerNote::ModelChatDone {
+                        request_id: request_id.clone(),
+                        stop: stop.map(str::to_string),
+                        error,
+                    },
+                );
+            };
+            let Some(resolved) = pi_extensions::model_ref::resolve_model_ref(&registry, &model)
+            else {
+                done(None, Some("unknown model".into()));
+                return Ok(json!({}));
+            };
+            match registry.resolve_stream(&resolved) {
+                Ok(stream) => {
+                    let ctx = crate::model_chat::build_context(&resolved, &messages, &tools);
+                    let sink = {
+                        let inner = Arc::clone(inner);
+                        let owner = client_id.to_string();
+                        Arc::new(move |note| inner.note_to_client(&owner, note))
+                    };
+                    crate::model_chat::start(
+                        request_id,
+                        stream,
+                        ctx,
+                        sink,
+                        Arc::clone(&inner.model_chats),
+                    );
+                }
+                Err(err) => done(None, Some(err.to_string())),
+            }
+            Ok(json!({}))
+        }
     }
 }
 
@@ -627,8 +684,12 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             kind,
             data,
         } => inner.append_ui_note(&session_id, &kind, data),
-        ClientNote::CancelModelChat { .. } | ClientNote::Shutdown => {
-            // β-3b: model_chat lifecycle / shutdown signal.
+        ClientNote::CancelModelChat { request_id } => {
+            crate::model_chat::cancel(&inner.model_chats, &request_id)
+        }
+        ClientNote::Shutdown => {
+            // Host-driven teardown rides the connection drop; nothing to do
+            // per-note.
         }
     }
 }
@@ -1599,7 +1660,7 @@ mod tests {
 
     // Reuse the session module's serialized test scaffolding so this suite
     // never races the process-wide runtime / thread-store / HOME globals.
-    use crate::session::tests::{hermetic_home, init_globals, lock_globals};
+    use crate::test_support::{hermetic_home, init_globals, lock_globals};
     use manox_protocol::in_process_pair;
 
     /// A scripted engine: records runs/steers/authorizations and lets a test

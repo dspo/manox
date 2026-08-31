@@ -3,11 +3,11 @@
 //!
 //! The browser is a dumb terminal — every command is driven on the app main
 //! thread against the same `Entity<Thread>`s the desktop Workspace operates,
-//! through `manox-session-core`'s `handle_command`. The `pump` is a
-//! gpui-foreground task that polls per-connection command queues; the HTTP
-//! and WS workers run on the global tokio runtime (`agent::runtime::handle`).
-//! Each connection is one independent bridge, matching the vscode
-//! multi-surface model; on disconnect it detaches its sessions without
+//! through the `AgentServer` protocol gateway. The `pump` is a gpui-foreground
+//! task that polls per-connection command queues; the HTTP and WS workers run
+//! on the global tokio runtime (`agent::runtime::handle`). Each connection is
+//! one independent bridge, matching the vscode multi-surface model; on
+//! disconnect it detaches its sessions without
 //! cancelling turns, so a browser refresh never kills a desktop turn.
 
 mod bridge;
