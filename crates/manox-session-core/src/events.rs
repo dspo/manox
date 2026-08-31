@@ -143,8 +143,17 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
             json!({"type": "plan_mode_changed", "enabled": enabled})
         }
         ThreadEvent::HistoryProgress => json!({"type": "history_progress"}),
-        ThreadEvent::Compaction { summary, .. } => {
-            json!({"type": "compaction", "summary": summary})
+        ThreadEvent::Compaction {
+            summary,
+            retained_tail,
+            ..
+        } => {
+            json!({
+                "type": "compaction",
+                "summary": summary,
+                "retained_tail": serde_json::to_value(retained_tail)
+                    .unwrap_or(Value::Array(Vec::new())),
+            })
         }
         ThreadEvent::BackgroundTaskUpdated { snapshot } => json!({
             "type": "background_task_updated",
@@ -385,6 +394,7 @@ mod tests {
                 summary: "older context".into(),
                 messages_compacted: 12,
                 tokens_before: 100_000,
+                retained_tail: Vec::new(),
             },
             Some("s1"),
         )

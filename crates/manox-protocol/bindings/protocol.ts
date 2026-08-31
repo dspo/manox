@@ -82,7 +82,10 @@ export type ServerNote = { "method": "ready" } | { "method": "sessionCreated", s
  * The retained tail of messages after compaction: the server folds
  * older history into the summary and keeps the most recent messages.
  * The client store replaces its transcript with `summary + retained`.
- * Empty when the server does not send the tail (compatibility).
+ * Always present on the wire — an empty array means nothing was
+ * retained. Populate from the kernel `CompactionResult.retained_tail`
+ * via `translate`; never send a synthetic empty tail for a
+ * compaction that kept messages.
  */
 retained: JsonValue, } | { "method": "cacheInvalidation", sessionId: string, reprocessedTokens: bigint, } | { "method": "subagentStarted", sessionId: string, id: string, agentType: string, description: string, } | { "method": "subagentProgress", sessionId: string, id: string, agentType: string, toolUses: number, latestActivity: string | null, status: string, } | { "method": "subagentChild", sessionId: string, id: string, event: JsonValue, } | { "method": "backgroundTaskUpdated", sessionId: string, snapshot: JsonValue, } | { "method": "steerPending", sessionId: string, clientId: string, messageId: string, } | { "method": "steerInjected", sessionId: string, messageId: string, } | { "method": "approvalDecision", sessionId: string, toolCallId: string, toolName: string, toolTitle: string, verdict: string, reason: string | null, } | { "method": "branch", sessionId: string, branch: string, } | { "method": "gitStats", sessionId: string, stats: JsonValue, } | { "method": "historyProgress", sessionId: string, } | { "method": "retry", sessionId: string, attempt: number, maxAttempts: number, delaySecs: bigint, reason: string, detail: string | null, } | { "method": "peerMessage", sessionId: string, from: string, content: string, } | { "method": "modelText", requestId: string, text: string, } | { "method": "modelThinking", requestId: string, text: string, } | { "method": "modelToolCall", requestId: string, id: string, name: string, input: JsonValue, } | { "method": "modelChatDone", requestId: string, stop: string | null, error: string | null, } | { "method": "tokenUsage", sessionId: string, input: bigint, output: bigint, cacheCreation: bigint, cacheRead: bigint, } | { "method": "error", sessionId: string | null, message: string, };
 

@@ -251,11 +251,15 @@ pub enum ThreadEvent {
     CompactionStarted {
         tokens_before: u64,
     },
-    /// A compaction pass landed.
+    /// A compaction pass landed. `retained_tail` carries the messages kept
+    /// intact across the boundary (from the kernel's `CompactionResult`) so
+    /// protocol clients can replace — not append — their transcript with
+    /// `summary + tail`.
     Compaction {
         summary: String,
         messages_compacted: usize,
         tokens_before: u64,
+        retained_tail: Vec<crate::message::Message>,
     },
     /// The model submitted a plan file for the user's review verdict via
     /// the `ProposePlan` tool.

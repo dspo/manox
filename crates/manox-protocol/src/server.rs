@@ -256,7 +256,10 @@ pub enum ServerNote {
         /// The retained tail of messages after compaction: the server folds
         /// older history into the summary and keeps the most recent messages.
         /// The client store replaces its transcript with `summary + retained`.
-        /// Empty when the server does not send the tail (compatibility).
+        /// Always present on the wire — an empty array means nothing was
+        /// retained. Populate from the kernel `CompactionResult.retained_tail`
+        /// via `translate`; never send a synthetic empty tail for a
+        /// compaction that kept messages.
         retained: serde_json::Value,
     },
     /// Provider-side prompt cache was lost since the previous turn; the

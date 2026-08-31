@@ -138,10 +138,13 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
         CompactionStarted { tokens_before, .. } => ThreadEvent::CompactionStarted {
             tokens_before: *tokens_before,
         },
-        Compaction { summary, .. } => ThreadEvent::Compaction {
+        Compaction {
+            summary, retained, ..
+        } => ThreadEvent::Compaction {
             summary: summary.clone(),
             messages_compacted: 0,
             tokens_before: 0,
+            retained_tail: serde_json::from_value(retained.clone()).unwrap_or_default(),
         },
         CacheInvalidation {
             reprocessed_tokens, ..
