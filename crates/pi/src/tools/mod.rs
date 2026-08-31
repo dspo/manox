@@ -59,7 +59,7 @@ impl ToolRegistry {
     pub fn register_defaults(&mut self) {
         self.register(Arc::new(read::ReadTool));
         self.register(Arc::new(write::WriteTool));
-        self.register(Arc::new(edit::EditTool));
+        self.register(Arc::new(edit::EditTool::default()));
         self.register(Arc::new(bash::BashTool::new(None)));
         self.register(Arc::new(grep::GrepTool));
         self.register(Arc::new(glob::GlobTool));

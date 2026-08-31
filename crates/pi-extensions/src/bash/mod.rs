@@ -862,16 +862,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_permissions_non_widening_fails_without_prompting() {
-        // workspace-write -> workspace-write is not strictly wider: the
-        // approver is never asked, and the call returns the verbatim error.
+    async fn sandbox_permissions_same_level_is_silent_no_op() {
+        // workspace-write -> workspace-write: an idempotent no-op grant. The
+        // approver is never asked, the call runs at the standing mode.
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let approver = Arc::new(CannedApprover {
             outcome: crate::sandbox::EscalationOutcome::AllowedOnce,
             asked: Arc::clone(&asked),
         });
         let (tool, _) = escalation_tool(PermissionMode::WorkspaceWrite, Some(approver));
-        let err = tool
+        let result = tool
             .execute(
                 "c1",
                 serde_json::json!({"command": "ls", "sandbox_permissions": "workspace-write", "justification": "x"}),
@@ -879,12 +879,15 @@ mod tests {
                 &ctx("/base"),
             )
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("not strictly wider"), "{}", err);
+            .unwrap();
+        assert!(
+            output_text(&result).contains("ran=sandboxed"),
+            "the no-op grant stays at the standing mode"
+        );
         assert_eq!(
             asked.load(Ordering::SeqCst),
             0,
-            "non-widening never prompts"
+            "a same-level request never prompts"
         );
     }
 

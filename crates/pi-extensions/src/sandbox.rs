@@ -348,15 +348,19 @@ pub trait EscalationApprover: Send + Sync {
 /// channel, then map every outcome — the ordered fail-closed sequence both
 /// enforcing families share. Returns the granted mode to stamp onto exactly
 /// this call; returns the distinct verbatim text for every other path (a
-/// non-widening request, a missing approval service, a rejection, a
-/// cancellation, an unanswerable ask). A non-widening request never prompts a
-/// human.
+/// narrowing request, a missing approval service, a rejection, a
+/// cancellation, an unanswerable ask). A same-level request is an idempotent
+/// no-op grant — the call already runs at that mode — and never prompts a
+/// human; a narrowing one fails, because escalation only widens.
 pub async fn approve_escalation(
     request: EscalationRequest,
     approver: Option<&dyn EscalationApprover>,
 ) -> Result<PermissionMode, String> {
     let mode = request.requested_mode;
     let subject = request.subject.clone();
+    if mode == request.effective_mode {
+        return Ok(mode);
+    }
     // Strict widening is an execution check against the call's effective mode.
     let wider = WIDER_MODES
         .iter()
@@ -365,7 +369,9 @@ pub async fn approve_escalation(
         .unwrap_or(&[] as &[PermissionMode]);
     if !wider.contains(&mode) {
         return Err(format!(
-            "sandbox escalation to \"{}\" is not strictly wider than this call's current \"{}\" mode",
+            "sandbox escalation to \"{}\" is not strictly wider than this call's current \"{}\" mode. \
+             Escalation only widens: omit `sandbox_permissions` to run at the current mode, or \
+             request a wider one",
             mode.wire(),
             request.effective_mode.wire()
         ));
@@ -523,9 +529,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approve_escalation_non_widening_never_prompts() {
-        // workspace-write -> workspace-write is not strictly wider.
-        let err = approve_escalation(
+    async fn approve_escalation_same_level_is_idempotent_no_op() {
+        // workspace-write -> workspace-write: the call already runs at that
+        // mode, so the request is a no-op grant — it neither prompts a human
+        // (no approver is composed) nor errors.
+        let mode = approve_escalation(
             req(
                 PermissionMode::WorkspaceWrite,
                 PermissionMode::WorkspaceWrite,
@@ -533,8 +541,27 @@ mod tests {
             None,
         )
         .await
+        .unwrap();
+        assert_eq!(mode, PermissionMode::WorkspaceWrite);
+    }
+
+    #[tokio::test]
+    async fn approve_escalation_narrowing_fails_with_omit_hint() {
+        // danger-full-access -> workspace-write narrows: escalation only
+        // widens, and the error must teach the omission escape hatch.
+        let err = approve_escalation(
+            req(
+                PermissionMode::WorkspaceWrite,
+                PermissionMode::DangerFullAccess,
+            ),
+            None,
+        )
+        .await
         .unwrap_err();
-        assert!(err.contains("not strictly wider"), "{err}");
+        assert!(
+            err.contains("not strictly wider") && err.contains("omit `sandbox_permissions`"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -880,7 +880,10 @@ fn build_tools(
             "main",
         )),
         Arc::new(crate::file_lock::FileLockedTool::new(
-            Arc::new(pi::tools::edit::EditTool),
+            Arc::new(
+                pi::tools::edit::EditTool::default()
+                    .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
+            ),
             "main",
         )),
         Arc::new(pi::tools::grep::GrepTool),
@@ -1253,7 +1256,11 @@ fn build_tools(
                         "sailor",
                     )),
                     Arc::new(crate::file_lock::FileLockedTool::new(
-                        Arc::new(pi::tools::edit::EditTool),
+                        Arc::new(
+                            pi::tools::edit::EditTool::default().with_enforce_seen_lines(
+                                crate::settings::edit().enforce_seen_lines,
+                            ),
+                        ),
                         "sailor",
                     )),
                 ],
