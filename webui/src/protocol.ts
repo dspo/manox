@@ -276,6 +276,10 @@ export interface WireMessage {
 		steered?: boolean;
 		external_event?: boolean;
 		display_text?: string;
+		/** Authoring agent of a user-role turn the human did not type;
+		 * absent = human input. Mirrors agent::MessageAuthor (serde
+		 * snake_case externally-tagged variants). */
+		author?: 'lead' | 'harness' | { agent: string } | null;
 	};
 }
 

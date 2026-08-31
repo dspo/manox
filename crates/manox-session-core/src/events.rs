@@ -186,6 +186,9 @@ pub fn thread_event_to_json(ev: &ThreadEvent, session_id: Option<&str>) -> Optio
                     "kind": "error",
                     "text": text,
                 }),
+                // The child's resolved model is desktop turn-header metadata;
+                // the web transcript has no consumer for it yet.
+                agent::SubagentChildEvent::Model(_) => return None,
             };
             json!({"type": "subagent_child", "id": id, "event": event})
         }

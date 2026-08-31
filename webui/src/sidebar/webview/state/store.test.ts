@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ActorEvent, ThreadListItem, WireMessage } from '../../../protocol';
 import type { HostToWebview } from '../../messages';
 import { Store, wireMessagesToTranscriptItems } from './store';
-import { foldToolStatus } from './transcript';
+import { foldToolStatus, userTurnHeader } from './transcript';
 
 const event = (ev: ActorEvent): HostToWebview => ({ type: 'events', events: [ev] });
 
@@ -784,6 +784,31 @@ describe('wireMessagesToTranscriptItems', () => {
         modelId: 'm1',
         timestamp: 1_700_000_000,
         images: [{ mimeType: 'image/png', data: null, byteLen: 1234 }],
+        author: null,
+      },
+    ]);
+  });
+
+  it('passes the authoring agent through as the turn header from', () => {
+    const items = wireMessagesToTranscriptItems([
+      wire({
+        id: 'u1',
+        role: 'user',
+        provenance: 'user',
+        content: [{ Text: 'review the pr' }],
+        ui: { author: { agent: 'pr690-reviewer' } },
+      }),
+    ]);
+    expect(items).toEqual([
+      {
+        kind: 'user',
+        id: 'u1',
+        text: 'review the pr',
+        displayText: undefined,
+        modelId: null,
+        timestamp: 1_700_000_000,
+        images: undefined,
+        author: { agent: 'pr690-reviewer' },
       },
     ]);
   });
@@ -1547,5 +1572,22 @@ describe('tool output tail cap', () => {
       event({ type: 'tool_output', sessionId: 's', id: 't1', chunk: '😀' + 'a'.repeat(63_999) }),
     );
     expect(toolCard(store, 't1')?.output).toBe('a'.repeat(63_999));
+  });
+});
+
+describe('userTurnHeader', () => {
+  it('joins every segment in order with the host separators', () => {
+    expect(userTurnHeader({ agent: 'r1' }, 'Captain', 'm', '17:55')).toBe(
+      'r1 > Captain·m·17:55',
+    );
+  });
+
+  it('drops absent segments and skips the joiner between them', () => {
+    expect(userTurnHeader(null, 'Captain', null, '17:55')).toBe('You > Captain·17:55');
+    expect(userTurnHeader('harness', 'Captain', undefined, null)).toBe('Harness > Captain');
+  });
+
+  it('collapses to the bare from label when nothing follows', () => {
+    expect(userTurnHeader(null, '', null, null)).toBe('You');
   });
 });

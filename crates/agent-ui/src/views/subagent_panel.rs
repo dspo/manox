@@ -35,16 +35,20 @@ use crate::views::subagents::status_indicator;
 /// main conversation, and the child call id pairs start/end under parallel
 /// child tool execution. A message stop carries the child message's token
 /// usage, consumed by the `Stop` arm to label the just-finished reply.
-fn thread_event_of(child: &SubagentChildEvent) -> (ThreadEvent, Option<TokenUsage>) {
+/// `None` marks an observation the transcript never renders — the child's
+/// resolved model — which the panel consumes as turn-header metadata.
+fn thread_event_of(child: &SubagentChildEvent) -> Option<(ThreadEvent, Option<TokenUsage>)> {
     match child {
-        SubagentChildEvent::Text(text) => (ThreadEvent::AgentText(text.clone()), None),
-        SubagentChildEvent::Thinking(text) => (ThreadEvent::AgentThinking(text.clone()), None),
+        SubagentChildEvent::Text(text) => Some((ThreadEvent::AgentText(text.clone()), None)),
+        SubagentChildEvent::Thinking(text) => {
+            Some((ThreadEvent::AgentThinking(text.clone()), None))
+        }
         SubagentChildEvent::ToolStart { id, name, hint } => {
             let input = hint
                 .as_ref()
                 .map(|(key, value)| serde_json::json!({ key: value }));
             let title_value = input.clone().unwrap_or_default();
-            (
+            Some((
                 ThreadEvent::ToolCall {
                     id: id.clone(),
                     name: name.clone(),
@@ -53,23 +57,26 @@ fn thread_event_of(child: &SubagentChildEvent) -> (ThreadEvent, Option<TokenUsag
                     input,
                 },
                 None,
-            )
+            ))
         }
         SubagentChildEvent::ToolEnd {
             id,
             is_error,
             output,
             ..
-        } => (
+        } => Some((
             ThreadEvent::ToolResult {
                 id: id.clone(),
                 output: output.clone(),
                 is_error: *is_error,
             },
             None,
-        ),
-        SubagentChildEvent::Stop { reason, usage } => (ThreadEvent::Stop(*reason), *usage),
-        SubagentChildEvent::Error(text) => (ThreadEvent::Error(anyhow::anyhow!("{text}")), None),
+        )),
+        SubagentChildEvent::Stop { reason, usage } => Some((ThreadEvent::Stop(*reason), *usage)),
+        SubagentChildEvent::Error(text) => {
+            Some((ThreadEvent::Error(anyhow::anyhow!("{text}")), None))
+        }
+        SubagentChildEvent::Model(_) => None,
     }
 }
 
@@ -84,6 +91,9 @@ pub(crate) struct SubagentPanel {
     /// Rendered above the transcript when the panel fell back to the final
     /// answer (no live transcript survives a reload).
     final_note: bool,
+    /// The model the child runs: every turn header's `{model}` segment and the
+    /// activity rows' model name. The recipient (the sub-agent definition)
+    /// lives with the conversation, which owns the turn headers.
     role: String,
     weak_workspace: WeakEntity<Workspace>,
     scroll_handle: ScrollHandle,
@@ -95,9 +105,10 @@ impl SubagentPanel {
     pub(crate) fn new(
         topic: String,
         role: String,
+        recipient: String,
         status: ToolCallStatus,
         backfill: &[SubagentChildEvent],
-        prompt: Option<String>,
+        prompt: Option<(String, i64)>,
         final_text: Option<String>,
         weak_workspace: WeakEntity<Workspace>,
         cx: &mut App,
@@ -108,13 +119,20 @@ impl SubagentPanel {
         };
         let final_note = backfill.is_empty() && final_text.is_some();
         let role_for_conv = role.clone();
-        // Seed the Captain's dispatch prompt as the opening user bubble so the
-        // panel always shows the conversation's first message; the final-answer
-        // fallback (when nothing was bridged) and the bridged child events
-        // follow through the same display/apply pipeline as the main thread.
+        // Seed the Captain's dispatch prompt as the opening turn, stamped with
+        // its author and its send time, so the header reads
+        // `Captain > {recipient}·{model}·{time}`. The final-answer fallback
+        // (when nothing was bridged) and the bridged child events follow
+        // through the same display/apply pipeline as the main thread.
         let mut display = Vec::new();
-        if let Some(prompt) = prompt {
-            display.push(agent::db::HistoryEntry::Message(Message::user(prompt)));
+        if let Some((prompt, dispatched_at)) = prompt {
+            let mut message = Message::user(prompt);
+            message.timestamp = dispatched_at;
+            message.ui = Some(agent::MessageUiMetadata {
+                author: Some(agent::MessageAuthor::Lead),
+                ..Default::default()
+            });
+            display.push(agent::db::HistoryEntry::Message(message));
         }
         if backfill.is_empty()
             && let Some(final_text) = final_text
@@ -124,18 +142,21 @@ impl SubagentPanel {
             ])));
         }
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
+        let recipient_author = agent::MessageAuthor::Agent(recipient.clone());
         let conversation = cx.new(|cx| {
             let mut conversation = ConversationState::rebuild_from_display(
                 &display,
                 &empty_usage,
                 &role_for_conv,
+                recipient_author,
                 false,
                 ctx.clone(),
                 cx,
             );
             for child in backfill {
-                let (event, usage) = thread_event_of(child);
-                conversation.apply(&event, &role_for_conv, usage, ctx.clone(), cx);
+                if let Some((event, usage)) = thread_event_of(child) {
+                    conversation.apply(&event, &role_for_conv, usage, ctx.clone(), cx);
+                }
             }
             conversation
         });
@@ -152,7 +173,16 @@ impl SubagentPanel {
     }
 
     pub(crate) fn push(&mut self, child: &SubagentChildEvent, cx: &mut Context<Self>) {
-        let (event, usage) = thread_event_of(child);
+        if let SubagentChildEvent::Model(model) = child {
+            // The child's resolved model arrives once, at dispatch: later turn
+            // headers name the model that actually runs the work.
+            self.role = model.clone();
+            cx.notify();
+            return;
+        }
+        let Some((event, usage)) = thread_event_of(child) else {
+            return;
+        };
         let role = self.role.clone();
         let ctx = ApplyCtx {
             weak: self.weak_workspace.clone(),
@@ -295,9 +325,15 @@ impl Render for SubagentPanel {
 mod tests {
     use super::*;
 
+    /// Test view of the transcript mapping: every event probed here renders a
+    /// row, so the header-only observations never come through.
+    fn translated(child: &SubagentChildEvent) -> (ThreadEvent, Option<TokenUsage>) {
+        thread_event_of(child).expect("event maps onto a transcript event")
+    }
+
     #[test]
     fn child_events_translate_to_shared_thread_events() {
-        let (event, usage) = thread_event_of(&SubagentChildEvent::ToolStart {
+        let (event, usage) = translated(&SubagentChildEvent::ToolStart {
             id: "c1".into(),
             name: "Read".into(),
             hint: Some(("path".into(), "src/x.rs".into())),
@@ -320,7 +356,7 @@ mod tests {
             other => panic!("expected ToolCall, got {other:?}"),
         }
 
-        let (event, usage) = thread_event_of(&SubagentChildEvent::ToolEnd {
+        let (event, usage) = translated(&SubagentChildEvent::ToolEnd {
             id: "c1".into(),
             name: "Read".into(),
             is_error: true,
@@ -342,20 +378,24 @@ mod tests {
         }
 
         assert!(matches!(
-            thread_event_of(&SubagentChildEvent::Text("hi".into())),
+            translated(&SubagentChildEvent::Text("hi".into())),
             (ThreadEvent::AgentText(t), None) if t == "hi"
         ));
         assert!(matches!(
-            thread_event_of(&SubagentChildEvent::Thinking("hmm".into())),
+            translated(&SubagentChildEvent::Thinking("hmm".into())),
             (ThreadEvent::AgentThinking(t), None) if t == "hmm"
         ));
+        assert!(
+            thread_event_of(&SubagentChildEvent::Model("glm-5.2".into())).is_none(),
+            "the child's resolved model is header metadata, never a transcript row"
+        );
     }
 
     /// A message stop maps onto the shared `Stop` boundary with the child
     /// message's usage; a terminal provider error maps onto `Error`.
     #[test]
     fn stop_and_error_events_translate_to_thread_boundaries() {
-        let (event, usage) = thread_event_of(&SubagentChildEvent::Stop {
+        let (event, usage) = translated(&SubagentChildEvent::Stop {
             reason: agent::language_model::StopReason::ToolUse,
             usage: Some(TokenUsage {
                 input_tokens: 10,
@@ -369,7 +409,7 @@ mod tests {
         ));
         assert_eq!(usage.unwrap().input_tokens, 10);
 
-        let (event, usage) = thread_event_of(&SubagentChildEvent::Stop {
+        let (event, usage) = translated(&SubagentChildEvent::Stop {
             reason: agent::language_model::StopReason::EndTurn,
             usage: None,
         });
@@ -379,7 +419,7 @@ mod tests {
         ));
         assert!(usage.is_none());
 
-        let (event, usage) = thread_event_of(&SubagentChildEvent::Error("boom".into()));
+        let (event, usage) = translated(&SubagentChildEvent::Error("boom".into()));
         assert!(usage.is_none());
         assert!(matches!(event, ThreadEvent::Error(e) if e.to_string() == "boom"));
     }

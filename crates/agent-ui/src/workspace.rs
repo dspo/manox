@@ -234,6 +234,15 @@ struct DeferredUserTurn {
     user_images: Vec<UserImage>,
 }
 
+/// The Captain's dispatch prompt for one sub-agent address, with the Unix
+/// second it was sent: a sub-agent panel's opening bubble shows the send time,
+/// never the time its tab was opened.
+#[derive(Debug, Clone)]
+struct SubagentPrompt {
+    text: String,
+    dispatched_at: i64,
+}
+
 /// A thread parked in the background while still running a turn. The held
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
 /// to clear the running indicator, mark the thread unread, and drop it from
@@ -373,10 +382,11 @@ pub struct Workspace {
     /// status=Success/Error), used as the panel's final answer when the
     /// Agent tool-result is absent (new Steer bus has no ToolResult).
     subagent_final_text: HashMap<String, String>,
-    /// The Captain's dispatch prompt per subagent address, captured from the
-    /// Steer tool call so a panel always shows the opening user message even
-    /// before the child streams anything.
-    subagent_prompts: HashMap<String, String>,
+    /// The Captain's dispatch prompt per subagent address with its send time,
+    /// captured from the Steer tool call so a panel always shows the opening
+    /// user message — correctly attributed and timed — even before the child
+    /// streams anything.
+    subagent_prompts: HashMap<String, SubagentPrompt>,
     /// Lazily-built browser tab entities, keyed by `BrowserTabId`. A browser
     /// tab keeps its `BrowserView` (and the underlying native webview) across
     /// tab switches; dropped when the tab closes, which detaches the native
@@ -737,7 +747,8 @@ impl Workspace {
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
-        let conversation = cx.new(|_| ConversationState::new());
+        let recipient = thread.read(cx).self_author();
+        let conversation = cx.new(|_| ConversationState::new(recipient));
         let context_rail =
             { cx.new(|_| crate::views::context_rail::ContextRail::new(thread.clone())) };
         let weak_ws = cx.weak_entity();
@@ -986,6 +997,7 @@ impl Workspace {
         let display: Vec<agent::db::HistoryEntry> = self.thread.read(cx).display_history().to_vec();
         let usage = self.thread.read(cx).request_token_usage().clone();
         let role = self.model_label(cx);
+        let recipient = self.recipient_author(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let cwd = thread_cwd(&self.thread, cx);
@@ -994,6 +1006,7 @@ impl Workspace {
                 &display,
                 &usage,
                 &role,
+                recipient,
                 running,
                 crate::conversation::ApplyCtx {
                     weak: weak.clone(),
@@ -1472,8 +1485,13 @@ impl Workspace {
                             .and_then(|v| v.as_str());
                         let prompt = args.get("prompt").and_then(|v| v.as_str());
                         if is_dispatch && let (Some(addr), Some(prompt)) = (addr, prompt) {
-                            this.subagent_prompts
-                                .insert(addr.to_string(), prompt.to_string());
+                            this.subagent_prompts.insert(
+                                addr.to_string(),
+                                SubagentPrompt {
+                                    text: prompt.to_string(),
+                                    dispatched_at: chrono::Utc::now().timestamp(),
+                                },
+                            );
                         }
                     }
                     let weak = cx.weak_entity();
@@ -3463,6 +3481,7 @@ impl Workspace {
         let usage = self.thread.read(cx).request_token_usage().clone();
         let background_tasks = self.thread.read(cx).background_task_snapshots();
         let role = self.model_label(cx);
+        let recipient = self.recipient_author(cx);
         let weak = cx.weak_entity();
         let running = self.thread.read(cx).is_running();
         let cwd = thread_cwd(&self.thread, cx);
@@ -3471,6 +3490,7 @@ impl Workspace {
                 &display,
                 &usage,
                 &role,
+                recipient,
                 running,
                 crate::conversation::ApplyCtx {
                     weak: weak.clone(),
@@ -5010,18 +5030,29 @@ impl Workspace {
         } else {
             topic.to_string()
         };
-        let role = if subagent_type.is_empty() {
+        let recipient = if subagent_type.is_empty() {
             "sub-agent".to_string()
         } else {
             subagent_type.to_string()
         };
+        // Transcript rows name the model that runs the child: the child reports
+        // its resolved model at dispatch (`SubagentChildEvent::Model`), and the
+        // parent's live label stands in until one is known.
+        let role = backfill
+            .iter()
+            .find_map(|event| match event {
+                agent::SubagentChildEvent::Model(model) => Some(model.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| self.model_label(cx));
         let prompt = self.subagent_prompts.get(id).cloned();
         let panel = crate::views::subagent_panel::SubagentPanel::new(
             banner,
             role,
+            recipient,
             status,
             &backfill,
-            prompt,
+            prompt.map(|p| (p.text, p.dispatched_at)),
             final_text,
             cx.weak_entity(),
             cx,
@@ -5089,8 +5120,13 @@ impl Workspace {
     ) {
         for row in agent::subagent_restore::rebuild_from_messages(messages) {
             let first_line = agent::steer_bus::first_line(&row.prompt);
-            self.subagent_prompts
-                .insert(row.address.clone(), row.prompt.clone());
+            self.subagent_prompts.insert(
+                row.address.clone(),
+                SubagentPrompt {
+                    text: row.prompt.clone(),
+                    dispatched_at: row.dispatched_at,
+                },
+            );
             if let Some(text) = &row.final_text {
                 self.subagent_final_text
                     .insert(row.address.clone(), text.clone());
@@ -5172,6 +5208,13 @@ impl Workspace {
         self.editor_preview_md = None;
         self.input_state.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    /// The agent whose conversation this workspace renders — every user
+    /// bubble's header `to`. `lead`-labeled threads show the localized Captain
+    /// label; a team member thread shows its own member name.
+    fn recipient_author(&self, cx: &App) -> agent::MessageAuthor {
+        self.thread.read(cx).self_author()
     }
 
     fn user_turn_meta(&self, cx: &mut Context<Self>) -> UserTurnMeta {
@@ -5529,9 +5572,10 @@ impl Workspace {
                 }
             };
         let mut meta = self.user_turn_meta(cx);
-        // The seed is harness-authored: attribute it to the session's own
-        // agent so the bubble header names the agent, not the human.
-        meta.author = Some(self.thread.read(cx).self_author());
+        // The expanded plan directive is written by the harness on the user's
+        // behalf, so the bubble header names the harness, not the human and
+        // not the agent that receives it.
+        meta.author = Some(agent::MessageAuthor::Harness);
         let ui = Self::message_ui_metadata(&meta);
         if matches!(choice, PlanReviewChoice::ExecuteFresh) {
             // Fresh context: archive this thread and continue on a new one
