@@ -10,7 +10,7 @@
 //! yaml's per-model `context`/`max_tokens` fields are honored (TS ignores
 //! them), with precedence yaml > `[Nm]` suffix > KNOWN_MODELS > defaults.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use pi::provider_registry::{Api, Cost, InputModality, ProviderConfig, ProviderModelConfig};
@@ -42,6 +42,11 @@ struct CxConfig {
     /// Parsed for the visible-agents computation; not registered anywhere.
     #[serde(default)]
     agents: Vec<CxAgent>,
+    /// Dedicated per-subagent models: `subagent_type` → raw
+    /// `provider::model::effort` spec. Consumed by the host's subagent
+    /// dispatch, not by provider registration.
+    #[serde(default)]
+    subagents: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,8 +167,8 @@ pub fn register_providers_yaml(
     registry: &pi::ProviderRegistry,
     raw: &str,
 ) -> anyhow::Result<usize> {
-    let config: CxConfig = serde_yaml::from_str(raw)
-        .map_err(|err| anyhow::anyhow!("parse cx providers config: {err}"))?;
+    let config = parse_config(raw)?;
+
     let mut registered = 0;
     for provider in &config.providers {
         // A credential failure skips this provider only (warn-logged, never
@@ -214,6 +219,27 @@ pub fn register_providers_yaml(
         }
     }
     Ok(registered)
+}
+
+/// Parse the cx providers config document — shared by registration and the
+/// subagent-model loader so one broken file cannot be seen differently by
+/// the two consumers.
+fn parse_config(raw: &str) -> anyhow::Result<CxConfig> {
+    serde_yaml::from_str(raw).map_err(|err| anyhow::anyhow!("parse cx providers config: {err}"))
+}
+
+/// Dedicated per-subagent models from the cx providers config's top-level
+/// `subagents:` map (`subagent_type: "provider::model::effort"`). A missing
+/// file yields an empty map (mirrors [`register_providers`]); a parse
+/// failure is a hard error the caller warns about — never silent.
+pub fn load_subagent_models(path: impl AsRef<Path>) -> anyhow::Result<HashMap<String, String>> {
+    let path = path.as_ref();
+    let raw = match std::fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => anyhow::bail!("read {}: {err}", path.display()),
+    };
+    Ok(parse_config(&raw)?.subagents.into_iter().collect())
 }
 
 fn wire_api_to_api(wire_api: &str) -> Option<Api> {
@@ -977,5 +1003,47 @@ agents:
             Some("completions")
         );
         assert_eq!(model_api_to_wire_key("anthropic-messages"), None);
+    }
+
+    #[test]
+    fn load_subagent_models_reads_the_subagents_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cx.providers.config.yaml");
+        // A missing file yields an empty map, like `register_providers`.
+        assert!(load_subagent_models(&path).unwrap().is_empty());
+        // A config without the `subagents:` key yields an empty map.
+        std::fs::write(&path, FIXTURE).unwrap();
+        assert!(load_subagent_models(&path).unwrap().is_empty());
+        // The `subagents:` block returns its raw spec strings verbatim.
+        let with_subagents = format!(
+            "{FIXTURE}\nsubagents:\n  Explore: 百炼::glm-5.3::high\n  Sailor: DeepSeek::deepseek-v4-flash::high\n"
+        );
+        std::fs::write(&path, &with_subagents).unwrap();
+        let map = load_subagent_models(&path).unwrap();
+        assert_eq!(map.get("Explore").unwrap(), "百炼::glm-5.3::high");
+        assert_eq!(
+            map.get("Sailor").unwrap(),
+            "DeepSeek::deepseek-v4-flash::high"
+        );
+        assert_eq!(map.len(), 2);
+        // A broken document is a hard error, never a silent empty map.
+        std::fs::write(&path, "providers: [unclosed").unwrap();
+        let err = load_subagent_models(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("parse cx providers config"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn subagents_block_does_not_affect_registration() {
+        let registry = pi::ProviderRegistry::new();
+        let with_subagents = format!("{FIXTURE}\nsubagents:\n  Explore: P::m::high\n");
+        let count = register_providers_yaml(&registry, &with_subagents).unwrap();
+        assert_eq!(
+            count, 4,
+            "the `subagents` key must not disturb registration"
+        );
+        assert_eq!(registry.provider_names().len(), 4);
     }
 }

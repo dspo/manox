@@ -56,6 +56,15 @@ vscode_app:
     provider: "string (optional; Responses wire provider 名，缺失时取第一个兼容 Provider)"
     disabled: "bool (optional; default false; true = 不注入 Codex 扩展)"
 
+# 子代理专属模型钉选（manox 宿主消费，cx 不解释其值，仅随配置一起 round-trip）。
+# key = subagent 类型名（Explore / Sailor / 用户与插件定义的 agent），
+# value = "provider::model::effort"：provider = 本文件中的 provider name（或其
+# "{name}-{wire_api}" 注册形态）；model = 该 provider 下的模型 id；effort ∈
+# off | low | medium | high | max（缺省 = 子会话默认，即 default_thinking_level
+# 按模型钳制）。
+subagents:
+  Explore: "string (optional; provider::model::effort)"
+
 # 运行时语义
 #
 # 1. 默认兼容性由下面两层自动推导：
@@ -77,3 +86,4 @@ vscode_app:
 #    - copilot + completions -> COPILOT_PROVIDER_TYPE=openai + WIRE_API=completions
 #    - claude  + anthropic   -> ANTHROPIC_BASE_URL / ANTHROPIC_MODEL
 #    - codex   + responses   -> 注入 synthetic provider config 后启动
+

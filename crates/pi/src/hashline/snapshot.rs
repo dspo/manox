@@ -220,6 +220,18 @@ impl SnapshotStore {
         matches
     }
 
+    /// The canonical paths holding a version tagged `hash`. When an edit cites
+    /// a tag unknown for its own path, a hit here names the cross-file mix-up
+    /// (the model pasted another file's header) instead of misreporting it as
+    /// a fabricated tag.
+    pub fn paths_of_tag(&self, hash: &str) -> Vec<PathBuf> {
+        self.by_path
+            .iter()
+            .filter(|(_, versions)| versions.iter().any(|v| v.tag == hash))
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
     /// Record which lines of a snapshot were displayed by a read tool. Merges
     /// into the existing `seen_lines` set. No-op when the tag is not retained.
     pub fn record_seen_lines(&mut self, path: &Path, tag: &str, lines: &HashSet<usize>) {

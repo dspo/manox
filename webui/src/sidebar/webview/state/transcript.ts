@@ -4,6 +4,8 @@
 
 import type { BackgroundTaskSnapshotWire, ToolCallStatus } from '../../../protocol';
 
+import { t } from '../lib/i18n';
+
 /** UI status vocabulary (matches the tool card's label/icon tables). Wire
  * statuses fold into it; authorization states pass through. */
 export type ToolUiStatus =
@@ -63,6 +65,10 @@ export type TranscriptItem =
       /** Unix seconds; echo submissions stamp wall-clock time. */
       timestamp?: number | null;
       images?: UserImage[];
+      /** Authoring agent of the turn (wire form); absent/null = human
+       * input, so the header's `from` reads "You". Store-side pass-through
+       * only — the bubble style does not branch on it. */
+      author?: 'lead' | 'harness' | { agent: string } | null;
       /** Echo id of a submission parked while a turn ran. */
       clientId?: string;
       /** Parked: the bubble shows the queued chip until the turn drains. */
@@ -97,3 +103,27 @@ export type TranscriptItem =
       output?: string;
       isError?: boolean;
     };
+
+/** Turn header: `{from} > {to}·{model}·{time}` — mirrors the gpui host.
+ * `from` is the turn's real author (human input is unattributed); `to` is
+ * the agent whose conversation renders the turn. Empty segments drop, and
+ * the `>` clause disappears when nothing follows `from`. */
+export function userTurnHeader(
+  author: 'lead' | 'harness' | { agent: string } | null | undefined,
+  recipientLabel: string,
+  modelId: string | null | undefined,
+  timeLabel: string | null,
+): string {
+  const from =
+    author == null
+      ? t('you')
+      : author === 'lead'
+        ? t('captain')
+        : author === 'harness'
+          ? t('harness')
+          : author.agent;
+  const tail = [recipientLabel, modelId ?? '', timeLabel ?? '']
+    .filter((part) => part !== '')
+    .join('·');
+  return tail === '' ? from : `${from} > ${tail}`;
+}

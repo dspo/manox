@@ -27,6 +27,7 @@ portable-pty = { workspace = true }
 
 agent.workspace = true
 toml.workspace = true
+hyperlinks.workspace = true
 
 # cx library —— `SessionHandle` 驱动外部 agent CLI 的 PTY，供 `CxSessionSource` 包裹。
 cx.workspace = true
@@ -39,3 +40,4 @@ test-support = []
 
 [lints.clippy]
 dbg_macro = "deny"
+

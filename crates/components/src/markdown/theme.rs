@@ -34,6 +34,9 @@ pub struct MdStyles {
     pub selection_bg: Hsla,
     /// Underline color for clickable link spans.
     pub link_color: Hsla,
+    /// Wash behind the link under the cursor; `None` disables the hover
+    /// highlight.
+    pub hover_link_bg: Option<Hsla>,
     /// Document body type size (paragraphs, list items, inline code,
     /// blockquotes; headings inherit it except the 1rem steps). Mounts
     /// override per instance; default is the chrome base size (1rem).
@@ -62,6 +65,9 @@ impl MdStyles {
             // light/dark themes.
             selection_bg: hsla(211.0 / 360.0, 0.85, 0.6, 0.4),
             link_color: theme.accent_foreground,
+            // A faint accent wash behind the hovered link, subtle on both
+            // light and dark backgrounds.
+            hover_link_bg: Some(hsla(theme.accent.h, theme.accent.s, theme.accent.l, 0.15)),
             body_size: rems(1.).into(),
         }
     }

@@ -41,8 +41,13 @@ pub struct UserTurnMeta {
     /// The agent that authored this user turn; `None` = human input and
     /// the bubble header shows the localized "You".
     pub author: Option<agent::MessageAuthor>,
-    /// Mirrors `MessageUiMetadata::peer`: team peer delivery, rebuilt as a
-    /// team bubble on reload.
+    /// The agent whose conversation renders this turn — the header's `to`.
+    /// A view-side fact stamped by the owning `ConversationState`, never
+    /// persisted: the same message shows its own recipient in the main
+    /// thread, in a member thread, and in a sub-agent panel.
+    pub recipient: Option<agent::MessageAuthor>,
+    /// Mirrors `MessageUiMetadata::peer`: the turn arrived as a peer delivery,
+    /// so its bubble carries the sender's attribution and a peer accent.
     pub peer: bool,
 }
 
@@ -65,11 +70,12 @@ impl UserTurnMeta {
             approval_mode,
             steered: false,
             author: None,
+            recipient: None,
             peer: false,
         }
     }
 
-    pub(crate) fn from_message(message: &Message) -> Self {
+    pub(crate) fn from_message(message: &Message, recipient: Option<agent::MessageAuthor>) -> Self {
         let ui = message.ui.as_ref();
         Self {
             timestamp: message.timestamp,
@@ -79,6 +85,7 @@ impl UserTurnMeta {
                 .map(PermissionMode::from_i64),
             steered: ui.and_then(|m| m.steered).unwrap_or(false),
             author: ui.and_then(|m| m.author.clone()),
+            recipient,
             peer: ui.map(|m| m.peer).unwrap_or(false),
         }
     }
@@ -161,15 +168,6 @@ pub enum ConvItem {
         detail: Option<String>,
         collapsed: bool,
         user_toggled: bool,
-    },
-    /// A peer message from a team member (or the leader) — `SendMessage` /
-    /// broadcast delivery routed through `ThreadEvent::PeerMessage`. The `from`
-    /// is a member name (data); `content` is the peer's own message body
-    /// (model-generated, left verbatim). Rendered as a distinct bubble so team
-    /// chatter reads apart from the user/assistant thread.
-    TeamMessage {
-        from: String,
-        content: String,
     },
     /// A plan review item rendered as a bordered card in the message list.
     /// Carries the finalized `<proposed_plan>` text so the user can read it
@@ -531,6 +529,10 @@ pub struct ConversationState {
     /// Dropped when the authoritative `rebuild_from_display` replaces this
     /// conversation (`HistoryRestored`).
     history_builder: Option<crate::views::message::ItemBuilder>,
+    /// The agent whose conversation this list renders — every user bubble's
+    /// header `to`. Fixed for the conversation's lifetime: the main thread's
+    /// is its own agent, a sub-agent panel's is the sub-agent definition.
+    recipient: agent::MessageAuthor,
 }
 
 /// Where a notice lands in the item list.
@@ -576,17 +578,6 @@ pub enum ApplyOutcome {
     RemeasureAndAppend { remeasure_ix: usize },
 }
 
-impl Default for ConversationState {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            next_item_id: 0,
-            turn_started_at: Instant::now(),
-            history_builder: None,
-        }
-    }
-}
-
 /// Workspace context threaded through `apply` / `rebuild_from_display`: the
 /// weak handle (for item toggle callbacks) plus the thread cwd snapshot (for
 /// the `TerminalPanel` prompt line). Bundled so the signatures stay under
@@ -600,8 +591,14 @@ pub struct ApplyCtx {
 }
 
 impl ConversationState {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(recipient: agent::MessageAuthor) -> Self {
+        Self {
+            items: Vec::new(),
+            next_item_id: 0,
+            turn_started_at: Instant::now(),
+            history_builder: None,
+            recipient,
+        }
     }
 
     pub fn items(&self) -> &[Entity<MessageItem>] {
@@ -644,6 +641,10 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
+        let mut meta = meta;
+        // The header's `to` is whoever owns this conversation, so it is stamped
+        // here rather than carried by every caller.
+        meta.recipient = Some(self.recipient.clone());
         let id = self.alloc_id();
         let role = meta.model_id.clone();
         self.items.push(cx.new(|_| {
@@ -674,6 +675,8 @@ impl ConversationState {
         weak: WeakEntity<Workspace>,
         cx: &mut App,
     ) {
+        let mut meta = meta;
+        meta.recipient = Some(self.recipient.clone());
         let id = self.alloc_id();
         let role = meta.model_id.clone();
         self.items.push(cx.new(|_| {
@@ -1605,12 +1608,26 @@ impl ConversationState {
                 ApplyOutcome::Appended
             }
             ThreadEvent::PeerMessage { from, content } => {
+                // A peer delivery is a user-role turn the human did not type:
+                // it renders in the same turn frame as every other user bubble,
+                // header reading `{sender} > {this agent}·…`.
                 let id = self.alloc_id();
+                let meta = UserTurnMeta {
+                    timestamp: chrono::Utc::now().timestamp(),
+                    model_id: String::new(),
+                    approval_mode: None,
+                    steered: false,
+                    author: Some(agent::MessageAuthor::from_routing(from)),
+                    recipient: Some(self.recipient.clone()),
+                    peer: true,
+                };
                 self.items.push(cx.new(|_| {
                     MessageItem::new(
-                        ConvItem::TeamMessage {
-                            from: from.clone(),
-                            content: content.clone(),
+                        ConvItem::User {
+                            text: content.clone(),
+                            images: Vec::new(),
+                            meta: Some(meta),
+                            display_state: UserMessageDisplayState::Normal,
                         },
                         role.to_string(),
                         id,
@@ -1776,6 +1793,9 @@ impl ConversationState {
                     ApplyOutcome::Appended
                 }
             }
+            // Title metadata rides the chrome (title bar / sidebar), not the
+            // transcript; no conversation item.
+            ThreadEvent::TitleChanged { .. } => ApplyOutcome::Unchanged,
         };
         if popped_retry {
             match outcome {
@@ -1869,12 +1889,13 @@ impl ConversationState {
         display: &[HistoryEntry],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
+        recipient: agent::MessageAuthor,
         running: bool,
         ctx: ApplyCtx,
         cx: &mut App,
     ) -> Self {
         let ApplyCtx { weak, cwd } = ctx;
-        let mut builder = ItemBuilder::new();
+        let mut builder = ItemBuilder::new(Some(recipient.clone()));
         let mut kinds: Vec<ConvItem> = Vec::new();
         let mut pending: Vec<Message> = Vec::new();
         let mut deferred: Vec<&UiNoteRecord> = Vec::new();
@@ -1937,6 +1958,7 @@ impl ConversationState {
             next_item_id,
             turn_started_at: Instant::now(),
             history_builder: None,
+            recipient,
         }
     }
 
@@ -1958,9 +1980,10 @@ impl ConversationState {
             return ApplyOutcome::Unchanged;
         }
         let ApplyCtx { weak, cwd } = ctx;
+        let builder_recipient = self.recipient.clone();
         let builder = self
             .history_builder
-            .get_or_insert_with(crate::views::message::ItemBuilder::new);
+            .get_or_insert_with(|| ItemBuilder::new(Some(builder_recipient.clone())));
         let mut kinds = Vec::new();
         builder.extend(messages, usage, &mut kinds);
         for kind in kinds {
@@ -2119,7 +2142,8 @@ mod tests {
     #[test]
     fn optimistic_steer_rolls_back_and_late_confirmation_heals_tombstone() {
         let cx = gpui::TestAppContext::single();
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let meta = UserTurnMeta::new(1, "test-model".into(), None);
 
         cx.update(|cx| {
@@ -2168,7 +2192,8 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -2228,7 +2253,8 @@ mod tests {
     #[gpui::test]
     fn history_progress_apply_is_unchanged(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx { weak, cwd: None };
         cx.update(|cx| {
@@ -2252,7 +2278,8 @@ mod tests {
     #[gpui::test]
     fn agent_text_needs_new_without_segment_is_plain_append(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -2283,7 +2310,8 @@ mod tests {
     #[gpui::test]
     fn popped_retry_then_append_remeasures_reused_tail_slot(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -2404,6 +2432,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
+                agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -2461,6 +2490,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
+                agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -2522,6 +2552,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
+                agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -2565,7 +2596,7 @@ mod tests {
                 content: "file contents here".to_string(),
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new(), false);
+        let items = build_items(&messages, &std::collections::HashMap::new(), false, None);
         let tool = find_thinking_entry(&items, "tu_1").expect("tool call entry present");
         assert_eq!(tool.output, "file contents here");
         assert_eq!(tool.status, ToolCallStatus::Success);
@@ -2587,7 +2618,7 @@ mod tests {
                 content: "boom".to_string(),
             }),
         ])];
-        let items = build_items(&messages, &std::collections::HashMap::new(), false);
+        let items = build_items(&messages, &std::collections::HashMap::new(), false, None);
         let tool = find_thinking_entry(&items, "tu_x").expect("standalone result entry present");
         assert_eq!(tool.output, "boom");
         assert_eq!(tool.status, ToolCallStatus::Error);
@@ -2639,7 +2670,7 @@ mod tests {
                 content: envelope,
             })]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new(), false);
+        let items = build_items(&messages, &std::collections::HashMap::new(), false, None);
         let task = items
             .iter()
             .find_map(|i| match i {
@@ -2695,7 +2726,7 @@ mod tests {
                 }),
             ]),
         ];
-        let items = build_items(&messages, &std::collections::HashMap::new(), false);
+        let items = build_items(&messages, &std::collections::HashMap::new(), false, None);
         // Exactly one Thinking container, holding both calls in order.
         let containers: Vec<_> = items
             .iter()
@@ -2730,14 +2761,14 @@ mod tests {
             Message::user("hello".to_string()),
             Message::assistant(vec![MessageContent::Text("draft reply".to_string())]),
         ];
-        let completed = build_items(&messages, &std::collections::HashMap::new(), false);
+        let completed = build_items(&messages, &std::collections::HashMap::new(), false, None);
         match completed.last().unwrap() {
             ConvItem::Assistant { streaming, .. } => {
                 assert!(!*streaming, "completed tail not streaming")
             }
             _ => panic!("trailing item is an assistant bubble"),
         }
-        let running = build_items(&messages, &std::collections::HashMap::new(), true);
+        let running = build_items(&messages, &std::collections::HashMap::new(), true, None);
         match running.last().unwrap() {
             ConvItem::Assistant { streaming, .. } => {
                 assert!(*streaming, "running tail is streaming")
@@ -3001,7 +3032,8 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) -> (gpui::Entity<ConversationState>, ApplyCtx) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3263,7 +3295,8 @@ mod tests {
     #[gpui::test]
     fn live_reasoning_round_opens_expanded(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3304,7 +3337,8 @@ mod tests {
     #[gpui::test]
     fn live_tool_entry_opens_expanded(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3346,7 +3380,8 @@ mod tests {
     #[gpui::test]
     fn tool_result_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3414,7 +3449,8 @@ mod tests {
     #[gpui::test]
     fn user_toggled_entry_skips_auto_collapse(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3481,7 +3517,8 @@ mod tests {
     #[gpui::test]
     fn reasoning_round_auto_collapses_after_tool_use_stop(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3545,7 +3582,8 @@ mod tests {
     #[gpui::test]
     fn terminal_stop_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3632,7 +3670,8 @@ mod tests {
     #[test]
     fn push_notice_turn_end_appends_with_unique_ids() {
         let cx = gpui::TestAppContext::single();
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3668,7 +3707,8 @@ mod tests {
     #[test]
     fn push_notice_after_anchor_inserts_mid_list() {
         let cx = gpui::TestAppContext::single();
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3717,7 +3757,8 @@ mod tests {
     #[test]
     fn push_notice_after_anchor_clamps_out_of_range() {
         let cx = gpui::TestAppContext::single();
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3735,7 +3776,8 @@ mod tests {
     fn notice_anchor_for_tool_resolves_containing_item() {
         let cx = gpui::TestAppContext::single();
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3805,7 +3847,8 @@ mod tests {
     fn notice_anchors_near_its_tool_call() {
         let cx = gpui::TestAppContext::single();
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3860,7 +3903,8 @@ mod tests {
     #[gpui::test]
     fn argless_tool_end_event_keeps_title_and_input(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let conversation = cx.update(|cx| cx.new(|_| ConversationState::new()));
+        let conversation =
+            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx { weak, cwd: None };
         cx.update(|cx| {

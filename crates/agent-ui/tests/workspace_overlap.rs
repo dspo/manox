@@ -116,6 +116,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
             &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
+            agent::MessageAuthor::Lead,
             true,
             agent_ui::conversation::ApplyCtx { weak, cwd: None },
             cx,
@@ -187,6 +188,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
             &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
+            agent::MessageAuthor::Lead,
             true,
             agent_ui::conversation::ApplyCtx {
                 weak: gpui::WeakEntity::<Workspace>::new_invalid(),

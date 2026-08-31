@@ -139,7 +139,6 @@ fn text_body_of(kind: &ConvItem) -> Option<(bool, String)> {
         ConvItem::Error(msg) => Some((false, msg.clone())),
         // `Notice` owns a paginated `TerminalPanel` body (`notice_panel`),
         // not a markdown document.
-        ConvItem::TeamMessage { content, .. } => Some((false, content.clone())),
         ConvItem::Recap { summary, .. } => Some((false, summary.clone())),
         ConvItem::Retry {
             detail: Some(detail),
@@ -158,7 +157,7 @@ fn text_body_of(kind: &ConvItem) -> Option<(bool, String)> {
 /// switches models.
 ///
 /// `markdown` holds the owned `Entity<Markdown>` for items with a text body
-/// (Assistant, User, Error, TeamMessage, Recap, Retry): a
+/// (Assistant, User, Error, Recap, Retry): a
 /// stateful document carrying parse-once incremental parsing + document-level
 /// selection, so a streaming delta re-parses only the tail and a cross-block
 /// drag selects one continuous range with Cmd/Ctrl+C copy. `None` for other
@@ -820,9 +819,6 @@ pub fn render_item(
         ConvItem::AgentTask(t) => render_agent_task(t, ix, theme, agent_ctx, tool_ctx, cx),
         ConvItem::Error(msg) => render_error(msg, ix, theme, body, cx),
         ConvItem::Notice(msg) => render_notice(msg, ix, theme, notice_panel, cx),
-        ConvItem::TeamMessage { from, content } => {
-            render_team_message(from, content, ix, theme, body, cx)
-        }
         ConvItem::PlanReview {
             title,
             plan_text,
@@ -887,13 +883,32 @@ fn copy_button_hoverable(
         .child(copy_button(ix, prefix, text))
 }
 
-/// Display name of the agent that authored a user-role message: the main
-/// agent uses the localized Captain label (shared with the context rail),
-/// named agents keep their manifest / member name verbatim.
+/// Display name of an agent in a turn header: the main agent uses the
+/// localized Captain label (shared with the context rail), the host harness
+/// keeps its own name, and named agents keep their manifest / member name
+/// verbatim.
 pub fn author_display(author: &agent::MessageAuthor) -> String {
     match author {
         agent::MessageAuthor::Lead => i18n::t("context-agents-captain").to_string(),
+        agent::MessageAuthor::Harness => i18n::t("message-harness-role").to_string(),
         agent::MessageAuthor::Agent(name) => name.clone(),
+    }
+}
+
+/// The user-turn header: `{from} > {to}·{model}·{time}`. `from` is the
+/// message's real author (human input is unattributed); `to` is the agent
+/// whose conversation renders the turn. Empty segments drop, and the `>`
+/// clause disappears when nothing follows `from`.
+fn user_turn_header(from: &str, to: &str, model: &str, time: &str) -> String {
+    let tail = [to, model, time]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("·");
+    if tail.is_empty() {
+        from.to_string()
+    } else {
+        format!("{from} > {tail}")
     }
 }
 
@@ -930,19 +945,24 @@ fn render_user(
         .and_then(|m| m.author.as_ref())
         .map(author_display)
         .unwrap_or_else(|| i18n::t("message-user-role").to_string());
-    let mut header_parts = vec![sender];
-    if let Some(meta) = meta {
-        header_parts.push(format_user_turn_time(meta.timestamp));
-    }
-    if !model_id.is_empty() {
-        header_parts.push(model_id.to_string());
-    }
-    let header = header_parts.join(" > ");
+    let recipient = meta
+        .and_then(|m| m.recipient.as_ref())
+        .map(author_display)
+        .unwrap_or_default();
+    let time = meta
+        .map(|m| format_user_turn_time(m.timestamp))
+        .unwrap_or_default();
+    let header = user_turn_header(&sender, &recipient, model_id, &time);
     let group = format!("user-{ix}");
-    let accent = meta
-        .and_then(|m| m.approval_mode)
-        .map(|mode| approval_mode_color(mode, theme))
-        .unwrap_or(theme.accent);
+    // An inbound peer delivery keeps the hue the team banner used, so agent
+    // chatter reads apart from the human's own turns.
+    let accent = if meta.is_some_and(|m| m.peer) {
+        theme.primary
+    } else {
+        meta.and_then(|m| m.approval_mode)
+            .map(|mode| approval_mode_color(mode, theme))
+            .unwrap_or(theme.accent)
+    };
 
     // A persistent "steered" marker for user messages that entered the list
     // via the steer-queue drain (mid-turn injection) rather than starting a
@@ -1251,34 +1271,6 @@ pub fn render_notice(
         notice_panel
             .map(|p| p.into_any_element())
             .unwrap_or_else(|| gpui::div().child(msg.to_string()).into_any_element()),
-        theme,
-        None,
-    )
-}
-
-/// A peer message from a teammate (or the leader) within a team. The `from`
-/// name leads the label in the accent color; `content` is the peer's own body,
-/// rendered as markdown. Accent-tinted to read apart from user / assistant
-/// turns without the danger tone of an error.
-pub fn render_team_message(
-    from: &str,
-    content: &str,
-    ix: usize,
-    theme: &Theme,
-    body: Option<Entity<Markdown>>,
-    cx: &mut App,
-) -> gpui::AnyElement {
-    // The whole label row is accent-colored, so `from` inherits primary here.
-    let label: SharedString = format!("{from} · {}", i18n::t("message-team")).into();
-    render_banner(
-        theme.primary,
-        label,
-        None,
-        format!("team-msg-{ix}"),
-        ix,
-        "copy-team-msg",
-        content.to_string(),
-        body_or_static(body, ("team-msg", ix), content.to_string(), theme, cx),
         theme,
         None,
     )
@@ -3223,11 +3215,18 @@ fn close_segment(items: &mut [ConvItem], seg_ix: Option<usize>) {
 pub struct ItemBuilder {
     last_user_id: Option<String>,
     active_segment_ix: Option<usize>,
+    /// The agent whose conversation the built items render in — every user
+    /// bubble's header `to`. `None` omits the segment (a bare rebuild with no
+    /// owning view).
+    recipient: Option<agent::MessageAuthor>,
 }
 
 impl ItemBuilder {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(recipient: Option<agent::MessageAuthor>) -> Self {
+        Self {
+            recipient,
+            ..Default::default()
+        }
     }
 
     /// Append items for `messages` to `items`. A trailing open activity
@@ -3304,24 +3303,16 @@ impl ItemBuilder {
                         })
                         .collect();
                     if !external_event && (!text.is_empty() || !images.is_empty()) {
-                        let meta = crate::conversation::UserTurnMeta::from_message(m);
-                        if meta.peer {
-                            // Peer deliveries render as team bubbles live;
-                            // rebuild the same item on reload so historical
-                            // views keep the sender, not a "You" bubble.
-                            let from = meta.author.as_ref().map(author_display).unwrap_or_default();
-                            items.push(ConvItem::TeamMessage {
-                                from,
-                                content: text,
-                            });
-                        } else {
-                            items.push(ConvItem::User {
-                                text,
-                                images,
-                                meta: Some(meta),
-                                display_state: crate::conversation::UserMessageDisplayState::Normal,
-                            });
-                        }
+                        let meta = crate::conversation::UserTurnMeta::from_message(
+                            m,
+                            self.recipient.clone(),
+                        );
+                        items.push(ConvItem::User {
+                            text,
+                            images,
+                            meta: Some(meta),
+                            display_state: crate::conversation::UserMessageDisplayState::Normal,
+                        });
                     }
                     for c in &m.content {
                         match c {
@@ -3539,8 +3530,9 @@ pub fn build_items(
     messages: &[Message],
     usage: &HashMap<String, TokenUsage>,
     trailing_streaming: bool,
+    recipient: Option<agent::MessageAuthor>,
 ) -> Vec<ConvItem> {
-    let mut builder = ItemBuilder::new();
+    let mut builder = ItemBuilder::new(recipient);
     let mut items = Vec::new();
     builder.extend(messages, usage, &mut items);
     builder.finish(&mut items, trailing_streaming);
@@ -3911,7 +3903,7 @@ mod tests {
             )]),
             Message::user_with_content(vec![tr("tu_3", "Bash", "Built.")]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let segments: Vec<&ThinkingContainer> = items
             .iter()
             .filter_map(|i| match i {
@@ -3963,7 +3955,7 @@ mod tests {
         let usage = HashMap::new();
 
         // One-shot build (the authoritative rebuild path).
-        let one_shot = build_items(&messages, &usage, false);
+        let one_shot = build_items(&messages, &usage, false, None);
 
         fn segment_entry_counts(items: &[ConvItem]) -> Vec<usize> {
             items
@@ -3978,7 +3970,7 @@ mod tests {
         // Every candidate split point must reproduce the one-shot build —
         // the carried turn/segment state makes the batch boundary invisible.
         for split in 1..messages.len() {
-            let mut builder = ItemBuilder::new();
+            let mut builder = ItemBuilder::new(None);
             let mut incremental: Vec<ConvItem> = Vec::new();
             builder.extend(&messages[..split], &usage, &mut incremental);
             builder.extend(&messages[split..], &usage, &mut incremental);
@@ -3996,7 +3988,7 @@ mod tests {
         }
 
         // A three-batch chain (per-message batches) must also match.
-        let mut builder = ItemBuilder::new();
+        let mut builder = ItemBuilder::new(None);
         let mut incremental: Vec<ConvItem> = Vec::new();
         for message in &messages {
             builder.extend(std::slice::from_ref(message), &usage, &mut incremental);
@@ -4027,7 +4019,7 @@ mod tests {
     #[test]
     fn item_builder_extend_survives_stale_segment_index_on_fresh_vec() {
         let usage = HashMap::new();
-        let mut builder = ItemBuilder::new();
+        let mut builder = ItemBuilder::new(None);
 
         // Batch 1 leaves an open activity segment (index into `first`).
         let mut first = Vec::new();
@@ -4086,7 +4078,7 @@ mod tests {
             // Second user prompt closes the first turn's segment.
             Message::user("next".to_string()),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let seg = items.iter().find_map(|i| match i {
             ConvItem::Thinking(t) => Some(t),
             _ => None,
@@ -4108,7 +4100,7 @@ mod tests {
             display_text: Some("/gitwork:deliver fast".to_string()),
             ..Default::default()
         });
-        let items = build_items(&[message], &HashMap::new(), false);
+        let items = build_items(&[message], &HashMap::new(), false, None);
         let texts: Vec<&String> = items
             .iter()
             .filter_map(|i| match i {
@@ -4122,7 +4114,7 @@ mod tests {
     #[test]
     fn build_items_user_bubble_keeps_plain_text_without_display_text() {
         let message = Message::user("plain turn".to_string());
-        let items = build_items(&[message], &HashMap::new(), false);
+        let items = build_items(&[message], &HashMap::new(), false, None);
         assert!(matches!(
             items.first(),
             Some(ConvItem::User { text, .. }) if text == "plain turn"
@@ -4155,7 +4147,7 @@ mod tests {
             )]),
             Message::user_with_content(vec![tr("tu_3", "Read", "b")]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let segments: Vec<&ThinkingContainer> = items
             .iter()
             .filter_map(|i| match i {
@@ -4198,7 +4190,7 @@ mod tests {
                 tr("tu_ask", "AskUserQuestion", "answered"),
             ]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         // The ordinary tool folds into a segment; the two special tools are
         // standalone top-level cards.
         let agent = items.iter().find_map(|i| match i {
@@ -4401,7 +4393,7 @@ mod tests {
                 content: "file contents".to_string(),
             })]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let containers: Vec<&ThinkingContainer> = items
             .iter()
             .filter_map(|i| match i {
@@ -4460,7 +4452,7 @@ mod tests {
                 MessageContent::Text("here is the answer".to_string()),
             ]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let containers: Vec<&ThinkingContainer> = items
             .iter()
             .filter_map(|i| match i {
@@ -4513,7 +4505,7 @@ mod tests {
                 },
             ]),
         ];
-        let items = build_items(&messages, &HashMap::new(), false);
+        let items = build_items(&messages, &HashMap::new(), false, None);
         let containers: Vec<&ThinkingContainer> = items
             .iter()
             .filter_map(|i| match i {
@@ -4549,6 +4541,7 @@ mod tests {
             &[Message::user("wait for CI".into()), external],
             &HashMap::new(),
             false,
+            None,
         );
         assert_eq!(
             items
@@ -4560,8 +4553,11 @@ mod tests {
         );
     }
 
+    /// A reloaded peer delivery is a user-role turn like any other: the same
+    /// bubble, carrying the sender as `from`, the owning agent as `to`, and the
+    /// unwrapped body the sender actually wrote.
     #[test]
-    fn build_items_rebuilds_peer_messages_as_team_bubbles() {
+    fn build_items_rebuilds_peer_deliveries_as_attributed_user_turns() {
         let mut peer = Message::user("[from alice]: report".into());
         peer.ui = Some(agent::MessageUiMetadata {
             author: Some(agent::MessageAuthor::Agent("alice".into())),
@@ -4569,15 +4565,45 @@ mod tests {
             display_text: Some("report".into()),
             ..Default::default()
         });
-        let items = build_items(&[peer], &HashMap::new(), false);
-        assert!(
-            matches!(
-                items.first(),
-                Some(ConvItem::TeamMessage { from, content }) if from == "alice" && content == "report"
-            ),
-            "a reloaded peer delivery keeps its sender, got: {:?}",
-            items.first()
+        let items = build_items(
+            &[peer],
+            &HashMap::new(),
+            false,
+            Some(agent::MessageAuthor::Lead),
         );
+        let Some(ConvItem::User { text, meta, .. }) = items.first() else {
+            panic!(
+                "a peer delivery renders as a user turn, got {:?}",
+                items.first()
+            );
+        };
+        let meta = meta.as_ref().expect("a peer turn carries its chrome");
+        assert_eq!(
+            text, "report",
+            "the wrapped model-facing form stays out of view"
+        );
+        assert_eq!(
+            meta.author,
+            Some(agent::MessageAuthor::Agent("alice".into())),
+            "the sender is the header's `from`"
+        );
+        assert_eq!(meta.recipient, Some(agent::MessageAuthor::Lead));
+        assert!(meta.peer, "the inbound-peer marker survives the reload");
+    }
+
+    /// The header's segment order and joiners: `{from} > {to}·{model}·{time}`,
+    /// with empty segments dropped and no `>` clause when nothing follows.
+    #[test]
+    fn user_turn_header_orders_from_then_recipient_model_time() {
+        assert_eq!(
+            user_turn_header("你", "船长", "glm-5.2", "17:55"),
+            "你 > 船长·glm-5.2·17:55"
+        );
+        assert_eq!(
+            user_turn_header("You", "Sailor", "", "17:55"),
+            "You > Sailor·17:55"
+        );
+        assert_eq!(user_turn_header("You", "", "", ""), "You");
     }
 
     #[test]
@@ -4587,7 +4613,7 @@ mod tests {
             author: Some(agent::MessageAuthor::Lead),
             ..Default::default()
         });
-        let items = build_items(&[seed], &HashMap::new(), false);
+        let items = build_items(&[seed], &HashMap::new(), false, None);
         let Some(ConvItem::User { meta, .. }) = items.first() else {
             panic!("agent-authored seed stays a user bubble");
         };
@@ -4626,12 +4652,6 @@ mod tests {
         // document — `text_body_of` reports `None` for it.
         let notice = ConvItem::Notice("n".into());
         assert_eq!(text_body_of(&notice), None);
-
-        let team = ConvItem::TeamMessage {
-            from: "alice".into(),
-            content: "peer body".into(),
-        };
-        assert_eq!(text_body_of(&team), Some((false, "peer body".into())));
 
         let recap = ConvItem::Recap {
             summary: "sum".into(),

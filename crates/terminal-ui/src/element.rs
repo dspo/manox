@@ -29,6 +29,7 @@ use terminal::alacritty_terminal::selection::SelectionRange;
 use terminal::alacritty_terminal::vte::ansi::CursorShape;
 use terminal::{Cell, Flags, HoverTarget};
 
+use crate::block_chars::{BlockRect, COLS, SUBROWS};
 use crate::grid_renderer::{BackgroundRegion, BatchedTextRun, GridPlan, layout_grid};
 use crate::layout_cache::{LineShapeCache, line_fingerprint};
 use crate::terminal_view::{TerminalInputHandler, TerminalView};
@@ -78,6 +79,8 @@ pub struct PrepaintState {
     search_rects: Vec<(Bounds<Pixels>, bool)>,
     /// Pre-shaped text runs with their paint origin.
     shaped_runs: Vec<(Point<Pixels>, ShapedLine)>,
+    /// Block-character cells as sub-grid rects.
+    block_rects: Vec<BlockRect>,
     /// Cursor block, plus a pre-shaped preedit line when IME marked text is
     /// active. `None` when the terminal reports no cursor.
     cursor: Option<CursorPrepaint>,
@@ -91,6 +94,7 @@ pub struct PrepaintState {
 struct TermSnapshot {
     background: Vec<BackgroundRegion>,
     runs: Vec<BatchedTextRun>,
+    block_rects: Vec<BlockRect>,
     /// Content fingerprint per display line; keys the shaped-line cache.
     line_fps: HashMap<i32, u64>,
     /// Cursor position in display coordinates (line, column).
@@ -354,13 +358,19 @@ impl Element for TerminalElement {
                     );
                     s = e;
                 }
-                let GridPlan { background, runs } = layout_grid(
+                let GridPlan {
+                    background,
+                    runs,
+                    block_rects,
+                } = layout_grid(
                     cells.iter().map(|(d, _g, c, cell)| (*d, *c, *cell)),
                     &self.theme,
+                    t.block_char_render(),
                 );
                 TermSnapshot {
                     background,
                     runs,
+                    block_rects,
                     line_fps,
                     cursor_grid: (cursor_pt.line.0 + offset, cursor_pt.column.0 as i32),
                     cursor_shape,
@@ -524,6 +534,7 @@ impl Element for TerminalElement {
             selection_rects,
             search_rects,
             shaped_runs,
+            block_rects: snapshot.block_rects,
             cursor: Some(cursor),
             scrollbar_track,
             scrollbar_thumb,
@@ -574,15 +585,29 @@ impl Element for TerminalElement {
         }
 
         // Hover target underline (OSC 8 link / URL / path), at the span's
-        // bottom edge.
+        // bottom edge, in the theme's link-hover color.
         if let Some(hover) = &self.hover {
             let x = origin.x + hover.start_col as f32 * cell_w;
             let y = origin.y + (hover.row + 1) as f32 * lh - px(2.);
             let w = (hover.end_col - hover.start_col + 1) as f32 * cell_w;
             window.paint_quad(fill(
                 Bounds::new(point(x, y), size(w, px(2.))),
-                rgba(0x3366ffcc),
+                self.theme.link_hover,
             ));
+        }
+
+        // Block-character sub-grid rects, converted from grid coords to
+        // pixels. Painted before the text runs — block cells never shape.
+        for block in &prepaint.block_rects {
+            let bx = origin.x + block.col as f32 * cell_w;
+            let by = origin.y + block.line as f32 * lh;
+            for r in &block.rects {
+                let x = bx + r.x0 as f32 * cell_w / COLS as f32;
+                let y = by + r.y0 as f32 * lh / SUBROWS as f32;
+                let w = (r.x1 - r.x0) as f32 * cell_w / COLS as f32;
+                let h = (r.y1 - r.y0) as f32 * lh / SUBROWS as f32;
+                window.paint_quad(fill(Bounds::new(point(x, y), size(w, h)), r.color));
+            }
         }
 
         // Pre-shaped text runs — paint only, no shaping or allocation here.

@@ -883,7 +883,10 @@ fn build_tools(
             "main",
         )),
         Arc::new(crate::file_lock::FileLockedTool::new(
-            Arc::new(pi::tools::edit::EditTool),
+            Arc::new(
+                pi::tools::edit::EditTool::default()
+                    .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
+            ),
             "main",
         )),
         Arc::new(pi::tools::grep::GrepTool),
@@ -1179,6 +1182,27 @@ fn build_tools(
         let subagent_background = subagent_background.clone();
         let subagent_description = subagent_description.clone();
         move |model: &PiModel| {
+            // Dedicated per-type models from the cx providers config's
+            // `subagents:` map; an unreadable config warns and leaves
+            // subagents inheriting the thread model.
+            let overrides = pi_extensions::provider::load_subagent_models(
+                pi_extensions::provider::default_config_path(),
+            )
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "subagent model config unreadable; subagents inherit the thread model"
+                );
+                HashMap::new()
+            });
+            for key in overrides.keys() {
+                if registry.get(key).is_none() {
+                    tracing::warn!(
+                        subagent_type = %key,
+                        "subagent model config names an unknown subagent type"
+                    );
+                }
+            }
             let subagent = SubagentTool::new(
                 registry.clone(),
                 vec![
@@ -1208,7 +1232,11 @@ fn build_tools(
                         "sailor",
                     )),
                     Arc::new(crate::file_lock::FileLockedTool::new(
-                        Arc::new(pi::tools::edit::EditTool),
+                        Arc::new(
+                            pi::tools::edit::EditTool::default().with_enforce_seen_lines(
+                                crate::settings::edit().enforce_seen_lines,
+                            ),
+                        ),
                         "sailor",
                     )),
                 ],
@@ -1221,6 +1249,8 @@ fn build_tools(
             // Resolve agent-definition `model` overrides against the live
             // registry (registration has landed before session assembly).
             .with_provider_registry(provider_registry.clone())
+            // Resolve dedicated per-type model specs from the config map.
+            .with_model_overrides(overrides)
             // Subagent transcripts persist under the host session root (a
             // subdirectory the sidebar's non-recursive listing never
             // surfaces) so their usage stays accountable.
@@ -1438,15 +1468,17 @@ where
                 }
                 Some(SessionCmd::Shutdown) => *shutdown_after_run = true,
                 Some(SessionCmd::SetModel(new_model)) => {
-                    // Mid-run switch: the harness handle applies it to the
-                    // next provider request immediately and persists a
-                    // model_change entry at the turn boundary (the kernel's
-                    // TS mid-run setModel path). Mirror the shared slot and
-                    // the actor's working model so settlement (title,
-                    // session rebuilds) sees it too.
-                    handle.set_model(new_model.clone());
-                    *state.model.lock().unwrap() = Some(new_model.clone());
-                    *pi_model = new_model;
+                    // Mid-run switch: the harness handle queues it for the
+                    // next turn boundary (the kernel's TS mid-run `setModel`
+                    // path), where the model_change entry persists. The
+                    // mirrors follow the handle's verdict, not the request: a
+                    // model the fixed stream refuses leaves every mirror on
+                    // the model the run still serves, and the model already in
+                    // play is never re-queued.
+                    if *pi_model != new_model && handle.set_model(new_model.clone()) {
+                        *state.model.lock().unwrap() = Some(new_model.clone());
+                        *pi_model = new_model;
+                    }
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {
                     // Mid-run switch: the queued mutation lands at the next
@@ -1468,10 +1500,15 @@ where
                     session_path: target,
                     title,
                 }) if target == session_path => {
-                    if let Err(error) = persist_title(sessions_dir, &target, title).await {
+                    if let Err(error) = persist_title(sessions_dir, &target, title.clone()).await {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
                         let _ = notice_tx.send(BackendNotice::SessionListDirty);
+                        // The facade mirrors the persisted title so the
+                        // title bar tracks the sidebar without a reload.
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::TitleChanged { title },
+                        )));
                     }
                 }
                 Some(SessionCmd::AppendUiNote(record)) => {
@@ -2277,6 +2314,10 @@ async fn run_actor(
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
+    let restored_title = pi_extensions::session_meta::load(&sessions_dir, session.path())
+        .await
+        .ok()
+        .and_then(|meta| meta.title);
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
     // facade's Ready handler reads `history()` immediately, and a drainer
@@ -2305,6 +2346,7 @@ async fn run_actor(
         plan_file: plan_file_restored,
         plan_review_pending,
         plan_snapshot,
+        title: restored_title,
     })));
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -2519,13 +2561,22 @@ async fn run_actor(
                 // registry, so a cross-provider switch reaches the right
                 // endpoint + credential (the old bridge captured the
                 // initial model's credential for every later model).
-                if let Err(err) = session.set_model(new_model.clone()).await {
-                    tracing::warn!("pi set_model failed: {err}");
+                //
+                // Every mirror follows the harness, never the request: a
+                // refused switch (credential preflight, non-idle phase)
+                // leaves the actor on the model the session still runs, and
+                // the model already in play never appends a second
+                // `model_change` entry.
+                if pi_model != new_model {
+                    if let Err(err) = session.set_model(new_model.clone()).await {
+                        tracing::warn!("pi set_model failed: {err}");
+                    } else {
+                        // Keep the actor's working model in sync: Open/NewSession
+                        // below build sessions with it.
+                        pi_model = new_model.clone();
+                        *state.model.lock().unwrap() = Some(new_model);
+                    }
                 }
-                // Keep the actor's working model in sync: Open/NewSession
-                // below build sessions with it.
-                pi_model = new_model.clone();
-                *state.model.lock().unwrap() = Some(new_model);
             }
             SessionCmd::SetPermissionMode(mode) => {
                 state.gate.set_mode(mode);
@@ -2609,10 +2660,15 @@ async fn run_actor(
                 title,
             } => {
                 if session.path() == &session_path {
-                    if let Err(error) = persist_title(&sessions_dir, &session_path, title).await {
+                    if let Err(error) =
+                        persist_title(&sessions_dir, &session_path, title.clone()).await
+                    {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
                         let _ = notice_tx.send(BackendNotice::SessionListDirty);
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::TitleChanged { title },
+                        )));
                     }
                 }
             }
@@ -4870,6 +4926,11 @@ mod tests {
             cmd_tx
                 .send(SessionCmd::SetModel(new_model.clone()))
                 .unwrap();
+            // A re-pick of the model already in play changes nothing: the
+            // second command must not append another entry.
+            cmd_tx
+                .send(SessionCmd::SetModel(new_model.clone()))
+                .unwrap();
             for _ in 0..10_000 {
                 if state.model.lock().unwrap().as_ref().map(|m| m.id.as_str()) == Some("new") {
                     break;
@@ -4905,12 +4966,14 @@ mod tests {
             "switched-turn usage must enter the per-model stats: {:?}",
             stats.per_model
         );
-        // The switch persisted as a model_change entry, so a reload
+        // The switch persisted as exactly one model_change entry, so a reload
         // attributes the same history the same way.
         let jsonl = tokio::fs::read_to_string(session.path()).await.unwrap();
-        assert!(
-            jsonl.contains("\"type\":\"model_change\"") && jsonl.contains("\"modelId\":\"new\""),
-            "the mid-run switch must persist a model_change entry for the new model"
+        assert_eq!(
+            jsonl.matches("\"modelId\":\"new\"").count(),
+            1,
+            "the mid-run switch must persist one model_change entry for the new model, even \
+             when the same model is picked twice: {jsonl}"
         );
     }
 

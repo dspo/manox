@@ -18,6 +18,8 @@ pub struct TerminalTheme {
     pub cursor: Hsla,
     /// ANSI colors 0..16 (Black, Red, …, BrightWhite).
     pub ansi: [Hsla; 16],
+    /// Underline color for the hovered link/URL/path span.
+    pub link_hover: Hsla,
 }
 
 impl Default for TerminalTheme {
@@ -44,15 +46,21 @@ impl Default for TerminalTheme {
                 hsla(0.50, 0.75, 0.55, 1.0), // BrightCyan
                 hsla(0.0, 0.0, 0.97, 1.0),   // BrightWhite
             ],
+            // The historical hover underline blue, kept for standalone themes.
+            link_hover: hsla(0.625, 0.80, 0.60, 0.80),
         }
     }
 }
-
 impl TerminalTheme {
     /// Build a terminal palette whose bg/fg/cursor track the app theme.
     pub fn from_app_theme(theme: &Theme) -> Self {
         let bg = theme.background;
         let fg = theme.foreground;
+        // The link underline follows the theme accent, faded to 80% opacity.
+        let link_hover = Hsla {
+            a: 0.80,
+            ..theme.accent
+        };
         if theme.is_dark() {
             Self {
                 default_fg: fg,
@@ -76,6 +84,7 @@ impl TerminalTheme {
                     hsla(0.50, 0.75, 0.55, 1.0), // BrightCyan
                     hsla(0.0, 0.0, 0.97, 1.0),   // BrightWhite
                 ],
+                link_hover,
             }
         } else {
             Self {
@@ -100,6 +109,7 @@ impl TerminalTheme {
                     hsla(0.50, 0.75, 0.45, 1.0), // BrightCyan
                     fg,                          // BrightWhite → theme fg
                 ],
+                link_hover,
             }
         }
     }
@@ -112,6 +122,8 @@ impl TerminalTheme {
             default_bg: rgb_to_hsla(&file.background),
             cursor: rgb_to_hsla(&file.foreground),
             ansi: std::array::from_fn(|i| rgb_to_hsla(&file.palette[i])),
+            // Standalone theme files carry no accent; reuse the default blue.
+            link_hover: hsla(0.625, 0.80, 0.60, 0.80),
         }
     }
 }

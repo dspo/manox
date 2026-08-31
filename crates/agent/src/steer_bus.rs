@@ -419,6 +419,17 @@ impl AgentBus {
             )
             .await?;
         let handle = session.handle();
+        // The child's resolved model rides the same observation channel as its
+        // transcript, so the sub-agent panel's turn header names the model that
+        // actually runs the work (never the parent's label).
+        let _ = self
+            .notice_tx
+            .send(BackendNotice::Event(Box::new(ThreadEvent::SubagentChild {
+                id: addr.clone(),
+                child: crate::thread::SubagentChildEvent::Model(crate::pi_providers::display_name(
+                    session.model(),
+                )),
+            })));
 
         // Register background task for the sidebar card.
         let task_cancel = CancellationToken::new();

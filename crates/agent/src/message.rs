@@ -29,29 +29,47 @@ pub enum MessageAuthor {
     /// The session's main agent (Captain).
     #[default]
     Lead,
+    /// The host harness itself: a turn it injected on the user's behalf
+    /// (the plan-execution seed).
+    Harness,
     /// A named agent: team member name or agent-manifest name.
     Agent(String),
 }
 
 impl MessageAuthor {
-    /// Routing identity: `"lead"` for the main agent, the manifest /
-    /// member name otherwise. The session sidecar persists this string.
+    /// Routing identity: `"lead"` for the main agent, `"harness"` for the
+    /// host, the manifest / member name otherwise. The session sidecar
+    /// persists this string.
     pub fn routing(&self) -> &str {
         match self {
             MessageAuthor::Lead => crate::team::LEADER_NAME,
+            MessageAuthor::Harness => HARNESS_NAME,
             MessageAuthor::Agent(name) => name,
         }
     }
 
-    /// Inverse of [`MessageAuthor::routing`].
+    /// Inverse of [`MessageAuthor::routing`]. `"captain"` — the Steer bus's
+    /// name for any thread's root agent — is a lead alias, so bus-authored
+    /// deliveries and peer injections display identically whether the
+    /// attribution came from memory or from the sidecar round trip.
     pub fn from_routing(name: &str) -> Self {
-        if name == crate::team::LEADER_NAME {
+        if name == crate::team::LEADER_NAME || name == BUS_CAPTAIN_NAME {
             MessageAuthor::Lead
+        } else if name == HARNESS_NAME {
+            MessageAuthor::Harness
         } else {
             MessageAuthor::Agent(name.to_string())
         }
     }
 }
+
+/// Routing identity of the host harness (see [`MessageAuthor::Harness`]).
+pub const HARNESS_NAME: &str = "harness";
+
+/// The Steer bus's display name for a thread's root agent. Not a routing
+/// identity the host persists — it arrives on inbound bus deliveries and is
+/// folded into [`MessageAuthor::Lead`] by [`MessageAuthor::from_routing`].
+pub const BUS_CAPTAIN_NAME: &str = "captain";
 
 /// UI-only metadata captured when a user message is submitted.
 ///
@@ -234,6 +252,15 @@ mod tests {
         assert_eq!(back.author, Some(MessageAuthor::Agent("Sailor".into())));
         assert!(back.peer);
 
+        let harness = MessageUiMetadata {
+            author: Some(MessageAuthor::Harness),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&harness).unwrap();
+        assert_eq!(value["author"], "harness");
+        let back: MessageUiMetadata = serde_json::from_value(value).unwrap();
+        assert_eq!(back.author, Some(MessageAuthor::Harness));
+
         // Human turns carry no attribution in the persisted form.
         let plain = MessageUiMetadata::default();
         let value = serde_json::to_value(&plain).unwrap();
@@ -243,8 +270,18 @@ mod tests {
     #[test]
     fn author_routing_round_trips_through_lead_sentinel() {
         assert_eq!(MessageAuthor::Lead.routing(), "lead");
+        assert_eq!(MessageAuthor::Harness.routing(), "harness");
         assert_eq!(MessageAuthor::Agent("Sailor".into()).routing(), "Sailor");
         assert_eq!(MessageAuthor::from_routing("lead"), MessageAuthor::Lead);
+        assert_eq!(
+            MessageAuthor::from_routing("captain"),
+            MessageAuthor::Lead,
+            "the bus's root-agent alias folds into the lead identity"
+        );
+        assert_eq!(
+            MessageAuthor::from_routing("harness"),
+            MessageAuthor::Harness
+        );
         assert_eq!(
             MessageAuthor::from_routing("Sailor"),
             MessageAuthor::Agent("Sailor".into())

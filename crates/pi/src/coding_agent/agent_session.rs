@@ -493,7 +493,33 @@ impl AgentSession {
     /// clamped against the current model and persisted only when it changes
     /// (TS `setThinkingLevel`).
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
-        let desired = Some(level.unwrap_or_else(|| "off".into()));
+        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), true)
+            .await
+    }
+
+    /// Apply a reasoning tier to this session only — the same clamp and
+    /// `thinking_level_change` entry as [`Self::set_thinking_level`], minus
+    /// the write to the agent's global settings default. A subagent session
+    /// applying its pinned effort must not touch the shared
+    /// `~/.pi/agent/settings.json`.
+    pub async fn set_thinking_level_local(
+        &mut self,
+        level: Option<String>,
+    ) -> Result<(), anyhow::Error> {
+        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), false)
+            .await
+    }
+
+    /// Shared reasoning-tier application: clamp the desired level against
+    /// the model's capability, append a `thinking_level_change` entry when
+    /// it changes, and apply it in memory. `persist` additionally writes the
+    /// effective level to the agent's global settings default (the
+    /// persisting setter's contract); the session-local path skips that.
+    async fn apply_thinking(
+        &mut self,
+        desired: Option<String>,
+        persist: bool,
+    ) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
         let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
@@ -504,7 +530,7 @@ impl AgentSession {
                 .session()
                 .append_thinking_level_change(&wire)
                 .await?;
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+            if persist && (model.thinking != crate::types::ThinkingKind::None || wire != "off") {
                 self.settings_thinking_default = Some(wire.clone());
                 let default = wire.clone();
                 // Best-effort preference for future sessions; the entry has
@@ -1169,7 +1195,7 @@ impl AgentSessionBuilder {
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
                 Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
                     as Arc<dyn AgentTool>,
-                Arc::new(EditTool) as Arc<dyn AgentTool>,
+                Arc::new(EditTool::default()) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
                 Arc::new(GlobTool) as Arc<dyn AgentTool>,
@@ -3674,5 +3700,62 @@ mod tests {
         let messages = session.prompt("never runs").await.unwrap();
         assert!(messages.is_empty(), "handled input runs no turn");
         assert!(!*later_ran.lock().unwrap(), "handled stops the chain");
+    }
+
+    fn test_thinking_model() -> Model {
+        Model {
+            thinking: crate::types::ThinkingKind::Enabled,
+            ..test_model()
+        }
+    }
+
+    /// The local setter clamps like the persisting one but never writes the
+    /// agent's global settings: a pinned subagent effort must not leak into
+    /// `~/.pi/agent/settings.json`.
+    #[tokio::test]
+    async fn set_thinking_level_local_applies_without_global_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_thinking_model())
+            .build()
+            .await
+            .unwrap();
+        session
+            .set_thinking_level_local(Some("max".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.thinking_level().as_deref(), Some("max"));
+        assert!(
+            !dir.path().join("agent/settings.json").exists(),
+            "the local setter must not write the agent's global settings"
+        );
+    }
+
+    /// A non-thinking model clamps any pinned effort to off, so the session
+    /// level stays unset.
+    #[tokio::test]
+    async fn set_thinking_level_local_clamps_non_thinking_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_model_runtime(fake_runtime())
+            .with_model(test_model())
+            .build()
+            .await
+            .unwrap();
+        session
+            .set_thinking_level_local(Some("high".into()))
+            .await
+            .unwrap();
+        assert_eq!(session.thinking_level(), None);
     }
 }

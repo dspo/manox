@@ -210,9 +210,6 @@ pub fn handle_command(state: &mut ActorState, sink: &EventSink, cmd: &Value) -> 
                 state.focused.clone(),
                 sink.clone(),
             );
-            if let Some(model) = agent::pi_providers::default_model() {
-                thread.with_mut(|t| t.set_model(model));
-            }
             let persisted_mode = thread.read(|t| t.permission_mode());
             state.sessions.insert(
                 id.clone(),
@@ -681,10 +678,12 @@ pub fn handle_command(state: &mut ActorState, sink: &EventSink, cmd: &Value) -> 
                 agent::collaboration_mode::plan_compact_instructions(lang, &pending.plan_file)
             });
             session.thread.with_mut(|t| {
+                // The execution seed is harness-authored, not the session's own
+                // agent speaking: the turn header says so.
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),
                     approval_mode: Some(t.permission_mode().as_i64()),
-                    author: Some(t.self_author()),
+                    author: Some(agent::MessageAuthor::Harness),
                     ..Default::default()
                 };
                 t.approve_plan(compact, compact_instructions, seed_text, Some(ui));
@@ -714,7 +713,7 @@ pub fn handle_command(state: &mut ActorState, sink: &EventSink, cmd: &Value) -> 
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),
                     approval_mode: Some(t.permission_mode().as_i64()),
-                    author: Some(t.self_author()),
+                    author: Some(agent::MessageAuthor::Harness),
                     ..Default::default()
                 };
                 t.seed_plan_execution(plan_file, seed_text, Some(ui));

@@ -176,6 +176,12 @@ pub struct CxConfig {
     /// 入口）与 CLI 启动路径共同消费；未配置时为 `None`，序列化时省略。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vscode_app: Option<VsCodeAppSettings>,
+    /// Dedicated per-subagent models (top-level `subagents:` map,
+    /// `subagent_type: "provider::model::effort"`). Consumed by the host's
+    /// subagent dispatch (`pi_extensions::provider`), never by cx itself;
+    /// modeled here so every cx-side config save round-trips it losslessly.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subagents: BTreeMap<String, String>,
 }
 
 /// ChatGPT.app 注入设置（`cx.providers.config.yaml` 顶层 `chatgpt_app:` 段）。
@@ -1682,6 +1688,12 @@ providers:
             }],
             chatgpt_app: None,
             vscode_app: None,
+            subagents: [(
+                "Explore".to_string(),
+                "百炼::qwen3.8-flash::high".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         };
 
         write_config_file(&path, &config).unwrap();
@@ -1695,6 +1707,7 @@ providers:
         assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
 
         let read_back = read_config_file(&path).unwrap();
+        assert_eq!(read_back.subagents, config.subagents);
         assert_eq!(read_back.providers.len(), 1);
         let provider = &read_back.providers[0];
         assert_eq!(provider.name, "Test");
@@ -1739,6 +1752,7 @@ providers:
                 model_injection: ModelInjection::Single,
             }),
             vscode_app: None,
+            subagents: Default::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("chatgpt_app:"));
@@ -1782,6 +1796,7 @@ providers:
                     disabled: true,
                 },
             }),
+            subagents: Default::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("vscode_app:"));
@@ -2213,5 +2228,29 @@ endpoints: {}
         assert_eq!(m1.wire_apis, vec!["anthropic".to_string()]);
         assert_eq!(m1.context, Some(200_000));
         assert_eq!(m1.supports_tools, Some(false));
+    }
+
+    /// Regression: a config save round-trips the host-owned top-level
+    /// `subagents:` map — cx must never silently drop it.
+    #[test]
+    fn subagents_map_round_trips() {
+        let yaml = r#"
+providers: []
+agents: []
+subagents:
+  Explore: 百炼::qwen3.8-flash::high
+  Sailor: DeepSeek::deepseek-v4-flash::high
+"#;
+        let config: CxConfig = serde_yaml::from_str(yaml).expect("parse");
+        assert_eq!(config.subagents.len(), 2);
+        let written = serde_yaml::to_string(&config).unwrap();
+        let read_back: CxConfig = serde_yaml::from_str(&written).expect("reparse");
+        assert_eq!(read_back.subagents, config.subagents);
+    }
+
+    #[test]
+    fn subagents_map_omitted_when_empty() {
+        let yaml = serde_yaml::to_string(&CxConfig::default()).unwrap();
+        assert!(!yaml.contains("subagents"));
     }
 }

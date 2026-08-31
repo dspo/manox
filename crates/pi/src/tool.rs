@@ -464,6 +464,35 @@ async fn execute_one(
         }
     };
 
+    // A malformed stream can deliver a call whose arguments never parsed
+    // into an object (null, a bare string). Fail it explicitly rather than
+    // depend on every tool schema declaring `type: object`.
+    if !args.is_object() {
+        let result = AgentToolResult::error(format!(
+            "Invalid arguments: arguments must be a JSON object, got {}",
+            match args {
+                serde_json::Value::Null => "null".to_string(),
+                v => v.to_string(),
+            }
+        ));
+        let result_message = make_tool_result_message(&id, &name, &result);
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.clone(),
+            tool_name: name.clone(),
+            result: result.clone(),
+            is_error: result.is_error,
+        })
+        .await?;
+        return Ok(ExecutedToolCall {
+            tool_call_id: id,
+            tool_name: name,
+            result_message,
+            result,
+            blocked: false,
+            block_reason: None,
+        });
+    }
+
     // Validate arguments against the tool's JSON Schema.
     if let Err(e) = validate_tool_args(tool.parameters_schema(), args.clone()) {
         let result = AgentToolResult::error(format!("Invalid arguments: {e}"));

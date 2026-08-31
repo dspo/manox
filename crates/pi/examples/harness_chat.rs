@@ -70,7 +70,7 @@ fn default_tools() -> Arc<[Arc<dyn AgentTool>]> {
     Arc::from(vec![
         Arc::new(ReadTool) as Arc<dyn AgentTool>,
         Arc::new(WriteTool),
-        Arc::new(EditTool),
+        Arc::new(EditTool::default()),
         Arc::new(BashTool::new(None)),
         Arc::new(GrepTool),
         Arc::new(GlobTool),

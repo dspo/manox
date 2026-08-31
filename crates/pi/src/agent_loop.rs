@@ -257,6 +257,13 @@ async fn run_loop_inner(
                 stop_reason,
                 Some(StopReason::Error) | Some(StopReason::Aborted)
             ) {
+                // The terminating message may still carry tool calls the
+                // stream built before dying — they never dispatch, so give
+                // each one an explicit not-executed result instead of a
+                // permanent dangling call in the transcript.
+                let terminated_results = fail_tool_calls_from_terminated(&message, sink).await?;
+                context.messages.extend(terminated_results.clone());
+                new_messages.extend(terminated_results);
                 sink.emit(AgentEvent::TurnEnd {
                     message: Box::new(message),
                     tool_results: Vec::new(),
@@ -672,6 +679,66 @@ async fn fail_tool_calls_from_truncated(
     }
 
     Ok((executed, messages))
+}
+
+/// Fail all tool calls carried by a terminal Error/Aborted assistant message.
+///
+/// A stream that dies mid-tool-call still persists the assistant message —
+/// `terminal_message_from_partial` preserves whatever content already
+/// streamed, including half-built `ToolUse` blocks whose arguments may be
+/// null. Without this sweep those calls hang forever: dispatch never
+/// happens, so no result ever lands, and the transcript ends on a call the
+/// model believes is running. Every dangling call gets an explicit
+/// not-executed result so the next turn can re-issue it.
+async fn fail_tool_calls_from_terminated(
+    message: &AgentMessage,
+    sink: &(dyn EventSink + Send + Sync),
+) -> Result<Vec<AgentMessage>, anyhow::Error> {
+    let tool_calls: Vec<(&str, &str, serde_json::Value)> = match message {
+        AgentMessage::Assistant { content, .. } => content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolUse {
+                    id, name, input, ..
+                } => Some((id.as_str(), name.as_str(), input.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for (id, name, _args) in tool_calls {
+        sink.emit(AgentEvent::ToolExecutionStart {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            arguments: serde_json::Value::Null,
+        })
+        .await?;
+        let result = AgentToolResult::error(format!(
+            "Tool call \"{name}\" was not executed: the turn ended (stream error or abort) \
+             before this call ran, so its arguments may be incomplete. Re-issue the tool call \
+             with complete arguments."
+        ));
+        let result_message = AgentMessage::ToolResult {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            content: result.content.clone(),
+            is_error: true,
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            timestamp: chrono::Utc::now(),
+        };
+        sink.emit(AgentEvent::ToolExecutionEnd {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            result,
+            is_error: true,
+        })
+        .await?;
+        messages.push(result_message);
+    }
+    Ok(messages)
 }
 
 #[cfg(test)]
@@ -2251,6 +2318,93 @@ mod tests {
                 .await;
             Err(anyhow::anyhow!("connection reset"))
         }
+    }
+
+    /// A stream that dies after emitting a partial assistant carrying a
+    /// half-built tool call (arguments never parsed — null), as a provider
+    /// drop does mid-tool-call.
+    struct PartialToolCallThenFailStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for PartialToolCallThenFailStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let message = AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_dead".into(),
+                    name: "Edit".into(),
+                    input: serde_json::Value::Null,
+                    thought_signature: None,
+                }],
+                model: "mock".into(),
+                provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: Some("resp_2".into()),
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: None,
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            Err(anyhow::anyhow!("connection reset"))
+        }
+    }
+
+    /// A tool call that never dispatched (the stream died around it) still
+    /// gets an explicit not-executed result: the transcript must never end
+    /// on a dangling call, and the model must be told to re-issue it.
+    #[tokio::test]
+    async fn terminated_turn_fails_dangling_tool_calls() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(PartialToolCallThenFailStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let result = messages
+            .iter()
+            .find(|m| matches!(m, AgentMessage::ToolResult { tool_call_id, .. } if tool_call_id == "call_dead"))
+            .expect("dangling call got a synthetic result");
+        let AgentMessage::ToolResult {
+            is_error,
+            tool_name,
+            ..
+        } = result
+        else {
+            unreachable!()
+        };
+        assert!(is_error, "the synthetic result is an error");
+        assert_eq!(tool_name, "Edit");
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ToolExecutionEnd { tool_call_id, is_error: true, .. }
+                    if tool_call_id == "call_dead"
+            )),
+            "execution-end event emitted for the dead call"
+        );
     }
 
     /// A mid-stream provider failure is materialized from the partial

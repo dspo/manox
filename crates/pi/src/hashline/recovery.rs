@@ -43,13 +43,29 @@ pub fn try_recover(
     let current_tag = super::hash::compute_tag(current);
     let Some(snapshot) = store.get(path, claimed_tag) else {
         // The claimed tag names a file state this session never recorded:
-        // fabricated, or carried over from a prior session / app restart.
-        let mut message = format!(
-            "snapshot tag {claimed_tag} is not from this session (fabricated, or carried over \
-             from a prior session or app restart). The current file hashes to {current_tag}. \
-             Re-read the file with `Read` and copy the fresh [path#tag] header — never invent a \
-             tag or reuse one from a prior session."
-        );
+        // fabricated, carried over from a prior session / app restart — or,
+        // most commonly, pasted from ANOTHER file's header. Probe the store
+        // for the tag's real owner before blaming the model's memory.
+        let owners = store.paths_of_tag(claimed_tag);
+        let mut message = if owners.is_empty() {
+            format!(
+                "snapshot tag {claimed_tag} is not from this session (fabricated, or carried over \
+                 from a prior session or app restart). The current file hashes to {current_tag}. \
+                 Re-read the file with `Read` and copy the fresh [path#tag] header — never invent a \
+                 tag or reuse one from a prior session."
+            )
+        } else {
+            let owners = owners
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "snapshot tag {claimed_tag} was minted for {owners} — not for this file. You \
+                 pasted another file's header. The current file hashes to {current_tag}; re-read \
+                 it with `Read` and use the fresh [path#tag] header it returns."
+            )
+        };
         let context = super::anchored_context(ops, current);
         if !context.is_empty() {
             message.push_str("\nCurrent file content near your anchors:\n");

@@ -17,6 +17,7 @@ use crate::language::Language;
 use crate::paths;
 
 static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
+static EDIT: OnceLock<EditSettings> = OnceLock::new();
 static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
 static MCP_DISABLED: OnceLock<Vec<String>> = OnceLock::new();
 
@@ -26,11 +27,17 @@ pub fn init_optimization() {
     let _ = CONTEXT_OPT.set(s.context_optimization);
     let _ = SIDE_CALLS.set(s.side_calls);
     let _ = MCP_DISABLED.set(s.mcp.disabled.clone());
+    let _ = EDIT.set(s.edit);
 }
 
 /// Cached context-optimization settings. Defaults when not yet initialized.
 pub fn context_optimization() -> ContextOptimizationSettings {
     CONTEXT_OPT.get().copied().unwrap_or_default().effective()
+}
+
+/// Cached hashline Edit settings. Defaults when not yet initialized.
+pub fn edit() -> EditSettings {
+    EDIT.get().copied().unwrap_or_default()
 }
 
 /// Cached side-call settings. Defaults when not yet initialized.
@@ -107,6 +114,22 @@ pub struct Settings {
     /// endpoint). Read lazily at the first ChromeUse tool call.
     #[serde(default)]
     pub chrome: ChromeSettings,
+
+    /// Hashline Edit tool switches. Read once per harness build, so changes
+    /// apply to new threads.
+    #[serde(default)]
+    pub edit: EditSettings,
+}
+
+/// Hashline Edit tool switches. `enforce_seen_lines` opts a host into the
+/// anti-blind-edit guard; it ships off (matching upstream oh-my-pi) because
+/// the guard trades edit-rejection round-trips for blind-anchor safety.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct EditSettings {
+    /// Reject edits whose anchor lines the read that minted the tag never
+    /// displayed. Default `false`.
+    pub enforce_seen_lines: bool,
 }
 
 /// MCP toggles: server names the user switched off in the settings panel.

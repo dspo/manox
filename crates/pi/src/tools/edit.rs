@@ -19,7 +19,24 @@ use crate::hashline::parser::Op;
 use crate::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use crate::tools::edit_diff;
 
-pub struct EditTool;
+#[derive(Default)]
+pub struct EditTool {
+    /// Reject no-drift edits whose anchor lines a prior `read`/`grep` never
+    /// displayed. Off by default, matching upstream oh-my-pi's shipped
+    /// `edit.enforceSeenLines: false`: the guard historically caused frequent
+    /// edit rejections once truncation or summaries hid part of a file the
+    /// model believed it had fully read. Hosts that want the anti-blind-edit
+    /// discipline opt in explicitly.
+    pub enforce_seen_lines: bool,
+}
+
+impl EditTool {
+    /// Opt the host into the seen-line guard (see [`EditTool::enforce_seen_lines`]).
+    pub fn with_enforce_seen_lines(mut self, enforce: bool) -> Self {
+        self.enforce_seen_lines = enforce;
+        self
+    }
+}
 
 /// The `patch` field description doubles as the hashline grammar reference
 /// the model sees; keep it in sync with `hashline::parser`.
@@ -120,16 +137,55 @@ impl AgentTool for EditTool {
             .expect("hashline clipboard poisoned")
             .clear();
 
-        let mut results: Vec<String> = Vec::new();
         let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
             .map_err(ToolError::InvalidArguments)?;
+
+        // All-or-nothing execution: every section is fully prepared (read,
+        // tag check, gate, apply/recover, byte transforms) BEFORE any byte is
+        // written, so a later section's rejection cannot leave earlier ones
+        // half-applied on disk. Per-file mutation locks are all taken up
+        // front, in canonical path order, so two concurrent multi-file edits
+        // can never deadlock on overlapping lock sets.
+        let mut lock_paths: Vec<PathBuf> = parsed
+            .files
+            .iter()
+            .map(|fp| resolve_path(&fp.path, &cwd))
+            .collect();
+        lock_paths.sort_by_key(|p| hashline::canonical_path(p));
+        lock_paths.dedup_by(|a, b| hashline::canonical_path(a) == hashline::canonical_path(b));
+        let mut guards = Vec::with_capacity(lock_paths.len());
+        for path in &lock_paths {
+            guards.push(ctx.tool_state().mutation_queue.lock(path).await);
+        }
+
+        /// One prepared, not-yet-written file effect.
+        enum Pending {
+            Write {
+                path: PathBuf,
+                path_display: String,
+                persisted: String,
+                snap_text: String,
+                current: String,
+                old_tag: String,
+                recovered: bool,
+                payload_hash: u64,
+            },
+            Remove {
+                path: PathBuf,
+                path_display: String,
+            },
+            Move {
+                from: PathBuf,
+                to: PathBuf,
+                persisted: String,
+                path_display: String,
+            },
+        }
+
+        let mut prepared: Vec<Pending> = Vec::with_capacity(parsed.files.len());
         for fp in parsed.files {
             let path = resolve_path(&fp.path, &cwd);
             let path_display = path.display().to_string();
-
-            // Hold the mutation lock across all operations so concurrent
-            // edits to the same file are serialized.
-            let _guard = ctx.tool_state().mutation_queue.lock(&path).await;
 
             // File-level operations (REM/MV) still validate the tag — the
             // model must have a current view of the file it's deleting or
@@ -172,37 +228,44 @@ impl AgentTool for EditTool {
                 }
                 match file_op {
                     hashline::FileOp::Rem => {
-                        ctx.env().remove(&path).await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "edit REM failed {path_display}: {e}"
-                            ))
-                        })?;
-                        ctx.tool_state()
-                            .snapshots
-                            .lock()
-                            .expect("hashline snapshot store poisoned")
-                            .invalidate(&path);
-                        results.push(format!("[{path_display}] deleted"));
+                        prepared.push(Pending::Remove { path, path_display });
                         continue;
                     }
                     hashline::FileOp::Move { dest } => {
                         let dest_path = resolve_path(std::path::Path::new(dest), &cwd);
-                        ctx.env().write_file(&dest_path, &raw).await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "edit MV write failed {path_display}: {e}"
-                            ))
-                        })?;
-                        ctx.env().remove(&path).await.map_err(|e| {
-                            ToolError::ExecutionFailed(format!(
-                                "edit MV source removal failed {path_display}: {e}"
-                            ))
-                        })?;
-                        ctx.tool_state()
-                            .snapshots
-                            .lock()
-                            .expect("hashline snapshot store poisoned")
-                            .relocate(&path, &dest_path);
-                        results.push(format!("[{path_display}] moved to {}", dest_path.display()));
+                        if hashline::canonical_path(&dest_path) == hashline::canonical_path(&path) {
+                            return Err(ToolError::ExecutionFailed(format!(
+                                "edit MV {path_display}: destination is the source file itself"
+                            )));
+                        }
+                        // The section's line ops ride the move: apply them to
+                        // the current content first (a bare header + `MV` moves
+                        // the file unchanged), then persist the result at the
+                        // destination with the source's line-ending/BOM shape.
+                        let expanded = expand_clipboard_ops(&fp.ops, &current, ctx)?;
+                        let effective = if fp.ops.is_empty() {
+                            current.clone()
+                        } else {
+                            hashline::apply(&current, &expanded)
+                                .map_err(|e| {
+                                    ToolError::ExecutionFailed(format!(
+                                        "edit MV apply failed {path_display}: {e}"
+                                    ))
+                                })?
+                                .text
+                        };
+                        let persisted = persist(
+                            &effective,
+                            hashline::detect_crlf(&raw),
+                            hashline::has_bom(&raw),
+                            raw.ends_with('\n'),
+                        );
+                        prepared.push(Pending::Move {
+                            path_display,
+                            from: path,
+                            to: dest_path,
+                            persisted,
+                        });
                         continue;
                     }
                 }
@@ -221,23 +284,49 @@ impl AgentTool for EditTool {
             // Paste expands to Ins with clipboard content.
             let expanded_ops = expand_clipboard_ops(&fp.ops, &current, ctx)?;
 
+            // Position-free ops (pure INS.HEAD/INS.TAIL) land identically no
+            // matter how the file drifted around them: applying to live
+            // content directly beats failing an edit whose anchors carry no
+            // line numbers to go stale. `expand_clipboard_ops` above has
+            // already rewritten every PASTE (HEAD/TAIL included, which parse
+            // anchor-less) into its INS equivalent, so the Paste arm below is
+            // defensive — it holds only if a future change lets Paste ops
+            // survive expansion.
+            let position_free = expanded_ops.iter().all(|op| {
+                matches!(
+                    op,
+                    Op::Ins { anchor: None, .. } | Op::Paste { anchor: None, .. }
+                )
+            });
+
             let new_text = if current_tag == fp.tag {
                 // Seen-line gate — only on the no-drift path, where anchor line
                 // numbers index the tagged content 1:1. On recovery the numbers
-                // shift, so provenance does not apply.
-                hashline::assert_seen_lines(
-                    &mut ctx
-                        .tool_state()
-                        .snapshots
-                        .lock()
-                        .expect("hashline snapshot store poisoned"),
-                    &path,
-                    &fp.tag,
-                    &expanded_ops,
-                    &current,
-                )
-                .map_err(ToolError::ExecutionFailed)?;
+                // shift, so provenance does not apply. Host-opt-in: upstream
+                // ships it off because blind anchors on a drifted view are
+                // caught by the tag check, and the gate's rejections cost a
+                // full model round-trip each.
+                if self.enforce_seen_lines {
+                    hashline::assert_seen_lines(
+                        &mut ctx
+                            .tool_state()
+                            .snapshots
+                            .lock()
+                            .expect("hashline snapshot store poisoned"),
+                        &path,
+                        &fp.tag,
+                        &expanded_ops,
+                        &current,
+                    )
+                    .map_err(ToolError::ExecutionFailed)?;
+                }
 
+                hashline::apply(&current, &expanded_ops)
+                    .map_err(|e| {
+                        ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
+                    })?
+                    .text
+            } else if position_free {
                 hashline::apply(&current, &expanded_ops)
                     .map_err(|e| {
                         ToolError::ExecutionFailed(format!("edit apply failed {path_display}: {e}"))
@@ -252,81 +341,179 @@ impl AgentTool for EditTool {
                 hashline::try_recover(&current, &fp.tag, &expanded_ops, &mut store, &path)
                     .map_err(|e| ToolError::ExecutionFailed(format!("edit {path_display}: {e}")))?
             };
+            let recovered = current_tag != fp.tag;
 
             // Restore original line endings, trailing newline, and BOM so
             // the write is a minimal content delta, not a full-rewrite that
             // flattens formatting or drops the file's terminating newline.
             let persisted = persist(&new_text, is_crlf, had_bom, had_trailing_nl);
-            ctx.env().write_file(&path, &persisted).await.map_err(|e| {
-                ToolError::ExecutionFailed(format!("edit write failed {path_display}: {e}"))
-            })?;
-
-            // Record snapshot of LF-normalized text, consistent with Read tool.
-            // The model authored the whole file through this patch (or the diff
-            // it produced), so every line counts as seen — a follow-up edit on
-            // the returned tag must not trip the gate. Files over the snapshot
-            // cap mint no tag (hashline editing is out of scope for them).
             let snap_text = hashline::normalize_to_lf(&new_text);
-            let new_snap = if snap_text.len() > hashline::SNAPSHOT_MAX_BYTES {
-                None
-            } else {
-                let mut store = ctx
-                    .tool_state()
-                    .snapshots
-                    .lock()
-                    .expect("hashline snapshot store poisoned");
-                let snap = store.record(&path, &snap_text);
-                let all_lines: HashSet<usize> = (1..=snap_text.lines().count()).collect();
-                store.record_seen_lines(&path, &snap.tag, &all_lines);
-                Some(snap)
-            };
-            let diff = edit_diff::compute_unified_diff(&current, &new_text, &path);
-            let changed = !edit_diff::is_diff_empty(&diff);
+            prepared.push(Pending::Write {
+                path,
+                path_display,
+                persisted,
+                snap_text,
+                current,
+                old_tag: fp.tag,
+                recovered,
+                payload_hash: hash_ops(&fp.ops),
+            });
+        }
 
-            // No-op loop guard: the same payload producing no change repeatedly
-            // means the model is spinning; escalate after a few identical no-ops.
-            // Keyed by canonical path so `/tmp` vs `/private/tmp` spellings of
-            // one file cannot dodge the escalation.
-            let noop_key = hashline::canonical_path(&path);
-            if changed {
-                ctx.tool_state()
-                    .noop_edits
-                    .lock()
-                    .expect("noop guard poisoned")
-                    .remove(&noop_key);
-                results.push(match new_snap {
-                    Some(s) => format!("[{path_display}#{}]\n{diff}", s.tag),
-                    None => format!("[{path_display}]\n{diff}\n(no snapshot: file exceeds 4MB)"),
-                });
-            } else {
-                let payload_hash = hash_ops(&fp.ops);
-                let mut guard = ctx
-                    .tool_state()
-                    .noop_edits
-                    .lock()
-                    .expect("noop guard poisoned");
-                let entry = guard.entry(noop_key.clone()).or_insert((payload_hash, 0));
-                if entry.0 == payload_hash {
-                    entry.1 += 1;
-                } else {
-                    entry.0 = payload_hash;
-                    entry.1 = 1;
+        // Commit: every section validated — write them all. A write-phase I/O
+        // failure still names which sections landed and which did not, so the
+        // model never re-guesses the on-disk state.
+        let mut results: Vec<String> = Vec::with_capacity(prepared.len());
+        let mut failure_manifest: Vec<String> = Vec::new();
+        for pending in prepared {
+            match pending {
+                Pending::Remove { path, path_display } => {
+                    ctx.env().remove(&path).await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "edit REM failed {path_display}: {e}{}",
+                            commit_manifest(&failure_manifest)
+                        ))
+                    })?;
+                    ctx.tool_state()
+                        .snapshots
+                        .lock()
+                        .expect("hashline snapshot store poisoned")
+                        .invalidate(&path);
+                    failure_manifest.push(format!("{path_display} deleted"));
+                    results.push(format!("[{path_display}] deleted"));
                 }
-                let count = entry.1;
-                drop(guard);
-                if count >= NOOP_HARD_LIMIT {
-                    return Err(ToolError::ExecutionFailed(format!(
-                        "edit {path_display}: this patch made no changes {count} times in a row \
-                         with an identical payload — the file already matches your intent. Stop \
-                         re-issuing it; re-read the file if you expected a difference."
-                    )));
+                Pending::Move {
+                    from,
+                    to,
+                    persisted,
+                    path_display,
+                } => {
+                    ctx.env().write_file(&to, &persisted).await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "edit MV write failed {path_display}: {e}{}",
+                            commit_manifest(&failure_manifest)
+                        ))
+                    })?;
+                    ctx.env().remove(&from).await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "edit MV source removal failed {path_display}: {e}{}",
+                            commit_manifest(&failure_manifest)
+                        ))
+                    })?;
+                    ctx.tool_state()
+                        .snapshots
+                        .lock()
+                        .expect("hashline snapshot store poisoned")
+                        .relocate(&from, &to);
+                    failure_manifest.push(format!("{path_display} moved"));
+                    results.push(format!("[{path_display}] moved to {}", to.display()));
                 }
-                let hint = "(no changes — the targeted lines already match the body; re-read \
-                            before another edit)";
-                results.push(match new_snap {
-                    Some(s) => format!("[{path_display}#{}]\n{hint}", s.tag),
-                    None => format!("[{path_display}]\n{hint}\n(no snapshot: file exceeds 4MB)"),
-                });
+                Pending::Write {
+                    path,
+                    path_display,
+                    persisted,
+                    snap_text,
+                    current,
+                    old_tag,
+                    recovered,
+                    payload_hash,
+                } => {
+                    ctx.env().write_file(&path, &persisted).await.map_err(|e| {
+                        ToolError::ExecutionFailed(format!(
+                            "edit write failed {path_display}: {e}{}",
+                            commit_manifest(&failure_manifest)
+                        ))
+                    })?;
+                    failure_manifest.push(path_display.clone());
+
+                    // Record snapshot of LF-normalized text, consistent with
+                    // Read tool. The model authored the whole file through this
+                    // patch (or the diff it produced), so every line counts as
+                    // seen — a follow-up edit on the returned tag must not trip
+                    // the gate. Files over the snapshot cap mint no tag.
+                    let new_snap = if snap_text.len() > hashline::SNAPSHOT_MAX_BYTES {
+                        None
+                    } else {
+                        let mut store = ctx
+                            .tool_state()
+                            .snapshots
+                            .lock()
+                            .expect("hashline snapshot store poisoned");
+                        let snap = store.record(&path, &snap_text);
+                        let all_lines: HashSet<usize> = (1..=snap_text.lines().count()).collect();
+                        store.record_seen_lines(&path, &snap.tag, &all_lines);
+                        Some(snap)
+                    };
+                    let diff = edit_diff::compute_unified_diff(&current, &snap_text, &path);
+                    let changed = !edit_diff::is_diff_empty(&diff);
+
+                    // No-op loop guard: the same payload producing no change
+                    // repeatedly means the model is spinning; escalate after a
+                    // few identical no-ops. Keyed by canonical path so `/tmp`
+                    // vs `/private/tmp` spellings of one file cannot dodge it.
+                    let noop_key = hashline::canonical_path(&path);
+                    if changed {
+                        ctx.tool_state()
+                            .noop_edits
+                            .lock()
+                            .expect("noop guard poisoned")
+                            .remove(&noop_key);
+                        let fresh_header = new_snap
+                            .as_ref()
+                            .map(|s| format!("[{path_display}#{}]", s.tag))
+                            .unwrap_or_else(|| "a fresh Read".to_string());
+                        let mut entry = match new_snap {
+                            Some(s) => format!("[{path_display}#{}]\n{diff}", s.tag),
+                            None => {
+                                format!("[{path_display}]\n{diff}\n(no snapshot: file exceeds 4MB)")
+                            }
+                        };
+                        if recovered {
+                            // The edit landed through drift recovery: every
+                            // hashline header still in the model's context for
+                            // this file is now stale, and the next edit citing
+                            // one re-enters the slow (or failing) recovery
+                            // path. Say so while the new header is right here.
+                            entry.push_str(&format!(
+                                "\n[drift recovery: the file changed since tag #{old_tag} — \
+                                 older headers for this file are stale; anchor the next edit on \
+                                 {fresh_header}]",
+                            ));
+                        }
+                        results.push(entry);
+                    } else {
+                        let mut guard = ctx
+                            .tool_state()
+                            .noop_edits
+                            .lock()
+                            .expect("noop guard poisoned");
+                        let entry = guard.entry(noop_key).or_insert((payload_hash, 0));
+                        if entry.0 == payload_hash {
+                            entry.1 += 1;
+                        } else {
+                            entry.0 = payload_hash;
+                            entry.1 = 1;
+                        }
+                        let count = entry.1;
+                        drop(guard);
+                        if count >= NOOP_HARD_LIMIT {
+                            return Err(ToolError::ExecutionFailed(format!(
+                                "edit {path_display}: this patch made no changes {count} times in \
+                                 a row with an identical payload — the file already matches your \
+                                 intent. Stop re-issuing it; re-read the file if you expected a \
+                                 difference."
+                            )));
+                        }
+                        let hint = "(no changes — the targeted lines already match the body; \
+                                    re-read before another edit)";
+                        results.push(match new_snap {
+                            Some(s) => format!("[{path_display}#{}]\n{hint}", s.tag),
+                            None => {
+                                format!("[{path_display}]\n{hint}\n(no snapshot: file exceeds 4MB)")
+                            }
+                        });
+                    }
+                }
             }
         }
 
@@ -337,6 +524,19 @@ impl AgentTool for EditTool {
         }
         Ok(AgentToolResult::text(out))
     }
+}
+
+/// The tail of a commit-phase failure message: which sections already landed
+/// on disk, so the model knows exactly what remains to re-issue. Empty when
+/// nothing was written yet (the common, fully-atomic case).
+fn commit_manifest(written: &[String]) -> String {
+    if written.is_empty() {
+        return String::new();
+    }
+    format!(
+        " — sections already applied: {}; the remaining sections were NOT applied, re-issue them",
+        written.join(", ")
+    )
 }
 
 /// Resolve a patch section path against the call's effective working directory

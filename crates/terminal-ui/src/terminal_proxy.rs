@@ -97,6 +97,10 @@ impl TerminalProxy {
         self.handle.read(|t| t.bell)
     }
 
+    pub fn block_char_render(&self) -> bool {
+        self.handle.read(|t| t.block_char_render())
+    }
+
     pub fn is_ready(&self) -> bool {
         self.handle.read(|t| t.is_ready())
     }

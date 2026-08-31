@@ -204,6 +204,10 @@ pub struct ReadyInfo {
     /// mirrors it as the rebuild fallback after compaction summarized
     /// the transcript's plan tool calls away.
     pub plan_snapshot: Option<serde_json::Value>,
+    /// Display title persisted in the session sidecar; the facade mirrors
+    /// it so the title bar matches the sidebar's
+    /// [`crate::db::ThreadSummary::display_title`] source of truth.
+    pub title: Option<String>,
 }
 
 /// Notices the backend sends back to the facade's gpui drainer.

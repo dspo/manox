@@ -1,4 +1,4 @@
-//! Process-global `TerminalStore` — gpui-free mirror of `agent::thread_store_pi`.
+//! Process-global `TerminalStore` — gpui-free mirror of `agent::thread_store`.
 //!
 //! Holds an `Arc<ThreadsDatabase>` plus the current session-summary list
 //! behind a `TerminalStoreHandle` (`Arc` + lock + channel broadcast).
@@ -173,7 +173,7 @@ static GLOBAL: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex:
 /// Test-only override of the process-global `TerminalStore`. `init_for_test`
 /// stores an in-memory-db-backed handle here so persistence-bearing tests
 /// don't touch the real `~/.manox/threads.db`; `drop_for_test` clears it.
-/// Mirrors `thread_store_pi`'s override slot.
+/// Mirrors `thread_store`'s override slot.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_OVERRIDE: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex::new(None);
 

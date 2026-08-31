@@ -9,9 +9,13 @@
 //! The Term lock is taken only on the terminal side. The PTY reader/writer
 //! threads never touch it — they move raw bytes over the channel.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+
+use hyperlinks::{
+    OverlaySpan, PathOptions, UrlKind, default_path_options, detect_paths, detect_urls, trim_url,
+};
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
@@ -54,6 +58,24 @@ pub struct HoverTarget {
 pub enum HoverKind {
     Url,
     Path,
+}
+
+impl HoverTarget {
+    /// Map a library link span onto a grid hover target. `row` is stamped by
+    /// [`Terminal::hover_target`]; the column span is the span's extent on the
+    /// hovered display row.
+    pub fn from_overlay(span: &OverlaySpan, row: usize, start_col: usize, end_col: usize) -> Self {
+        HoverTarget {
+            text: span.href.clone(),
+            row,
+            start_col,
+            end_col,
+            kind: match span.kind {
+                UrlKind::Url => HoverKind::Url,
+                UrlKind::Path => HoverKind::Path,
+            },
+        }
+    }
 }
 
 /// Grid dimensions supplied to `Term::new` / `Term::resize`.
@@ -121,6 +143,9 @@ pub struct Terminal {
     pub cwd: PathBuf,
     pub cols: usize,
     pub rows: usize,
+    /// Whether block characters render as sub-grid rects (settings-derived;
+    /// off falls back to font shaping).
+    block_char_render: bool,
     term: Arc<ManoxTermLock>,
     /// The PTY source is `Send` but not `Sync` (portable-pty's boxed
     /// master/reader), so it sits behind a mutex to keep `Terminal: Sync` —
@@ -262,6 +287,7 @@ impl Terminal {
             cwd,
             cols,
             rows,
+            block_char_render: settings.block_char_render,
             term,
             pty: parking_lot::Mutex::new(pty),
             output_processor: Processor::<StdSyncHandler>::new(),
@@ -433,6 +459,12 @@ impl Terminal {
     /// Send input bytes (keystrokes, paste) to the shell.
     pub fn input(&self, bytes: &[u8]) -> std::io::Result<()> {
         self.pty.lock().write(bytes)
+    }
+
+    /// Whether block characters (`▀▌▓…`) paint as sub-grid rects rather than
+    /// font-shaped glyphs. Mirrors the `[terminal] block_char_render` setting.
+    pub fn block_char_render(&self) -> bool {
+        self.block_char_render
     }
 
     /// Name of the process owning the foreground process group, when it is
@@ -636,15 +668,16 @@ impl Terminal {
     }
 
     /// The hoverable target at visible `(row, col)`: an OSC 8 hyperlink
-    /// first, else the semantic word when it classifies as a URL or a path.
-    /// `None` outside the visible grid or on plain text.
+    /// first, else the semantic word when it classifies as a URL or a path
+    /// (wrapped across display lines the word is merged). `None` outside the
+    /// visible grid or on plain text.
     pub fn hover_target(&self, row: usize, col: usize) -> Option<HoverTarget> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
         self.with_term(|t| {
             let point = self.display_point(t, row, col);
-            hyperlink_span(t, point).or_else(|| word_target(t, point))
+            hyperlink_span(t, point).or_else(|| word_target(t, point, Some(&self.cwd)))
         })
         .map(|mut h| {
             h.row = row;
@@ -757,43 +790,75 @@ fn hyperlink_span(term: &ManoxTerm, point: Point) -> Option<HoverTarget> {
     })
 }
 
-/// The semantic word at `point` when it looks like a URL or a path.
-/// Multi-line spans (wrapped words) are not hoverable.
-fn word_target(term: &ManoxTerm, point: Point) -> Option<HoverTarget> {
+/// The semantic word at `point` when it looks like a URL or a path. The word
+/// may span display lines (soft-wrapped links): the fragments are merged and
+/// the whole is classified, so a wrapped URL stays one hoverable target.
+fn word_target(term: &ManoxTerm, point: Point, cwd: Option<&Path>) -> Option<HoverTarget> {
+    let grid = term.grid();
     let start = term.semantic_search_left(point);
     let end = term.semantic_search_right(point);
-    if start.line != point.line || end.line != point.line {
-        return None;
-    }
-    let grid = term.grid();
-    let row = &grid[point.line];
     let mut text = String::new();
-    for c in start.column.0..=end.column.0 {
-        text.push(row[Column(c)].c);
+    for line in start.line.0..=end.line.0 {
+        let row = &grid[Line(line)];
+        let from = if line == start.line.0 {
+            start.column.0
+        } else {
+            0
+        };
+        let to = if line == end.line.0 {
+            end.column.0
+        } else {
+            grid.columns() - 1
+        };
+        for c in from..=to {
+            text.push(row[Column(c)].c);
+        }
     }
-    // Trailing padding / wide-char spacers are not part of the word.
+    // Trailing padding / wide-char spacers are not part of the word, then the
+    // URL boundary trim strips trailing punctuation and closing brackets.
     let text = text.trim_end().to_owned();
-    let kind = classify_word(&text)?;
-    Some(HoverTarget {
-        start_col: start.column.0,
-        end_col: start.column.0 + text.len().saturating_sub(1),
-        // Stamped with the display row by `hover_target`.
-        row: 0,
-        text,
-        kind,
-    })
+    let trimmed = trim_url(&text).to_owned();
+    let span = classify(&trimmed, cwd)?;
+    let (start_col, end_col) = if start.line == end.line {
+        (
+            start.column.0,
+            start.column.0 + trimmed.len().saturating_sub(1),
+        )
+    } else {
+        // The underline covers the hovered row's fragment; trims only shorten
+        // the last line's fragment.
+        let from = if start.line.0 == point.line.0 {
+            start.column.0
+        } else {
+            0
+        };
+        let to = if end.line.0 == point.line.0 {
+            end.column
+                .0
+                .saturating_sub(text.len().saturating_sub(trimmed.len()))
+        } else {
+            grid.columns() - 1
+        };
+        (from, to)
+    };
+    Some(HoverTarget::from_overlay(
+        &span, // Stamped with the display row by `hover_target`.
+        0, start_col, end_col,
+    ))
 }
 
-/// Classify a semantic word as an openable target: `http(s)://` → URL;
-/// anything containing a path separator → path.
-fn classify_word(text: &str) -> Option<HoverKind> {
-    if text.starts_with("http://") || text.starts_with("https://") {
-        return Some(HoverKind::Url);
+/// Classify a semantic word via the shared link library: a URL span first,
+/// else a path span (`/`-containing with extension / line anchor / cwd
+/// existence).
+fn classify(text: &str, cwd: Option<&Path>) -> Option<OverlaySpan> {
+    if let Some(span) = detect_urls(text).into_iter().next() {
+        return Some(span);
     }
-    if text.contains('/') {
-        return Some(HoverKind::Path);
-    }
-    None
+    let opts = PathOptions {
+        cwd: cwd.map(PathBuf::from),
+        ..default_path_options()
+    };
+    detect_paths(text, &opts).into_iter().next()
 }
 
 #[cfg(test)]
@@ -997,10 +1062,15 @@ mod tests {
 
     /// A standalone Term fed with `text` — hover/word tests without a PTY.
     fn term_with(text: &str) -> ManoxTerm {
+        term_with_size(text, 80, 24)
+    }
+
+    /// A standalone Term with a custom grid size, for wrap behavior tests.
+    fn term_with_size(text: &str, cols: usize, rows: usize) -> ManoxTerm {
         let (event_tx, _rx) = async_channel::bounded::<TerminalEvent>(256);
         let listener = ManoxListener::new(event_tx);
         let cfg = build_config(&TerminalSettings::default());
-        let size = TermSize { cols: 80, rows: 24 };
+        let size = TermSize { cols, rows };
         let mut term = Term::new(cfg, &size, listener);
         let mut processor = Processor::<StdSyncHandler>::new();
         for &b in text.as_bytes() {
@@ -1010,12 +1080,30 @@ mod tests {
     }
 
     #[test]
-    fn classify_word_rules() {
-        assert_eq!(classify_word("https://a.b/c"), Some(HoverKind::Url));
-        assert_eq!(classify_word("http://a.b"), Some(HoverKind::Url));
-        assert_eq!(classify_word("/tmp/x"), Some(HoverKind::Path));
-        assert_eq!(classify_word("src/main.rs"), Some(HoverKind::Path));
-        assert_eq!(classify_word("hello"), None);
+    fn classify_rules() {
+        assert_eq!(
+            classify("https://a.b/c", None),
+            Some(OverlaySpan {
+                href: "https://a.b/c".into(),
+                range: 0..13,
+                kind: UrlKind::Url,
+            })
+        );
+        assert_eq!(
+            classify("http://a.b", None).map(|s| s.kind),
+            Some(UrlKind::Url)
+        );
+        assert_eq!(
+            classify("mailto:x@y.z", None).map(|s| s.kind),
+            Some(UrlKind::Url)
+        );
+        assert_eq!(
+            classify("src/main.rs", None).map(|s| s.kind),
+            Some(UrlKind::Path)
+        );
+        // Extension-less, non-existent paths need a cwd to classify.
+        assert_eq!(classify("/tmp/x", None), None);
+        assert_eq!(classify("hello", None), None);
     }
 
     #[test]
@@ -1024,15 +1112,28 @@ mod tests {
         // path cols 32..=43 — `:` stays inside the word per build_config's
         // separator set.
         let term = term_with("open https://example.com/x then /tmp/foo.txt\r\n");
-        let url = word_target(&term, Point::new(Line(0), Column(8))).expect("url word");
+        let url = word_target(&term, Point::new(Line(0), Column(8)), None).expect("url word");
         assert_eq!(url.text, "https://example.com/x");
         assert_eq!(url.kind, HoverKind::Url);
         assert_eq!((url.start_col, url.end_col), (5, 25));
-        let path = word_target(&term, Point::new(Line(0), Column(37))).expect("path word");
+        let path = word_target(&term, Point::new(Line(0), Column(37)), None).expect("path word");
         assert_eq!(path.text, "/tmp/foo.txt");
         assert_eq!(path.kind, HoverKind::Path);
         assert_eq!((path.start_col, path.end_col), (32, 43));
-        assert!(word_target(&term, Point::new(Line(0), Column(1))).is_none());
+        assert!(word_target(&term, Point::new(Line(0), Column(1)), None).is_none());
+    }
+
+    #[test]
+    fn word_target_merges_wrapped_url_across_lines() {
+        // At 20 cols the URL "https://example.com/verylong/path" wraps onto a
+        // second display line; hovering the first fragment must still yield
+        // the whole URL as one target.
+        let term = term_with_size("go https://example.com/verylong/path here\r\n", 20, 4);
+        let target = word_target(&term, Point::new(Line(0), Column(8)), None).expect("wrapped url");
+        assert_eq!(target.text, "https://example.com/verylong/path");
+        assert_eq!(target.kind, HoverKind::Url);
+        // The underline covers the hovered row's fragment (cols 3..=19).
+        assert_eq!((target.start_col, target.end_col), (3, 19));
     }
 
     #[test]

@@ -33,6 +33,7 @@ members = [
     "crates/manox-napi",
     "crates/manox-webui",
     "crates/manox-protocol",
+    "crates/hyperlinks",
 ]
 resolver = "2"
 
@@ -61,6 +62,7 @@ manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
+hyperlinks = { path = "crates/hyperlinks" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
 # 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。cx-providers 为 provider
 # 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。
@@ -219,3 +221,4 @@ psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }
+

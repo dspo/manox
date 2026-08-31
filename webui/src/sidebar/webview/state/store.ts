@@ -900,6 +900,7 @@ export function wireMessagesToTranscriptItems(
         modelId: ui.model_id ?? null,
         timestamp: msg.timestamp,
         images: images.length ? images : undefined,
+        author: ui.author ?? null,
       });
       continue;
     }

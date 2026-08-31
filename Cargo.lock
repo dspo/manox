@@ -4441,6 +4441,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyperlinks"
+version = "0.1.0"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5507,6 +5511,7 @@ version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui-component",
+ "hyperlinks",
  "log",
  "markdown",
  "ropey",
@@ -9841,6 +9846,7 @@ dependencies = [
  "chrono",
  "cx",
  "futures",
+ "hyperlinks",
  "libc",
  "parking_lot",
  "portable-pty",

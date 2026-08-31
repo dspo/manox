@@ -29,7 +29,7 @@ Component names use PascalCase. The hierarchy mirrors the visual containment tre
 | 后台线程（ctrl-b 置底 / 切换自动 park） | ✅ | `background_threads` + `attach_thread` parking |
 | 外部会话（Claude Code / Codex / GitHub Copilot CLI / VS Code 注入 / 终端纯 PTY） | ✅ | 侧栏 provider→model 级联（agents）+ 终端直接入口（`SpawnPlainSession`）+ `ViewMode::ExternalSession`；agent 会话退出后可从侧栏恢复（sidecar 记录 CLI session id，`claude --resume <id>` / `codex resume <id>` 定向恢复；未捕获时走 CLI picker；copilot `--continue`） |
 | Browser 标签 / Terminal 标签 | ✅ | webview host notify/inbound 桥；平台 terminal surface |
-| TurnNavigator | ✅ | cmd-m / cmd-shift-; |
+| TurnNavigator | ✅ | cmd-m 打开；↑/↓ 选条、enter 定位、⌘↵ 回填 composer、⌘C 复制；历史回溯另有 ⌥↑/⌥↓ |
 | 图片附件 | ✅ | 剪贴板粘贴 / plus 选择 → chip → 气泡渲染 → 内核 `ContentBlock::Image` 投递（TS `prompt(text, {images})` parity，#438）；steer 带图同路 |
 | MCP | ✅ | 连接核心共享化 + pi AgentTool 桥（#442）；Settings → MCP servers 面板（列表/连接状态/持久开关） |
 | Plus 菜单（文件 / 目标 / 插件） | ✅ 部分 | 文件 → native picker → pending attachments；目标 → seed `/goal`；Plugins 组为静态装饰（待与插件面板 #474 整合） |
@@ -364,7 +364,7 @@ Virtual list backed by native `gpui::list` (`gpui::list(list_state, render_item)
 
 #### MessageItem
 
-Single rendered conversation item, centered, full width (no fixed content cap — the transcript adapts to the window width). Each `MessageItem` renders one of the variant cards below based on `ConvItem` kind. Every kind that carries a text body — user, assistant, error, notice, team message, recap, retry detail, plan review — mounts a persistent `Entity<Markdown>` (`MessageItem::markdown`, created lazily by `ensure_markdown`) instead of rebuilding one per frame: a per-frame `Entity` resets the document's `DocSelection`/`FocusHandle` on every render and breaks drag-select + Cmd/Ctrl+C (the old `markdown_tv` fallback), while a persistent body keeps its selection state alive across frames and leaves inline links clickable.
+Single rendered conversation item, centered, full width (no fixed content cap — the transcript adapts to the window width). Each `MessageItem` renders one of the variant cards below based on `ConvItem` kind. Every kind that carries a text body — user (incl. peer deliveries), assistant, error, notice, recap, retry detail, plan review — mounts a persistent `Entity<Markdown>` (`MessageItem::markdown`, created lazily by `ensure_markdown`) instead of rebuilding one per frame: a per-frame `Entity` resets the document's `DocSelection`/`FocusHandle` on every render and breaks drag-select + Cmd/Ctrl+C (the old `markdown_tv` fallback), while a persistent body keeps its selection state alive across frames and leaves inline links clickable.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -372,7 +372,7 @@ Single rendered conversation item, centered, full width (no fixed content cap �
 
 #### UserMessage
 
-Full-width user turn block rendered inside [TurnFrame](#turnframe): `You > Time/DateTime > ModelID` metadata header, persistent selectable markdown body, copy btn (hover), and a permission-mode-colored frame captured at send time.
+Full-width user turn block rendered inside [TurnFrame](#turnframe): `{from} > {to}·ModelID·Time` metadata header (`user_turn_header`; empty segments drop, no `>` clause when nothing follows `from`), persistent selectable markdown body, copy btn (hover), and a permission-mode-colored frame captured at send time. `from` is the turn's real author — unattributed human input renders the localized "You", otherwise Captain (lead), Harness (host-injected turns, e.g. the plan-execution seed), or the named agent (team peer delivery, shown with a `theme.primary` peer accent); `to` is the agent whose conversation renders the turn (main thread shows Captain, a member thread its own name, a sub-agent panel the sub-agent type) — a view-side fact stamped by the owning `ConversationState`, never persisted. Peer deliveries share this same renderer live and after reload.
 
 > Source: `agent-ui/src/views/message.rs`
 
@@ -457,7 +457,15 @@ Vertical flex, `flex_shrink_0`, `py_2`, contains [Composer](#composer) or [AskDr
 
 #### Composer
 
-Centered wrapper around the input row + chips.
+Centered wrapper around the input row + chips. Its `Input` keeps the bare arrows for the caret: `up` / `down`
+always move the cursor inside the multi-line draft (first line's start and last line's end included, never
+history). Composer history recall lives on `⌥↑` / `⌥↓` (`ComposerRecallUp` / `ComposerRecallDown`, bound on the
+`composer > Input` key context the wrapper carries while the completion popover is closed). The walk is entered
+only by those keys — a running walk keeps stepping after an edit, and the text it leaves behind becomes the
+walk's working line, which `⌥↓` past the newest turn restores. Submitting or switching threads ends the walk.
+A [TurnNavigator](#capability-matrix) `⌘↵` fill is a walk landing too: the walk moves onto the filled turn, so
+the draft the fill displaced is the working line `⌥↓` returns — `InputState::set_value` clears the input's undo
+history, so nothing else survives that replacement.
 
 > Source: `agent-ui/src/workspace.rs`
 
@@ -763,7 +771,7 @@ Rendered markdown view (`Markdown`).
 
 #### SubagentPanel
 
-A right-pane read-only observation tab for one Steer-bus sub-agent run (`RightTab::Subagent(address)`, equal citizen of the right tab bar). The tab label shows the subagent's **address** (`SubagentProgress.id`, e.g. `Sailor_0`); the panel's second-level header banner shows the **topic** — status indicator + mono topic text (the shared `subagent_topic` / dispatch-prompt first-line derivation, address fallback when empty). Body: a miniature conversation rendered through the **same `ConversationState` + message pipeline as the main conversation** — it opens with the Captain's dispatch prompt as a user bubble (captured from the Steer tool call into `Workspace::subagent_prompts`), then the bridged child events translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`) — assistant bubbles, reasoning folds, tool cards, tail-follow scrolling. The live accumulation lives in `Workspace::subagent_transcripts` and is kept for the session lifetime (no longer trimmed at terminal status), so a tab opened after the run replays the full work; a panel opened after a reload falls back to `subagent_final_text` replayed as the assistant message plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
+A right-pane read-only observation tab for one Steer-bus sub-agent run (`RightTab::Subagent(address)`, equal citizen of the right tab bar). The tab label shows the subagent's **address** (`SubagentProgress.id`, e.g. `Sailor_0`); the panel's second-level header banner shows the **topic** — status indicator + mono topic text (the shared `subagent_topic` / dispatch-prompt first-line derivation, address fallback when empty). Body: a miniature conversation rendered through the **same `ConversationState` + message pipeline as the main conversation** — it opens with the Captain's dispatch prompt as a user bubble (captured from the Steer tool call into `Workspace::subagent_prompts` with its send time), header reading `Captain > {recipient}·{model}·{time}` where `recipient` is the sub-agent type (the conversation's `to`) and `model` is the child session's dispatch-reported model (`SubagentChildEvent::Model`, sent once at dispatch; the parent's live model label stands in until then and after reload), then the bridged child events translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`) — assistant bubbles, reasoning folds, tool cards, tail-follow scrolling. The live accumulation lives in `Workspace::subagent_transcripts` and is kept for the session lifetime (no longer trimmed at terminal status), so a tab opened after the run replays the full work; a panel opened after a reload falls back to `subagent_final_text` replayed as the assistant message plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
 
 > Source: `agent-ui/src/views/subagent_panel.rs`, `agent-ui/src/workspace.rs`
 

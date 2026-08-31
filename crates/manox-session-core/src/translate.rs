@@ -223,6 +223,10 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             session_id: session_id.into(),
         }),
         ThreadEvent::HistoryRestored => Skip,
+        // The persisted display title rides the `ThreadInfo` snapshot's
+        // `display_title` (rebuilt from the facade on Ready/attach); the live
+        // event carries no state the client has not already received.
+        ThreadEvent::TitleChanged { .. } => Skip,
         ThreadEvent::ToolCallAuthorization {
             id,
             tool_name,
