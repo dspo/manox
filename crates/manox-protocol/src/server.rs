@@ -253,6 +253,14 @@ pub enum ServerNote {
     Compaction {
         session_id: String,
         summary: String,
+        /// The retained tail of messages after compaction: the server folds
+        /// older history into the summary and keeps the most recent messages.
+        /// The client store replaces its transcript with `summary + retained`.
+        /// Always present on the wire — an empty array means nothing was
+        /// retained. Populate from the kernel `CompactionResult.retained_tail`
+        /// via `translate`; never send a synthetic empty tail for a
+        /// compaction that kept messages.
+        retained: serde_json::Value,
     },
     /// Provider-side prompt cache was lost since the previous turn; the
     /// client renders a cache-miss divider.

@@ -333,6 +333,7 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
         ServerNote::Compaction {
             session_id,
             summary,
+            retained: _,
         } => json!({"type": "compaction", "sessionId": session_id, "summary": summary}),
         ServerNote::BackgroundTaskUpdated {
             session_id,

@@ -1900,10 +1900,12 @@ fn subscribe_harness_events(
             // prompt. Fire-and-forget: the manual `/compact` path awaits the
             // same clear before mirroring.
             clear_user_chrome_spawn(sessions_dir.clone(), session_path.clone());
+            let retained_tail = adapt::harness_messages_to_messages(&result.retained_tail);
             let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
                 summary: result.summary,
                 messages_compacted: 0,
                 tokens_before: result.tokens_before,
+                retained_tail,
             })));
         }
         _ => {}

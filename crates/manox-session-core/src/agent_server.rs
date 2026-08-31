@@ -2366,4 +2366,87 @@ mod tests {
         agent::capability::drop_provider_for_test();
         agent::thread_store::drop_global_for_test();
     }
+
+    #[test]
+    fn open_session_snapshot_subscribe_is_atomic() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("pi-sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/proj");
+        init_globals();
+        agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        // Open the session — the pump subscribes synchronously inside
+        // spawn_pump, then emit_history_and_info sends the snapshot. Any
+        // event that fires after the subscribe is captured by the
+        // subscription and must not appear in the snapshot.
+        client.send(FromClient::Request {
+            id: MsgId::new("open"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        // Expect SessionCreated.
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        // Expect ThreadHistory (the snapshot).
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { session_id, .. }
+                } if session_id == "s1"
+            )
+        });
+        // Expect ThreadInfo.
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadInfo { session_id, .. }
+                } if session_id == "s1"
+            )
+        });
+        // Now inject an event — the pump subscribed before the snapshot
+        // was sent, so the event must arrive via the subscription stream.
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
+            .unwrap();
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { session_id } } if session_id == "s1"),
+        );
+        // Verify no duplicate TurnStarted. The snapshot is empty (fresh
+        // thread with no history), so the subscription should deliver the
+        // event exactly once.
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match client.conn.server_rx().try_recv() {
+                Ok(FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. },
+                }) => {
+                    panic!(
+                        "duplicate TurnStarted delivered — event is in both snapshot and subscription"
+                    );
+                }
+                Ok(_) => continue,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => break,
+            }
+        }
+        drop(client);
+        drop(server);
+        agent::thread_store::drop_global_for_test();
+    }
 }

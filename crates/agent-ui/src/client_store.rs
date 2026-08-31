@@ -199,6 +199,17 @@ impl ClientStore {
                     cache_read: *cache_read,
                 });
             }
+            // A compaction notification replaces the store's transcript with
+            // the retained tail (the server folds older history into the
+            // summary and keeps the most recent messages).
+            ServerNote::Compaction { retained, .. } => {
+                match serde_json::from_value::<Vec<Message>>(retained.clone()) {
+                    Ok(msgs) => self.messages = msgs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Compaction retained parse failed; keeping stale messages")
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -343,5 +354,48 @@ mod tests {
         });
         assert_eq!(store.cumulative_usage.as_ref().unwrap().input, 100);
         assert!((store.cumulative_cost - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn compaction_note_replaces_store_transcript() {
+        let mut store = ClientStore::default();
+        // Seed the store with a pair of messages via ThreadHistory.
+        let msgs = vec![
+            Message::user("hello".into()),
+            Message::assistant(vec![agent::language_model::MessageContent::Text(
+                "world".into(),
+            )]),
+        ];
+        let history = serde_json::to_value(&msgs).unwrap();
+        store.apply_server_note(&ServerNote::ThreadHistory {
+            session_id: "s1".into(),
+            messages: history.clone(),
+            display_history: serde_json::Value::Array(Vec::new()),
+            auto_approved_tools: None,
+            restored: false,
+            loading: false,
+        });
+        assert_eq!(store.messages.len(), 2, "should have two seeded messages");
+        // Apply a Compaction note with a summary and a retained tail that
+        // keeps only the assistant message.
+        let retained = serde_json::to_value(&msgs[1..]).unwrap();
+        store.apply_server_note(&ServerNote::Compaction {
+            session_id: "s1".into(),
+            summary: "compacted 1 message".into(),
+            retained,
+        });
+        // The store must replace (not append) its transcript: only the
+        // retained tail remains, plus the compaction summary message.
+        assert_eq!(
+            store.messages.len(),
+            1,
+            "compaction should replace transcript, leaving only retained messages"
+        );
+        // The retained message is the assistant's "world" reply.
+        assert_eq!(
+            store.messages[0].role,
+            agent::language_model::Role::Assistant,
+            "retained tail should survive compaction"
+        );
     }
 }

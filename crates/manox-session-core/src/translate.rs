@@ -165,9 +165,12 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             summary,
             messages_compacted,
             tokens_before,
+            retained_tail,
         } => Note(ServerNote::Compaction {
             session_id: session_id.into(),
             summary: format!("{summary} ({messages_compacted} msgs, {tokens_before} tokens)"),
+            retained: serde_json::to_value(retained_tail)
+                .unwrap_or(serde_json::Value::Array(Vec::new())),
         }),
         ThreadEvent::SubagentStarted {
             id,
@@ -275,3 +278,38 @@ pub fn token_usage_snapshot(usage: &agent::language_model::TokenUsage) -> TokenU
 }
 
 use Translated::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The compaction tail must flow through the REAL translate path, not a
+    /// synthetic empty array: the client store replaces its transcript with
+    /// `summary + retained`, so an empty-by-default field would wipe every
+    /// protocol client's transcript on each real compaction.
+    #[test]
+    fn compaction_note_carries_the_retained_tail() {
+        let tail = vec![
+            agent::message::Message::assistant(vec![agent::language_model::MessageContent::Text(
+                "kept answer".into(),
+            )]),
+            agent::message::Message::user("kept follow-up".into()),
+        ];
+        let translated = translate(
+            &::agent::thread::ThreadEvent::Compaction {
+                summary: "folded".into(),
+                messages_compacted: 9,
+                tokens_before: 100_000,
+                retained_tail: tail.clone(),
+            },
+            "s1",
+        );
+        let Translated::Note(ServerNote::Compaction { retained, .. }) = translated else {
+            panic!("expected a Compaction note");
+        };
+        let round: Vec<agent::message::Message> =
+            serde_json::from_value(retained).expect("retained deserializes back");
+        assert_eq!(round.len(), 2, "the tail survives the wire form");
+        assert_eq!(round.len(), tail.len());
+    }
+}
