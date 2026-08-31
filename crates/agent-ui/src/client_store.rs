@@ -103,6 +103,12 @@ impl ClientStore {
     pub fn apply_server_note(&mut self, note: &ServerNote) {
         match note {
             ServerNote::ThreadInfo { info, .. } => self.apply_thread_info(info),
+            // The session id is the thread id (`CreateSession` binds them);
+            // mirror it so `store.id` matches the bound thread without
+            // waiting for a `ThreadInfo` payload (which carries no id).
+            ServerNote::SessionCreated { session_id } => {
+                self.id = ThreadId(session_id.clone());
+            }
             ServerNote::ThreadHistory {
                 messages,
                 display_history,

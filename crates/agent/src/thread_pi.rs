@@ -588,8 +588,15 @@ impl Thread {
     /// sidebar (`open_existing` swaps in its engine) or starts typing
     /// (`run_turn` materializes a fresh engine on first use).
     pub fn landing(cwd: PathBuf) -> ThreadHandle {
+        Self::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd)
+    }
+
+    /// A landing thread with a caller-chosen id, so the desktop can bind its
+    /// AgentServer session to the same id (`CreateSession` uses the session
+    /// id as the `ThreadId`).
+    pub fn landing_with_id(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
         ThreadHandle::new(Self {
-            id: ThreadId(uuid::Uuid::new_v4().to_string()),
+            id,
             cwd,
             project: None,
             model: crate::pi_providers::default_model(),
