@@ -248,9 +248,15 @@ struct DeferredUserTurn {
 /// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
 /// to clear the running indicator, mark the thread unread, and drop it from
 /// `background_threads` — it never touches `conversation`/`self.thread`, so a
-/// background thread's events cannot be misattributed to the foreground thread.
+/// background thread's events cannot be misattributed to the foreground
+/// thread. The store + connection keep the parked thread's AgentServer session
+/// alive (reclaim re-attaches them; no `DisposeSession` is ever sent while
+/// parking — that would cancel a running turn).
 struct BackgroundThread {
     entity: Entity<ThreadEntity>,
+    store: Option<gpui::Entity<ClientStoreHandle>>,
+    client_conn: Option<manox_protocol::InProcessConnection>,
+    session_id: Option<String>,
     _sub: Subscription,
 }
 
@@ -314,6 +320,10 @@ pub struct Workspace {
     /// γ-3: the AgentServer session_id for the landing thread. Used as the
     /// `session_id` field in `FromClient` commands.
     pub(crate) session_id: Option<String>,
+    /// The shared AgentServer every foreground/background session connects
+    /// to. Created at landing; `attach_thread` opens per-thread sessions on
+    /// it via `ClientStoreHandle::for_session`.
+    pub(crate) agent_server: std::sync::Arc<manox_session_core::agent_server::AgentServer>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -733,15 +743,22 @@ impl Workspace {
         if let Some(home) = agent::paths::home_dir() {
             cwd = home;
         }
-        let thread = cx.new(|cx| ThreadProxy::new(Thread::landing(cwd.clone()), cx));
-
-        // γ-2a: the landing thread also gets an AgentServer-backed
-        // ClientStoreHandle — the desktop's transitional read path.
         let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
             cwd.clone(),
         ));
+        // The landing thread id doubles as its AgentServer session id
+        // (`CreateSession` uses the session id as the `ThreadId`), so the
+        // thread the workspace renders and the thread the server drives are
+        // the same conversation.
+        let landing_id = uuid::Uuid::new_v4().to_string();
+        let thread = cx.new(|cx| {
+            ThreadProxy::new(
+                Thread::landing_with_id(agent::ThreadId(landing_id.clone()), cwd.clone()),
+                cx,
+            )
+        });
         let (store, client_conn, session_id) = {
-            let session_id = uuid::Uuid::new_v4().to_string();
+            let session_id = landing_id.clone();
             let (client_conn, server_conn) = manox_protocol::in_process_pair();
             agent_server.accept(std::sync::Arc::new(server_conn));
             client_conn.send_to_server(manox_protocol::FromClient::Request {
@@ -800,6 +817,7 @@ impl Workspace {
             store: Some(store),
             client_conn: Some(client_conn),
             session_id: Some(session_id),
+            agent_server,
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
@@ -929,7 +947,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.attach_thread(thread, window, cx);
+        self.attach_thread(thread, false, window, cx);
     }
 
     /// Seed a parsed `AskUserQuestion` as the pending ask. Diagnostic-only:
@@ -1112,8 +1130,11 @@ impl Workspace {
     }
 
     fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
-        let thread = self.thread.clone();
-        cx.subscribe(&thread, |this, _thread, ev: &ThreadEvent, cx| {
+        let store = self
+            .store
+            .clone()
+            .expect("subscribe_thread requires the foreground store");
+        cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
             match ev {
                 ThreadEvent::ToolCallAuthorization { id, input, .. } => {
                     // Every interaction — AskUserQuestion calls and bubbled
@@ -1152,10 +1173,9 @@ impl Workspace {
                         title: title.clone(),
                         content,
                     });
-                    // Persist the pending verdict so a restart re-surfaces
-                    // the card (the engine re-emits PlanReady on Ready).
-                    this.thread
-                        .update(cx, |t, _| t.set_plan_review_pending(true));
+                    // The AgentServer pump already persisted the pending
+                    // verdict flag on PlanReady (agent_server.rs), so a
+                    // restart re-emits the card without a UI-side write.
                     // The sidebar row pauses its spinner (blue static) while
                     // the verdict is due; `respond_plan_review` releases it.
                     let thread_id = this
@@ -1709,125 +1729,122 @@ impl Workspace {
     /// subscription running it.
     fn subscribe_background_thread(
         &self,
-        thread: Entity<ThreadEntity>,
+        store: &gpui::Entity<ClientStoreHandle>,
+        id: String,
         cx: &mut Context<Self>,
     ) -> Subscription {
-        let id = thread.read(cx).id.0.clone();
-        cx.subscribe(
-            &thread,
-            move |this, _thread, ev: &ThreadEvent, cx| match ev {
-                ThreadEvent::TurnStarted => {
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| s.mark_running(&id));
-                }
-                ThreadEvent::ToolCallAuthorization { .. } => {
-                    // A parked thread's question card is not visible; the
-                    // sidebar badge is the only signal until the user
-                    // switches back and the card re-surfaces.
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_auth(&id, true));
-                }
-                ThreadEvent::ToolCall { status, .. }
-                    if !matches!(status, agent::thread::ToolCallStatus::PendingApproval) =>
-                {
-                    // Tool traffic past a parked authorization proves the run
-                    // resumed (the verdict resolved); drop the badge. The
-                    // `PendingApproval` card itself precedes the authorization
-                    // event and must not clear it.
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_auth(&id, false));
-                }
-                ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_auth(&id, false));
-                }
-                ThreadEvent::SteerInjected { message_id } => {
-                    this.consume_background_steer(&id, message_id);
-                }
-                ThreadEvent::PlanReady { plan_file, title } => {
-                    // A plan proposed while the thread was parked never reaches
-                    // the foreground handler: stash the review so the
-                    // switch-back restore (`attach_thread` drains `pending_plans`)
-                    // re-surfaces the verdict card, and persist the sidecar flag
-                    // so a restart re-emits PlanReady on Ready. The sidebar
-                    // keeps the blue-static wait until the verdict lands.
-                    let content = std::fs::read_to_string(plan_file).unwrap_or_default();
-                    this.pending_plans.insert(
-                        id.clone(),
-                        PendingPlanReview {
-                            plan_file: plan_file.clone(),
-                            title: title.clone(),
-                            content,
-                        },
-                    );
-                    _thread.update(cx, |t, _| t.set_plan_review_pending(true));
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_plan(&id, true));
-                }
-                ThreadEvent::TurnFinished {
-                    cancelled,
-                    failed,
-                    stranded_steer_ids,
-                    ..
-                } => {
-                    // A cancelled/failed turn voids a stashed plan review
-                    // (mirroring the foreground demote); a normal settle keeps
-                    // it so the switch-back restore re-surfaces the card. The
-                    // pending-plan badge stays up while a review is stashed —
-                    // the card is not visible until the user switches back.
-                    if *cancelled || *failed {
-                        this.pending_plans.remove(&id);
-                    }
-                    let has_stashed_plan = this.pending_plans.contains_key(&id);
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| {
-                        s.mark_idle(&id);
-                        if !has_stashed_plan {
-                            s.mark_pending_plan(&id, false);
-                        }
-                        s.mark_pending_auth(&id, false);
-                        if !*failed {
-                            s.set_errored(&id, false);
-                        }
-                        s.set_unread(&id, true);
-                    });
-                    // Mirror the foreground terminal bookkeeping: steers the
-                    // aborted turn never drained flip to `Failed` in the
-                    // parked stash (a late `SteerInjected` can still heal
-                    // them), and queued follow-ups only become the next turn
-                    // on a natural settle — never after a cancel.
-                    this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
-                    if !*cancelled {
-                        this.flush_parked_follow_ups(&id, cx);
-                    }
-                }
-                ThreadEvent::Error(_) => {
-                    // An errored run voids a stashed plan review (the verdict
-                    // is moot once the loop bailed out).
+        let store = store.clone();
+        cx.subscribe(&store, move |this, _store, ev: &ThreadEvent, cx| match ev {
+            ThreadEvent::TurnStarted => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_running(&id));
+            }
+            ThreadEvent::ToolCallAuthorization { .. } => {
+                // A parked thread's question card is not visible; the
+                // sidebar badge is the only signal until the user
+                // switches back and the card re-surfaces.
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, true));
+            }
+            ThreadEvent::ToolCall { status, .. }
+                if !matches!(status, agent::thread::ToolCallStatus::PendingApproval) =>
+            {
+                // Tool traffic past a parked authorization proves the run
+                // resumed (the verdict resolved); drop the badge. The
+                // `PendingApproval` card itself precedes the authorization
+                // event and must not clear it.
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, false));
+            }
+            ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_auth(&id, false));
+            }
+            ThreadEvent::SteerInjected { message_id } => {
+                this.consume_background_steer(&id, message_id);
+            }
+            ThreadEvent::PlanReady { plan_file, title } => {
+                // A plan proposed while the thread was parked never reaches
+                // the foreground handler: stash the review so the
+                // switch-back restore (`attach_thread` drains `pending_plans`)
+                // re-surfaces the verdict card, and persist the sidecar flag
+                // so a restart re-emits PlanReady on Ready. The sidebar
+                // keeps the blue-static wait until the verdict lands.
+                let content = std::fs::read_to_string(plan_file).unwrap_or_default();
+                this.pending_plans.insert(
+                    id.clone(),
+                    PendingPlanReview {
+                        plan_file: plan_file.clone(),
+                        title: title.clone(),
+                        content,
+                    },
+                );
+                let store = agent::thread_store_global();
+                store.with_mut(|s| s.mark_pending_plan(&id, true));
+            }
+            ThreadEvent::TurnFinished {
+                cancelled,
+                failed,
+                stranded_steer_ids,
+                ..
+            } => {
+                // A cancelled/failed turn voids a stashed plan review
+                // (mirroring the foreground demote); a normal settle keeps
+                // it so the switch-back restore re-surfaces the card. The
+                // pending-plan badge stays up while a review is stashed —
+                // the card is not visible until the user switches back.
+                if *cancelled || *failed {
                     this.pending_plans.remove(&id);
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| {
-                        s.mark_idle(&id);
-                        s.mark_background_work(&id, false);
+                }
+                let has_stashed_plan = this.pending_plans.contains_key(&id);
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_idle(&id);
+                    if !has_stashed_plan {
                         s.mark_pending_plan(&id, false);
-                        s.mark_pending_auth(&id, false);
-                        s.set_errored(&id, true);
-                        s.set_unread(&id, true);
-                    });
+                    }
+                    s.mark_pending_auth(&id, false);
+                    if !*failed {
+                        s.set_errored(&id, false);
+                    }
+                    s.set_unread(&id, true);
+                });
+                // Mirror the foreground terminal bookkeeping: steers the
+                // aborted turn never drained flip to `Failed` in the
+                // parked stash (a late `SteerInjected` can still heal
+                // them), and queued follow-ups only become the next turn
+                // on a natural settle — never after a cancel.
+                this.mark_parked_stranded_steers_failed(&id, stranded_steer_ids);
+                if !*cancelled {
+                    this.flush_parked_follow_ups(&id, cx);
                 }
-                ThreadEvent::BackgroundTaskUpdated { .. } => {
-                    let store = agent::thread_store_global();
-                    store.with_mut(|s| {
-                        s.mark_background_work(
-                            &id,
-                            agent::background_task::thread_has_running_tasks(&id),
-                        );
-                        s.set_unread(&id, true);
-                    });
-                }
-                _ => {}
-            },
-        )
+            }
+            ThreadEvent::Error(_) => {
+                // An errored run voids a stashed plan review (the verdict
+                // is moot once the loop bailed out).
+                this.pending_plans.remove(&id);
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_idle(&id);
+                    s.mark_background_work(&id, false);
+                    s.mark_pending_plan(&id, false);
+                    s.mark_pending_auth(&id, false);
+                    s.set_errored(&id, true);
+                    s.set_unread(&id, true);
+                });
+            }
+            ThreadEvent::BackgroundTaskUpdated { .. } => {
+                let store = agent::thread_store_global();
+                store.with_mut(|s| {
+                    s.mark_background_work(
+                        &id,
+                        agent::background_task::thread_has_running_tasks(&id),
+                    );
+                    s.set_unread(&id, true);
+                });
+            }
+            _ => {}
+        })
     }
 
     /// Flip the parked thread's `SteerPending` cards whose steers an aborted
@@ -2015,7 +2032,7 @@ impl Workspace {
         if let Some(dir) = &project {
             Self::register_project_in_store(dir, cx);
         }
-        self.attach_thread(new, window, cx);
+        self.attach_thread(new, false, window, cx);
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -3558,10 +3575,16 @@ impl Workspace {
         )
     }
 
-    /// Switch to a new thread: persist the current one, build/load the new one, re-subscribe, and rebuild the conversation view.
+    /// Switch to a new thread: persist the current one, build/load the new
+    /// one, re-subscribe, and rebuild the conversation view. Each thread gets
+    /// its own AgentServer session (`reopen` = `OpenSession` on an existing
+    /// thread, else `CreateSession` on a fresh one); parking a running thread
+    /// keeps its store/connection so the session stays alive and is never
+    /// cancelled.
     fn attach_thread(
         &mut self,
         new_thread: Entity<ThreadEntity>,
+        reopen: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3626,10 +3649,15 @@ impl Workspace {
         // so its `run_turn_loop` task stays alive (the entity is otherwise only
         // held by `self.thread`; overwriting that field would drop it and
         // silently kill the turn via `WeakEntity::upgrade() -> None`).
-        if (old_thread.read(cx).is_running()
+        // Park a still-running old thread in the background. Its store,
+        // connection and session are carried along (never `DisposeSession` —
+        // that would cancel the running turn): reclaim re-attaches them and
+        // the sidebar badges read them. An idle old thread's session has no
+        // activity to preserve, so its store is simply dropped.
+        let old_running = (old_thread.read(cx).is_running()
             || agent::background_task::thread_has_running_tasks(&old_id))
-            && old_id != new_id
-        {
+            && old_id != new_id;
+        if old_running {
             // Seed the live-state sets for whatever is still in flight: the
             // background subscription below reacts only to future events, so a
             // turn that started (or a monitor / task that spawned) while this
@@ -3644,11 +3672,65 @@ impl Workspace {
                 let store = agent::thread_store_global();
                 store.with_mut(|s| s.mark_background_work(&old_id, true));
             }
-            let sub = self.subscribe_background_thread(old_thread.clone(), cx);
+            let old_store = self.store.take();
+            let old_conn = self.client_conn.take();
+            let old_sid = self.session_id.take();
+            let sub = self.subscribe_background_thread(
+                old_store
+                    .as_ref()
+                    .expect("a parked running thread always has a store"),
+                old_id.clone(),
+                cx,
+            );
             self.background_threads.push(BackgroundThread {
                 entity: old_thread,
+                store: old_store,
+                client_conn: old_conn,
+                session_id: old_sid,
                 _sub: sub,
             });
+        } else if old_id != new_id {
+            // Idle switch: the outgoing session has nothing in flight. The
+            // AgentServer removes the owner on disconnect; the thread persists
+            // in the db for a later `OpenSession`.
+            self.store = None;
+            self.client_conn = None;
+            self.session_id = None;
+        }
+
+        // If the new thread was previously parked in the background, reclaim it
+        // (entity + store + connection) so it becomes the foreground thread
+        // and is no longer double-held.
+        if let Some(pos) = self
+            .background_threads
+            .iter()
+            .position(|b| b.entity.read(cx).id.0 == new_id)
+        {
+            let bg = self.background_threads.remove(pos);
+            self.store = bg.store;
+            self.client_conn = bg.client_conn;
+            self.session_id = bg.session_id;
+        }
+
+        // A brand-new foreground thread gets its own session: `reopen` binds
+        // an existing thread via `OpenSession` (history arrives as
+        // `ServerNote`s), otherwise a fresh one via `CreateSession`.
+        if self.store.is_none() {
+            let server = self.agent_server.clone();
+            let new_sid = new_id.clone();
+            let cwd = thread_cwd(&new_thread, &None, cx)
+                .unwrap_or_default()
+                .to_string();
+            let mut conn_slot: Option<manox_protocol::InProcessConnection> = None;
+            let store = cx.new(|cx| {
+                let (handle, conn) =
+                    ClientStoreHandle::for_session(&server, &new_sid, &cwd, reopen, cx);
+                conn_slot = Some(conn);
+                handle
+            });
+            self.store = Some(store);
+            self.client_conn = conn_slot;
+            self.session_id = Some(new_sid);
         }
 
         // If the new thread was previously parked in the background, reclaim it
@@ -4145,7 +4227,7 @@ impl Workspace {
             t.set_reasoning_effort(effort);
             t.set_permission_mode(permission);
         });
-        self.attach_thread(new, window, cx);
+        self.attach_thread(new, false, window, cx);
     }
 
     /// Park the active thread into the background (preserving its run + event
@@ -4186,8 +4268,8 @@ impl Workspace {
             .iter()
             .position(|b| b.entity.read(cx).id.0 == id)
         {
-            let thread = self.background_threads.remove(pos).entity;
-            self.attach_thread(thread, window, cx);
+            let bg = self.background_threads.remove(pos);
+            self.attach_thread(bg.entity, true, window, cx);
             return;
         }
         let store = self.sidebar.read(cx).store();
@@ -4195,7 +4277,7 @@ impl Workspace {
             return;
         };
         let loaded = cx.new(|cx| ThreadProxy::new(loaded, cx));
-        self.attach_thread(loaded, window, cx);
+        self.attach_thread(loaded, true, window, cx);
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6223,7 +6305,7 @@ impl Workspace {
                 t.set_permission_mode(permission);
                 t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui));
             });
-            self.attach_thread(new, window, cx);
+            self.attach_thread(new, false, window, cx);
             refresh_thread_list();
             agent::thread_store_global().with_mut(|s| s.archive_thread(&old_id, true));
         } else {
@@ -9727,6 +9809,9 @@ fn truncate_follow_up(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Serializes tests that init/replace the process-wide `thread_store`
+    /// global; without it parallel tests clobber each other's store.
+    static GLOBALS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::{
         ComposerPlacement, RecallDirection, RecallStep, Workspace, composer_key_context,
         composer_placement, editor_can_submit,
@@ -9962,6 +10047,7 @@ mod tests {
     async fn right_pane_state_machine(cx: &mut gpui::TestAppContext) {
         use super::{PersistedRightTab, RightTab};
         use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
 
         cx.update(gpui_component::init);
         let db_path =
@@ -10158,5 +10244,83 @@ mod tests {
             .line
         });
         assert_eq!(row, 1, "native MoveDown moved the caret back down");
+    }
+
+    #[gpui::test]
+    fn attach_thread_rebinds_store_to_new_session(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-attach-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            agent::runtime::init();
+            agent::pi_providers::init();
+            agent::thread_store::init_for_test(db.clone());
+        });
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+        let landing_id = ws.read_with(&visual, |ws, cx| ws.thread.read(cx).id.0.clone());
+
+        // The landing thread's session is bound to its own id.
+        let session_id = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+        assert_eq!(session_id, Some(landing_id.clone()), "landing session id");
+
+        // Attach a fresh thread: a new session is created for it, so the
+        // foreground store now mirrors the new thread (not the old one).
+        let new_id = "t-attach-2".to_string();
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                let new = cx.new(|cx| {
+                    crate::thread_proxy::ThreadProxy::new(
+                        agent::Thread::new_fresh(agent::ThreadId(new_id.clone()), "/".into()),
+                        cx,
+                    )
+                });
+                ws.attach_thread(new, false, _window, cx);
+            });
+        });
+        cx.run_until_parked();
+        // Give the new session's pump a beat to deliver ThreadInfo.
+        cx.run_until_parked();
+        let rebound = ws.read_with(&visual, |ws, cx| {
+            let store_id = ws.store.as_ref().map(|s| s.read(cx).store.id.0.clone());
+            (
+                ws.session_id.clone(),
+                store_id,
+                ws.thread.read(cx).id.0.clone(),
+            )
+        });
+        cx.run_until_parked();
+        // Give the new session's pump a beat to deliver ThreadInfo.
+        assert_eq!(
+            rebound.0.as_deref(),
+            Some(new_id.as_str()),
+            "session rebound"
+        );
+        assert_eq!(
+            rebound.1.as_deref(),
+            Some(new_id.as_str()),
+            "store mirrors new thread"
+        );
+        assert_eq!(rebound.2, new_id, "foreground thread swapped");
+        drop(ws);
+        drop(visual);
+        agent::thread_store::drop_global_for_test();
     }
 }

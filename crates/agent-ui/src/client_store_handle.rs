@@ -66,13 +66,16 @@ impl ClientStoreHandle {
     /// accepts the in-process connection and the client immediately declares
     /// itself (handshake + session creation), so the pump starts mirroring
     /// `ServerNote`s for `session_id`. The desktop's transitional read path —
-    /// Create a handle that pumps `FromServer` notifications into the store,
-    /// and return a clone of the client connection for sending `FromClient`
-    /// commands (γ-3 mutation path).
+    /// Create a handle wired to a live `AgentServer` session. `reopen` picks
+    /// the binding: `false` declares a fresh thread (`CreateSession`), `true`
+    /// reopens an existing one (`OpenSession` — idempotent: a live session
+    /// replays its snapshots, a persisted one loads from disk; the history
+    /// arrives via `ServerNote`s, so the Request response is ignored).
     pub fn for_session(
         server: &manox_session_core::agent_server::AgentServer,
         session_id: &str,
         cwd: &str,
+        reopen: bool,
         cx: &mut Context<Self>,
     ) -> (Self, manox_protocol::InProcessConnection) {
         use manox_protocol::*;
@@ -90,12 +93,21 @@ impl ClientStoreHandle {
                 sessions: vec![],
             }),
         });
-        client_conn.send_to_server(FromClient::Notification {
-            note: ClientNote::CreateSession {
-                session_id: session_id.into(),
-                cwd: Some(cwd.into()),
-            },
-        });
+        if reopen {
+            client_conn.send_to_server(FromClient::Request {
+                id: MsgId::new("open"),
+                call: ClientCall::OpenSession {
+                    session_id: session_id.into(),
+                },
+            });
+        } else {
+            client_conn.send_to_server(FromClient::Notification {
+                note: ClientNote::CreateSession {
+                    session_id: session_id.into(),
+                    cwd: Some(cwd.into()),
+                },
+            });
+        }
         let sender = client_conn.clone();
         let handle = Self::new(client_conn, cx);
         (handle, sender)
