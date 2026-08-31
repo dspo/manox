@@ -149,6 +149,14 @@ pub fn server_note_to_webview_json(note: &ServerNote) -> Option<Value> {
             "sessionId": session_id,
             "tokensBefore": tokens_before,
         }),
+        ServerNote::CacheInvalidation {
+            session_id,
+            reprocessed_tokens,
+        } => json!({
+            "type": "cache_invalidation",
+            "sessionId": session_id,
+            "reprocessedTokens": reprocessed_tokens,
+        }),
         // ThreadEvent projections (mirror events.rs field-for-field).
         ServerNote::TurnStarted { session_id } => {
             json!({"type": "turn_started", "sessionId": session_id})

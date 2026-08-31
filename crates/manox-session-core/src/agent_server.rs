@@ -306,14 +306,14 @@ impl AgentServerInner {
     // ── Snapshots (queries). ────────────────────────────────────────────────
     fn emit_history_and_info(&self, thread: &ThreadHandle, session_id: &str, restored: bool) {
         let messages = thread.read(|t| strip_messages_for_wire(t.messages()));
-        // β-3a: the display sequence (messages ⊕ UI note cards) needs a
-        // dedicated serializer; ship an empty array until that lands.
+        let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
+            .unwrap_or_else(|_| json!([]));
         self.route_note(
             session_id,
             ServerNote::ThreadHistory {
                 session_id: session_id.into(),
                 messages,
-                display_history: json!([]),
+                display_history,
                 auto_approved_tools: None,
                 restored,
                 loading: false,
@@ -591,6 +591,10 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             session_id,
             plan_file,
         } => inner.plan_seed(&session_id, &plan_file),
+        ClientNote::Compact {
+            session_id,
+            instructions,
+        } => inner.compact(&session_id, instructions),
         ClientNote::Goal {
             session_id,
             action,
@@ -942,6 +946,13 @@ impl AgentServerInner {
             let content = to_message_content(text, images);
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
         });
+    }
+
+    fn compact(&self, session_id: &str, instructions: Option<String>) {
+        let Some(thread) = self.session_thread(session_id) else {
+            return self.note_error(session_id, "unknown session");
+        };
+        thread.with_mut(|t| t.compact(instructions));
     }
 
     fn plan_seed(&self, session_id: &str, plan_file: &str) {
