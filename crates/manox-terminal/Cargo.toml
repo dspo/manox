@@ -31,6 +31,7 @@ hyperlinks.workspace = true
 
 # cx library —— `SessionHandle` 驱动外部 agent CLI 的 PTY，供 `CxSessionSource` 包裹。
 cx.workspace = true
+manox-ext-agents.workspace = true
 
 [features]
 # Enables `store::init_for_test` / `drop_for_test` so cross-crate harness tests

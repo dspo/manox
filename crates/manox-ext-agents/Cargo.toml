@@ -1,0 +1,29 @@
+[package]
+name = "manox-ext-agents"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+manox-providers.workspace = true
+dirs = "6.0"
+libc = "0.2"
+portable-pty = "0.9"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "io-util"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "native-tls"] }
+futures-util = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+which = "7.0"
+
+[dev-dependencies]
+tempfile = "3"

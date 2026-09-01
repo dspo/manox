@@ -11,7 +11,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::Agent;
+use crate::api::Agent;
 use crate::session::{self, SessionRegistry};
 
 /// Byte prepended to clear an agent's input area before injecting (Ctrl+U).
@@ -22,7 +22,7 @@ pub const CLEAR_INPUT_BYTE: u8 = 0x15;
 /// `CLEAR_INPUT_BYTE` as a `&str`, shared by `compose_effective` (socket path)
 /// and `SessionHandle::clear_buffer` / `write_over` (in-process path) so the
 /// clear prefix cannot drift between them.
-pub(crate) const CLEAR_INPUT: &str = "\u{15}";
+pub const CLEAR_INPUT: &str = "\u{15}";
 
 /// How a caller picks the target session. The CLI parses its `--session` string
 /// into this; library callers construct it directly for type safety.
@@ -77,7 +77,7 @@ pub fn send(selector: &SendSelector, text: Option<&str>, clear_buffer: bool) -> 
 
 /// Pick one live session by selector. `started_at` is RFC3339, so a descending
 /// lexicographic sort yields the most recent.
-pub(crate) fn resolve_session<'a>(
+pub fn resolve_session<'a>(
     alive: &'a [SessionRegistry],
     selector: &SendSelector,
 ) -> Result<&'a SessionRegistry> {
@@ -108,7 +108,7 @@ pub(crate) fn resolve_session<'a>(
 
 /// Compose the `text` payload: prepend the clear byte when requested. The relay
 /// appends the trailing `'\n'`, so callers never include it here.
-pub(crate) fn compose_effective(text: Option<&str>, clear_buffer: bool) -> String {
+pub fn compose_effective(text: Option<&str>, clear_buffer: bool) -> String {
     match (text, clear_buffer) {
         (Some(t), true) => format!("{CLEAR_INPUT}{t}"),
         // Ctrl+U then the relay's appended '\n': claude code clears the input box
@@ -119,21 +119,6 @@ pub(crate) fn compose_effective(text: Option<&str>, clear_buffer: bool) -> Strin
         (None, false) => {
             unreachable!("caller must pass text or clear_buffer (validated by `send`)")
         }
-    }
-}
-
-/// Map a CLI `--session` string to a typed selector. Keywords are
-/// case-insensitive; anything else is treated as a literal session id.
-pub(crate) fn parse_selector(session: Option<&str>) -> SendSelector {
-    let Some(value) = session else {
-        return SendSelector::Latest;
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "latest" => SendSelector::Latest,
-        "claude" => SendSelector::Agent(Agent::Claude),
-        "codex" => SendSelector::Agent(Agent::Codex),
-        "copilot" => SendSelector::Agent(Agent::Copilot),
-        _ => SendSelector::Id(value.to_ascii_lowercase()),
     }
 }
 
@@ -250,27 +235,5 @@ mod tests {
     fn send_rejects_empty_without_clear() {
         let err = send(&SendSelector::Latest, None, false).unwrap_err();
         assert!(format!("{err}").contains("--clear-buffer"));
-    }
-
-    #[test]
-    fn parse_selector_defaults_to_latest_and_maps_keywords() {
-        assert!(matches!(parse_selector(None), SendSelector::Latest));
-        assert!(matches!(
-            parse_selector(Some("latest")),
-            SendSelector::Latest
-        ));
-        assert!(matches!(
-            parse_selector(Some("Claude")),
-            SendSelector::Agent(Agent::Claude)
-        ));
-        assert!(matches!(
-            parse_selector(Some("CODEX")),
-            SendSelector::Agent(Agent::Codex)
-        ));
-        // ids are 32-hex lowercase; an uppercase id is lowercased to match.
-        match parse_selector(Some("DeadBeef")) {
-            SendSelector::Id(s) => assert_eq!(s, "deadbeef"),
-            _ => panic!("expected Id"),
-        }
     }
 }

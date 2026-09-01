@@ -13,25 +13,26 @@
 # gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
 [workspace]
 members = [
-    "crates/manox-agent",
-    "apps/desktop/agent-ui",
-    "apps/desktop/manox",
-    "crates/manox-harness",
-    "crates/manox-terminal",
-    "apps/desktop/terminal-ui",
-    "apps/desktop/manox-components",
-    "crates/supervisor",
-    "crates/lsp",
-    "apps/desktop/manox-webview",
-    "apps/desktop/manox-webview-macros",
-    "crates/cx",
-    "crates/manox-providers",
-    "crates/manox-session-core",
-    "apps/vscode/manox-napi",
-    "crates/manox-webui",
-    "crates/manox-protocol",
-    "crates/hyperlinks",
-]
+	    "crates/manox-agent",
+	    "apps/desktop/agent-ui",
+	    "apps/desktop/manox",
+	    "crates/manox-harness",
+	    "crates/manox-terminal",
+	    "apps/desktop/terminal-ui",
+	    "apps/desktop/manox-components",
+	    "crates/supervisor",
+	    "crates/lsp",
+	    "apps/desktop/manox-webview",
+	    "apps/desktop/manox-webview-macros",
+	    "crates/cx",
+	    "crates/manox-providers",
+	    "crates/manox-session-core",
+	    "apps/vscode/manox-napi",
+	    "crates/manox-webui",
+	    "crates/manox-protocol",
+	    "crates/hyperlinks",
+	    "crates/manox-ext-agents",
+	]
 resolver = "2"
 
 [workspace.package]
@@ -57,6 +58,7 @@ manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
 manox-harness = { path = "crates/manox-harness" }
 hyperlinks = { path = "crates/hyperlinks" }
+	manox-ext-agents = { path = "crates/manox-ext-agents" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
 # 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。manox-providers 为 provider
 # 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。

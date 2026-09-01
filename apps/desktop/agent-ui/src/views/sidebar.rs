@@ -571,7 +571,7 @@ impl Sidebar {
                 menu = menu.item(
                     PopupMenuItem::new("VS Code")
                         .icon(icon)
-                        .disabled(!cx::vscode_app_installed())
+                        .disabled(!manox_ext_agents::vscode_app_installed())
                         .on_click(move |_, _window, cx| {
                             let _ = sidebar.update(cx, |this, cx| {
                                 let project = this.new_session_project.clone();
@@ -1414,7 +1414,7 @@ fn build_project_menu(
         menu = menu.item(
             PopupMenuItem::new("VS Code")
                 .icon(icon)
-                .disabled(!cx::vscode_app_installed())
+                .disabled(!manox_ext_agents::vscode_app_installed())
                 .on_click(move |_, _window, cx| {
                     let _ = sidebar_vscode.update(cx, |this, cx| {
                         let project = this.new_session_project.clone();

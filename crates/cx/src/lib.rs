@@ -1,3 +1,8 @@
+#![allow(clippy::empty_line_after_doc_comments)]
+use manox_ext_agents::api::Agent;
+use manox_ext_agents::send::SendSelector;
+use manox_ext_agents::*;
+
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Parser, Subcommand};
@@ -28,29 +33,20 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 use manox_providers::{
-    AgentConfig, ApiKeySourceKind, ChatGptAppSettings, CopilotAuth, CxConfig, EndpointConfig,
-    ModelConfig, PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec,
-    ProviderModelConfig, ProviderModels, ResolvedAgent, ResolvedModel, VsCodeAppSettings,
-    VsCodeExtensionBlock, WireApi, active_provider_config_path, canonical_agent_id,
-    context_window_from_suffix, cx_state_dir, effective_agents_for_model, read_config_file,
-    resolve_apikey, resolved_agents,
+    AgentConfig, ApiKeySourceKind, ChatGptAppSettings, CopilotAuth, CxConfig,
+    PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec, ProviderModelConfig,
+    ProviderModels, ResolvedAgent, ResolvedModel, VsCodeAppSettings, WireApi,
+    active_provider_config_path, canonical_agent_id, context_window_from_suffix, cx_state_dir,
+    effective_agents_for_model, read_config_file, resolve_apikey, resolved_agents,
 };
 
-mod chatgpt_app;
+// mod chatgpt_app; -- moved to manox-ext-agents
 mod probe;
 mod relay;
-mod session;
+// mod session; -- moved to manox-ext-agents
 mod stats;
-mod vscode_app;
-mod warp;
-
-/// Programmatic agent launch API (builder + live session handle).
-pub mod api;
-pub use api::{Agent, AgentBuilder, SessionHandle, SessionResult};
-
-/// Out-of-process message injection into a running session (`cx send` core).
-pub mod send;
-pub use send::{CLEAR_INPUT_BYTE, SendSelector, SendTarget, send};
+// mod vscode_app; -- moved to manox-ext-agents
+// mod warp; -- moved to manox-ext-agents
 
 const SEND_AFTER_HELP: &str = "\
 示例:
@@ -123,96 +119,8 @@ enum TextInputAction {
     Cancel,
 }
 
-// resolved_model_from_config delegates to the shared ResolvedModel::from_config
-// in manox-providers — the single source of truth for capability defaults and
-// agent/endpoint compatibility resolution.
-fn resolved_model_from_config(
-    config: &CxConfig,
-    provider: &ProviderConfig,
-    endpoint: &EndpointConfig,
-    model: &ModelConfig,
-) -> ResolvedModel {
-    ResolvedModel::from_config(config, provider, endpoint, model)
-}
-
 /// True if `model` lists `agent_id` (modulo `canonical_agent_id` normalization).
-fn resolved_model_supports_agent(model: &ResolvedModel, agent_id: &str) -> bool {
-    let agent_id = canonical_agent_id(agent_id);
-    model
-        .visible_agents
-        .iter()
-        .any(|a| canonical_agent_id(a) == agent_id)
-}
-
-#[derive(Debug, Clone)]
-struct ModelOption {
-    selection_key: String,
-    id: String,
-    desc: String,
-    variants: Vec<ResolvedModel>,
-}
-
-impl ModelOption {
-    fn from_variants(variants: Vec<ResolvedModel>) -> Self {
-        let first = variants
-            .first()
-            .expect("ModelOption::from_variants requires at least one variant");
-        Self {
-            selection_key: format!("{}\t{}", first.provider_name, first.id),
-            id: first.id.clone(),
-            desc: first.desc.clone(),
-            variants,
-        }
-    }
-
-    fn default_variant_index(&self, agent_wire_apis: Option<&[WireApi]>) -> usize {
-        let filtered: Vec<(usize, &ResolvedModel)> = self
-            .variants
-            .iter()
-            .enumerate()
-            .filter(|(_, v)| agent_wire_apis.is_none_or(|apis| apis.contains(&v.wire_api)))
-            .collect();
-        filtered
-            .into_iter()
-            .min_by_key(|(_, variant)| variant.wire_api.priority())
-            .map(|(index, _)| index)
-            .unwrap_or(0)
-    }
-
-    fn selected_variant_index(
-        &self,
-        selected_wire_apis: &BTreeMap<String, usize>,
-        agent_wire_apis: Option<&[WireApi]>,
-    ) -> usize {
-        selected_wire_apis
-            .get(&self.selection_key)
-            .copied()
-            .filter(|index| *index < self.variants.len())
-            .unwrap_or_else(|| self.default_variant_index(agent_wire_apis))
-    }
-
-    fn selected_variant<'a>(
-        &'a self,
-        selected_wire_apis: &BTreeMap<String, usize>,
-        agent_wire_apis: Option<&[WireApi]>,
-    ) -> &'a ResolvedModel {
-        &self.variants[self.selected_variant_index(selected_wire_apis, agent_wire_apis)]
-    }
-
-    fn formatted_row(
-        &self,
-        selected_wire_apis: &BTreeMap<String, usize>,
-        agent_wire_apis: Option<&[WireApi]>,
-    ) -> String {
-        let selected = self.selected_variant(selected_wire_apis, agent_wire_apis);
-        format!(
-            "{:<24} {:<11}  {}",
-            self.id,
-            selected.wire_api.display(),
-            self.desc
-        )
-    }
-}
+///
 
 /// Model 列表表头，与 `ModelOption::formatted_row()` 使用相同的列宽格式。
 /// 左侧 3 spaces 对齐 `highlight_symbol("✨ ")` 的 3 列宽偏移。
@@ -263,44 +171,6 @@ fn wire_api_launch_value(wire_api: WireApi) -> Result<&'static str> {
             bail!("该模型当前被标记为 unavailable，请先运行 `cx probe` 更新探测结果")
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedProvider {
-    name: String,
-    has_endpoints: bool,
-    apikey_source: Option<String>,
-    env: BTreeMap<String, String>,
-}
-
-impl ResolvedProvider {
-    fn from_config(config: &ProviderConfig) -> Self {
-        Self {
-            name: config.name.clone(),
-            has_endpoints: config.has_endpoints(),
-            apikey_source: config.apikey_source.clone(),
-            env: config.env.clone(),
-        }
-    }
-
-    fn requires_model(&self) -> bool {
-        self.has_endpoints
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Selection {
-    agent_id: String,
-    agent_binary: String,
-    agent_args: Vec<String>,
-    agent_env: BTreeMap<String, String>,
-    selected_wire_api: WireApi,
-    provider: ResolvedProvider,
-    model: Option<ResolvedModel>,
-    /// 仅 ChatGPT.app 等注入型 agent 使用：注入给桌面端的完整模型列表。
-    /// 首个元素为默认模型（写入 config.toml 的 `model =`，并在注入脚本里标记 `isDefault`）。
-    /// 非 ChatGPT.app agent 始终为空 Vec。
-    injected_models: Vec<ResolvedModel>,
 }
 
 fn default_agent_configs() -> Vec<AgentConfig> {
@@ -908,13 +778,7 @@ fn prepare_chatgpt_launch_home_for_app(
 }
 
 /// `prepare_chatgpt_launch_home_for_app` 的产物，供 chatgpt_app 启动编排使用。
-struct ChatGptAppPrepared {
-    codex_home: PathBuf,
-    env_key: String,
-    reasoning_effort: String,
-    /// Settings 配置的自定义环境变量（保留键在注入时过滤）。
-    custom_env: BTreeMap<String, String>,
-}
+// struct ChatGptAppPrepared -- now in manox-ext-agents
 
 fn load_config() -> Result<CxConfig> {
     let path = active_provider_config_path()?;
@@ -985,7 +849,7 @@ fn resolved_models_for_provider(
     let mut models = Vec::new();
     for endpoint in provider.normalized_endpoints_resolved(&fetched) {
         for model in &endpoint.models {
-            models.push(resolved_model_from_config(
+            models.push(ResolvedModel::from_config(
                 config, provider, &endpoint, model,
             ));
         }
@@ -1193,7 +1057,12 @@ pub fn launch_chatgpt_app(provider_name: &str, default_model_id: &str) -> Result
     apply_probe_cache(&mut all_models);
     let selection = build_chatgpt_selection(&config, &all_models, provider_name, default_model_id)?;
     let apikey = resolve_chatgpt_app_apikey(&selection.provider)?;
-    chatgpt_app::launch_with_injection(&selection, &apikey, &[], &chatgpt_settings)
+    manox_ext_agents::chatgpt_app::launch_with_injection(
+        &selection,
+        &apikey,
+        &[],
+        &chatgpt_settings,
+    )
 }
 
 /// ChatGPT.app 注入使用的 CODEX_HOME 目录（Settings 只读展示）。
@@ -1457,158 +1326,7 @@ fn normalize_vscode_app_settings(settings: VsCodeAppSettings) -> Option<VsCodeAp
 }
 
 /// VS Code 的 Claude Code 扩展注入部分（ANTHROPIC_* BYOK env）。
-pub(crate) struct VsCodeClaudePart {
-    pub selection: Selection,
-    pub apikey: String,
-}
-
-/// VS Code 的 Codex 扩展注入部分（CODEX_HOME + config.toml 官方机制，
-/// 复用 ChatGPT.app 的准备逻辑）。
-pub(crate) struct VsCodeCodexPart {
-    pub prepared: ChatGptAppPrepared,
-    pub apikey: String,
-    /// 启动摘要展示用。
-    pub provider_name: String,
-    pub model_id: String,
-    /// 发给 provider 的 model id（剥除上下文后缀）；Claude 部分缺席时用作 CX_MODEL。
-    pub api_model_id: String,
-    /// Provider + Model 级自定义环境变量（ResolvedModel.env 已合并）。
-    pub model_env: BTreeMap<String, String>,
-}
-
-/// 非交互启动 VS Code：读取持久化 `vscode_app:` 设置，按需注入
-/// Claude Code Extension（ANTHROPIC_* env）与 Codex Extension
-///（CODEX_HOME + config.toml，复用 ChatGPT.app 注入机制）；两块均不注入时
-/// 等效普通打开。供 GUI 嵌入方（manox 系统菜单 / 侧边栏单一入口）与 CLI TUI
-/// 调用。`folder` 为 `Some` 时新实例直接打开该目录（侧边栏项目路径）；
-/// 系统菜单路径传 `None`。
-/// 机制见 `vscode_app` 模块：解析登录 shell env 后以最高优先级叠加注入 env，
-/// 带 VSCODE_CLI=1 启动，令扩展宿主 / 各扩展 / 集成终端继承注入值。
-/// 阻塞调用（shell 解析至多 10s；VS Code 运行中时含确认与退出等待，至多约
-/// 60s+），调用方应在后台线程执行。
-pub fn launch_vscode_app_from_settings(folder: Option<&Path>) -> Result<()> {
-    let config = load_config()?;
-    let mut all_models = build_all_models(&config);
-    apply_probe_cache(&mut all_models);
-    let settings = config.vscode_app.clone().unwrap_or_default();
-    let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
-    let claude = resolve_vscode_claude_part(&config, &all_models, &settings.claude_code)?;
-    let codex =
-        resolve_vscode_codex_part(&config, &all_models, &settings.codex, &chatgpt_settings)?;
-    vscode_app::launch(claude.as_ref(), codex.as_ref(), folder)
-}
-
-/// 解析 VS Code 的 Claude Code 扩展注入部分。
-///
-/// `disabled` 返回 `None`；无任何可注入 provider（候选为空）同样返回 `None`
-///（等效未配置，按不注入处理）。持久化 provider 不可用时回落第一个兼容
-/// provider 并告警。默认模型 = 该 provider 首个 id 序 Anthropic wire 模型。
-fn resolve_vscode_claude_part(
-    config: &CxConfig,
-    all_models: &[ResolvedModel],
-    block: &VsCodeExtensionBlock,
-) -> Result<Option<VsCodeClaudePart>> {
-    if block.disabled {
-        return Ok(None);
-    }
-    let candidates: Vec<(ResolvedProvider, Vec<ResolvedModel>)> =
-        providers_for_agent(config, "VS Code")
-            .into_iter()
-            .filter(|p| p.has_endpoints)
-            .filter_map(|p| {
-                let models = injected_models_for_vscode_claude(all_models, &p.name);
-                (!models.is_empty()).then_some((p, models))
-            })
-            .collect();
-    let Some((provider, models)) =
-        pick_vscode_provider(&candidates, block.provider.as_deref(), "Claude Code")
-    else {
-        return Ok(None);
-    };
-    let model_id = models[0].id.clone();
-    let selection = build_vscode_selection(config, all_models, &provider.name, &model_id)?;
-    let apikey = resolve_vscode_apikey(&selection.provider)?;
-    Ok(Some(VsCodeClaudePart { selection, apikey }))
-}
-
-/// 解析 VS Code 的 Codex 扩展注入部分。
-///
-/// 候选 / 回落 / 告警语义同 Claude 部分（Responses 目录非空的 provider）。
-/// 默认模型 = `injected_models_for_chatgpt_app` 首元素；全量目录写入
-/// model-catalog.json。`chatgpt_app:` 段设置（env / supports_websockets）复用。
-fn resolve_vscode_codex_part(
-    config: &CxConfig,
-    all_models: &[ResolvedModel],
-    block: &VsCodeExtensionBlock,
-    chatgpt_settings: &ChatGptAppSettings,
-) -> Result<Option<VsCodeCodexPart>> {
-    if block.disabled {
-        return Ok(None);
-    }
-    let candidates: Vec<(ResolvedProvider, Vec<ResolvedModel>)> =
-        providers_for_agent(config, "ChatGPT.app")
-            .into_iter()
-            .filter(|p| p.has_endpoints)
-            .filter_map(|p| {
-                let models = injected_models_for_chatgpt_app(all_models, &p.name);
-                (!models.is_empty()).then_some((p, models))
-            })
-            .collect();
-    let Some((provider, injected)) =
-        pick_vscode_provider(&candidates, block.provider.as_deref(), "Codex")
-    else {
-        return Ok(None);
-    };
-    let default_model = injected[0].clone();
-    let prepared = prepare_chatgpt_launch_home_for_app(
-        &default_model,
-        provider,
-        WireApi::Responses,
-        injected,
-        chatgpt_settings,
-        // 昵称是 ChatGPT.app 注入专属配置；VS Code Codex 扩展复用同一
-        // config.toml 机制时保持 provider 本名。
-        &provider.name,
-    )?;
-    let apikey = resolve_chatgpt_app_apikey(provider)?;
-    Ok(Some(VsCodeCodexPart {
-        api_model_id: default_model.api_model_id(),
-        provider_name: provider.name.clone(),
-        model_id: default_model.id.clone(),
-        model_env: default_model.env.clone(),
-        prepared,
-        apikey,
-    }))
-}
-
-/// 按 vscode_app 块配置挑选 provider：显式指定优先；缺失或已不可用时回落
-/// 第一个兼容候选（不可用另告警）。候选为空返回 None。
-fn pick_vscode_provider<'a>(
-    candidates: &'a [(ResolvedProvider, Vec<ResolvedModel>)],
-    configured: Option<&str>,
-    block_label: &str,
-) -> Option<&'a (ResolvedProvider, Vec<ResolvedModel>)> {
-    if candidates.is_empty() {
-        return None;
-    }
-    match configured {
-        Some(name) => match candidates.iter().find(|(p, _)| p.name == name) {
-            Some(found) => Some(found),
-            None => {
-                eprintln!(
-                    "[cx] 警告: VS Code {block_label} 块配置的 provider `{name}` 不可用，回落第一个兼容 provider"
-                );
-                Some(&candidates[0])
-            }
-        },
-        None => Some(&candidates[0]),
-    }
-}
-
-/// VS Code 是否已安装（供 manox 菜单禁用决策）。
-pub fn vscode_app_installed() -> bool {
-    vscode_app::is_installed()
-}
+// VsCode types and functions -- now in manox-ext-agents
 
 // ══════════════════════════════════════════════════
 // CLI definition（clap derive）
@@ -1972,7 +1690,7 @@ fn run_launcher(
         let apikey = resolve_chatgpt_app_apikey_interactive(&selection.provider)?;
         apply_selected_model_tab_name(&selection)?;
         let chatgpt_settings = config.chatgpt_app.clone().unwrap_or_default();
-        return chatgpt_app::launch_with_injection(
+        return manox_ext_agents::chatgpt_app::launch_with_injection(
             &selection,
             &apikey,
             &passthrough_args,
@@ -2001,10 +1719,26 @@ fn run_launcher(
 
 /// `cx send`：向运行中的 cx agent session 注入一条消息。
 ///
-/// 薄封装：把 `--session` 字符串解析成 `SendSelector`，委托 `send::send` 完成扫描/连接/写入。
+/// 薄封装：把 `--session` 字符串解析成 `SendSelector`，委托 `manox_ext_agents::send::send` 完成扫描/连接/写入。
+
+/// Map a CLI `--session` string to a typed selector. Keywords are
+/// case-insensitive; anything else is treated as a literal session id.
+fn parse_selector(session: Option<&str>) -> SendSelector {
+    let Some(value) = session else {
+        return SendSelector::Latest;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "latest" => SendSelector::Latest,
+        "claude" => SendSelector::Agent(Agent::Claude),
+        "codex" => SendSelector::Agent(Agent::Codex),
+        "copilot" => SendSelector::Agent(Agent::Copilot),
+        _ => SendSelector::Id(value.to_ascii_lowercase()),
+    }
+}
+
 fn run_send(session: Option<String>, clear_buffer: bool, text: Option<String>) -> Result<()> {
-    let selector = send::parse_selector(session.as_deref());
-    let target = send::send(&selector, text.as_deref(), clear_buffer)?;
+    let selector = crate::parse_selector(session.as_deref());
+    let target = manox_ext_agents::send::send(&selector, text.as_deref(), clear_buffer)?;
     println!("已注入到 session {} ({})", target.id, target.agent);
     Ok(())
 }
@@ -2522,7 +2256,8 @@ fn launch_agent(spec: LaunchSpec) -> Result<()> {
     }
 
     // Warp 集成：在启动 agent 前发出 session_start 事件
-    let warp_session = warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
+    let warp_session =
+        manox_ext_agents::warp::maybe_emit_session_start(&spec.agent_id, spec.model_id.as_deref());
 
     // PTY 中继路径（opt-in，`cx --pty`）：cx 持 master，终端 IO 透传，并暴露 IPC 注入入口。
     // relay::run 自行打印摘要、spawn、进 raw mode、收尾，返回 `!`。
@@ -2580,7 +2315,7 @@ fn finalize_agent_exit(
     status: &std::process::ExitStatus,
     started_at: std::time::Instant,
     started_sys: std::time::SystemTime,
-    warp_session: &Option<warp::WarpSession>,
+    warp_session: &Option<manox_ext_agents::warp::WarpSession>,
     cwd: &Path,
 ) -> ! {
     let exit_code = exit_code_from(status);
@@ -2614,7 +2349,7 @@ pub(crate) fn finalize_exit_common(
     started_sys: std::time::SystemTime,
     exit_code: i32,
     termination: Option<&str>,
-    warp_session: &Option<warp::WarpSession>,
+    warp_session: &Option<manox_ext_agents::warp::WarpSession>,
     cwd: &Path,
     session_id: Option<&str>,
 ) -> ! {
@@ -2644,7 +2379,7 @@ pub(crate) fn finalize_exit_common(
 
     // Relay path owns an IPC socket + registry; remove them so they don't linger.
     if let Some(id) = session_id {
-        session::cleanup_session(id);
+        manox_ext_agents::session::cleanup_session(id);
     }
 
     std::process::exit(exit_code);
@@ -2767,30 +2502,6 @@ fn format_duration(d: std::time::Duration) -> String {
             format!("{h}h{m}m")
         }
     }
-}
-
-#[derive(Debug)]
-struct LaunchSpec {
-    program: PathBuf,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
-    summary: String,
-    detach: bool,
-    env_remove: Vec<String>,
-    /// Agent 标识符（如 "claude"、"codex"、"copilot"），供 Warp 集成和退出摘要使用。
-    agent_id: String,
-    /// Provider 名称，供退出摘要使用。
-    provider_name: String,
-    /// 选中的模型 ID，供 Warp 集成和退出摘要使用。
-    model_id: Option<String>,
-    /// 是否经 PTY 中继启动（cx 持 master，终端 IO 透传），而非 `Command::status()` 直连。
-    /// 由 `--pty` CLI flag 决定；默认 false（直连）。
-    pty: bool,
-    /// 自定义 IPC socket 路径（仅 pty 时生效；None 则用 ~/.manox/sessions/<id>.sock）。
-    socket: Option<String>,
-    /// Agent 进程的工作目录。`None` 时继承 cx 自身的 cwd（`std::env::current_dir`），
-    /// 保留直连/库调用的默认行为；`Some` 时 PTY 与直连两条 spawn 路径都以此为子进程 cwd。
-    cwd: Option<PathBuf>,
 }
 
 /// Resolve an explicit (provider, model) launch selection to the concrete
@@ -2981,12 +2692,12 @@ fn build_launch_spec(
                 args.extend(passthrough_args.iter().cloned());
             }
             "ChatGPT.app" => {
-                // ChatGPT.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 chatgpt_app::launch_with_injection。
+                // ChatGPT.app 不走通用 LaunchSpec 流程；run_launcher 已分流到 manox_ext_agents::chatgpt_app::launch_with_injection。
                 // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
                 bail!("ChatGPT.app 应由注入路径启动，不应进入 build_launch_spec");
             }
             "VS Code" => {
-                // VS Code 不走通用 LaunchSpec 流程；run_launcher 已分流到 vscode_app::launch。
+                // VS Code 不走通用 LaunchSpec 流程；run_launcher 已分流到 manox_ext_agents::vscode_app::launch。
                 // 此处仅在误入时给出明确错误，避免静默走 generic passthrough。
                 bail!("VS Code 应由注入路径启动，不应进入 build_launch_spec");
             }
@@ -5085,10 +4796,13 @@ agents:
         let all_models = config.resolve_all_models();
 
         // 默认块 → 第一个兼容 provider（配置序）+ 首个 id 序模型
-        let part =
-            resolve_vscode_claude_part(&config, &all_models, &VsCodeExtensionBlock::default())
-                .expect("resolve")
-                .expect("part");
+        let part = resolve_vscode_claude_part(
+            &config,
+            &all_models,
+            &manox_providers::VsCodeExtensionBlock::default(),
+        )
+        .expect("resolve")
+        .expect("part");
         assert_eq!(part.selection.provider.name, "both");
         assert_eq!(part.selection.model.as_ref().unwrap().id, "b1");
         assert_eq!(part.apikey, "k");
@@ -5097,7 +4811,7 @@ agents:
         let part = resolve_vscode_claude_part(
             &config,
             &all_models,
-            &VsCodeExtensionBlock {
+            &manox_providers::VsCodeExtensionBlock {
                 provider: Some("anthropic-only".into()),
                 disabled: false,
             },
@@ -5111,7 +4825,7 @@ agents:
         let part = resolve_vscode_claude_part(
             &config,
             &all_models,
-            &VsCodeExtensionBlock {
+            &manox_providers::VsCodeExtensionBlock {
                 provider: Some("ghost".into()),
                 disabled: false,
             },
@@ -5125,7 +4839,7 @@ agents:
             resolve_vscode_claude_part(
                 &config,
                 &all_models,
-                &VsCodeExtensionBlock {
+                &manox_providers::VsCodeExtensionBlock {
                     provider: None,
                     disabled: true,
                 },
@@ -5910,7 +5624,7 @@ agents:
         };
         let endpoints = provider.normalized_endpoints();
         let model = &endpoints[0].models[0];
-        let resolved = resolved_model_from_config(&config, &provider, &endpoints[0], model);
+        let resolved = ResolvedModel::from_config(&config, &provider, &endpoints[0], model);
 
         // Model env overrides provider env for shared key
         assert_eq!(resolved.env.get("SHARED"), Some(&"from-model".into()));
@@ -7299,7 +7013,7 @@ agents:
         // ResolvedModel merges provider + model env
         let endpoints = provider.normalized_endpoints();
         let resolved =
-            resolved_model_from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
         assert_eq!(resolved.env.len(), 3);
         assert_eq!(
             resolved.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL"),
@@ -7336,7 +7050,7 @@ agents:
         let provider = &config.providers[0];
         let endpoints = provider.normalized_endpoints();
         let resolved =
-            resolved_model_from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
+            ResolvedModel::from_config(&config, provider, &endpoints[0], &endpoints[0].models[0]);
 
         assert_eq!(
             resolved.env.get("SHARED_VAR"),

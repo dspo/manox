@@ -12,7 +12,7 @@ use std::thread;
 
 use async_channel::Sender;
 
-use cx::SessionHandle;
+use manox_ext_agents::SessionHandle;
 
 use crate::event::TerminalEvent;
 use crate::pty_source::PtySource;

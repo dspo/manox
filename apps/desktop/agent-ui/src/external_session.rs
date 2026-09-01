@@ -65,11 +65,11 @@ impl SessionKind {
     }
 
     /// The cx `Agent` to launch; `None` for plain PTY sessions.
-    pub fn agent(&self) -> Option<cx::Agent> {
+    pub fn agent(&self) -> Option<manox_ext_agents::Agent> {
         match self {
-            Self::ClaudeCode => Some(cx::Agent::Claude),
-            Self::Codex => Some(cx::Agent::Codex),
-            Self::GithubCopilot => Some(cx::Agent::Copilot),
+            Self::ClaudeCode => Some(manox_ext_agents::Agent::Claude),
+            Self::Codex => Some(manox_ext_agents::Agent::Codex),
+            Self::GithubCopilot => Some(manox_ext_agents::Agent::Copilot),
             Self::Terminal => None,
         }
     }
@@ -165,7 +165,7 @@ pub struct ExternalSession {
     /// `None` for plain PTY sessions (Terminal): dropping the
     /// `TerminalView` drops the `PtyHandle`, whose teardown kills the child
     /// tree, so no explicit kill reference is needed.
-    pub handle: Option<Arc<cx::SessionHandle>>,
+    pub handle: Option<Arc<manox_ext_agents::SessionHandle>>,
     pub _exit_sub: Subscription,
     /// The durable record backing this session — written at spawn, kept in
     /// sync (title) while live, deleted on close. `None` for plain PTY

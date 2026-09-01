@@ -96,7 +96,7 @@ impl ChatGptPanelState {
     /// injectable catalog asynchronously (remote-models providers fetch online,
     /// so opening Settings must not block).
     pub fn load(window: &mut Window, cx: &mut Context<SettingsView>) -> Self {
-        let codex_home = cx::chatgpt_codex_home()
+        let codex_home = manox_ext_agents::chatgpt_codex_home()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "~/.manox/.codex".to_string());
         let mut state = Self {
@@ -113,7 +113,7 @@ impl ChatGptPanelState {
             dirty: false,
             pending_saved_toast: false,
         };
-        match cx::chatgpt_app_settings() {
+        match manox_ext_agents::chatgpt_app_settings() {
             Ok(settings) => state.apply_settings(window, cx, settings),
             Err(e) => state.load_error = Some(format!("{e:#}")),
         }
@@ -155,7 +155,7 @@ impl ChatGptPanelState {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { cx::chatgpt_injectable_catalog() })
+                .spawn(async { manox_ext_agents::chatgpt_injectable_catalog() })
                 .await;
             let _ = this.update_in(cx, |this, _window, cx| {
                 this.chatgpt_panel.catalog = Some(match result {
@@ -235,7 +235,7 @@ impl ChatGptPanelState {
     fn save(&mut self, window: &mut Window, cx: &mut Context<SettingsView>) -> bool {
         let env = self.collect_env(cx);
         let nickname = self.nickname.read(cx).value().trim().to_string();
-        if let Err(e) = cx::validate_chatgpt_custom_env(&env) {
+        if let Err(e) = manox_ext_agents::validate_chatgpt_custom_env(&env) {
             window.push_notification(
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
                 cx,
@@ -248,7 +248,7 @@ impl ChatGptPanelState {
             supports_websockets: Some(self.supports_ws),
             model_injection: self.model_injection,
         };
-        if let Err(e) = cx::save_chatgpt_app_settings(&settings) {
+        if let Err(e) = manox_ext_agents::save_chatgpt_app_settings(&settings) {
             tracing::warn!(error = %e, "failed to save chatgpt_app settings");
             window.push_notification(
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),

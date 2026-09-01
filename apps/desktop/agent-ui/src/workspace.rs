@@ -2299,7 +2299,7 @@ impl Workspace {
             spawn_args.push("--session-id".into());
             spawn_args.push(sid.clone());
         }
-        let mut builder = cx::AgentBuilder::new()
+        let mut builder = manox_ext_agents::AgentBuilder::new()
             .agent(agent)
             .pty(true)
             .provider(provider_name.clone())
@@ -2528,9 +2528,9 @@ impl Workspace {
             let launch_provider = provider.clone();
             let launch_model = model.clone();
             let result = cx
-                .background_spawn(
-                    async move { cx::launch_chatgpt_app(&launch_provider, &launch_model) },
-                )
+                .background_spawn(async move {
+                    manox_ext_agents::launch_chatgpt_app(&launch_provider, &launch_model)
+                })
                 .await;
             let _ = this.update_in(cx, |_, window, cx| match result {
                 Ok(()) => {
@@ -2581,9 +2581,9 @@ impl Workspace {
     ) {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
-                .background_spawn(
-                    async move { cx::launch_vscode_app_from_settings(folder.as_deref()) },
-                )
+                .background_spawn(async move {
+                    manox_ext_agents::launch_vscode_app_from_settings(folder.as_deref())
+                })
                 .await;
             let _ = this.update_in(cx, |_, window, cx| match result {
                 Ok(()) => {
@@ -2662,7 +2662,7 @@ impl Workspace {
         cx.spawn_in(window, async move |_window, cx| {
             let handle = match cx
                 .background_spawn(async move {
-                    let mut builder = cx::AgentBuilder::new()
+                    let mut builder = manox_ext_agents::AgentBuilder::new()
                         .agent(agent)
                         .pty(true)
                         .provider(provider)

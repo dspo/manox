@@ -47,7 +47,7 @@ struct AgentEvent {
 ///
 /// 实现 `Drop`：当 `WarpSession` 被丢弃时（包括 panic 导致的提前退出），
 /// 自动发出 `stop` 事件，确保 Warp 侧边栏不会残留 "running" 状态。
-pub(crate) struct WarpSession {
+pub struct WarpSession {
     agent_id: String,
     session_id: String,
     model: Option<String>,
@@ -56,7 +56,7 @@ pub(crate) struct WarpSession {
 
 impl WarpSession {
     /// 返回 session ID，供传递给子进程环境变量使用。
-    pub(crate) fn session_id(&self) -> &str {
+    pub fn session_id(&self) -> &str {
         &self.session_id
     }
 
@@ -64,7 +64,7 @@ impl WarpSession {
     ///
     /// 幂等：多次调用只发出一次事件。
     /// `exit_code` 为 agent 进程的退出码；异常退出（信号终止等）时为 `None`。
-    pub(crate) fn emit_stop(&self, exit_code: Option<i32>) {
+    pub fn emit_stop(&self, exit_code: Option<i32>) {
         if self.stopped.load(Ordering::Relaxed) {
             return;
         }
@@ -113,7 +113,7 @@ const _: () = {
 ///
 /// 返回的 `WarpSession` 可用于后续发出 stop 事件。
 /// 非 Warp 环境或 `/dev/tty` 不可用时返回 `None`。
-pub(crate) fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<WarpSession> {
+pub fn maybe_emit_session_start(agent_id: &str, model: Option<&str>) -> Option<WarpSession> {
     if !is_warp_terminal() {
         return None;
     }
