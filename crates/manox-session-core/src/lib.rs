@@ -55,7 +55,7 @@ pub(crate) mod test_support {
     pub(crate) fn init_globals() {
         INIT_ONCE.call_once(|| {
             manox_agent::runtime::init();
-            manox_agent::pi_providers::init();
+            manox_agent::provider_glue::init();
         });
     }
 }

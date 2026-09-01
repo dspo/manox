@@ -3,7 +3,7 @@
 //! A gpui-free thread owned behind a `ThreadHandle` (`Arc<ThreadCore>`): the
 //! state lives in a lock, and run events from the tokio actor around a pi
 //! `AgentSession` (via the `ThreadEngine` contract) flow back through a
-//! channel, are adapted into `ThreadEvent`s (see `pi_engine::adapt`), and
+//! channel, are adapted into `ThreadEvent`s (see `engine::adapt`), and
 //! broadcast to the handle's subscribers. History is exposed as a display
 //! sequence (messages interleaved with persisted UI annotation cards) so the
 //! rebuild path (`ConversationState::rebuild_from_display`) replays it in
@@ -280,7 +280,7 @@ pub enum ThreadEvent {
     /// The thread's active opt-in browser tool suites changed; the composer
     /// chips are derived state of this mirror.
     BrowserSuitesChanged {
-        suites: Vec<crate::pi_engine::BrowserSuite>,
+        suites: Vec<crate::engine::BrowserSuite>,
     },
     /// A peer message was delivered from another team member.
     PeerMessage {
@@ -358,7 +358,7 @@ pub struct Thread {
     /// Opt-in browser tool suites the user activated; the composer chips
     /// derive from this mirror. Replayed to the engine when a landing thread
     /// materializes it, so a pre-engine toggle is never dropped.
-    browser_suites: Vec<crate::pi_engine::BrowserSuite>,
+    browser_suites: Vec<crate::engine::BrowserSuite>,
     /// Whether a suite was toggled since construction; until then the
     /// `Ready` projection seeds the mirror (same pattern as
     /// `permission_mode_explicitly_set`).
@@ -644,7 +644,7 @@ impl Thread {
             id,
             cwd,
             project: None,
-            model: crate::pi_providers::default_model(),
+            model: crate::provider_glue::default_model(),
             permission_mode: PermissionMode::default(),
             messages: Vec::new(),
             reasoning_effort: ReasoningEffort::default(),
@@ -705,7 +705,7 @@ impl Thread {
         // the facade reports `Loading` until `Ready` so the workspace can
         // gate input and render the streaming preview.
         let loading = initial_path.is_some();
-        let model = crate::pi_providers::default_model();
+        let model = crate::provider_glue::default_model();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
@@ -713,7 +713,7 @@ impl Thread {
         // shared with the engine's goal tools; db unavailability degrades
         // goal features off rather than blocking the thread.
         let goal_bridge = GoalBridge::for_thread(&id.0);
-        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
+        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
             sessions_dir,
@@ -786,7 +786,7 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
+        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
             cwd.clone(),
             model,
             sessions_dir,
@@ -1540,7 +1540,7 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
+        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
             sessions_dir,
@@ -1693,7 +1693,7 @@ impl Thread {
     }
 
     /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
-    pub fn set_browser_suite(&mut self, suite: crate::pi_engine::BrowserSuite, enable: bool) {
+    pub fn set_browser_suite(&mut self, suite: crate::engine::BrowserSuite, enable: bool) {
         self.browser_suites_explicitly_set = true;
         let changed = if enable {
             if self.browser_suites.contains(&suite) {
@@ -1721,7 +1721,7 @@ impl Thread {
 
     /// The opt-in browser tool suites active on this thread; the workspace
     /// derives the composer chips from this mirror.
-    pub fn browser_suites(&self) -> &[crate::pi_engine::BrowserSuite] {
+    pub fn browser_suites(&self) -> &[crate::engine::BrowserSuite] {
         &self.browser_suites
     }
 
@@ -1880,7 +1880,7 @@ fn drain_engine_notices(
 /// third parameter (manox's sub-agent description override) is unused by the
 /// pi backend, which never spawns manox sub-agents.
 pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> String {
-    crate::pi_engine::adapt::tool_title(name, args)
+    crate::engine::adapt::tool_title(name, args)
 }
 
 // Shared helpers the compact/estimation path calls with the same signature as
@@ -2171,7 +2171,7 @@ impl Thread {
 
     /// Persist a registry turn's compact display form (`/key args`) in the
     /// session sidecar. The pi transcript stores only the expanded
-    /// macro/skill body, so the sidecar is what lets `pi_engine::sync_history`
+    /// macro/skill body, so the sidecar is what lets `engine::sync_history`
     /// restore the send-time bubble after a reload. Fire-and-forget: a lost
     /// write only narrows the reload window, the live bubble is unaffected.
     fn persist_registry_display(&self, ordinal: usize, display: Option<String>) {
@@ -3045,15 +3045,15 @@ pub(crate) mod tests {
     /// instead of being dropped.
     #[tokio::test]
     async fn landing_browser_suite_toggle_parks_in_mirror() {
-        crate::pi_providers::init_for_test();
+        crate::provider_glue::init_for_test();
         let thread = Thread::landing(PathBuf::from("/tmp"));
         thread.with_mut(|t| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::ChromeUse, true);
+            t.set_browser_suite(crate::engine::BrowserSuite::ChromeUse, true);
         });
         thread.read(|t| {
             assert_eq!(
                 t.browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::ChromeUse]
+                vec![crate::engine::BrowserSuite::ChromeUse]
             );
         });
     }
@@ -3068,7 +3068,7 @@ pub(crate) mod tests {
             model: None,
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
-            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            browser_suites: vec![crate::engine::BrowserSuite::ChromeUse],
             plan_mode: false,
             plan_file: None,
             plan_review_pending: false,
@@ -3078,7 +3078,7 @@ pub(crate) mod tests {
         thread.read(|t| {
             assert_eq!(
                 t.browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::ChromeUse]
+                vec![crate::engine::BrowserSuite::ChromeUse]
             );
         });
     }
@@ -3090,14 +3090,14 @@ pub(crate) mod tests {
     async fn explicit_browser_suite_toggle_outranks_ready_projection() {
         let thread = thread_with_engine(HistoryPhase::Ready, Arc::new(FakeEngine::new()));
         thread.with_mut(|t| {
-            t.set_browser_suite(crate::pi_engine::BrowserSuite::WebExplore, true);
+            t.set_browser_suite(crate::engine::BrowserSuite::WebExplore, true);
         });
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
             reasoning_effort: ReasoningEffort::default(),
-            browser_suites: vec![crate::pi_engine::BrowserSuite::ChromeUse],
+            browser_suites: vec![crate::engine::BrowserSuite::ChromeUse],
             plan_mode: false,
             plan_file: None,
             plan_review_pending: false,
@@ -3107,7 +3107,7 @@ pub(crate) mod tests {
         thread.read(|t| {
             assert_eq!(
                 t.browser_suites().to_vec(),
-                vec![crate::pi_engine::BrowserSuite::WebExplore]
+                vec![crate::engine::BrowserSuite::WebExplore]
             );
         });
     }

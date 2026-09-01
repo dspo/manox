@@ -426,7 +426,7 @@ impl AgentBus {
             .notice_tx
             .send(BackendNotice::Event(Box::new(ThreadEvent::SubagentChild {
                 id: addr.clone(),
-                child: crate::thread::SubagentChildEvent::Model(crate::pi_providers::display_name(
+                child: crate::thread::SubagentChildEvent::Model(crate::provider_glue::display_name(
                     session.model(),
                 )),
             })));
@@ -555,7 +555,7 @@ impl AgentBus {
                                 },
                             )));
                         }
-                        for ev in crate::pi_engine::adapt::child_events_of(&addr_clone, &event) {
+                        for ev in crate::engine::adapt::child_events_of(&addr_clone, &event) {
                             let _ = notice_tx.send(BackendNotice::Event(Box::new(ev)));
                         }
                     }

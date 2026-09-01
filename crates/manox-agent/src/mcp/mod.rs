@@ -3,7 +3,7 @@
 //! Reads `~/.manox/mcp.toml` (layered with each installed plugin's
 //! `.mcp.json`), connects every configured server (stdio or streamable HTTP)
 //! via the `rmcp` SDK, and lists their tools. The harness bridges differ:
-//! the pi path wraps each tool as a pi `AgentTool` ([`pi_tool::PiMcpTool`]);
+//! the pi path wraps each tool as a pi `AgentTool` ([`napi_tool::PiMcpTool`]);
 //! the retired manox harness wraps the same connected servers into its own
 //! tool type. Configuration is file-only (no UI writes) in both.
 //!
@@ -12,7 +12,7 @@
 //! enhancement and never blocks the rest of startup.
 
 pub mod config;
-pub mod pi_tool;
+pub mod napi_tool;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};

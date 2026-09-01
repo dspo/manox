@@ -111,7 +111,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
                     serde_json::from_value(serde_json::Value::String(s.clone()))
                         .ok()
                         .or_else(|| {
-                            serde_json::from_value::<manox_agent::pi_engine::BrowserSuite>(
+                            serde_json::from_value::<manox_agent::engine::BrowserSuite>(
                                 serde_json::Value::String(s.clone()),
                             )
                             .ok()

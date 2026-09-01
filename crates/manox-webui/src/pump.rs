@@ -223,7 +223,7 @@ mod tests {
         hermetic_home();
         INIT_ONCE.call_once(|| {
             manox_agent::runtime::init();
-            manox_agent::pi_providers::init();
+            manox_agent::provider_glue::init();
         });
         manox_agent::thread_store::init();
         let server = AgentServer::new(std::path::PathBuf::from("/"));

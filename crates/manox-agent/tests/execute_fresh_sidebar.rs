@@ -132,13 +132,13 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
         manox_agent::runtime::init();
         manox_agent::settings::init_optimization();
         manox_agent::i18n::init();
-        manox_agent::pi_providers::init();
+        manox_agent::provider_glue::init();
         manox_agent::thread_store::init();
     });
     // Provider registration runs on a background thread; block until it lands
     // so `default_model` resolves before the thread is constructed.
     cx.update(|_| {
-        manox_agent::runtime::handle().block_on(manox_agent::pi_providers::wait_ready());
+        manox_agent::runtime::handle().block_on(manox_agent::provider_glue::wait_ready());
     });
 
     // Mirror `respond_plan_review`'s ExecuteFresh arm: spawn a fresh

@@ -124,7 +124,7 @@ pub trait ThreadEngine: Send + Sync {
     fn set_plan_mode(&self, _enabled: bool) {}
 
     /// Toggle an opt-in browser tool suite (ChromeUse / WebExplore) on or off.
-    fn set_browser_suite(&self, _suite: crate::pi_engine::BrowserSuite, _enable: bool) {}
+    fn set_browser_suite(&self, _suite: crate::engine::BrowserSuite, _enable: bool) {}
 
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     fn set_plan_review_pending(&self, _pending: bool) {}
@@ -191,7 +191,7 @@ pub struct ReadyInfo {
     /// Opt-in browser tool suites active in the session (projected from
     /// the authoritative active-tool set); the facade mirrors it so the
     /// composer chips derive from the thread's state.
-    pub browser_suites: Vec<crate::pi_engine::BrowserSuite>,
+    pub browser_suites: Vec<crate::engine::BrowserSuite>,
     /// Plan mode restored from the session sidecar (fresh sessions
     /// default to off); the facade re-syncs rendered instructions.
     pub plan_mode: bool,

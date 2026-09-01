@@ -28,7 +28,7 @@ use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
-use crate::pi_approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
+use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
@@ -858,7 +858,7 @@ fn build_tools(
     let standing_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
         Arc::new(move || standing_gate.mode());
     let escalation_approver: Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync> =
-        Arc::new(crate::pi_approval::GateEscalationApprover::new(Arc::clone(
+        Arc::new(crate::approval::GateEscalationApprover::new(Arc::clone(
             gate,
         )));
     let mut bash = BashTool::new(bash_ops, background.clone())
@@ -913,9 +913,9 @@ fn build_tools(
     // inside the tool through the host-injected approver (never the gate).
     // `Monitor`'s command half spawns through the same sandbox-wrapped
     // background registry under workspace-write.
-    let confined_bash_auto_allow: Option<crate::pi_approval::AutoAllowResolver> = sandbox_available
+    let confined_bash_auto_allow: Option<crate::approval::AutoAllowResolver> = sandbox_available
         .then(|| {
-            let allow: crate::pi_approval::AutoAllowResolver =
+            let allow: crate::approval::AutoAllowResolver =
                 Arc::new(move |name: &str, params: &serde_json::Value| match name {
                     "Bash" => true,
                     "Monitor" => params
@@ -1071,7 +1071,7 @@ fn build_tools(
     if let Some(registry) = crate::mcp::try_global() {
         for server in registry.servers() {
             for tool in &server.tools {
-                let mcp_tool = Arc::new(crate::mcp::pi_tool::PiMcpTool::new(
+                let mcp_tool = Arc::new(crate::mcp::napi_tool::PiMcpTool::new(
                     server.name.clone(),
                     tool.clone(),
                     Arc::clone(&server.client),
@@ -1156,7 +1156,7 @@ fn build_tools(
         let registry = Arc::clone(&registry);
         let runtime = runtime.clone();
         let model_slot = Arc::clone(&model_slot);
-        let provider_registry = crate::pi_providers::global();
+        let provider_registry = crate::provider_glue::global();
         let subagent_bash_ops = Arc::clone(&subagent_bash_ops);
         let subagent_background = subagent_background.clone();
         let subagent_description = subagent_description.clone();
@@ -2090,7 +2090,7 @@ async fn run_actor(
     // provider, sub-second) has landed. The snapshot must be fetched AFTER
     // the wait: `global()` clones the current Arc, and the init thread
     // swaps it once registration completes — an early handle stays empty.
-    crate::pi_providers::wait_ready().await;
+    crate::provider_glue::wait_ready().await;
     // Bound the LSP registry probe wait: a missing/slow probe must never
     // stall session assembly (tools register without LSP when it misses).
     let _ = tokio::time::timeout(
@@ -2098,16 +2098,16 @@ async fn run_actor(
         crate::lsp_tools::wait_ready(),
     )
     .await;
-    let registry = crate::pi_providers::global();
+    let registry = crate::provider_glue::global();
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
-        crate::pi_providers::LegacyAliasCatalog::new(registry.clone()),
+        crate::provider_glue::LegacyAliasCatalog::new(registry.clone()),
     ));
     // Goal tools emit `GoalChanged` through the notice channel once the
     // actor owns it (facade-side operations emit on the gpui thread).
     if let Some(bridge) = &state.goal_bridge {
         bridge.set_sender(notice_tx.clone());
     }
-    let Some(mut pi_model) = model.or_else(crate::pi_providers::default_model) else {
+    let Some(mut pi_model) = model.or_else(crate::provider_glue::default_model) else {
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
@@ -4023,10 +4023,10 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
 /// the agent-ui overlap walk) can rebuild a conversation from a captured
 /// session without widening the production API surface.
 #[cfg(feature = "test-support")]
-#[path = "pi_engine_adapt.rs"]
+#[path = "engine_adapt.rs"]
 pub mod adapt;
 #[cfg(not(feature = "test-support"))]
-#[path = "pi_engine_adapt.rs"]
+#[path = "engine_adapt.rs"]
 pub(crate) mod adapt;
 
 #[cfg(test)]

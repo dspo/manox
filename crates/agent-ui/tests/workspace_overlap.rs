@@ -42,7 +42,7 @@ fn load_real_session_messages() -> Vec<manox_agent::Message> {
         .filter_map(|event| event.get("message").cloned())
         .filter_map(|message| serde_json::from_value::<pi::types::AgentMessage>(message).ok())
         .collect::<Vec<_>>();
-    manox_agent::pi_engine::adapt::harness_messages_to_messages(&harness_messages)
+    manox_agent::engine::adapt::harness_messages_to_messages(&harness_messages)
 }
 
 fn register_lilex(cx: &mut TestAppContext) {
@@ -101,7 +101,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
     register_lilex(cx);
     cx.update(|_cx| {
         manox_agent::runtime::init();
-        manox_agent::pi_providers::init();
+        manox_agent::provider_glue::init();
         manox_agent::thread_store::init();
     });
     let messages = load_real_session_messages();

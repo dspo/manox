@@ -311,8 +311,8 @@ async fn extract(content: &str, prompt: &str, timeout_secs: u64) -> Result<Strin
     use pi::agent_loop::StreamFn;
     use pi::types::{AgentContext, AgentEvent, AssistantMessageEvent};
 
-    let registry = crate::pi_providers::global();
-    let model = crate::pi_providers::default_model()
+    let registry = crate::provider_glue::global();
+    let model = crate::provider_glue::default_model()
         .ok_or_else(|| "no default model configured".to_string())?;
     let stream: std::sync::Arc<dyn StreamFn> = registry
         .resolve_stream(&model)

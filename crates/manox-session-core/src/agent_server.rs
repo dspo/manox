@@ -378,7 +378,7 @@ impl AgentServerInner {
                 project: t.project().map(|p| p.to_string_lossy().into_owned()),
                 display_title: t.display_title(),
                 model_id: t.model().map(|m| m.id.clone()),
-                model_name: t.model().map(manox_agent::pi_providers::display_name),
+                model_name: t.model().map(manox_agent::provider_glue::display_name),
                 model: t
                     .model()
                     .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null)),
@@ -416,7 +416,7 @@ impl AgentServerInner {
     }
 
     fn models_snapshot(&self) -> Value {
-        let models: Vec<Value> = deduped_models(manox_agent::pi_providers::global().models())
+        let models: Vec<Value> = deduped_models(manox_agent::provider_glue::global().models())
             .iter()
             .map(model_json)
             .collect();
@@ -505,7 +505,7 @@ async fn handle_call(
                     let model = t.model();
                     json!({
                         "id": model.map(|m| m.id.clone()),
-                        "name": model.map(manox_agent::pi_providers::display_name),
+                        "name": model.map(manox_agent::provider_glue::display_name),
                     })
                 })
             }),
@@ -534,7 +534,7 @@ async fn handle_call(
             // Bare-model completion (the VS Code LanguageModelChat provider):
             // stream deltas back to the CALLING client as request-scoped
             // notes. Ported from the retired actor command engine.
-            let registry = manox_agent::pi_providers::global();
+            let registry = manox_agent::provider_glue::global();
             let done = |stop: Option<&str>, error: Option<String>| {
                 inner.note_to_client(
                     client_id,
@@ -734,7 +734,7 @@ impl AgentServerInner {
     ) {
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| inner.cwd.clone());
         let thread = Thread::new_fresh(ThreadId(session_id.into()), cwd);
-        if let Some(model) = manox_agent::pi_providers::default_model() {
+        if let Some(model) = manox_agent::provider_glue::default_model() {
             thread.with_mut(|t| t.set_model(model));
         }
         let mode = thread.read(|t| t.permission_mode());
@@ -961,7 +961,7 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        let registry = manox_agent::pi_providers::global();
+        let registry = manox_agent::provider_glue::global();
         match pi_extensions::model_ref::resolve_model_ref(&registry, id) {
             Some(model) => thread.with_mut(|t| t.set_model(model)),
             None => self.note_error(session_id, "unknown model"),
@@ -1674,9 +1674,9 @@ fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
 fn model_json(model: &pi::types::Model) -> Value {
     json!({
         "id": model.id,
-        "name": manox_agent::pi_providers::display_name(model),
+        "name": manox_agent::provider_glue::display_name(model),
         "provider": model.provider,
-        "provider_name": manox_agent::pi_providers::display_provider_name(model),
+        "provider_name": manox_agent::provider_glue::display_provider_name(model),
         "api": model.api,
         "context_window": model.context_window,
         "max_tokens": model.max_tokens,

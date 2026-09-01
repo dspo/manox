@@ -346,10 +346,10 @@ pub fn render_attachment_chips(
 }
 
 /// Display metadata for an active browser tool suite chip.
-fn browser_chip_meta(suite: manox_agent::pi_engine::BrowserSuite) -> (IconName, &'static str) {
+fn browser_chip_meta(suite: manox_agent::engine::BrowserSuite) -> (IconName, &'static str) {
     match suite {
-        manox_agent::pi_engine::BrowserSuite::ChromeUse => (IconName::Globe, "composer-add-chrome"),
-        manox_agent::pi_engine::BrowserSuite::WebExplore => {
+        manox_agent::engine::BrowserSuite::ChromeUse => (IconName::Globe, "composer-add-chrome"),
+        manox_agent::engine::BrowserSuite::WebExplore => {
             (IconName::Frame, "composer-add-internal-browser")
         }
     }
@@ -359,7 +359,7 @@ fn browser_chip_meta(suite: manox_agent::pi_engine::BrowserSuite) -> (IconName, 
 /// persist across submits (unlike file attachments); `on_remove(ix)` removes
 /// chip `ix` and deactivates its suite.
 pub fn render_browser_chips(
-    suites: &[manox_agent::pi_engine::BrowserSuite],
+    suites: &[manox_agent::engine::BrowserSuite],
     theme: &Theme,
     on_remove: impl Fn(usize, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> gpui::AnyElement {

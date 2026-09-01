@@ -357,7 +357,7 @@ fn main() {
         // empty. Rebuild once registration lands so the 工具 cascades
         // populate without waiting for a settings save / manual reload.
         cx.spawn(async move |cx| {
-            manox_agent::pi_providers::wait_ready().await;
+            manox_agent::provider_glue::wait_ready().await;
             cx.update(agent_ui::menu::rebuild_menus);
         })
         .detach();
@@ -569,7 +569,7 @@ fn build_tools_menu() -> Menu {
 fn build_chatgpt_menu_items() -> Vec<MenuItem> {
     let mut providers: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for model in manox_agent::pi_providers::global().models() {
+    for model in manox_agent::provider_glue::global().models() {
         let visible = model
             .metadata
             .get("agents")
@@ -579,8 +579,8 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
         if !visible {
             continue;
         }
-        let provider = manox_agent::pi_providers::display_provider_name(&model);
-        let model_id = manox_agent::pi_providers::config_id(&model);
+        let provider = manox_agent::provider_glue::display_provider_name(&model);
+        let model_id = manox_agent::provider_glue::config_id(&model);
         if !seen.insert((provider.clone(), model_id.clone())) {
             continue; // same model registered on several wire apis
         }

@@ -464,7 +464,7 @@ impl ContextRail {
                 // model segment tinted by its wire api; the raw composite key
                 // renders verbatim when the registry cannot resolve it.
                 let model_row = match model_name.split_once('/').and_then(|(provider, id)| {
-                    manox_agent::pi_providers::global().resolve_model(provider, id)
+                    manox_agent::provider_glue::global().resolve_model(provider, id)
                 }) {
                     Some(m) => h_flex()
                         .text_xs()
@@ -479,7 +479,7 @@ impl ContextRail {
                             gpui::div()
                                 .flex_none()
                                 .text_color(theme.muted_foreground)
-                                .child(manox_agent::pi_providers::display_provider_name(&m)),
+                                .child(manox_agent::provider_glue::display_provider_name(&m)),
                         )
                         .child(
                             gpui::div()
@@ -492,7 +492,7 @@ impl ContextRail {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(Workspace::pi_wire_text_color(&m.api, theme))
-                                .child(manox_agent::pi_providers::display_name(&m)),
+                                .child(manox_agent::provider_glue::display_name(&m)),
                         )
                         .into_any_element(),
                     None => gpui::div()
@@ -1214,7 +1214,7 @@ fn format_cost(cost: f64) -> String {
 /// retired manox build probes its own registry.
 fn model_window_tokens(model_name: &str) -> Option<u64> {
     {
-        let registry = manox_agent::pi_providers::global();
+        let registry = manox_agent::provider_glue::global();
         // per_model keys are composite "{provider}/{model_id}"; resolve O(1).
         // Bare ids (legacy keys) fall through to the scan below.
         if let Some((provider, id)) = model_name.split_once('/')

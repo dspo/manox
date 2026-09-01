@@ -37,7 +37,7 @@ pub(crate) fn build_model_cascade(
     }
     let mut providers: Vec<(String, Vec<Entry>)> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for m in manox_agent::pi_providers::global().models() {
+    for m in manox_agent::provider_glue::global().models() {
         // Missing metadata = non-cx registration (visible); otherwise the
         // effective agent list must contain the cascade's agent (parity
         // with the retired manox `visible_agents` filter).
@@ -53,8 +53,8 @@ pub(crate) fn build_model_cascade(
         if !visible {
             continue;
         }
-        let prov = manox_agent::pi_providers::display_provider_name(&m);
-        let config_id = manox_agent::pi_providers::config_id(&m);
+        let prov = manox_agent::provider_glue::display_provider_name(&m);
+        let config_id = manox_agent::provider_glue::config_id(&m);
         // Identity is the registration name (unique per wire endpoint), so
         // wire variants of one provider stay separate; only exact
         // duplicates collapse (parity with the composer model menu).
@@ -63,9 +63,9 @@ pub(crate) fn build_model_cascade(
         }
         let entry = Entry {
             config_id,
-            display: manox_agent::pi_providers::display_name(&m),
+            display: manox_agent::provider_glue::display_name(&m),
             tag: crate::Workspace::pi_wire_tag_variant(&m.api),
-            wire: manox_agent::pi_providers::wire_key(&m).map(str::to_string),
+            wire: manox_agent::provider_glue::wire_key(&m).map(str::to_string),
         };
         // Lookup-based grouping (not adjacency): the registry is sorted by
         // registration name, so equal display names must still merge.

@@ -31,7 +31,7 @@ pub mod path_env;
 pub mod path_policy;
 pub mod paths;
 pub mod permission;
-pub mod pi_providers;
+pub mod provider_glue;
 pub mod plan;
 pub mod plan_mode;
 pub mod plugin;
@@ -60,8 +60,8 @@ pub mod thread_registry;
 pub mod thread_store;
 
 pub mod monitor_bridge;
-pub mod pi_approval;
-pub mod pi_engine;
+pub mod approval;
+pub mod engine;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
@@ -90,7 +90,7 @@ pub fn init() {
     // user's locale is settled before the first frame / first turn.
     i18n::init();
     settings::init_optimization();
-    pi_providers::init();
+    provider_glue::init();
     // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
     // connections settle (per-server timeout); failures are isolated.
     mcp::init();

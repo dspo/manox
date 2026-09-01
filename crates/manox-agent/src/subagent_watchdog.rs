@@ -118,7 +118,7 @@ impl SubagentWatchdog {
             } => {
                 self.tool_calls += 1;
                 self.in_flight = self.in_flight.saturating_add(1);
-                self.last_activity = Some(match crate::pi_engine::adapt::arg_hint(arguments) {
+                self.last_activity = Some(match crate::engine::adapt::arg_hint(arguments) {
                     Some((key, value)) => format!("{tool_name} {key}={value}"),
                     None => tool_name.clone(),
                 });

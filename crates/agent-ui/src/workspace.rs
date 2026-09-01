@@ -495,7 +495,7 @@ pub struct Workspace {
     /// Opt-in browser tool suites activated via the `+` menu. Unlike file
     /// attachments these persist across submits (they track session-level tool
     /// activation); removing a chip deactivates the suite.
-    active_browser_suites: Vec<manox_agent::pi_engine::BrowserSuite>,
+    active_browser_suites: Vec<manox_agent::engine::BrowserSuite>,
     /// True while a native directory picker is open from the "Choose project" row.
     /// Guards against the user submitting a message before the picker resolves
     /// (which would make `set_project` a silent no-op once `messages` is non-empty).
@@ -5823,7 +5823,7 @@ impl Workspace {
         {
             self.thread
                 .read(|t| t.model().cloned())
-                .map(|model| manox_agent::pi_providers::display_name(&model))
+                .map(|model| manox_agent::provider_glue::display_name(&model))
                 .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
         }
     }
@@ -6386,13 +6386,13 @@ impl Workspace {
                     gpui::div()
                         .text_xs()
                         .text_color(theme.foreground)
-                        .child(manox_agent::pi_providers::display_provider_name(m))
+                        .child(manox_agent::provider_glue::display_provider_name(m))
                         .into_any_element(),
                     dot().into_any_element(),
                     gpui::div()
                         .text_xs()
                         .text_color(model_color)
-                        .child(manox_agent::pi_providers::display_name(m))
+                        .child(manox_agent::provider_glue::display_name(m))
                         .into_any_element(),
                     dot().into_any_element(),
                     gpui::div()
@@ -6497,12 +6497,12 @@ impl Workspace {
         // different registrations must still merge into one submenu.
         let mut providers: Vec<(String, Vec<pi::types::Model>)> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for m in manox_agent::pi_providers::global().models() {
-            let prov = manox_agent::pi_providers::display_provider_name(&m);
+        for m in manox_agent::provider_glue::global().models() {
+            let prov = manox_agent::provider_glue::display_provider_name(&m);
             // Identity is the registration name (unique per wire endpoint), so
             // wire variants of one provider stay separate; only exact
             // duplicates collapse.
-            if !seen.insert((m.provider.clone(), manox_agent::pi_providers::config_id(&m))) {
+            if !seen.insert((m.provider.clone(), manox_agent::provider_glue::config_id(&m))) {
                 continue;
             }
             match providers.iter_mut().find(|(name, _)| *name == prov) {
@@ -6520,7 +6520,7 @@ impl Workspace {
                 let mut submenu = submenu;
                 for m in &models {
                     let model = m.clone();
-                    let model_name = manox_agent::pi_providers::display_name(&model);
+                    let model_name = manox_agent::provider_glue::display_name(&model);
                     let (variant, label) = Self::pi_wire_tag_variant(&model.api);
                     let ws = ws.clone();
                     submenu = submenu.item(
@@ -7633,7 +7633,7 @@ impl Workspace {
                     let _ = ws_chrome.update(cx, |this, cx| {
                         this.close_plus_menu();
                         this.activate_browser_tool_suite(
-                            manox_agent::pi_engine::BrowserSuite::ChromeUse,
+                            manox_agent::engine::BrowserSuite::ChromeUse,
                             cx,
                         );
                     });
@@ -7642,7 +7642,7 @@ impl Workspace {
                     let _ = ws_internal.update(cx, |this, cx| {
                         this.close_plus_menu();
                         this.activate_browser_tool_suite(
-                            manox_agent::pi_engine::BrowserSuite::WebExplore,
+                            manox_agent::engine::BrowserSuite::WebExplore,
                             cx,
                         );
                     });
@@ -7665,7 +7665,7 @@ impl Workspace {
     /// against the session's authoritative active-tool set.
     fn activate_browser_tool_suite(
         &mut self,
-        suite: manox_agent::pi_engine::BrowserSuite,
+        suite: manox_agent::engine::BrowserSuite,
         _cx: &mut Context<Self>,
     ) {
         self.thread.with_mut(|t| t.set_browser_suite(suite, true));
@@ -7675,7 +7675,7 @@ impl Workspace {
     /// the mirror echo (see `activate_browser_tool_suite`).
     fn deactivate_browser_tool_suite(
         &mut self,
-        suite: manox_agent::pi_engine::BrowserSuite,
+        suite: manox_agent::engine::BrowserSuite,
         _cx: &mut Context<Self>,
     ) {
         self.thread.with_mut(|t| t.set_browser_suite(suite, false));
@@ -10126,7 +10126,7 @@ mod tests {
         );
         cx.update(|_cx| {
             manox_agent::runtime::init();
-            manox_agent::pi_providers::init();
+            manox_agent::provider_glue::init();
             manox_agent::thread_store::init_for_test(db.clone());
         });
 
@@ -10336,7 +10336,7 @@ mod tests {
         );
         cx.update(|_cx| {
             manox_agent::runtime::init();
-            manox_agent::pi_providers::init();
+            manox_agent::provider_glue::init();
             manox_agent::thread_store::init_for_test(db.clone());
         });
         let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
@@ -10406,7 +10406,7 @@ mod tests {
         );
         cx.update(|_cx| {
             manox_agent::runtime::init();
-            manox_agent::pi_providers::init();
+            manox_agent::provider_glue::init();
             manox_agent::thread_store::init_for_test(db.clone());
         });
 

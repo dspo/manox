@@ -217,7 +217,7 @@ pub async fn run_title_agent(
     request: &TitleRequest,
 ) -> anyhow::Result<Option<String>> {
     let policy = crate::settings::side_calls().title_policy();
-    let model = crate::pi_providers::resolve_side_call_model(&policy)
+    let model = crate::provider_glue::resolve_side_call_model(&policy)
         .unwrap_or_else(|| session_model.clone());
     let stream = (runtime.resolver())(&model)?;
     let result = Arc::new(Mutex::new(None));

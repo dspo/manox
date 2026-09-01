@@ -736,7 +736,7 @@ impl ModelsPanelState {
         // main thread; on failure the previous registry stays live.
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
-                .background_spawn(async move { manox_agent::pi_providers::reload() })
+                .background_spawn(async move { manox_agent::provider_glue::reload() })
                 .await;
             let _ = this.update_in(cx, |_this, window, cx| match result {
                 Ok(()) => crate::menu::rebuild_menus(cx),

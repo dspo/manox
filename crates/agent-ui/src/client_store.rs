@@ -33,7 +33,7 @@ pub struct ClientStore {
     pub goal_elapsed_seconds: Option<u64>,
     pub plan_mode: bool,
     pub persisted_plan: Option<Value>,
-    pub browser_suites: Vec<manox_agent::pi_engine::BrowserSuite>,
+    pub browser_suites: Vec<manox_agent::engine::BrowserSuite>,
     pub history_phase: manox_agent::thread::HistoryPhase,
     pub running: bool,
     pub has_interacted: bool,
@@ -149,7 +149,7 @@ impl ClientStore {
                 self.browser_suites = suites
                     .iter()
                     .filter_map(|s| {
-                        serde_json::from_value::<manox_agent::pi_engine::BrowserSuite>(Value::String(
+                        serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(
                             s.clone(),
                         ))
                         .ok()
@@ -243,7 +243,7 @@ impl ClientStore {
             .browser_suites
             .iter()
             .filter_map(|s| {
-                serde_json::from_value::<manox_agent::pi_engine::BrowserSuite>(Value::String(s.clone()))
+                serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(s.clone()))
                     .ok()
             })
             .collect();

@@ -89,7 +89,7 @@ pub fn init_harness(cx: &mut TestAppContext) {
     register_lilex(cx);
     cx.update(|_cx| {
         manox_agent::runtime::init();
-        manox_agent::pi_providers::init();
+        manox_agent::provider_glue::init();
         manox_agent::thread_store::init();
     });
 }
