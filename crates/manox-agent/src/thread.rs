@@ -82,7 +82,7 @@ impl HistoryPhase {
 /// lifecycle subset; the remaining variants exist so the workspace and
 /// conversation list compile against the shared contract and simply never
 /// fire.
-/// One streamed child-session observation from a running sub-agent (pi path:
+/// One streamed child-session observation from a running sub-agent (manox harness:
 /// bridged from the child's `AgentEvent`s through the Agent tool's progress
 /// channel). Text/thinking deltas append to the drill-down transcript; tool
 /// start/end render as activity lines; message stops and terminal errors

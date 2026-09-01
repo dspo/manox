@@ -528,7 +528,7 @@ impl ThreadStore {
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
-                // (the retired harness fired on thread deletion; the pi path
+                // (the retired harness fired on thread deletion; the manox harness
                 // keeps sessions and archives instead). Fail-open, detached.
                 crate::plugin_hooks::fire(
                     crate::plugin_hooks::HookEvent::SessionEnd,

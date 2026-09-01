@@ -1,6 +1,6 @@
 //! `web_fetch` tool: a lightweight HTTP GET client for fetching web documents
 //! (HTML / text / JSON / XML). Ported from the retired manox harness to the
-//! pi path as a host-layer tool (manox-original, no TS counterpart). It
+//! manox harness as a host-layer tool (manox-original, no TS counterpart). It
 //! carries no cookies, no login state, and no JS execution — for anything
 //! behind auth or rendered by client-side JS, use the browser tools
 //! (`ChromeUse*`, when enabled).
