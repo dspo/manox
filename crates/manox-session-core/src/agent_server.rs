@@ -471,9 +471,32 @@ impl AgentServerInner {
     }
 
     fn threads_snapshot(&self) -> Value {
-        // β-3a: a plain summary list is deferred (ThreadSummary is not serde);
-        // the workspace filter and live ThreadsUpdated push land in β-3b.
-        json!([])
+        let store = manox_agent::thread_store_global();
+        store.read(|s| {
+            let threads: Vec<Value> = s
+                .summaries()
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "title": t.display_title(),
+                        "updated_at": t.updated_at,
+                        "running": s.is_running(&t.id),
+                        "unread": t.has_unread,
+                        "errored": t.errored,
+                        "pending_auth": s.pending_auth_contains(&t.id),
+                        "pending_plan": s.pending_plan_contains(&t.id),
+                        "background_work": s.background_work_contains(&t.id),
+                        "model_id": t.model_id,
+                        "pinned": t.pinned,
+                        "archived": t.archived,
+                        "parent_id": t.parent_id,
+                        "depth": t.depth,
+                    })
+                })
+                .collect();
+            json!(threads)
+        })
     }
 
     fn models_snapshot(&self) -> Value {
