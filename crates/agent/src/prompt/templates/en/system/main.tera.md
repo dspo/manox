@@ -3,7 +3,10 @@
 ## Available skills (consult their full body via the `skill` tool on demand)
 {% for s in skills -%}
 - {{ s.name }}: {{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP ready
+{{ lsp_ready_specs }}{% endif %}
 
 ## Tool preferences
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).

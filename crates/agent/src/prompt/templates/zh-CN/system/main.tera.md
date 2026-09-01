@@ -3,7 +3,10 @@
 ## 可用技能（通过 `skill` 工具按需查阅完整内容）
 {% for s in skills -%}
 - {{ s.name }}：{{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP 就绪
+{{ lsp_ready_specs }}{% endif %}
 
 ## 工具偏好
 优先使用 Grep/Glob/Ls 工具而非 Bash 中的原始 grep/find/ls——无沙箱、只读模式下无需审批、输出结构化有界。仅在工具功能不足时（管道、复杂标志、链式命令）才使用 Bash shell 命令。

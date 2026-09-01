@@ -570,10 +570,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(status) => format!("UpdateGoal {status}"),
             None => "UpdateGoal".to_string(),
         },
-        "LspStatus" | "LspEnsure" | "LspWaitReady" => match arg("language") {
-            Some(language) => format!("{name} {language}"),
-            None => name.to_string(),
-        },
         "GoToDefinition" | "FindReferences" | "Hover" => {
             let line = args.get("line").and_then(|v| v.as_u64());
             match (arg("path"), line, arg("symbol")) {
@@ -1015,10 +1011,6 @@ mod tests {
         assert_eq!(
             tool_title("TaskStop", &json!({"task_id": "mon_2"})),
             "TaskStop mon_2"
-        );
-        assert_eq!(
-            tool_title("LspEnsure", &json!({"language": "rust"})),
-            "LspEnsure rust"
         );
         assert_eq!(
             tool_title(

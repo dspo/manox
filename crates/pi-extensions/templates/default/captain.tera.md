@@ -18,4 +18,7 @@ Foreground tool calls (Bash without `run_in_background`) block this turn. Backgr
 ## Available skills
 Installed skills, invocable by the user as `/name` slash commands:
 {% for s in skills %}- {{ s.name }}: {{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP ready
+{{ lsp_ready_specs }}{% endif %}

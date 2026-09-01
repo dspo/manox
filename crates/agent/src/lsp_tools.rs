@@ -1,9 +1,14 @@
 //! LSP `AgentTool` adapters for the pi harness (ported from the retired
-//! manox harness). Three lifecycle tools surface the harness-driven
-//! spawn/readiness model; six code-intel tools route a file path to the
-//! right server client by extension and return `path:line:col` or text
-//! summaries. All nine are read-only and ride ungated (the permission gate
-//! applies to mutating tools only).
+//! manox harness). Six code-intel tools route a file path to the right
+//! server client by extension and return `path:line:col` or text summaries.
+//! All six are read-only and ride ungated (the permission gate applies to
+//! mutating tools only).
+//!
+//! Every code-intel tool auto-warms the server on first use (bounded ~5s):
+//! `client_for_path` in the registry ensures the server is spawned and
+//! waits briefly for initialize; if still indexing, it returns an actionable
+//! "retry shortly" error. No explicit LspEnsure/LspWaitReady calls are
+//! needed — the harness pre-warms detected servers at session startup.
 //!
 //! Position input is `(path, line, symbol, column?)`: the model normally
 //! picks the symbol text off a line and the client resolves the exact
@@ -17,9 +22,6 @@ use std::sync::Arc;
 
 // ─── tool name constants ────────────────────────────────────────────────────
 
-pub const LSP_STATUS: &str = "LspStatus";
-pub const LSP_ENSURE: &str = "LspEnsure";
-pub const LSP_WAIT_READY: &str = "LspWaitReady";
 pub const GO_TO_DEFINITION: &str = "GoToDefinition";
 pub const FIND_REFERENCES: &str = "FindReferences";
 pub const HOVER: &str = "Hover";
@@ -75,238 +77,6 @@ fn truncate_output(text: &str, max: usize, hint: &str) -> String {
         text.len() - end,
         hint
     )
-}
-
-// ─── language alias resolution ──────────────────────────────────────────────
-
-/// Map a free-form language id to a spec id. Accepts the spec id itself
-/// (`rust-analyzer`) or common language aliases (`rust`, `go`, `python`,
-/// `typescript`/`ts`). Returns `None` for an unknown alias.
-fn resolve_language(input: &str) -> Option<&'static str> {
-    let id = match input.trim().to_ascii_lowercase().as_str() {
-        "rust" | "rust-analyzer" | "rust_analyzer" => "rust-analyzer",
-        "go" | "golang" | "gopls" => "gopls",
-        "python" | "py" | "pyright" => "pyright",
-        "typescript" | "ts" | "typescript-language-server" => "typescript-language-server",
-        other => return lsp::spec::spec_for_id(other).map(|s| s.id),
-    };
-    Some(id)
-}
-
-// ─── lifecycle tools ────────────────────────────────────────────────────────
-
-pub struct LspStatusTool;
-
-#[derive(Deserialize, JsonSchema)]
-struct LspStatusInput {
-    /// Optional language id (`rust`, `go`, `python`, `typescript`) or server
-    /// spec id (`rust-analyzer`). When omitted, reports every supported server.
-    #[serde(default)]
-    language: Option<String>,
-}
-
-#[async_trait::async_trait]
-impl AgentTool for LspStatusTool {
-    fn name(&self) -> &str {
-        LSP_STATUS
-    }
-    fn description(&self) -> &str {
-        "Report the status of language servers (rust-analyzer/gopls/pyright/typescript-language-server) for the current project. \
-         Returns `not_started` (installed, not spawned yet — the default), `starting`, `ready`, `failed`, or an actionable missing/broken probe detail per server. \
-         Cheap: does not spawn a server. Optional `language` filters to one. \
-         Use this before code-intel tools to decide whether to call LspEnsure/LspWaitReady."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        schema::<LspStatusInput>()
-    }
-    fn is_read_only(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        params: serde_json::Value,
-        _signal: CancellationToken,
-        ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        let Ok(parsed) = serde_json::from_value::<LspStatusInput>(params) else {
-            return Err(ToolError::InvalidArguments(
-                "input parse failed".to_string(),
-            ));
-        };
-        let cwd = ctx.cwd().to_path_buf();
-        let result: anyhow::Result<String> = async move {
-            let Some(reg) = lsp::registry::try_global() else {
-                return Ok("LSP not initialized".to_string());
-            };
-            let mut all = reg.statuses_for(&cwd).await;
-            if let Some(lang) = parsed.language {
-                let Some(want) = resolve_language(&lang) else {
-                    return Ok(format!("unknown language `{lang}`"));
-                };
-                all.retain(|report| report.id == want);
-            }
-            if all.is_empty() {
-                return Ok("No matching LSP server is configured".to_string());
-            }
-            let body = all
-                .into_iter()
-                .map(|report| match report.detail {
-                    Some(detail) => format!("{}: {:?} ({detail})", report.id, report.status),
-                    None => format!("{}: {:?}", report.id, report.status),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(body)
-        }
-        .await;
-        match result {
-            Ok(text) => Ok(AgentToolResult::text(text)),
-            Err(e) => Err(ToolError::ExecutionFailed(format!("{e:#}"))),
-        }
-    }
-}
-
-pub struct LspEnsureTool;
-
-#[derive(Deserialize, JsonSchema)]
-struct LspEnsureInput {
-    /// Language id (`rust`/`go`/`python`/`typescript`) or server spec id.
-    language: String,
-}
-
-#[async_trait::async_trait]
-impl AgentTool for LspEnsureTool {
-    fn name(&self) -> &str {
-        LSP_ENSURE
-    }
-    fn description(&self) -> &str {
-        "Ensure a language server is spawned for the current project. Non-blocking: kicks off spawn+initialize in the background and returns `starting` immediately, or `ready`/`failed`/`not_installed`. \
-         Idempotent — call repeatedly. Pair with LspWaitReady when you need to block until ready. \
-         Code-intel tools (GoToDefinition etc.) also ensure implicitly, so calling this is optional but lets you warm a server before first use."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        schema::<LspEnsureInput>()
-    }
-    fn is_read_only(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        params: serde_json::Value,
-        _signal: CancellationToken,
-        ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        let Ok(parsed) = serde_json::from_value::<LspEnsureInput>(params) else {
-            return Err(ToolError::InvalidArguments(
-                "input parse failed".to_string(),
-            ));
-        };
-        let cwd = ctx.cwd().to_path_buf();
-        let result: anyhow::Result<String> = async move {
-            let Some(reg) = lsp::registry::try_global() else {
-                return Ok("LSP not initialized".to_string());
-            };
-            let Some(spec_id) = resolve_language(&parsed.language) else {
-                return Ok(format!("unknown language `{}`", parsed.language));
-            };
-            match reg.availability(spec_id) {
-                Some(lsp::registry::ServerAvailability::Available) => {}
-                Some(lsp::registry::ServerAvailability::Broken(reason)) => {
-                    return Ok(format!("{spec_id}: broken ({reason})"));
-                }
-                Some(lsp::registry::ServerAvailability::NotInstalled) | None => {
-                    return Ok(format!("{spec_id}: not_installed"));
-                }
-            }
-            let status = reg.ensure(spec_id, cwd).await?;
-            Ok(format!("{spec_id}: {status:?}"))
-        }
-        .await;
-        match result {
-            Ok(text) => Ok(AgentToolResult::text(text)),
-            Err(e) => Err(ToolError::ExecutionFailed(format!("{e:#}"))),
-        }
-    }
-}
-
-pub struct LspWaitReadyTool;
-
-#[derive(Deserialize, JsonSchema)]
-struct LspWaitReadyInput {
-    /// Language id or server spec id.
-    language: String,
-    /// Seconds to wait. Default 10. The harness chooses how long to block;
-    /// pass a small value to poll, a larger one to wait out indexing.
-    #[serde(default = "default_wait_secs")]
-    timeout_secs: u64,
-}
-
-fn default_wait_secs() -> u64 {
-    10
-}
-
-#[async_trait::async_trait]
-impl AgentTool for LspWaitReadyTool {
-    fn name(&self) -> &str {
-        LSP_WAIT_READY
-    }
-    fn description(&self) -> &str {
-        "Block until a language server is ready (or the timeout elapses). Returns `ready`/`starting`(timed out, still indexing)/`failed`/`not_installed`. \
-         This is the explicit 'I decide to wait' entry point — LspEnsure kicks off spawn non-blocking, then LspWaitReady blocks on it. \
-         Call before a burst of code-intel calls if you want them to hit a warm server."
-    }
-    fn parameters_schema(&self) -> serde_json::Value {
-        schema::<LspWaitReadyInput>()
-    }
-    fn is_read_only(&self) -> bool {
-        true
-    }
-    async fn execute(
-        &self,
-        _tool_call_id: &str,
-        params: serde_json::Value,
-        _signal: CancellationToken,
-        ctx: &dyn ToolContext,
-    ) -> Result<AgentToolResult, ToolError> {
-        let Ok(parsed) = serde_json::from_value::<LspWaitReadyInput>(params) else {
-            return Err(ToolError::InvalidArguments(
-                "input parse failed".to_string(),
-            ));
-        };
-        let cwd = ctx.cwd().to_path_buf();
-        let result: anyhow::Result<String> = async move {
-            let Some(reg) = lsp::registry::try_global() else {
-                return Ok("LSP not initialized".to_string());
-            };
-            let Some(spec_id) = resolve_language(&parsed.language) else {
-                return Ok(format!("unknown language `{}`", parsed.language));
-            };
-            match reg.availability(spec_id) {
-                Some(lsp::registry::ServerAvailability::Available) => {}
-                Some(lsp::registry::ServerAvailability::Broken(reason)) => {
-                    return Ok(format!("{spec_id}: broken ({reason})"));
-                }
-                Some(lsp::registry::ServerAvailability::NotInstalled) | None => {
-                    return Ok(format!("{spec_id}: not_installed"));
-                }
-            }
-            let status = reg
-                .wait_ready(
-                    spec_id,
-                    cwd,
-                    std::time::Duration::from_secs(parsed.timeout_secs),
-                )
-                .await?;
-            Ok(format!("{spec_id}: {status:?}"))
-        }
-        .await;
-        match result {
-            Ok(text) => Ok(AgentToolResult::text(text)),
-            Err(e) => Err(ToolError::ExecutionFailed(format!("{e:#}"))),
-        }
-    }
 }
 
 // ─── code-intel tools ───────────────────────────────────────────────────────
@@ -366,7 +136,7 @@ impl AgentTool for GoToDefinitionTool {
     fn description(&self) -> &str {
         "Find where a symbol is defined (LSP textDocument/definition). Input: path + 1-indexed line + the symbol text on that line; pass optional 1-indexed column only when the symbol occurs twice on the line. \
          Returns `path:line:col` triples (feed straight to read_file). Routes by file extension: .rs→rust-analyzer, .go→gopls, .py→pyright, .ts/.tsx/...→typescript-language-server. \
-         The server must be installed and warmed (LspEnsure/LspWaitReady); returns an 'indexing, retry' note if not ready yet."
+         Auto-warms the server on first use (bounded ~5s); returns an 'indexing, retry' note if not ready yet."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<PositionInput>()
@@ -394,7 +164,7 @@ impl AgentTool for GoToDefinitionTool {
                 .await?;
             Ok(render_locs(
                 locs,
-                "No definitions found (server may still be indexing; call LspStatus or retry shortly).",
+                "No definitions found (server may still be indexing; retry shortly).",
                 "narrow the symbol or call DocumentSymbols first",
             ))
         }
@@ -431,7 +201,7 @@ impl AgentTool for FindReferencesTool {
     }
     fn description(&self) -> &str {
         "Find all references to a symbol (LSP textDocument/references). Semantically accurate — unlike grep, won't be swamped by same-name identifiers in other scopes. \
-         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns `path:line:col` triples. include_declaration defaults true. Same routing/ready rules as GoToDefinition."
+         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns `path:line:col` triples. include_declaration defaults true. Auto-warms on first use (bounded ~5s)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<ReferencesInput>()
@@ -465,7 +235,7 @@ impl AgentTool for FindReferencesTool {
                 .await?;
             Ok(render_locs(
                 locs,
-                "No references found (server may still be indexing; call LspStatus or retry shortly).",
+                "No references found (server may still be indexing; retry shortly).",
                 "narrow the symbol or call DocumentSymbols first",
             ))
         }
@@ -486,7 +256,7 @@ impl AgentTool for HoverTool {
     }
     fn description(&self) -> &str {
         "Get hover info for a symbol (LSP textDocument/hover): type signature, doc comments. \
-         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns markdown/plaintext, or 'no hover' if the server has nothing. Same routing/ready rules as GoToDefinition."
+         Input: path + 1-indexed line + symbol text, plus optional column for same-line ambiguity. Returns markdown/plaintext, or 'no hover' if the server has nothing. Auto-warms on first use (bounded ~5s)."
     }
     fn parameters_schema(&self) -> serde_json::Value {
         schema::<PositionInput>()
@@ -564,10 +334,7 @@ impl AgentTool for DocumentSymbolsTool {
             let (client, abs) = client_for_path(&parsed.path, &cwd).await?;
             let syms = client.document_symbols(&abs).await?;
             if syms.is_empty() {
-                return Ok(
-                    "No symbols (server may still be indexing; call LspStatus or retry shortly)."
-                        .to_string(),
-                );
+                return Ok("No symbols (server may still be indexing; retry shortly).".to_string());
             }
             let body = syms
                 .into_iter()
@@ -603,7 +370,7 @@ impl AgentTool for WorkspaceSymbolsTool {
     }
     fn description(&self) -> &str {
         "Search symbols across the whole workspace (LSP workspace/symbol). Input: query string. \
-         Returns `path:line:col name` triples. Which server answers depends on the servers warmed for the current project — call LspEnsure for the language(s) you care about first. \
+         Returns `path:line:col name` triples. Which server answers depends on the servers available — auto-warms on first use (bounded ~5s). \
          Note: a server only returns symbols it has indexed; an empty result may mean indexing isn't done."
     }
     fn parameters_schema(&self) -> serde_json::Value {
@@ -650,7 +417,10 @@ impl AgentTool for WorkspaceSymbolsTool {
                 }
             }
             if all.is_empty() {
-                return Ok("No symbols matched (warm the servers with LspEnsure, or indexing may be incomplete).".to_string());
+                return Ok(
+                    "No symbols matched (servers may still be indexing; retry shortly)."
+                        .to_string(),
+                );
             }
             all.sort_by_key(|(_, _, line, _)| *line);
             let body = all
@@ -736,7 +506,10 @@ impl AgentTool for DiagnosticsTool {
                 }
             }
             if bodies.is_empty() {
-                return Ok("No cached diagnostics (call LspEnsure to warm servers, then re-run; indexing may be incomplete).".to_string());
+                return Ok(
+                    "No cached diagnostics (servers may still be indexing; retry shortly)."
+                        .to_string(),
+                );
             }
             Ok(truncate_output(
                 &bodies.join("\n\n"),
@@ -793,15 +566,12 @@ fn render_diagnostics_report(path: &Path, report: lsp::DiagnosticsReport) -> Str
 
 // ─── registration ───────────────────────────────────────────────────────────
 
-/// All nine LSP tools, all read-only. Registration is the caller's job —
+/// All six code-intel tools, all read-only. Registration is the caller's job —
 /// `tools()` always returns the full set; the registration site skips it
 /// when `lsp::registry::try_global()` reports no available server specs
 /// (the agent degrades to grep/glob).
 pub fn tools() -> Vec<Arc<dyn pi::tool::AgentTool>> {
     vec![
-        Arc::new(LspStatusTool),
-        Arc::new(LspEnsureTool),
-        Arc::new(LspWaitReadyTool),
         Arc::new(GoToDefinitionTool),
         Arc::new(FindReferencesTool),
         Arc::new(HoverTool),
@@ -809,6 +579,23 @@ pub fn tools() -> Vec<Arc<dyn pi::tool::AgentTool>> {
         Arc::new(WorkspaceSymbolsTool),
         Arc::new(DiagnosticsTool),
     ]
+}
+
+/// Pre-warm every detected LSP server at the session cwd so the first
+/// code-intel call hits a ready server. Runs as a detached background task:
+/// non-blocking, fire-and-forget. The code-intel tools themselves also
+/// auto-ensure (bounded ~5s), so this is purely an optimization.
+pub fn prewarm_background(cwd: PathBuf) {
+    tokio::spawn(async move {
+        let Some(reg) = lsp::registry::try_global() else {
+            return;
+        };
+        for spec in reg.available_specs() {
+            if let Err(e) = reg.ensure(spec.id, cwd.clone()).await {
+                tracing::warn!("LSP pre-warm failed for {}: {e}", spec.id);
+            }
+        }
+    });
 }
 
 static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();

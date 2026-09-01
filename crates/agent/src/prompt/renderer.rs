@@ -479,6 +479,7 @@ mod tests {
                     today: "2026-07-14".to_string(),
                     permission_mode: "danger-full-access",
                 },
+                lsp_ready_specs: String::new(),
             };
             assert_clean(
                 &render(PromptTemplate::SystemMain, lang, &main).unwrap(),
