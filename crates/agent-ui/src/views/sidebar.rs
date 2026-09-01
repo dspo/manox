@@ -16,8 +16,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::i18n;
-use agent::thread::PermissionMode;
-use agent::thread_store::StoreHandle;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, Transformation,
@@ -33,6 +31,8 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use manox_agent::thread::PermissionMode;
+use manox_agent::thread_store::StoreHandle;
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so
@@ -105,7 +105,7 @@ enum AnimRole {
 /// selection-slide: their ids join one `flat_ids` ordering and `render_thread_item`
 /// applies the same `SlideCtx` wash to either.
 enum SidebarRow {
-    Thread(agent::ThreadSummary),
+    Thread(manox_agent::ThreadSummary),
     External(crate::external_session::ExternalSessionSummary),
 }
 
@@ -205,10 +205,10 @@ pub enum SidebarEvent {
 /// store); a collapsed leader hides its subtree.
 fn team_forest(
     team_collapsed: &HashSet<String>,
-    threads: &[agent::ThreadSummary],
+    threads: &[manox_agent::ThreadSummary],
     externals: &[crate::external_session::ExternalSessionSummary],
 ) -> Vec<ThreadRender> {
-    let mut members: HashMap<&str, Vec<&agent::ThreadSummary>> = HashMap::new();
+    let mut members: HashMap<&str, Vec<&manox_agent::ThreadSummary>> = HashMap::new();
     let ids: HashSet<&str> = threads.iter().map(|s| s.id.as_str()).collect();
     for s in threads {
         if s.depth > 0
@@ -266,9 +266,9 @@ const MAX_TEAM_RENDER_DEPTH: f32 = 8.0;
 fn push_member(
     team_collapsed: &HashSet<String>,
     out: &mut Vec<ThreadRender>,
-    s: &agent::ThreadSummary,
+    s: &manox_agent::ThreadSummary,
     depth: f32,
-    members: &HashMap<&str, Vec<&agent::ThreadSummary>>,
+    members: &HashMap<&str, Vec<&manox_agent::ThreadSummary>>,
 ) {
     let has_kids = members.contains_key(s.id.as_str());
     out.push(ThreadRender {
@@ -351,7 +351,7 @@ impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
-        let store = agent::thread_store_global();
+        let store = manox_agent::thread_store_global();
         // The store is gpui-free: pump its event channel into `cx.notify()`
         // through a spawned task instead of `cx.subscribe` (transitional;
         // γ replaces this with a client store + entity subscription).
@@ -825,7 +825,7 @@ impl Sidebar {
     /// them at the store); a collapsed leader hides its subtree.
     fn order_rows(
         &self,
-        threads: &[agent::ThreadSummary],
+        threads: &[manox_agent::ThreadSummary],
         externals: &[crate::external_session::ExternalSessionSummary],
     ) -> Vec<ThreadRender> {
         team_forest(&self.team_collapsed, threads, externals)
@@ -839,7 +839,7 @@ impl Sidebar {
     fn render_project_group(
         &self,
         path: &str,
-        group: &[agent::ThreadSummary],
+        group: &[manox_agent::ThreadSummary],
         selected: Option<&str>,
         store: &StoreHandle,
         slide: &SlideCtx,
@@ -1013,8 +1013,8 @@ impl Render for Sidebar {
         let selected = self.selected.clone();
         let store = self.store.clone();
 
-        let mut projects: Vec<(String, Vec<agent::ThreadSummary>)> = Vec::new();
-        let mut loose: Vec<agent::ThreadSummary> = Vec::new();
+        let mut projects: Vec<(String, Vec<manox_agent::ThreadSummary>)> = Vec::new();
+        let mut loose: Vec<manox_agent::ThreadSummary> = Vec::new();
         for s in &summaries {
             // Only REGISTERED projects become folder groups; a session cwd
             // that was never bound as a project (e.g. the default home dir)
@@ -1555,7 +1555,7 @@ struct SidebarThreadItem {
 
 impl SidebarThreadItem {
     fn from_thread(
-        summary: &agent::ThreadSummary,
+        summary: &manox_agent::ThreadSummary,
         selected: bool,
         live: ThreadLiveState,
         nesting: RowNesting,
@@ -2215,8 +2215,8 @@ mod tests {
         Theme::from(&*ThemeColor::light())
     }
 
-    fn sample_thread() -> agent::ThreadSummary {
-        agent::ThreadSummary {
+    fn sample_thread() -> manox_agent::ThreadSummary {
+        manox_agent::ThreadSummary {
             id: "thread-abcdef12".into(),
             summary: "Summarize the diff".into(),
             title: None,

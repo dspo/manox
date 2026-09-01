@@ -93,14 +93,14 @@ fn main() {
     app.run(move |cx| {
         gpui_component::init(cx);
         // This binary is the native-app host; the identity must be pinned
-        // before `agent::init` computes host-scoped state.
-        agent::host::set_host(agent::host::Host::ManoxApp);
-        agent::init();
+        // before `manox_agent::init` computes host-scoped state.
+        manox_agent::host::set_host(manox_agent::host::Host::ManoxApp);
+        manox_agent::init();
         // `terminal` runs its PTY pumps on the shared process-global tokio
-        // runtime; hand it the handle before `terminal::init` builds the store.
-        terminal::runtime::set_runtime(agent::runtime::handle().clone());
+        // runtime; hand it the handle before `manox_terminal::init` builds the store.
+        manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         agent_ui::slash_command::init(cx);
-        terminal::init();
+        manox_terminal::init();
         terminal_ui::init(cx);
 
         // Embedded OFL typefaces. Lilex ships only Light/Medium in upright and
@@ -357,7 +357,7 @@ fn main() {
         // empty. Rebuild once registration lands so the 工具 cascades
         // populate without waiting for a settings save / manual reload.
         cx.spawn(async move |cx| {
-            agent::pi_providers::wait_ready().await;
+            manox_agent::provider_glue::wait_ready().await;
             cx.update(agent_ui::menu::rebuild_menus);
         })
         .detach();
@@ -403,7 +403,7 @@ fn main() {
 
             // Wire the process-wide browser host: bind it to the main
             // Workspace, register it as the `CapabilityClient` provider (so the
-            // `web_explore_*` tools reach it via `agent::capability::provider()`)
+            // `web_explore_*` tools reach it via `manox_agent::capability::provider()`)
             // and the agent-ui concrete registry (so `BrowserView` attaches the
             // notify/inbound bridges at build), then spawn the notify/inbound
             // drainer on the Workspace — a notify ships through the OnceLock
@@ -426,10 +426,10 @@ fn main() {
     // supervisor's per-process timeouts. The main thread is not a tokio worker
     // (gpui's `run` returned here), so `Handle::block_on` is safe. Only manox's
     // own children are signaled — a server the user ran elsewhere is untouched.
-    match agent::runtime::try_handle() {
+    match manox_agent::runtime::try_handle() {
         Some(handle) => {
             handle.block_on(async {
-                agent::background_task::shutdown_all().await;
+                manox_agent::background_task::shutdown_all().await;
                 supervisor::global().shutdown_all().await;
             });
         }
@@ -440,7 +440,7 @@ fn main() {
     // ChromeUse: close the shared Chrome session so a launched (owned) Chrome
     // process does not outlive manox; an attached browser is detached and
     // left running.
-    agent::chrome_use::shutdown();
+    manox_agent::chrome_use::shutdown();
 }
 
 /// Open the main window over the process-lifetime `Workspace`, creating the
@@ -518,23 +518,29 @@ fn build_app_menus() -> Vec<Menu> {
     {
         vec![
             Menu::new("manox").items([
-                MenuItem::action(agent::i18n::t("menu-about"), OpenAbout),
+                MenuItem::action(manox_agent::i18n::t("menu-about"), OpenAbout),
                 MenuItem::separator(),
-                MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
+                MenuItem::action(
+                    manox_agent::i18n::t("menu-settings"),
+                    agent_ui::OpenSettings,
+                ),
                 MenuItem::separator(),
-                MenuItem::action(agent::i18n::t("menu-quit"), Quit),
+                MenuItem::action(manox_agent::i18n::t("menu-quit"), Quit),
             ]),
             build_tools_menu(),
         ]
     }
     #[cfg(not(target_os = "macos"))]
     {
-        vec![Menu::new(agent::i18n::t("menu-file")).items([
-            MenuItem::action(agent::i18n::t("menu-about"), OpenAbout),
+        vec![Menu::new(manox_agent::i18n::t("menu-file")).items([
+            MenuItem::action(manox_agent::i18n::t("menu-about"), OpenAbout),
             MenuItem::separator(),
-            MenuItem::action(agent::i18n::t("menu-settings"), agent_ui::OpenSettings),
+            MenuItem::action(
+                manox_agent::i18n::t("menu-settings"),
+                agent_ui::OpenSettings,
+            ),
             MenuItem::separator(),
-            MenuItem::action(agent::i18n::t("menu-quit"), Quit),
+            MenuItem::action(manox_agent::i18n::t("menu-quit"), Quit),
         ])]
     }
 }
@@ -554,22 +560,25 @@ fn build_tools_menu() -> Menu {
     // VS Code 单一入口：注入目标由持久化 `vscode_app:` 设置决定
     //（Settings → 外部工具 → Visual Studio Code.app），启动时无选择级联。
     // VS Code 未安装时禁用——此时没有任何 VS Code 实例可打开/注入。
-    let vscode = MenuItem::action(agent::i18n::t("menu-vscode-open"), agent_ui::LaunchVSCode)
-        .disabled(!cx::vscode_app_installed());
-    Menu::new(agent::i18n::t("menu-tools")).items([MenuItem::submenu(chatgpt), vscode])
+    let vscode = MenuItem::action(
+        manox_agent::i18n::t("menu-vscode-open"),
+        agent_ui::LaunchVSCode,
+    )
+    .disabled(!cx::vscode_app_installed());
+    Menu::new(manox_agent::i18n::t("menu-tools")).items([MenuItem::submenu(chatgpt), vscode])
 }
 
 /// Items inside the `ChatGPT.app` submenu: one nested submenu per provider
 /// that exposes models visible to the `ChatGPT.app` agent (i.e. Responses-capable
 /// models), one action item per model. Mirrors the provider registry snapshot
-/// at build time — `agent::i18n::rebuild_menus` re-runs menu construction after
+/// at build time — `manox_agent::i18n::rebuild_menus` re-runs menu construction after
 /// a registry reload. Provider submenus keep the registry's first-appearance
 /// order; models keep registry order within their provider.
 #[cfg(target_os = "macos")]
 fn build_chatgpt_menu_items() -> Vec<MenuItem> {
     let mut providers: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for model in agent::pi_providers::global().models() {
+    for model in manox_agent::provider_glue::global().models() {
         let visible = model
             .metadata
             .get("agents")
@@ -579,8 +588,8 @@ fn build_chatgpt_menu_items() -> Vec<MenuItem> {
         if !visible {
             continue;
         }
-        let provider = agent::pi_providers::display_provider_name(&model);
-        let model_id = agent::pi_providers::config_id(&model);
+        let provider = manox_agent::provider_glue::display_provider_name(&model);
+        let model_id = manox_agent::provider_glue::config_id(&model);
         if !seen.insert((provider.clone(), model_id.clone())) {
             continue; // same model registered on several wire apis
         }

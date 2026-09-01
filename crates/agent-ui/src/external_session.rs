@@ -365,7 +365,7 @@ impl ResumeSidecar {
 /// `~/.manox/external-sessions` — one `<id>.json` per unclosed
 /// external agent session.
 pub(crate) fn resume_dir() -> PathBuf {
-    agent::paths::manox_config_dir()
+    manox_agent::paths::manox_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join("external-sessions")
 }
@@ -477,7 +477,7 @@ pub(crate) fn claude_project_slug(abs_path: &str) -> String {
 /// records the kernel-resolved cwd. `None`: no HOME or canonicalize failed
 /// (cwd gone).
 pub(crate) fn claude_project_dir_for_cwd(cwd: &Path) -> Option<PathBuf> {
-    claude_project_dir_for_cwd_in(cwd, &agent::paths::home_dir()?)
+    claude_project_dir_for_cwd_in(cwd, &manox_agent::paths::home_dir()?)
 }
 
 /// [`claude_project_dir_for_cwd`] against an explicit home — the test seam.
@@ -491,7 +491,11 @@ pub(crate) fn claude_project_dir_for_cwd_in(cwd: &Path, home: &Path) -> Option<P
 /// `~/.codex/sessions` into each launch's CODEX_HOME, so rollouts from
 /// cx-launched codex land here. `None`: no HOME.
 pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
-    Some(agent::paths::home_dir()?.join(".codex").join("sessions"))
+    Some(
+        manox_agent::paths::home_dir()?
+            .join(".codex")
+            .join("sessions"),
+    )
 }
 
 /// Names of `*.jsonl` regular files directly in `dir` — subdirectories are

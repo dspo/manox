@@ -6,9 +6,9 @@
 
 mod common;
 
-use agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
+use manox_agent::ThreadEvent;
 
 #[gpui::test]
 async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext) {
@@ -49,7 +49,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "background PlanReady must stash the review"
     );
     assert!(
-        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
+        manox_agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "sidebar keeps the pending-plan badge"
     );
     emit(
@@ -67,7 +67,7 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         "a normal settle keeps the stashed plan"
     );
     assert!(
-        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
+        manox_agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the badge survives the settle while the verdict is due"
     );
 
@@ -85,5 +85,5 @@ async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext
         workspace.read_with(&visual.cx, |ws, cx| ws.diagnostic_tail_plan_active(cx)),
         "the restored card must be active (verdict buttons rendered)"
     );
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
 }

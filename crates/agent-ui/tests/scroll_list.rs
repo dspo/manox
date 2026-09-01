@@ -6,7 +6,6 @@
 
 use std::{cell::RefCell, rc::Rc};
 
-use agent::ToolCallStatus;
 use agent_ui::{
     Workspace,
     conversation::{
@@ -20,6 +19,7 @@ use gpui::{
     Styled as _, TestAppContext, VisualTestContext, Window, WindowHandle, div, list, px, size,
 };
 use gpui_component::{ActiveTheme as _, ElementExt as _};
+use manox_agent::ToolCallStatus;
 use manox_components::markdown::{Markdown, PanelKind, TerminalPanel};
 
 struct ListProbe {

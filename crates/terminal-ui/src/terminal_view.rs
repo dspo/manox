@@ -26,13 +26,13 @@ use gpui::{
     UTF16Selection, Window, div, point, px, rgba, size,
 };
 use gpui_component::ActiveTheme as _;
-use terminal::alacritty_terminal::selection::SelectionType;
-use terminal::alacritty_terminal::term::TermMode;
-use terminal::alacritty_terminal::vi_mode::ViMotion;
-use terminal::mappings::keys;
-use terminal::mappings::mouse::{self, MouseAction};
-use terminal::settings::{BellMode, CursorBlinkSetting};
-use terminal::{HoverKind, HoverTarget, Rgb};
+use manox_terminal::alacritty_terminal::selection::SelectionType;
+use manox_terminal::alacritty_terminal::term::TermMode;
+use manox_terminal::alacritty_terminal::vi_mode::ViMotion;
+use manox_terminal::mappings::keys;
+use manox_terminal::mappings::mouse::{self, MouseAction};
+use manox_terminal::settings::{BellMode, CursorBlinkSetting};
+use manox_terminal::{HoverKind, HoverTarget, Rgb};
 
 use crate::blink::CursorBlink;
 use crate::element::TerminalElement;
@@ -44,7 +44,7 @@ use crate::theme::{TerminalTheme, color_for_request, hsla_to_rgb};
 #[derive(Default, Clone)]
 struct Search {
     pattern: String,
-    matches: Vec<(terminal::Point, terminal::Point)>,
+    matches: Vec<(manox_terminal::Point, manox_terminal::Point)>,
     active: usize,
 }
 
@@ -117,7 +117,7 @@ pub struct TerminalView {
 impl TerminalView {
     pub fn new(terminal: Entity<TerminalProxy>, cx: &mut App) -> Entity<Self> {
         let terminal_for_view = terminal.clone();
-        let s = terminal::settings::load();
+        let s = manox_terminal::settings::load();
         let skip_shell: Vec<Keystroke> = s
             .commands_to_skip_shell
             .iter()
@@ -126,7 +126,7 @@ impl TerminalView {
         let theme_override =
             s.theme
                 .as_deref()
-                .and_then(|spec| match terminal::theme::resolve(spec) {
+                .and_then(|spec| match manox_terminal::theme::resolve(spec) {
                     Ok(file) => Some(TerminalTheme::from_theme_file(&file)),
                     Err(e) => {
                         tracing::warn!(
@@ -171,14 +171,14 @@ impl TerminalView {
         });
         cx.subscribe(&terminal, {
             let view = view.clone();
-            move |_t, ev: &terminal::event::TerminalEvent, cx| match ev {
-                terminal::event::TerminalEvent::Bell => {
+            move |_t, ev: &manox_terminal::event::TerminalEvent, cx| match ev {
+                manox_terminal::event::TerminalEvent::Bell => {
                     view.update(cx, |v, cx| v.ring_bell(cx));
                 }
-                terminal::event::TerminalEvent::ColorRequest(idx, fmt) => {
+                manox_terminal::event::TerminalEvent::ColorRequest(idx, fmt) => {
                     view.update(cx, |v, cx| v.answer_color_request(*idx, fmt.clone(), cx));
                 }
-                terminal::event::TerminalEvent::CursorBlinkingChange => {
+                manox_terminal::event::TerminalEvent::CursorBlinkingChange => {
                     // The program flipped its blink flag: restart the phase
                     // visible so the cursor never vanishes on the toggle.
                     view.update(cx, |v, cx| {
@@ -586,7 +586,7 @@ impl TerminalView {
             // Local scrollback scroll is a no-op on the alt screen the TUI
             // owns, so without this the wheel does nothing.
             let (row, col) = self.px_to_grid(ev.position, window);
-            let mods = terminal::Modifiers {
+            let mods = manox_terminal::Modifiers {
                 shift: ev.modifiers.shift,
                 alt: ev.modifiers.alt,
                 control: ev.modifiers.control,
@@ -596,7 +596,7 @@ impl TerminalView {
             });
             return;
         }
-        if terminal::term::alternate_scroll_active(mode) {
+        if manox_terminal::term::alternate_scroll_active(mode) {
             // Alt screen without mouse capture (less, git log): the wheel
             // becomes arrow-key presses (xterm alternateScroll). On the
             // normal screen the wheel falls through to the local scrollback
@@ -663,7 +663,7 @@ impl Render for TerminalView {
                     .py_1()
                     .bg(cx.theme().background)
                     .child(div().text_xs().text_color(cx.theme().foreground).child(
-                        agent::i18n::t_str_count(
+                        manox_agent::i18n::t_str_count(
                             "terminal-search-status",
                             &[("pattern", pattern.as_str())],
                             count as i64,
@@ -720,7 +720,7 @@ impl Render for TerminalView {
                     div()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground)
-                        .child(agent::i18n::t("terminal-starting")),
+                        .child(manox_agent::i18n::t("terminal-starting")),
                 ),
             );
         }

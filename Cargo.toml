@@ -7,27 +7,26 @@
 #
 # LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
-# cx / cx-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
-# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/cx-providers）。
+# cx / manox-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
+# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/manox-providers）。
 #
 # gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
 [workspace]
 members = [
-    "crates/agent",
+    "crates/manox-agent",
     "crates/agent-ui",
     "crates/manox",
     "crates/pi",
     "crates/pi-extensions",
-    "crates/terminal",
+    "crates/manox-terminal",
     "crates/terminal-ui",
-    "crates/components",
-    "crates/supervisor",
-    "crates/lsp",
-    "crates/webview",
-    "crates/http_proxy",
-    "crates/webview-macros",
+"crates/manox-components",
+	    "crates/supervisor",
+	    "crates/lsp",
+"crates/manox-webview",
+		    "crates/manox-webview-macros",
     "crates/cx",
-"crates/cx-providers",
+"crates/manox-providers",
 	    "crates/manox-session-core",
 	    "crates/manox-napi",
 	    "crates/manox-webui",
@@ -44,28 +43,27 @@ publish = false
 [workspace.dependencies]
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
-agent = { path = "crates/agent" }
+manox-agent = { path = "crates/manox-agent" }
 agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
-terminal = { path = "crates/terminal" }
+manox-terminal = { path = "crates/manox-terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
-manox-components = { path = "crates/components" }
+manox-components = { path = "crates/manox-components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
-manox-webview = { path = "crates/webview" }
-manox-webview-macros = { path = "crates/webview-macros" }
-http_proxy = { path = "crates/http_proxy" }
-	manox-session-core = { path = "crates/manox-session-core" }
+manox-webview = { path = "crates/manox-webview" }
+manox-webview-macros = { path = "crates/manox-webview-macros" }
+		manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
 pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
 hyperlinks = { path = "crates/hyperlinks" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
-# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。cx-providers 为 provider
+# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。manox-providers 为 provider
 # 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。
 cx = { path = "crates/cx" }
-cx-providers = { path = "crates/cx-providers" }
+manox-providers = { path = "crates/manox-providers" }
 
 anyhow = "1"
 async-channel = "2"
@@ -113,14 +111,14 @@ httparse = "1"
 # allowlist. Internationalized domain names entered as UTF-8 are converted to
 # the A-label form that TLS SNI and HTTP Host headers carry on the wire.
 idna = "1"
-# thiserror — derive Error for the http_proxy crate's host-pattern and deny-reason types.
+# thiserror — derive Error (used by the now-removed http_proxy crate; kept
+# for any remaining thiserror usage in the workspace).
 thiserror = "1"
-# url — URL parsing for the sandbox network proxy (CONNECT authority-form,
-# absolute-form request targets, Host headers). reqwest already pulls url in
-# transitively; declaring it here lets the http_proxy crate reference a stable version.
+# url — URL parsing. reqwest already pulls url in transitively; kept here
+# for crates that need a direct dependency.
 url = "2"
-# log — facade for the http_proxy crate. The proxy runs on dedicated std::thread
-# workers (not tokio), so it uses the simpler `log` facade rather than `tracing`.
+# log — facade. The now-removed http_proxy crate used the simpler `log` facade
+# rather than `tracing`; kept for any remaining log usage.
 log = "0.4"
 base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider

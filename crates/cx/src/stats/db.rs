@@ -7,7 +7,7 @@
 //! 跨文件去重（codex/copilot）在 insert 时处理。
 
 use anyhow::{Context, Result};
-use cx_providers::cx_state_dir;
+use manox_providers::cx_state_dir;
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 

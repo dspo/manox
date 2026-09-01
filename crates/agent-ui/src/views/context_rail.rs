@@ -22,7 +22,6 @@
 
 use crate::client_store_handle::ClientStoreHandle;
 use crate::i18n;
-use agent::ThreadEvent;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -31,10 +30,11 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+use manox_agent::ThreadEvent;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agent::{PlanSnapshot, PlanStepStatus};
+use manox_agent::{PlanSnapshot, PlanStepStatus};
 
 use crate::Workspace;
 use crate::cockpit::{CockpitPhase, cache_read_ratio, context_budget_pct, format_cache_hit};
@@ -62,7 +62,7 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: agent::thread::ThreadHandle,
+    pub(crate) thread: manox_agent::thread::ThreadHandle,
     /// γ-2a transitional read path: the AgentServer-backed store mirroring
     /// kernel state via `ServerNote`s. `None` when the workspace has not
     /// created the AgentServer connection; every kernel-state read dual-reads
@@ -85,8 +85,8 @@ pub(crate) struct ContextRail {
     /// preserve whatever collapse state the user last chose.
     pub(crate) plan_seen: bool,
     agents: Vec<SubagentInfo>,
-    pub(crate) side_calls: Vec<agent::SideCallMetric>,
-    pub(crate) main_call: Option<agent::SideCallMetric>,
+    pub(crate) side_calls: Vec<manox_agent::SideCallMetric>,
+    pub(crate) main_call: Option<manox_agent::SideCallMetric>,
     /// Latest git change stats for the thread's cwd. Refreshed (debounced) by
     /// `Workspace` on thread attach and terminal stop.
     pub(crate) git_change_stats: Option<GitChangeStats>,
@@ -100,7 +100,7 @@ pub(crate) struct ContextRail {
 
 impl ContextRail {
     pub(crate) fn new(
-        thread: agent::thread::ThreadHandle,
+        thread: manox_agent::thread::ThreadHandle,
         store: Option<Entity<ClientStoreHandle>>,
     ) -> Self {
         Self {
@@ -188,7 +188,7 @@ impl ContextRail {
                 self.cockpit_phase = CockpitPhase::Thinking;
             }
             ThreadEvent::ToolCall { status, .. } => match status {
-                agent::thread::ToolCallStatus::Running => {
+                manox_agent::thread::ToolCallStatus::Running => {
                     self.cockpit_phase = CockpitPhase::RunningTool;
                 }
                 // A non-running terminal/intermediate status means the model
@@ -219,7 +219,7 @@ impl ContextRail {
         id: &str,
         subagent_type: &str,
         description: Option<&str>,
-        status: agent::ToolCallStatus,
+        status: manox_agent::ToolCallStatus,
         health: Option<&str>,
         cx: &mut Context<Self>,
     ) {
@@ -420,7 +420,7 @@ impl ContextRail {
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    agent::TokenUsage {
+                    manox_agent::TokenUsage {
                         input_tokens: v.input,
                         output_tokens: v.output,
                         cache_creation_input_tokens: v.cache_creation,
@@ -435,7 +435,7 @@ impl ContextRail {
             .map(|(k, v)| {
                 (
                     k.clone(),
-                    agent::TokenUsage {
+                    manox_agent::TokenUsage {
                         input_tokens: v.input,
                         output_tokens: v.output,
                         cache_creation_input_tokens: v.cache_creation,
@@ -448,7 +448,7 @@ impl ContextRail {
         let warn_color = theme.warning;
         let mut section = v_flex().w_full().gap_0p5().child(header);
         if !per_model.is_empty() {
-            let mut models: Vec<(&String, &agent::language_model::TokenUsage)> =
+            let mut models: Vec<(&String, &manox_agent::language_model::TokenUsage)> =
                 per_model.iter().collect();
             models.sort_by_key(|(_, u)| -(u.total_tokens() as i64));
             let total_models = models.len();
@@ -464,7 +464,7 @@ impl ContextRail {
                 // model segment tinted by its wire api; the raw composite key
                 // renders verbatim when the registry cannot resolve it.
                 let model_row = match model_name.split_once('/').and_then(|(provider, id)| {
-                    agent::pi_providers::global().resolve_model(provider, id)
+                    manox_agent::provider_glue::global().resolve_model(provider, id)
                 }) {
                     Some(m) => h_flex()
                         .text_xs()
@@ -479,7 +479,7 @@ impl ContextRail {
                             gpui::div()
                                 .flex_none()
                                 .text_color(theme.muted_foreground)
-                                .child(agent::pi_providers::display_provider_name(&m)),
+                                .child(manox_agent::provider_glue::display_provider_name(&m)),
                         )
                         .child(
                             gpui::div()
@@ -492,7 +492,7 @@ impl ContextRail {
                                 .min_w_0()
                                 .truncate()
                                 .text_color(Workspace::pi_wire_text_color(&m.api, theme))
-                                .child(agent::pi_providers::display_name(&m)),
+                                .child(manox_agent::provider_glue::display_name(&m)),
                         )
                         .into_any_element(),
                     None => gpui::div()
@@ -726,8 +726,8 @@ impl ContextRail {
     /// Status indicator for the Captain (main agent) row.
     /// The Captain uses `ship-wheel` for the completed state, distinguishing it
     /// from sub-agents that use `circle-check-big`.
-    fn captain_status_indicator(status: agent::ToolCallStatus, theme: &Theme) -> AnyElement {
-        use agent::ToolCallStatus;
+    fn captain_status_indicator(status: manox_agent::ToolCallStatus, theme: &Theme) -> AnyElement {
+        use manox_agent::ToolCallStatus;
         match status {
             ToolCallStatus::PendingApproval | ToolCallStatus::Running => {
                 crate::views::braille_spinner::BrailleSpinner::new()
@@ -763,11 +763,11 @@ impl ContextRail {
             .map(|s| s.read(cx).store.running)
             .unwrap_or(false);
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
-            agent::ToolCallStatus::Error
+            manox_agent::ToolCallStatus::Error
         } else if running {
-            agent::ToolCallStatus::Running
+            manox_agent::ToolCallStatus::Running
         } else {
-            agent::ToolCallStatus::Success
+            manox_agent::ToolCallStatus::Success
         };
         let mut rows = vec![
             h_flex()
@@ -777,7 +777,7 @@ impl ContextRail {
                 .items_center()
                 .child(Self::captain_status_indicator(main_status, theme))
                 .child(gpui::div().text_xs().text_color(theme.foreground).child(
-                    crate::views::message::author_display(&agent::MessageAuthor::Lead),
+                    crate::views::message::author_display(&manox_agent::MessageAuthor::Lead),
                 ))
                 .into_any_element(),
         ];
@@ -947,7 +947,7 @@ impl ContextRail {
                         .child(i18n::t("cockpit-plan-all-done")),
                 );
             } else {
-                let mut sorted: Vec<&agent::PlanStep> = plan.steps.iter().collect();
+                let mut sorted: Vec<&manox_agent::PlanStep> = plan.steps.iter().collect();
                 sorted.sort_by_key(|s| Self::plan_sort_key(s.status));
                 let remaining = total.saturating_sub(done);
                 for step in sorted.iter().take(5) {
@@ -972,7 +972,7 @@ impl ContextRail {
         // InProgress first, then Pending, then Completed; original
         // chronological order is preserved within each group.
         let mut list = v_flex().w_full().gap_1();
-        let mut steps: Vec<&agent::PlanStep> = plan.steps.iter().collect();
+        let mut steps: Vec<&manox_agent::PlanStep> = plan.steps.iter().collect();
         steps.sort_by_key(|s| Self::plan_sort_key(s.status));
         for step in steps {
             list = list.child(self.render_plan_row(step, theme));
@@ -995,7 +995,7 @@ impl ContextRail {
     /// One plan step row: status glyph + title. The in-progress step is
     /// foreground-bold; others are muted so the live step stands out. The title
     /// truncates to one line with a tooltip carrying the full text.
-    fn render_plan_row(&self, step: &agent::PlanStep, theme: &Theme) -> AnyElement {
+    fn render_plan_row(&self, step: &manox_agent::PlanStep, theme: &Theme) -> AnyElement {
         let muted = theme.muted_foreground;
         let (glyph, glyph_color) = match step.status {
             PlanStepStatus::Pending => ("◻", muted),
@@ -1062,8 +1062,8 @@ impl Render for ContextRail {
 /// Build the hover tooltip for the usage row, consolidating main and side
 /// calls into one tree view.
 fn build_usage_tooltip(
-    main_call: Option<&agent::SideCallMetric>,
-    side_calls: &[agent::SideCallMetric],
+    main_call: Option<&manox_agent::SideCallMetric>,
+    side_calls: &[manox_agent::SideCallMetric],
     theme: &Theme,
 ) -> AnyElement {
     let muted = theme.muted_foreground;
@@ -1114,7 +1114,7 @@ fn section_heading(text: &str, muted: gpui::Hsla) -> AnyElement {
 
 /// A tree row for a call metric (main or side call).
 fn call_tree_row(
-    metric: &agent::SideCallMetric,
+    metric: &manox_agent::SideCallMetric,
     purpose_prefix: Option<&str>,
     is_last: bool,
     muted: gpui::Hsla,
@@ -1214,7 +1214,7 @@ fn format_cost(cost: f64) -> String {
 /// retired manox build probes its own registry.
 fn model_window_tokens(model_name: &str) -> Option<u64> {
     {
-        let registry = agent::pi_providers::global();
+        let registry = manox_agent::provider_glue::global();
         // per_model keys are composite "{provider}/{model_id}"; resolve O(1).
         // Bare ids (legacy keys) fall through to the scan below.
         if let Some((provider, id)) = model_name.split_once('/')

@@ -129,76 +129,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent"
-version = "0.1.0"
-dependencies = [
- "agent",
- "anyhow",
- "async-channel 2.5.0",
- "async-trait",
- "base64",
- "brush-builtins",
- "brush-core",
- "chrono",
- "cx-providers",
- "fluent",
- "futures",
- "globset",
- "gpui",
- "grep-regex",
- "grep-searcher",
- "html2text",
- "http",
- "ignore",
- "image",
- "libc",
- "lsp",
- "lsp-types",
- "parking_lot",
- "pi",
- "pi-extensions",
- "reqwest 0.12.28",
- "rmcp",
- "rquickjs",
- "rusqlite",
- "rustwright-core",
- "schemars 0.8.22",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar",
- "supervisor",
- "tempfile",
- "tera",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tokio-util",
- "toml 0.8.23",
- "tracing",
- "unic-langid",
- "uuid",
- "xxhash-rust",
- "zstd",
-]
-
-[[package]]
 name = "agent-ui"
 version = "0.1.0"
 dependencies = [
- "agent",
  "anyhow",
  "async-channel 2.5.0",
  "base64",
  "chrono",
  "cx",
- "cx-providers",
  "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "manox-agent",
  "manox-components",
  "manox-protocol",
+ "manox-providers",
  "manox-session-core",
+ "manox-terminal",
  "manox-webview",
  "open",
  "pi",
@@ -207,7 +155,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "terminal",
  "terminal-ui",
  "tokio",
  "tracing",
@@ -2183,12 +2130,12 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
- "cx-providers",
  "dirs",
  "futures-util",
  "glob",
  "image",
  "libc",
+ "manox-providers",
  "portable-pty",
  "rand 0.8.6",
  "ratatui",
@@ -2206,19 +2153,6 @@ dependencies = [
  "url",
  "which 7.0.3",
  "zstd",
-]
-
-[[package]]
-name = "cx-providers"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "reqwest 0.12.28",
- "serde",
- "serde_yaml",
- "tempfile",
- "url",
 ]
 
 [[package]]
@@ -4358,20 +4292,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "http_proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures",
- "httparse",
- "idna",
- "log",
- "thiserror 1.0.69",
- "tokio",
- "url",
-]
-
-[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5499,7 +5419,6 @@ dependencies = [
 name = "manox"
 version = "0.1.0"
 dependencies = [
- "agent",
  "agent-ui",
  "anyhow",
  "cx",
@@ -5509,13 +5428,67 @@ dependencies = [
  "gpui_platform",
  "image",
  "ksni",
+ "manox-agent",
+ "manox-terminal",
  "manox-webui",
  "supervisor",
- "terminal",
  "terminal-ui",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+]
+
+[[package]]
+name = "manox-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "async-trait",
+ "base64",
+ "brush-builtins",
+ "brush-core",
+ "chrono",
+ "fluent",
+ "futures",
+ "globset",
+ "gpui",
+ "grep-regex",
+ "grep-searcher",
+ "html2text",
+ "http",
+ "ignore",
+ "image",
+ "libc",
+ "lsp",
+ "lsp-types",
+ "manox-agent",
+ "manox-providers",
+ "parking_lot",
+ "pi",
+ "pi-extensions",
+ "reqwest 0.12.28",
+ "rmcp",
+ "rquickjs",
+ "rusqlite",
+ "rustwright-core",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "similar",
+ "supervisor",
+ "tempfile",
+ "tera",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "toml 0.8.23",
+ "tracing",
+ "unic-langid",
+ "uuid",
+ "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
@@ -5536,7 +5509,7 @@ dependencies = [
 name = "manox-napi"
 version = "0.1.0"
 dependencies = [
- "agent",
+ "manox-agent",
  "manox-protocol",
  "manox-session-core",
  "napi",
@@ -5558,15 +5531,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "manox-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "url",
+]
+
+[[package]]
 name = "manox-session-core"
 version = "0.1.0"
 dependencies = [
- "agent",
  "anyhow",
  "async-channel 2.5.0",
  "async-trait",
  "chrono",
  "futures",
+ "manox-agent",
  "manox-protocol",
  "parking_lot",
  "pi",
@@ -5578,16 +5564,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "manox-terminal"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "async-channel 2.5.0",
+ "chrono",
+ "cx",
+ "futures",
+ "hyperlinks",
+ "libc",
+ "manox-agent",
+ "parking_lot",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sysinfo 0.39.6",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "manox-webui"
 version = "0.1.0"
 dependencies = [
- "agent",
  "anyhow",
  "axum",
  "base64",
  "futures",
  "gpui",
  "include_dir",
+ "manox-agent",
  "manox-protocol",
  "manox-session-core",
  "open",
@@ -9906,40 +9916,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "terminal"
-version = "0.1.0"
-dependencies = [
- "agent",
- "alacritty_terminal",
- "anyhow",
- "async-channel 2.5.0",
- "chrono",
- "cx",
- "futures",
- "hyperlinks",
- "libc",
- "parking_lot",
- "portable-pty",
- "serde",
- "serde_json",
- "sysinfo 0.39.6",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "terminal-ui"
 version = "0.1.0"
 dependencies = [
- "agent",
  "anyhow",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "manox-agent",
+ "manox-terminal",
  "serde",
- "terminal",
  "tracing",
 ]
 

@@ -107,8 +107,8 @@ fn multiple_urls_detected() {
 fn path_with_extension_detected() {
     let opts = default_path_options();
     assert_eq!(
-        paths("see crates/agent/src/thread.rs for it", &opts),
-        vec!["crates/agent/src/thread.rs"]
+        paths("see crates/manox-agent/src/thread.rs for it", &opts),
+        vec!["crates/manox-agent/src/thread.rs"]
     );
     assert_eq!(paths("open /tmp/foo.txt", &opts), vec!["/tmp/foo.txt"]);
 }

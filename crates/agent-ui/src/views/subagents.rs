@@ -5,10 +5,10 @@
 //! harness has no child-thread entities for (the panel was retired with the
 //! manox harness).
 
-use agent::ToolCallStatus;
 use gpui::AnyElement;
 use gpui::prelude::*;
 use gpui_component::{Icon, IconName, Sizable as _, Theme};
+use manox_agent::ToolCallStatus;
 
 use crate::views::braille_spinner::BrailleSpinner;
 

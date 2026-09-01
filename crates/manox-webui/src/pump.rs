@@ -95,7 +95,7 @@ fn spawn_shuttle(
     client_id: String,
     cwd: String,
 ) -> tokio::task::JoinHandle<()> {
-    agent::runtime::handle().spawn(async move {
+    manox_agent::runtime::handle().spawn(async move {
         client.send_to_server(FromClient::Request {
             id: MsgId::new("init"),
             call: ClientCall::Initialize(Initialize {
@@ -222,10 +222,10 @@ mod tests {
         let _g = GLOBALS_LOCK.lock().unwrap();
         hermetic_home();
         INIT_ONCE.call_once(|| {
-            agent::runtime::init();
-            agent::pi_providers::init();
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
         });
-        agent::thread_store::init();
+        manox_agent::thread_store::init();
         let server = AgentServer::new(std::path::PathBuf::from("/"));
         let (client_conn, server_conn) = in_process_pair();
         server.accept(std::sync::Arc::new(server_conn));
@@ -250,7 +250,7 @@ mod tests {
             outbound.flush();
             while let Ok(f) = frame_rx.try_recv() {
                 if f["type"] == "session_ready" && f["sessionId"] == "s1" {
-                    agent::thread_store::drop_global_for_test();
+                    manox_agent::thread_store::drop_global_for_test();
                     return;
                 }
             }

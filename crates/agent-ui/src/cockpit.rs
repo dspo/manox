@@ -4,11 +4,11 @@
 //!
 //! The execution plan overview is no longer inferred here — the model publishes
 //! it explicitly through the `UpdatePlan` tool, and the rail consumes the
-//! [`agent::PlanSnapshot`] directly.
+//! [`manox_agent::PlanSnapshot`] directly.
 
 use std::time::Duration;
 
-use agent::language_model::TokenUsage;
+use manox_agent::language_model::TokenUsage;
 
 /// Coarse run phase shown in the status row. Derived from `ThreadEvent`s in
 /// the workspace's `subscribe_thread` closure.

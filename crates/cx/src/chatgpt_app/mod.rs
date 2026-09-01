@@ -26,7 +26,7 @@ use crate::Selection;
 use crate::prepare_chatgpt_launch_home_for_app;
 use crate::probe::runtime;
 use crate::warp;
-use cx_providers::{ChatGptAppSettings, ModelInjection};
+use manox_providers::{ChatGptAppSettings, ModelInjection};
 
 const DEFAULT_APP_PATH: &str = "/Applications/ChatGPT.app";
 /// 等待 ChatGPT.app renderer 注册到 CDP 的最长时长。

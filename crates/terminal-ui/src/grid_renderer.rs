@@ -12,7 +12,7 @@
 //! at paint time; here we keep the raw fg/bg/flags to stay gpui-agnostic.
 
 use gpui::Hsla;
-use terminal::{Cell, Flags};
+use manox_terminal::{Cell, Flags};
 
 use crate::block_chars::{BlockRect, COLS, SUBROWS, block_shape, expand};
 use crate::theme::{TerminalTheme, convert, is_default_background};
@@ -232,7 +232,7 @@ fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundReg
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terminal::{Cell, Color, Flags, NamedColor};
+    use manox_terminal::{Cell, Color, Flags, NamedColor};
 
     fn cell(c: char, fg: Color, bg: Color, flags: Flags) -> Cell {
         Cell {

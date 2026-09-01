@@ -8,7 +8,7 @@
 //!   `(thread_id, user_message_id)` with a `completed_at` unix-seconds timestamp
 //!
 //! 历史数据源：manox pi 化后（`crates/pi` 内核）不再写 `token_usage` 镜像，
-//! 新用量改由 `~/.manox/pi-sessions/` 的 JSONL session 承载
+//! 新用量改由 `~/.manox/sessions/` 的 JSONL session 承载
 //! （见 `parser/pi.rs::parse_with_agent`，`SourceKind::PiSession(AGENT_MANOX)`）。
 //! 本解析器继续统计 pi 化之前的存量数据；两条链路互斥，不会重复计数。
 //!

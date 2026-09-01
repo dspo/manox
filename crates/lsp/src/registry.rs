@@ -1,7 +1,7 @@
 //! Process-global LSP registry: PATH detection at startup, lazy per-`(spec,
 //! root)` client lifecycle.
 //!
-//! Mirrors `agent::mcp::registry`'s `OnceLock` shape. `init()` probes each
+//! Mirrors `manox_agent::mcp::registry`'s `OnceLock` shape. `init()` probes each
 //! executable with a bounded version command, but never spawns a long-running
 //! server. Per-`(spec_id, root)` slot, `ensure` kicks off a
 //! detached spawn+initialize (non-blocking — returns `Starting` immediately),
@@ -10,7 +10,7 @@
 //! bounded wait, returns the `Ready` client or an "indexing, retry" error).
 //!
 //! The `AgentTool` adapters that surface this as tools live in the `agent`
-//! crate (`agent::lsp`) to avoid a dependency cycle (`agent` depends on
+//! crate (`manox_agent::lsp`) to avoid a dependency cycle (`agent` depends on
 //! `lsp`; `lsp` must not depend on `agent`).
 
 use std::collections::HashMap;
@@ -491,7 +491,7 @@ fn probe_server(spec: &LspServerSpec) -> ServerAvailability {
 pub fn global() -> &'static LspRegistry {
     REGISTRY
         .get()
-        .expect("LspRegistry not initialized; call agent::init first")
+        .expect("LspRegistry not initialized; call manox_agent::init first")
 }
 
 pub fn try_global() -> Option<&'static LspRegistry> {

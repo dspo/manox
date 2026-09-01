@@ -9,7 +9,7 @@
 //! This crate is pure tokio — no `agent`/`gpui` dependency — so the JSON-RPC
 //! framer and client stay unit-testable without the GPUI runtime. The
 //! `AgentTool` adapters that wrap these clients live in the `agent` crate
-//! (`agent::lsp`), avoiding a dependency cycle.
+//! (`manox_agent::lsp`), avoiding a dependency cycle.
 
 pub mod client;
 pub mod proto;

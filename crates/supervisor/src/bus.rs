@@ -63,7 +63,7 @@ impl ProcessBus {
     ///
     /// The caller must be on the tokio runtime (this `tokio::spawn`s the reaper
     /// and stderr reader). Callers off-runtime (e.g. the gpui main thread)
-    /// drive this through `agent::runtime::handle()`'s `block_on`/`spawn`.
+    /// drive this through `manox_agent::runtime::handle()`'s `block_on`/`spawn`.
     pub async fn spawn(
         &self,
         name: &str,

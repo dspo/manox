@@ -10,8 +10,8 @@
 //! [`server_note_to_thread_event`], `FromServer::Request` (adjudication
 //! `ServerCall`s) via [`server_call_to_thread_event`].
 
-use agent::ThreadEvent;
-use agent::thread::{HistoryPhase, PermissionMode};
+use manox_agent::ThreadEvent;
+use manox_agent::thread::{HistoryPhase, PermissionMode};
 use manox_protocol::{ServerCall, ServerNote};
 
 /// Project a `ServerNote` onto the `ThreadEvent` the desktop conversation
@@ -55,7 +55,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
             serde_json::from_value(serde_json::Value::String(
                 reason.clone().unwrap_or_default(),
             ))
-            .unwrap_or(agent::language_model::StopReason::EndTurn),
+            .unwrap_or(manox_agent::language_model::StopReason::EndTurn),
         ),
         TurnFinished {
             cancelled,
@@ -92,7 +92,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
             cache_creation,
             cache_read,
             ..
-        } => ThreadEvent::TokenUsageUpdated(agent::language_model::TokenUsage {
+        } => ThreadEvent::TokenUsageUpdated(manox_agent::language_model::TokenUsage {
             input_tokens: *input,
             output_tokens: *output,
             cache_creation_input_tokens: *cache_creation,
@@ -111,7 +111,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
                     serde_json::from_value(serde_json::Value::String(s.clone()))
                         .ok()
                         .or_else(|| {
-                            serde_json::from_value::<agent::pi_engine::BrowserSuite>(
+                            serde_json::from_value::<manox_agent::engine::BrowserSuite>(
                                 serde_json::Value::String(s.clone()),
                             )
                             .ok()
@@ -160,7 +160,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
             id: id.clone(),
             subagent_type: agent_type.clone(),
             description: description.clone(),
-            child: agent::ThreadId::default(),
+            child: manox_agent::ThreadId::default(),
         },
         SubagentProgress {
             id,
@@ -173,7 +173,7 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
             id: id.clone(),
             subagent_type: agent_type.clone(),
             tool_uses: *tool_uses,
-            token_usage: agent::language_model::TokenUsage::default(),
+            token_usage: manox_agent::language_model::TokenUsage::default(),
             latest_activity: latest_activity.clone(),
             status: parse_status(status),
             health: None,
@@ -239,7 +239,7 @@ pub fn server_call_to_thread_event(call: &ServerCall) -> Option<ThreadEvent> {
         }),
         AskUserQuestion { auth_id, input, .. } => Some(ThreadEvent::ToolCallAuthorization {
             id: auth_id.clone(),
-            tool_name: agent::tools::ASK_USER_QUESTION.to_string(),
+            tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
             summary: String::new(),
             input: input.clone(),
         }),
@@ -254,9 +254,9 @@ pub fn server_call_to_thread_event(call: &ServerCall) -> Option<ThreadEvent> {
 }
 
 /// Reverse of `translate`'s ToolCallStatus projection (kebab-case string).
-fn parse_status(status: &str) -> agent::thread::ToolCallStatus {
+fn parse_status(status: &str) -> manox_agent::thread::ToolCallStatus {
     serde_json::from_value(serde_json::Value::String(status.to_string()))
-        .unwrap_or(agent::thread::ToolCallStatus::PendingApproval)
+        .unwrap_or(manox_agent::thread::ToolCallStatus::PendingApproval)
 }
 
 /// Reverse of `translate`'s PermissionMode projection (kebab-case string).
@@ -266,7 +266,7 @@ fn parse_permission_mode(mode: &str) -> PermissionMode {
 }
 
 /// Reverse of `translate`'s ReasoningEffort projection (snake-case string).
-fn parse_reasoning_effort(effort: &str) -> agent::language_model::ReasoningEffort {
+fn parse_reasoning_effort(effort: &str) -> manox_agent::language_model::ReasoningEffort {
     serde_json::from_value(serde_json::Value::String(effort.to_string())).unwrap_or_default()
 }
 
@@ -306,7 +306,7 @@ mod tests {
         assert!(matches!(
             server_note_to_thread_event(&note),
             Some(ThreadEvent::ToolCall { status, .. })
-                if matches!(status, agent::thread::ToolCallStatus::PendingApproval)
+                if matches!(status, manox_agent::thread::ToolCallStatus::PendingApproval)
         ));
     }
 
@@ -378,7 +378,7 @@ mod tests {
         assert!(matches!(
             server_call_to_thread_event(&call),
             Some(ThreadEvent::ToolCallAuthorization { tool_name, .. })
-                if tool_name == agent::tools::ASK_USER_QUESTION
+                if tool_name == manox_agent::tools::ASK_USER_QUESTION
         ));
     }
 

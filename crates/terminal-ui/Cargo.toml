@@ -15,8 +15,8 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 serde.workspace = true
 tracing.workspace = true
-terminal.workspace = true
-agent.workspace = true
+manox-terminal.workspace = true
+manox-agent.workspace = true
 
 [lints.clippy]
 dbg_macro = "deny"

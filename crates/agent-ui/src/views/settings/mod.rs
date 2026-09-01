@@ -18,7 +18,7 @@ use gpui_component::{
 };
 
 use crate::i18n;
-use agent::{settings as user_settings, thread::PermissionMode};
+use manox_agent::{settings as user_settings, thread::PermissionMode};
 
 use crate::views::management_shell::back_control;
 use crate::views::plugin_manager::PluginManagerView;
@@ -229,7 +229,7 @@ pub struct SettingsView {
     memory_skip_tool: bool,
     // --- MCP panel state ---
     /// Server names switched off by the user; persisted to `settings.toml`
-    /// on toggle (`agent::settings::set_mcp_disabled`). Seeded from settings
+    /// on toggle (`manox_agent::settings::set_mcp_disabled`). Seeded from settings
     /// at view creation.
     pub(crate) mcp_disabled: std::collections::HashSet<String>,
     // --- Environment panel state ---

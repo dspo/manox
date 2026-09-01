@@ -40,7 +40,7 @@ pub(crate) struct AppState {
 }
 
 /// Bind a loopback listener, publish the endpoint, then serve forever. Runs
-/// on the global tokio runtime (`agent::runtime::handle`) so no new runtime
+/// on the global tokio runtime (`manox_agent::runtime::handle`) so no new runtime
 /// is created.
 pub(crate) async fn bind_and_serve() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;

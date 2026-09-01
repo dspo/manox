@@ -38,7 +38,7 @@ is confirmed to have a home in the AgentServer protocol.
 
 | Actor capability | AgentServer equivalent | Gap? |
 |---|---|---|
-| `init` (host slug pinning) | `agent::host::set_host()` + `agent::init()` — called by manox-napi BEFORE creating AgentServer | No gap — done outside protocol |
+| `init` (host slug pinning) | `manox_agent::host::set_host()` + `manox_agent::init()` — called by manox-napi BEFORE creating AgentServer | No gap — done outside protocol |
 | `spawn_models_push` | `ClientCall::ListModels` — client calls after `ServerNote::Ready` | No gap — replaces proactive push with client-initiated query |
 | `subscribe_thread` (event subscription) | Pump receives `FromServer::Notification(ServerNote)` — all ThreadEvents flow as ServerNote | No gap — pump handles all events |
 | External CLI session restore | `ClientCall::OpenSession` returns history snapshot | No gap |

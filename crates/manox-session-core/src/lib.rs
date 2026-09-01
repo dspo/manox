@@ -51,11 +51,11 @@ pub(crate) mod test_support {
 
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
-    /// (`agent::init` would also boot MCP/LSP/plugin subsystems).
+    /// (`manox_agent::init` would also boot MCP/LSP/plugin subsystems).
     pub(crate) fn init_globals() {
         INIT_ONCE.call_once(|| {
-            agent::runtime::init();
-            agent::pi_providers::init();
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
         });
     }
 }

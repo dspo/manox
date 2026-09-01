@@ -7,7 +7,7 @@
 
 use gpui::Hsla;
 use gpui_component::Theme;
-use terminal::{Color, NamedColor, Rgb, theme::ThemeFile};
+use manox_terminal::{Color, NamedColor, Rgb, theme::ThemeFile};
 
 /// Resolved terminal palette used by the renderer. Compared by the view to
 /// bust the shaped-line cache on a theme switch.

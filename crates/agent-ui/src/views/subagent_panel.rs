@@ -7,7 +7,7 @@
 //! miniature conversation (assistant bubbles, reasoning folds, tool cards).
 //!
 //! The workspace accumulates the child session's bridged events
-//! ([`agent::SubagentChildEvent`]) per Agent tool-call id; opening mid-run
+//! ([`manox_agent::SubagentChildEvent`]) per Agent tool-call id; opening mid-run
 //! backfills from that accumulation by replaying the translated events.
 //! Pi sub-agent sessions are ephemeral (no persisted child transcript), so a
 //! panel opened after a reload falls back to the Agent tool result's final
@@ -16,15 +16,15 @@
 use std::collections::HashMap;
 
 use crate::i18n;
-use agent::Message;
-use agent::ToolCallStatus;
-use agent::language_model::{MessageContent, TokenUsage};
-use agent::thread::{SubagentChildEvent, ThreadEvent};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, WeakEntity, Window, px,
 };
 use gpui_component::{ActiveTheme as _, ElementExt as _, h_flex, v_flex};
+use manox_agent::Message;
+use manox_agent::ToolCallStatus;
+use manox_agent::language_model::{MessageContent, TokenUsage};
+use manox_agent::thread::{SubagentChildEvent, ThreadEvent};
 
 use crate::Workspace;
 use crate::conversation::{ApplyCtx, ConversationState};
@@ -52,7 +52,7 @@ fn thread_event_of(child: &SubagentChildEvent) -> Option<(ThreadEvent, Option<To
                 ThreadEvent::ToolCall {
                     id: id.clone(),
                     name: name.clone(),
-                    title: agent::thread::tool_title(name, &title_value, None),
+                    title: manox_agent::thread::tool_title(name, &title_value, None),
                     status: ToolCallStatus::Running,
                     input,
                 },
@@ -128,21 +128,21 @@ impl SubagentPanel {
         if let Some((prompt, dispatched_at)) = prompt {
             let mut message = Message::user(prompt);
             message.timestamp = dispatched_at;
-            message.ui = Some(agent::MessageUiMetadata {
-                author: Some(agent::MessageAuthor::Lead),
+            message.ui = Some(manox_agent::MessageUiMetadata {
+                author: Some(manox_agent::MessageAuthor::Lead),
                 ..Default::default()
             });
-            display.push(agent::db::HistoryEntry::Message(message));
+            display.push(manox_agent::db::HistoryEntry::Message(message));
         }
         if backfill.is_empty()
             && let Some(final_text) = final_text
         {
-            display.push(agent::db::HistoryEntry::Message(Message::assistant(vec![
-                MessageContent::Text(final_text),
-            ])));
+            display.push(manox_agent::db::HistoryEntry::Message(Message::assistant(
+                vec![MessageContent::Text(final_text)],
+            )));
         }
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
-        let recipient_author = agent::MessageAuthor::Agent(recipient.clone());
+        let recipient_author = manox_agent::MessageAuthor::Agent(recipient.clone());
         let conversation = cx.new(|cx| {
             let mut conversation = ConversationState::rebuild_from_display(
                 &display,
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn stop_and_error_events_translate_to_thread_boundaries() {
         let (event, usage) = translated(&SubagentChildEvent::Stop {
-            reason: agent::language_model::StopReason::ToolUse,
+            reason: manox_agent::language_model::StopReason::ToolUse,
             usage: Some(TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -405,17 +405,17 @@ mod tests {
         });
         assert!(matches!(
             event,
-            ThreadEvent::Stop(agent::language_model::StopReason::ToolUse)
+            ThreadEvent::Stop(manox_agent::language_model::StopReason::ToolUse)
         ));
         assert_eq!(usage.unwrap().input_tokens, 10);
 
         let (event, usage) = translated(&SubagentChildEvent::Stop {
-            reason: agent::language_model::StopReason::EndTurn,
+            reason: manox_agent::language_model::StopReason::EndTurn,
             usage: None,
         });
         assert!(matches!(
             event,
-            ThreadEvent::Stop(agent::language_model::StopReason::EndTurn)
+            ThreadEvent::Stop(manox_agent::language_model::StopReason::EndTurn)
         ));
         assert!(usage.is_none());
 

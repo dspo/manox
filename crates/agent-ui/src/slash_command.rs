@@ -18,8 +18,8 @@
 //! mode, and model, see [`NewCommand`]), and `/mode` (cycle or set the
 //! thread's permission mode, optionally with a prompt that starts working
 //! immediately, see [`ModeCommand`]); markdown prompt-macros and skills are
-//! mirrored into the registry at startup from the shared `agent::command` /
-//! `agent::skill` registries ([`MarkdownSlashCommand`] /
+//! mirrored into the registry at startup from the shared `manox_agent::command` /
+//! `manox_agent::skill` registries ([`MarkdownSlashCommand`] /
 //! [`SkillSlashCommand`]).
 
 use std::sync::{Arc, OnceLock};
@@ -27,8 +27,8 @@ use std::sync::{Arc, OnceLock};
 use gpui::{App, Context, SharedString, Window};
 
 use crate::i18n;
-use agent::command::CommandDefinition;
-use agent::skill::SkillDefinition;
+use manox_agent::command::CommandDefinition;
+use manox_agent::skill::SkillDefinition;
 
 use crate::conversation::NoticeAnchor;
 use crate::views::completion::CompletionKind;
@@ -138,9 +138,9 @@ pub fn init(_cx: &mut App) {
     // skill sharing one is skipped — keeps one popover row per name and routes
     // dispatch to the higher-priority command/built-in. The built-in set is
     // shared with the headless actor's surface via
-    // `agent::slash_builtins`, so the two hosts enumerate the same commands.
+    // `manox_agent::slash_builtins`, so the two hosts enumerate the same commands.
     let mut command_keys: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
-        agent::slash_builtins::BUILTIN_SLASH_COMMANDS
+        manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS
             .iter()
             .map(|meta| meta.name.to_string()),
     );
@@ -150,9 +150,9 @@ pub fn init(_cx: &mut App) {
     // `Thread::submit_command`, which substitutes `$ARGUMENTS` into the body
     // (the retired manox harness additionally applied the macro's
     // `allowed-tools` turn filter).
-    // `agent::command::try_global` is `None` only before `agent::init` (which
+    // `manox_agent::command::try_global` is `None` only before `manox_agent::init` (which
     // `main` calls before us); fall back to no macros rather than panicking.
-    for (key, def) in agent::command::try_global()
+    for (key, def) in manox_agent::command::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -173,7 +173,7 @@ pub fn init(_cx: &mut App) {
     // message. A command and a skill may share a key (`gitwork:deliver`); the
     // command wins — skip a skill whose key an already-registered command owns,
     // so the popover shows one row and `parse`/`dispatch` hit the command path.
-    for (key, def) in agent::skill::try_global()
+    for (key, def) in manox_agent::skill::try_global()
         .map(|r| r.entries())
         .unwrap_or_default()
     {
@@ -315,8 +315,8 @@ impl SlashCommand for SkillSlashCommand {
 
 /// The shared built-in metadata for a command by canonical name. Panics on a
 /// miss so a typo in a command impl is caught at startup, never at runtime.
-fn builtin_meta(name: &str) -> &'static agent::slash_builtins::BuiltinSlashMeta {
-    agent::slash_builtins::canonical_builtin(name).expect("registered built-in command")
+fn builtin_meta(name: &str) -> &'static manox_agent::slash_builtins::BuiltinSlashMeta {
+    manox_agent::slash_builtins::canonical_builtin(name).expect("registered built-in command")
 }
 
 /// `/plan` — toggle plan mode. Entering wires the read-only gate and the
@@ -355,7 +355,7 @@ impl SlashCommand for ModeCommand {
             Some((head, tail)) => (head, tail.trim()),
             None => (trimmed, ""),
         };
-        let parsed: Result<agent::thread::PermissionMode, _> =
+        let parsed: Result<manox_agent::thread::PermissionMode, _> =
             serde_json::from_value(serde_json::Value::String(name.to_string()));
         match parsed {
             Ok(mode) => {
@@ -486,11 +486,11 @@ impl SlashCommand for GoalCommand {
         // The authoritative goal lives in the AgentServer session (mirrored
         // via the store); edit/budget/rounds read the current values since
         // `edit_goal` overwrites objective/budget/rounds in place.
-        let current_goal: Option<agent::goal::ThreadGoal> = workspace
+        let current_goal: Option<manox_agent::goal::ThreadGoal> = workspace
             .store
             .as_ref()
             .and_then(|s| s.read(cx).store.goal.as_ref())
-            .and_then(|v| serde_json::from_value::<agent::goal::ThreadGoal>(v.clone()).ok());
+            .and_then(|v| serde_json::from_value::<manox_agent::goal::ThreadGoal>(v.clone()).ok());
         if let Some(objective) = trimmed.strip_prefix("replace ").map(str::trim) {
             let _ = workspace.send_note(|sid| manox_protocol::ClientNote::Goal {
                 session_id: sid.into(),
@@ -601,7 +601,7 @@ impl SlashCommand for GoalCommand {
             _ => {
                 let needs_confirmation = current_goal
                     .as_ref()
-                    .is_some_and(|goal| goal.status != agent::goal::GoalStatus::Complete);
+                    .is_some_and(|goal| goal.status != manox_agent::goal::GoalStatus::Complete);
                 if needs_confirmation {
                     workspace.begin_goal_replace_with_objective(trimmed, window, cx);
                     return SlashResult::Handled;

@@ -133,7 +133,7 @@ struct CxAgent {
     #[allow(dead_code)]
     args: Vec<String>,
     /// Ignored by resolution (hardcoded wire apis win — parity with
-    /// cx-providers), parsed for schema completeness.
+    /// manox-providers), parsed for schema completeness.
     #[serde(default)]
     #[allow(dead_code)]
     wire_apis: Vec<String>,
@@ -147,7 +147,7 @@ struct CxAgent {
 /// Register every provider endpoint from the config file into `registry`.
 /// A missing file is not an error (returns 0) — a fresh install simply has
 /// no providers. Synchronous on purpose: credential resolution may hit the
-/// OS keychain or a shell command, matching cx-providers' blocking
+/// OS keychain or a shell command, matching manox-providers' blocking
 /// semantics; callers run this at startup/reload.
 pub fn register_providers(
     registry: &pi::ProviderRegistry,
@@ -271,16 +271,16 @@ fn model_supports_wire_api(wire_apis: Option<&[String]>, endpoint_wire_api: &str
     }
 }
 
-// ── apikey resolution (mirrors cx_providers::resolve_apikey) ──
+// ── apikey resolution (mirrors manox_providers::resolve_apikey) ──
 
-/// Resolve an `apikey_source` the way cx-providers does, with one
+/// Resolve an `apikey_source` the way manox-providers does, with one
 /// deliberate difference: `env:VAR` is **not** read eagerly — it is passed
 /// through as the kernel's `$VAR` interpolation syntax so the value is
 /// re-read on every request (TS pi resolves api keys uncached for the same
 /// reason).
 ///
 /// `Ok(None)` never happens for a present source; a missing source is a
-/// hard error (parity with cx-providers, which refuses to build a model
+/// hard error (parity with manox-providers, which refuses to build a model
 /// without one).
 pub fn resolve_apikey(source: Option<&str>) -> Result<Option<String>, String> {
     let Some(source) = source else {
@@ -439,7 +439,7 @@ fn known_model_meta(id: &str) -> KnownModelMeta {
 
 /// Split a raw model id into the wire-facing id and an optional trailing
 /// context-window hint (`deepseek-v4-flash[1m]` → `("deepseek-v4-flash",
-/// Some(1_000_000))`). Grammar mirrors `cx_providers::parse_context_window`
+/// Some(1_000_000))`). Grammar mirrors `manox_providers::parse_context_window`
 /// (`[200k]`, `[1m123k]`, bare numbers, k/m units); an unparseable or
 /// non-trailing group leaves the id intact (sent to the API verbatim).
 pub fn parse_model_id(raw: &str) -> (String, Option<u64>) {
@@ -469,8 +469,8 @@ fn trailing_bracket_open(id: &str) -> Option<usize> {
 
 /// Parse a context-window suffix term list: digit runs with optional
 /// `k`/`m` unit letters, additive (`1m123k` = 1_123_000). Port of
-/// `cx_providers::parse_context_window` (kept in sync by tests; the
-/// extension cannot depend on cx-providers by design).
+/// `manox_providers::parse_context_window` (kept in sync by tests; the
+/// extension cannot depend on manox-providers by design).
 fn parse_context_window(s: &str) -> Option<u64> {
     let t = s.trim();
     if t.is_empty() || t.contains(char::is_whitespace) {
@@ -577,11 +577,11 @@ fn build_model_config(
     }
 }
 
-// ── visible agents (port of cx_providers::effective_agents_for_model) ──
+// ── visible agents (port of manox_providers::effective_agents_for_model) ──
 
 /// Canonicalize a config agent id (legacy `codex-app` → `codex`,
 /// `Codex.app` → `ChatGPT.app`, `codex+` → `codex` — parity with
-/// cx-providers).
+/// manox-providers).
 fn canonical_agent_id(agent_id: &str) -> &str {
     match agent_id {
         "codex-app" => "codex",
@@ -604,7 +604,7 @@ fn normalize_agent_ids(agent_ids: &[String]) -> Vec<String> {
 }
 
 /// Hardcoded wire apis each built-in agent supports — the config file's
-/// per-agent `wire_apis` is ignored (parity with cx-providers).
+/// per-agent `wire_apis` is ignored (parity with manox-providers).
 fn hardcoded_wire_apis(agent_id: &str) -> &'static [&'static str] {
     match canonical_agent_id(agent_id) {
         "copilot" => &["anthropic", "responses", "completions"],
@@ -629,7 +629,7 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
             ids.push("ChatGPT.app".to_string());
         } else if id == "claude" {
             // claude expands into a CLI entry and a VS Code desktop entry
-            // (injection-type agent, parity with cx-providers).
+            // (injection-type agent, parity with manox-providers).
             ids.push("claude".to_string());
             ids.push("VS Code".to_string());
         } else {
@@ -640,7 +640,7 @@ fn resolved_agent_ids(config: &CxConfig) -> Vec<String> {
 }
 
 /// The effective agent visibility for one model on one endpoint — the port
-/// of `cx_providers::effective_agents_for_model`: start from the agents
+/// of `manox_providers::effective_agents_for_model`: start from the agents
 /// whose hardcoded wire apis match the endpoint's wire api, then apply the
 /// endpoint's and the model's `agents` lists as allow-list filters (an
 /// empty filter is a no-op).
@@ -905,7 +905,7 @@ providers:
     }
 
     #[test]
-    fn effective_agents_parity_with_cx_providers_rules() {
+    fn effective_agents_parity_with_manox_providers_rules() {
         let config: CxConfig = serde_yaml::from_str(FIXTURE).unwrap();
         // anthropic endpoint, no filters: claude + VS Code
         // (codex/ChatGPT.app are responses-only; copilot unconfigured).

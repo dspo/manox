@@ -22,8 +22,8 @@ pub enum Translated {
 }
 
 /// Translate one kernel event into its protocol form.
-pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translated {
-    use agent::thread::ThreadEvent;
+pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Translated {
+    use manox_agent::thread::ThreadEvent;
 
     match ev {
         ThreadEvent::AgentText(text) => Note(ServerNote::AgentText {
@@ -239,7 +239,7 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
             // AskUserQuestion's authorization is an interactive question, not a
             // bare allow/deny: route it as its own ServerCall kind so the
             // client renders the ask card and returns structured answers.
-            if tool_name == agent::tools::ASK_USER_QUESTION {
+            if tool_name == manox_agent::tools::ASK_USER_QUESTION {
                 Call(ServerCall::AskUserQuestion {
                     session_id: session_id.into(),
                     auth_id: id.clone(),
@@ -268,7 +268,7 @@ pub fn translate(ev: &agent::thread::ThreadEvent, session_id: &str) -> Translate
 }
 
 /// Build a `TokenUsageSnapshot` from a kernel `TokenUsage`.
-pub fn token_usage_snapshot(usage: &agent::language_model::TokenUsage) -> TokenUsageSnapshot {
+pub fn token_usage_snapshot(usage: &manox_agent::language_model::TokenUsage) -> TokenUsageSnapshot {
     TokenUsageSnapshot {
         input: usage.input_tokens,
         output: usage.output_tokens,
@@ -290,13 +290,13 @@ mod tests {
     #[test]
     fn compaction_note_carries_the_retained_tail() {
         let tail = vec![
-            agent::message::Message::assistant(vec![agent::language_model::MessageContent::Text(
-                "kept answer".into(),
-            )]),
-            agent::message::Message::user("kept follow-up".into()),
+            manox_agent::message::Message::assistant(vec![
+                manox_agent::language_model::MessageContent::Text("kept answer".into()),
+            ]),
+            manox_agent::message::Message::user("kept follow-up".into()),
         ];
         let translated = translate(
-            &::agent::thread::ThreadEvent::Compaction {
+            &::manox_agent::thread::ThreadEvent::Compaction {
                 summary: "folded".into(),
                 messages_compacted: 9,
                 tokens_before: 100_000,
@@ -307,7 +307,7 @@ mod tests {
         let Translated::Note(ServerNote::Compaction { retained, .. }) = translated else {
             panic!("expected a Compaction note");
         };
-        let round: Vec<agent::message::Message> =
+        let round: Vec<manox_agent::message::Message> =
             serde_json::from_value(retained).expect("retained deserializes back");
         assert_eq!(round.len(), 2, "the tail survives the wire form");
         assert_eq!(round.len(), tail.len());

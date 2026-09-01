@@ -34,8 +34,8 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 rust-embed.workspace = true
 
-agent.workspace = true
-terminal.workspace = true
+manox-agent.workspace = true
+manox-terminal.workspace = true
 terminal-ui.workspace = true
 manox-components.workspace = true
 open.workspace = true
@@ -47,7 +47,7 @@ cx.workspace = true
 
 # cx provider config schema —— the Settings → Models panel edits
 # `cx.providers.config.yaml` through these structs.
-cx-providers.workspace = true
+manox-providers.workspace = true
 
 # pi harness backend.
 pi = { workspace = true }
@@ -57,8 +57,8 @@ manox-session-core.workspace = true
 
 
 [dev-dependencies]
-agent = { workspace = true, features = ["test-support"] }
-terminal = { workspace = true, features = ["test-support"] }
+manox-agent = { workspace = true, features = ["test-support"] }
+manox-terminal = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 

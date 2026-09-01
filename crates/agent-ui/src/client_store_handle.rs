@@ -2,8 +2,8 @@
 //! `RpcConnection` into the store. γ-1b: the Entity wrapper + pump; γ-2 wires
 //! the views read from this.
 
-use agent::ThreadEvent;
 use gpui::{Context, EventEmitter, Task};
+use manox_agent::ThreadEvent;
 use manox_protocol::{FromServer, RpcConnection};
 
 use crate::client_store::ClientStore;
