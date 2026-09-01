@@ -44,6 +44,7 @@ manox-webview.workspace = true
 # cx library —— `AgentBuilder` / `SessionHandle` to spawn external agent CLIs
 # (claude/codex/copilot) and hold the PTY handle for an `ExternalSession`.
 cx.workspace = true
+manox-ext-agents.workspace = true
 
 # cx provider config schema —— the Settings → Models panel edits
 # `cx.providers.config.yaml` through these structs.

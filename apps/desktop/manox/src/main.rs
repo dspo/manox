@@ -564,7 +564,7 @@ fn build_tools_menu() -> Menu {
         manox_agent::i18n::t("menu-vscode-open"),
         agent_ui::LaunchVSCode,
     )
-    .disabled(!cx::vscode_app_installed());
+    .disabled(!manox_ext_agents::vscode_app_installed());
     Menu::new(manox_agent::i18n::t("menu-tools")).items([MenuItem::submenu(chatgpt), vscode])
 }
 

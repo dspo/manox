@@ -285,7 +285,7 @@ impl SessionHandle {
     /// mode, forward stdin, or print anything — those are the CLI driver's call.
     ///
     /// `warp_session` is taken by value: the handle owns the paired stop event.
-    pub(crate) fn spawn(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> Result<Self> {
+    pub fn spawn(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> Result<Self> {
         let session_id = session::generate_session_id();
         let started_at = Instant::now();
 
@@ -422,11 +422,11 @@ impl SessionHandle {
 
     /// The SIGWINCH flag the CLI's signal handler sets; the writer thread polls
     /// it to sync the master size to the user terminal. Library callers ignore.
-    pub(crate) fn resize_flag(&self) -> Arc<AtomicBool> {
+    pub fn resize_flag(&self) -> Arc<AtomicBool> {
         self.resize_flag.clone()
     }
 
-    pub(crate) fn writer_tx(&self) -> mpsc::Sender<WriteReq> {
+    pub fn writer_tx(&self) -> mpsc::Sender<WriteReq> {
         self.writer_tx
             .lock()
             .expect("writer_tx mutex poisoned")
@@ -463,7 +463,7 @@ impl SessionHandle {
 
     /// Kill the child, reap it, finalize, and return the outcome. Used by the
     /// CLI on the raw-mode-failure path where the agent must be torn down.
-    pub(crate) fn kill_wait(&self) -> SessionResult {
+    pub fn kill_wait(&self) -> SessionResult {
         let status = match self.child.lock().expect("child mutex poisoned").take() {
             Some(mut child) => {
                 let _ = child.kill();

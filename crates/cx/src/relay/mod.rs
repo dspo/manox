@@ -8,11 +8,11 @@
 // handle owns the spawn/IPC/writer-thread lifecycle; `relay::run` owns the
 // terminal interaction.
 
-pub(crate) mod ipc;
-pub(crate) mod pty;
-pub(crate) mod transfer;
+// pub(crate) mod ipc; -- moved to manox-ext-agents
+// pub(crate) mod pty; -- moved to manox-ext-agents
+// pub(crate) mod transfer; -- moved to manox-ext-agents
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
@@ -22,11 +22,32 @@ use portable_pty::ExitStatus as PtyExitStatus;
 use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::flag as sig_flag;
 
-use crate::LaunchSpec;
-use crate::api::SessionHandle;
-use crate::warp::WarpSession;
+use manox_ext_agents::LaunchSpec;
+use manox_ext_agents::api::SessionHandle;
+use manox_ext_agents::warp::WarpSession;
 
-use transfer::stdin_forward;
+use manox_ext_agents::relay::transfer::WriteReq;
+use std::sync::mpsc;
+use std::thread;
+
+/// Read raw stdin verbatim and forward to the writer channel.
+fn stdin_forward(tx: mpsc::Sender<WriteReq>) {
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(WriteReq::Bytes(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
 
 /// Run the agent through a PTY relay, accepting IPC injections.
 ///
@@ -120,7 +141,11 @@ pub(crate) fn run(spec: &LaunchSpec, warp_session: Option<WarpSession>) -> ! {
 
 /// Print the inline exit summary (agent/provider/model/duration/tokens/termination),
 /// matching `finalize_exit_common`'s formatting for the direct-launch path.
-fn print_exit_summary(res: &crate::SessionResult, started_sys: SystemTime, cwd: &std::path::Path) {
+fn print_exit_summary(
+    res: &manox_ext_agents::SessionResult,
+    started_sys: SystemTime,
+    cwd: &std::path::Path,
+) {
     let tokens = crate::stats::count_recent_session_tokens(&res.agent_id, started_sys, cwd);
     println!();
     println!(

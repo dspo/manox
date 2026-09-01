@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+manox-ext-agents.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
@@ -21,12 +22,12 @@ rand = "0.8"
 ratatui = "0.29"
 signal-hook = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "process", "signal"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = "0.3"
 glob = "0.3"
 regex = "1.11"
-rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

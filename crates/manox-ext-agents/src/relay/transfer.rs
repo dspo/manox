@@ -5,13 +5,12 @@
 // slave, whose line discipline turns 0x03 into SIGINT for the agent. A single
 // writer thread serializes writes from stdin and IPC so they never interleave.
 
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use crossterm::terminal;
 use portable_pty::{MasterPty, PtySize};
 
 /// A unit of work for the master writer thread.
@@ -21,30 +20,9 @@ use portable_pty::{MasterPty, PtySize};
 /// The relay tears down via `process::exit` (the agent's EOF ends the main
 /// thread, which finalizes and exits), so there is no shutdown message — stdin
 /// and IPC both send `Bytes` only.
-pub(crate) enum WriteReq {
+pub enum WriteReq {
     Bytes(Vec<u8>),
     Resize(u16, u16),
-}
-
-/// Read raw stdin verbatim and forward to the writer channel.
-///
-/// Returns when stdin hits EOF (e.g. Ctrl+D) or the channel is closed.
-pub(crate) fn stdin_forward(tx: mpsc::Sender<WriteReq>) {
-    thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(WriteReq::Bytes(buf[..n].to_vec())).is_err() {
-                        break; // writer thread gone
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 /// Consume the writer channel and write to the master, serializing stdin/IPC.
@@ -75,15 +53,8 @@ pub(crate) fn writer_loop(
                     });
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if resize_flag.swap(false, Ordering::Relaxed)
-                        && let Ok((cols, rows)) = terminal::size()
-                    {
-                        let _ = master.resize(PtySize {
-                            rows,
-                            cols,
-                            pixel_width: 0,
-                            pixel_height: 0,
-                        });
+                    if resize_flag.swap(false, Ordering::Relaxed) {
+                        // Resize handled via SessionHandle::resize in library context
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,

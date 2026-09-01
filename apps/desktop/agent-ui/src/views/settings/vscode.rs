@@ -83,7 +83,7 @@ impl VsCodePanelState {
             save_generation: 0,
             window_handle: window.window_handle(),
         };
-        match cx::vscode_app_settings() {
+        match manox_ext_agents::vscode_app_settings() {
             Ok(settings) => {
                 state.claude_code = settings.claude_code;
                 state.codex = settings.codex;
@@ -109,8 +109,10 @@ impl VsCodePanelState {
                 .background_executor()
                 .spawn(async move {
                     match kind {
-                        BlockKind::ClaudeCode => cx::vscode_claude_injectable_catalog(),
-                        BlockKind::Codex => cx::chatgpt_injectable_catalog(),
+                        BlockKind::ClaudeCode => {
+                            manox_ext_agents::vscode_claude_injectable_catalog()
+                        }
+                        BlockKind::Codex => manox_ext_agents::chatgpt_injectable_catalog(),
                     }
                 })
                 .await;
@@ -191,7 +193,7 @@ impl VsCodePanelState {
             claude_code: self.claude_code.clone(),
             codex: self.codex.clone(),
         };
-        if let Err(e) = cx::save_vscode_app_settings(&settings) {
+        if let Err(e) = manox_ext_agents::save_vscode_app_settings(&settings) {
             tracing::warn!(error = %e, "failed to save vscode_app settings");
             window.push_notification(
                 Notification::error(e.to_string()).title(i18n::t("settings-save-failed-title")),
