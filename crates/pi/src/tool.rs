@@ -15,6 +15,31 @@ use crate::types::{AgentEvent, AgentLoopConfig, ContentBlock, EventSink};
 
 // ── Tool state ─────────────────────────────────────────────────────────────
 
+/// Nudge flag bits for per-session-once nudges.
+pub mod nudge {
+    /// Bit 0: grep/rg/find/ls native tool preference shown.
+    pub const GREP_TOOL_PREF: u8 = 1 << 0;
+    /// Bit 1: long sleep (>=10s) → background suggestion shown.
+    pub const SLEEP_BACKGROUND: u8 = 1 << 1;
+    /// Bit 2: poll loop (while/for/until + sleep) → background/Monitor shown.
+    pub const POLL_LOOP: u8 = 1 << 2;
+    /// Bit 3: gh run watch / gh pr checks --watch → background shown.
+    pub const GH_WATCH: u8 = 1 << 3;
+
+    /// Check whether `flag` has been shown in this session.
+    pub fn has(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
+        nudge_flags.lock().map(|f| *f & flag != 0).unwrap_or(true)
+    }
+
+    /// Mark `flag` as shown (returns true if it was already set).
+    pub fn mark(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
+        let mut flags = nudge_flags.lock().unwrap_or_else(|e| e.into_inner());
+        let already = *flags & flag != 0;
+        *flags |= flag;
+        already
+    }
+}
+
 /// Session-scoped tool state: hashline snapshots, the file mutation queue,
 /// and the hashline clipboard.
 ///
@@ -43,6 +68,11 @@ pub struct ToolState {
     /// post-command directory); `None` until the first tool call resolves, so
     /// resolution starts from the session cwd.
     pub sticky_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Per-session nudge flags: each bit marks a nudge type that has been shown
+    /// this session, so nudges fire at most once per session. Bit 0 = grep
+    /// native tool preference, bit 1 = sleep nudge, bit 2 = poll loop nudge,
+    /// bit 3 = gh watch nudge.
+    pub nudge_flags: std::sync::Mutex<u8>,
 }
 
 impl ToolState {
@@ -53,6 +83,7 @@ impl ToolState {
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
             sticky_cwd: std::sync::Mutex::new(None),
+            nudge_flags: std::sync::Mutex::new(0),
         }
     }
 
@@ -65,6 +96,7 @@ impl ToolState {
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
             sticky_cwd: std::sync::Mutex::new(None),
+            nudge_flags: std::sync::Mutex::new(0),
         }
     }
 }

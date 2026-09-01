@@ -1,8 +1,13 @@
-// Grep tool — in-process content search with regex.
+// Grep tool — in-process content search with regex (ripgrep engine).
 //
 // Uses the `grep-searcher` engine for matching and `ignore` for filesystem
 // traversal (respects .gitignore). No shell execution — the LLM's input is
 // treated as data, not as a command string.
+//
+// Prefer this over `grep` in Bash for plain searches: no sandbox, no approval
+// in read-only mode, bounded structured output. Use Bash only for pipes
+// (grep|awk, wc -l) or when the ripgrep engine's regex dialect is insufficient.
+// Supports count, files-with-matches, and per-file max-count modes.
 
 use std::path::{Path, PathBuf};
 
@@ -35,7 +40,11 @@ impl AgentTool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search for patterns in files"
+        "Search file contents with a regex (ripgrep engine). \
+         Prefer this over `grep` in Bash for plain searches: no sandbox, no \
+         approval in read-only mode, bounded structured output. Use Bash only \
+         for pipes (grep|awk, wc -l) or when the ripgrep engine's regex dialect \
+         is insufficient. Supports count and files-with-matches modes."
     }
 
     fn is_read_only(&self) -> bool {
@@ -77,6 +86,18 @@ impl AgentTool for GrepTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of results to return"
+                },
+                "count": {
+                    "type": "boolean",
+                    "description": "When true, return per-file match counts instead of the matched lines themselves"
+                },
+                "files_with_matches": {
+                    "type": "boolean",
+                    "description": "When true, return only the paths of files that contain at least one match (like grep -l)"
+                },
+                "max_count": {
+                    "type": "integer",
+                    "description": "Stop searching each file after this many matches (per-file limit)"
                 }
             },
             "required": ["pattern"]
@@ -102,6 +123,16 @@ impl AgentTool for GrepTool {
             .as_u64()
             .map(|v| v as usize)
             .unwrap_or(Self::DEFAULT_LIMIT);
+        let count_mode = params["count"].as_bool().unwrap_or(false);
+        let files_with_matches = params["files_with_matches"].as_bool().unwrap_or(false);
+        let max_count = params["max_count"].as_u64().map(|v| v as usize);
+
+        // mutually exclusive modes: count and files_with_matches
+        if count_mode && files_with_matches {
+            return Err(ToolError::InvalidArguments(
+                "count and files_with_matches are mutually exclusive".into(),
+            ));
+        }
 
         // Build the matcher on the ripgrep engine. Literal mode escapes the
         // pattern first; the engine otherwise interprets it as a regex.
@@ -126,10 +157,38 @@ impl AgentTool for GrepTool {
         // Build the file glob filter.
         let glob_set = build_glob_filter(glob_pattern)?;
 
+        if files_with_matches {
+            let matched = search_files_names(&search_path, &matcher, &glob_set, max_count, limit);
+            if matched.is_empty() {
+                return Ok(AgentToolResult::text("No matches found"));
+            }
+            let output = matched.join("\n");
+            return Ok(AgentToolResult::text(output));
+        }
+
+        if count_mode {
+            let counts = search_files_count(&search_path, &matcher, &glob_set, max_count, limit);
+            if counts.is_empty() {
+                return Ok(AgentToolResult::text("No matches found"));
+            }
+            let output = counts
+                .iter()
+                .map(|(path, c)| format!("{}:{}", path, c))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(AgentToolResult::text(output));
+        }
+
         // Walk the directory tree and collect matches plus, per matched file,
         // the 1-indexed lines the output will display (match + context).
-        let (matches, matched_paths, displayed) =
-            search_files(&search_path, &matcher, &glob_set, context_lines, limit);
+        let (matches, matched_paths, displayed) = search_files(
+            &search_path,
+            &matcher,
+            &glob_set,
+            context_lines,
+            limit,
+            max_count,
+        );
         if matches.is_empty() {
             return Ok(AgentToolResult::text("No matches found"));
         }
@@ -215,6 +274,140 @@ fn build_glob_filter(pattern: Option<&str>) -> Result<Option<globset::GlobSet>, 
     Ok(Some(set))
 }
 
+/// Search files but only return the names of matching files (like `grep -l`).
+fn search_files_names(
+    search_path: &Path,
+    matcher: &RegexMatcher,
+    glob_set: &Option<globset::GlobSet>,
+    max_count: Option<usize>,
+    limit: usize,
+) -> Vec<String> {
+    let mut results: Vec<String> = Vec::new();
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
+
+    let walker = WalkBuilder::new(search_path)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .max_depth(None)
+        .build();
+
+    for entry in walker {
+        if results.len() >= limit {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        if let Some(globs) = glob_set
+            && !globs.is_match(path)
+        {
+            continue;
+        }
+
+        let mut count = 0usize;
+        let mut sink = CollectBoolSink {
+            max_count,
+            matched: &mut count,
+        };
+        let _ = searcher.search_path(matcher, path, &mut sink);
+        if count == 0 {
+            continue;
+        }
+
+        let display_path = match path.strip_prefix(search_path) {
+            Ok(rel) if rel.as_os_str().is_empty() => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => path.display().to_string(),
+        };
+        results.push(display_path);
+    }
+
+    results
+}
+
+/// Search files and return per-file match counts.
+fn search_files_count(
+    search_path: &Path,
+    matcher: &RegexMatcher,
+    glob_set: &Option<globset::GlobSet>,
+    max_count: Option<usize>,
+    limit: usize,
+) -> Vec<(String, usize)> {
+    let mut results: Vec<(String, usize)> = Vec::new();
+    let mut searcher = SearcherBuilder::new()
+        .binary_detection(BinaryDetection::quit(b'\x00'))
+        .build();
+
+    let walker = WalkBuilder::new(search_path)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .max_depth(None)
+        .build();
+
+    for entry in walker {
+        if results.len() >= limit {
+            break;
+        }
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+
+        let path = entry.path();
+
+        if let Some(globs) = glob_set
+            && !globs.is_match(path)
+        {
+            continue;
+        }
+
+        let mut count = 0usize;
+        let mut sink = CollectBoolSink {
+            max_count,
+            matched: &mut count,
+        };
+        let _ = searcher.search_path(matcher, path, &mut sink);
+        if count == 0 {
+            continue;
+        }
+
+        let display_path = match path.strip_prefix(search_path) {
+            Ok(rel) if rel.as_os_str().is_empty() => path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            Ok(rel) => rel.display().to_string(),
+            Err(_) => path.display().to_string(),
+        };
+        results.push((display_path, count));
+    }
+
+    results
+}
+
 /// Search files for a pattern with the ripgrep engine. Returns the formatted
 /// matches, the paths of files that produced at least one match (in
 /// first-match order, deduplicated), and the 1-indexed lines each matched
@@ -226,6 +419,7 @@ fn search_files(
     glob_set: &Option<globset::GlobSet>,
     context_lines: usize,
     limit: usize,
+    max_count: Option<usize>,
 ) -> (
     Vec<String>,
     Vec<PathBuf>,
@@ -271,8 +465,10 @@ fn search_files(
             continue;
         }
 
+        let _per_file_remaining = max_count.map(|mc| mc.saturating_sub(0));
         let mut sink = CollectSink {
             remaining: limit - results.len(),
+            max_count,
             matches: Vec::new(),
         };
         let _ = searcher.search_path(matcher, path, &mut sink);
@@ -335,8 +531,10 @@ fn search_files(
 /// Collects matched lines for one file while the searcher runs. The searcher
 /// feeds each line separately; `remaining` bounds the total emitted results
 /// across files, stopping the search of a file once the limit is reached.
+/// `max_count` stops searching a file after that many matches.
 struct CollectSink {
     remaining: usize,
+    max_count: Option<usize>,
     matches: Vec<(u64, String)>,
 }
 
@@ -345,6 +543,11 @@ impl Sink for CollectSink {
 
     fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch) -> Result<bool, Self::Error> {
         if self.matches.len() >= self.remaining {
+            return Ok(false);
+        }
+        if let Some(mc) = self.max_count
+            && self.matches.len() >= mc
+        {
             return Ok(false);
         }
         // `bytes()` includes the line terminator; strip it and the `\r` of a
@@ -360,6 +563,26 @@ impl Sink for CollectSink {
             }
         }
         self.matches.push((mat.line_number().unwrap_or(0), line));
+        Ok(true)
+    }
+}
+
+/// A sink that only counts matches (does not capture line content).
+struct CollectBoolSink<'a> {
+    max_count: Option<usize>,
+    matched: &'a mut usize,
+}
+
+impl Sink for CollectBoolSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, _mat: &SinkMatch) -> Result<bool, Self::Error> {
+        *self.matched += 1;
+        if let Some(mc) = self.max_count
+            && *self.matched >= mc
+        {
+            return Ok(false);
+        }
         Ok(true)
     }
 }
@@ -410,7 +633,7 @@ mod tests {
         std::fs::write(nested.join("hit.rs"), "fn needle() {}\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10, None);
         let output = matches.join("\n");
         assert!(
             output.contains("src/deep/hit.rs:1:"),
@@ -431,7 +654,7 @@ mod tests {
         std::fs::write(&file, "fn needle() {}\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _, _) = search_files(&file, &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(&file, &matcher, &None, 0, 10, None);
         let output = matches.join("\n");
         assert!(
             output.starts_with("target.rs:1:"),
@@ -446,7 +669,7 @@ mod tests {
         std::fs::write(&file, "fn a() {\r\nneedle()\r\n}\r\n").unwrap();
 
         let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
-        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10);
+        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 10, None);
         let output = matches.join("\n");
         assert!(
             output.contains("win.rs:2:needle()"),
@@ -466,5 +689,51 @@ mod tests {
         assert!(output.contains("> 3:line2"));
         assert!(output.contains("  2:line1"));
         assert!(output.contains("  4:line3"));
+    }
+
+    #[test]
+    fn files_with_matches_returns_only_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn needle() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn other() {}\n").unwrap();
+        std::fs::write(dir.path().join("c.rs"), "fn needle2() {}\n").unwrap();
+
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let names = search_files_names(dir.path(), &matcher, &None, None, 10);
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a.rs".to_string()));
+        assert!(names.contains(&"c.rs".to_string()));
+    }
+
+    #[test]
+    fn count_mode_returns_file_and_match_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn needle() {}\nfn needle() {}\n").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn other() {}\n").unwrap();
+
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let counts = search_files_count(dir.path(), &matcher, &None, None, 10);
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].0, "a.rs");
+        assert_eq!(counts[0].1, 2);
+    }
+
+    #[test]
+    fn max_count_limits_per_file_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn needle() {}\nfn needle() {}\nfn needle() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn needle() {}\nfn needle() {}\n").unwrap();
+
+        let matcher = RegexMatcherBuilder::new().build("needle").unwrap();
+        let (matches, _, _) = search_files(dir.path(), &matcher, &None, 0, 100, Some(2));
+        // a.rs should contribute at most 2 matches, b.rs at most 2
+        let a_count = matches.iter().filter(|m| m.contains("a.rs")).count();
+        let b_count = matches.iter().filter(|m| m.contains("b.rs")).count();
+        assert!(a_count <= 2, "a.rs max_count=2: {a_count}");
+        assert!(b_count <= 2, "b.rs max_count=2: {b_count}");
     }
 }
