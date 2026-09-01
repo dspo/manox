@@ -2,7 +2,7 @@
 
 //! Shared harness for the interaction-card regression binaries. Each test
 //! binary holds exactly ONE `#[gpui::test]`: the tests initialize
-//! process-global singletons (`agent::runtime`, `pi_providers`,
+//! process-global singletons (`manox_agent::runtime`, `pi_providers`,
 //! `thread_store`) whose global store entity is app-affine, so two tests in
 //! one process would overwrite each other's store under the parallel test
 //! harness (see the `workspace_overlap` binary for the same constraint).
@@ -11,12 +11,12 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent::Thread;
-use agent::ThreadEvent;
-use agent::db::ThreadSummary;
-use agent::language_model::{LanguageModelToolUse, MessageContent, TokenUsage};
-use agent::message::Message;
-use agent::thread_engine::{BackendNotice, ThreadEngine};
+use manox_agent::Thread;
+use manox_agent::ThreadEvent;
+use manox_agent::db::ThreadSummary;
+use manox_agent::language_model::{LanguageModelToolUse, MessageContent, TokenUsage};
+use manox_agent::message::Message;
+use manox_agent::thread_engine::{BackendNotice, ThreadEngine};
 use agent_ui::Workspace;
 use gpui::{AppContext as _, Entity, TestAppContext, px, size};
 use gpui_component::Theme;
@@ -32,13 +32,13 @@ impl ThreadEngine for FakeEngine {
     fn is_running(&self) -> bool {
         false
     }
-    fn history(&self) -> Vec<agent::db::HistoryEntry> {
+    fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
         self.history
             .lock()
             .unwrap()
             .clone()
             .into_iter()
-            .map(agent::db::HistoryEntry::Message)
+            .map(manox_agent::db::HistoryEntry::Message)
             .collect()
     }
     fn request_token_usage(&self) -> std::collections::HashMap<String, TokenUsage> {
@@ -88,9 +88,9 @@ pub fn init_harness(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     register_lilex(cx);
     cx.update(|_cx| {
-        agent::runtime::init();
-        agent::pi_providers::init();
-        agent::thread_store::init();
+        manox_agent::runtime::init();
+        manox_agent::pi_providers::init();
+        manox_agent::thread_store::init();
     });
 }
 
@@ -114,7 +114,7 @@ pub fn open_workspace(
 /// creation, so the test swaps in the fake before anything runs. Returns the
 /// gpui-free `ThreadHandle`; the workspace binds its own `ClientStoreHandle`
 /// on `attach_thread`, and tests drive it through `emit`.
-pub fn fake_thread(cx: &mut TestAppContext, history: Vec<Message>) -> agent::thread::ThreadHandle {
+pub fn fake_thread(cx: &mut TestAppContext, history: Vec<Message>) -> manox_agent::thread::ThreadHandle {
     let (_, events) = tokio::sync::mpsc::unbounded_channel::<BackendNotice>();
     cx.update(|_cx| {
         let thread = Thread::landing(PathBuf::from("/tmp"));

@@ -1,7 +1,7 @@
 //! `WebExplore*` tool set — the agent's outbound surface for driving the
 //! built-in browser (ported from the retired manox harness).
 //!
-//! The browser capability (`agent::capability::CapabilityClient`) is a
+//! The browser capability (`manox_agent::capability::CapabilityClient`) is a
 //! frontend-provided seam; pi tools run on tokio. Each call therefore rides the
 //! same round-trip architecture as the permission gate: the tool sends a
 //! `BackendNotice::BrowserRequest` with a responder channel, the facade

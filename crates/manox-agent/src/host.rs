@@ -1,5 +1,5 @@
 //! Process-global host identity. Each host (the native app, the VS Code
-//! extension) pins its identity before `agent::init`; sessions carry the
+//! extension) pins its identity before `manox_agent::init`; sessions carry the
 //! creating host in their header metadata so every host's session list
 //! stays disjoint.
 
@@ -29,7 +29,7 @@ impl Host {
     }
 }
 
-/// The host of this process. Set once at startup before `agent::init`;
+/// The host of this process. Set once at startup before `manox_agent::init`;
 /// defaults to the native app.
 static CURRENT: std::sync::Mutex<Host> = std::sync::Mutex::new(Host::ManoxApp);
 

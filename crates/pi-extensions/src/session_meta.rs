@@ -46,7 +46,7 @@ pub struct SessionMeta {
     pub plan_review_pending: Option<bool>,
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
-    /// away) and restarts. Serialized `agent::plan::PlanSnapshot`; `None`
+    /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`
     /// after the model clears its plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_snapshot: Option<serde_json::Value>,
@@ -219,7 +219,7 @@ mod tests {
         let fresh = load(dir.path(), &session).await.unwrap();
         assert!(fresh.plan_snapshot.is_none());
 
-        // Persist a snapshot (serialized `agent::plan::PlanSnapshot` shape).
+        // Persist a snapshot (serialized `manox_agent::plan::PlanSnapshot` shape).
         let snapshot = serde_json::json!({
             "explanation": null,
             "steps": [

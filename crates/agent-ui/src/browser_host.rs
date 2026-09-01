@@ -4,7 +4,7 @@
 //!
 //! The host is a process-wide singleton registered as the `CapabilityClient`
 //! provider at App startup, reached by the `web_explore_*` tools through
-//! `agent::capability::provider()`. It owns a `WeakEntity<Workspace>` for the
+//! `manox_agent::capability::provider()`. It owns a `WeakEntity<Workspace>` for the
 //! outbound operations (open/navigate/eval, which touch the live `BrowserView`
 //! entities) and a routing table that maps each tab's webview label to its
 //! owning `Thread`.
@@ -39,8 +39,8 @@ use futures::future::BoxFuture;
 use gpui::{App, AppContext as _, AsyncApp, Entity, Task, WeakEntity};
 use tokio::sync::oneshot;
 
-use agent::capability::CapabilityClient;
-use agent::thread_engine::{BrowserOp, BrowserReply, BrowserTabId};
+use manox_agent::capability::CapabilityClient;
+use manox_agent::thread_engine::{BrowserOp, BrowserReply, BrowserTabId};
 use manox_webview::{BrowserInboundWrite as WvInboundWrite, BrowserNotification as WvNotification};
 
 use crate::workspace::Workspace;
@@ -135,7 +135,7 @@ impl WorkspaceBrowserHost {
         // the browser through `capability::provider()` without holding an
         // `&mut App` (capability inversion; protocol `ServerCall::BrowserOp`
         // later).
-        agent::capability::set_provider(GpuiCapability::start(cx));
+        manox_agent::capability::set_provider(GpuiCapability::start(cx));
         cx.update(|cx| {
             workspace.update(cx, |_, cx| {
                 cx.spawn(async move |_, _| {
@@ -257,7 +257,7 @@ impl WorkspaceBrowserHost {
             // JoinHandle is then polled here on the gpui background executor —
             // polling a JoinHandle needs no reactor context, unlike
             // tokio::time itself.
-            let join = agent::runtime::handle()
+            let join = manox_agent::runtime::handle()
                 .spawn(async move { tokio::time::timeout(Duration::from_secs(60), rx).await });
             let result = match join.await {
                 Ok(Ok(Ok(payload))) => {
@@ -492,7 +492,7 @@ enum ClipboardMsg {
 /// The gpui-backed capability provider. It is `Send + Sync` (it holds only a
 /// channel sender); the browser work itself runs on a main-thread service loop
 /// that owns the [`gpui::AsyncApp`], bridged by the channel. The kernel
-/// invokes [`agent::capability::CapabilityClient`] without holding an
+/// invokes [`manox_agent::capability::CapabilityClient`] without holding an
 /// `&mut App`.
 pub struct GpuiCapability {
     tx: async_channel::Sender<BrowserCapabilityMsg>,

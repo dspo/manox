@@ -46,7 +46,7 @@ thread_local! {
 }
 
 /// Read `settings.toml`, resolve the UI locale, and build the bundle on the
-/// calling (startup) thread. Called once from `agent::init` before any UI
+/// calling (startup) thread. Called once from `manox_agent::init` before any UI
 /// render or system-prompt build. Any failure is non-fatal: warn and fall back
 /// to English so a malformed config never blocks startup.
 pub fn init() {

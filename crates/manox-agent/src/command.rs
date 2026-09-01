@@ -242,9 +242,9 @@ pub fn global() -> &'static CommandRegistry {
     REGISTRY.get().expect("command registry not initialized")
 }
 
-/// Non-panicking accessor for callers that may run before `agent::init`
+/// Non-panicking accessor for callers that may run before `manox_agent::init`
 /// (e.g. the UI slash-command registry init, which `main` calls after
-/// `agent::init` but is still safer not to assume).
+/// `manox_agent::init` but is still safer not to assume).
 pub fn try_global() -> Option<&'static CommandRegistry> {
     REGISTRY.get()
 }

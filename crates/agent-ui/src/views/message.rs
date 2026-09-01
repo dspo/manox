@@ -27,9 +27,9 @@ use crate::conversation::{
     UserImage, UserTurnMeta,
 };
 use crate::i18n;
-use agent::language_model::{LanguageModelToolResult, MessageContent, Role};
-use agent::thread::PermissionMode;
-use agent::{Message, TokenUsage, ToolCallStatus};
+use manox_agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use manox_agent::thread::PermissionMode;
+use manox_agent::{Message, TokenUsage, ToolCallStatus};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
@@ -413,7 +413,7 @@ impl MessageItem {
             // list_directory / …) and MCP tools are manox abstractions, not
             // terminal commands — they render the body only, without the cwd
             // preamble that would imply "run this in a shell".
-            let is_terminal_command = entry.name.as_str() == agent::tools::BASH;
+            let is_terminal_command = entry.name.as_str() == manox_agent::tools::BASH;
             let command = if is_terminal_command {
                 entry
                     .input
@@ -807,7 +807,7 @@ pub fn render_item(
         } => render_assistant(text, ix, role, *activity_header, theme, body, cx),
         ConvItem::Thinking(t) => render_thinking(t, ix, role, theme, tool_ctx, cx),
         ConvItem::ToolCall(t) => {
-            if t.name == agent::tools::ASK_USER_QUESTION {
+            if t.name == manox_agent::tools::ASK_USER_QUESTION {
                 render_ask_user_card(t, ix, theme, tool_ctx, cx)
             } else {
                 // Ordinary tool calls fold into `Thinking`; a top-level
@@ -888,11 +888,11 @@ fn copy_button_hoverable(
 /// localized Captain label (shared with the context rail), the host harness
 /// keeps its own name, and named agents keep their manifest / member name
 /// verbatim.
-pub fn author_display(author: &agent::MessageAuthor) -> String {
+pub fn author_display(author: &manox_agent::MessageAuthor) -> String {
     match author {
-        agent::MessageAuthor::Lead => i18n::t("context-agents-captain").to_string(),
-        agent::MessageAuthor::Harness => i18n::t("message-harness-role").to_string(),
-        agent::MessageAuthor::Agent(name) => name.clone(),
+        manox_agent::MessageAuthor::Lead => i18n::t("context-agents-captain").to_string(),
+        manox_agent::MessageAuthor::Harness => i18n::t("message-harness-role").to_string(),
+        manox_agent::MessageAuthor::Agent(name) => name.clone(),
     }
 }
 
@@ -1426,7 +1426,7 @@ pub fn render_retry(
 /// syntax highlighting can colour the output.
 fn lang_hint_for_tool(name: &str) -> Option<&'static str> {
     match name {
-        x if x == agent::tools::BASH => Some("bash"),
+        x if x == manox_agent::tools::BASH => Some("bash"),
         "python" => Some("python"),
         _ => None,
     }
@@ -1871,7 +1871,7 @@ fn render_tool_entry(
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
+    use manox_agent::ToolCallStatus;
     let is_active = matches!(
         e.status,
         ToolCallStatus::PendingApproval | ToolCallStatus::Running
@@ -2152,7 +2152,7 @@ fn render_plan_review_card(
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_fresh.update(cx, |w, cx| {
                 w.respond_plan_review(
-                    agent::collaboration_mode::PlanReviewChoice::ExecuteFresh,
+                    manox_agent::collaboration_mode::PlanReviewChoice::ExecuteFresh,
                     window,
                     cx,
                 );
@@ -2167,7 +2167,7 @@ fn render_plan_review_card(
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_compact.update(cx, |w, cx| {
                 w.respond_plan_review(
-                    agent::collaboration_mode::PlanReviewChoice::ExecuteCompact,
+                    manox_agent::collaboration_mode::PlanReviewChoice::ExecuteCompact,
                     window,
                     cx,
                 );
@@ -2182,7 +2182,7 @@ fn render_plan_review_card(
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_keep.update(cx, |w, cx| {
                 w.respond_plan_review(
-                    agent::collaboration_mode::PlanReviewChoice::ExecuteKeep,
+                    manox_agent::collaboration_mode::PlanReviewChoice::ExecuteKeep,
                     window,
                     cx,
                 );
@@ -2197,7 +2197,7 @@ fn render_plan_review_card(
         .on_click(move |_, window, cx: &mut App| {
             let _ = weak_refine.update(cx, |w, cx| {
                 w.respond_plan_review(
-                    agent::collaboration_mode::PlanReviewChoice::Refine,
+                    manox_agent::collaboration_mode::PlanReviewChoice::Refine,
                     window,
                     cx,
                 );
@@ -2340,7 +2340,7 @@ fn render_ask_user_card(
                         .icon(IconName::Close)
                         .on_click(move |_, _, cx: &mut App| {
                             let _ = weak_cancel.update(cx, |w, cx| {
-                                w.resolve_auth(agent::PermissionDecision::Deny, cx);
+                                w.resolve_auth(manox_agent::PermissionDecision::Deny, cx);
                             });
                         }),
                 ),
@@ -2506,7 +2506,7 @@ pub fn render_tool_call(
     tool_ctx: Option<&ToolCallCtx>,
     cx: &mut App,
 ) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
+    use manox_agent::ToolCallStatus;
     let (status_color, status_label): (gpui::Hsla, SharedString) = match item.status {
         ToolCallStatus::PendingApproval => (theme.muted_foreground, i18n::t("status-pending")),
         ToolCallStatus::Running => (theme.muted_foreground, i18n::t("status-running")),
@@ -2706,7 +2706,7 @@ fn render_tool_output(
     // copy-selection yields the display text while the LLM still sees numbered
     // output on the next turn. Non-`read_file` tools borrow the raw output
     // without allocating.
-    let display: std::borrow::Cow<'_, str> = if item.name == agent::tools::READ {
+    let display: std::borrow::Cow<'_, str> = if item.name == manox_agent::tools::READ {
         std::borrow::Cow::Owned(strip_hashline_numbering(&display_output))
     } else {
         std::borrow::Cow::Borrowed(&display_output)
@@ -2739,7 +2739,7 @@ fn render_tool_output(
 }
 
 fn agent_terminal_icon(status: ToolCallStatus) -> Icon {
-    use agent::ToolCallStatus;
+    use manox_agent::ToolCallStatus;
     match status {
         ToolCallStatus::Success | ToolCallStatus::Continued => {
             Icon::default().path("icons/circle-check-big.svg")
@@ -2755,7 +2755,7 @@ fn agent_terminal_icon(status: ToolCallStatus) -> Icon {
 /// Status indicator for a sub-agent task row. Running/Pending get a braille
 /// spinner; terminal states get a static icon.
 fn agent_status_indicator(status: ToolCallStatus, theme: &Theme) -> gpui::AnyElement {
-    use agent::ToolCallStatus;
+    use manox_agent::ToolCallStatus;
     let color = match status {
         ToolCallStatus::Running | ToolCallStatus::PendingApproval => theme.accent_foreground,
         ToolCallStatus::Success | ToolCallStatus::Continued => theme.success,
@@ -2859,7 +2859,7 @@ fn render_background_task(
     tool_ctx: Option<&ToolCallCtx>,
     _cx: &mut App,
 ) -> gpui::AnyElement {
-    use agent::background_task::{TaskKind, TaskStatus};
+    use manox_agent::background_task::{TaskKind, TaskStatus};
 
     let is_running = matches!(bt.status, TaskStatus::Running | TaskStatus::Stopping);
     let kind_str = match bt.kind {
@@ -3009,8 +3009,8 @@ fn render_background_task(
                     let task_id = task_id_for_stop.clone();
                     move |_, _window, _cx: &mut App| {
                         let task_id = task_id.clone();
-                        agent::runtime::handle().spawn(async move {
-                            let _ = agent::background_task::stop(&task_id).await;
+                        manox_agent::runtime::handle().spawn(async move {
+                            let _ = manox_agent::background_task::stop(&task_id).await;
                         });
                     }
                 }),
@@ -3058,13 +3058,13 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
         entry.output.clone()
     };
     match entry.name.as_str() {
-        x if x == agent::tools::READ => (PanelKind::File, strip_hashline_numbering(&raw)),
+        x if x == manox_agent::tools::READ => (PanelKind::File, strip_hashline_numbering(&raw)),
         // write_file's `output` is a one-line confirmation ("Wrote N bytes"), not
         // the file content; the content lives in the tool input. Show the written
         // content with a line-number gutter on success. On failure (`is_error`)
         // `output` carries the error — surface that as plain text via the default
         // arm so the user sees what went wrong, not just what was attempted.
-        x if x == agent::tools::WRITE && !entry.is_error => {
+        x if x == manox_agent::tools::WRITE && !entry.is_error => {
             let content = entry
                 .input
                 .get("content")
@@ -3073,7 +3073,7 @@ fn tool_panel_body(entry: &ToolCallItem) -> (PanelKind, String) {
                 .to_string();
             (PanelKind::File, content)
         }
-        x if x == agent::tools::EDIT => (PanelKind::Diff, raw),
+        x if x == manox_agent::tools::EDIT => (PanelKind::Diff, raw),
         _ => (PanelKind::Plain, raw),
     }
 }
@@ -3219,11 +3219,11 @@ pub struct ItemBuilder {
     /// The agent whose conversation the built items render in — every user
     /// bubble's header `to`. `None` omits the segment (a bare rebuild with no
     /// owning view).
-    recipient: Option<agent::MessageAuthor>,
+    recipient: Option<manox_agent::MessageAuthor>,
 }
 
 impl ItemBuilder {
-    pub fn new(recipient: Option<agent::MessageAuthor>) -> Self {
+    pub fn new(recipient: Option<manox_agent::MessageAuthor>) -> Self {
         Self {
             recipient,
             ..Default::default()
@@ -3387,7 +3387,7 @@ impl ItemBuilder {
                                 }
                             }
                             MessageContent::ToolUse(tu) => {
-                                if tu.name.as_ref() == agent::tools::AGENT {
+                                if tu.name.as_ref() == manox_agent::tools::AGENT {
                                     // Sub-agent tasks stay as standalone compact
                                     // rows; their full conversation lives in a
                                     // read-only right-pane tab.
@@ -3402,7 +3402,7 @@ impl ItemBuilder {
                                         status: ToolCallStatus::Success,
                                         is_error: false,
                                     }));
-                                } else if tu.name.as_ref() == agent::tools::ASK_USER_QUESTION {
+                                } else if tu.name.as_ref() == manox_agent::tools::ASK_USER_QUESTION {
                                     // An inline clarify card: stays a top-level
                                     // ToolCall so `render_ask_user_card` can drive
                                     // its interactive snapshot while pending; the
@@ -3413,7 +3413,7 @@ impl ItemBuilder {
                                     items.push(ConvItem::ToolCall(ToolCallItem {
                                         id: tu.id.clone(),
                                         name: tu.name.to_string(),
-                                        title: agent::thread::tool_title(
+                                        title: manox_agent::thread::tool_title(
                                             tu.name.as_ref(),
                                             &tu.input,
                                             None,
@@ -3437,7 +3437,7 @@ impl ItemBuilder {
                                     let entry = ActivityEntry::Tool(ToolCallItem {
                                         id: tu.id.clone(),
                                         name: tu.name.to_string(),
-                                        title: agent::thread::tool_title(
+                                        title: manox_agent::thread::tool_title(
                                             tu.name.as_ref(),
                                             &tu.input,
                                             None,
@@ -3531,7 +3531,7 @@ pub fn build_items(
     messages: &[Message],
     usage: &HashMap<String, TokenUsage>,
     trailing_streaming: bool,
-    recipient: Option<agent::MessageAuthor>,
+    recipient: Option<manox_agent::MessageAuthor>,
 ) -> Vec<ConvItem> {
     let mut builder = ItemBuilder::new(recipient);
     let mut items = Vec::new();
@@ -3628,7 +3628,7 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
+    use manox_agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use gpui::{
         AnyWindowHandle, Bounds, Pixels, Render, TestAppContext, VisualTestContext, Window, size,
     };
@@ -3735,12 +3735,12 @@ mod tests {
             // past the card border.
             let bg_task_item = ConvItem::BackgroundTask(BackgroundTaskItem {
                 task_id: "bash_overflow".into(),
-                kind: agent::background_task::TaskKind::BackgroundBash,
+                kind: manox_agent::background_task::TaskKind::BackgroundBash,
                 description: format!(
                     "cd /some/project && run <<'EOF'\n{{\n  \"prompt\": \"{}\"\n}}\nEOF",
                     "x".repeat(512)
                 ),
-                status: agent::background_task::TaskStatus::Failed,
+                status: manox_agent::background_task::TaskStatus::Failed,
                 event_count: 3,
                 total_bytes: 2048,
                 exit_code: Some(65),
@@ -4097,7 +4097,7 @@ mod tests {
         // model-facing text plus a compact `display_text`; the rebuilt bubble
         // must show the compact form (parity with the live send-time view).
         let mut message = Message::user("EXPANDED MACRO BODY".to_string());
-        message.ui = Some(agent::MessageUiMetadata {
+        message.ui = Some(manox_agent::MessageUiMetadata {
             display_text: Some("/gitwork:deliver fast".to_string()),
             ..Default::default()
         });
@@ -4199,7 +4199,7 @@ mod tests {
             _ => None,
         });
         let ask = items.iter().find_map(|i| match i {
-            ConvItem::ToolCall(t) if t.name == agent::tools::ASK_USER_QUESTION => Some(t),
+            ConvItem::ToolCall(t) if t.name == manox_agent::tools::ASK_USER_QUESTION => Some(t),
             _ => None,
         });
         let seg = items.iter().find_map(|i| match i {
@@ -4534,7 +4534,7 @@ mod tests {
     #[test]
     fn build_items_does_not_render_external_event_as_user_bubble() {
         let mut external = Message::user("CI pipeline completed".into());
-        external.ui = Some(agent::MessageUiMetadata {
+        external.ui = Some(manox_agent::MessageUiMetadata {
             external_event: Some(true),
             ..Default::default()
         });
@@ -4560,8 +4560,8 @@ mod tests {
     #[test]
     fn build_items_rebuilds_peer_deliveries_as_attributed_user_turns() {
         let mut peer = Message::user("[from alice]: report".into());
-        peer.ui = Some(agent::MessageUiMetadata {
-            author: Some(agent::MessageAuthor::Agent("alice".into())),
+        peer.ui = Some(manox_agent::MessageUiMetadata {
+            author: Some(manox_agent::MessageAuthor::Agent("alice".into())),
             peer: true,
             display_text: Some("report".into()),
             ..Default::default()
@@ -4570,7 +4570,7 @@ mod tests {
             &[peer],
             &HashMap::new(),
             false,
-            Some(agent::MessageAuthor::Lead),
+            Some(manox_agent::MessageAuthor::Lead),
         );
         let Some(ConvItem::User { text, meta, .. }) = items.first() else {
             panic!(
@@ -4585,10 +4585,10 @@ mod tests {
         );
         assert_eq!(
             meta.author,
-            Some(agent::MessageAuthor::Agent("alice".into())),
+            Some(manox_agent::MessageAuthor::Agent("alice".into())),
             "the sender is the header's `from`"
         );
-        assert_eq!(meta.recipient, Some(agent::MessageAuthor::Lead));
+        assert_eq!(meta.recipient, Some(manox_agent::MessageAuthor::Lead));
         assert!(meta.peer, "the inbound-peer marker survives the reload");
     }
 
@@ -4610,8 +4610,8 @@ mod tests {
     #[test]
     fn build_items_keeps_author_on_user_bubble() {
         let mut seed = Message::user("implement the approved plan".into());
-        seed.ui = Some(agent::MessageUiMetadata {
-            author: Some(agent::MessageAuthor::Lead),
+        seed.ui = Some(manox_agent::MessageUiMetadata {
+            author: Some(manox_agent::MessageAuthor::Lead),
             ..Default::default()
         });
         let items = build_items(&[seed], &HashMap::new(), false, None);
@@ -4620,7 +4620,7 @@ mod tests {
         };
         assert_eq!(
             meta.as_ref().unwrap().author,
-            Some(agent::MessageAuthor::Lead)
+            Some(manox_agent::MessageAuthor::Lead)
         );
     }
 

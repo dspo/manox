@@ -10,7 +10,7 @@ publish = false
 # feature graph: feature unification would leak `test-support` into a
 # release build that pulls this crate (the WebUI host). The test-support
 # dev-dependency below keeps that graph out of the normal build.
-agent.workspace = true
+manox-agent.workspace = true
 pi.workspace = true
 pi-extensions.workspace = true
 futures.workspace = true
@@ -30,5 +30,5 @@ tracing.workspace = true
 # release dependency graph, so the feature-unification constraint above
 # still holds.
 anyhow.workspace = true
-agent = { workspace = true, features = ["test-support"] }
+manox-agent = { workspace = true, features = ["test-support"] }
 async-channel = { workspace = true }

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use agent::{Message, ThreadId};
+use manox_agent::{Message, ThreadId};
 use manox_protocol::ServerNote;
 use manox_protocol::server::{ThreadInfoPayload, TokenUsageSnapshot};
 use serde_json::Value;
@@ -20,21 +20,21 @@ pub struct ClientStore {
     pub model_id: Option<String>,
     pub model_name: Option<String>,
     pub model: Option<serde_json::Value>,
-    pub permission_mode: agent::thread::PermissionMode,
-    pub reasoning_effort: agent::language_model::ReasoningEffort,
+    pub permission_mode: manox_agent::thread::PermissionMode,
+    pub reasoning_effort: manox_agent::language_model::ReasoningEffort,
     pub pinned: bool,
     pub archived: bool,
     pub depth: u32,
     pub agent_label: String,
-    pub self_author: agent::MessageAuthor,
+    pub self_author: manox_agent::MessageAuthor,
     pub cwd_path: Option<String>,
     pub branch: Option<String>,
     pub goal: Option<Value>,
     pub goal_elapsed_seconds: Option<u64>,
     pub plan_mode: bool,
     pub persisted_plan: Option<Value>,
-    pub browser_suites: Vec<agent::pi_engine::BrowserSuite>,
-    pub history_phase: agent::thread::HistoryPhase,
+    pub browser_suites: Vec<manox_agent::pi_engine::BrowserSuite>,
+    pub history_phase: manox_agent::thread::HistoryPhase,
     pub running: bool,
     pub has_interacted: bool,
     pub cwd: String,
@@ -64,13 +64,13 @@ impl Default for ClientStore {
             model_id: None,
             model_name: None,
             model: None,
-            permission_mode: agent::thread::PermissionMode::default(),
-            reasoning_effort: agent::language_model::ReasoningEffort::default(),
+            permission_mode: manox_agent::thread::PermissionMode::default(),
+            reasoning_effort: manox_agent::language_model::ReasoningEffort::default(),
             pinned: false,
             archived: false,
             depth: 0,
             agent_label: String::new(),
-            self_author: agent::MessageAuthor::default(),
+            self_author: manox_agent::MessageAuthor::default(),
             cwd_path: None,
             branch: None,
             goal: None,
@@ -78,7 +78,7 @@ impl Default for ClientStore {
             plan_mode: false,
             persisted_plan: None,
             browser_suites: Vec::new(),
-            history_phase: agent::thread::HistoryPhase::default(),
+            history_phase: manox_agent::thread::HistoryPhase::default(),
             running: false,
             has_interacted: false,
             cwd: String::new(),
@@ -127,14 +127,14 @@ impl ClientStore {
                 self.model_name = name.clone();
             }
             ServerNote::PermissionModeChanged { mode, .. } => {
-                self.permission_mode = serde_json::from_value::<agent::thread::PermissionMode>(
+                self.permission_mode = serde_json::from_value::<manox_agent::thread::PermissionMode>(
                     Value::String(mode.clone()),
                 )
                 .unwrap_or_default();
             }
             ServerNote::ReasoningEffortChanged { effort, .. } => {
                 self.reasoning_effort = serde_json::from_value::<
-                    agent::language_model::ReasoningEffort,
+                    manox_agent::language_model::ReasoningEffort,
                 >(Value::String(effort.clone()))
                 .unwrap_or_default();
             }
@@ -149,7 +149,7 @@ impl ClientStore {
                 self.browser_suites = suites
                     .iter()
                     .filter_map(|s| {
-                        serde_json::from_value::<agent::pi_engine::BrowserSuite>(Value::String(
+                        serde_json::from_value::<manox_agent::pi_engine::BrowserSuite>(Value::String(
                             s.clone(),
                         ))
                         .ok()
@@ -221,11 +221,11 @@ impl ClientStore {
         self.model_id = info.model_id.clone();
         self.model_name = info.model_name.clone();
         self.model = info.model.clone();
-        self.permission_mode = serde_json::from_value::<agent::thread::PermissionMode>(
+        self.permission_mode = serde_json::from_value::<manox_agent::thread::PermissionMode>(
             Value::String(info.permission_mode.clone()),
         )
         .unwrap_or_default();
-        self.reasoning_effort = serde_json::from_value::<agent::language_model::ReasoningEffort>(
+        self.reasoning_effort = serde_json::from_value::<manox_agent::language_model::ReasoningEffort>(
             Value::String(info.reasoning_effort.clone()),
         )
         .unwrap_or_default();
@@ -233,7 +233,7 @@ impl ClientStore {
         self.archived = info.archived;
         self.depth = info.depth;
         self.agent_label = info.agent_label.clone();
-        self.self_author = agent::MessageAuthor::from_routing(&info.self_author);
+        self.self_author = manox_agent::MessageAuthor::from_routing(&info.self_author);
         self.cwd_path = info.cwd_path.clone();
         self.branch = info.branch.clone();
         self.goal = info.goal.clone();
@@ -243,11 +243,11 @@ impl ClientStore {
             .browser_suites
             .iter()
             .filter_map(|s| {
-                serde_json::from_value::<agent::pi_engine::BrowserSuite>(Value::String(s.clone()))
+                serde_json::from_value::<manox_agent::pi_engine::BrowserSuite>(Value::String(s.clone()))
                     .ok()
             })
             .collect();
-        self.history_phase = serde_json::from_value::<agent::thread::HistoryPhase>(Value::String(
+        self.history_phase = serde_json::from_value::<manox_agent::thread::HistoryPhase>(Value::String(
             info.history_phase.clone(),
         ))
         .unwrap_or_default();
@@ -299,11 +299,11 @@ mod tests {
         assert_eq!(store.model_id.as_deref(), Some("claude-sonnet"));
         assert_eq!(
             store.permission_mode,
-            agent::thread::PermissionMode::WorkspaceWrite
+            manox_agent::thread::PermissionMode::WorkspaceWrite
         );
         assert_eq!(
             store.reasoning_effort,
-            agent::language_model::ReasoningEffort::High
+            manox_agent::language_model::ReasoningEffort::High
         );
         assert!(!store.running);
         assert!(!store.plan_mode);
@@ -362,7 +362,7 @@ mod tests {
         // Seed the store with a pair of messages via ThreadHistory.
         let msgs = vec![
             Message::user("hello".into()),
-            Message::assistant(vec![agent::language_model::MessageContent::Text(
+            Message::assistant(vec![manox_agent::language_model::MessageContent::Text(
                 "world".into(),
             )]),
         ];
@@ -394,7 +394,7 @@ mod tests {
         // The retained message is the assistant's "world" reply.
         assert_eq!(
             store.messages[0].role,
-            agent::language_model::Role::Assistant,
+            manox_agent::language_model::Role::Assistant,
             "retained tail should survive compaction"
         );
     }

@@ -90,7 +90,7 @@ pub fn init() {
 pub fn global() -> &'static McpRegistry {
     REGISTRY
         .get()
-        .expect("McpRegistry not initialized; call agent::init first")
+        .expect("McpRegistry not initialized; call manox_agent::init first")
 }
 
 /// The merged MCP config (mcp.toml + plugin `.mcp.json` layers) without

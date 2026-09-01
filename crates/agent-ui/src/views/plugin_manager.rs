@@ -15,7 +15,7 @@
 //! notice texts say so.
 
 use crate::i18n;
-use agent::plugin::PluginManager;
+use manox_agent::plugin::PluginManager;
 use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
@@ -107,7 +107,7 @@ impl PluginManagerView {
             cx.notify();
             return;
         }
-        self.selected_marketplace = Some(agent::paths::marketplace_slug(&url));
+        self.selected_marketplace = Some(manox_agent::paths::marketplace_slug(&url));
         self.run_task(
             i18n::t("plugins-notice-marketplace-added"),
             move || {
@@ -406,7 +406,7 @@ impl PluginManagerView {
 // ─── cards ──────────────────────────────────────────────────────────────────
 
 fn marketplace_card(
-    record: &agent::plugin::MarketplaceRecord,
+    record: &manox_agent::plugin::MarketplaceRecord,
     selected: bool,
     busy: bool,
     cx: &mut Context<PluginManagerView>,
@@ -476,7 +476,7 @@ fn marketplace_card(
 }
 
 fn marketplace_plugin_card(
-    plugin: agent::plugin::MarketplacePluginRecord,
+    plugin: manox_agent::plugin::MarketplacePluginRecord,
     busy: bool,
     cx: &mut Context<PluginManagerView>,
 ) -> AnyElement {
@@ -586,7 +586,7 @@ fn marketplace_plugin_card(
 }
 
 fn installed_plugin_card(
-    plugin: agent::plugin::InstalledPluginRecord,
+    plugin: manox_agent::plugin::InstalledPluginRecord,
     busy: bool,
     cx: &mut Context<PluginManagerView>,
 ) -> AnyElement {

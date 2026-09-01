@@ -23,7 +23,7 @@ pub fn init() {
 pub fn handle() -> &'static tokio::runtime::Handle {
     HANDLE
         .get()
-        .expect("tokio runtime not initialized; call agent::init first")
+        .expect("tokio runtime not initialized; call manox_agent::init first")
 }
 
 /// Returns the global tokio `Handle`, or `None` before `init` / after process

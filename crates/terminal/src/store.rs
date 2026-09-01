@@ -1,4 +1,4 @@
-//! Process-global `TerminalStore` — gpui-free mirror of `agent::thread_store`.
+//! Process-global `TerminalStore` — gpui-free mirror of `manox_agent::thread_store`.
 //!
 //! Holds an `Arc<ThreadsDatabase>` plus the current session-summary list
 //! behind a `TerminalStoreHandle` (`Arc` + lock + channel broadcast).
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use agent::db::{TerminalSession, ThreadsDatabase, default_db_path};
+use manox_agent::db::{TerminalSession, ThreadsDatabase, default_db_path};
 
 use crate::TerminalHandle;
 

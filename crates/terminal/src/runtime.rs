@@ -1,6 +1,6 @@
 //! Process-global tokio runtime handle for the terminal's async pumps.
 //!
-//! Mirrors `agent::runtime` in shape but stays crate-local: the terminal's
+//! Mirrors `manox_agent::runtime` in shape but stays crate-local: the terminal's
 //! PTY/event/readiness pumps run on whatever runtime the host registers, so
 //! the crate never reaches into another crate's globals. The host calls
 //! [`set_runtime`] once at startup, before constructing any `Terminal`.

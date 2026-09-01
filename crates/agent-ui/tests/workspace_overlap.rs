@@ -16,7 +16,7 @@
 //! `cargo test -p agent-ui --features test-support --test workspace_overlap`.
 //!
 //! Lives in its own test binary because it initializes process-global
-//! singletons (`agent::runtime`, `pi_providers`, `thread_store`) that cannot
+//! singletons (`manox_agent::runtime`, `pi_providers`, `thread_store`) that cannot
 //! coexist with other gpui tests in one process.
 #![cfg(feature = "test-support")]
 
@@ -29,7 +29,7 @@ use gpui_component::Theme;
 const FIXTURE: &str =
     "/Users/chenzhongrun/.manox/pi-sessions/dfd73eed-847d-4f42-97e5-72692ef39277.jsonl";
 
-fn load_real_session_messages() -> Vec<agent::Message> {
+fn load_real_session_messages() -> Vec<manox_agent::Message> {
     let source = std::fs::read_to_string(FIXTURE).expect("real session fixture");
     let harness_messages = source
         .lines()
@@ -42,7 +42,7 @@ fn load_real_session_messages() -> Vec<agent::Message> {
         .filter_map(|event| event.get("message").cloned())
         .filter_map(|message| serde_json::from_value::<pi::types::AgentMessage>(message).ok())
         .collect::<Vec<_>>();
-    agent::pi_engine::adapt::harness_messages_to_messages(&harness_messages)
+    manox_agent::pi_engine::adapt::harness_messages_to_messages(&harness_messages)
 }
 
 fn register_lilex(cx: &mut TestAppContext) {
@@ -100,15 +100,15 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     register_lilex(cx);
     cx.update(|_cx| {
-        agent::runtime::init();
-        agent::pi_providers::init();
-        agent::thread_store::init();
+        manox_agent::runtime::init();
+        manox_agent::pi_providers::init();
+        manox_agent::thread_store::init();
     });
     let messages = load_real_session_messages();
-    let display: Vec<agent::db::HistoryEntry> = messages
+    let display: Vec<manox_agent::db::HistoryEntry> = messages
         .iter()
         .cloned()
-        .map(agent::db::HistoryEntry::Message)
+        .map(manox_agent::db::HistoryEntry::Message)
         .collect();
     let weak = gpui::WeakEntity::<Workspace>::new_invalid();
     let conversation = cx.new(|cx| {
@@ -116,7 +116,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
             &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
-            agent::MessageAuthor::Lead,
+            manox_agent::MessageAuthor::Lead,
             true,
             agent_ui::conversation::ApplyCtx { weak, cwd: None },
             cx,
@@ -188,7 +188,7 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
             &display,
             &std::collections::HashMap::new(),
             "deepseek-v4-flash",
-            agent::MessageAuthor::Lead,
+            manox_agent::MessageAuthor::Lead,
             true,
             agent_ui::conversation::ApplyCtx {
                 weak: gpui::WeakEntity::<Workspace>::new_invalid(),
@@ -208,5 +208,5 @@ async fn workspace_overlap_walk_scroll_resize_rebuild(cx: &mut TestAppContext) {
     });
     draw(&mut visual);
     assert_workspace_bodies_contained(&mut visual, item_count, "rebuilt quarter");
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
 }

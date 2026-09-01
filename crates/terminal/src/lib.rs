@@ -7,7 +7,7 @@
 //! so no per-method ANSI handler is written here. The PTY reader runs on a
 //! dedicated std::thread; bytes are piped back to the event pumps through an
 //! `async_channel`, mirroring the provider streaming bridge in
-//! `agent::provider::anthropic`.
+//! `manox_agent::provider::anthropic`.
 //!
 //! The terminal crate is pure logic and does not depend on gpui or
 //! gpui-component; the GPUI `Element` rendering layer lives in the
@@ -43,7 +43,7 @@ pub use store::TerminalStoreHandle;
 pub use term::{HoverKind, HoverTarget, Terminal, TerminalHandle};
 
 /// Register the `TerminalStore` against the shared `ThreadsDatabase`.
-/// Call at App startup, after `agent::init` and
+/// Call at App startup, after `manox_agent::init` and
 /// `runtime::set_runtime`.
 pub fn init() {
     store::init();

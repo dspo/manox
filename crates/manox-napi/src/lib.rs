@@ -65,8 +65,8 @@ pub fn start(event_cb: JsFunction) -> Result<()> {
     }
 
     // Pin the host identity and initialize the agent runtime.
-    agent::host::set_host(agent::host::Host::Vscode);
-    agent::init();
+    manox_agent::host::set_host(manox_agent::host::Host::Vscode);
+    manox_agent::init();
 
     let tsfn: ThreadsafeFunction<String> =
         event_cb.create_threadsafe_function(0, |ctx| Ok(vec![ctx.value]))?;

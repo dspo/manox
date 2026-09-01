@@ -247,7 +247,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     }
 }
 
-/// Restore mapping: pi harness history onto the `agent::Message` history
+/// Restore mapping: pi harness history onto the `manox_agent::Message` history
 /// the rebuild path (`build_items`) renders. Blocks map one-to-one;
 /// terminal error/abort states surface as a trailing assistant text note
 /// so a reloaded session shows why the last run stopped.

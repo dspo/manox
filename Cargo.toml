@@ -13,7 +13,7 @@
 # gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
 [workspace]
 members = [
-    "crates/agent",
+    "crates/manox-agent",
     "crates/agent-ui",
     "crates/manox",
     "crates/pi",
@@ -44,7 +44,7 @@ publish = false
 [workspace.dependencies]
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
-agent = { path = "crates/agent" }
+manox-agent = { path = "crates/manox-agent" }
 agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
 terminal = { path = "crates/terminal" }

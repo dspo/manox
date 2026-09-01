@@ -274,7 +274,7 @@ async fn run_hook(
 
 static REGISTRY: OnceLock<HookRegistry> = OnceLock::new();
 
-/// Load every installed plugin's hooks once. Call from `agent::init` after
+/// Load every installed plugin's hooks once. Call from `manox_agent::init` after
 /// the plugin dirs are settled.
 pub fn init() {
     let registry = HookRegistry::load();

@@ -31,10 +31,10 @@ use manox_protocol::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
-use agent::language_model::{MessageContent, ReasoningEffort};
-use agent::thread::{PermissionMode, ThreadHandle};
-use agent::thread_engine::BackendNotice;
-use agent::{Message, MessageUiMetadata, Thread, ThreadEvent, ThreadId};
+use manox_agent::language_model::{MessageContent, ReasoningEffort};
+use manox_agent::thread::{PermissionMode, ThreadHandle};
+use manox_agent::thread_engine::BackendNotice;
+use manox_agent::{Message, MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 
 use crate::translate::{Translated, translate};
 
@@ -103,7 +103,7 @@ impl AgentServer {
     /// connection drives itself thereafter.
     pub fn accept(&self, conn: Arc<dyn RpcConnection>) {
         let inner = self.0.clone();
-        agent::runtime::handle().spawn(async move {
+        manox_agent::runtime::handle().spawn(async move {
             inner.serve_connection(conn).await;
         });
     }
@@ -114,7 +114,7 @@ impl AgentServer {
     pub fn set_session_engine_for_test(
         &self,
         session_id: &str,
-        engine: Arc<dyn agent::thread_engine::ThreadEngine>,
+        engine: Arc<dyn manox_agent::thread_engine::ThreadEngine>,
         events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
     ) {
         if let Some(thread) = self.0.session_thread(session_id) {
@@ -378,7 +378,7 @@ impl AgentServerInner {
                 project: t.project().map(|p| p.to_string_lossy().into_owned()),
                 display_title: t.display_title(),
                 model_id: t.model().map(|m| m.id.clone()),
-                model_name: t.model().map(agent::pi_providers::display_name),
+                model_name: t.model().map(manox_agent::pi_providers::display_name),
                 model: t
                     .model()
                     .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null)),
@@ -416,7 +416,7 @@ impl AgentServerInner {
     }
 
     fn models_snapshot(&self) -> Value {
-        let models: Vec<Value> = deduped_models(agent::pi_providers::global().models())
+        let models: Vec<Value> = deduped_models(manox_agent::pi_providers::global().models())
             .iter()
             .map(model_json)
             .collect();
@@ -425,7 +425,7 @@ impl AgentServerInner {
 
     fn commands_snapshot(&self) -> Value {
         let mut commands = Vec::new();
-        for meta in agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
+        for meta in manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
             commands.push(json!({
                 "name": meta.name,
                 "description": null,
@@ -435,11 +435,11 @@ impl AgentServerInner {
             }));
         }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
-            agent::slash_builtins::BUILTIN_SLASH_COMMANDS
+            manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS
                 .iter()
                 .map(|m| m.name.to_string()),
         );
-        if let Some(registry) = agent::command::try_global() {
+        if let Some(registry) = manox_agent::command::try_global() {
             for (key, def) in registry.entries() {
                 if seen.contains(key.as_str()) {
                     continue;
@@ -453,7 +453,7 @@ impl AgentServerInner {
                 }));
             }
         }
-        if let Some(registry) = agent::skill::try_global() {
+        if let Some(registry) = manox_agent::skill::try_global() {
             for (key, def) in registry.entries() {
                 if seen.contains(key.as_str()) {
                     continue;
@@ -505,7 +505,7 @@ async fn handle_call(
                     let model = t.model();
                     json!({
                         "id": model.map(|m| m.id.clone()),
-                        "name": model.map(agent::pi_providers::display_name),
+                        "name": model.map(manox_agent::pi_providers::display_name),
                     })
                 })
             }),
@@ -534,7 +534,7 @@ async fn handle_call(
             // Bare-model completion (the VS Code LanguageModelChat provider):
             // stream deltas back to the CALLING client as request-scoped
             // notes. Ported from the retired actor command engine.
-            let registry = agent::pi_providers::global();
+            let registry = manox_agent::pi_providers::global();
             let done = |stop: Option<&str>, error: Option<String>| {
                 inner.note_to_client(
                     client_id,
@@ -591,9 +591,9 @@ async fn open_session(
         inner.emit_history_and_info(&thread, session_id, true);
         return Ok(json!({ "restored": true }));
     }
-    let thread = agent::thread_store::global().with_mut(|s| s.load_thread(session_id));
+    let thread = manox_agent::thread_store::global().with_mut(|s| s.load_thread(session_id));
     let thread = thread.ok_or_else(|| RpcError::new(-1, "thread not found"))?;
-    agent::thread_store::global().with_mut(|s| s.set_unread(session_id, false));
+    manox_agent::thread_store::global().with_mut(|s| s.set_unread(session_id, false));
     let turn_active = Arc::new(AtomicBool::new(false));
     let pending_submits = Arc::new(StdMutex::new(Vec::new()));
     let pump = spawn_pump(
@@ -689,8 +689,8 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             max_rounds,
         } => inner.goal(&session_id, &action, objective, budget, max_rounds),
         ClientNote::StopBackgroundTask { task_id, .. } => {
-            agent::runtime::handle().spawn(async move {
-                let _ = agent::background_task::stop(&task_id).await;
+            manox_agent::runtime::handle().spawn(async move {
+                let _ = manox_agent::background_task::stop(&task_id).await;
             });
         }
         ClientNote::ArchiveThread {
@@ -698,7 +698,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             archived,
         } => inner.archive_thread(owner, &session_id, archived),
         ClientNote::PinThread { session_id, pinned } => {
-            agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
+            manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
         }
         ClientNote::FocusThread { session_id } => inner.focus_thread(session_id),
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
@@ -734,7 +734,7 @@ impl AgentServerInner {
     ) {
         let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| inner.cwd.clone());
         let thread = Thread::new_fresh(ThreadId(session_id.into()), cwd);
-        if let Some(model) = agent::pi_providers::default_model() {
+        if let Some(model) = manox_agent::pi_providers::default_model() {
             thread.with_mut(|t| t.set_model(model));
         }
         let mode = thread.read(|t| t.permission_mode());
@@ -793,7 +793,7 @@ impl AgentServerInner {
             && session.turn_active.load(Ordering::SeqCst)
         {
             session.thread.with_mut(|t| t.cancel());
-            agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
+            manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
         }
     }
 
@@ -834,7 +834,7 @@ impl AgentServerInner {
         };
         // Navigation built-ins take effect immediately even mid-turn.
         if let Some((name, _)) = slash.as_ref()
-            && let Some(builtin) = agent::slash_builtins::canonical_builtin(name)
+            && let Some(builtin) = manox_agent::slash_builtins::canonical_builtin(name)
             && matches!(builtin.name, "exit" | "new")
         {
             self.archive_thread(owner, session_id, true);
@@ -878,9 +878,9 @@ impl AgentServerInner {
                     ..ui.clone()
                 };
                 let builtin_hit = t.run_slash_builtin(&name, &args, Some(slash_ui.clone()));
-                let command_hit = agent::command::try_global().is_some()
+                let command_hit = manox_agent::command::try_global().is_some()
                     && t.submit_command(&name, &args, Some(slash_ui.clone()));
-                let skill_hit = agent::skill::try_global().is_some()
+                let skill_hit = manox_agent::skill::try_global().is_some()
                     && t.submit_skill(&name, &args, Some(slash_ui));
                 if builtin_hit || command_hit || skill_hit {
                     return;
@@ -961,7 +961,7 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        let registry = agent::pi_providers::global();
+        let registry = manox_agent::pi_providers::global();
         match pi_extensions::model_ref::resolve_model_ref(&registry, id) {
             Some(model) => thread.with_mut(|t| t.set_model(model)),
             None => self.note_error(session_id, "unknown model"),
@@ -1016,13 +1016,13 @@ impl AgentServerInner {
             return self.note_error(session_id, "unknown session");
         };
         let kind = match kind {
-            "error" => agent::db::UiNoteKind::Error,
-            "notice" => agent::db::UiNoteKind::Notice,
-            "plan_review" => agent::db::UiNoteKind::PlanReview,
+            "error" => manox_agent::db::UiNoteKind::Error,
+            "notice" => manox_agent::db::UiNoteKind::Notice,
+            "plan_review" => manox_agent::db::UiNoteKind::PlanReview,
             _ => return self.note_error(session_id, "unknown ui note kind"),
         };
         thread.with_mut(|t| {
-            t.append_ui_note(agent::db::UiNoteRecord { kind, data });
+            t.append_ui_note(manox_agent::db::UiNoteRecord { kind, data });
         });
     }
 
@@ -1040,7 +1040,7 @@ impl AgentServerInner {
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
             .collect();
         thread.with_mut(|t| {
-            let ui = agent::MessageUiMetadata {
+            let ui = manox_agent::MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
                 ..Default::default()
@@ -1063,7 +1063,7 @@ impl AgentServerInner {
         };
         let plan_file = plan_file.to_string();
         let lang = thread.read(|t| t.agent_language());
-        let seed_text = match agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file)
+        let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file)
         {
             Ok(text) => text,
             Err(e) => {
@@ -1094,21 +1094,21 @@ impl AgentServerInner {
             return self.note_error(session_id, "unknown session");
         };
         let objective = objective.unwrap_or_default();
-        let actor = agent::db::GoalActor::User;
+        let actor = manox_agent::db::GoalActor::User;
         let result = thread.with_mut(|t| match action {
             "create" => t.set_goal(objective),
             "edit" => t.edit_goal(objective, budget, max_rounds, actor),
             "replace" => t.replace_goal(objective, budget, max_rounds, actor),
             "clear" => t.clear_goal(actor),
             "pause" => t.set_goal_status(
-                agent::goal::GoalStatus::Paused,
-                Some(agent::goal::GoalBlockReason {
+                manox_agent::goal::GoalStatus::Paused,
+                Some(manox_agent::goal::GoalBlockReason {
                     code: "user-paused".into(),
                     message: "paused by user".into(),
                 }),
                 actor,
             ),
-            "resume" => t.set_goal_status(agent::goal::GoalStatus::Active, None, actor),
+            "resume" => t.set_goal_status(manox_agent::goal::GoalStatus::Active, None, actor),
             _ => Ok(()),
         });
         if let Err(e) = result {
@@ -1119,16 +1119,16 @@ impl AgentServerInner {
     fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
         if archived {
             self.dispose_session(owner, session_id);
-            agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, true));
+            manox_agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, true));
         } else {
-            agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, false));
+            manox_agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, false));
         }
     }
 
     fn focus_thread(&self, session_id: Option<String>) {
         *self.focused.lock().unwrap() = session_id.clone();
         if let Some(id) = session_id {
-            agent::thread_store::global().with_mut(|s| s.set_unread(&id, false));
+            manox_agent::thread_store::global().with_mut(|s| s.set_unread(&id, false));
         }
     }
 }
@@ -1248,8 +1248,8 @@ fn respond_auth_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, aut
         thread.with_mut(|t| {
             t.respond_authorization(
                 &auth_id,
-                agent::permission::ToolAuthorizationResponse::Decision(
-                    agent::permission::PermissionDecision::Deny,
+                manox_agent::permission::ToolAuthorizationResponse::Decision(
+                    manox_agent::permission::PermissionDecision::Deny,
                 ),
             )
         });
@@ -1274,12 +1274,12 @@ fn apply_approve_reply(
         Err(_) => false,
     };
     let response = if allow {
-        agent::permission::ToolAuthorizationResponse::Decision(
-            agent::permission::PermissionDecision::AllowOnce,
+        manox_agent::permission::ToolAuthorizationResponse::Decision(
+            manox_agent::permission::PermissionDecision::AllowOnce,
         )
     } else {
-        agent::permission::ToolAuthorizationResponse::Decision(
-            agent::permission::PermissionDecision::Deny,
+        manox_agent::permission::ToolAuthorizationResponse::Decision(
+            manox_agent::permission::PermissionDecision::Deny,
         )
     };
     if let Some(thread) = inner.session_thread(session_id) {
@@ -1294,7 +1294,7 @@ fn apply_ask_reply(
     outcome: Result<Value, RpcError>,
 ) {
     let response = match outcome {
-        Ok(v) => agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+        Ok(v) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
             answers: v
                 .get("answers")
                 .and_then(Value::as_array)
@@ -1310,7 +1310,7 @@ fn apply_ask_reply(
                 .unwrap_or_default(),
             response: v.get("response").and_then(Value::as_str).map(String::from),
         },
-        Err(_) => agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+        Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
             answers: Vec::new(),
             response: None,
         },
@@ -1325,7 +1325,7 @@ fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth
         thread.with_mut(|t| {
             t.respond_authorization(
                 &auth_id,
-                agent::permission::ToolAuthorizationResponse::AskUserQuestion {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
                     answers: Vec::new(),
                     response: None,
                 },
@@ -1366,7 +1366,7 @@ fn apply_plan_verdict(
     }
     let compact = choice == "execute_compact";
     let lang = thread.read(|t| t.agent_language());
-    let seed_text = match agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
+    let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
         Ok(text) => text,
         Err(e) => {
             thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
@@ -1374,7 +1374,7 @@ fn apply_plan_verdict(
         }
     };
     let compact_instructions =
-        compact.then(|| agent::collaboration_mode::plan_compact_instructions(lang, &plan_file));
+        compact.then(|| manox_agent::collaboration_mode::plan_compact_instructions(lang, &plan_file));
     thread.with_mut(|t| {
         t.set_plan_review_pending(false);
         let ui = MessageUiMetadata {
@@ -1438,15 +1438,15 @@ impl AgentServerCapabilityClient {
         Self(server.0.clone())
     }
 }
-impl agent::capability::CapabilityClient for AgentServerCapabilityClient {
+impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     fn browser_op(
         &self,
-        op: agent::thread_engine::BrowserOp,
-    ) -> futures::future::BoxFuture<'static, Result<agent::thread_engine::BrowserReply, String>>
+        op: manox_agent::thread_engine::BrowserOp,
+    ) -> futures::future::BoxFuture<'static, Result<manox_agent::thread_engine::BrowserReply, String>>
     {
         let inner = self.0.clone();
         Box::pin(async move {
-            let session_id = agent::capability::CURRENT_SESSION
+            let session_id = manox_agent::capability::CURRENT_SESSION
                 .try_with(|c| c.clone())
                 .ok()
                 .flatten()
@@ -1457,7 +1457,7 @@ impl agent::capability::CapabilityClient for AgentServerCapabilityClient {
             };
             let outcome = route_capability_call(&inner, &session_id, call).await;
             match outcome {
-                Ok(v) => serde_json::from_value::<agent::thread_engine::BrowserReply>(v)
+                Ok(v) => serde_json::from_value::<manox_agent::thread_engine::BrowserReply>(v)
                     .map_err(|e| e.to_string()),
                 Err(e) => Err(e.message),
             }
@@ -1478,7 +1478,7 @@ fn spawn_pump(
     // broadcast (a subscribe inside the task can lose events fired before
     // the task is first polled).
     let rx = thread.subscribe();
-    agent::runtime::handle().spawn(async move {
+    manox_agent::runtime::handle().spawn(async move {
         while let Ok(ev) = rx.recv().await {
             // Bookkeeping that mirrors the legacy host pump: thread-store list
             // flags and the queued-follow-up drain. No note is emitted here
@@ -1487,7 +1487,7 @@ fn spawn_pump(
                 ThreadEvent::TurnStarted => {
                     turn_active.store(true, Ordering::SeqCst);
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| {
+                    manox_agent::thread_store::global().with_mut(|s| {
                         s.mark_running(&id);
                         s.set_errored(&id, false);
                     });
@@ -1498,7 +1498,7 @@ fn spawn_pump(
                     turn_active.store(false, Ordering::SeqCst);
                     let unread = focused.lock().unwrap().as_deref() != Some(session_id.as_str());
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| {
+                    manox_agent::thread_store::global().with_mut(|s| {
                         s.mark_idle(&id);
                         s.mark_pending_auth(&id, false);
                         s.mark_pending_plan(&id, false);
@@ -1536,11 +1536,11 @@ fn spawn_pump(
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| s.mark_pending_auth(&id, true));
+                    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_auth(&id, true));
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| {
+                    manox_agent::thread_store::global().with_mut(|s| {
                         s.set_errored(&id, true);
                         s.mark_pending_plan(&id, false);
                         s.mark_background_work(&id, false);
@@ -1548,7 +1548,7 @@ fn spawn_pump(
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| s.mark_pending_plan(&id, true));
+                    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(&id, true));
                     thread.with_mut(|t| t.set_plan_review_pending(true));
                     // β-3b: initiate PlanVerdict (carries the plan body) and
                     // skip translate's bare PlanReady note — the call is the
@@ -1568,10 +1568,10 @@ fn spawn_pump(
                 }
                 ThreadEvent::BackgroundTaskUpdated { .. } => {
                     let id = session_id.clone();
-                    agent::thread_store::global().with_mut(|s| {
+                    manox_agent::thread_store::global().with_mut(|s| {
                         s.mark_background_work(
                             &id,
-                            agent::background_task::thread_has_running_tasks(&id),
+                            manox_agent::background_task::thread_has_running_tasks(&id),
                         )
                     });
                 }
@@ -1674,9 +1674,9 @@ fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
 fn model_json(model: &pi::types::Model) -> Value {
     json!({
         "id": model.id,
-        "name": agent::pi_providers::display_name(model),
+        "name": manox_agent::pi_providers::display_name(model),
         "provider": model.provider,
-        "provider_name": agent::pi_providers::display_provider_name(model),
+        "provider_name": manox_agent::pi_providers::display_provider_name(model),
         "api": model.api,
         "context_window": model.context_window,
         "max_tokens": model.max_tokens,
@@ -1699,8 +1699,8 @@ mod tests {
         runs: StdMutex<Vec<String>>,
         steer_calls: StdMutex<Vec<String>>,
         notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
-        auth_responses: StdMutex<Vec<(String, agent::permission::ToolAuthorizationResponse)>>,
-        pending_auth: StdMutex<Vec<(String, agent::permission::PendingAuthMeta)>>,
+        auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
+        pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
     }
 
     impl FakeEngine {
@@ -1722,14 +1722,14 @@ mod tests {
         }
     }
 
-    impl agent::thread_engine::ThreadEngine for FakeEngine {
+    impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
         fn is_running(&self) -> bool {
             false
         }
-        fn history(&self) -> Vec<agent::db::HistoryEntry> {
+        fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
             Vec::new()
         }
-        fn request_token_usage(&self) -> HashMap<String, agent::TokenUsage> {
+        fn request_token_usage(&self) -> HashMap<String, manox_agent::TokenUsage> {
             HashMap::new()
         }
         fn model(&self) -> Option<pi::types::Model> {
@@ -1755,16 +1755,16 @@ mod tests {
         fn active_session_path(&self) -> Option<PathBuf> {
             None
         }
-        fn session_list(&self) -> Vec<agent::ThreadSummary> {
+        fn session_list(&self) -> Vec<manox_agent::ThreadSummary> {
             Vec::new()
         }
-        fn pending_auth_entries(&self) -> Vec<(String, agent::permission::PendingAuthMeta)> {
+        fn pending_auth_entries(&self) -> Vec<(String, manox_agent::permission::PendingAuthMeta)> {
             self.pending_auth.lock().unwrap().clone()
         }
         fn respond_tool_authorization(
             &self,
             id: &str,
-            response: agent::permission::ToolAuthorizationResponse,
+            response: manox_agent::permission::ToolAuthorizationResponse,
         ) {
             self.auth_responses
                 .lock()
@@ -1804,7 +1804,7 @@ mod tests {
     }
 
     fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
-        agent::thread_store::init();
+        manox_agent::thread_store::init();
         let server = AgentServer::new(PathBuf::from("/"));
         let (client_conn, server_conn) = in_process_pair();
         server.accept(Arc::new(server_conn));
@@ -1936,20 +1936,20 @@ mod tests {
         );
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
     fn open_session_replays_thread_history() {
         let _g = lock_globals();
         hermetic_home();
-        let sessions = agent::paths::manox_config_dir()
+        let sessions = manox_agent::paths::manox_config_dir()
             .expect("config dir")
             .join("pi-sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         seed_session_file(&sessions, "s1", "/proj");
         init_globals();
-        agent::thread_store::init();
+        manox_agent::thread_store::init();
         let (server, client) = harness(vec![]);
         client.send(FromClient::Request {
             id: MsgId::new("open"),
@@ -1979,7 +1979,7 @@ mod tests {
         });
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
@@ -2039,8 +2039,8 @@ mod tests {
             let got = engine.auth_responses.lock().unwrap().iter().any(|(_, r)| {
                 matches!(
                     r,
-                    agent::permission::ToolAuthorizationResponse::Decision(
-                        agent::permission::PermissionDecision::AllowOnce
+                    manox_agent::permission::ToolAuthorizationResponse::Decision(
+                        manox_agent::permission::PermissionDecision::AllowOnce
                     )
                 )
             });
@@ -2072,7 +2072,7 @@ mod tests {
         });
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
@@ -2133,14 +2133,14 @@ mod tests {
                 .iter()
                 .any(|(_, r)| matches!(
                     r,
-                    agent::permission::ToolAuthorizationResponse::Decision(
-                        agent::permission::PermissionDecision::Deny
+                    manox_agent::permission::ToolAuthorizationResponse::Decision(
+                        manox_agent::permission::PermissionDecision::Deny
                     )
                 ))
         );
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
@@ -2177,7 +2177,7 @@ mod tests {
         assert!(!info.plan_mode);
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(engine.runs.lock().unwrap().len(), 1);
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
     #[test]
     fn ask_user_question_round_trips() {
@@ -2251,7 +2251,7 @@ mod tests {
             .send(BackendNotice::Event(Box::new(
                 ThreadEvent::ToolCallAuthorization {
                     id: "q1".into(),
-                    tool_name: agent::tools::ASK_USER_QUESTION.to_string(),
+                    tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
                     summary: "pick a color".into(),
                     input: json!({"question": "color?"}),
                 },
@@ -2278,7 +2278,7 @@ mod tests {
                 id == "q1"
                     && matches!(
                         r,
-                        agent::permission::ToolAuthorizationResponse::AskUserQuestion { .. }
+                        manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { .. }
                     )
             });
             if got {
@@ -2309,7 +2309,7 @@ mod tests {
         });
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
@@ -2377,17 +2377,17 @@ mod tests {
         let _ = std::fs::remove_file(&plan_file);
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
     #[test]
     fn browser_op_routes_to_client_and_returns_reply() {
         let _g = lock_globals();
         hermetic_home();
         init_globals();
-        agent::thread_store::init();
-        agent::capability::drop_provider_for_test();
+        manox_agent::thread_store::init();
+        manox_agent::capability::drop_provider_for_test();
         let (server, client) = harness(vec![HookKind::BrowserOp]);
-        agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
+        manox_agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
         create(&server, &client, "s1");
         let (engine, events) = FakeEngine::new();
         server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -2412,7 +2412,7 @@ mod tests {
         engine
             .notices
             .send(BackendNotice::BrowserRequest {
-                op: agent::thread_engine::BrowserOp::Open {
+                op: manox_agent::thread_engine::BrowserOp::Open {
                     url: "https://example.com".into(),
                 },
                 responder: tx,
@@ -2432,7 +2432,7 @@ mod tests {
         client.send(FromClient::Reply {
             id: call_id,
             outcome: Ok(
-                serde_json::to_value(agent::thread_engine::BrowserReply::TabId(1)).unwrap(),
+                serde_json::to_value(manox_agent::thread_engine::BrowserReply::TabId(1)).unwrap(),
             ),
         });
         // The engine's responder got the BrowserReply.
@@ -2442,7 +2442,7 @@ mod tests {
                 assert!(reply.is_ok(), "browser op should succeed, not fail-closed");
                 assert!(matches!(
                     reply.unwrap(),
-                    agent::thread_engine::BrowserReply::TabId(_)
+                    manox_agent::thread_engine::BrowserReply::TabId(_)
                 ));
                 break;
             }
@@ -2454,21 +2454,21 @@ mod tests {
         }
         drop(client);
         drop(server);
-        agent::capability::drop_provider_for_test();
-        agent::thread_store::drop_global_for_test();
+        manox_agent::capability::drop_provider_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
     fn open_session_snapshot_subscribe_is_atomic() {
         let _g = lock_globals();
         hermetic_home();
-        let sessions = agent::paths::manox_config_dir()
+        let sessions = manox_agent::paths::manox_config_dir()
             .expect("config dir")
             .join("pi-sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         seed_session_file(&sessions, "s1", "/proj");
         init_globals();
-        agent::thread_store::init();
+        manox_agent::thread_store::init();
         let (server, client) = harness(vec![]);
         // Open the session — the pump subscribes synchronously inside
         // spawn_pump, then emit_history_and_info sends the snapshot. Any
@@ -2538,7 +2538,7 @@ mod tests {
         }
         drop(client);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     use manox_protocol::transport::{BACKPRESSURE_CAPACITY, BackpressurePolicy, RpcConnection};
@@ -2856,7 +2856,7 @@ mod tests {
         drop(client_ip);
         drop(client_sl);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     /// ε-2b: multi-client routing — two clients, two sessions, one server.
@@ -2958,6 +2958,6 @@ mod tests {
         drop(client_a);
         drop(client_b);
         drop(server);
-        agent::thread_store::drop_global_for_test();
+        manox_agent::thread_store::drop_global_for_test();
     }
 }

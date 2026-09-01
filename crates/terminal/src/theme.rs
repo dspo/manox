@@ -54,7 +54,7 @@ pub fn resolve(spec: &str) -> Result<ThemeFile> {
     let path = if spec.contains('/') || spec.ends_with(".ottytheme") {
         PathBuf::from(spec)
     } else {
-        agent::paths::themes_dir()?.join(format!("{spec}.ottytheme"))
+        manox_agent::paths::themes_dir()?.join(format!("{spec}.ottytheme"))
     };
     load(&path)
 }

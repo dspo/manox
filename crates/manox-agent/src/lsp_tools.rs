@@ -602,7 +602,7 @@ static READY: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 static NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Kick off the LSP registry PATH probe on a background thread (called from
-/// `agent::init`); sessions await [`wait_ready`] (bounded) before tool
+/// `manox_agent::init`); sessions await [`wait_ready`] (bounded) before tool
 /// registration so startup never blocks on server probes.
 ///
 /// Waits for [`crate::path_env::wait_installed`] before probing so the

@@ -24,7 +24,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use agent::{Thread, ThreadId};
+use manox_agent::{Thread, ThreadId};
 
 /// Serve a canned Anthropic SSE reply (a single assistant text block, stop
 /// reason `end_turn`) on an ephemeral port. Returns the port.
@@ -129,16 +129,16 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
 
     let cx = gpui::TestAppContext::single();
     cx.update(|_| {
-        agent::runtime::init();
-        agent::settings::init_optimization();
-        agent::i18n::init();
-        agent::pi_providers::init();
-        agent::thread_store::init();
+        manox_agent::runtime::init();
+        manox_agent::settings::init_optimization();
+        manox_agent::i18n::init();
+        manox_agent::pi_providers::init();
+        manox_agent::thread_store::init();
     });
     // Provider registration runs on a background thread; block until it lands
     // so `default_model` resolves before the thread is constructed.
     cx.update(|_| {
-        agent::runtime::handle().block_on(agent::pi_providers::wait_ready());
+        manox_agent::runtime::handle().block_on(manox_agent::pi_providers::wait_ready());
     });
 
     // Mirror `respond_plan_review`'s ExecuteFresh arm: spawn a fresh
@@ -176,17 +176,17 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // The workspace's `TurnFinished` handler persists with `touch=true`,
     // which re-scans the session repository into the store summaries.
     // Apply the same call; the scan runs on the agent runtime.
-    agent::refresh_thread_list();
+    manox_agent::refresh_thread_list();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let listed =
-            agent::thread_store_global().read(|s| s.summaries().iter().any(|s| s.id == new_id));
+            manox_agent::thread_store_global().read(|s| s.summaries().iter().any(|s| s.id == new_id));
         if listed {
             break;
         }
         if Instant::now() > deadline {
             // Debug dump: what does the session repository actually contain?
-            let dir = agent::paths::manox_config_dir()
+            let dir = manox_agent::paths::manox_config_dir()
                 .expect("manox config dir")
                 .join("pi-sessions");
             let mut files = Vec::new();
@@ -195,7 +195,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
                     files.push(entry.path().display().to_string());
                 }
             }
-            let listed = agent::thread_store_global().read(|s| s.summaries().to_vec());
+            let listed = manox_agent::thread_store_global().read(|s| s.summaries().to_vec());
             panic!(
                 "fresh execution thread {new_id} never surfaced in ThreadStore summaries \
                  (sidebar list) — deferred session file missed by every refresh\n\
@@ -208,7 +208,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // The thread must be listed under the SAME id the facade thread carries
     // (the session file header id), so sidebar selection / running / unread
     // marks keyed by the facade id actually reach the row.
-    let listed_id = agent::thread_store_global().read(|s| {
+    let listed_id = manox_agent::thread_store_global().read(|s| {
         s.summaries()
             .iter()
             .find(|s| s.id == new_id)
@@ -221,7 +221,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
          sidebar row is keyed by a different id and selection/running/unread \
          marks never reach it"
     );
-    let summaries = agent::thread_store_global().read(|s| s.summaries().to_vec());
+    let summaries = manox_agent::thread_store_global().read(|s| s.summaries().to_vec());
     let summary = summaries
         .iter()
         .find(|s| s.id == new_id)
@@ -232,6 +232,6 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     );
     // Drop the process-global store entity so the gpui test app can tear
     // down without the leak detector tripping on it.
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
     eprintln!("PASS: fresh execution thread surfaced in store summaries: {summary:?}");
 }

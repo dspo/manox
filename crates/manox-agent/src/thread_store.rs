@@ -229,10 +229,10 @@ pub fn init() {
 
 /// Returns the global [`StoreHandle`]. Panics if `init` was not called.
 pub fn global() -> StoreHandle {
-    try_global().expect("ThreadStore not initialized; call agent::init first")
+    try_global().expect("ThreadStore not initialized; call manox_agent::init first")
 }
 
-/// The global store when initialized (`agent::init`, or `init_for_test`);
+/// The global store when initialized (`manox_agent::init`, or `init_for_test`);
 /// `None` before init so teardown paths (team disband) can skip archival
 /// instead of panicking in store-less environments.
 pub fn try_global() -> Option<StoreHandle> {

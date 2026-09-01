@@ -30,7 +30,7 @@ use gpui_component::{
 };
 
 use crate::i18n;
-use agent::thread::PermissionMode;
+use manox_agent::thread::PermissionMode;
 
 use super::{MOCK_PROJECTS, MockProject, SettingsView, WorkMode};
 
@@ -1005,7 +1005,7 @@ pub fn render_config(view: &mut SettingsView, cx: &mut Context<SettingsView>) ->
                 // Build identifier captured at compile time — commit SHA and
                 // build type. Not routed through i18n.
                 muted_text(
-                    SharedString::from(agent::version::full_version_string()),
+                    SharedString::from(manox_agent::version::full_version_string()),
                     muted,
                 ),
             ),
@@ -1156,9 +1156,9 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
     let entity = cx.entity();
     let muted = theme.muted_foreground;
 
-    let config = agent::mcp::load_merged_config();
+    let config = manox_agent::mcp::load_merged_config();
     let servers: Vec<String> = config.mcp_servers.keys().cloned().collect();
-    let connected: std::collections::HashMap<String, usize> = agent::mcp::try_global()
+    let connected: std::collections::HashMap<String, usize> = manox_agent::mcp::try_global()
         .map(|registry| {
             registry
                 .servers()
@@ -1241,7 +1241,7 @@ pub fn render_mcp(view: &mut SettingsView, cx: &mut Context<SettingsView>) -> An
                                 this.mcp_disabled.insert(name.clone());
                             }
                             let disabled: Vec<String> = this.mcp_disabled.iter().cloned().collect();
-                            if let Err(err) = agent::settings::set_mcp_disabled(disabled) {
+                            if let Err(err) = manox_agent::settings::set_mcp_disabled(disabled) {
                                 tracing::warn!(error = %err, "failed to persist MCP switch");
                             }
                         }),

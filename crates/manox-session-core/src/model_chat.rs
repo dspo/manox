@@ -332,7 +332,7 @@ pub fn start(
         .unwrap()
         .insert(request_id.clone(), token.clone());
 
-    agent::runtime::handle().spawn(async move {
+    manox_agent::runtime::handle().spawn(async move {
         let rid = request_id.clone();
         let (tx, mut rx) = mpsc::channel::<AgentEvent>(256);
         let mut stream_fut = stream.stream(&ctx, token.clone(), tx);

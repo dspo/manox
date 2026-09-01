@@ -1,5 +1,5 @@
 [package]
-name = "agent"
+name = "manox-agent"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true
@@ -67,7 +67,7 @@ html2text = "0.17.1"
 # lib without `cfg(test)`, so the test seams (`init_for_test` /
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
 # `chrome-use` keeps the chrome_use module and its live tests in the suite.
-agent = { path = ".", features = ["test-support", "chrome-use"] }
+manox-agent = { path = ".", features = ["test-support", "chrome-use"] }
 # Integration tests (`tests/`) use `gpui::TestAppContext` for the facade
 # layer; the library crate itself is gpui-free.
 gpui = { workspace = true, features = ["test-support"] }

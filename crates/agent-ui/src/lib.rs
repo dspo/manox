@@ -2,7 +2,7 @@
 //!
 //! Workspace top-level view + `ConversationState` + views. Holds an
 //! the AgentServer-backed `ClientStoreHandle` (the data mirror around the
-//! gpui-free `agent::ThreadHandle`) and subscribes to
+//! gpui-free `manox_agent::ThreadHandle`) and subscribes to
 //! `ThreadEvent` for incremental rendering.
 pub mod assets;
 pub mod browser_host;

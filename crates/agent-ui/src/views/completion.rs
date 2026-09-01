@@ -113,7 +113,7 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
 }
 
 /// Skills + subagents, filtered + sorted by `query`. Skills are shared
-/// across harnesses (`agent::skill`); subagent definitions are a retired
+/// across harnesses (`manox_agent::skill`); subagent definitions are a retired
 /// manox registry (the pi harness assembles its subagents in
 /// `pi_extensions::agents`).
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
@@ -121,7 +121,7 @@ pub fn mention_source(query: &str) -> Vec<CompletionItem> {
     // Registry keys (not bare names) so an inserted mention matches the key
     // the slash dispatch and the system-prompt summaries use; `try_global`
     // because the registry may be unset in test contexts.
-    if let Some(registry) = agent::skill::try_global() {
+    if let Some(registry) = manox_agent::skill::try_global() {
         for (key, def) in registry.entries() {
             items.push(CompletionItem {
                 name: key.clone().into(),

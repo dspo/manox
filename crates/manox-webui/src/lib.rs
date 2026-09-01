@@ -5,7 +5,7 @@
 //! thread against the same `Entity<Thread>`s the desktop Workspace operates,
 //! through the `AgentServer` protocol gateway. The `pump` is a gpui-foreground
 //! task that polls per-connection command queues; the HTTP and WS workers run
-//! on the global tokio runtime (`agent::runtime::handle`). Each connection is
+//! on the global tokio runtime (`manox_agent::runtime::handle`). Each connection is
 //! one independent bridge, matching the vscode multi-surface model; on
 //! disconnect it detaches its sessions without
 //! cancelling turns, so a browser refresh never kills a desktop turn.
@@ -92,7 +92,7 @@ pub fn open_webui() {
 }
 
 fn start_server() {
-    let handle = agent::runtime::handle();
+    let handle = manox_agent::runtime::handle();
     handle.spawn(async move {
         if let Err(e) = server::bind_and_serve().await {
             let mut st = state();
@@ -124,7 +124,7 @@ pub(crate) fn service_started(svc: WebuiService) {
 /// Persist the endpoint so out-of-process tooling can reach the service;
 /// mode 0600 keeps the token local to the user.
 fn write_webui_json(token: &str, port: u16, url: &str) {
-    let Ok(dir) = agent::paths::manox_config_dir() else {
+    let Ok(dir) = manox_agent::paths::manox_config_dir() else {
         return;
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {

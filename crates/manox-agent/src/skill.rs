@@ -202,8 +202,8 @@ pub fn global() -> &'static SkillRegistry {
 }
 
 /// Non-panicking accessor mirroring `command::try_global`, for callers that may
-/// run before `agent::init` (e.g. the UI slash-command registry init, which
-/// `main` calls after `agent::init` but is safer not to assume).
+/// run before `manox_agent::init` (e.g. the UI slash-command registry init, which
+/// `main` calls after `manox_agent::init` but is safer not to assume).
 pub fn try_global() -> Option<&'static SkillRegistry> {
     REGISTRY.get()
 }

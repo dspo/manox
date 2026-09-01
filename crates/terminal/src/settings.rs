@@ -1,14 +1,14 @@
 //! `TerminalSettings` — the `[terminal]` section of `settings.toml`.
 //!
-//! Read from the same `settings.toml` `agent::settings` parses; the
-//! `[terminal]` table is an unknown field to `agent::Settings` (which does not
+//! Read from the same `settings.toml` `manox_agent::settings` parses; the
+//! `[terminal]` table is an unknown field to `manox_agent::Settings` (which does not
 //! set `deny_unknown_fields`), so the two readers coexist on one file.
 //! Absent file / section / parse failure is non-fatal: defaults are returned.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use agent::paths;
+use manox_agent::paths;
 
 /// Cursor glyph drawn at the active cell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]

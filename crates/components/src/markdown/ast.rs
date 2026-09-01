@@ -606,25 +606,25 @@ mod tests {
 
     #[test]
     fn auto_detects_file_path_with_extension() {
-        let blocks = parse("see crates/agent/src/thread.rs for details");
+        let blocks = parse("see crates/manox-agent/src/thread.rs for details");
         let runs = match blocks.first() {
             Some(Block::Paragraph(r)) => r.clone(),
             _ => panic!("expected paragraph"),
         };
         assert_eq!(runs.link_spans.len(), 1);
-        assert_eq!(runs.link_spans[0].url, "crates/agent/src/thread.rs");
+        assert_eq!(runs.link_spans[0].url, "crates/manox-agent/src/thread.rs");
         assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
     }
 
     #[test]
     fn auto_detects_file_path_with_line_number() {
-        let blocks = parse("see crates/agent/src/thread.rs:508 for the field");
+        let blocks = parse("see crates/manox-agent/src/thread.rs:508 for the field");
         let runs = match blocks.first() {
             Some(Block::Paragraph(r)) => r.clone(),
             _ => panic!("expected paragraph"),
         };
         assert_eq!(runs.link_spans.len(), 1);
-        assert_eq!(runs.link_spans[0].url, "crates/agent/src/thread.rs:508");
+        assert_eq!(runs.link_spans[0].url, "crates/manox-agent/src/thread.rs:508");
         assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
     }
 

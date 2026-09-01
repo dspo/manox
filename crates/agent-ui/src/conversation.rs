@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent::ThreadEvent;
-use agent::db::{HistoryEntry, UiNoteKind, UiNoteRecord};
-use agent::language_model::StopReason;
-use agent::thread::PermissionMode;
-use agent::{Message, TokenUsage, ToolCallStatus};
+use manox_agent::ThreadEvent;
+use manox_agent::db::{HistoryEntry, UiNoteKind, UiNoteRecord};
+use manox_agent::language_model::StopReason;
+use manox_agent::thread::PermissionMode;
+use manox_agent::{Message, TokenUsage, ToolCallStatus};
 use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
@@ -40,12 +40,12 @@ pub struct UserTurnMeta {
     pub steered: bool,
     /// The agent that authored this user turn; `None` = human input and
     /// the bubble header shows the localized "You".
-    pub author: Option<agent::MessageAuthor>,
+    pub author: Option<manox_agent::MessageAuthor>,
     /// The agent whose conversation renders this turn — the header's `to`.
     /// A view-side fact stamped by the owning `ConversationState`, never
     /// persisted: the same message shows its own recipient in the main
     /// thread, in a member thread, and in a sub-agent panel.
-    pub recipient: Option<agent::MessageAuthor>,
+    pub recipient: Option<manox_agent::MessageAuthor>,
     /// Mirrors `MessageUiMetadata::peer`: the turn arrived as a peer delivery,
     /// so its bubble carries the sender's attribution and a peer accent.
     pub peer: bool,
@@ -75,7 +75,7 @@ impl UserTurnMeta {
         }
     }
 
-    pub(crate) fn from_message(message: &Message, recipient: Option<agent::MessageAuthor>) -> Self {
+    pub(crate) fn from_message(message: &Message, recipient: Option<manox_agent::MessageAuthor>) -> Self {
         let ui = message.ui.as_ref();
         Self {
             timestamp: message.timestamp,
@@ -191,9 +191,9 @@ pub enum ConvItem {
 #[derive(Debug, Clone)]
 pub struct BackgroundTaskItem {
     pub task_id: String,
-    pub kind: agent::background_task::TaskKind,
+    pub kind: manox_agent::background_task::TaskKind,
     pub description: String,
-    pub status: agent::background_task::TaskStatus,
+    pub status: manox_agent::background_task::TaskStatus,
     pub event_count: u64,
     pub total_bytes: u64,
     pub exit_code: Option<i32>,
@@ -204,18 +204,18 @@ pub struct BackgroundTaskItem {
 }
 
 fn recent_background_task_output(task_id: &str) -> Vec<String> {
-    let Some(task) = agent::background_task::get_by_str(task_id) else {
+    let Some(task) = manox_agent::background_task::get_by_str(task_id) else {
         return Vec::new();
     };
     latest_background_task_output(task.recent_events())
 }
 
-fn latest_background_task_output(events: Vec<agent::background_task::TaskEvent>) -> Vec<String> {
+fn latest_background_task_output(events: Vec<manox_agent::background_task::TaskEvent>) -> Vec<String> {
     let mut output: Vec<String> = events
         .into_iter()
         .rev()
         .filter_map(|event| match event.event {
-            agent::background_task::TaskEventKind::Output(text) => Some(text),
+            manox_agent::background_task::TaskEventKind::Output(text) => Some(text),
             _ => None,
         })
         .take(20)
@@ -496,7 +496,7 @@ pub(crate) fn agent_task_labels(input: &serde_json::Value) -> (String, String) {
             input
                 .get("prompt")
                 .and_then(serde_json::Value::as_str)
-                .map(agent::tools::subagent_topic)
+                .map(manox_agent::tools::subagent_topic)
         })
         .unwrap_or_default();
     (subagent_type, description)
@@ -532,7 +532,7 @@ pub struct ConversationState {
     /// The agent whose conversation this list renders — every user bubble's
     /// header `to`. Fixed for the conversation's lifetime: the main thread's
     /// is its own agent, a sub-agent panel's is the sub-agent definition.
-    recipient: agent::MessageAuthor,
+    recipient: manox_agent::MessageAuthor,
 }
 
 /// Where a notice lands in the item list.
@@ -591,7 +591,7 @@ pub struct ApplyCtx {
 }
 
 impl ConversationState {
-    pub fn new(recipient: agent::MessageAuthor) -> Self {
+    pub fn new(recipient: manox_agent::MessageAuthor) -> Self {
         Self {
             items: Vec::new(),
             next_item_id: 0,
@@ -1229,7 +1229,7 @@ impl ConversationState {
                 status,
                 input,
             } => {
-                if name == agent::tools::AGENT {
+                if name == manox_agent::tools::AGENT {
                     let (subagent_type, description) = input
                         .as_ref()
                         .map(agent_task_labels)
@@ -1266,7 +1266,7 @@ impl ConversationState {
                         }));
                         ApplyOutcome::Appended
                     }
-                } else if name == agent::tools::ASK_USER_QUESTION {
+                } else if name == manox_agent::tools::ASK_USER_QUESTION {
                     // Top-level card, never folded into an activity segment.
                     // `AskUserQuestion` drives an inline clarify card via
                     // `render_ask_user_card` while pending and a plain answered
@@ -1617,7 +1617,7 @@ impl ConversationState {
                     model_id: String::new(),
                     approval_mode: None,
                     steered: false,
-                    author: Some(agent::MessageAuthor::from_routing(from)),
+                    author: Some(manox_agent::MessageAuthor::from_routing(from)),
                     recipient: Some(self.recipient.clone()),
                     peer: true,
                 };
@@ -1889,7 +1889,7 @@ impl ConversationState {
         display: &[HistoryEntry],
         usage: &std::collections::HashMap<String, TokenUsage>,
         role: &str,
-        recipient: agent::MessageAuthor,
+        recipient: manox_agent::MessageAuthor,
         running: bool,
         ctx: ApplyCtx,
         cx: &mut App,
@@ -2005,7 +2005,7 @@ impl ConversationState {
     /// SessionEnded by `Thread::restore`.
     pub fn restore_background_tasks(
         &mut self,
-        snapshots: &[agent::background_task::TaskSnapshot],
+        snapshots: &[manox_agent::background_task::TaskSnapshot],
         role: &str,
         weak: WeakEntity<Workspace>,
         cx: &mut App,
@@ -2114,8 +2114,8 @@ fn note_to_item(n: &UiNoteRecord) -> ConvItem {
 mod tests {
     use super::*;
     use crate::views::message::build_items;
-    use agent::Message;
-    use agent::language_model::{
+    use manox_agent::Message;
+    use manox_agent::language_model::{
         LanguageModelToolResult, LanguageModelToolUse, MessageContent, Role,
     };
     use std::sync::Arc;
@@ -2123,11 +2123,11 @@ mod tests {
     #[test]
     fn background_task_card_keeps_latest_twenty_output_events() {
         let events = (0..25)
-            .map(|ix| agent::background_task::TaskEvent {
-                task_id: agent::background_task::TaskId("monitor-test".into()),
-                kind: agent::background_task::TaskKind::MonitorCommand,
+            .map(|ix| manox_agent::background_task::TaskEvent {
+                task_id: manox_agent::background_task::TaskId("monitor-test".into()),
+                kind: manox_agent::background_task::TaskKind::MonitorCommand,
                 owner_goal_id: None,
-                event: agent::background_task::TaskEventKind::Output(format!("event-{ix}")),
+                event: manox_agent::background_task::TaskEventKind::Output(format!("event-{ix}")),
                 thread_seq: ix,
                 task_seq: ix,
                 timestamp_ms: ix,
@@ -2143,7 +2143,7 @@ mod tests {
     fn optimistic_steer_rolls_back_and_late_confirmation_heals_tombstone() {
         let cx = gpui::TestAppContext::single();
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let meta = UserTurnMeta::new(1, "test-model".into(), None);
 
         cx.update(|cx| {
@@ -2193,7 +2193,7 @@ mod tests {
     ) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -2254,7 +2254,7 @@ mod tests {
     fn history_progress_apply_is_unchanged(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx { weak, cwd: None };
         cx.update(|cx| {
@@ -2279,7 +2279,7 @@ mod tests {
     fn agent_text_needs_new_without_segment_is_plain_append(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -2311,7 +2311,7 @@ mod tests {
     fn popped_retry_then_append_remeasures_reused_tail_slot(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -2370,9 +2370,9 @@ mod tests {
             timestamp: 0,
             parent_id: None,
             provenance: if role == Role::User {
-                agent::MessageProvenance::User
+                manox_agent::MessageProvenance::User
             } else {
-                agent::MessageProvenance::Assistant
+                manox_agent::MessageProvenance::Assistant
             },
             role,
             content: vec![MessageContent::Text(text.to_string())],
@@ -2432,7 +2432,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
-                agent::MessageAuthor::Lead,
+                manox_agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -2490,7 +2490,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
-                agent::MessageAuthor::Lead,
+                manox_agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -2552,7 +2552,7 @@ mod tests {
                 &display,
                 &HashMap::new(),
                 "model",
-                agent::MessageAuthor::Lead,
+                manox_agent::MessageAuthor::Lead,
                 false,
                 ctx,
                 cx,
@@ -3033,7 +3033,7 @@ mod tests {
     ) -> (gpui::Entity<ConversationState>, ApplyCtx) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3296,7 +3296,7 @@ mod tests {
     fn live_reasoning_round_opens_expanded(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3338,7 +3338,7 @@ mod tests {
     fn live_tool_entry_opens_expanded(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3381,7 +3381,7 @@ mod tests {
     fn tool_result_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3450,7 +3450,7 @@ mod tests {
     fn user_toggled_entry_skips_auto_collapse(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3518,7 +3518,7 @@ mod tests {
     fn reasoning_round_auto_collapses_after_tool_use_stop(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3583,7 +3583,7 @@ mod tests {
     fn terminal_stop_auto_collapse_is_delayed(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let ctx = ApplyCtx {
             weak: gpui::WeakEntity::<Workspace>::new_invalid(),
             cwd: None,
@@ -3671,7 +3671,7 @@ mod tests {
     fn push_notice_turn_end_appends_with_unique_ids() {
         let cx = gpui::TestAppContext::single();
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3708,7 +3708,7 @@ mod tests {
     fn push_notice_after_anchor_inserts_mid_list() {
         let cx = gpui::TestAppContext::single();
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3758,7 +3758,7 @@ mod tests {
     fn push_notice_after_anchor_clamps_out_of_range() {
         let cx = gpui::TestAppContext::single();
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         cx.update(|cx| {
             conversation.update(cx, |c, cx| {
@@ -3777,7 +3777,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3798,7 +3798,7 @@ mod tests {
                         id: "tu_1".into(),
                         name: "Bash".into(),
                         title: "run tests".into(),
-                        status: agent::ToolCallStatus::Running,
+                        status: manox_agent::ToolCallStatus::Running,
                         input: Some(serde_json::json!({"command": "cargo test"})),
                     },
                     "model",
@@ -3815,9 +3815,9 @@ mod tests {
                 let _ = c.apply(
                     &ThreadEvent::ToolCall {
                         id: "ask_1".into(),
-                        name: agent::tools::ASK_USER_QUESTION.into(),
+                        name: manox_agent::tools::ASK_USER_QUESTION.into(),
                         title: "clarify".into(),
-                        status: agent::ToolCallStatus::PendingApproval,
+                        status: manox_agent::ToolCallStatus::PendingApproval,
                         input: Some(serde_json::json!({"question": "which?"})),
                     },
                     "model",
@@ -3848,7 +3848,7 @@ mod tests {
         let cx = gpui::TestAppContext::single();
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx {
             weak: weak.clone(),
@@ -3868,7 +3868,7 @@ mod tests {
                         id: "tu_1".into(),
                         name: "Bash".into(),
                         title: "deploy".into(),
-                        status: agent::ToolCallStatus::Running,
+                        status: manox_agent::ToolCallStatus::Running,
                         input: Some(serde_json::json!({"command": "deploy"})),
                     },
                     "model",
@@ -3904,7 +3904,7 @@ mod tests {
     fn argless_tool_end_event_keeps_title_and_input(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let conversation =
-            cx.update(|cx| cx.new(|_| ConversationState::new(agent::MessageAuthor::Lead)));
+            cx.update(|cx| cx.new(|_| ConversationState::new(manox_agent::MessageAuthor::Lead)));
         let weak = gpui::WeakEntity::<Workspace>::new_invalid();
         let ctx = ApplyCtx { weak, cwd: None };
         cx.update(|cx| {

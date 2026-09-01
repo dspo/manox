@@ -7,7 +7,7 @@
 
 mod common;
 
-use agent::PermissionDecision;
+use manox_agent::PermissionDecision;
 use common::{init_harness, open_workspace};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -53,5 +53,5 @@ async fn escalation_authorization_surfaces_as_generic_card(cx: &mut TestAppConte
         !workspace.read_with(&visual.cx, |ws, _| ws.diagnostic_blocking_overlay_active()),
         "overlay gone with the card"
     );
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
 }

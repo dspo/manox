@@ -364,7 +364,7 @@ impl TerminalHandle {
             }),
             // OSC 52 write: store text on the system clipboard. Fail closed:
             // with no provider (or a refusing one) the copy is dropped.
-            TerminalEvent::ClipboardStore(text) => match agent::capability::provider() {
+            TerminalEvent::ClipboardStore(text) => match manox_agent::capability::provider() {
                 Some(p) => {
                     if let Err(e) = p.clipboard_write(text) {
                         tracing::warn!(error = %e, "terminal clipboard write failed");
@@ -381,7 +381,7 @@ impl TerminalHandle {
             // provider (or on error) the response is built from empty text,
             // so no clipboard content is ever injected.
             TerminalEvent::ClipboardLoad(cb) => {
-                let Some(p) = agent::capability::provider() else {
+                let Some(p) = manox_agent::capability::provider() else {
                     tracing::warn!("no clipboard capability provider; OSC 52 paste returns empty");
                     let response = cb("");
                     let _ = self.read(|t| t.input(response.as_bytes()));

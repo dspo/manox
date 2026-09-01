@@ -34,7 +34,7 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 rust-embed.workspace = true
 
-agent.workspace = true
+manox-agent.workspace = true
 terminal.workspace = true
 terminal-ui.workspace = true
 manox-components.workspace = true
@@ -57,7 +57,7 @@ manox-session-core.workspace = true
 
 
 [dev-dependencies]
-agent = { workspace = true, features = ["test-support"] }
+manox-agent = { workspace = true, features = ["test-support"] }
 terminal = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"

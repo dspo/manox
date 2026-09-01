@@ -1,4 +1,4 @@
-//! Menu rebuilder — the gpui-dependent twin of `agent::i18n`.
+//! Menu rebuilder — the gpui-dependent twin of `manox_agent::i18n`.
 //!
 //! The bin owns the native-menu construction (`Quit` action and `Menu`/`MenuItem`
 //! live there). When the UI locale changes the native menus must be re-`set_menus`'d
@@ -14,7 +14,7 @@ type MenuRebuild = Box<dyn Fn(&mut App) + Send + Sync>;
 static MENU_REBUILDER: OnceLock<MenuRebuild> = OnceLock::new();
 
 /// Register the native-menu rebuilder. Called once from the bin at startup,
-/// after `agent::init`. Subsequent `rebuild_menus` calls invoke it so menu
+/// after `manox_agent::init`. Subsequent `rebuild_menus` calls invoke it so menu
 /// labels re-localize live.
 pub fn set_menu_rebuilder(rebuild: impl Fn(&mut App) + Send + Sync + 'static) {
     let _ = MENU_REBUILDER.set(Box::new(rebuild));

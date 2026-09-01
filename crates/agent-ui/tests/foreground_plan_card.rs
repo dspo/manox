@@ -8,7 +8,7 @@
 
 mod common;
 
-use agent::ThreadEvent;
+use manox_agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
 
@@ -46,7 +46,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the fresh card is active"
     );
     assert!(
-        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
+        manox_agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "PlanReady raises the pending-plan badge"
     );
 
@@ -70,7 +70,7 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the card stays interactive after the proposal turn"
     );
     assert!(
-        agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
+        manox_agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "the pending-plan badge survives a normal settle while the verdict is due"
     );
 
@@ -94,8 +94,8 @@ async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) 
         "the cancelled turn demotes the card to a plain record"
     );
     assert!(
-        !agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
+        !manox_agent::thread_store_global().read(|s| s.pending_plan_contains(&a_id)),
         "a cancelled turn clears the pending-plan badge"
     );
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
 }

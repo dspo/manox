@@ -51,7 +51,7 @@ pub fn resolved_login_path() -> &'static str {
 
 /// Install the login shell's PATH process-wide from a background thread.
 ///
-/// Called once from `agent::init`. When the resolver returns, the process
+/// Called once from `manox_agent::init`. When the resolver returns, the process
 /// `PATH` is replaced, so every later subprocess spawn (bash tool, LSP
 /// servers, MCP stdio servers, monitors) inherits the user's environment.
 /// Subprocesses spawned before the resolver lands inherit the launcher's

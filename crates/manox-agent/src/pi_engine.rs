@@ -1066,7 +1066,7 @@ fn build_tools(
     }
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same permission gate as built-ins (remote calls are mutating
-    // by default). A registry that never initialized (pre-`agent::init`
+    // by default). A registry that never initialized (pre-`manox_agent::init`
     // tests) contributes nothing.
     if let Some(registry) = crate::mcp::try_global() {
         for server in registry.servers() {
@@ -2033,7 +2033,7 @@ fn attach_plan_hooks(
 /// per-directory chain down to the session cwd) loaded through
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
 /// every turn (TS project-instruction semantics). Skills/templates stay
-/// empty here — manox skills ride the `agent::skill` registry instead.
+/// empty here — manox skills ride the `manox_agent::skill` registry instead.
 fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
     let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
     let context_files = set
@@ -4014,7 +4014,7 @@ fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> Threa
 /// Pure mappings between pi harness wire types and the UI's language.
 ///
 /// The facade renders two data shapes: the `ThreadEvent` stream (live deltas)
-/// and `agent::Message` history (rebuild). A pi `AgentSession` produces
+/// and `manox_agent::Message` history (rebuild). A pi `AgentSession` produces
 /// `AgentEvent`s and `AgentMessage`s; the functions here translate them into
 /// those two shapes so the polished manox render pipeline is reused.
 ///

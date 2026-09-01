@@ -35,12 +35,12 @@ async fn ask_card_synthesized_when_rebuild_misses_the_tool_item(cx: &mut TestApp
     let weak = gpui::WeakEntity::<Workspace>::new_invalid();
     let conversation = cx.new(|cx| {
         ConversationState::rebuild_from_display(
-            &[agent::db::HistoryEntry::Message(bash_tool_use_message(
+            &[manox_agent::db::HistoryEntry::Message(bash_tool_use_message(
                 "t1",
             ))],
             &std::collections::HashMap::new(),
             "test-model",
-            agent::MessageAuthor::Lead,
+            manox_agent::MessageAuthor::Lead,
             true,
             ApplyCtx { weak, cwd: None },
             cx,
@@ -74,5 +74,5 @@ async fn ask_card_synthesized_when_rebuild_misses_the_tool_item(cx: &mut TestApp
         ws.diagnostic_tool_call_count("ask1", cx)
     });
     assert_eq!(cards, 1, "exactly one ask card");
-    agent::thread_store::drop_global_for_test();
+    manox_agent::thread_store::drop_global_for_test();
 }

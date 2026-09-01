@@ -54,7 +54,7 @@ pub fn init() {
 }
 
 /// Seed an empty registry for tests that construct threads without a full
-/// `agent::init`; no background build, so tests never pay the keychain /
+/// `manox_agent::init`; no background build, so tests never pay the keychain /
 /// shell cost of provider registration. Idempotent: the first setter wins.
 #[cfg(test)]
 pub fn init_for_test() {
@@ -87,7 +87,7 @@ pub fn global() -> Arc<ProviderRegistry> {
     // snapshot, not cascade into every model-listing view.
     REGISTRY
         .get()
-        .expect("pi_providers not initialized; call agent::init first")
+        .expect("pi_providers not initialized; call manox_agent::init first")
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -105,7 +105,7 @@ pub fn reload() -> anyhow::Result<()> {
     tracing::info!("pi providers: reloaded {count} provider endpoints");
     let lock = REGISTRY
         .get()
-        .expect("pi_providers not initialized; call agent::init first");
+        .expect("pi_providers not initialized; call manox_agent::init first");
     *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     Ok(())
 }

@@ -3,7 +3,7 @@
 //! Shells out to the system `git` binary (never `git2` — banned by project
 //! rule) to read the working-tree diff stats and the current branch, then
 //! parses the output into pure value types the UI renders from. All subprocess
-//! work runs on the global tokio runtime via [`agent::runtime::handle`]; the
+//! work runs on the global tokio runtime via [`manox_agent::runtime::handle`]; the
 //! results are delivered back to the gpui-side caller through an
 //! executor-agnostic `async_channel`, the same bridge the worktree tool uses.
 //!
@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use agent::runtime;
+use manox_agent::runtime;
 
 /// Working-tree change stats relative to `HEAD`.
 ///
