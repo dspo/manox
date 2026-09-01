@@ -543,11 +543,9 @@ impl ApprovalGatedTool {
                 }
                 Ok(())
             }
-            // Session/repo-scoped coordination carries no out-of-workspace
-            // write target: team orchestration and the shared task list run
-            // under WorkspaceWrite; ReadOnly still denies them at the mode
-            // match, DangerFullAccess never consults this.
-            "TaskCreate" | "TaskList" | "TaskUpdate" | "TaskGet" => Ok(()),
+            // Session/repo-scoped coordination (task tools) was removed in
+            // the tools-optimization cycle — they were retired with the
+            // Steer-based team architecture.
             // Every other gated call (escalated bash, unknown mutating
             // tools) has no in-workspace proof.
             _ => deny(),
@@ -1346,38 +1344,6 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
-    }
-
-    /// Session/repo-scoped coordination (team orchestration, shared task
-    /// list) carries no out-of-workspace write target: WorkspaceWrite admits
-    /// it, ReadOnly still denies at the mode match.
-    #[tokio::test]
-    async fn workspace_write_admits_session_scoped_tools() {
-        for name in ["TaskCreate", "TaskList", "TaskUpdate", "TaskGet"] {
-            let (gate, _rx) = gate_with_events();
-            gate.set_mode(PermissionMode::WorkspaceWrite);
-            let (tool, ran) = gated_named(name, false, false, Arc::clone(&gate));
-            let ctx = tool_ctx();
-            let result = tool
-                .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
-                .await
-                .unwrap();
-            assert!(!result.is_error, "{name} admitted under WorkspaceWrite");
-            assert_eq!(ran.load(Ordering::SeqCst), 1, "{name} delegated");
-
-            let (ro_gate, _rx) = gate_with_events();
-            ro_gate.set_mode(PermissionMode::ReadOnly);
-            let (ro_tool, ro_ran) = gated_named(name, false, false, Arc::clone(&ro_gate));
-            let err = ro_tool
-                .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
-                .await
-                .unwrap_err();
-            assert!(
-                err.to_string().contains(DENY_READ_ONLY),
-                "{name} denied in ReadOnly"
-            );
-            assert_eq!(ro_ran.load(Ordering::SeqCst), 0);
-        }
     }
 
     fn mutating_gated() -> ApprovalGatedTool {
