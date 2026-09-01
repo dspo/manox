@@ -1084,6 +1084,10 @@ fn build_tools(
         && !reg.available_specs().is_empty()
     {
         tools.extend(crate::lsp_tools::tools());
+        // Pre-warm every detected LSP server at the session cwd so the
+        // first code-intel call hits a ready server. Detached background
+        // task — non-blocking, fire-and-forget.
+        crate::lsp_tools::prewarm_background(cwd.to_path_buf());
     }
     // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
     // behind the same permission gate as built-ins (remote calls are mutating
@@ -1976,6 +1980,20 @@ fn session_builder(
                         description: s.description,
                     })
                     .collect(),
+                lsp_ready_specs: {
+                    // Format available LSP server ids as a comma-separated
+                    // list for the system prompt's LSP ready line. Empty
+                    // when no servers are available (the template omits the
+                    // line entirely).
+                    lsp::registry::try_global()
+                        .map(|reg| {
+                            let ids: Vec<&str> =
+                                reg.available_specs().iter().map(|s| s.id).collect();
+                            ids.join(", ")
+                        })
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default()
+                },
             },
         ))
         .with_resources(instruction_resources(cwd))
