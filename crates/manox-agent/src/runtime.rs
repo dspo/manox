@@ -11,11 +11,12 @@
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
-use std::sync::OnceLock;
+use std::sync::{Once, OnceLock};
 
 use tokio::runtime::Runtime;
 
 static HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+static INIT: Once = Once::new();
 
 /// Path to the runtime lock file under `~/.manox/`.
 fn lock_path() -> std::path::PathBuf {
@@ -67,12 +68,20 @@ fn acquire_runtime_lock() {
 }
 
 /// Build a 2-worker multi-threaded tokio runtime and register its global `Handle`. Call at App startup.
+///
+/// Idempotent: the runtime, the lock, and the handle are process-lifetime
+/// resources, so a second `init()` (e.g. a later test in the same process)
+/// is a no-op instead of re-acquiring the flock — re-acquiring a lock the
+/// process already holds opens a second file description that `flock` denies,
+/// which previously exited the whole test binary.
 pub fn init() {
-    acquire_runtime_lock();
-    let runtime = Runtime::new().expect("failed to build tokio runtime");
-    let _ = HANDLE.set(runtime.handle().clone());
-    // The runtime is intentionally forgotten: it lives for the process lifetime, with worker threads driving IO.
-    std::mem::forget(runtime);
+    INIT.call_once(|| {
+        acquire_runtime_lock();
+        let runtime = Runtime::new().expect("failed to build tokio runtime");
+        let _ = HANDLE.set(runtime.handle().clone());
+        // The runtime is intentionally forgotten: it lives for the process lifetime, with worker threads driving IO.
+        std::mem::forget(runtime);
+    });
 }
 
 /// Returns the global tokio `Handle`. Panics if `init` was not called.
