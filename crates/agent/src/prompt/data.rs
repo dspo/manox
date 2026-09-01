@@ -65,6 +65,12 @@ pub struct MainSystemPromptData {
     pub skills: Vec<SkillSummaryPromptData>,
     pub language: LanguagePromptData,
     pub runtime: RuntimeIdentityPromptData,
+    /// Comma-separated LSP server spec ids that are ready (e.g.
+    /// "rust-analyzer, gopls"). Empty when no LSP servers are available.
+    /// Injected as a dynamic line so the model knows which languages have
+    /// code intelligence without needing explicit LspEnsure/LspWaitReady.
+    #[serde(default)]
+    pub lsp_ready_specs: String,
 }
 
 /// Final system-message assembly at the `build_completion_request` boundary.

@@ -3,7 +3,10 @@
 ## 可用技能（通过 `skill` 工具按需查阅完整内容）
 {% for s in skills -%}
 - {{ s.name }}：{{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP 就绪
+{{ lsp_ready_specs }}{% endif %}
 
 ## 语言
 
