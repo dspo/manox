@@ -9,9 +9,10 @@
 //! surface as errors with a body summary instead of masquerading as content;
 //! binary content types are rejected rather than fed to the context as
 //! mojibake. Proxies come from the standard `HTTP_PROXY`/`HTTPS_PROXY`/
-//! `ALL_PROXY` environment variables — the in-repo `http_proxy` crate is a
-//! sandbox-side component (an allowlist proxy for seatbelt-confined child
-//! processes) and does not apply to this unsandboxed agent-process tool.
+//! `ALL_PROXY` environment variables — the in-repo `http_proxy` crate (now
+//! removed) was a sandbox-side component (an allowlist proxy for
+//! seatbelt-confined child processes) and does not apply to this unsandboxed
+//! agent-process tool.
 
 use std::time::Duration;
 
