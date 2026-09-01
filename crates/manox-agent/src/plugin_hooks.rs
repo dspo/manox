@@ -314,7 +314,7 @@ pub fn drain_fired_for_test() -> Vec<(HookEvent, String)> {
 
 /// `ToolCall` hook handler: fires `PreToolUse` across plugin hooks with the
 /// tool name + arguments (notification-only — never blocks the call).
-pub fn pre_tool_call_handler(cwd: PathBuf) -> pi::harness::HookHandler {
+pub fn pre_tool_call_handler(cwd: PathBuf) -> manox_harness::harness::HookHandler {
     Arc::new(move |ctx| {
         let tool_name = ctx
             .data
@@ -338,7 +338,7 @@ pub fn pre_tool_call_handler(cwd: PathBuf) -> pi::harness::HookHandler {
 /// kernel's ToolResult hook data carries no tool name or call id (only the
 /// error flag + result), so the payload is limited to what is available —
 /// documented deviation, notification-only surface.
-pub fn post_tool_result_handler(cwd: PathBuf) -> pi::harness::HookHandler {
+pub fn post_tool_result_handler(cwd: PathBuf) -> manox_harness::harness::HookHandler {
     Arc::new(move |ctx| {
         let is_error = ctx
             .data

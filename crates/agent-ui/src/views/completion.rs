@@ -115,7 +115,7 @@ pub fn slash_source(query: &str) -> Vec<CompletionItem> {
 /// Skills + subagents, filtered + sorted by `query`. Skills are shared
 /// across harnesses (`manox_agent::skill`); subagent definitions are a retired
 /// manox registry (the pi harness assembles its subagents in
-/// `pi_extensions::agents`).
+/// `manox_harness::agents`).
 pub fn mention_source(query: &str) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     // Registry keys (not bare names) so an inserted mention matches the key

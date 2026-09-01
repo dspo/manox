@@ -10,8 +10,8 @@
 //! the built-in browser tools. Chrome's network egress bypasses the bash
 //! sandbox proxy — treat it as an unsandboxed outbound surface.
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
-use pi::types::ContentBlock;
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::types::ContentBlock;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -991,8 +991,8 @@ impl AgentTool for ChromeUseFindChromiumExecutableTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::env::TokioExecutionEnv;
-    use pi::tool::{LocalToolContext, ToolState};
+    use manox_harness::env::TokioExecutionEnv;
+    use manox_harness::tool::{LocalToolContext, ToolState};
 
     fn tool_ctx() -> LocalToolContext {
         LocalToolContext::new(

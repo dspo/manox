@@ -206,7 +206,7 @@ impl UpdatePlanTool {
 }
 
 #[async_trait::async_trait]
-impl pi::tool::AgentTool for UpdatePlanTool {
+impl manox_harness::tool::AgentTool for UpdatePlanTool {
     fn name(&self) -> &str {
         UPDATE_PLAN
     }
@@ -234,20 +234,20 @@ impl pi::tool::AgentTool for UpdatePlanTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: tokio_util::sync::CancellationToken,
-        _ctx: &dyn pi::tool::ToolContext,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        _ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
         // Validate here so a malformed call returns an error tool result and
         // the rail keeps the last valid snapshot (rebuild skips errored calls).
-        let snapshot =
-            PlanSnapshot::from_input(&params).map_err(pi::tool::ToolError::InvalidArguments)?;
+        let snapshot = PlanSnapshot::from_input(&params)
+            .map_err(manox_harness::tool::ToolError::InvalidArguments)?;
         let confirmation = confirmation(&snapshot);
         let _ = self
             .notice_tx
             .send(crate::thread_engine::BackendNotice::Event(Box::new(
                 crate::thread::ThreadEvent::PlanUpdated { snapshot },
             )));
-        Ok(pi::tool::AgentToolResult {
-            content: vec![pi::types::ContentBlock::Text {
+        Ok(manox_harness::tool::AgentToolResult {
+            content: vec![manox_harness::types::ContentBlock::Text {
                 text: confirmation,
                 signature: None,
             }],
@@ -321,18 +321,18 @@ mod tests {
     use super::*;
     use crate::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use crate::message::Message;
-    use pi::tool::AgentTool as _;
+    use manox_harness::tool::AgentTool as _;
     use serde_json::json;
 
     fn input(plan: serde_json::Value) -> serde_json::Value {
         json!({ "plan": plan })
     }
 
-    fn tool_ctx() -> pi::tool::LocalToolContext {
-        pi::tool::LocalToolContext::new(
-            std::sync::Arc::new(pi::env::TokioExecutionEnv::new("/tmp")),
+    fn tool_ctx() -> manox_harness::tool::LocalToolContext {
+        manox_harness::tool::LocalToolContext::new(
+            std::sync::Arc::new(manox_harness::env::TokioExecutionEnv::new("/tmp")),
             std::path::PathBuf::from("/tmp"),
-            std::sync::Arc::new(pi::tool::ToolState::new()),
+            std::sync::Arc::new(manox_harness::tool::ToolState::new()),
         )
     }
 
@@ -357,7 +357,7 @@ mod tests {
             .expect("valid plan publishes");
         assert!(!result.is_error);
         let text = match &result.content[0] {
-            pi::types::ContentBlock::Text { text, .. } => text.clone(),
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
             other => panic!("expected text block, got {other:?}"),
         };
         assert!(text.contains("1/2 completed"), "{text}");
@@ -389,7 +389,10 @@ mod tests {
             )
             .await
             .expect_err("invalid status rejected");
-        assert!(matches!(err, pi::tool::ToolError::InvalidArguments(_)));
+        assert!(matches!(
+            err,
+            manox_harness::tool::ToolError::InvalidArguments(_)
+        ));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::thread::PermissionMode;
-use pi::types::Model as PiModel;
+use manox_harness::types::Model as PiModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
 /// authoritative state the facade mirrors after a settled run.
@@ -72,12 +72,12 @@ pub trait ThreadEngine: Send + Sync {
     /// blocks per the kernel's `ContentBlock::Image`). Events flow back
     /// through the engine's event channel (spawned with the engine);
     /// settlement lands in `history`.
-    fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>);
+    fn run(&self, prompt: String, images: Vec<manox_harness::types::ContentBlock>);
 
     /// Inject a steer (text + optional image attachments) into the running
     /// turn. Returns the steer id, which `cancel_steer` accepts to retract it
     /// before the loop drains it.
-    fn steer(&self, text: String, images: Vec<pi::types::ContentBlock>) -> String;
+    fn steer(&self, text: String, images: Vec<manox_harness::types::ContentBlock>) -> String;
 
     /// Retract a queued steer by id. False when it already drained.
     fn cancel_steer(&self, id: &str) -> bool;
@@ -179,7 +179,7 @@ pub struct ReadyInfo {
     /// The model the actor resolved for this thread (registration may
     /// have landed after construction); the facade mirrors it so the
     /// selector shows the default instead of "no model".
-    pub model: Option<pi::types::Model>,
+    pub model: Option<manox_harness::types::Model>,
     /// The permission mode persisted in the session sidecar (fresh
     /// sessions take the bounded default); the facade mirrors it for the
     /// access chip.
@@ -251,7 +251,7 @@ pub enum BackendNotice {
     /// responder when one is attached; fire-and-forget ops (cancel fan-out)
     /// send `None`. Generalizes the retired `TeamRequest` architecture.
     BusRequest {
-        op: pi_extensions::steer_bus::BusOp,
+        op: manox_harness::steer_bus::BusOp,
         responder: Option<async_channel::Sender<Result<String, String>>>,
     },
     /// A browser tool's host round trip: the tool (tokio) sends the op with
@@ -266,9 +266,9 @@ pub enum BackendNotice {
     /// the Captain as a peer message and triggers a turn (generalizes the
     /// retired `SailorCompleted`).
     SteerDelivered {
-        from: pi_extensions::steer_bus::AgentId,
-        reason: pi_extensions::steer_bus::SteerReason,
-        payload: pi_extensions::steer_bus::SteerPayload,
+        from: manox_harness::steer_bus::AgentId,
+        reason: manox_harness::steer_bus::SteerReason,
+        payload: manox_harness::steer_bus::SteerPayload,
     },
 }
 

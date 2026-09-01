@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -309,8 +309,8 @@ fn truncation_advisory(truncated: bool, total_received: usize, max_bytes: usize)
 /// settings default model; bounded by `timeout_secs`; empty answers and
 /// provider errors surface verbatim.
 async fn extract(content: &str, prompt: &str, timeout_secs: u64) -> Result<String, String> {
-    use pi::agent_loop::StreamFn;
-    use pi::types::{AgentContext, AgentEvent, AssistantMessageEvent};
+    use manox_harness::agent_loop::StreamFn;
+    use manox_harness::types::{AgentContext, AgentEvent, AssistantMessageEvent};
 
     let registry = crate::provider_glue::global();
     let model = crate::provider_glue::default_model()
@@ -324,8 +324,8 @@ async fn extract(content: &str, prompt: &str, timeout_secs: u64) -> Result<Strin
                         Answer the user's request using ONLY the provided content. \
                         If the content does not contain the answer, say so."
             .to_string(),
-        messages: vec![pi::types::AgentMessage::User {
-            content: vec![pi::types::ContentBlock::Text {
+        messages: vec![manox_harness::types::AgentMessage::User {
+            content: vec![manox_harness::types::ContentBlock::Text {
                 text: format!("Fetched content:\n\n{content}\n\nRequest: {prompt}"),
                 signature: None,
             }],
@@ -336,7 +336,7 @@ async fn extract(content: &str, prompt: &str, timeout_secs: u64) -> Result<Strin
         thinking_level: None,
         cache_retention: Default::default(),
         session_id: None,
-        stream_options: pi::types::StreamOptions::default(),
+        stream_options: manox_harness::types::StreamOptions::default(),
         metadata: Default::default(),
     };
 

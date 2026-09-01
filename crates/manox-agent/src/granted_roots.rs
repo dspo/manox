@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use pi_extensions::sandbox::canonicalize_best_effort;
+use manox_harness::sandbox::canonicalize_best_effort;
 
 /// The shared extra-root store for one session. Cheap to clone (`Arc` bump);
 /// every enforcing surface (each gated tool, the bash backends) holds the

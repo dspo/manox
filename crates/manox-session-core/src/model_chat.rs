@@ -16,9 +16,9 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use pi::agent_loop::StreamFn;
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
-use pi::types::{
+use manox_harness::agent_loop::StreamFn;
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::types::{
     AgentContext, AgentEvent, AgentMessage, AssistantMessageEvent, ContentBlock, Model, StopReason,
     StreamOptions,
 };
@@ -398,7 +398,7 @@ pub fn cancel(cancels: &Arc<Mutex<HashMap<String, CancellationToken>>>, request_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::types::{ContentBlock, StopReason, Usage};
+    use manox_harness::types::{ContentBlock, StopReason, Usage};
 
     fn test_model() -> Model {
         Model {

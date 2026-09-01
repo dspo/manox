@@ -6266,7 +6266,7 @@ impl Workspace {
                     .store
                     .model
                     .clone()
-                    .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+                    .and_then(|v| serde_json::from_value::<manox_harness::types::Model>(v).ok())
             });
             let effort = self
                 .store
@@ -6376,7 +6376,7 @@ impl Workspace {
                 .store
                 .model
                 .clone()
-                .and_then(|v| serde_json::from_value::<pi::types::Model>(v).ok())
+                .and_then(|v| serde_json::from_value::<manox_harness::types::Model>(v).ok())
         });
         let effort = self
             .store
@@ -6514,7 +6514,7 @@ impl Workspace {
         // Group by DISPLAY name via lookup (not adjacency): models() is
         // sorted by registration name, so same-display-name providers with
         // different registrations must still merge into one submenu.
-        let mut providers: Vec<(String, Vec<pi::types::Model>)> = Vec::new();
+        let mut providers: Vec<(String, Vec<manox_harness::types::Model>)> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
         for m in manox_agent::provider_glue::global().models() {
             let prov = manox_agent::provider_glue::display_provider_name(&m);

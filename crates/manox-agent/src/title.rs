@@ -1,16 +1,20 @@
 //! Host-private Title agent and its evidence shaping.
 //!
 //! Title generation is a manox capability, not a Pi parity surface. Each run
-//! creates an ephemeral `pi::Agent` with exactly one terminating `Title` tool.
+//! creates an ephemeral `manox_harness::Agent` with exactly one terminating `Title` tool.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pi::agent::Agent;
-use pi::coding_agent::ModelRuntime;
-use pi::tool::{AgentTool, AgentToolResult, LocalToolContext, ToolContext, ToolError, ToolState};
-use pi::types::{AgentMessage, ContentBlock, Model as PiModel, StopReason, StreamOptions};
+use manox_harness::agent::Agent;
+use manox_harness::coding_agent::ModelRuntime;
+use manox_harness::tool::{
+    AgentTool, AgentToolResult, LocalToolContext, ToolContext, ToolError, ToolState,
+};
+use manox_harness::types::{
+    AgentMessage, ContentBlock, Model as PiModel, StopReason, StreamOptions,
+};
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -223,8 +227,9 @@ pub async fn run_title_agent(
     let result = Arc::new(Mutex::new(None));
     let calls = Arc::new(Mutex::new(0usize));
     let tools = title_tools(Arc::clone(&result), Arc::clone(&calls));
-    let env: Arc<dyn pi::env::ExecutionEnv> =
-        Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf()));
+    let env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
+        manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
+    );
     let context: Arc<dyn ToolContext> = Arc::new(LocalToolContext::new(
         env,
         cwd.to_path_buf(),
@@ -390,13 +395,13 @@ fn truncate_head_tail(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::agent_loop::StreamFn;
-    use pi::types::{AgentContext, AgentEvent, Usage};
+    use manox_harness::agent_loop::StreamFn;
+    use manox_harness::types::{AgentContext, AgentEvent, Usage};
     use tokio::sync::mpsc;
 
     fn context() -> LocalToolContext {
         LocalToolContext::new(
-            Arc::new(pi::env::TokioExecutionEnv::new("/tmp")),
+            Arc::new(manox_harness::env::TokioExecutionEnv::new("/tmp")),
             "/tmp".into(),
             Arc::new(ToolState::new()),
         )
@@ -663,7 +668,8 @@ mod tests {
     async fn provider_context_exposes_only_title_tool() {
         let result = Arc::new(Mutex::new(None));
         let tools = title_tools(Arc::clone(&result), Arc::new(Mutex::new(0)));
-        let env: Arc<dyn pi::env::ExecutionEnv> = Arc::new(pi::env::TokioExecutionEnv::new("/tmp"));
+        let env: Arc<dyn manox_harness::env::ExecutionEnv> =
+            Arc::new(manox_harness::env::TokioExecutionEnv::new("/tmp"));
         let context: Arc<dyn ToolContext> = Arc::new(LocalToolContext::new(
             env,
             "/tmp".into(),
@@ -675,7 +681,7 @@ mod tests {
             id: "test".into(),
             context_window: 8_192,
             max_tokens: 128,
-            thinking: pi::types::ThinkingKind::None,
+            thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         };
         let mut agent = Agent::new(

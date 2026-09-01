@@ -12,7 +12,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -215,7 +215,7 @@ pub fn is_plan_mode_writable_param(
             let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
                 return false;
             };
-            let Ok(parsed) = pi::hashline::parse_patch(patch) else {
+            let Ok(parsed) = manox_harness::hashline::parse_patch(patch) else {
                 return false;
             };
             let file_patches = parsed.files;
@@ -299,7 +299,7 @@ pub fn gate_handler(
     plans_dir: PathBuf,
     cwd: PathBuf,
     is_read_only_subagent: ReadOnlySubagentResolver,
-) -> pi::harness::HookHandler {
+) -> manox_harness::harness::HookHandler {
     Arc::new(move |mut ctx| {
         if !state.enabled() {
             return ctx;
@@ -330,7 +330,7 @@ pub fn gate_handler(
 
 /// The `BeforeAgentStart` hook injecting the rendered plan-mode instructions
 /// as a user message on every turn while plan mode is active.
-pub fn injection_handler(state: Arc<PlanSessionState>) -> pi::harness::HookHandler {
+pub fn injection_handler(state: Arc<PlanSessionState>) -> manox_harness::harness::HookHandler {
     Arc::new(move |ctx| {
         let Some(instructions) = state.active_instructions() else {
             return ctx;
@@ -338,7 +338,7 @@ pub fn injection_handler(state: Arc<PlanSessionState>) -> pi::harness::HookHandl
         if !state.enabled() {
             return ctx;
         }
-        ctx.with_inject_messages(vec![pi::types::AgentMessage::user(instructions)])
+        ctx.with_inject_messages(vec![manox_harness::types::AgentMessage::user(instructions)])
     })
 }
 
@@ -448,7 +448,7 @@ impl AgentTool for ProposePlanTool {
                 title: title.clone(),
             })));
         Ok(AgentToolResult {
-            content: vec![pi::types::ContentBlock::Text {
+            content: vec![manox_harness::types::ContentBlock::Text {
                 text: format!(
                     "Plan submitted for review: {title} ({plan_file}). The turn ends here; wait for the user's verdict and do not implement before approval."
                 ),
@@ -476,7 +476,7 @@ mod tests {
     struct NullEnv;
 
     #[async_trait::async_trait]
-    impl pi::env::ExecutionEnv for NullEnv {
+    impl manox_harness::env::ExecutionEnv for NullEnv {
         fn cwd(&self) -> &std::path::Path {
             std::path::Path::new("/")
         }
@@ -486,7 +486,7 @@ mod tests {
         async fn absolute_path(
             &self,
             path: &std::path::Path,
-        ) -> Result<std::path::PathBuf, pi::env::FileError> {
+        ) -> Result<std::path::PathBuf, manox_harness::env::FileError> {
             Ok(path.to_path_buf())
         }
         async fn read_file(
@@ -494,24 +494,27 @@ mod tests {
             _path: &std::path::Path,
             _offset: Option<usize>,
             _limit: Option<usize>,
-        ) -> Result<String, pi::env::FileError> {
+        ) -> Result<String, manox_harness::env::FileError> {
             Ok(String::new())
         }
         async fn write_file(
             &self,
             _path: &std::path::Path,
             _content: &str,
-        ) -> Result<(), pi::env::FileError> {
+        ) -> Result<(), manox_harness::env::FileError> {
             Ok(())
         }
-        async fn exists(&self, _path: &std::path::Path) -> Result<bool, pi::env::FileError> {
+        async fn exists(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<bool, manox_harness::env::FileError> {
             Ok(false)
         }
         async fn file_info(
             &self,
             path: &std::path::Path,
-        ) -> Result<pi::env::FileInfo, pi::env::FileError> {
-            Ok(pi::env::FileInfo {
+        ) -> Result<manox_harness::env::FileInfo, manox_harness::env::FileError> {
+            Ok(manox_harness::env::FileInfo {
                 path: path.to_path_buf(),
                 is_dir: false,
                 size: 0,
@@ -520,13 +523,19 @@ mod tests {
         async fn list_dir(
             &self,
             _path: &std::path::Path,
-        ) -> Result<Vec<pi::env::FileInfo>, pi::env::FileError> {
+        ) -> Result<Vec<manox_harness::env::FileInfo>, manox_harness::env::FileError> {
             Ok(Vec::new())
         }
-        async fn create_dir(&self, _path: &std::path::Path) -> Result<(), pi::env::FileError> {
+        async fn create_dir(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), manox_harness::env::FileError> {
             Ok(())
         }
-        async fn remove(&self, _path: &std::path::Path) -> Result<(), pi::env::FileError> {
+        async fn remove(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<(), manox_harness::env::FileError> {
             Ok(())
         }
         async fn exec(
@@ -534,8 +543,8 @@ mod tests {
             _command: &str,
             _timeout: std::time::Duration,
             _signal: tokio_util::sync::CancellationToken,
-        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
-            Err(pi::env::ExecutionError::Other("null env".into()))
+        ) -> Result<manox_harness::env::CommandResult, manox_harness::env::ExecutionError> {
+            Err(manox_harness::env::ExecutionError::Other("null env".into()))
         }
         async fn exec_at(
             &self,
@@ -543,8 +552,8 @@ mod tests {
             _cwd: &std::path::Path,
             _timeout: std::time::Duration,
             _signal: tokio_util::sync::CancellationToken,
-        ) -> Result<pi::env::CommandResult, pi::env::ExecutionError> {
-            Err(pi::env::ExecutionError::Other("null env".into()))
+        ) -> Result<manox_harness::env::CommandResult, manox_harness::env::ExecutionError> {
+            Err(manox_harness::env::ExecutionError::Other("null env".into()))
         }
     }
 
@@ -558,10 +567,10 @@ mod tests {
         std::fs::write(dir.path().join("audit-plan.md"), "# Audit\n\nbody\n").unwrap();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let tool = ProposePlanTool::new(tx, PlanSessionState::new(), dir.path().to_path_buf());
-        let ctx = pi::tool::LocalToolContext::new(
+        let ctx = manox_harness::tool::LocalToolContext::new(
             std::sync::Arc::new(NullEnv),
             dir.path().to_path_buf(),
-            std::sync::Arc::new(pi::tool::ToolState::new()),
+            std::sync::Arc::new(manox_harness::tool::ToolState::new()),
         );
         let result = tool
             .execute(
@@ -807,7 +816,10 @@ mod tests {
         let hook = gate_handler(Arc::clone(&state), plans.clone(), cwd.clone(), read_only);
 
         let run = |tool: &str, args: serde_json::Value| {
-            let ctx = pi::harness::HookContext::new(pi::harness::HookPoint::ToolCall).with_data(
+            let ctx = manox_harness::harness::HookContext::new(
+                manox_harness::harness::HookPoint::ToolCall,
+            )
+            .with_data(
                 serde_json::json!({ "tool_call_id": "c1", "tool_name": tool, "args": args }),
             );
             hook(ctx)
@@ -959,7 +971,11 @@ mod tests {
     fn injection_only_while_active() {
         let state = PlanSessionState::new();
         let hook = injection_handler(Arc::clone(&state));
-        let ctx = || pi::harness::HookContext::new(pi::harness::HookPoint::BeforeAgentStart);
+        let ctx = || {
+            manox_harness::harness::HookContext::new(
+                manox_harness::harness::HookPoint::BeforeAgentStart,
+            )
+        };
 
         // Inactive: no injection even with instructions staged.
         state.set_active_instructions(Some("PLAN MODE".to_string()));

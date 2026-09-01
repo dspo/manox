@@ -3,7 +3,7 @@ use crate::language_model::{
     LanguageModelToolResult, LanguageModelToolUse, StopReason as ManoxStopReason,
 };
 use crate::thread::ToolCallStatus;
-use pi::types::StopReason as PiStopReason;
+use manox_harness::types::StopReason as PiStopReason;
 
 /// Map one pi `AgentEvent` onto the `ThreadEvent`s the workspace renders.
 ///
@@ -23,10 +23,10 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             assistant_message_event,
             ..
         } => match assistant_message_event {
-            pi::types::AssistantMessageEvent::TextDelta { delta, .. } => {
+            manox_harness::types::AssistantMessageEvent::TextDelta { delta, .. } => {
                 vec![ThreadEvent::AgentText(delta.clone())]
             }
-            pi::types::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+            manox_harness::types::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                 vec![ThreadEvent::AgentThinking(delta.clone())]
             }
             _ => Vec::new(),
@@ -345,13 +345,13 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
 /// away notes inside the kept segment (the tail payload holds only
 /// messages) — the same loss as the summarized history itself.
 pub fn entries_to_display(
-    entries: &[pi::session::SessionTreeEntry],
+    entries: &[manox_harness::session::SessionTreeEntry],
 ) -> (Vec<HistoryEntry>, Vec<PositionedNote>) {
     let mut display: Vec<HistoryEntry> = Vec::new();
     let mut notes: Vec<PositionedNote> = Vec::new();
     let mut message_count = 0usize;
     for entry in entries {
-        if let pi::session::SessionTreeEntry::Custom {
+        if let manox_harness::session::SessionTreeEntry::Custom {
             custom_type, data, ..
         } = entry
         {
@@ -375,7 +375,7 @@ pub fn entries_to_display(
             }
             continue;
         }
-        for message in pi::session::session_entry_to_context_messages(entry) {
+        for message in manox_harness::session::session_entry_to_context_messages(entry) {
             let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
             message_count += mapped.len();
             display.extend(mapped.into_iter().map(HistoryEntry::Message));
@@ -417,7 +417,7 @@ fn content_block_to_message_content(block: &ContentBlock) -> MessageContent {
 }
 
 /// Concatenate the text blocks of a tool result for display.
-fn tool_result_text(result: &pi::tool::AgentToolResult) -> String {
+fn tool_result_text(result: &manox_harness::tool::AgentToolResult) -> String {
     text_of_blocks(&result.content)
 }
 
@@ -685,13 +685,13 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
             assistant_message_event,
             ..
         } => match assistant_message_event {
-            pi::types::AssistantMessageEvent::TextDelta { delta, .. } => {
+            manox_harness::types::AssistantMessageEvent::TextDelta { delta, .. } => {
                 vec![ThreadEvent::SubagentChild {
                     id: id.to_string(),
                     child: crate::thread::SubagentChildEvent::Text(delta.clone()),
                 }]
             }
-            pi::types::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+            manox_harness::types::AssistantMessageEvent::ThinkingDelta { delta, .. } => {
                 vec![ThreadEvent::SubagentChild {
                     id: id.to_string(),
                     child: crate::thread::SubagentChildEvent::Thinking(delta.clone()),
@@ -788,7 +788,7 @@ pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::session::SessionTreeEntry;
+    use manox_harness::session::SessionTreeEntry;
 
     fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
         SessionTreeEntry::Message {
@@ -1059,10 +1059,10 @@ mod tests {
     }
 
     fn assistant_msg(
-        stop_reason: Option<pi::types::StopReason>,
+        stop_reason: Option<manox_harness::types::StopReason>,
         input_tokens: u64,
-    ) -> pi::types::AgentMessage {
-        pi::types::AgentMessage::Assistant {
+    ) -> manox_harness::types::AgentMessage {
+        manox_harness::types::AgentMessage::Assistant {
             content: vec![],
             model: "m".into(),
             provider: "p".into(),
@@ -1072,7 +1072,7 @@ mod tests {
             diagnostics: None,
             stop_reason,
             raw_stop_reason: None,
-            usage: Box::new(pi::types::Usage {
+            usage: Box::new(manox_harness::types::Usage {
                 input_tokens,
                 output_tokens: 7,
                 cache_creation_input_tokens: 0,
@@ -1087,10 +1087,10 @@ mod tests {
         }
     }
 
-    fn child_events_of_msg_end(stop_reason: pi::types::StopReason) -> Vec<ThreadEvent> {
+    fn child_events_of_msg_end(stop_reason: manox_harness::types::StopReason) -> Vec<ThreadEvent> {
         child_events_of(
             "sub-1",
-            &pi::types::AgentEvent::MessageEnd {
+            &manox_harness::types::AgentEvent::MessageEnd {
                 message: Box::new(assistant_msg(Some(stop_reason), 11)),
             },
         )
@@ -1100,7 +1100,7 @@ mod tests {
     /// and the message's token usage, mirroring the main thread's mapping.
     #[test]
     fn child_message_end_maps_to_stop_with_usage() {
-        let events = child_events_of_msg_end(pi::types::StopReason::ToolUse);
+        let events = child_events_of_msg_end(manox_harness::types::StopReason::ToolUse);
         assert_eq!(events.len(), 1);
         match &events[0] {
             crate::thread::ThreadEvent::SubagentChild {
@@ -1116,7 +1116,7 @@ mod tests {
             other => panic!("expected Stop, got {other:?}"),
         }
 
-        let events = child_events_of_msg_end(pi::types::StopReason::Stop);
+        let events = child_events_of_msg_end(manox_harness::types::StopReason::Stop);
         assert!(matches!(
             &events[0],
             crate::thread::ThreadEvent::SubagentChild {
@@ -1128,7 +1128,7 @@ mod tests {
             }
         ));
 
-        let events = child_events_of_msg_end(pi::types::StopReason::Length);
+        let events = child_events_of_msg_end(manox_harness::types::StopReason::Length);
         assert!(matches!(
             &events[0],
             crate::thread::ThreadEvent::SubagentChild {
@@ -1140,7 +1140,7 @@ mod tests {
             }
         ));
 
-        let events = child_events_of_msg_end(pi::types::StopReason::Aborted);
+        let events = child_events_of_msg_end(manox_harness::types::StopReason::Aborted);
         assert!(matches!(
             &events[0],
             crate::thread::ThreadEvent::SubagentChild {
@@ -1156,7 +1156,7 @@ mod tests {
     /// A terminal provider error message maps onto `Error` with its text.
     #[test]
     fn child_error_message_maps_to_error_event() {
-        let message = pi::types::AgentMessage::Assistant {
+        let message = manox_harness::types::AgentMessage::Assistant {
             content: vec![],
             model: "m".into(),
             provider: "p".into(),
@@ -1164,15 +1164,15 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
-            stop_reason: Some(pi::types::StopReason::Error),
+            stop_reason: Some(manox_harness::types::StopReason::Error),
             raw_stop_reason: None,
-            usage: Box::new(pi::types::Usage::default()),
+            usage: Box::new(manox_harness::types::Usage::default()),
             error_message: Some("context window exhausted".into()),
             timestamp: chrono::Utc::now(),
         };
         let events = child_events_of(
             "sub-1",
-            &pi::types::AgentEvent::MessageEnd {
+            &manox_harness::types::AgentEvent::MessageEnd {
                 message: Box::new(message),
             },
         );
@@ -1192,10 +1192,10 @@ mod tests {
     fn child_tool_end_carries_output_and_agent_end_seals() {
         let events = child_events_of(
             "sub-1",
-            &pi::types::AgentEvent::ToolExecutionEnd {
+            &manox_harness::types::AgentEvent::ToolExecutionEnd {
                 tool_call_id: "c1".into(),
                 tool_name: "Read".into(),
-                result: pi::tool::AgentToolResult::text("found it"),
+                result: manox_harness::tool::AgentToolResult::text("found it"),
                 is_error: false,
             },
         );
@@ -1220,7 +1220,7 @@ mod tests {
 
         let events = child_events_of(
             "sub-1",
-            &pi::types::AgentEvent::AgentEnd { messages: vec![] },
+            &manox_harness::types::AgentEvent::AgentEnd { messages: vec![] },
         );
         assert!(matches!(
             &events[0],

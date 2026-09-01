@@ -17,12 +17,12 @@
 //! `AskUserQuestion`, which is an interaction by design, not a permission
 //! prompt.
 
-use pi::types::Model as PiModel;
+use manox_harness::types::Model as PiModel;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use pi::tool::{
+use manox_harness::tool::{
     AgentTool as PiAgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError, ToolProgress,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -41,7 +41,7 @@ const DENY_OUT_OF_WORKSPACE: &str = "[sandbox: file access denied under workspac
 
 /// The same-turn escalation hint appended to a fs-mutation refusal.
 fn fs_escalation_hint() -> String {
-    pi_extensions::sandbox::escalation_hint_marker("operation")
+    manox_harness::sandbox::escalation_hint_marker("operation")
 }
 
 /// A refused fs mutation: the marker for `mode` plus the escalation hint.
@@ -154,11 +154,11 @@ impl GateEscalationApprover {
 }
 
 #[async_trait::async_trait]
-impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
+impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
     async fn request(
         &self,
-        req: pi_extensions::sandbox::EscalationRequest,
-    ) -> pi_extensions::sandbox::EscalationOutcome {
+        req: manox_harness::sandbox::EscalationRequest,
+    ) -> manox_harness::sandbox::EscalationOutcome {
         let mode = req.requested_mode;
         let tool_name = req.tool_name.clone();
         let reason = format!("escalate sandbox to {}: {}", mode.wire(), req.justification);
@@ -185,7 +185,7 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
                 r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
                 _ = signal.cancelled() => {
                     self.gate.discard(&req.call_id);
-                    return pi_extensions::sandbox::EscalationOutcome::Cancelled;
+                    return manox_harness::sandbox::EscalationOutcome::Cancelled;
                 }
             },
             None => rx.await.unwrap_or(ToolAuthorizationResponse::Decision(
@@ -195,9 +195,9 @@ impl pi_extensions::sandbox::EscalationApprover for GateEscalationApprover {
         self.gate.discard(&req.call_id);
         match response {
             ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => {
-                pi_extensions::sandbox::EscalationOutcome::AllowedOnce
+                manox_harness::sandbox::EscalationOutcome::AllowedOnce
             }
-            _ => pi_extensions::sandbox::EscalationOutcome::Rejected,
+            _ => manox_harness::sandbox::EscalationOutcome::Rejected,
         }
     }
 }
@@ -219,7 +219,7 @@ pub struct ApprovalGatedTool {
     /// call. The grant is a per-call local value (no shared cell —
     /// Write/Edit run `Parallel`, a shared cell would race). Bash resolves
     /// its own escalation inside the tool.
-    escalation_approver: Option<Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>>,
+    escalation_approver: Option<Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync>>,
     mode_resolver: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
     /// Session-shared extra writable roots, derived per call from the call's
     /// effective cwd: a linked worktree of the workspace admits itself
@@ -264,7 +264,7 @@ impl ApprovalGatedTool {
     /// verdict for that one call (no shared cell — Write/Edit are parallel).
     pub fn with_escalation(
         mut self,
-        approver: Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync>,
+        approver: Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync>,
         mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
     ) -> Self {
         self.escalation_approver = Some(approver);
@@ -381,7 +381,7 @@ impl ApprovalGatedTool {
     ) -> Result<Option<PermissionMode>, ToolError> {
         let sp = params.get("sandbox_permissions").and_then(|v| v.as_str());
         let just = params.get("justification").and_then(|v| v.as_str());
-        pi_extensions::sandbox::validate_escalation_args(sp, just)
+        manox_harness::sandbox::validate_escalation_args(sp, just)
             .map_err(ToolError::InvalidArguments)?;
         let Some(requested) = sp else {
             return Ok(None);
@@ -392,18 +392,18 @@ impl ApprovalGatedTool {
             )
         })?;
         let requested =
-            pi_extensions::sandbox::PermissionMode::from_wire(requested).ok_or_else(|| {
+            manox_harness::sandbox::PermissionMode::from_wire(requested).ok_or_else(|| {
                 ToolError::InvalidArguments(format!(
                     "sandbox_permissions must be one of: {}",
-                    pi_extensions::sandbox::ESCALATION_TARGETS
+                    manox_harness::sandbox::ESCALATION_TARGETS
                         .iter()
                         .map(|m| m.wire())
                         .collect::<Vec<_>>()
                         .join(", ")
                 ))
             })?;
-        let grant = pi_extensions::sandbox::approve_escalation(
-            pi_extensions::sandbox::EscalationRequest {
+        let grant = manox_harness::sandbox::approve_escalation(
+            manox_harness::sandbox::EscalationRequest {
                 requested_mode: requested,
                 justification: just.unwrap().to_string(),
                 effective_mode: standing,
@@ -437,7 +437,7 @@ impl ApprovalGatedTool {
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Option<std::path::PathBuf> {
-        let cwd = pi::tools::path_utils::peek_effective_cwd(
+        let cwd = manox_harness::tools::path_utils::peek_effective_cwd(
             ctx,
             params.get("cwd").and_then(|v| v.as_str()),
         )
@@ -453,7 +453,7 @@ impl ApprovalGatedTool {
             }
             "Edit" => {
                 let patch = params.get("patch")?.as_str()?;
-                let first = pi::hashline::parse_patch(patch)
+                let first = manox_harness::hashline::parse_patch(patch)
                     .ok()?
                     .files
                     .into_iter()
@@ -484,7 +484,7 @@ impl ApprovalGatedTool {
         // resolve (explicit `cwd` → sticky → session cwd), peeked read-only
         // so the fence does not advance the sticky cwd. A missing directory
         // is a denial: the tool would fail the same way.
-        let cwd = match pi::tools::path_utils::peek_effective_cwd(
+        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(
             ctx,
             params.get("cwd").and_then(|v| v.as_str()),
         ) {
@@ -498,12 +498,12 @@ impl ApprovalGatedTool {
         // plans-dir special-casing: the plans dir is admitted transitively
         // under the manox home.
         let mut roots =
-            pi_extensions::sandbox::writable_roots(PermissionMode::WorkspaceWrite, &cwd);
+            manox_harness::sandbox::writable_roots(PermissionMode::WorkspaceWrite, &cwd);
         if let Some(granted) = &self.granted_roots {
             roots.extend(granted.roots_for(&cwd));
         }
         let contained = |target: &Path| {
-            let canon = pi_extensions::sandbox::canonicalize_best_effort(target);
+            let canon = manox_harness::sandbox::canonicalize_best_effort(target);
             roots.iter().any(|r| canon.starts_with(r))
         };
         match self.inner.name() {
@@ -525,7 +525,7 @@ impl ApprovalGatedTool {
                 let Some(patch) = params.get("patch").and_then(|v| v.as_str()) else {
                     return deny();
                 };
-                let file_patches = match pi::hashline::parse_patch(patch) {
+                let file_patches = match manox_harness::hashline::parse_patch(patch) {
                     Ok(p) => p.files,
                     // Unverifiable targets fail closed (the Edit tool
                     // rejects malformed hashline anyway).
@@ -589,7 +589,7 @@ impl PiAgentTool for ApprovalGatedTool {
                 "sandbox_permissions".into(),
                 serde_json::json!({
                     "type": "string",
-                    "enum": pi_extensions::sandbox::ESCALATION_TARGETS
+                    "enum": manox_harness::sandbox::ESCALATION_TARGETS
                         .iter()
                         .map(|m| m.wire())
                         .collect::<Vec<_>>(),
@@ -849,8 +849,8 @@ fn ask_user_question_schema() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::env::TokioExecutionEnv;
-    use pi::tool::{LocalToolContext, ToolState};
+    use manox_harness::env::TokioExecutionEnv;
+    use manox_harness::tool::{LocalToolContext, ToolState};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn gate() -> Arc<ApprovalGate> {
@@ -1372,14 +1372,14 @@ mod tests {
         assert!(tool.needs_gate(&serde_json::json!({"unsandboxed": true})));
     }
 
-    struct CannedEscalationApprover(pi_extensions::sandbox::EscalationOutcome);
+    struct CannedEscalationApprover(manox_harness::sandbox::EscalationOutcome);
 
     #[async_trait::async_trait]
-    impl pi_extensions::sandbox::EscalationApprover for CannedEscalationApprover {
+    impl manox_harness::sandbox::EscalationApprover for CannedEscalationApprover {
         async fn request(
             &self,
-            _req: pi_extensions::sandbox::EscalationRequest,
-        ) -> pi_extensions::sandbox::EscalationOutcome {
+            _req: manox_harness::sandbox::EscalationRequest,
+        ) -> manox_harness::sandbox::EscalationOutcome {
             self.0
         }
     }
@@ -1398,7 +1398,7 @@ mod tests {
             Arc::new(move || standing.mode());
         let tool = tool.with_escalation(
             Arc::new(CannedEscalationApprover(
-                pi_extensions::sandbox::EscalationOutcome::AllowedOnce,
+                manox_harness::sandbox::EscalationOutcome::AllowedOnce,
             )),
             mode_resolver,
         );
@@ -1452,7 +1452,7 @@ mod tests {
             Arc::new(move || standing.mode());
         let tool = Arc::new(tool.with_escalation(
             Arc::new(CannedEscalationApprover(
-                pi_extensions::sandbox::EscalationOutcome::AllowedOnce,
+                manox_harness::sandbox::EscalationOutcome::AllowedOnce,
             )),
             mode_resolver,
         ));
@@ -1528,7 +1528,7 @@ mod tests {
             Arc::new(move || standing.mode());
         let tool = ApprovalGatedTool::new(Arc::new(PropMock), gate).with_escalation(
             Arc::new(CannedEscalationApprover(
-                pi_extensions::sandbox::EscalationOutcome::AllowedOnce,
+                manox_harness::sandbox::EscalationOutcome::AllowedOnce,
             )),
             mode_resolver,
         );

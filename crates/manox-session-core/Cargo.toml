@@ -11,8 +11,7 @@ publish = false
 # release build that pulls this crate (the WebUI host). The test-support
 # dev-dependency below keeps that graph out of the normal build.
 manox-agent.workspace = true
-pi.workspace = true
-pi-extensions.workspace = true
+manox-harness.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 async-trait = "0.1"

@@ -24,7 +24,7 @@ use crate::language::Language;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
-use pi::types::Model as PiModel;
+use manox_harness::types::Model as PiModel;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone, Default)]
@@ -53,10 +53,10 @@ pub struct SideCallMetric {
 }
 
 /// File-effect policy for confined bash and the fs write fence (the per-call
-/// sandbox mode). Defined in the extension layer (`pi_extensions::sandbox`) so
+/// sandbox mode). Defined in the extension layer (`manox_harness::sandbox`) so
 /// the bash tool and the host fence share one vocabulary; re-exported here for
 /// the host's session/persistence (wire field `approval_mode`, kebab values).
-pub use pi_extensions::sandbox::PermissionMode;
+pub use manox_harness::sandbox::PermissionMode;
 
 /// History-loading state of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -331,7 +331,7 @@ pub struct Thread {
     pending_prompts: Vec<String>,
     /// Image blocks attached to the pending prompts, drained by `run_turn`
     /// onto the engine (kernel `ContentBlock::Image`).
-    pending_images: Vec<pi::types::ContentBlock>,
+    pending_images: Vec<manox_harness::types::ContentBlock>,
     /// Steer message ids handed to the engine this run, awaiting settlement.
     pending_steers: VecDeque<String>,
     /// UI metadata of the most recently inserted user turn, re-attached to
@@ -549,10 +549,10 @@ impl ThreadHandle {
     /// the live-thread registry (never the gpui thread_store global).
     fn handle_bus_request(
         &self,
-        op: pi_extensions::steer_bus::BusOp,
+        op: manox_harness::steer_bus::BusOp,
         responder: Option<async_channel::Sender<Result<String, String>>>,
     ) {
-        use pi_extensions::steer_bus::BusOp;
+        use manox_harness::steer_bus::BusOp;
         let result: Result<String, String> = match op {
             BusOp::SpawnMember { name, prompt } => {
                 let member = self.read(|t| t.new_team_member(name.clone()));
@@ -991,9 +991,9 @@ impl Thread {
                 // let a turn fire — the Captain reliably observes the
                 // result without polling.
                 let sender = match &from {
-                    pi_extensions::steer_bus::AgentId::Subagent(addr) => addr.clone(),
-                    pi_extensions::steer_bus::AgentId::Captain => "captain".to_string(),
-                    pi_extensions::steer_bus::AgentId::User => "user".to_string(),
+                    manox_harness::steer_bus::AgentId::Subagent(addr) => addr.clone(),
+                    manox_harness::steer_bus::AgentId::Captain => "captain".to_string(),
+                    manox_harness::steer_bus::AgentId::User => "user".to_string(),
                 };
                 self.deliver_peer_messages(vec![crate::team::PeerMessage {
                     from: sender,
@@ -1082,7 +1082,7 @@ impl Thread {
             .filter_map(|c| match c {
                 MessageContent::Text(t) => Some(t.as_str()),
                 MessageContent::Image { data, mime_type } => {
-                    images.push(pi::types::ContentBlock::Image {
+                    images.push(manox_harness::types::ContentBlock::Image {
                         data: data.clone(),
                         mime_type: mime_type.clone(),
                     });
@@ -1116,7 +1116,7 @@ impl Thread {
             .filter_map(|c| match c {
                 MessageContent::Text(t) => Some(t.as_str()),
                 MessageContent::Image { data, mime_type } => {
-                    images.push(pi::types::ContentBlock::Image {
+                    images.push(manox_harness::types::ContentBlock::Image {
                         data: data.clone(),
                         mime_type: mime_type.clone(),
                     });
@@ -2209,7 +2209,7 @@ impl Thread {
         let Some(session_path) = self.active_session_path() else {
             return;
         };
-        let record = pi_extensions::session_meta::UserAttributionMeta {
+        let record = manox_harness::session_meta::UserAttributionMeta {
             author: author.routing().to_string(),
             peer: ui.peer,
             display_text: ui.display_text.clone(),
@@ -2258,7 +2258,7 @@ fn persist_registry_display_spawn(
 ) -> tokio::task::JoinHandle<()> {
     crate::runtime::handle().spawn(async move {
         if let Err(err) =
-            pi_extensions::session_meta::update(&sessions_dir, &session_path, |meta| {
+            manox_harness::session_meta::update(&sessions_dir, &session_path, |meta| {
                 meta.registry_displays.insert(ordinal, display);
             })
             .await
@@ -2272,11 +2272,11 @@ fn persist_user_attribution_spawn(
     sessions_dir: PathBuf,
     session_path: PathBuf,
     ordinal: usize,
-    record: pi_extensions::session_meta::UserAttributionMeta,
+    record: manox_harness::session_meta::UserAttributionMeta,
 ) -> tokio::task::JoinHandle<()> {
     crate::runtime::handle().spawn(async move {
         if let Err(err) =
-            pi_extensions::session_meta::update(&sessions_dir, &session_path, |meta| {
+            manox_harness::session_meta::update(&sessions_dir, &session_path, |meta| {
                 meta.user_attributions.insert(ordinal, record);
             })
             .await
@@ -2312,7 +2312,7 @@ pub(crate) mod tests {
         permission_mode: Mutex<Option<PermissionMode>>,
         thinking_level: Mutex<Option<String>>,
         /// Recorded `run` calls: (prompt, images) pairs.
-        runs: Mutex<Vec<(String, Vec<pi::types::ContentBlock>)>>,
+        runs: Mutex<Vec<(String, Vec<manox_harness::types::ContentBlock>)>>,
         /// Recorded `persist_plan_snapshot` calls (serialized snapshots).
         plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
     }
@@ -2356,11 +2356,11 @@ pub(crate) mod tests {
             None
         }
 
-        fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>) {
+        fn run(&self, prompt: String, images: Vec<manox_harness::types::ContentBlock>) {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, _text: String, _images: Vec<pi::types::ContentBlock>) -> String {
+        fn steer(&self, _text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
             String::new()
         }
 
@@ -2489,7 +2489,7 @@ pub(crate) mod tests {
         crate::runtime::handle().block_on(task).unwrap();
 
         let meta = crate::runtime::handle()
-            .block_on(pi_extensions::session_meta::load(
+            .block_on(manox_harness::session_meta::load(
                 &sessions_dir,
                 &session_path,
             ))
@@ -2708,9 +2708,9 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine::new());
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.handle_notice(BackendNotice::SteerDelivered {
-            from: pi_extensions::steer_bus::AgentId::Subagent("sailor-1".into()),
-            reason: pi_extensions::steer_bus::SteerReason::Complete,
-            payload: pi_extensions::steer_bus::SteerPayload {
+            from: manox_harness::steer_bus::AgentId::Subagent("sailor-1".into()),
+            reason: manox_harness::steer_bus::SteerReason::Complete,
+            payload: manox_harness::steer_bus::SteerPayload {
                 text: "PR #601 LGTM".into(),
             },
         });
@@ -3167,7 +3167,7 @@ pub(crate) mod tests {
             id: id.into(),
             context_window: 100_000,
             max_tokens: 8_192,
-            thinking: pi::types::ThinkingKind::None,
+            thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         }
     }

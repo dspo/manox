@@ -5,7 +5,7 @@
 //! `tools/call` natively on the tokio runtime (pi tools already run there —
 //! no executor bridge needed, unlike the retired manox adapter).
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use rmcp::model::CallToolRequestParams;
 use tokio_util::sync::CancellationToken;
 

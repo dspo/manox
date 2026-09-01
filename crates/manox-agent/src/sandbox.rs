@@ -21,16 +21,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi::env::{CommandResult, ExecutionError};
-use pi::tools::bash::{BashExecRequest, BashOperations};
-use pi_extensions::sandbox::{PermissionMode, writable_roots};
+use manox_harness::env::{CommandResult, ExecutionError};
+use manox_harness::sandbox::{PermissionMode, writable_roots};
+use manox_harness::tools::bash::{BashExecRequest, BashOperations};
 use tokio_util::sync::CancellationToken;
 
 // The one canonicalization home: the seatbelt and the fs fence share
-// `pi_extensions::sandbox`'s `..`-folding implementation so a traversal
+// `manox_harness::sandbox`'s `..`-folding implementation so a traversal
 // cannot survive into a classified path. Re-exported here for the host
 // callers that still reach it as `crate::sandbox::canonicalize_best_effort`.
-pub use pi_extensions::sandbox::canonicalize_best_effort;
+pub use manox_harness::sandbox::canonicalize_best_effort;
 
 /// Default wall-clock limit for a one-shot command (mirrors the bash tool's
 /// own default).
@@ -329,8 +329,8 @@ impl BashOperations for SandboxedBashOperations {
             } {
                 result.stderr.push_str(&format!(
                     "\n{}\n{}",
-                    pi_extensions::sandbox::sandbox_denial_marker(mode),
-                    pi_extensions::sandbox::escalation_hint_marker("command"),
+                    manox_harness::sandbox::sandbox_denial_marker(mode),
+                    manox_harness::sandbox::escalation_hint_marker("command"),
                 ));
             }
             Ok(result)
@@ -345,7 +345,7 @@ impl BashOperations for SandboxedBashOperations {
 /// even when the enclosing exec future is dropped from outside).
 async fn run_to_completion(
     child: tokio::process::Child,
-    on_data: Option<pi::tools::bash::BashDataCallback<'_>>,
+    on_data: Option<manox_harness::tools::bash::BashDataCallback<'_>>,
     timeout: Duration,
     signal: &CancellationToken,
 ) -> Result<CommandResult, ExecutionError> {
@@ -484,7 +484,7 @@ mod tests {
         );
         // The manox state home is admitted (plan files write without
         // escalation).
-        if let Some(home) = pi_extensions::sandbox::manox_home() {
+        if let Some(home) = manox_harness::sandbox::manox_home() {
             assert!(sb.contains(&format!(
                 "(allow file-write* (subpath \"{}\"))",
                 canonicalize_best_effort(&home).display()
@@ -618,7 +618,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn sandboxed_exec_admits_manox_home_writes() {
-        let Some(home) = pi_extensions::sandbox::manox_home() else {
+        let Some(home) = manox_harness::sandbox::manox_home() else {
             return; // no home dir to admit
         };
         std::fs::create_dir_all(&home).ok();

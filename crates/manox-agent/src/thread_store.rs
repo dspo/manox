@@ -1,7 +1,7 @@
 //! The `ThreadStore` facade — the session-list state the sidebar renders.
 //!
 //! The sidebar's session list comes from the pi session repository (jsonl)
-//! plus a per-session UI-metadata sidecar (`pi_extensions::session_meta`).
+//! plus a per-session UI-metadata sidecar (`manox_harness::session_meta`).
 //! The pi transcript persists itself, so `refresh_thread_list` only refreshes
 //! the sidebar list; manox SQLite timeline/note records are not produced.
 //! Archived sessions are excluded from the sidebar list but stay in
@@ -70,7 +70,7 @@ pub struct ThreadStore {
 struct MetaWrite {
     dir: PathBuf,
     path: PathBuf,
-    update: Box<dyn FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + Sync + 'static>,
+    update: Box<dyn FnOnce(&mut manox_harness::session_meta::SessionMeta) + Send + Sync + 'static>,
 }
 
 /// The gpui-free handle to the thread store. Cheap to clone (`Arc`); state
@@ -174,7 +174,7 @@ impl StoreHandle {
     fn spawn_meta_write(&self, write: MetaWrite) {
         let this = self.clone();
         crate::runtime::handle().spawn(async move {
-            let saved = pi_extensions::session_meta::update(&write.dir, &write.path, write.update)
+            let saved = manox_harness::session_meta::update(&write.dir, &write.path, write.update)
                 .await
                 .is_ok();
             if saved {
@@ -599,7 +599,7 @@ impl ThreadStore {
     fn write_meta(
         &mut self,
         id: &str,
-        update: impl FnOnce(&mut pi_extensions::session_meta::SessionMeta) + Send + Sync + 'static,
+        update: impl FnOnce(&mut manox_harness::session_meta::SessionMeta) + Send + Sync + 'static,
     ) {
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         let Some(path) = self.session_paths.get(id).cloned() else {
@@ -633,7 +633,7 @@ struct SessionRow {
 /// thread-level rows happens in [`group_by_thread`] and team depths in
 /// [`resolve_depths`] afterwards.
 async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
-    let repo = pi::session::repository::SessionRepository::new(dir);
+    let repo = manox_harness::session::repository::SessionRepository::new(dir);
     let Ok(list) = repo.list().await else {
         return Vec::new();
     };
@@ -653,11 +653,11 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
         {
             continue;
         }
-        let meta = match pi_extensions::session_meta::load(dir, &info.path).await {
+        let meta = match manox_harness::session_meta::load(dir, &info.path).await {
             Ok(meta) => meta,
             Err(error) => {
                 tracing::warn!(session = %info.id, error = %error, "session sidecar unreadable; rendering default flags");
-                pi_extensions::session_meta::SessionMeta::default()
+                manox_harness::session_meta::SessionMeta::default()
             }
         };
         // The owning thread's id rides the header metadata (stamped at
@@ -817,7 +817,9 @@ fn group_by_thread(
 /// The team leader's session id from a session header's `team.parent`, when
 /// present. Shared by the sidebar store and the actor's mirrored session
 /// list so both resolve the affiliation identically.
-pub(crate) fn team_parent_id(info: &pi::session::repository::SessionInfo) -> Option<String> {
+pub(crate) fn team_parent_id(
+    info: &manox_harness::session::repository::SessionInfo,
+) -> Option<String> {
     info.metadata
         .as_ref()
         .and_then(|m| m.get("team"))
@@ -827,8 +829,8 @@ pub(crate) fn team_parent_id(info: &pi::session::repository::SessionInfo) -> Opt
 }
 /// Map a pi session info + sidecar onto the sidebar summary shape.
 fn session_info_to_summary(
-    info: &pi::session::repository::SessionInfo,
-    meta: &pi_extensions::session_meta::SessionMeta,
+    info: &manox_harness::session::repository::SessionInfo,
+    meta: &manox_harness::session_meta::SessionMeta,
 ) -> ThreadSummary {
     let summary = if info.first_message.trim().is_empty() {
         "(no messages)".to_string()
@@ -1224,13 +1226,13 @@ mod tests {
         // Sidecars: the fork wears the source's title/project.
         let base_path = sessions.join(format!("{base_id}.jsonl"));
         let fork_path = sessions.join(format!("{fork_id}.jsonl"));
-        pi_extensions::session_meta::update(sessions, &base_path, |m| {
+        manox_harness::session_meta::update(sessions, &base_path, |m| {
             m.title = Some("the title".into());
             m.project = Some("/proj/a".into());
         })
         .await
         .unwrap();
-        pi_extensions::session_meta::update(sessions, &fork_path, |m| {
+        manox_harness::session_meta::update(sessions, &fork_path, |m| {
             m.title = Some("the title".into());
             m.project = Some("/proj/a".into());
         })
@@ -1263,9 +1265,9 @@ mod tests {
     fn sample_info(
         id: &str,
         metadata: Option<serde_json::Value>,
-    ) -> pi::session::repository::SessionInfo {
+    ) -> manox_harness::session::repository::SessionInfo {
         let now = chrono::Utc::now();
-        pi::session::repository::SessionInfo {
+        manox_harness::session::repository::SessionInfo {
             path: PathBuf::from(format!("{id}.jsonl")),
             id: id.to_string(),
             cwd: "/p".to_string(),
@@ -1288,7 +1290,7 @@ mod tests {
         );
         info.parent_session_path = Some("fork-source".to_string());
         let summary =
-            session_info_to_summary(&info, &pi_extensions::session_meta::SessionMeta::default());
+            session_info_to_summary(&info, &manox_harness::session_meta::SessionMeta::default());
         assert_eq!(summary.parent_id.as_deref(), Some("leader"));
     }
 
@@ -1297,21 +1299,21 @@ mod tests {
         let mut info = sample_info("forked", Some(serde_json::json!({ "host": "manox" })));
         info.parent_session_path = Some("source".to_string());
         let summary =
-            session_info_to_summary(&info, &pi_extensions::session_meta::SessionMeta::default());
+            session_info_to_summary(&info, &manox_harness::session_meta::SessionMeta::default());
         assert_eq!(summary.parent_id.as_deref(), Some("source"));
     }
 
     #[test]
     fn summary_project_prefers_sidecar_over_cwd() {
         let info = sample_info("s", None);
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             project: Some("/proj/a".into()),
             ..Default::default()
         };
         let summary = session_info_to_summary(&info, &meta);
         assert_eq!(summary.project, "/proj/a");
         // Without a bound project the header cwd classifies the row.
-        let default = pi_extensions::session_meta::SessionMeta::default();
+        let default = manox_harness::session_meta::SessionMeta::default();
         let summary = session_info_to_summary(&info, &default);
         assert_eq!(summary.project, "/p");
     }
@@ -1401,7 +1403,7 @@ mod tests {
         // it just doesn't double as a scheduler benchmark.
         for _ in 0..1500 {
             if let Ok(meta) = crate::runtime::handle()
-                .block_on(pi_extensions::session_meta::load(dir.path(), &session))
+                .block_on(manox_harness::session_meta::load(dir.path(), &session))
                 && meta.archived
                 && meta.pinned
             {
@@ -1447,7 +1449,7 @@ mod tests {
         let wait_for = |expected: Option<&str>| {
             for _ in 0..1500 {
                 if let Ok(meta) = crate::runtime::handle()
-                    .block_on(pi_extensions::session_meta::load(dir.path(), &session))
+                    .block_on(manox_harness::session_meta::load(dir.path(), &session))
                     && meta.tag.as_deref() == expected
                 {
                     return true;

@@ -14,7 +14,7 @@
 //! engine wraps them in `ApprovalGatedTool`), so the outbound trust axis is
 //! governed by the same mode that gates `Bash` / `Write`.
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::mpsc;
@@ -610,8 +610,8 @@ impl AgentTool for WebExploreCloseTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::env::TokioExecutionEnv;
-    use pi::tool::{LocalToolContext, ToolState};
+    use manox_harness::env::TokioExecutionEnv;
+    use manox_harness::tool::{LocalToolContext, ToolState};
 
     fn tool_ctx() -> LocalToolContext {
         LocalToolContext::new(

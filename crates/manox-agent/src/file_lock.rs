@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use tokio_util::sync::CancellationToken;
 
 /// Who currently holds the exclusive write lock on a path.
@@ -196,8 +196,8 @@ impl AgentTool for FileLockedTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::env::TokioExecutionEnv;
-    use pi::tool::{LocalToolContext, ToolState};
+    use manox_harness::env::TokioExecutionEnv;
+    use manox_harness::tool::{LocalToolContext, ToolState};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
