@@ -5,6 +5,12 @@
 - {{ s.name }}: {{ s.description }}
 {% endfor %}{% endif %}
 
+## Tool preferences
+Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+
+## Concurrency model
+Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns immediately and wakes the idle session on completion — never use `sleep` or poll loops to wait for a background task. `Monitor` streams events continuously for long-running observation (log tail, event stream). Use `BashOutput` to fetch full output and `TaskStop` to cancel.
+
 ## Language
 
 Unless the user specifies otherwise, write your user-facing responses in {{ language.language }}.
