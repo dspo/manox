@@ -20,12 +20,12 @@ members = [
     "crates/pi-extensions",
     "crates/manox-terminal",
     "crates/terminal-ui",
-    "crates/components",
-    "crates/supervisor",
-    "crates/lsp",
-    "crates/webview",
-    "crates/http_proxy",
-    "crates/webview-macros",
+"crates/manox-components",
+	    "crates/supervisor",
+	    "crates/lsp",
+	    "crates/manox-webview",
+	    "crates/http_proxy",
+	    "crates/manox-webview-macros",
     "crates/cx",
 "crates/manox-providers",
 	    "crates/manox-session-core",
@@ -49,11 +49,11 @@ agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
 manox-terminal = { path = "crates/manox-terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
-manox-components = { path = "crates/components" }
+manox-components = { path = "crates/manox-components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
-manox-webview = { path = "crates/webview" }
-manox-webview-macros = { path = "crates/webview-macros" }
+manox-webview = { path = "crates/manox-webview" }
+manox-webview-macros = { path = "crates/manox-webview-macros" }
 http_proxy = { path = "crates/http_proxy" }
 	manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
