@@ -91,8 +91,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 10 | **SelfInfo** | Call SelfInfo | Returns non-empty output containing a thread id |
-| 11 | **Skill** | Call Skill with any registered skill name you know (e.g. `gitwork:deliver`). If you do not know any skill name, call Skill with name `gitwork:deliver` anyway — PASS if it returns skill content, SKIP if it returns an error indicating no skills are registered. | Returns non-empty content (skill body), or SKIP with reason |
+| 10 | **Skill** | Call Skill with any registered skill name you know (e.g. `gitwork:deliver`). If you do not know any skill name, call Skill with name `gitwork:deliver` anyway — PASS if it returns skill content, SKIP if it returns an error indicating no skills are registered. | Returns non-empty content (skill body), or SKIP with reason |
 
 ### Group: Monitor
 
