@@ -8,7 +8,6 @@ publish.workspace = true
 manox-agent = { workspace = true }
 manox-session-core = { workspace = true }
 manox-protocol = { workspace = true }
-gpui = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
@@ -22,8 +21,4 @@ open = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-# The pump tests run on a gpui test app and tear the process-global
-# ThreadStore down via `drop_global_for_test`; both require the test-support
-# features. Dev-dependencies never enter the release dependency graph.
-gpui = { workspace = true, features = ["test-support"] }
 manox-agent = { workspace = true, features = ["test-support"] }

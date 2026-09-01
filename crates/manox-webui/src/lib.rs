@@ -3,7 +3,7 @@
 //!
 //! The browser is a dumb terminal — every command is driven on the app main
 //! thread against the same `Entity<Thread>`s the desktop Workspace operates,
-//! through the `AgentServer` protocol gateway. The `pump` is a gpui-foreground
+//! through the `AgentServer` protocol gateway. The `pump` is a foreground
 //! task that polls per-connection command queues; the HTTP and WS workers run
 //! on the global tokio runtime (`manox_agent::runtime::handle`). Each connection is
 //! one independent bridge, matching the vscode multi-surface model; on
@@ -22,7 +22,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::bridge::Outbound;
 
-pub use pump::spawn_pump;
+pub use pump::spawn_server;
 
 /// The foreground pump's inbound channel: the server registers/tears down
 /// connections here; the pump holds the receiver on the main thread.
@@ -57,6 +57,7 @@ pub(crate) struct ConnectionHandle {
     pub outbound: Arc<Outbound>,
 }
 
+/// Returns a snapshot of the current server state.
 fn state() -> std::sync::MutexGuard<'static, ServerState> {
     STATE
         .get_or_init(|| {
@@ -68,6 +69,12 @@ fn state() -> std::sync::MutexGuard<'static, ServerState> {
         })
         .lock()
         .unwrap()
+}
+
+/// Returns the service URL if the server is running, `None` otherwise.
+pub fn service_url() -> Option<String> {
+    let st = state();
+    st.service.as_ref().map(|svc| svc.url.clone())
 }
 
 /// Tray entry: open the browser tab, starting the server on first use. A
@@ -91,7 +98,9 @@ pub fn open_webui() {
     start_server();
 }
 
-fn start_server() {
+/// Start the HTTP + WebSocket server on the global tokio runtime. The server
+/// binds to a random loopback port and publishes the endpoint via `state()`.
+pub fn start_server() {
     let handle = manox_agent::runtime::handle();
     handle.spawn(async move {
         if let Err(e) = server::bind_and_serve().await {
@@ -151,7 +160,7 @@ fn open_url(url: &str) {
 }
 
 /// The server clones the pump's sender so WS workers can register
-/// connections. `None` before `spawn_pump` runs (app startup guarantees the
+/// connections. `None` before `spawn_server` runs (app startup guarantees the
 /// pump is live before any tray open).
 pub(crate) fn main_channel_sender() -> Option<UnboundedSender<ToMain>> {
     MAIN_CHANNEL.get().and_then(|m| m.lock().unwrap().clone())
