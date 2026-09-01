@@ -191,7 +191,30 @@ impl AgentServerInner {
         while let Ok(msg) = rx.recv().await {
             match msg {
                 FromClient::Request { id, call } => {
+                    // List-type calls also push a matching notification to
+                    // the requesting client — the VS Code TS client reads
+                    // results from notifications (push delivery), not from
+                    // Response bodies (request-response). Both are sent for
+                    // protocol completeness.
+                    let push_after = match &call {
+                        ClientCall::ListModels => Some(ListPush::Models),
+                        ClientCall::ListThreads => Some(ListPush::Threads),
+                        _ => None,
+                    };
                     let outcome = handle_call(&self, &client_id, call).await;
+                    if let Some(push) = push_after
+                        && let Ok(value) = &outcome
+                    {
+                        let note = match push {
+                            ListPush::Models => ServerNote::Models {
+                                models: value.clone(),
+                            },
+                            ListPush::Threads => ServerNote::ThreadsUpdated {
+                                threads: value.clone(),
+                            },
+                        };
+                        conn.send_to_client(FromServer::Notification { note });
+                    }
                     conn.send_to_client(FromServer::Response { id, outcome });
                 }
                 FromClient::Notification { note } => {
@@ -446,6 +469,13 @@ impl AgentServerInner {
         }
         json!(commands)
     }
+}
+
+/// Which notification to push after a list-type ClientCall succeeds.
+#[derive(Debug, Clone, Copy)]
+enum ListPush {
+    Models,
+    Threads,
 }
 
 // ── ClientCall dispatch (free fn — borrowed inner, no move per call). ────────
