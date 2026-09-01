@@ -967,34 +967,9 @@ fn build_tools(
     tools.push(Arc::new(crate::plan::UpdatePlanTool::new(
         notice_tx.clone(),
     )));
-    // Shared task-list tools: the team orchestration tools retired with the
-    // Steer-based team architecture; the task list persists per thread and
-    // every session registers the four tools. Gated like any other mutating
-    // tool: ReadOnly denies, WorkspaceWrite admits (session-scoped, no
-    // out-of-workspace target — see `workspace_write_verdict`), DangerFullAccess
-    // runs ungated.
-    let task_list = Arc::new(std::sync::Mutex::new(
-        crate::team::tools::PlainTaskList::new(),
-    ));
-    for tool in [
-        Arc::new(crate::team::tools::TaskCreateTool::with_list(Arc::clone(
-            &task_list,
-        ))) as Arc<dyn PiAgentTool>,
-        Arc::new(crate::team::tools::TaskListTool::with_list(Arc::clone(
-            &task_list,
-        ))),
-        Arc::new(crate::team::tools::TaskUpdateTool::with_list(Arc::clone(
-            &task_list,
-        ))),
-        Arc::new(crate::team::tools::TaskGetTool::with_list(Arc::clone(
-            &task_list,
-        ))),
-    ] {
-        tools.push(Arc::new(
-            ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy)),
-        ));
-    }
+    // Task tools (TaskCreate/TaskList/TaskUpdate/TaskGet) were removed in
+    // the tools-optimization cycle — they were retired with the Steer-based
+    // team architecture and UpdatePlan provides a strictly better alternative.
     // AskUserQuestion/ProposePlan — they persist the durable goal contract,
     // not filesystem side effects. Absent when the db is unavailable.
     if let Some(bridge) = goal_bridge {
