@@ -47,7 +47,7 @@ cx.workspace = true
 
 # cx provider config schema —— the Settings → Models panel edits
 # `cx.providers.config.yaml` through these structs.
-cx-providers.workspace = true
+manox-providers.workspace = true
 
 # pi harness backend.
 pi = { workspace = true }

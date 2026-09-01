@@ -7,8 +7,8 @@
 #
 # LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
-# cx / cx-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
-# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/cx-providers）。
+# cx / manox-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
+# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/manox-providers）。
 #
 # gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
 [workspace]
@@ -27,7 +27,7 @@ members = [
     "crates/http_proxy",
     "crates/webview-macros",
     "crates/cx",
-"crates/cx-providers",
+"crates/manox-providers",
 	    "crates/manox-session-core",
 	    "crates/manox-napi",
 	    "crates/manox-webui",
@@ -62,10 +62,10 @@ pi = { path = "crates/pi" }
 pi-extensions = { path = "crates/pi-extensions" }
 hyperlinks = { path = "crates/hyperlinks" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
-# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。cx-providers 为 provider
+# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。manox-providers 为 provider
 # 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。
 cx = { path = "crates/cx" }
-cx-providers = { path = "crates/cx-providers" }
+manox-providers = { path = "crates/manox-providers" }
 
 anyhow = "1"
 async-channel = "2"

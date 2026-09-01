@@ -140,7 +140,6 @@ dependencies = [
  "brush-builtins",
  "brush-core",
  "chrono",
- "cx-providers",
  "fluent",
  "futures",
  "globset",
@@ -154,6 +153,7 @@ dependencies = [
  "libc",
  "lsp",
  "lsp-types",
+ "manox-providers",
  "parking_lot",
  "pi",
  "pi-extensions",
@@ -191,13 +191,13 @@ dependencies = [
  "base64",
  "chrono",
  "cx",
- "cx-providers",
  "futures",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
  "manox-components",
  "manox-protocol",
+ "manox-providers",
  "manox-session-core",
  "manox-webview",
  "open",
@@ -2183,12 +2183,12 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
- "cx-providers",
  "dirs",
  "futures-util",
  "glob",
  "image",
  "libc",
+ "manox-providers",
  "portable-pty",
  "rand 0.8.6",
  "ratatui",
@@ -2206,19 +2206,6 @@ dependencies = [
  "url",
  "which 7.0.3",
  "zstd",
-]
-
-[[package]]
-name = "cx-providers"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs",
- "reqwest 0.12.28",
- "serde",
- "serde_yaml",
- "tempfile",
- "url",
 ]
 
 [[package]]
@@ -5555,6 +5542,19 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
+]
+
+[[package]]
+name = "manox-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_yaml",
+ "tempfile",
+ "url",
 ]
 
 [[package]]

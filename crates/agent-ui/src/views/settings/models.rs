@@ -1,7 +1,7 @@
 //! Settings → General → Models panel.
 //!
 //! Two-column form view over the cx providers config
-//! (`~/.manox/cx.providers.config.yaml`, schema: `cx_providers::CxConfig`).
+//! (`~/.manox/cx.providers.config.yaml`, schema: `manox_providers::CxConfig`).
 //! The left column lists provider cards (accordion, double-click header to
 //! rename); the expanded card renders whichever module the right-hand module
 //! nav has selected — 基本信息 / 环境变量 / 端点信息 / 模型列表. Every edit
@@ -33,7 +33,7 @@ use gpui_component::{
 };
 
 use crate::i18n;
-use cx_providers::{
+use manox_providers::{
     AgentConfig, ApiKeySourceKind, CxConfig, ProviderConfig, ProviderEndpointDetail,
     ProviderEndpointSpec, ProviderModelConfig, ProviderModels, active_provider_config_path,
     agent_display_name, canonical_agent_id, known_agent_ids, normalize_agent_configs,
@@ -2254,7 +2254,7 @@ fn carry_over_unmodeled_sections(config: &mut CxConfig, fresh: &CxConfig) {
 #[cfg(test)]
 mod tests {
     use super::carry_over_unmodeled_sections;
-    use cx_providers::{ChatGptAppSettings, CxConfig, VsCodeAppSettings, VsCodeExtensionBlock};
+    use manox_providers::{ChatGptAppSettings, CxConfig, VsCodeAppSettings, VsCodeExtensionBlock};
 
     /// Regression: the CxConfig produced by the Models panel's `collect()`
     /// carries empty values for all three unmodeled sections; the carry-over

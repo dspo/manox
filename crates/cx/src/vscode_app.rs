@@ -512,7 +512,7 @@ mod tests {
     use super::*;
     use crate::ResolvedModel;
     use crate::ResolvedProvider;
-    use cx_providers::{CopilotAuth, WireApi};
+    use manox_providers::{CopilotAuth, WireApi};
 
     fn vscode_test_selection(model_id: &str, env: BTreeMap<String, String>) -> Selection {
         Selection {

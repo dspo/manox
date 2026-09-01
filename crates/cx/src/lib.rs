@@ -27,7 +27,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::Url;
 
-use cx_providers::{
+use manox_providers::{
     AgentConfig, ApiKeySourceKind, ChatGptAppSettings, CopilotAuth, CxConfig, EndpointConfig,
     ModelConfig, PROVIDER_CONFIG_FILE_NAME, ProviderConfig, ProviderEndpointSpec,
     ProviderModelConfig, ProviderModels, ResolvedAgent, ResolvedModel, VsCodeAppSettings,
@@ -124,7 +124,7 @@ enum TextInputAction {
 }
 
 // resolved_model_from_config delegates to the shared ResolvedModel::from_config
-// in cx-providers — the single source of truth for capability defaults and
+// in manox-providers — the single source of truth for capability defaults and
 // agent/endpoint compatibility resolution.
 fn resolved_model_from_config(
     config: &CxConfig,

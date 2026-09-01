@@ -1,7 +1,7 @@
 //! Settings → External Tools → ChatGPT.app panel.
 //!
 //! Displays and edits the ChatGPT.app injection settings
-//! (`cx_providers::ChatGptAppSettings`, stored in the top-level `chatgpt_app:`
+//! (`manox_providers::ChatGptAppSettings`, stored in the top-level `chatgpt_app:`
 //! section of `cx.providers.config.yaml`, shared by the CLI and GUI launch
 //! paths). The panel mirrors ChatGPT.app's own Settings visual language: a big
 //! page heading, then per-block name + description above a border-only rounded
@@ -39,7 +39,7 @@ use gpui_component::{
 };
 
 use crate::i18n;
-use cx_providers::{ChatGptAppSettings, ModelInjection};
+use manox_providers::{ChatGptAppSettings, ModelInjection};
 
 use super::SettingsView;
 use super::panels::{

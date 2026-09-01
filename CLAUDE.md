@@ -43,8 +43,8 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 **所有持久化内容统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）。路径清单：
 
-- 单一状态根：`~/.manox/`（`agent::paths::manox_config_dir()` 与 `cx_providers::cx_state_dir()` 均指向它）
-- LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/cx-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
+- 单一状态根：`~/.manox/`（`agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）
+- LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
 - 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`agent::thread_registry`）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork。
 - pi 会话（.jsonl）：`~/.manox/pi-sessions/`
@@ -68,7 +68,7 @@ manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/gith
 
 ### 分层与依赖链
 
-`agent（宿主）→ pi-extensions（扩展）→ pi（内核）`；`cx-providers` 不进扩展层（仅服务 cx 路由域/外部 CLI 会话）。
+`agent（宿主）→ pi-extensions（扩展）→ pi（内核）`；`manox-providers` 不进扩展层（仅服务 cx 路由域/外部 CLI 会话）。
 
 - **crates/pi 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
 - **crates/pi-extensions**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。

@@ -1,7 +1,7 @@
 //! Settings → External Tools → Visual Studio Code.app panel.
 //!
 //! Reads and edits the `vscode_app:` section of `cx.providers.config.yaml`
-//! (`cx_providers::VsCodeAppSettings`). Two blocks — Claude Code Extension
+//! (`manox_providers::VsCodeAppSettings`). Two blocks — Claude Code Extension
 //! and Codex Extension — each expose a Provider dropdown whose options are
 //! the providers filtered by the extension's wire api (Anthropic vs
 //! Responses, the latter shared with the ChatGPT.app catalog). Launching
@@ -31,7 +31,7 @@ use gpui_component::{
 };
 
 use crate::i18n;
-use cx_providers::{VsCodeAppSettings, VsCodeExtensionBlock};
+use manox_providers::{VsCodeAppSettings, VsCodeExtensionBlock};
 
 use super::SettingsView;
 use super::chatgpt::{block, read_only_row};
