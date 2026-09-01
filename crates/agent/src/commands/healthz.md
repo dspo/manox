@@ -17,18 +17,17 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 | FS Write | Write, Edit |
 | Shell | Bash, BashOutput |
 | User Interaction | AskUserQuestion |
-| Metadata | SelfInfo, Skill |
+| Metadata | Skill |
 | Monitor | Monitor, TaskStop |
 | Web | WebFetch |
 | Subagent | Agent |
 | Goal | GetGoal, CreateGoal, UpdateGoal |
 | Plan | UpdatePlan |
-| Task | TaskCreate, TaskList, TaskGet, TaskUpdate |
 | Browser | WebExploreOpen, WebExploreNavigate, WebExploreReadText, WebExploreReadDom, WebExploreClick, WebExploreType, WebExploreScroll, WebExploreScreenshot, WebExploreYield, WebExploreClose |
 
 **Out of scope** — do NOT test (skip silently, do not report):
 
-- LSP tools: LspStatus, LspEnsure, LspWaitReady, GoToDefinition, FindReferences, Hover, DocumentSymbols, WorkspaceSymbols, Diagnostics
+- LSP tools: GoToDefinition, FindReferences, Hover, DocumentSymbols, WorkspaceSymbols, Diagnostics
 - Conditional tools: Code, ToolSearch
 - External plugin subagents: remora:remora-task
 - Plugin commands: gitwork:*
@@ -92,8 +91,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 10 | **SelfInfo** | Call SelfInfo | Returns non-empty output containing a thread id |
-| 11 | **Skill** | Call Skill with any registered skill name you know (e.g. `gitwork:deliver`). If you do not know any skill name, call Skill with name `gitwork:deliver` anyway — PASS if it returns skill content, SKIP if it returns an error indicating no skills are registered. | Returns non-empty content (skill body), or SKIP with reason |
+| 10 | **Skill** | Call Skill with any registered skill name you know (e.g. `gitwork:deliver`). If you do not know any skill name, call Skill with name `gitwork:deliver` anyway — PASS if it returns skill content, SKIP if it returns an error indicating no skills are registered. | Returns non-empty content (skill body), or SKIP with reason |
 
 ### Group: Monitor
 
@@ -134,17 +132,6 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 |---|------|--------|-----------------|
 | 20 | **Bash+Read per-call cwd** | `mkdir -p <tmp>/healthz-cwd && echo hi > <tmp>/healthz-cwd/f` via Bash with `cwd`; Read `f` without `cwd` | Bash runs in the directory; Read resolves `f` through the sticky cwd |
 
-### Group: Task (sequential)
-
-The per-thread shared task list — the retired team-coordination layer's
-remaining tools.
-
-| # | Tool | Action | PASS criterion |
-|---|------|--------|-----------------|
-| 22 | **TaskCreate** | Create a task: "Read the file at `<tmpdir>/hello.txt` and report its contents." | Returns a task id (e.g. T1) |
-| 23 | **TaskList** | List tasks on the task list | The task appears in the list |
-| 24 | **TaskGet** | Read the task by id | Returns the task with correct subject |
-| 25 | **TaskUpdate** | Update the task status to `in_progress` | Success, no error |
 ### Group: Browser (sequential, clean up after)
 
 | # | Tool | Action | PASS criterion |

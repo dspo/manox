@@ -158,11 +158,19 @@ impl AgentTool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. State (cwd, exported vars, functions) persists across calls. \
-         Optionally run in the background with `run_in_background: true` — the command starts in a \
-         fresh shell (no persistent state) at the session cwd — a completion summary with the \
-         output tail arrives automatically; fetch the full output via `BashOutput`; stop with \
-         `TaskStop`. Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
+        "Execute a shell command. \
+         State (cwd, exported vars, functions) persists across calls. \
+         \
+         **Concurrency model**: foreground calls block this turn; \
+         `run_in_background: true` starts the command in a fresh shell (no \
+         persistent state) at the session cwd — a completion summary with the \
+         output tail arrives automatically and **wakes the idle session** so you \
+         can act on it immediately. Never use `sleep` or poll loops to wait for \
+         a background task — it will wake you when done. Use `BashOutput` \
+         (shell_id) for the full output; `TaskStop` stops the task. Persistent \
+         shell commands within one batch run serially (shared state). \
+         \
+         Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
          piping through `head`/`tail`. Commands run under a file sandbox; a blocked file operation \
          is reported as `[sandbox: file access denied under <mode> mode]` — a policy denial, not a \
          bug. When a command is denied and a wider mode would let it succeed, retry the exact same \
@@ -379,9 +387,16 @@ impl BashTool {
                 .expect("sticky cwd poisoned") = Some(dir);
         }
 
-        Ok(AgentToolResult::text(assemble_output(
-            result, head_lines, tail_lines,
-        )))
+        let mut output = assemble_output(result, head_lines, tail_lines);
+
+        // Per-session-once nudges: suggest native tools when the model reaches
+        // for raw grep/rg/find/ls, and suggest background for long waits.
+        if !run_in_background {
+            output.push_str(&nudge_tool_preference(&command, ctx));
+            output.push_str(&nudge_sleep_loop(&command, ctx));
+        }
+
+        Ok(AgentToolResult::text(output))
     }
 
     /// The standing session mode (absent any per-call grant).
@@ -509,6 +524,83 @@ fn assemble_output(result: CommandResult, head: Option<usize>, tail: Option<usiz
         ));
     }
     final_output
+}
+
+/// Per-session-once nudge: when the command is a bare grep/rg/find/ls call,
+/// suggest using the native tool instead (no sandbox, no approval).
+fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
+    let trimmed = command.trim();
+    // Check for bare grep/rg/find/ls commands (not piped, not part of a chain).
+    let is_native_candidate = trimmed.starts_with("grep ")
+        || trimmed.starts_with("rg ")
+        || trimmed.starts_with("find ")
+        || trimmed.starts_with("ls ")
+        || trimmed == "grep"
+        || trimmed == "rg"
+        || trimmed == "find"
+        || trimmed == "ls";
+    if !is_native_candidate {
+        return String::new();
+    }
+    let nf = &ctx.tool_state().nudge_flags;
+    if pi::tool::nudge::mark(nf, pi::tool::nudge::GREP_TOOL_PREF) {
+        return String::new(); // already shown this session
+    }
+    // Determine which native tool to suggest.
+    let native = if trimmed.starts_with("grep") || trimmed.starts_with("rg") {
+        "Grep"
+    } else if trimmed.starts_with("find") {
+        "Glob"
+    } else {
+        "Ls"
+    };
+    format!(
+        "\n\n[tip: prefer the `{native}` tool over raw `{}` — no sandbox, no approval in read-only mode]",
+        trimmed.split_whitespace().next().unwrap_or("cmd")
+    )
+}
+
+/// Per-session-once nudges for long-running foreground patterns.
+fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
+    let trimmed = command.trim();
+    let nf = &ctx.tool_state().nudge_flags;
+
+    // Pure sleep N (N >= 10): suggest background.
+    if let Some(rest) = trimmed.strip_prefix("sleep ") {
+        let secs: u64 = rest
+            .split_whitespace()
+            .next()
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        if secs >= 10 && !pi::tool::nudge::mark(nf, pi::tool::nudge::SLEEP_BACKGROUND) {
+            return "\n\n[tip: long wait detected — use `run_in_background: true` and the completion \
+                    summary will wake you automatically when done]".to_string();
+        }
+    }
+
+    // Poll loop: while/for/until + sleep.
+    if (trimmed.starts_with("while ")
+        || trimmed.starts_with("for ")
+        || trimmed.starts_with("until "))
+        && trimmed.contains("sleep")
+        && !pi::tool::nudge::mark(nf, pi::tool::nudge::POLL_LOOP)
+    {
+        return "\n\n[tip: poll loop detected — use `run_in_background: true` with completion \
+                wake-up, or `Monitor` for streaming observation]"
+            .to_string();
+    }
+
+    // gh run watch / gh pr checks --watch: suggest background.
+    if (trimmed.contains("gh run watch") || trimmed.contains("gh pr checks --watch"))
+        && !pi::tool::nudge::mark(nf, pi::tool::nudge::GH_WATCH)
+    {
+        return "\n\n[tip: CI wait detected — use `run_in_background: true` and the completion \
+                summary will wake you when the CI finishes]"
+            .to_string();
+    }
+
+    String::new()
 }
 
 /// Keep the first `head` and/or last `tail` lines of the output.

@@ -1,4 +1,13 @@
 // Ls tool — directory listing with output truncation.
+//
+// Supports long format (size/mtime columns), hidden files, and recursive depth.
+// Use this over `ls` in Bash for plain directory listings: no sandbox, no
+// approval in read-only mode. Use Bash `ls` only when format flags exceed
+// what this tool offers (e.g. `-laR`, `-lhS`, `--sort=time`).
+
+use std::path::Path;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +33,11 @@ impl AgentTool for LsTool {
     }
 
     fn description(&self) -> &str {
-        "List directory contents"
+        "List directory contents. Use this over `ls` in Bash for plain \
+         directory listings: no sandbox, no approval in read-only mode. \
+         Supports long format (size/mtime), hidden files, and recursive depth. \
+         Use Bash `ls` only when format flags exceed what this tool offers \
+         (e.g. `-laR`, `-lhS`, `--sort=time`)."
     }
 
     fn is_read_only(&self) -> bool {
@@ -46,6 +59,18 @@ impl AgentTool for LsTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of entries to return"
+                },
+                "long": {
+                    "type": "boolean",
+                    "description": "Show detailed format with size and modification time columns"
+                },
+                "hidden": {
+                    "type": "boolean",
+                    "description": "Show hidden files (those starting with '.')"
+                },
+                "depth": {
+                    "type": "integer",
+                    "description": "Recursion depth for subdirectories (0 = no recursion, 1 = immediate children, etc.)"
                 }
             }
         })
@@ -63,15 +88,37 @@ impl AgentTool for LsTool {
             .as_u64()
             .map(|v| v as usize)
             .unwrap_or(Self::DEFAULT_LIMIT);
+        let long = params["long"].as_bool().unwrap_or(false);
+        let hidden = params["hidden"].as_bool().unwrap_or(false);
+        let depth = params["depth"].as_u64().map(|v| v as usize);
 
         let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
             .map_err(ToolError::InvalidArguments)?;
         let path = cwd.join(path_str);
-        let entries = ctx
-            .env()
-            .list_dir(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+
+        let entries = if let Some(d) = depth {
+            list_recursive(&path, d, hidden, limit)
+        } else {
+            let entries = ctx
+                .env()
+                .list_dir(&path)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
+            if hidden {
+                entries
+            } else {
+                entries
+                    .into_iter()
+                    .filter(|e| {
+                        e.path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| !n.starts_with('.'))
+                            .unwrap_or(true)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
 
         let total = entries.len();
 
@@ -88,7 +135,40 @@ impl AgentTool for LsTool {
             } else {
                 format_size(entry.size)
             };
-            output.push_str(&format!("{kind} {size:>8}  {name}\n"));
+
+            if long {
+                let mtime = entry
+                    .path
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| {
+                        t.duration_since(UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs() as i64)
+                    })
+                    .unwrap_or(0);
+                let mtime_str = if mtime > 0 {
+                    // Format as ISO-like date-time or relative time.
+                    let secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let age = secs - mtime;
+                    if age < 3600 {
+                        format!("{}m", age / 60)
+                    } else if age < 86400 {
+                        format!("{}h", age / 3600)
+                    } else {
+                        format!("{}d", age / 86400)
+                    }
+                } else {
+                    "-".to_string()
+                };
+                output.push_str(&format!("{kind} {size:>8} {mtime_str:>5}  {name}\n"));
+            } else {
+                output.push_str(&format!("{kind} {size:>8}  {name}\n"));
+            }
         }
 
         if total > limit {
@@ -120,6 +200,55 @@ impl AgentTool for LsTool {
         }
 
         Ok(AgentToolResult::text(final_output))
+    }
+}
+
+/// Recursively list directory contents up to a given depth.
+#[allow(clippy::only_used_in_recursion)]
+fn list_recursive(
+    base: &Path,
+    depth: usize,
+    show_hidden: bool,
+    _limit: usize,
+) -> Vec<crate::env::FileInfo> {
+    let mut results = Vec::new();
+    list_recursive_impl(base, base, depth, show_hidden, &mut results);
+    results
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn list_recursive_impl(
+    base: &Path,
+    current: &Path,
+    remaining: usize,
+    show_hidden: bool,
+    results: &mut Vec<crate::env::FileInfo>,
+) {
+    let Ok(entries) = std::fs::read_dir(current) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !show_hidden
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with('.')
+        {
+            continue;
+        }
+        let is_dir = path.is_dir();
+        let size = if is_dir {
+            0
+        } else {
+            path.metadata().map(|m| m.len()).unwrap_or(0)
+        };
+        results.push(crate::env::FileInfo {
+            path: path.to_path_buf(),
+            is_dir,
+            size,
+        });
+        if is_dir && remaining > 0 {
+            list_recursive_impl(base, &path, remaining - 1, show_hidden, results);
+        }
     }
 }
 

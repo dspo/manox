@@ -3,7 +3,16 @@
 ## Available skills (consult their full body via the `skill` tool on demand)
 {% for s in skills -%}
 - {{ s.name }}: {{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP ready
+{{ lsp_ready_specs }}{% endif %}
+
+## Tool preferences
+Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+
+## Concurrency model
+Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns immediately and wakes the idle session on completion — never use `sleep` or poll loops to wait for a background task. `Monitor` streams events continuously for long-running observation (log tail, event stream). Use `BashOutput` to fetch full output and `TaskStop` to cancel.
 
 ## Language
 

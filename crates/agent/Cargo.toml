@@ -60,6 +60,7 @@ unic-langid.workspace = true
 tera.workspace = true
 tokio-tungstenite = { workspace = true }
 rustwright_core = { workspace = true, optional = true }
+html2text = "0.17.1"
 
 [dev-dependencies]
 # Self-reference with `test-support`: integration tests (`tests/`) compile the

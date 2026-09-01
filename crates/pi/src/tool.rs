@@ -15,6 +15,31 @@ use crate::types::{AgentEvent, AgentLoopConfig, ContentBlock, EventSink};
 
 // ── Tool state ─────────────────────────────────────────────────────────────
 
+/// Nudge flag bits for per-session-once nudges.
+pub mod nudge {
+    /// Bit 0: grep/rg/find/ls native tool preference shown.
+    pub const GREP_TOOL_PREF: u8 = 1 << 0;
+    /// Bit 1: long sleep (>=10s) → background suggestion shown.
+    pub const SLEEP_BACKGROUND: u8 = 1 << 1;
+    /// Bit 2: poll loop (while/for/until + sleep) → background/Monitor shown.
+    pub const POLL_LOOP: u8 = 1 << 2;
+    /// Bit 3: gh run watch / gh pr checks --watch → background shown.
+    pub const GH_WATCH: u8 = 1 << 3;
+
+    /// Check whether `flag` has been shown in this session.
+    pub fn has(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
+        nudge_flags.lock().map(|f| *f & flag != 0).unwrap_or(true)
+    }
+
+    /// Mark `flag` as shown (returns true if it was already set).
+    pub fn mark(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
+        let mut flags = nudge_flags.lock().unwrap_or_else(|e| e.into_inner());
+        let already = *flags & flag != 0;
+        *flags |= flag;
+        already
+    }
+}
+
 /// Session-scoped tool state: hashline snapshots, the file mutation queue,
 /// and the hashline clipboard.
 ///
@@ -43,6 +68,11 @@ pub struct ToolState {
     /// post-command directory); `None` until the first tool call resolves, so
     /// resolution starts from the session cwd.
     pub sticky_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// Per-session nudge flags: each bit marks a nudge type that has been shown
+    /// this session, so nudges fire at most once per session. Bit 0 = grep
+    /// native tool preference, bit 1 = sleep nudge, bit 2 = poll loop nudge,
+    /// bit 3 = gh watch nudge.
+    pub nudge_flags: std::sync::Mutex<u8>,
 }
 
 impl ToolState {
@@ -53,6 +83,7 @@ impl ToolState {
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
             sticky_cwd: std::sync::Mutex::new(None),
+            nudge_flags: std::sync::Mutex::new(0),
         }
     }
 
@@ -65,6 +96,7 @@ impl ToolState {
             clipboard: std::sync::Mutex::new(Vec::new()),
             noop_edits: std::sync::Mutex::new(std::collections::HashMap::new()),
             sticky_cwd: std::sync::Mutex::new(None),
+            nudge_flags: std::sync::Mutex::new(0),
         }
     }
 }
@@ -311,6 +343,12 @@ pub struct ExecutedToolCall {
 /// the conversation. Each call emits a matched `ToolExecutionStart` /
 /// `ToolExecutionEnd` pair and runs the optional `before_tool_call` /
 /// `after_tool_call` hooks from `config`.
+///
+/// The batch is scheduled as a DAG based on path dependencies and
+/// declaration mode: read-only tools on disjoint paths run concurrently,
+/// mutating tools are serialized against reads on the same path, and
+/// tools that declare `ExecutionMode::Sequential` (Bash) conflict with
+/// all other calls in the batch.
 pub async fn execute_tool_calls(
     tool_calls: &[(&str, &str, JsonValue)],
     tools: &[Arc<dyn AgentTool>],
@@ -320,19 +358,195 @@ pub async fn execute_tool_calls(
     sink: &(dyn EventSink + Send + Sync),
     sequential: bool,
 ) -> Result<(Vec<ExecutedToolCall>, Vec<crate::types::AgentMessage>), anyhow::Error> {
-    // A tool that declares itself Sequential forces the whole batch to run
-    // one call at a time, so its per-call ordering holds.
-    let any_tool_sequential = tool_calls.iter().any(|(_, name, _)| {
-        tools
-            .iter()
-            .find(|t| t.name() == *name)
-            .is_some_and(|t| t.execution_mode() == ExecutionMode::Sequential)
-    });
-    let sequential = sequential || any_tool_sequential;
+    // When the host explicitly requests sequential, fall through to the
+    // simple sequential path.
     if sequential {
-        execute_sequential(tool_calls, tools, signal, ctx, config, sink).await
-    } else {
-        execute_parallel(tool_calls, tools, signal, ctx, config, sink).await
+        return execute_sequential(tool_calls, tools, signal, ctx, config, sink).await;
+    }
+    // Single call: no scheduling needed.
+    if tool_calls.len() <= 1 {
+        return execute_parallel(tool_calls, tools, signal, ctx, config, sink).await;
+    }
+
+    // Build metadata for each call.
+    let n = tool_calls.len();
+    let meta: Vec<ToolCallMeta> = tool_calls
+        .iter()
+        .map(|(_id, name, args)| {
+            let tool = tools.iter().find(|t| t.name() == *name);
+            let is_read_only = tool.is_some_and(|t| t.is_read_only());
+            let conflicts_with_all =
+                tool.is_some_and(|t| t.execution_mode() == ExecutionMode::Sequential);
+            let paths = extract_call_paths(name, args);
+            ToolCallMeta {
+                is_read_only,
+                conflicts_with_all,
+                paths,
+            }
+        })
+        .collect();
+
+    // Build adjacency: adj[i] = list of successors of i.
+    // in_degree[i] = number of predecessors.
+    let mut adj: Vec<Vec<usize>> = vec![vec![]; n];
+    let mut in_degree: Vec<usize> = vec![0; n];
+
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if should_depend(&meta[i], &meta[j]) {
+                adj[i].push(j);
+                in_degree[j] += 1;
+            }
+        }
+    }
+
+    // Iterative Kahn: each round executes all ready tasks concurrently.
+    let mut results: Vec<Option<ExecutedToolCall>> = (0..n).map(|_| None).collect();
+
+    while results.iter().any(|r| r.is_none()) {
+        // Collect indices with in_degree == 0.
+        let ready: Vec<usize> = (0..n)
+            .filter(|i| results[*i].is_none() && in_degree[*i] == 0)
+            .collect();
+
+        if ready.is_empty() {
+            // Cycle detected — should not happen with our DAG construction.
+            // Fall back to sequential for safety.
+            return execute_sequential(tool_calls, tools, signal, ctx, config, sink).await;
+        }
+
+        // Check cancellation before dispatching the next layer.
+        if signal.is_cancelled() {
+            // Fill all remaining slots with aborted results.
+            for i in 0..n {
+                if results[i].is_some() {
+                    continue;
+                }
+                let (id, name, _) = tool_calls[i];
+                let result = AgentToolResult::error("aborted");
+                let result_message = make_tool_result_message(id, name, &result);
+                results[i] = Some(ExecutedToolCall {
+                    tool_call_id: id.to_string(),
+                    tool_name: name.to_string(),
+                    result_message,
+                    result,
+                    blocked: false,
+                    block_reason: None,
+                });
+            }
+            break;
+        }
+
+        // Execute ready tasks concurrently.
+        let futures: Vec<_> = ready
+            .iter()
+            .map(|&i| {
+                let (id, name, args) = &tool_calls[i];
+                execute_one((*id, *name, args), tools, signal.clone(), ctx, config, sink)
+            })
+            .collect();
+
+        let outcomes = futures::future::join_all(futures).await;
+        let outcomes: Vec<ExecutedToolCall> = outcomes.into_iter().collect::<Result<_, _>>()?;
+
+        for (idx, outcome) in ready.iter().zip(outcomes) {
+            results[*idx] = Some(outcome);
+            // Decrement in_degree of successors.
+            for &succ in &adj[*idx] {
+                in_degree[succ] = in_degree[succ].saturating_sub(1);
+            }
+        }
+    }
+
+    // Reconstruct in emission order.
+    let mut executed = Vec::with_capacity(n);
+    let mut messages = Vec::with_capacity(n);
+    for r in results.into_iter().flatten() {
+        messages.push(r.result_message.clone());
+        executed.push(r);
+    }
+
+    Ok((executed, messages))
+}
+
+/// Parsed per-call metadata for dependency scheduling.
+struct ToolCallMeta {
+    is_read_only: bool,
+    /// Tool declared `ExecutionMode::Sequential` (Bash-style) — conflicts
+    /// with all other calls in the batch.
+    conflicts_with_all: bool,
+    /// Paths this call operates on. Empty means unknown (wildcard).
+    paths: Vec<std::path::PathBuf>,
+}
+
+/// Whether call `i` (earlier in emission order) must complete before
+/// call `j` (later) can start.
+///
+/// Rules (per plan F.3):
+/// 1. If `j` conflicts with all (Bash), edge i -> j:
+///    Bash waits for everything before it.
+/// 2. If `i` conflicts with all (Bash), edge i -> j:
+///    Everything after Bash waits for it.
+/// 3. Both read-only: no edge (reads commute, no data dependency).
+/// 4. If `i` is read-only and `j` is mutating on a shared path:
+///    R(p) -> W(p): read must complete before write.
+/// 5. If `i` is mutating and `j` is read-only on a shared path:
+///    W(p) -> R(p): write must complete before subsequent read.
+/// 6. If both are mutating on a shared path: W(p) -> W(p).
+/// 7. Otherwise: no edge.
+fn should_depend(a: &ToolCallMeta, b: &ToolCallMeta) -> bool {
+    // Bash (or any Sequential-declaring tool) conflicts with everything.
+    if b.conflicts_with_all || a.conflicts_with_all {
+        return true;
+    }
+    // Both read-only: no edge needed.
+    if a.is_read_only && b.is_read_only {
+        return false;
+    }
+    // Neither has a known path: conservative edge (conflict).
+    if a.paths.is_empty() && b.paths.is_empty() {
+        return true;
+    }
+    // At least one has a known path: check for overlap.
+    paths_overlap(&a.paths, &b.paths)
+}
+
+/// Check if two sets of paths overlap. An empty set is treated as wildcard
+/// (conflicts with everything). Uses exact string comparison (conservative
+/// approach per plan: no canonicalization, no prefix matching).
+fn paths_overlap(a: &[std::path::PathBuf], b: &[std::path::PathBuf]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return true; // wildcard
+    }
+    a.iter().any(|pa| b.iter().any(|pb| pa == pb))
+}
+
+/// Extract file paths from a tool call's parameters for dependency scheduling.
+///
+/// Returns an empty vec when the path cannot be determined (treated as
+/// wildcard / conflict-with-all). Uses conservative exact-string matching.
+fn extract_call_paths(tool_name: &str, params: &serde_json::Value) -> Vec<std::path::PathBuf> {
+    match tool_name {
+        "Write" => params["path"]
+            .as_str()
+            .map(|p| vec![std::path::PathBuf::from(p)])
+            .unwrap_or_default(),
+        "Edit" => {
+            // Use the hashline parser to extract file paths from the patch.
+            if let Some(patch) = params["patch"].as_str()
+                && let Ok(parsed) = crate::hashline::parser::parse_patch(patch)
+            {
+                return parsed.files.into_iter().map(|f| f.path).collect();
+            }
+            vec![]
+        }
+        // Read, Grep, Glob, Ls all take an optional `path` parameter.
+        "Read" | "Grep" | "Glob" | "Ls" => params["path"]
+            .as_str()
+            .map(|p| vec![std::path::PathBuf::from(p)])
+            .unwrap_or_default(),
+        // Unknown tools: conservative wildcard.
+        _ => vec![],
     }
 }
 
@@ -1099,5 +1313,530 @@ mod tests {
             ),
             "end must carry the final result content"
         );
+    }
+
+    // ── DAG scheduler tests ─────────────────────────────────────────────
+    //
+    // The test matrix verifies path-aware scheduling correctness:
+    // 1. Same-file Read -> Edit ordering
+    // 2. Different-file Write x2 parallel (no deadlock)
+    // 3. Bash batch: reads before Bash concurrent, reads after Bash barrier
+    // 4. Emission order determinism (results in original call order)
+    // 5. Cancellation propagation (in-flight tasks settled, pending skipped)
+    // 6. Empty batch / single call degeneracy
+
+    /// A configurable fake tool for testing the DAG scheduler.
+    ///
+    /// Records start/end in a shared trace, and optionally waits on a barrier
+    /// (to prove concurrent execution) or a gate (to hold until released).
+    struct FakeTool {
+        name: String,
+        is_read_only: bool,
+        execution_mode: ExecutionMode,
+        barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+        gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+        trace: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        trace_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for FakeTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "Fake tool for DAG scheduler tests"
+        }
+        fn is_read_only(&self) -> bool {
+            self.is_read_only
+        }
+        fn execution_mode(&self) -> ExecutionMode {
+            self.execution_mode
+        }
+        fn parameters_schema(&self) -> JsonValue {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "patch": { "type": "string" },
+                    "command": { "type": "string" },
+                    "content": { "type": "string" }
+                }
+            })
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: JsonValue,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<AgentToolResult, ToolError> {
+            // Record start.
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", self.trace_id));
+
+            // Wait on barrier if present (proves concurrent launch).
+            if let Some(ref barrier) = self.barrier {
+                barrier.wait().await;
+            }
+
+            // Wait on gate if present (holds until released).
+            if let Some(ref gate) = self.gate {
+                gate.notified().await;
+            }
+
+            // Record end.
+            self.trace
+                .lock()
+                .unwrap()
+                .push(format!("end:{}", self.trace_id));
+
+            Ok(AgentToolResult::text(format!("done:{}", self.trace_id)))
+        }
+    }
+
+    /// Helper: create a FakeTool with the given configuration.
+    #[allow(dead_code)]
+    fn make_fake(
+        name: &str,
+        is_read_only: bool,
+        execution_mode: ExecutionMode,
+        barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+        gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+        trace: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> std::sync::Arc<dyn AgentTool> {
+        std::sync::Arc::new(FakeTool {
+            name: name.to_string(),
+            is_read_only,
+            execution_mode,
+            barrier,
+            gate,
+            trace,
+            trace_id: name.to_string(),
+        })
+    }
+
+    /// Helper: build a tool call tuple for the fake tool.
+    fn call(
+        id: &'static str,
+        name: &'static str,
+        path: Option<&'static str>,
+    ) -> (&'static str, &'static str, JsonValue) {
+        let mut args = serde_json::json!({});
+        if let Some(p) = path {
+            args["path"] = serde_json::json!(p);
+        }
+        (id, name, args)
+    }
+
+    /// Test 1: Same-file Read -> Edit ordering.
+    ///
+    /// A Read and an Edit on the same path must execute in emission order.
+    /// The Read starts first; the Edit waits for it to complete.
+    #[tokio::test]
+    async fn test_same_file_read_edit_ordering() {
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let edit_gate = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
+            make_fake(
+                "Read",
+                true,
+                ExecutionMode::Parallel,
+                None,
+                None,
+                std::sync::Arc::clone(&trace),
+            ),
+            make_fake(
+                "Edit",
+                false,
+                ExecutionMode::Parallel,
+                None,
+                Some(std::sync::Arc::clone(&edit_gate)),
+                std::sync::Arc::clone(&trace),
+            ),
+        ];
+
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let signal = CancellationToken::new();
+        let config = AgentLoopConfig::default();
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+
+        // Both calls on the same path /a.
+        let calls = [
+            call("c1", "Read", Some("/a")),
+            call("c2", "Edit", Some("/a")),
+        ];
+
+        // Spawn execution; it will block on the Edit gate.
+        let execution = execute_tool_calls(&calls, &tools, signal, &ctx, &config, &sink, false);
+        tokio::pin!(execution);
+
+        // Poll the execution until it hits the Edit gate, yielding to let it
+        // make progress.
+        for _ in 0..10 {
+            tokio::select! {
+                biased;
+                result = &mut execution => {
+                    let (_executed, _messages) = result.unwrap();
+                    // Execution completed early — this shouldn't happen since
+                    // Edit is gated.
+                    panic!("execution completed before Edit gate was released");
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+
+        // Read should have started (and completed) while Edit is still gated.
+        {
+            let t = trace.lock().unwrap();
+            assert!(
+                t.contains(&"start:Read".to_string()),
+                "Read must have started: {:?}",
+                *t
+            );
+            assert!(
+                t.contains(&"end:Read".to_string()),
+                "Read must have completed while Edit is gated: {:?}",
+                *t
+            );
+            assert!(
+                t.contains(&"start:Edit".to_string()),
+                "Edit must have started (scheduled after Read): {:?}",
+                *t
+            );
+            assert!(
+                !t.contains(&"end:Edit".to_string()),
+                "Edit must not complete while gated: {:?}",
+                *t
+            );
+        }
+
+        // Release the gate so Edit completes.
+        edit_gate.notify_one();
+        let (executed, _messages) = execution.await.unwrap();
+
+        assert_eq!(executed.len(), 2);
+        assert!(!executed[0].result.is_error);
+        assert!(!executed[1].result.is_error);
+
+        // Final trace: Read starts & ends before Edit ends.
+        let t = trace.lock().unwrap();
+        let read_start = t.iter().position(|s| s == "start:Read").unwrap();
+        let read_end = t.iter().position(|s| s == "end:Read").unwrap();
+        let edit_end = t.iter().position(|s| s == "end:Edit").unwrap();
+        assert!(read_start < read_end, "Read start before end");
+        assert!(read_end < edit_end, "Read completes before Edit ends");
+    }
+
+    /// Test 2: Different-file Write x2 parallel (no deadlock).
+    ///
+    /// Two writes on different paths should execute concurrently. We use a
+    /// 2-party barrier: both writes must reach the barrier simultaneously,
+    /// proving parallel execution. If the scheduler serialized them, the
+    /// second write would never reach the barrier (deadlock).
+    #[tokio::test]
+    async fn test_different_file_writes_parallel() {
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
+            make_fake(
+                "Write",
+                false,
+                ExecutionMode::Parallel,
+                Some(std::sync::Arc::clone(&barrier)),
+                None,
+                std::sync::Arc::clone(&trace),
+            ),
+            make_fake(
+                "Write",
+                false,
+                ExecutionMode::Parallel,
+                Some(std::sync::Arc::clone(&barrier)),
+                None,
+                std::sync::Arc::clone(&trace),
+            ),
+        ];
+
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let signal = CancellationToken::new();
+        let config = AgentLoopConfig::default();
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+
+        // Different paths: /a and /b.
+        let calls = [
+            call("c1", "Write", Some("/a")),
+            call("c2", "Write", Some("/b")),
+        ];
+
+        let (executed, _messages) =
+            execute_tool_calls(&calls, &tools, signal, &ctx, &config, &sink, false)
+                .await
+                .unwrap();
+
+        assert_eq!(executed.len(), 2);
+        assert!(!executed[0].result.is_error);
+        assert!(!executed[1].result.is_error);
+
+        // Both writes completed (the barrier was satisfied -> parallel).
+        let t = trace.lock().unwrap();
+        assert!(
+            t.contains(&"start:Write".to_string()),
+            "Write must have started at least once: {:?}",
+            *t
+        );
+        assert_eq!(
+            t.iter().filter(|s| *s == "start:Write").count(),
+            2,
+            "Both Write instances must have started: {:?}",
+            *t
+        );
+    }
+
+    /// Test 3: Bash batch — reads before Bash concurrent, reads after Bash
+    /// barrier.
+    ///
+    /// Batch: Read(/a), Read(/b), Bash, Read(/c).
+    /// - Read(/a) and Read(/b) run concurrently (same layer, no dependency).
+    /// - Bash waits for both reads (Bash conflicts with all).
+    /// - Read(/c) waits for Bash.
+    #[tokio::test]
+    async fn test_bash_batch_ordering() {
+        // Gate-free: the DAG guarantees the layering deterministically
+        // ({ReadA, ReadB} -> Bash -> ReadC), so the FINAL trace pins the
+        // ordering without any mid-execution observation.
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mk = |id: &'static str, name: &'static str, ro: bool| {
+            std::sync::Arc::new(FakeTool {
+                name: name.to_string(),
+                is_read_only: ro,
+                execution_mode: ExecutionMode::Parallel,
+                barrier: None,
+                gate: None,
+                trace: std::sync::Arc::clone(&trace),
+                trace_id: id.to_string(),
+            })
+        };
+        // Distinct names: the scheduler resolves a call's tool by NAME, so
+        // same-named fakes would all hit the first instance.
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
+            mk("ReadA", "ReadA", true),
+            mk("ReadB", "ReadB", true),
+            mk("Bash", "Bash", false),
+            mk("ReadC", "ReadC", true),
+        ];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let calls = [
+            call("c1", "ReadA", Some("/a")),
+            call("c2", "ReadB", Some("/b")),
+            call("c3", "Bash", None),
+            call("c4", "ReadC", Some("/c")),
+        ];
+        let (executed, _) = execute_tool_calls(
+            &calls,
+            &tools,
+            CancellationToken::new(),
+            &ctx,
+            &AgentLoopConfig::default(),
+            &RecordingSink(std::sync::Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(executed.len(), 4);
+        let t = trace.lock().unwrap();
+        let idx = |tag: &str| {
+            t.iter()
+                .position(|e| e == tag)
+                .unwrap_or_else(|| panic!("{tag} missing: {t:?}"))
+        };
+        // Reads emitted BEFORE Bash must complete before Bash starts — and
+        // they ran concurrently with each other (both started before either
+        // ended is NOT asserted: only the barrier against Bash matters).
+        assert!(idx("end:ReadA") < idx("start:Bash"), "{t:?}");
+        assert!(idx("end:ReadB") < idx("start:Bash"), "{t:?}");
+        // A read emitted AFTER a mutating call barriers on it.
+        assert!(idx("end:Bash") < idx("start:ReadC"), "{t:?}");
+    }
+
+    /// Test 4: Emission order determinism.
+    ///
+    /// Results must be returned in the original call order regardless of
+    /// scheduling order.
+    #[tokio::test]
+    async fn test_emission_order_determinism() {
+        // Three mutating/read calls on one path execute in emission order;
+        // results come back in emission order regardless of execution.
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mk = |id: &'static str, name: &'static str, ro: bool| {
+            std::sync::Arc::new(FakeTool {
+                name: name.to_string(),
+                is_read_only: ro,
+                execution_mode: ExecutionMode::Parallel,
+                barrier: None,
+                gate: None,
+                trace: std::sync::Arc::clone(&trace),
+                trace_id: id.to_string(),
+            })
+        };
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![
+            mk("W1", "W1", false),
+            mk("Read", "Read", true),
+            mk("W2", "W2", false),
+        ];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let calls = [
+            call("c1", "W1", Some("/a")),
+            call("c2", "Read", Some("/a")),
+            call("c3", "W2", Some("/a")),
+        ];
+        let (executed, messages) = execute_tool_calls(
+            &calls,
+            &tools,
+            CancellationToken::new(),
+            &ctx,
+            &AgentLoopConfig::default(),
+            &RecordingSink(std::sync::Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+        .unwrap();
+        // Results are reported in emission order (c1, c2, c3), not
+        // completion order.
+        let ids: Vec<&str> = executed.iter().map(|e| e.tool_call_id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "c2", "c3"]);
+        assert_eq!(messages.len(), 3);
+        let t = trace.lock().unwrap();
+        let idx = |tag: &str| {
+            t.iter()
+                .position(|e| e == tag)
+                .unwrap_or_else(|| panic!("{tag} missing: {t:?}"))
+        };
+        // Same-path chain: W1 before Read before W2.
+        assert!(idx("end:W1") < idx("start:Read"), "{t:?}");
+        assert!(idx("end:Read") < idx("start:W2"), "{t:?}");
+    }
+
+    /// Test 5: Cancellation propagation.
+    ///
+    /// When cancelled mid-batch, in-flight tasks must settle (return aborted
+    /// or complete naturally) and pending tasks must not start.
+    #[tokio::test]
+    async fn test_cancellation_propagation() {
+        // A pre-cancelled signal: the scheduler aborts every call before
+        // dispatch (pending calls never start). In-flight settle is
+        // execute_one's own cancellation check, covered by its tests.
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mk = |id: &'static str| {
+            std::sync::Arc::new(FakeTool {
+                name: "Write".to_string(),
+                is_read_only: false,
+                execution_mode: ExecutionMode::Parallel,
+                barrier: None,
+                gate: None,
+                trace: std::sync::Arc::clone(&trace),
+                trace_id: id.to_string(),
+            })
+        };
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![mk("W1"), mk("W2"), mk("W3")];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let calls = [
+            call("c1", "Write", Some("/a")),
+            call("c2", "Write", Some("/b")),
+            call("c3", "Write", Some("/c")),
+        ];
+        let signal = CancellationToken::new();
+        signal.cancel();
+        let (executed, messages) = execute_tool_calls(
+            &calls,
+            &tools,
+            signal,
+            &ctx,
+            &AgentLoopConfig::default(),
+            &RecordingSink(std::sync::Mutex::new(Vec::new())),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(executed.len(), 3, "every slot is settled");
+        assert!(
+            executed.iter().all(|e| e.result.is_error),
+            "all results are errors: {executed:?}"
+        );
+        assert_eq!(messages.len(), 3);
+        assert!(
+            trace.lock().unwrap().is_empty(),
+            "no tool ran after cancellation"
+        );
+    }
+
+    /// Test 6: Empty batch and single call degeneracy.
+    #[tokio::test]
+    async fn test_empty_batch_returns_empty() {
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let signal = CancellationToken::new();
+        let config = AgentLoopConfig::default();
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+
+        let (executed, messages) =
+            execute_tool_calls(&[], &tools, signal, &ctx, &config, &sink, false)
+                .await
+                .unwrap();
+
+        assert!(executed.is_empty());
+        assert!(messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_single_call_works() {
+        let trace: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools: Vec<std::sync::Arc<dyn AgentTool>> = vec![make_fake(
+            "Write",
+            false,
+            ExecutionMode::Parallel,
+            None,
+            None,
+            trace,
+        )];
+
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let signal = CancellationToken::new();
+        let config = AgentLoopConfig::default();
+        let sink = RecordingSink(std::sync::Mutex::new(Vec::new()));
+
+        let calls = [call("c1", "Write", Some("/a"))];
+
+        let (executed, messages) =
+            execute_tool_calls(&calls, &tools, signal, &ctx, &config, &sink, false)
+                .await
+                .unwrap();
+
+        assert_eq!(executed.len(), 1);
+        assert_eq!(messages.len(), 1);
+        assert!(!executed[0].result.is_error);
     }
 }

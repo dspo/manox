@@ -560,21 +560,8 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(steps) => format!("UpdatePlan ({} steps)", steps.len()),
             None => "UpdatePlan".to_string(),
         },
-        "TaskCreate" => match arg("subject") {
-            Some(subject) => format!("TaskCreate {subject}"),
-            None => "TaskCreate".to_string(),
-        },
-        "TaskUpdate" => match arg("id") {
-            Some(id) => match arg("status") {
-                Some(status) => format!("TaskUpdate {id}→{status}"),
-                None => format!("TaskUpdate {id}"),
-            },
-            None => "TaskUpdate".to_string(),
-        },
-        "TaskGet" => match arg("id") {
-            Some(id) => format!("TaskGet {id}"),
-            None => "TaskGet".to_string(),
-        },
+        // Task tools were removed in the tools-optimization cycle — they
+        // were retired with the Steer-based team architecture.
         "CreateGoal" => match arg("objective") {
             Some(objective) => format!("CreateGoal {}", short_value(&objective, 40)),
             None => "CreateGoal".to_string(),
@@ -582,10 +569,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
         "UpdateGoal" => match arg("status") {
             Some(status) => format!("UpdateGoal {status}"),
             None => "UpdateGoal".to_string(),
-        },
-        "LspStatus" | "LspEnsure" | "LspWaitReady" => match arg("language") {
-            Some(language) => format!("{name} {language}"),
-            None => name.to_string(),
         },
         "GoToDefinition" | "FindReferences" | "Hover" => {
             let line = args.get("line").and_then(|v| v.as_u64());
@@ -997,16 +980,7 @@ mod tests {
             ),
             "UpdatePlan (2 steps)"
         );
-        assert_eq!(
-            tool_title("TaskCreate", &json!({"subject": "fix bug"})),
-            "TaskCreate fix bug"
-        );
-        assert_eq!(
-            tool_title("TaskUpdate", &json!({"id": "t1", "status": "completed"})),
-            "TaskUpdate t1→completed"
-        );
-        assert_eq!(tool_title("TaskGet", &json!({"id": "t1"})), "TaskGet t1");
-        assert_eq!(tool_title("TaskList", &json!({})), "TaskList");
+        // Task tools were removed in the tools-optimization cycle.
         assert_eq!(tool_title("GetGoal", &json!({})), "GetGoal");
         assert_eq!(
             tool_title("UpdateGoal", &json!({"status": "complete"})),
@@ -1037,10 +1011,6 @@ mod tests {
         assert_eq!(
             tool_title("TaskStop", &json!({"task_id": "mon_2"})),
             "TaskStop mon_2"
-        );
-        assert_eq!(
-            tool_title("LspEnsure", &json!({"language": "rust"})),
-            "LspEnsure rust"
         );
         assert_eq!(
             tool_title(

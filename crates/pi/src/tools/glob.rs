@@ -2,8 +2,13 @@
 //
 // Uses `ignore` for filesystem traversal and `globset` for pattern matching.
 // No shell execution — the LLM's input is treated as data, not as a command string.
+//
+// Supports mtime filtering, kind (files/dirs), and mtime-sorted output.
+// Use Bash with `find` only when the glob pattern language is insufficient
+// (e.g. complex boolean predicates, custom sort, multi-pattern combinations).
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
@@ -31,7 +36,11 @@ impl AgentTool for GlobTool {
     }
 
     fn description(&self) -> &str {
-        "Find files matching a glob pattern"
+        "Find files matching a glob pattern. Use this over `find` in Bash for \
+         simple tree searches: no sandbox, no approval in read-only mode. \
+         Supports mtime filtering, kind (files/dirs), and mtime-sorted output. \
+         Use Bash `find` only when the glob language is insufficient (complex \
+         boolean predicates, custom sort, multi-pattern combinations)."
     }
 
     fn is_read_only(&self) -> bool {
@@ -57,6 +66,20 @@ impl AgentTool for GlobTool {
                 "limit": {
                     "type": "integer",
                     "description": "Maximum number of results to return"
+                },
+                "modified_within_secs": {
+                    "type": "integer",
+                    "description": "Only return entries modified within this many seconds from now"
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["files", "dirs"],
+                    "description": "Filter to only files or only directories. Omit for both"
+                },
+                "sort_by_mtime": {
+                    "type": "string",
+                    "enum": ["asc", "desc"],
+                    "description": "Sort results by modification time, ascending or descending"
                 }
             },
             "required": ["pattern"]
@@ -78,6 +101,9 @@ impl AgentTool for GlobTool {
             .as_u64()
             .map(|v| v as usize)
             .unwrap_or(Self::DEFAULT_LIMIT);
+        let modified_within_secs = params["modified_within_secs"].as_u64();
+        let kind = params["kind"].as_str();
+        let sort_by_mtime = params["sort_by_mtime"].as_str();
 
         let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
             .map_err(ToolError::InvalidArguments)?;
@@ -92,7 +118,21 @@ impl AgentTool for GlobTool {
             .build()
             .map_err(|e| ToolError::InvalidArguments(format!("invalid glob: {e}")))?;
 
-        let mut results: Vec<String> = Vec::new();
+        let now = SystemTime::now();
+        let cutoff = modified_within_secs.map(|secs| {
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(secs)
+        });
+
+        // Collect entries with optional metadata for sorting/filtering.
+        struct Entry {
+            path: String,
+            mtime: Option<u64>,
+        }
+
+        let mut entries: Vec<Entry> = Vec::new();
 
         let walker = WalkBuilder::new(&search_path)
             .hidden(false)
@@ -109,7 +149,19 @@ impl AgentTool for GlobTool {
                 Err(_) => continue,
             };
 
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let ft = entry.file_type();
+            let is_file = ft.is_some_and(|ft| ft.is_file());
+            let is_dir = ft.is_some_and(|ft| ft.is_dir());
+
+            // Apply kind filter.
+            match kind {
+                Some("files") if !is_file => continue,
+                Some("dirs") if !is_dir => continue,
+                _ => {}
+            }
+
+            // Only files and dirs, skip other types.
+            if !is_file && !is_dir {
                 continue;
             }
 
@@ -117,10 +169,6 @@ impl AgentTool for GlobTool {
 
             if !glob_set.is_match(path) {
                 continue;
-            }
-
-            if results.len() >= limit {
-                break;
             }
 
             // Emit paths relative to the search root. Searching a single file
@@ -135,13 +183,50 @@ impl AgentTool for GlobTool {
                 Err(_) => path.display().to_string(),
             };
 
-            results.push(display_path);
+            // Get mtime for filtering and sorting.
+            let mtime = std::fs::metadata(path).ok().and_then(|m| {
+                m.modified().ok().and_then(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs())
+                })
+            });
+
+            // Apply mtime filter.
+            if let Some(cutoff) = cutoff {
+                match mtime {
+                    Some(mtime) if mtime < cutoff => continue,
+                    None => continue, // skip if we can't get mtime and filter is active
+                    _ => {}
+                }
+            }
+
+            entries.push(Entry {
+                path: display_path,
+                mtime,
+            });
         }
 
-        if results.is_empty() {
+        // Sort by mtime if requested.
+        if let Some(order) = sort_by_mtime {
+            match order {
+                "asc" => entries.sort_by_key(|e| e.mtime),
+                "desc" => {
+                    entries.sort_by_key(|e| std::cmp::Reverse(e.mtime));
+                }
+                _ => {}
+            }
+        }
+
+        if entries.is_empty() {
             return Ok(AgentToolResult::text("No files found"));
         }
 
+        let results: Vec<&str> = entries
+            .iter()
+            .take(limit)
+            .map(|e| e.path.as_str())
+            .collect();
         let joined = results.join("\n");
 
         // Truncate if too large.
@@ -155,7 +240,7 @@ impl AgentTool for GlobTool {
         if result.was_truncated {
             output.push_str(&format!(
                 "\n\n[glob: {} files, {} lines, {} bytes — output truncated]",
-                results.len(),
+                entries.len(),
                 result.original_lines,
                 result.original_bytes
             ));

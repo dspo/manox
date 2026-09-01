@@ -1,13 +1,17 @@
-//! Agent-routing vocabulary and task tools that outlived the retired
-//! `Entity<Team>` roster machinery (deleted — see git history).
+//! Agent-routing vocabulary that outlived the retired `Entity<Team>`
+//! roster machinery (deleted — see git history).
 //!
 //! The live `TeamMember` flow (Steer `spawn="TeamMember"`) creates real
 //! threads that coordinate through the Steer bus; what remains here is the
 //! shared attribution primitives (`LEADER_NAME`, `author_for`,
-//! [`PeerMessage`]) used by the bus's member-message path, plus the task
-//! tools operating on the bus-owned `PlainTaskList`.
+//! [`PeerMessage`]) used by the bus's member-message path.
+//!
+//! Task tools (TaskCreate/TaskList/TaskUpdate/TaskGet) were removed in the
+//! tools-optimization cycle — they were retired with the Steer-based team
+//! architecture and UpdatePlan provides a strictly better alternative.
 
-pub mod tools;
+// Task tools module removed in the tools-optimization cycle.
+// pub mod tools;
 
 use crate::message::MessageAuthor;
 

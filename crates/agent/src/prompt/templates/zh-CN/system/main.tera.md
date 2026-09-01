@@ -3,7 +3,16 @@
 ## 可用技能（通过 `skill` 工具按需查阅完整内容）
 {% for s in skills -%}
 - {{ s.name }}：{{ s.description }}
-{% endfor %}{% endif %}
+{% endfor %}{% endif %}{% if lsp_ready_specs %}
+
+## LSP 就绪
+{{ lsp_ready_specs }}{% endif %}
+
+## 工具偏好
+优先使用 Grep/Glob/Ls 工具而非 Bash 中的原始 grep/find/ls——无沙箱、只读模式下无需审批、输出结构化有界。仅在工具功能不足时（管道、复杂标志、链式命令）才使用 Bash shell 命令。
+
+## 并发模型
+前台工具调用（无 `run_in_background` 的 Bash）阻塞当前轮次。后台 Bash（`run_in_background: true`）立即返回，完成时唤醒空闲会话——切勿使用 `sleep` 或轮询循环等待后台任务。`Monitor` 持续流式推送事件，适用于长时间观察（日志 tail、事件流）。使用 `BashOutput` 获取完整输出，`TaskStop` 取消任务。
 
 ## 语言
 
