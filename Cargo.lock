@@ -143,14 +143,13 @@ dependencies = [
  "gpui-component-assets",
  "manox-agent",
  "manox-components",
+ "manox-harness",
  "manox-protocol",
  "manox-providers",
  "manox-session-core",
  "manox-terminal",
  "manox-webview",
  "open",
- "pi",
- "pi-extensions",
  "rust-embed",
  "serde",
  "serde_json",
@@ -5463,10 +5462,9 @@ dependencies = [
  "lsp",
  "lsp-types",
  "manox-agent",
+ "manox-harness",
  "manox-providers",
  "parking_lot",
- "pi",
- "pi-extensions",
  "reqwest 0.12.28",
  "rmcp",
  "rquickjs",
@@ -5503,6 +5501,44 @@ dependencies = [
  "ropey",
  "unicode-linebreak",
  "vte",
+]
+
+[[package]]
+name = "manox-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "async-trait",
+ "brush-builtins",
+ "brush-core",
+ "chrono",
+ "dirs",
+ "futures",
+ "globset",
+ "grep-regex",
+ "grep-searcher",
+ "http",
+ "ignore",
+ "jsonschema",
+ "libc",
+ "native-tls",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "similar",
+ "tempfile",
+ "tera",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-native-tls",
+ "tokio-tungstenite 0.24.0",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5553,10 +5589,9 @@ dependencies = [
  "chrono",
  "futures",
  "manox-agent",
+ "manox-harness",
  "manox-protocol",
  "parking_lot",
- "pi",
- "pi-extensions",
  "serde_json",
  "tokio",
  "tokio-util",
@@ -7178,64 +7213,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
 dependencies = [
  "siphasher 1.0.3",
-]
-
-[[package]]
-name = "pi"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "async-trait",
- "chrono",
- "futures",
- "globset",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "jsonschema",
- "libc",
- "regex",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "serde_yaml",
- "similar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "pi-extensions"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "brush-builtins",
- "brush-core",
- "chrono",
- "dirs",
- "futures",
- "http",
- "libc",
- "native-tls",
- "pi",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tera",
- "thiserror 1.0.69",
- "tokio",
- "tokio-native-tls",
- "tokio-tungstenite 0.24.0",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

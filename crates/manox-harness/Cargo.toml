@@ -1,0 +1,46 @@
+[package]
+name = "manox-harness"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["fs", "process", "time", "sync", "io-util", "macros", "rt-multi-thread"] }
+tokio-util.workspace = true
+tokio-tungstenite.workspace = true
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_yaml.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+globset.workspace = true
+ignore.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+similar.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+async-trait = "0.1"
+jsonschema.workspace = true
+libc.workspace = true
+http = "1"
+dirs = "6"
+brush-core.workspace = true
+brush-builtins.workspace = true
+tera.workspace = true
+tempfile = "3"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "fs", "net", "io-util"] }
+tempfile = "3"
+
+[lints.clippy]
+dbg_macro = "deny"

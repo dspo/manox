@@ -1,4 +1,4 @@
-//! The pi harness engine: drives a `pi::coding_agent::AgentSession` from a
+//! The pi harness engine: drives a `manox_harness::coding_agent::AgentSession` from a
 //! tokio actor and adapts its events onto the UI's `ThreadEvent` language.
 //!
 //! This is the first-class harness backend behind the `Thread` facade: the
@@ -12,16 +12,16 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pi::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
-use pi::ext_point_agent::AgentRegistry;
-use pi::tool::AgentTool as PiAgentTool;
-use pi::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiModel};
-use pi_extensions::agents::{SubagentTool, register_defaults};
-use pi_extensions::bash::BashTool;
-use pi_extensions::bash::orchestration::BackgroundManager;
-use pi_extensions::bash::persistent::PersistentShellOperations;
-use pi_extensions::monitor::{MonitorManager, MonitorTool};
-use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
+use manox_harness::agents::{SubagentTool, register_defaults};
+use manox_harness::bash::BashTool;
+use manox_harness::bash::orchestration::BackgroundManager;
+use manox_harness::bash::persistent::PersistentShellOperations;
+use manox_harness::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
+use manox_harness::ext_point_agent::AgentRegistry;
+use manox_harness::monitor::{MonitorManager, MonitorTool};
+use manox_harness::tool::AgentTool as PiAgentTool;
+use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiModel};
+use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
@@ -43,13 +43,13 @@ pub(crate) enum SessionCmd {
     /// Start a turn with the given user text and attached images.
     Prompt {
         text: String,
-        images: Vec<pi::types::ContentBlock>,
+        images: Vec<manox_harness::types::ContentBlock>,
     },
     /// Inject a steer into the running turn.
     Steer {
         id: String,
         text: String,
-        images: Vec<pi::types::ContentBlock>,
+        images: Vec<manox_harness::types::ContentBlock>,
     },
     /// Retract a queued steer.
     CancelSteer(String),
@@ -305,7 +305,7 @@ fn spawn_history_preview(
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
 ) {
     crate::runtime::handle().spawn(async move {
-        let mut stream = match pi_extensions::session_stream::SessionTranscriptStream::open(&path)
+        let mut stream = match manox_harness::session_stream::SessionTranscriptStream::open(&path)
             .await
         {
             Ok(stream) => stream,
@@ -324,7 +324,7 @@ fn spawn_history_preview(
             }
             let msgs: Vec<HistoryEntry> = entries
                 .iter()
-                .flat_map(pi::session::session_entry_to_context_messages)
+                .flat_map(manox_harness::session::session_entry_to_context_messages)
                 .flat_map(|m| adapt::harness_messages_to_messages(std::slice::from_ref(&m)))
                 .map(HistoryEntry::Message)
                 .collect();
@@ -390,7 +390,7 @@ impl ThreadEngine for PiEngine {
         self.state.model.lock().unwrap().clone()
     }
 
-    fn run(&self, prompt: String, images: Vec<pi::types::ContentBlock>) {
+    fn run(&self, prompt: String, images: Vec<manox_harness::types::ContentBlock>) {
         if let Some(title) = crate::title::initial_title(&prompt) {
             let _ = self.cmd_tx.send(SessionCmd::SetInitialTitle(title));
         }
@@ -400,7 +400,7 @@ impl ThreadEngine for PiEngine {
         });
     }
 
-    fn steer(&self, text: String, images: Vec<pi::types::ContentBlock>) -> String {
+    fn steer(&self, text: String, images: Vec<manox_harness::types::ContentBlock>) -> String {
         let id = uuid::Uuid::new_v4().to_string();
         let _ = self.cmd_tx.send(SessionCmd::Steer {
             id: id.clone(),
@@ -524,7 +524,7 @@ impl ThreadEngine for PiEngine {
 /// Write/Edit (write), and Bash (exec); `tools: []` means the full
 /// snapshot. The tag rides the `AgentToolDescription` template so the model
 /// knows what each subagent can do before dispatching.
-fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
+fn subagent_capability(def: &manox_harness::ext_point_agent::AgentDef) -> &'static str {
     if def.tools.is_empty() {
         return "write+bash";
     }
@@ -538,7 +538,7 @@ fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
     }
 }
 
-/// Host wrapper around `pi_extensions::bash::BashTool` for the subagent
+/// Host wrapper around `manox_harness::bash::BashTool` for the subagent
 /// snapshot. A Sailor is already an async primitive, so a background bash
 /// inside a subagent session is pointless AND dangerous — the subagent's
 /// registry has no manager/seatbelt-wrap, so `run_in_background` would
@@ -548,7 +548,7 @@ fn subagent_capability(def: &pi::ext_point_agent::AgentDef) -> &'static str {
 /// for the subagent context (one-shot, no state persistence, no gating
 /// claim) since the kernel BashTool's static text assumes the host session.
 struct SubagentBashTool {
-    inner: Arc<dyn pi::tool::AgentTool>,
+    inner: Arc<dyn manox_harness::tool::AgentTool>,
 }
 
 const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs in a fresh \
@@ -559,7 +559,7 @@ const SUBAGENT_BASH_DESCRIPTION: &str = "Execute a shell command. Each call runs
     instead of piping through `head`/`tail`.";
 
 #[async_trait::async_trait]
-impl pi::tool::AgentTool for SubagentBashTool {
+impl manox_harness::tool::AgentTool for SubagentBashTool {
     fn name(&self) -> &str {
         "Bash"
     }
@@ -572,7 +572,7 @@ impl pi::tool::AgentTool for SubagentBashTool {
     fn requires_approval(&self, params: &serde_json::Value) -> bool {
         self.inner.requires_approval(params)
     }
-    fn execution_mode(&self) -> pi::tool::ExecutionMode {
+    fn execution_mode(&self) -> manox_harness::tool::ExecutionMode {
         // Delegate: the kernel BashTool declares Sequential (a stateful
         // persistent shell on non-macOS); the wrapper must inherit it so a
         // single Sailor session doesn't interleave parallel bash state.
@@ -597,10 +597,10 @@ impl pi::tool::AgentTool for SubagentBashTool {
         tool_call_id: &str,
         params: serde_json::Value,
         signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
         if params["run_in_background"].as_bool().unwrap_or(false) {
-            return Err(pi::tool::ToolError::ExecutionFailed(
+            return Err(manox_harness::tool::ToolError::ExecutionFailed(
                 "`run_in_background` is not available inside a subagent session — the subagent \
                  itself is the async primitive. Run the command in the foreground instead."
                     .into(),
@@ -614,11 +614,11 @@ impl pi::tool::AgentTool for SubagentBashTool {
         tool_call_id: &str,
         params: serde_json::Value,
         signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-        progress: &dyn pi::tool::ToolProgress,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        ctx: &dyn manox_harness::tool::ToolContext,
+        progress: &dyn manox_harness::tool::ToolProgress,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
         if params["run_in_background"].as_bool().unwrap_or(false) {
-            return Err(pi::tool::ToolError::ExecutionFailed(
+            return Err(manox_harness::tool::ToolError::ExecutionFailed(
                 "`run_in_background` is not available inside a subagent session — the subagent \
                  itself is the async primitive. Run the command in the foreground instead."
                     .into(),
@@ -630,7 +630,7 @@ impl pi::tool::AgentTool for SubagentBashTool {
     }
 }
 
-/// Host wrapper around `pi_extensions::bash::TaskStopTool` that also stops
+/// Host wrapper around `manox_harness::bash::TaskStopTool` that also stops
 /// legacy-registry tasks (asynchronously-dispatched Sailors). The kernel
 /// `TaskStopTool` only knows the pi-extensions bash/monitor registries; a
 /// Sailor registers in the legacy `background_task` registry, so the model
@@ -647,7 +647,7 @@ const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a backgroun
     task settles to Stopped. Idempotent for an already-terminal task.";
 
 #[async_trait::async_trait]
-impl pi::tool::AgentTool for LegacyAwareTaskStop {
+impl manox_harness::tool::AgentTool for LegacyAwareTaskStop {
     fn name(&self) -> &str {
         "TaskStop"
     }
@@ -669,16 +669,16 @@ impl pi::tool::AgentTool for LegacyAwareTaskStop {
         tool_call_id: &str,
         params: serde_json::Value,
         signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
         // Legacy tasks (Sailors) live in background_task; stop there first.
         if let Some(id) = params["task_id"].as_str()
             && crate::background_task::get_by_str(id).is_some()
         {
             crate::background_task::stop(id)
                 .await
-                .map_err(pi::tool::ToolError::ExecutionFailed)?;
-            return Ok(pi::tool::AgentToolResult::text(format!(
+                .map_err(manox_harness::tool::ToolError::ExecutionFailed)?;
+            return Ok(manox_harness::tool::AgentToolResult::text(format!(
                 "Stopped background task `{id}`"
             )));
         }
@@ -691,9 +691,9 @@ impl pi::tool::AgentTool for LegacyAwareTaskStop {
         tool_call_id: &str,
         params: serde_json::Value,
         signal: tokio_util::sync::CancellationToken,
-        ctx: &dyn pi::tool::ToolContext,
-        _progress: &dyn pi::tool::ToolProgress,
-    ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
+        ctx: &dyn manox_harness::tool::ToolContext,
+        _progress: &dyn manox_harness::tool::ToolProgress,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
         // TaskStop never streams; route both entry points through execute.
         self.execute(tool_call_id, params, signal, ctx).await
     }
@@ -808,15 +808,15 @@ fn build_tools(
     // wider mode here for exactly one call; the sandboxed backend's mode
     // resolver reads it before the standing session mode.
     let grant_cell: Arc<std::sync::atomic::AtomicI64> = Arc::new(
-        std::sync::atomic::AtomicI64::new(pi_extensions::sandbox::NO_GRANT),
+        std::sync::atomic::AtomicI64::new(manox_harness::sandbox::NO_GRANT),
     );
-    let bash_ops: Arc<dyn pi::tools::bash::BashOperations> = if sandbox_available {
+    let bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> = if sandbox_available {
         let sandbox_mode_gate = Arc::clone(gate);
         let cell_for_resolver = Arc::clone(&grant_cell);
         let sandbox_mode_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
             Arc::new(move || {
                 let g = cell_for_resolver.load(std::sync::atomic::Ordering::SeqCst);
-                if g != pi_extensions::sandbox::NO_GRANT {
+                if g != manox_harness::sandbox::NO_GRANT {
                     PermissionMode::from_i64(g)
                 } else {
                     sandbox_mode_gate.mode()
@@ -828,7 +828,7 @@ fn build_tools(
             sandbox_mode_resolver,
         ));
         let wrap_ops = Arc::clone(&ops);
-        let wrap: pi_extensions::bash::background::SandboxCommandBuilder =
+        let wrap: manox_harness::bash::background::SandboxCommandBuilder =
             Arc::new(move |command, cwd| wrap_ops.wrap_background(command, cwd));
         background = Arc::new(BackgroundRegistry::new().with_sandbox(wrap));
         ops
@@ -837,7 +837,8 @@ fn build_tools(
     };
     // Subagent snapshot inherits the same seatbelt backend so a Sailor's
     // Bash is confined exactly like the Captain's (B4: no ungated bypass).
-    let subagent_bash_ops: Arc<dyn pi::tools::bash::BashOperations> = Arc::clone(&bash_ops);
+    let subagent_bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
+        Arc::clone(&bash_ops);
     let subagent_background = Arc::new(BackgroundRegistry::new());
     let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
     let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
@@ -846,9 +847,9 @@ fn build_tools(
     // an approved `sandbox_permissions` grant). Installed only where a
     // seatbelt exists to escape from; on other platforms the default backend
     // is already unsandboxed.
-    let unsandboxed_ops: Option<Arc<dyn pi::tools::bash::BashOperations>> =
+    let unsandboxed_ops: Option<Arc<dyn manox_harness::tools::bash::BashOperations>> =
         sandbox_available.then(|| {
-            let ops: Arc<dyn pi::tools::bash::BashOperations> =
+            let ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
                 Arc::new(crate::sandbox::UnsandboxedBashOperations::new(cwd));
             ops
         });
@@ -857,7 +858,7 @@ fn build_tools(
     let standing_gate = Arc::clone(gate);
     let standing_resolver: Arc<dyn Fn() -> PermissionMode + Send + Sync> =
         Arc::new(move || standing_gate.mode());
-    let escalation_approver: Arc<dyn pi_extensions::sandbox::EscalationApprover + Send + Sync> =
+    let escalation_approver: Arc<dyn manox_harness::sandbox::EscalationApprover + Send + Sync> =
         Arc::new(crate::approval::GateEscalationApprover::new(Arc::clone(
             gate,
         )));
@@ -873,25 +874,25 @@ fn build_tools(
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
         // Read with oh-my-pi path selectors (`path:N-M` / `:raw` / multi-range);
         // selector-less reads delegate to the kernel ReadTool unchanged.
-        Arc::new(pi_extensions::read::SelectorReadTool::new()),
+        Arc::new(manox_harness::read::SelectorReadTool::new()),
         // Write/Edit carry the process write lock for their execution window:
         // concurrent writers to the same path get a named-holder conflict
         // instead of silently clobbering each other (old manox file_lock
         // semantics; owner stays "main" until the team system lands).
         Arc::new(crate::file_lock::FileLockedTool::new(
-            Arc::new(pi::tools::write::WriteTool),
+            Arc::new(manox_harness::tools::write::WriteTool),
             "main",
         )),
         Arc::new(crate::file_lock::FileLockedTool::new(
             Arc::new(
-                pi::tools::edit::EditTool::default()
+                manox_harness::tools::edit::EditTool::default()
                     .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
             ),
             "main",
         )),
-        Arc::new(pi::tools::grep::GrepTool),
-        Arc::new(pi::tools::glob::GlobTool),
-        Arc::new(pi::tools::ls::LsTool),
+        Arc::new(manox_harness::tools::grep::GrepTool),
+        Arc::new(manox_harness::tools::glob::GlobTool),
+        Arc::new(manox_harness::tools::ls::LsTool),
         Arc::new(bash),
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
@@ -1085,7 +1086,7 @@ fn build_tools(
     // present (Dispatch returns an error until set_subagent_tool is called).
     tools.push(Arc::new(crate::steer_bus::SteerTool::new(
         Arc::clone(bus),
-        pi_extensions::steer_bus::AgentId::Captain,
+        manox_harness::steer_bus::AgentId::Captain,
     )));
     // The watchdog's pull surface: the Captain queries live subagent health
     // (working / tool running / stalled / looping) before deciding to
@@ -1133,11 +1134,14 @@ fn build_tools(
                 .is_some_and(|c| c == "read-only")
         })
     };
-    let sailor_ctx: Arc<dyn pi::tool::ToolContext> = Arc::new(pi::tool::LocalToolContext::new(
-        Arc::new(pi::env::TokioExecutionEnv::new(cwd.to_path_buf())),
-        cwd.to_path_buf(),
-        Arc::new(pi::tool::ToolState::new()),
-    ));
+    let sailor_ctx: Arc<dyn manox_harness::tool::ToolContext> =
+        Arc::new(manox_harness::tool::LocalToolContext::new(
+            Arc::new(manox_harness::env::TokioExecutionEnv::new(
+                cwd.to_path_buf(),
+            )),
+            cwd.to_path_buf(),
+            Arc::new(manox_harness::tool::ToolState::new()),
+        ));
     let subagent_description = match crate::prompt::render(
         crate::prompt::PromptTemplate::AgentToolDescription,
         crate::language::Language::En,
@@ -1164,8 +1168,8 @@ fn build_tools(
             // Dedicated per-type models from the cx providers config's
             // `subagents:` map; an unreadable config warns and leaves
             // subagents inheriting the thread model.
-            let overrides = pi_extensions::provider::load_subagent_models(
-                pi_extensions::provider::default_config_path(),
+            let overrides = manox_harness::provider::load_subagent_models(
+                manox_harness::provider::default_config_path(),
             )
             .unwrap_or_else(|e| {
                 tracing::warn!(
@@ -1185,10 +1189,10 @@ fn build_tools(
             let subagent = SubagentTool::new(
                 registry.clone(),
                 vec![
-                    Arc::new(pi_extensions::read::SelectorReadTool::new()),
-                    Arc::new(pi::tools::grep::GrepTool),
-                    Arc::new(pi::tools::glob::GlobTool),
-                    Arc::new(pi::tools::ls::LsTool),
+                    Arc::new(manox_harness::read::SelectorReadTool::new()),
+                    Arc::new(manox_harness::tools::grep::GrepTool),
+                    Arc::new(manox_harness::tools::glob::GlobTool),
+                    Arc::new(manox_harness::tools::ls::LsTool),
                     // Write/exec axis: definitions that opt into the full
                     // snapshot (e.g. Sailor, `tools: []`) get these; read-only
                     // definitions (Explore) name an explicit allowlist that
@@ -1199,7 +1203,7 @@ fn build_tools(
                     // surface a named-holder conflict instead of silently racing.
                     Arc::new(SubagentBashTool {
                         inner: Arc::new(
-                            pi_extensions::bash::BashTool::new(
+                            manox_harness::bash::BashTool::new(
                                 Arc::clone(&subagent_bash_ops),
                                 subagent_background.clone(),
                             )
@@ -1207,14 +1211,15 @@ fn build_tools(
                         ),
                     }),
                     Arc::new(crate::file_lock::FileLockedTool::new(
-                        Arc::new(pi::tools::write::WriteTool),
+                        Arc::new(manox_harness::tools::write::WriteTool),
                         "sailor",
                     )),
                     Arc::new(crate::file_lock::FileLockedTool::new(
                         Arc::new(
-                            pi::tools::edit::EditTool::default().with_enforce_seen_lines(
-                                crate::settings::edit().enforce_seen_lines,
-                            ),
+                            manox_harness::tools::edit::EditTool::default()
+                                .with_enforce_seen_lines(
+                                    crate::settings::edit().enforce_seen_lines,
+                                ),
                         ),
                         "sailor",
                     )),
@@ -1401,7 +1406,7 @@ fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
 #[allow(clippy::too_many_arguments)] // drive plumbing: each input is a distinct sink
 async fn drive_run<F>(
     run: F,
-    handle: &pi::harness::HarnessHandle,
+    handle: &manox_harness::harness::HarnessHandle,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
     run_steers: &mut Vec<String>,
     shutdown_after_run: &mut bool,
@@ -1532,7 +1537,7 @@ async fn settle_run(
     abort_requested: bool,
     session: &AgentSession,
     state: &Arc<EngineState>,
-    repo: &pi::session::repository::SessionRepository,
+    repo: &manox_harness::session::repository::SessionRepository,
     sessions_dir: &Path,
     cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -1629,7 +1634,7 @@ async fn goal_housekeeping(
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 async fn chain_goal_rounds(
     session: &mut AgentSession,
-    handle: &pi::harness::HarnessHandle,
+    handle: &manox_harness::harness::HarnessHandle,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
     run_steers: &mut Vec<String>,
     shutdown_after_run: &mut bool,
@@ -1637,7 +1642,7 @@ async fn chain_goal_rounds(
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     pi_model: &mut PiModel,
-    repo: &pi::session::repository::SessionRepository,
+    repo: &manox_harness::session::repository::SessionRepository,
     sessions_dir: &Path,
     cwd: &Path,
     session_path: &Path,
@@ -1699,7 +1704,7 @@ fn subscribe_session(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     live: Arc<Mutex<LiveTranscript>>,
     title: TitleScheduler,
-) -> pi::agent::Subscription {
+) -> manox_harness::agent::Subscription {
     let event_tx = notice_tx.clone();
     // Seed the live mirror with the completed transcript so a mid-run tick
     // never drops restored history; the listener below appends from here.
@@ -1852,7 +1857,7 @@ fn subscribe_harness_events(
     session_path: PathBuf,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     wakeup_tx: &mpsc::UnboundedSender<()>,
-) -> pi::harness::HarnessSubscription {
+) -> manox_harness::harness::HarnessSubscription {
     let tx = notice_tx.clone();
     let wake = wakeup_tx.clone();
     session.subscribe_harness(Arc::new(move |event| match event {
@@ -1860,15 +1865,15 @@ fn subscribe_harness_events(
         // actor decides whether the session is idle and resumes it
         // (`continue_` drains the steering queue first) — the listener stays
         // stateless and never touches the session itself.
-        pi::harness::HarnessEvent::QueueUpdate { steer, .. } if steer > 0 => {
+        manox_harness::harness::HarnessEvent::QueueUpdate { steer, .. } if steer > 0 => {
             let _ = wake.send(());
         }
-        pi::harness::HarnessEvent::CompactionStart { .. } => {
+        manox_harness::harness::HarnessEvent::CompactionStart { .. } => {
             let _ = tx.send(BackendNotice::Event(Box::new(
                 ThreadEvent::CompactionStarted { tokens_before: 0 },
             )));
         }
-        pi::harness::HarnessEvent::CompactionEnd {
+        manox_harness::harness::HarnessEvent::CompactionEnd {
             result: Some(result),
             aborted: false,
             ..
@@ -1924,7 +1929,7 @@ fn session_builder(
     parent_session: Option<&str>,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
-    pi::coding_agent::AgentSessionBuilder,
+    manox_harness::coding_agent::AgentSessionBuilder,
     SessionOrchestrators,
     crate::plan_mode::ReadOnlySubagentResolver,
 ) {
@@ -1944,13 +1949,13 @@ fn session_builder(
         .with_cwd(cwd.to_path_buf())
         .with_session_dir(sessions_dir.to_path_buf())
         .with_model_runtime(runtime.clone())
-        .with_system_prompt_builder(pi_extensions::prompt::captain_prompt_builder(
-            pi_extensions::prompt::CaptainConfig {
+        .with_system_prompt_builder(manox_harness::prompt::captain_prompt_builder(
+            manox_harness::prompt::CaptainConfig {
                 cwd: cwd.to_path_buf(),
                 today: chrono::Local::now().format("%Y-%m-%d").to_string(),
                 skills: crate::skill::summaries_or_empty()
                     .into_iter()
-                    .map(|s| pi_extensions::prompt::SkillSummary {
+                    .map(|s| manox_harness::prompt::SkillSummary {
                         name: s.name,
                         description: s.description,
                     })
@@ -2013,12 +2018,12 @@ fn attach_plan_hooks(
     read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver,
 ) {
     session.on(
-        pi::harness::HookPoint::BeforeAgentStart,
+        manox_harness::harness::HookPoint::BeforeAgentStart,
         crate::plan_mode::injection_handler(Arc::clone(plan)),
     );
     let plans_dir = crate::paths::plans_dir().unwrap_or_else(|_| PathBuf::from(".manox/plans"));
     session.on(
-        pi::harness::HookPoint::ToolCall,
+        manox_harness::harness::HookPoint::ToolCall,
         crate::plan_mode::gate_handler(
             Arc::clone(plan),
             plans_dir,
@@ -2034,12 +2039,12 @@ fn attach_plan_hooks(
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
 /// every turn (TS project-instruction semantics). Skills/templates stay
 /// empty here — manox skills ride the `manox_agent::skill` registry instead.
-fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
+fn instruction_resources(cwd: &Path) -> manox_harness::harness::HarnessResources {
     let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
     let context_files = set
         .eager
         .iter()
-        .map(|src| pi::harness::ContextFile {
+        .map(|src| manox_harness::harness::ContextFile {
             name: src
                 .path
                 .file_name()
@@ -2049,7 +2054,7 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
             content: src.content.clone(),
         })
         .collect();
-    pi::harness::HarnessResources {
+    manox_harness::harness::HarnessResources {
         skills: Vec::new(),
         prompt_templates: Vec::new(),
         context_files,
@@ -2060,11 +2065,11 @@ fn instruction_resources(cwd: &Path) -> pi::harness::HarnessResources {
 /// fire-and-forget shell-outs). Notification-only; never blocks a call.
 fn attach_plugin_hooks(session: &mut AgentSession, cwd: &Path) {
     session.on(
-        pi::harness::HookPoint::ToolCall,
+        manox_harness::harness::HookPoint::ToolCall,
         crate::plugin_hooks::pre_tool_call_handler(cwd.to_path_buf()),
     );
     session.on(
-        pi::harness::HookPoint::ToolResult,
+        manox_harness::harness::HookPoint::ToolResult,
         crate::plugin_hooks::post_tool_result_handler(cwd.to_path_buf()),
     );
 }
@@ -2117,7 +2122,7 @@ async fn run_actor(
     // Restore the requested session, else the newest one, else start fresh.
     // Tool cwd follows the restored session's project dir (the builder's
     // `open` re-pins cwd too).
-    let repo = pi::session::repository::SessionRepository::new(&sessions_dir);
+    let repo = manox_harness::session::repository::SessionRepository::new(&sessions_dir);
     // `fresh` threads (sidebar new-conversation, project-bound creation)
     // never inherit the previous session; startup and explicit opens do.
     let latest = if fresh {
@@ -2309,7 +2314,7 @@ async fn run_actor(
     }
     let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
     let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
-    let restored_title = pi_extensions::session_meta::load(&sessions_dir, session.path())
+    let restored_title = manox_harness::session_meta::load(&sessions_dir, session.path())
         .await
         .ok()
         .and_then(|meta| meta.title);
@@ -2800,7 +2805,7 @@ async fn run_actor(
                     }
                     Err(err)
                         if err
-                            .downcast_ref::<pi::compaction::NothingToCompact>()
+                            .downcast_ref::<manox_harness::compaction::NothingToCompact>()
                             .is_some() =>
                     {
                         tracing::debug!("pi compact: nothing to compact");
@@ -3039,7 +3044,7 @@ async fn rebuild_session(
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
     // already idle when a switch happens, so nothing in-flight is lost.
-    let repo = pi::session::repository::SessionRepository::new(sessions_dir);
+    let repo = manox_harness::session::repository::SessionRepository::new(sessions_dir);
     let cwd = repo
         .list()
         .await
@@ -3198,7 +3203,10 @@ impl TitleScheduler {
                 };
                 if matches!(
                     stop_reason,
-                    Some(pi::types::StopReason::Error | pi::types::StopReason::Aborted)
+                    Some(
+                        manox_harness::types::StopReason::Error
+                            | manox_harness::types::StopReason::Aborted
+                    )
                 ) {
                     return;
                 }
@@ -3333,8 +3341,8 @@ mod title_scheduler_tests {
         // alive through the block, so a `wake` call inside it self-deadlocked
         // the non-reentrant std mutex when a terminate tool ended the turn.
         let (tx, _rx) = mpsc::unbounded_channel::<SessionCmd>();
-        let resolver: pi::agent_loop::StreamResolver = Arc::new(
-            |_model: &PiModel| -> Result<Arc<dyn pi::agent_loop::StreamFn>, anyhow::Error> {
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(
+            |_model: &PiModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
                 Err(anyhow::anyhow!("unused in this test"))
             },
         );
@@ -3356,7 +3364,7 @@ mod title_scheduler_tests {
         let event = AgentEvent::ToolExecutionEnd {
             tool_call_id: "call-1".into(),
             tool_name: crate::plan_mode::PROPOSE_PLAN.into(),
-            result: pi::tool::AgentToolResult {
+            result: manox_harness::tool::AgentToolResult {
                 content: vec![ContentBlock::Text {
                     text: "plan submitted".into(),
                     signature: None,
@@ -3385,7 +3393,7 @@ async fn load_title_scheduler(
     session_path: &Path,
     provider_responses: usize,
 ) -> PersistedTitleScheduler {
-    pi_extensions::session_meta::load(sessions_dir, session_path)
+    manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .ok()
         .map(|meta| PersistedTitleScheduler {
@@ -3407,7 +3415,7 @@ fn successful_provider_responses(messages: &[AgentMessage]) -> usize {
                     ..
                 } if !matches!(
                     stop_reason,
-                    Some(pi::types::StopReason::Error | pi::types::StopReason::Aborted)
+                    Some(manox_harness::types::StopReason::Error | manox_harness::types::StopReason::Aborted)
                 )
             )
         })
@@ -3422,13 +3430,13 @@ async fn persist_title(
     // Probe first (unlocked read): persisting an unchanged title would only
     // churn the sidecar; the locked re-read inside `update` makes any race
     // benign (title is last-write-wins either way).
-    let current = pi_extensions::session_meta::load(sessions_dir, session_path)
+    let current = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
     if current.title.as_deref() == Some(title.as_str()) {
         return Ok(());
     }
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.title = Some(title.clone());
     })
     .await
@@ -3438,7 +3446,7 @@ async fn persist_title(
 /// `approval_mode`); fresh sessions (missing sidecar or field) and unknown
 /// values land on the bounded default.
 async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> PermissionMode {
-    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+    match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => meta
             .approval_mode
             .as_deref()
@@ -3466,7 +3474,7 @@ fn render_plan_instructions() -> Option<String> {
 }
 
 async fn load_plan_state(sessions_dir: &Path, session_path: &Path) -> (bool, Option<String>) {
-    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+    match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => (meta.plan_mode.unwrap_or(false), meta.plan_file),
         Err(_) => (false, None),
     }
@@ -3480,7 +3488,7 @@ async fn write_plan_sidecar(
     session_path: &Path,
     plan: &crate::plan_mode::PlanSessionState,
 ) -> Result<(), anyhow::Error> {
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.plan_mode = plan.enabled().then_some(true);
         meta.plan_file = plan.plan_file();
     })
@@ -3488,7 +3496,7 @@ async fn write_plan_sidecar(
 }
 
 async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> bool {
-    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+    match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => meta.plan_review_pending.unwrap_or(false),
         Err(_) => false,
     }
@@ -3498,7 +3506,7 @@ async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> b
 /// survival: the transcript's plan tool calls are summarized away, but the
 /// rail's plan restores from here).
 async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<serde_json::Value> {
-    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+    match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => meta.plan_snapshot,
         Err(_) => None,
     }
@@ -3509,7 +3517,7 @@ async fn write_plan_review_pending_sidecar(
     session_path: &Path,
     pending: bool,
 ) -> Result<(), anyhow::Error> {
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.plan_review_pending = pending.then_some(true);
     })
     .await
@@ -3520,7 +3528,7 @@ async fn write_plan_snapshot_sidecar(
     session_path: &Path,
     snapshot: Option<serde_json::Value>,
 ) -> Result<(), anyhow::Error> {
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.plan_snapshot = snapshot;
     })
     .await
@@ -3556,7 +3564,7 @@ async fn write_approval_mode_sidecar(
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .expect("PermissionMode serializes to its kebab wire name");
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.approval_mode = Some(raw);
     })
     .await
@@ -3565,7 +3573,7 @@ async fn write_approval_mode_sidecar(
 /// The reasoning effort persisted in a session's sidecar; fresh sessions
 /// (missing sidecar or field) default to High.
 async fn load_reasoning_effort(sessions_dir: &Path, session_path: &Path) -> ReasoningEffort {
-    match pi_extensions::session_meta::load(sessions_dir, session_path).await {
+    match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => match meta.reasoning_effort.as_deref() {
             Some("high") => ReasoningEffort::High,
             Some("max") => ReasoningEffort::Max,
@@ -3582,7 +3590,7 @@ async fn write_reasoning_effort_sidecar(
     session_path: &Path,
     effort: ReasoningEffort,
 ) -> Result<(), anyhow::Error> {
-    pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.reasoning_effort = Some(effort.wire_value().to_string());
     })
     .await
@@ -3648,7 +3656,7 @@ async fn load_registry_displays(
     sessions_dir: &Path,
     session_path: &Path,
 ) -> std::collections::HashMap<usize, String> {
-    pi_extensions::session_meta::load(sessions_dir, session_path)
+    manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .map(|meta| meta.registry_displays)
         .unwrap_or_default()
@@ -3660,8 +3668,8 @@ async fn load_registry_displays(
 async fn load_user_attributions(
     sessions_dir: &Path,
     session_path: &Path,
-) -> std::collections::HashMap<usize, pi_extensions::session_meta::UserAttributionMeta> {
-    pi_extensions::session_meta::load(sessions_dir, session_path)
+) -> std::collections::HashMap<usize, manox_harness::session_meta::UserAttributionMeta> {
+    manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .map(|meta| meta.user_attributions)
         .unwrap_or_default()
@@ -3675,13 +3683,13 @@ async fn load_user_attributions(
 /// ordinals over the rebuilt sequence.
 async fn clear_user_chrome(sessions_dir: &Path, session_path: &Path) {
     // Probe first: clearing empty maps would only churn the sidecar.
-    let meta = pi_extensions::session_meta::load(sessions_dir, session_path)
+    let meta = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .unwrap_or_default();
     if meta.registry_displays.is_empty() && meta.user_attributions.is_empty() {
         return;
     }
-    if let Err(err) = pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    if let Err(err) = manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.registry_displays.clear();
         meta.user_attributions.clear();
     })
@@ -3735,7 +3743,7 @@ fn attach_user_attributions(
     history: &mut [HistoryEntry],
     attributions: &std::collections::HashMap<
         usize,
-        pi_extensions::session_meta::UserAttributionMeta,
+        manox_harness::session_meta::UserAttributionMeta,
     >,
 ) {
     if attributions.is_empty() {
@@ -3763,7 +3771,7 @@ fn attach_user_attributions(
 /// Persist the bound project in the session sidecar so the sidebar groups
 /// the session under its project folder across restarts.
 async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project: &Path) {
-    if let Err(err) = pi_extensions::session_meta::update(sessions_dir, session_path, |meta| {
+    if let Err(err) = manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
         meta.project = Some(project.to_string_lossy().to_string());
     })
     .await
@@ -3927,7 +3935,7 @@ fn sync_usage_from_messages(session: &AgentSession, state: &Arc<EngineState>) {
 }
 
 /// Kernel usage totals → the facade's token usage shape.
-fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsage {
+fn token_usage_from_totals(t: &manox_harness::coding_agent::usage::UsageTotals) -> TokenUsage {
     TokenUsage {
         input_tokens: t.input,
         output_tokens: t.output,
@@ -3937,7 +3945,7 @@ fn token_usage_from_totals(t: &pi::coding_agent::usage::UsageTotals) -> TokenUsa
 }
 
 /// Map a pi usage report onto the manox token shape.
-fn to_token_usage(u: &pi::types::Usage) -> TokenUsage {
+fn to_token_usage(u: &manox_harness::types::Usage) -> TokenUsage {
     TokenUsage {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
@@ -3949,7 +3957,7 @@ fn to_token_usage(u: &pi::types::Usage) -> TokenUsage {
 /// Re-read the session directory and mirror the summary list into engine
 /// state (the sidebar's source of truth).
 async fn refresh_session_list(
-    repo: &pi::session::repository::SessionRepository,
+    repo: &manox_harness::session::repository::SessionRepository,
     state: &Arc<EngineState>,
 ) {
     let mut out = Vec::new();
@@ -3979,7 +3987,9 @@ async fn refresh_session_list(
 /// depth 0 because the mirror is never rendered as a tree. `parent_id`
 /// still resolves the team affiliation via the shared helper so any reader
 /// sees the same edge the sidebar does.
-fn session_info_to_summary(info: &pi::session::repository::SessionInfo) -> ThreadSummary {
+fn session_info_to_summary(
+    info: &manox_harness::session::repository::SessionInfo,
+) -> ThreadSummary {
     ThreadSummary {
         id: info.id.clone(),
         summary: info.first_message.clone(),
@@ -4187,7 +4197,7 @@ mod tests {
     async fn attach_registry_displays_restores_sidecar_compact_forms() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-display.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             registry_displays: [
                 (0usize, "/gitwork:deliver fast".to_string()),
                 (2usize, "/healthz".to_string()),
@@ -4196,7 +4206,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
@@ -4241,11 +4251,11 @@ mod tests {
     async fn attach_user_attributions_restores_sidecar_authorship() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-author.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             user_attributions: [
                 (
                     0usize,
-                    pi_extensions::session_meta::UserAttributionMeta {
+                    manox_harness::session_meta::UserAttributionMeta {
                         author: "lead".into(),
                         peer: false,
                         display_text: None,
@@ -4253,7 +4263,7 @@ mod tests {
                 ),
                 (
                     1usize,
-                    pi_extensions::session_meta::UserAttributionMeta {
+                    manox_harness::session_meta::UserAttributionMeta {
                         author: "Sailor".into(),
                         peer: true,
                         display_text: Some("unwrapped body".into()),
@@ -4262,7 +4272,7 @@ mod tests {
                 // Beyond the transcript's ordinals: tolerated, attaches nowhere.
                 (
                     5usize,
-                    pi_extensions::session_meta::UserAttributionMeta {
+                    manox_harness::session_meta::UserAttributionMeta {
                         author: "lead".into(),
                         peer: false,
                         display_text: None,
@@ -4273,7 +4283,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
@@ -4327,13 +4337,13 @@ mod tests {
     async fn clear_user_chrome_drops_sidecar_ordinals() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-display-clear.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             registry_displays: [(0usize, "/gitwork:deliver fast".to_string())]
                 .into_iter()
                 .collect(),
             user_attributions: [(
                 0usize,
-                pi_extensions::session_meta::UserAttributionMeta {
+                manox_harness::session_meta::UserAttributionMeta {
                     author: "lead".into(),
                     peer: false,
                     display_text: None,
@@ -4343,7 +4353,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
@@ -4376,11 +4386,11 @@ mod tests {
     async fn permission_mode_sidecar_tolerates_unknown_values() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-2.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             approval_mode: Some("yolo".to_string()),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
         assert_eq!(
@@ -4394,12 +4404,12 @@ mod tests {
     async fn permission_mode_write_preserves_other_sidecar_fields() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-3.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             title: Some("my thread".to_string()),
             project: Some("/tmp/proj".to_string()),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
 
@@ -4407,7 +4417,7 @@ mod tests {
             .await
             .unwrap();
 
-        let loaded = pi_extensions::session_meta::load(dir.path(), &session)
+        let loaded = manox_harness::session_meta::load(dir.path(), &session)
             .await
             .unwrap();
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
@@ -4419,36 +4429,37 @@ mod tests {
     fn steer_message_carries_images_behind_text() {
         let msg = steer_message(
             "look at this".to_string(),
-            vec![pi::types::ContentBlock::Image {
+            vec![manox_harness::types::ContentBlock::Image {
                 data: "aW1hZ2U=".to_string(),
                 mime_type: "image/png".to_string(),
             }],
         );
-        let pi::types::AgentMessage::User { content, .. } = &msg else {
+        let manox_harness::types::AgentMessage::User { content, .. } = &msg else {
             panic!("steer message must be a user message");
         };
         assert_eq!(content.len(), 2, "text first, then the image block");
         assert!(matches!(
             &content[0],
-            pi::types::ContentBlock::Text { text, .. } if text == "look at this"
+            manox_harness::types::ContentBlock::Text { text, .. } if text == "look at this"
         ));
         assert!(matches!(
             &content[1],
-            pi::types::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
+            manox_harness::types::ContentBlock::Image { mime_type, .. } if mime_type == "image/png"
         ));
     }
 
     #[test]
     fn agent_tool_start_maps_to_subagent_progress_row() {
-        let events =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionStart {
+        let events = adapt::agent_event_to_thread_events(
+            &manox_harness::types::AgentEvent::ToolExecutionStart {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({
                     "subagent_type": "Explore",
                     "prompt": "find the auth module and summarize its structure",
                 }),
-            });
+            },
+        );
         assert_eq!(events.len(), 2, "tool card + rail observation row");
         match &events[1] {
             crate::thread::ThreadEvent::SubagentProgress {
@@ -4472,13 +4483,14 @@ mod tests {
 
     #[test]
     fn agent_tool_end_closes_subagent_progress_row() {
-        let events =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionEnd {
+        let events = adapt::agent_event_to_thread_events(
+            &manox_harness::types::AgentEvent::ToolExecutionEnd {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
-                result: pi::tool::AgentToolResult::text("done"),
+                result: manox_harness::tool::AgentToolResult::text("done"),
                 is_error: false,
-            });
+            },
+        );
         assert_eq!(events.len(), 3, "tool card + result + rail row");
         match &events[2] {
             crate::thread::ThreadEvent::SubagentProgress { id, status, .. } => {
@@ -4491,26 +4503,28 @@ mod tests {
 
     #[test]
     fn non_agent_tools_emit_no_subagent_progress() {
-        let events =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionStart {
+        let events = adapt::agent_event_to_thread_events(
+            &manox_harness::types::AgentEvent::ToolExecutionStart {
                 tool_call_id: "call-2".into(),
                 tool_name: "Read".into(),
                 arguments: serde_json::json!({"path": "src/main.rs"}),
-            });
+            },
+        );
         assert_eq!(events.len(), 1, "plain tools keep a single tool card");
     }
 
     #[test]
     fn agent_child_text_delta_maps_to_subagent_child() {
-        let events =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+        let events = adapt::agent_event_to_thread_events(
+            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({}),
                 partial_result: serde_json::json!({
                     "subagent_event": { "kind": "text", "text": "found it" }
                 }),
-            });
+            },
+        );
         assert_eq!(events.len(), 1);
         match &events[0] {
             crate::thread::ThreadEvent::SubagentChild { id, child } => {
@@ -4527,7 +4541,7 @@ mod tests {
     #[test]
     fn agent_child_tool_lifecycle_maps_to_child_and_rail_activity() {
         let start = adapt::agent_event_to_thread_events(
-            &pi::types::AgentEvent::ToolExecutionUpdate {
+            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({}),
@@ -4552,7 +4566,7 @@ mod tests {
         }
 
         let end = adapt::agent_event_to_thread_events(
-            &pi::types::AgentEvent::ToolExecutionUpdate {
+            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-1".into(),
                 tool_name: crate::tools::AGENT.into(),
                 arguments: serde_json::json!({}),
@@ -4573,13 +4587,14 @@ mod tests {
 
     #[test]
     fn bash_output_update_still_maps_to_tool_output() {
-        let events =
-            adapt::agent_event_to_thread_events(&pi::types::AgentEvent::ToolExecutionUpdate {
+        let events = adapt::agent_event_to_thread_events(
+            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
                 tool_call_id: "call-3".into(),
                 tool_name: "Bash".into(),
                 arguments: serde_json::json!({}),
                 partial_result: serde_json::json!({ "output": "line one" }),
-            });
+            },
+        );
         assert_eq!(events.len(), 1);
         assert!(matches!(
             &events[0],
@@ -4589,8 +4604,8 @@ mod tests {
     #[test]
     fn adapt_strips_proposed_plan_blocks_from_assistant_text() {
         let plan = "## Steps\n- do the thing";
-        let messages = vec![pi::types::AgentMessage::Assistant {
-            content: vec![pi::types::ContentBlock::Text {
+        let messages = vec![manox_harness::types::AgentMessage::Assistant {
+            content: vec![manox_harness::types::ContentBlock::Text {
                 text: format!(
                     "Here is my plan.\n\n<proposed_plan>\n{plan}\n</proposed_plan>\n\nShall we?"
                 ),
@@ -4602,9 +4617,9 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
-            stop_reason: Some(pi::types::StopReason::Stop),
+            stop_reason: Some(manox_harness::types::StopReason::Stop),
             raw_stop_reason: None,
-            usage: Box::new(pi::types::Usage::default()),
+            usage: Box::new(manox_harness::types::Usage::default()),
             error_message: None,
             timestamp: chrono::Utc::now(),
         }];
@@ -4673,7 +4688,7 @@ mod tests {
             diagnostics: None,
             stop_reason: None,
             raw_stop_reason: None,
-            usage: Box::new(pi::types::Usage::default()),
+            usage: Box::new(manox_harness::types::Usage::default()),
             error_message: None,
             timestamp: chrono::Utc::now(),
         }
@@ -4733,13 +4748,13 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl pi::agent_loop::StreamFn for MidRunModelStream {
+    impl manox_harness::agent_loop::StreamFn for MidRunModelStream {
         async fn stream(
             &self,
-            context: &pi::types::AgentContext,
+            context: &manox_harness::types::AgentContext,
             _signal: tokio_util::sync::CancellationToken,
-            _event_tx: tokio::sync::mpsc::Sender<pi::types::AgentEvent>,
-        ) -> Result<pi::types::AgentMessage, anyhow::Error> {
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<manox_harness::types::AgentMessage, anyhow::Error> {
             let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.seen.lock().unwrap().push(context.model.id.clone());
             if n == 0 {
@@ -4759,8 +4774,8 @@ mod tests {
                     response_id: None,
                     diagnostics: None,
                     raw_stop_reason: None,
-                    stop_reason: Some(pi::types::StopReason::ToolUse),
-                    usage: Box::new(pi::types::Usage {
+                    stop_reason: Some(manox_harness::types::StopReason::ToolUse),
+                    usage: Box::new(manox_harness::types::Usage {
                         input_tokens: 100,
                         output_tokens: 10,
                         ..Default::default()
@@ -4783,8 +4798,8 @@ mod tests {
                     response_id: None,
                     diagnostics: None,
                     raw_stop_reason: None,
-                    stop_reason: Some(pi::types::StopReason::Stop),
-                    usage: Box::new(pi::types::Usage {
+                    stop_reason: Some(manox_harness::types::StopReason::Stop),
+                    usage: Box::new(manox_harness::types::Usage {
                         input_tokens: 100,
                         output_tokens: 10,
                         ..Default::default()
@@ -4800,7 +4815,7 @@ mod tests {
     struct EchoTool;
 
     #[async_trait::async_trait]
-    impl pi::tool::AgentTool for EchoTool {
+    impl manox_harness::tool::AgentTool for EchoTool {
         fn name(&self) -> &str {
             "echo"
         }
@@ -4817,9 +4832,9 @@ mod tests {
             _id: &str,
             params: serde_json::Value,
             _signal: tokio_util::sync::CancellationToken,
-            _ctx: &dyn pi::tool::ToolContext,
-        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-            Ok(pi::tool::AgentToolResult::text(
+            _ctx: &dyn manox_harness::tool::ToolContext,
+        ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+            Ok(manox_harness::tool::AgentToolResult::text(
                 params["message"].as_str().unwrap_or("no message"),
             ))
         }
@@ -4832,7 +4847,7 @@ mod tests {
             id: "new".into(),
             context_window: 100_000,
             max_tokens: 8_192,
-            thinking: pi::types::ThinkingKind::None,
+            thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         }
     }
@@ -4844,7 +4859,7 @@ mod tests {
             id: "test".into(),
             context_window: 100_000,
             max_tokens: 8_192,
-            thinking: pi::types::ThinkingKind::None,
+            thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         }
     }
@@ -4870,8 +4885,8 @@ mod tests {
             release2: Arc::new(tokio::sync::Notify::new()),
         });
         let stream_for_resolver = Arc::clone(&stream);
-        let resolver: pi::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
-            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn pi::agent_loop::StreamFn>)
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
         });
         let runtime = ModelRuntime::new(resolver);
 
@@ -4881,7 +4896,9 @@ mod tests {
             .with_agent_dir(dir.path().join("agent"))
             .with_model_runtime(runtime)
             .with_model(test_model())
-            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_tools(vec![
+                Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
+            ])
             .with_system_prompt("You are a test assistant.")
             .build()
             .await
@@ -4992,8 +5009,8 @@ mod tests {
             release2: Arc::new(tokio::sync::Notify::new()),
         });
         let stream_for_resolver = Arc::clone(&stream);
-        let resolver: pi::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
-            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn pi::agent_loop::StreamFn>)
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
         });
         let runtime = ModelRuntime::new(resolver);
 
@@ -5003,7 +5020,9 @@ mod tests {
             .with_agent_dir(dir.path().join("agent"))
             .with_model_runtime(runtime)
             .with_model(test_model())
-            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_tools(vec![
+                Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
+            ])
             .with_system_prompt("You are a test assistant.")
             .build()
             .await
@@ -5067,7 +5086,7 @@ mod tests {
         // Settlement persists the parked note BEFORE the authoritative
         // sync, so the rebuilt mirror retains it — no loss window between
         // the mid-run mirror and the next reload.
-        let repo = pi::session::repository::SessionRepository::new(&sessions_path);
+        let repo = manox_harness::session::repository::SessionRepository::new(&sessions_path);
         settle_run(
             &result,
             false,
@@ -5110,13 +5129,13 @@ mod tests {
     struct StaticStream;
 
     #[async_trait::async_trait]
-    impl pi::agent_loop::StreamFn for StaticStream {
+    impl manox_harness::agent_loop::StreamFn for StaticStream {
         async fn stream(
             &self,
-            context: &pi::types::AgentContext,
+            context: &manox_harness::types::AgentContext,
             _signal: tokio_util::sync::CancellationToken,
-            _event_tx: tokio::sync::mpsc::Sender<pi::types::AgentEvent>,
-        ) -> Result<pi::types::AgentMessage, anyhow::Error> {
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<manox_harness::types::AgentMessage, anyhow::Error> {
             Ok(AgentMessage::Assistant {
                 content: vec![ContentBlock::Text {
                     text: "ok".into(),
@@ -5129,8 +5148,8 @@ mod tests {
                 response_id: None,
                 diagnostics: None,
                 raw_stop_reason: None,
-                stop_reason: Some(pi::types::StopReason::Stop),
-                usage: Box::new(pi::types::Usage::default()),
+                stop_reason: Some(manox_harness::types::StopReason::Stop),
+                usage: Box::new(manox_harness::types::Usage::default()),
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             })
@@ -5140,7 +5159,7 @@ mod tests {
     /// Restores the two test models from their session references.
     struct TestModelCatalog;
 
-    impl pi::coding_agent::model_runtime::ModelCatalog for TestModelCatalog {
+    impl manox_harness::coding_agent::model_runtime::ModelCatalog for TestModelCatalog {
         fn resolve(&self, provider: &str, model_id: &str) -> Option<PiModel> {
             match (provider, model_id) {
                 ("test", "test") => Some(test_model()),
@@ -5166,10 +5185,9 @@ mod tests {
         tokio::fs::create_dir_all(&sessions).await.unwrap();
         tokio::fs::create_dir_all(&agent).await.unwrap();
 
-        let resolver: pi::agent_loop::StreamResolver =
-            Arc::new(
-                |_m: &PiModel| Ok(Arc::new(StaticStream) as Arc<dyn pi::agent_loop::StreamFn>),
-            );
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
         let runtime = ModelRuntime::new(resolver).with_catalog(Arc::new(TestModelCatalog));
 
         // Phase 1: a session that ran under `test` and switched to `new`.
@@ -5179,7 +5197,9 @@ mod tests {
             .with_agent_dir(&agent)
             .with_model_runtime(runtime.clone())
             .with_model(test_model())
-            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_tools(vec![
+                Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
+            ])
             .with_system_prompt("You are a test assistant.")
             .build()
             .await
@@ -5201,7 +5221,9 @@ mod tests {
         let reopened = create_agent_session()
             .with_agent_dir(&agent)
             .with_model_runtime(runtime)
-            .with_tools(vec![Arc::new(EchoTool) as Arc<dyn pi::tool::AgentTool>])
+            .with_tools(vec![
+                Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
+            ])
             .with_system_prompt("You are a test assistant.")
             .open(path)
             .await
@@ -5258,11 +5280,11 @@ mod tests {
     async fn reasoning_effort_sidecar_tolerates_unknown_values() {
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("sess-effort-unknown.jsonl");
-        let meta = pi_extensions::session_meta::SessionMeta {
+        let meta = manox_harness::session_meta::SessionMeta {
             reasoning_effort: Some("medium".to_string()),
             ..Default::default()
         };
-        pi_extensions::session_meta::save(dir.path(), &session, &meta)
+        manox_harness::session_meta::save(dir.path(), &session, &meta)
             .await
             .unwrap();
         assert_eq!(
@@ -5272,15 +5294,15 @@ mod tests {
         );
     }
 
-    fn assistant_usage(cache_read: u64) -> pi::types::Usage {
-        pi::types::Usage {
+    fn assistant_usage(cache_read: u64) -> manox_harness::types::Usage {
+        manox_harness::types::Usage {
             input_tokens: 10,
             cache_read_input_tokens: cache_read,
             ..Default::default()
         }
     }
 
-    fn assistant_request(usage: pi::types::Usage) -> AgentMessage {
+    fn assistant_request(usage: manox_harness::types::Usage) -> AgentMessage {
         AgentMessage::Assistant {
             content: Vec::new(),
             model: "deepseek-v4-flash".into(),
@@ -5289,7 +5311,7 @@ mod tests {
             response_model: None,
             response_id: None,
             diagnostics: None,
-            stop_reason: Some(pi::types::StopReason::Stop),
+            stop_reason: Some(manox_harness::types::StopReason::Stop),
             raw_stop_reason: None,
             usage: Box::new(usage),
             error_message: None,
@@ -5379,8 +5401,8 @@ mod tests {
 
     #[test]
     fn agent_tool_description_lists_built_in_subagents_with_capability() {
-        let mut registry = pi::ext_point_agent::AgentRegistry::new();
-        pi_extensions::agents::register_defaults(&mut registry);
+        let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();
+        manox_harness::agents::register_defaults(&mut registry);
         let subagents: Vec<crate::prompt::SubagentTypeData> = registry
             .all()
             .iter()
@@ -5420,8 +5442,8 @@ mod tests {
     /// dispatched while plan mode is active.
     #[test]
     fn subagent_capability_tags_write_bash_vs_read_only() {
-        let mut registry = pi::ext_point_agent::AgentRegistry::new();
-        pi_extensions::agents::register_defaults(&mut registry);
+        let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();
+        manox_harness::agents::register_defaults(&mut registry);
         let sailor = registry.get("Sailor").expect("Sailor registered");
         let explore = registry.get("Explore").expect("Explore registered");
         assert_eq!(subagent_capability(sailor), "write+bash");
@@ -5461,7 +5483,7 @@ mod tests {
     /// inner so the gate is exercised without constructing a real BashTool.
     struct MarkerBash;
     #[async_trait::async_trait]
-    impl pi::tool::AgentTool for MarkerBash {
+    impl manox_harness::tool::AgentTool for MarkerBash {
         fn name(&self) -> &str {
             "Bash"
         }
@@ -5492,9 +5514,9 @@ mod tests {
             _: &str,
             _: serde_json::Value,
             _: tokio_util::sync::CancellationToken,
-            _: &dyn pi::tool::ToolContext,
-        ) -> Result<pi::tool::AgentToolResult, pi::tool::ToolError> {
-            Ok(pi::tool::AgentToolResult::text("foreground-ok"))
+            _: &dyn manox_harness::tool::ToolContext,
+        ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+            Ok(manox_harness::tool::AgentToolResult::text("foreground-ok"))
         }
     }
 
@@ -5504,10 +5526,12 @@ mod tests {
         let tool = SubagentBashTool {
             inner: Arc::new(MarkerBash),
         };
-        let ctx = pi::tool::LocalToolContext::new(
-            Arc::new(pi::env::TokioExecutionEnv::new(PathBuf::from("/tmp"))),
+        let ctx = manox_harness::tool::LocalToolContext::new(
+            Arc::new(manox_harness::env::TokioExecutionEnv::new(PathBuf::from(
+                "/tmp",
+            ))),
             PathBuf::from("/tmp"),
-            Arc::new(pi::tool::ToolState::new()),
+            Arc::new(manox_harness::tool::ToolState::new()),
         );
         // Background: refused at the gate; the inner is never reached.
         let bg = tool
@@ -5537,7 +5561,7 @@ mod tests {
             .content
             .iter()
             .filter_map(|b| {
-                if let pi::types::ContentBlock::Text { text, .. } = b {
+                if let manox_harness::types::ContentBlock::Text { text, .. } = b {
                     Some(text.as_str())
                 } else {
                     None
@@ -5581,25 +5605,24 @@ mod tests {
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
 
-        let resolver: pi::agent_loop::StreamResolver =
-            Arc::new(
-                |_m: &PiModel| Ok(Arc::new(StaticStream) as Arc<dyn pi::agent_loop::StreamFn>),
-            );
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
         let runtime = ModelRuntime::new(resolver);
 
         let mut registry = AgentRegistry::new();
         register_defaults(&mut registry);
         let registry = Arc::new(registry);
-        let tools: Vec<Arc<dyn pi::tool::AgentTool>> = vec![
-            Arc::new(pi::tools::read::ReadTool),
-            Arc::new(pi::tools::grep::GrepTool),
-            Arc::new(pi::tools::glob::GlobTool),
-            Arc::new(pi::tools::ls::LsTool),
+        let tools: Vec<Arc<dyn manox_harness::tool::AgentTool>> = vec![
+            Arc::new(manox_harness::tools::read::ReadTool),
+            Arc::new(manox_harness::tools::grep::GrepTool),
+            Arc::new(manox_harness::tools::glob::GlobTool),
+            Arc::new(manox_harness::tools::ls::LsTool),
         ];
-        let ctx = pi::tool::LocalToolContext::new(
-            Arc::new(pi::env::TokioExecutionEnv::new(cwd.clone())),
+        let ctx = manox_harness::tool::LocalToolContext::new(
+            Arc::new(manox_harness::env::TokioExecutionEnv::new(cwd.clone())),
             cwd.clone(),
-            Arc::new(pi::tool::ToolState::new()),
+            Arc::new(manox_harness::tool::ToolState::new()),
         );
 
         // Host-injected directory: the transcript persists there and the

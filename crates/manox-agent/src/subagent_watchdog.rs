@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use pi::types::AgentEvent;
+use manox_harness::types::AgentEvent;
 
 /// The fixed cadence of [`SubagentWatchdog::tick`].
 pub const WATCHDOG_TICK: Duration = Duration::from_secs(5);
@@ -281,8 +281,8 @@ fn canonical_args(arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::tool::AgentToolResult;
-    use pi::types::AgentMessage;
+    use manox_harness::tool::AgentToolResult;
+    use manox_harness::types::AgentMessage;
 
     fn tool_start(name: &str, args: serde_json::Value) -> AgentEvent {
         AgentEvent::ToolExecutionStart {

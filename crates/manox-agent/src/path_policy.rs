@@ -7,4 +7,4 @@
 //! helpers still reached as `crate::path_policy::*` by host callers are
 //! re-exported from the extension-layer sandbox module.
 
-pub use pi_extensions::sandbox::{canonicalize_best_effort, is_temp_scratch};
+pub use manox_harness::sandbox::{canonicalize_best_effort, is_temp_scratch};

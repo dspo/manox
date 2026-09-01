@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use pi::ext_point_agent::{AgentDef, AgentRegistry};
+use manox_harness::ext_point_agent::{AgentDef, AgentRegistry};
 
 /// `~/.manox/agents` — user-authored subagent definitions.
 pub fn user_agents_dir() -> Result<PathBuf, anyhow::Error> {

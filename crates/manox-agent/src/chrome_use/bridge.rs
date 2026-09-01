@@ -6,7 +6,7 @@
 //! the engine's `CancelToken`, so a cancelled turn interrupts the in-flight
 //! CDP wait instead of letting it run to the operation timeout.
 
-use pi::tool::ToolError;
+use manox_harness::tool::ToolError;
 use rustwright_core::CancelToken;
 use tokio_util::sync::CancellationToken;
 

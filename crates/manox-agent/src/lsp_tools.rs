@@ -29,7 +29,7 @@ pub const DOCUMENT_SYMBOLS: &str = "DocumentSymbols";
 pub const WORKSPACE_SYMBOLS: &str = "WorkspaceSymbols";
 pub const DIAGNOSTICS: &str = "Diagnostics";
 
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -570,7 +570,7 @@ fn render_diagnostics_report(path: &Path, report: lsp::DiagnosticsReport) -> Str
 /// `tools()` always returns the full set; the registration site skips it
 /// when `lsp::registry::try_global()` reports no available server specs
 /// (the agent degrades to grep/glob).
-pub fn tools() -> Vec<Arc<dyn pi::tool::AgentTool>> {
+pub fn tools() -> Vec<Arc<dyn manox_harness::tool::AgentTool>> {
     vec![
         Arc::new(GoToDefinitionTool),
         Arc::new(FindReferencesTool),

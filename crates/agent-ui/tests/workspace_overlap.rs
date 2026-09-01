@@ -40,7 +40,9 @@ fn load_real_session_messages() -> Vec<manox_agent::Message> {
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .filter(|event| event.get("type").and_then(|value| value.as_str()) == Some("message"))
         .filter_map(|event| event.get("message").cloned())
-        .filter_map(|message| serde_json::from_value::<pi::types::AgentMessage>(message).ok())
+        .filter_map(|message| {
+            serde_json::from_value::<manox_harness::types::AgentMessage>(message).ok()
+        })
         .collect::<Vec<_>>();
     manox_agent::engine::adapt::harness_messages_to_messages(&harness_messages)
 }

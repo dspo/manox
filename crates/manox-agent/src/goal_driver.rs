@@ -14,9 +14,9 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use pi::coding_agent::AgentSession;
-use pi::harness::HarnessHandle;
-use pi::types::{AgentMessage, ContentBlock};
+use manox_harness::coding_agent::AgentSession;
+use manox_harness::harness::HarnessHandle;
+use manox_harness::types::{AgentMessage, ContentBlock};
 
 use crate::goal::{GoalActor, GoalBlockReason, GoalStatus, ThreadGoal};
 use crate::goal_tools::GoalBridge;
@@ -31,7 +31,7 @@ pub struct GoalRoundIdentity {
 
 /// Goal-budget tokens of one pi usage report — excludes provider cache reads
 /// by definition (`budget_tokens` parity).
-fn budget_from_pi_usage(usage: &pi::types::Usage) -> u64 {
+fn budget_from_pi_usage(usage: &manox_harness::types::Usage) -> u64 {
     usage.input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
 }
 

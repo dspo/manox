@@ -15,10 +15,9 @@
 members = [
     "crates/manox-agent",
     "crates/agent-ui",
-    "crates/manox",
-    "crates/pi",
-    "crates/pi-extensions",
-    "crates/manox-terminal",
+"crates/manox",
+	    "crates/manox-harness",
+	    "crates/manox-terminal",
     "crates/terminal-ui",
 "crates/manox-components",
 	    "crates/supervisor",
@@ -56,8 +55,7 @@ manox-webview-macros = { path = "crates/manox-webview-macros" }
 		manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
-pi = { path = "crates/pi" }
-pi-extensions = { path = "crates/pi-extensions" }
+manox-harness = { path = "crates/manox-harness" }
 hyperlinks = { path = "crates/hyperlinks" }
 # cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
 # 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。manox-providers 为 provider

@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use pi::harness::HarnessHandle;
-use pi::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
-use pi::types::{AgentMessage, ContentBlock};
-use pi_extensions::agents::SubagentTool;
-use pi_extensions::steer_bus::{
+use manox_harness::agents::SubagentTool;
+use manox_harness::harness::HarnessHandle;
+use manox_harness::steer_bus::{
     AgentId, BusOp, DispatchBudgets, SteerPayload, SteerReason, ToSpec,
 };
+use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::types::{AgentMessage, ContentBlock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -505,7 +505,7 @@ impl AgentBus {
             // the sub-agent panel + rail show live dynamics (the retired
             // JSON bridge's successor). The subscription must outlive the loop.
             let (ev_tx, mut ev_rx) =
-                tokio::sync::mpsc::unbounded_channel::<pi::types::AgentEvent>();
+                tokio::sync::mpsc::unbounded_channel::<manox_harness::types::AgentEvent>();
             let _subscription = session.subscribe(Arc::new(move |event, _cancel| {
                 let _ = ev_tx.send(event);
                 Box::pin(async move {})

@@ -50,8 +50,7 @@ cx.workspace = true
 manox-providers.workspace = true
 
 # pi harness backend.
-pi = { workspace = true }
-pi-extensions = { workspace = true }
+manox-harness = { workspace = true }
 manox-protocol.workspace = true
 manox-session-core.workspace = true
 

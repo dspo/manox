@@ -545,7 +545,7 @@ async fn handle_call(
                     },
                 );
             };
-            let Some(resolved) = pi_extensions::model_ref::resolve_model_ref(&registry, &model)
+            let Some(resolved) = manox_harness::model_ref::resolve_model_ref(&registry, &model)
             else {
                 done(None, Some("unknown model".into()));
                 return Ok(json!({}));
@@ -962,7 +962,7 @@ impl AgentServerInner {
             return self.note_error(session_id, "unknown session");
         };
         let registry = manox_agent::provider_glue::global();
-        match pi_extensions::model_ref::resolve_model_ref(&registry, id) {
+        match manox_harness::model_ref::resolve_model_ref(&registry, id) {
             Some(model) => thread.with_mut(|t| t.set_model(model)),
             None => self.note_error(session_id, "unknown model"),
         }
@@ -1666,7 +1666,7 @@ fn parse_slash(text: &str) -> Option<(String, String)> {
     (!name.is_empty()).then(|| (name.to_string(), args.trim_start().to_string()))
 }
 
-fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
+fn deduped_models(models: Vec<manox_harness::types::Model>) -> Vec<manox_harness::types::Model> {
     let mut seen = std::collections::HashSet::new();
     models
         .into_iter()
@@ -1674,7 +1674,7 @@ fn deduped_models(models: Vec<pi::types::Model>) -> Vec<pi::types::Model> {
         .collect()
 }
 
-fn model_json(model: &pi::types::Model) -> Value {
+fn model_json(model: &manox_harness::types::Model) -> Value {
     json!({
         "id": model.id,
         "name": manox_agent::provider_glue::display_name(model),
@@ -1735,13 +1735,13 @@ mod tests {
         fn request_token_usage(&self) -> HashMap<String, manox_agent::TokenUsage> {
             HashMap::new()
         }
-        fn model(&self) -> Option<pi::types::Model> {
+        fn model(&self) -> Option<manox_harness::types::Model> {
             None
         }
-        fn run(&self, prompt: String, _: Vec<pi::types::ContentBlock>) {
+        fn run(&self, prompt: String, _: Vec<manox_harness::types::ContentBlock>) {
             self.runs.lock().unwrap().push(prompt);
         }
-        fn steer(&self, text: String, _: Vec<pi::types::ContentBlock>) -> String {
+        fn steer(&self, text: String, _: Vec<manox_harness::types::ContentBlock>) -> String {
             self.steer_calls.lock().unwrap().push(text);
             String::new()
         }
@@ -1749,7 +1749,7 @@ mod tests {
             false
         }
         fn abort(&self) {}
-        fn set_model(&self, _: pi::types::Model) {}
+        fn set_model(&self, _: manox_harness::types::Model) {}
         fn set_thinking_level(&self, _: Option<String>) {}
         fn open_session(&self, _: PathBuf) {}
         fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}

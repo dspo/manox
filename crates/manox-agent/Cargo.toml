@@ -16,8 +16,7 @@ chrome-use = ["dep:rustwright_core"]
 test-support = []
 
 [dependencies]
-pi.workspace = true
-pi-extensions.workspace = true
+manox-harness.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 async-channel.workspace = true

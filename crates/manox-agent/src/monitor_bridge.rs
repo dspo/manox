@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pi_extensions::bash::orchestration::{BackgroundEvent, BackgroundManager};
-use pi_extensions::monitor::{
+use manox_harness::bash::orchestration::{BackgroundEvent, BackgroundManager};
+use manox_harness::monitor::{
     MonitorEvent, MonitorKind, MonitorManager, MonitorOutput, MonitorStatus,
 };
 use tokio::sync::broadcast::error::RecvError;
@@ -278,7 +278,7 @@ fn handle_background_event(
             let tid = id.0.clone();
             let bg_for_stop = Arc::clone(background);
             let on_stop: Arc<dyn Fn(&str) + Send + Sync> =
-                Arc::new(move |id| bg_for_stop.kill(&pi::TaskId(id.to_string())));
+                Arc::new(move |id| bg_for_stop.kill(&manox_harness::TaskId(id.to_string())));
             let proxy = register_proxy(
                 &tid,
                 TaskKind::BackgroundBash,
@@ -369,7 +369,8 @@ fn spawn_background_poller(
                 break;
             }
             tokio::time::sleep(BACKGROUND_POLL_INTERVAL).await;
-            let Ok(info) = background.status(&pi::TaskId(id.clone()), POLL_TAIL_BYTES) else {
+            let Ok(info) = background.status(&manox_harness::TaskId(id.clone()), POLL_TAIL_BYTES)
+            else {
                 continue;
             };
             let tail = info.output_tail;
@@ -402,8 +403,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use pi_extensions::bash::background::BackgroundRegistry;
-    use pi_extensions::monitor::MonitorManager;
+    use manox_harness::bash::background::BackgroundRegistry;
+    use manox_harness::monitor::MonitorManager;
     use tokio::sync::mpsc;
 
     use super::*;

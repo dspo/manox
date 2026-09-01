@@ -20,7 +20,7 @@ use manox_agent::db::ThreadSummary;
 use manox_agent::language_model::{LanguageModelToolUse, MessageContent, TokenUsage};
 use manox_agent::message::Message;
 use manox_agent::thread_engine::{BackendNotice, ThreadEngine};
-use pi::types::{ContentBlock, Model as PiModel};
+use manox_harness::types::{ContentBlock, Model as PiModel};
 
 /// Minimal backend for the workspace tests: no actor, fixed history. The
 /// thread facade drives everything else through emitted `ThreadEvent`s.

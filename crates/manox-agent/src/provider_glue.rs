@@ -1,15 +1,15 @@
 //! The process-wide pi provider registry.
 //!
-//! Registration is owned by the `pi_extensions::provider` extension, which
+//! Registration is owned by the `manox_harness::provider` extension, which
 //! reads the native cx providers config and registers every provider
-//! endpoint into the kernel [`pi::ProviderRegistry`]. The host only
+//! endpoint into the kernel [`manox_harness::ProviderRegistry`]. The host only
 //! initializes, reloads, and hands out the shared snapshot — the actor
 //! side resolves models and streams through it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use pi::ProviderRegistry;
+use manox_harness::ProviderRegistry;
 
 static REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 /// Signalled once the initial background registration completes (success or
@@ -20,9 +20,9 @@ static READY_FLAG: AtomicBool = AtomicBool::new(false);
 
 fn build() -> Arc<ProviderRegistry> {
     let registry = Arc::new(ProviderRegistry::new());
-    match pi_extensions::provider::register_providers(
+    match manox_harness::provider::register_providers(
         &registry,
-        pi_extensions::provider::default_config_path(),
+        manox_harness::provider::default_config_path(),
     ) {
         Ok(0) => tracing::info!("pi providers: no provider endpoints registered"),
         Ok(count) => tracing::info!("pi providers: registered {count} provider endpoints"),
@@ -98,9 +98,9 @@ pub fn global() -> Arc<ProviderRegistry> {
 /// commands) — call from a background thread.
 pub fn reload() -> anyhow::Result<()> {
     let fresh = Arc::new(ProviderRegistry::new());
-    let count = pi_extensions::provider::register_providers(
+    let count = manox_harness::provider::register_providers(
         &fresh,
-        pi_extensions::provider::default_config_path(),
+        manox_harness::provider::default_config_path(),
     )?;
     tracing::info!("pi providers: reloaded {count} provider endpoints");
     let lock = REGISTRY
@@ -114,14 +114,14 @@ pub fn reload() -> anyhow::Result<()> {
 /// reference (id or alias) resolved against the registry, else the first
 /// registered model (sorted) that is visible to claude-class agents (pi is
 /// claude-class), else the first registered model outright, else `None`.
-pub fn default_model() -> Option<pi::types::Model> {
+pub fn default_model() -> Option<manox_harness::types::Model> {
     let reference = crate::settings::load().default_model;
     if let Some(r) = reference
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty())
     {
-        if let Some(model) = pi_extensions::model_ref::resolve_model_ref(&global(), r) {
+        if let Some(model) = manox_harness::model_ref::resolve_model_ref(&global(), r) {
             return Some(model);
         }
         tracing::warn!(reference = %r, "default_model did not resolve; falling back to first registered model");
@@ -129,7 +129,7 @@ pub fn default_model() -> Option<pi::types::Model> {
     let models = global().models();
     models
         .iter()
-        .find(|m| pi_extensions::model_ref::visible_to_agent(m, "claude"))
+        .find(|m| manox_harness::model_ref::visible_to_agent(m, "claude"))
         .cloned()
         .or_else(|| models.into_iter().next())
 }
@@ -141,21 +141,21 @@ pub fn default_model() -> Option<pi::types::Model> {
 /// ("Empty → inherit the main model").
 pub fn resolve_side_call_model(
     policy: &crate::settings::SideCallPolicy,
-) -> Option<pi::types::Model> {
+) -> Option<manox_harness::types::Model> {
     resolve_side_call_model_in(&global(), policy)
 }
 
 /// Registry-injectable core of [`resolve_side_call_model`] (testable
 /// without the process-global registry).
 pub fn resolve_side_call_model_in(
-    registry: &pi::ProviderRegistry,
+    registry: &manox_harness::ProviderRegistry,
     policy: &crate::settings::SideCallPolicy,
-) -> Option<pi::types::Model> {
+) -> Option<manox_harness::types::Model> {
     let reference = policy.model.trim();
     if reference.is_empty() {
         return None;
     }
-    let resolved = pi_extensions::model_ref::resolve_model_ref(registry, reference);
+    let resolved = manox_harness::model_ref::resolve_model_ref(registry, reference);
     if resolved.is_none() {
         tracing::warn!(
             reference = %reference,
@@ -179,8 +179,8 @@ impl LegacyAliasCatalog {
     }
 }
 
-impl pi::coding_agent::model_runtime::ModelCatalog for LegacyAliasCatalog {
-    fn resolve(&self, provider: &str, model_id: &str) -> Option<pi::types::Model> {
+impl manox_harness::coding_agent::model_runtime::ModelCatalog for LegacyAliasCatalog {
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<manox_harness::types::Model> {
         let catalog = self.registry.catalog();
         if let Some(model) = catalog.resolve(provider, model_id) {
             return Some(model);
@@ -194,7 +194,7 @@ impl pi::coding_agent::model_runtime::ModelCatalog for LegacyAliasCatalog {
 }
 
 /// Display name of a registered model (metadata `name`, else the id).
-pub fn display_name(model: &pi::types::Model) -> String {
+pub fn display_name(model: &manox_harness::types::Model) -> String {
     model
         .metadata
         .get("name")
@@ -205,7 +205,7 @@ pub fn display_name(model: &pi::types::Model) -> String {
 
 /// Display name of a model's provider (metadata `provider_display_name`,
 /// else the registration name).
-pub fn display_provider_name(model: &pi::types::Model) -> String {
+pub fn display_provider_name(model: &manox_harness::types::Model) -> String {
     model
         .metadata
         .get("provider_display_name")
@@ -217,7 +217,7 @@ pub fn display_provider_name(model: &pi::types::Model) -> String {
 /// Config-level identity of a registered model (metadata `config_id`,
 /// else the registration id). Host model lists key rows by this so a model
 /// registered through several wire apis appears once.
-pub fn config_id(model: &pi::types::Model) -> String {
+pub fn config_id(model: &manox_harness::types::Model) -> String {
     model
         .metadata
         .get("config_id")
@@ -228,25 +228,25 @@ pub fn config_id(model: &pi::types::Model) -> String {
 
 /// Cx wire key of a registered model's endpoint (`"anthropic"` /
 /// `"responses"` / `"completions"`); `None` for non-cx registrations.
-pub fn wire_key(model: &pi::types::Model) -> Option<&'static str> {
-    pi_extensions::provider::model_api_to_wire_key(&model.api)
+pub fn wire_key(model: &manox_harness::types::Model) -> Option<&'static str> {
+    manox_harness::provider::model_api_to_wire_key(&model.api)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi::coding_agent::model_runtime::ModelCatalog;
-    use pi::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
+    use manox_harness::coding_agent::model_runtime::ModelCatalog;
+    use manox_harness::provider_registry::{Api, Cost, ProviderConfig, ProviderModelConfig};
 
     #[test]
     fn config_id_prefers_metadata_over_registration_id() {
-        let model = |metadata| pi::types::Model {
+        let model = |metadata| manox_harness::types::Model {
             provider: "bailian-a".into(),
             api: "anthropic".into(),
             id: "deepseek-v4-flash".into(),
             context_window: 200_000,
             max_tokens: 8_192,
-            thinking: pi::types::ThinkingKind::None,
+            thinking: manox_harness::types::ThinkingKind::None,
             metadata,
         };
         assert_eq!(
