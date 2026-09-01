@@ -24,10 +24,10 @@ use gpui::{
     Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point, px, relative, rgba,
     size,
 };
-use terminal::alacritty_terminal::grid::Dimensions as _;
-use terminal::alacritty_terminal::selection::SelectionRange;
-use terminal::alacritty_terminal::vte::ansi::CursorShape;
-use terminal::{Cell, Flags, HoverTarget};
+use manox_terminal::alacritty_terminal::grid::Dimensions as _;
+use manox_terminal::alacritty_terminal::selection::SelectionRange;
+use manox_terminal::alacritty_terminal::vte::ansi::CursorShape;
+use manox_terminal::{Cell, Flags, HoverTarget};
 
 use crate::block_chars::{BlockRect, COLS, SUBROWS};
 use crate::grid_renderer::{BackgroundRegion, BatchedTextRun, GridPlan, layout_grid};
@@ -47,7 +47,7 @@ pub struct TerminalElement {
     /// In-flight IME marked text, painted inline at the cursor.
     pub marked_text: SharedString,
     /// `/pattern` match ranges in grid coordinates, painted as highlights.
-    pub search_matches: Vec<(terminal::Point, terminal::Point)>,
+    pub search_matches: Vec<(manox_terminal::Point, manox_terminal::Point)>,
     /// Index of the active match (highlighted distinctly).
     pub active_match: Option<usize>,
     /// The hovered link/URL/path span, underlined in paint.
@@ -158,7 +158,7 @@ impl TerminalElement {
     /// shaped-line cache. Consumes the `RenderableContent` (GridIterator is
     /// not Clone).
     fn display_cells<'a>(
-        mut content: terminal::RenderableContent<'a>,
+        mut content: manox_terminal::RenderableContent<'a>,
     ) -> Vec<(i32, i32, usize, &'a Cell)> {
         let mut out: Vec<(i32, i32, usize, &Cell)> = Vec::new();
         let mut display_line = -1i32;
@@ -229,7 +229,7 @@ impl TerminalElement {
     /// truncated to their first line (rare for `/pattern` search). The active
     /// match index is flagged so paint can color it distinctly.
     fn match_rects(
-        matches: &[(terminal::Point, terminal::Point)],
+        matches: &[(manox_terminal::Point, manox_terminal::Point)],
         active: Option<usize>,
         offset: i32,
         rows: i32,

@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use gpui::{Context, EventEmitter};
-use terminal::TerminalHandle;
-use terminal::event::TerminalEvent;
+use manox_terminal::TerminalHandle;
+use manox_terminal::event::TerminalEvent;
 
 /// A gpui `Entity` owning a gpui-free [`TerminalHandle`], re-emitting the
 /// handle's events so `cx.subscribe` keeps working unchanged.
@@ -88,12 +88,12 @@ impl TerminalProxy {
     /// generically and the caller only touches the trait surface it needs.
     pub fn with_term<R>(
         &self,
-        f: impl FnOnce(&terminal::Term<terminal::event::ManoxListener>) -> R,
+        f: impl FnOnce(&manox_terminal::Term<manox_terminal::event::ManoxListener>) -> R,
     ) -> R {
         self.handle.read(|t| t.with_term(f))
     }
 
-    pub fn bell(&self) -> terminal::settings::BellMode {
+    pub fn bell(&self) -> manox_terminal::settings::BellMode {
         self.handle.read(|t| t.bell)
     }
 
@@ -105,7 +105,7 @@ impl TerminalProxy {
         self.handle.read(|t| t.is_ready())
     }
 
-    pub fn mode(&self) -> terminal::alacritty_terminal::term::TermMode {
+    pub fn mode(&self) -> manox_terminal::alacritty_terminal::term::TermMode {
         self.handle.read(|t| t.mode())
     }
 
@@ -125,14 +125,14 @@ impl TerminalProxy {
         self.handle.read(|t| t.hyperlink_at(row, col))
     }
 
-    pub fn hover_target(&self, row: usize, col: usize) -> Option<terminal::HoverTarget> {
+    pub fn hover_target(&self, row: usize, col: usize) -> Option<manox_terminal::HoverTarget> {
         self.handle.read(|t| t.hover_target(row, col))
     }
 
     pub fn search_matches(
         &self,
         pattern: &str,
-    ) -> Result<Vec<(terminal::Point, terminal::Point)>, String> {
+    ) -> Result<Vec<(manox_terminal::Point, manox_terminal::Point)>, String> {
         self.handle.read(|t| t.search_matches(pattern))
     }
 
@@ -170,7 +170,7 @@ impl TerminalProxy {
         row: usize,
         col: usize,
         delta_lines: i32,
-        modifiers: &terminal::Modifiers,
+        modifiers: &manox_terminal::Modifiers,
     ) {
         self.handle
             .with_mut(|t| t.mouse_wheel(row, col, delta_lines, modifiers));
@@ -178,7 +178,7 @@ impl TerminalProxy {
 
     pub fn start_selection(
         &self,
-        ty: terminal::alacritty_terminal::selection::SelectionType,
+        ty: manox_terminal::alacritty_terminal::selection::SelectionType,
         row: usize,
         col: usize,
     ) {
@@ -197,7 +197,7 @@ impl TerminalProxy {
         self.handle.with_mut(|t| t.toggle_vi_mode());
     }
 
-    pub fn vi_motion(&self, motion: terminal::alacritty_terminal::vi_mode::ViMotion) {
+    pub fn vi_motion(&self, motion: manox_terminal::alacritty_terminal::vi_mode::ViMotion) {
         self.handle.with_mut(|t| t.vi_motion(motion));
     }
 }

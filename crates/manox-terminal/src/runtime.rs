@@ -21,7 +21,7 @@ pub fn set_runtime(handle: tokio::runtime::Handle) {
 pub fn handle() -> &'static tokio::runtime::Handle {
     HANDLE
         .get()
-        .expect("terminal runtime not initialized; call terminal::runtime::set_runtime first")
+        .expect("terminal runtime not initialized; call manox_manox_terminal::runtime::set_runtime first")
 }
 
 /// The registered runtime handle, or `None` before registration.

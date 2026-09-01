@@ -86,7 +86,7 @@ use crate::{
 };
 use crate::{FocusConversation, OpenSettings};
 use manox_protocol::RpcConnection;
-use terminal::Terminal;
+use manox_terminal::Terminal;
 use terminal_ui::TerminalView;
 use terminal_ui::terminal_proxy::TerminalProxy;
 
@@ -2206,7 +2206,7 @@ impl Workspace {
     pub fn focus_terminal(&mut self, cx: &mut Context<Self>) {
         if self.terminal_view.is_none() {
             let id = uuid::Uuid::new_v4().to_string();
-            let pty = match terminal::pty::default_source(&self.cwd, 80, 24) {
+            let pty = match manox_terminal::pty::default_source(&self.cwd, 80, 24) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to open terminal pty");
@@ -2316,7 +2316,7 @@ impl Workspace {
             }
         };
         let id = format!("external:{}:{}", agent_id, uuid::Uuid::new_v4());
-        let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+        let source = manox_terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
         let terminal = match Terminal::spawn(id.clone(), cwd.clone(), 80, 24, Box::new(source)) {
             Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
             Err(e) => {
@@ -2419,8 +2419,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let cwd = project_cwd.clone().unwrap_or_else(|| self.cwd.clone());
-        let source: Box<dyn terminal::pty_source::PtySource> = match kind {
-            SessionKind::Terminal => match terminal::pty::default_source(&cwd, 80, 24) {
+        let source: Box<dyn manox_terminal::pty_source::PtySource> = match kind {
+            SessionKind::Terminal => match manox_terminal::pty::default_source(&cwd, 80, 24) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(error = ?e, "failed to open terminal pty");
@@ -2492,11 +2492,11 @@ impl Workspace {
         let exit_id = id.to_string();
         cx.subscribe(
             terminal,
-            move |this, _terminal, ev: &terminal::event::TerminalEvent, cx| match ev {
-                terminal::event::TerminalEvent::ChildExit(_) => {
+            move |this, _terminal, ev: &manox_terminal::event::TerminalEvent, cx| match ev {
+                manox_terminal::event::TerminalEvent::ChildExit(_) => {
                     this.remove_external_session(&exit_id, cx);
                 }
-                terminal::event::TerminalEvent::Title(title) => {
+                manox_terminal::event::TerminalEvent::Title(title) => {
                     this.set_external_title(&exit_id, title.clone(), cx);
                 }
                 _ => {}
@@ -2683,9 +2683,9 @@ impl Workspace {
                 }
             };
             let _ = this.update_in(cx, |this, window, cx| {
-                let source = terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
+                let source = manox_terminal::cx_session::CxSessionSource::new(Arc::clone(&handle));
                 let terminal =
-                    match terminal::Terminal::spawn(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source))
+                    match manox_terminal::Terminal::spawn(id.clone(), PathBuf::from(&sidecar.cwd), 80, 24, Box::new(source))
                     {
                         Ok(t) => cx.new(|cx| TerminalProxy::new(t, cx)),
                         Err(e) => {

@@ -18,7 +18,7 @@ members = [
     "crates/manox",
     "crates/pi",
     "crates/pi-extensions",
-    "crates/terminal",
+    "crates/manox-terminal",
     "crates/terminal-ui",
     "crates/components",
     "crates/supervisor",
@@ -47,7 +47,7 @@ publish = false
 manox-agent = { path = "crates/manox-agent" }
 agent-ui = { path = "crates/agent-ui" }
 manox = { path = "crates/manox" }
-terminal = { path = "crates/terminal" }
+manox-terminal = { path = "crates/manox-terminal" }
 terminal-ui = { path = "crates/terminal-ui" }
 manox-components = { path = "crates/components" }
 supervisor = { path = "crates/supervisor" }

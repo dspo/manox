@@ -1,5 +1,5 @@
 [package]
-name = "terminal"
+name = "manox-terminal"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

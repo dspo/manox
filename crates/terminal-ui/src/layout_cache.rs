@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use terminal::{Cell, Color};
+use manox_terminal::{Cell, Color};
 
 /// One cached line: the shaped runs (start column + value) and the content
 /// fingerprint they were built from.
@@ -123,7 +123,7 @@ fn hash_color(mix: &mut impl FnMut(u8), color: &Color) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use terminal::Flags;
+    use manox_terminal::Flags;
 
     fn cell(c: char, fg: Color, bg: Color, flags: Flags) -> Cell {
         Cell {
@@ -140,14 +140,14 @@ mod tests {
         let a = [
             cell(
                 'h',
-                Color::Named(terminal::NamedColor::Foreground),
-                Color::Named(terminal::NamedColor::Background),
+                Color::Named(manox_terminal::NamedColor::Foreground),
+                Color::Named(manox_terminal::NamedColor::Background),
                 Flags::empty(),
             ),
             cell(
                 'i',
-                Color::Named(terminal::NamedColor::Foreground),
-                Color::Named(terminal::NamedColor::Background),
+                Color::Named(manox_terminal::NamedColor::Foreground),
+                Color::Named(manox_terminal::NamedColor::Background),
                 Flags::empty(),
             ),
         ];
@@ -160,14 +160,14 @@ mod tests {
         let base = [
             cell(
                 'a',
-                Color::Named(terminal::NamedColor::Foreground),
-                Color::Named(terminal::NamedColor::Background),
+                Color::Named(manox_terminal::NamedColor::Foreground),
+                Color::Named(manox_terminal::NamedColor::Background),
                 Flags::empty(),
             ),
             cell(
                 'b',
-                Color::Named(terminal::NamedColor::Foreground),
-                Color::Named(terminal::NamedColor::Background),
+                Color::Named(manox_terminal::NamedColor::Foreground),
+                Color::Named(manox_terminal::NamedColor::Background),
                 Flags::empty(),
             ),
         ];
@@ -178,11 +178,11 @@ mod tests {
         assert_ne!(fp, line_fingerprint(by_char.iter()));
 
         let mut by_fg = base.clone();
-        by_fg[0].fg = Color::Named(terminal::NamedColor::Red);
+        by_fg[0].fg = Color::Named(manox_terminal::NamedColor::Red);
         assert_ne!(fp, line_fingerprint(by_fg.iter()));
 
         let mut by_bg = base.clone();
-        by_bg[0].bg = Color::Spec(terminal::Rgb { r: 1, g: 2, b: 3 });
+        by_bg[0].bg = Color::Spec(manox_terminal::Rgb { r: 1, g: 2, b: 3 });
         assert_ne!(fp, line_fingerprint(by_bg.iter()));
 
         let mut by_flags = base.clone();

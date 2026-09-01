@@ -22,7 +22,7 @@ agent-ui.workspace = true
 # gpui app only; the VS Code host (manox-napi) builds the agent without it.
 manox-agent = { workspace = true, features = ["chrome-use"] }
 cx.workspace = true
-terminal.workspace = true
+manox-terminal.workspace = true
 terminal-ui.workspace = true
 supervisor.workspace = true
 manox-webui.workspace = true

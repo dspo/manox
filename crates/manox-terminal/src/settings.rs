@@ -84,7 +84,7 @@ pub struct TerminalSettings {
     pub line_height: f32,
     /// Color theme: a `.ottytheme` name under `~/.manox/themes/`
     /// (or a path to a theme file). `None` derives the palette from the app
-    /// theme instead — see `terminal::theme::resolve`.
+    /// theme instead — see `manox_manox_terminal::theme::resolve`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     #[serde(

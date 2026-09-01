@@ -178,7 +178,7 @@ static GLOBAL: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex:
 static TEST_OVERRIDE: std::sync::Mutex<Option<TerminalStoreHandle>> = std::sync::Mutex::new(None);
 
 /// Open the db, load the session list, and register the process-global
-/// handle. Call at App startup, after `terminal::runtime::set_runtime`.
+/// handle. Call at App startup, after `manox_manox_terminal::runtime::set_runtime`.
 pub fn init() {
     let path = default_db_path().expect("resolve threads.db path");
     let db = ThreadsDatabase::open(&path)
@@ -201,7 +201,7 @@ pub fn init() {
 
 /// Returns the global [`TerminalStoreHandle`]. Panics if `init` was not called.
 pub fn global() -> TerminalStoreHandle {
-    try_global().expect("TerminalStore not initialized, call terminal::init first")
+    try_global().expect("TerminalStore not initialized, call manox_manox_terminal::init first")
 }
 
 /// The global store when initialized (`init` or `init_for_test`); `None`

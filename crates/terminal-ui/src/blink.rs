@@ -5,7 +5,7 @@
 //! DECSCUSR), and force-visible conditions (selection, IME preedit, recent
 //! input).
 
-use terminal::settings::CursorBlinkSetting;
+use manox_terminal::settings::CursorBlinkSetting;
 
 /// Blink phase for the terminal cursor. `on` flips every tick; `reset` pins
 /// it back to visible so input never lands on an invisible cursor.
