@@ -67,6 +67,9 @@ struct ClientEntry {
     conn: Arc<dyn RpcConnection>,
     peer: RpcPeer,
     hello: ClientHello,
+    /// Monotonically increasing generation assigned on each handshake. Used by
+    /// `remove_client` to avoid deleting a newer entry that replaced this one.
+    generation: u64,
 }
 
 /// The single gateway. Cloning shares the inner state.
@@ -84,6 +87,9 @@ struct AgentServerInner {
     /// In-flight bare-model completions by request id (the LanguageModelChat
     /// provider path); cancellation tokens shared with the spawned streams.
     model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// Monotonically increasing counter for client entry generations, used to
+    /// detect stale entries during same-client-id reconnection.
+    next_generation: AtomicU64,
 }
 
 impl AgentServer {
@@ -96,6 +102,7 @@ impl AgentServer {
             focused: Arc::new(StdMutex::new(None)),
             call_seq: AtomicU64::new(0),
             model_chats: Arc::new(StdMutex::new(HashMap::new())),
+            next_generation: AtomicU64::new(1),
         }))
     }
 
@@ -128,7 +135,7 @@ impl AgentServerInner {
     async fn serve_connection(self: Arc<Self>, conn: Arc<dyn RpcConnection>) {
         let rx = conn.client_rx();
         // ── Handshake: the first message must be Initialize. ─────────────
-        let client_id = match rx.recv().await {
+        let (client_id, generation) = match rx.recv().await {
             Ok(FromClient::Request {
                 id,
                 call:
@@ -138,13 +145,24 @@ impl AgentServerInner {
                         sessions,
                     }),
             }) => {
-                if client_id.is_empty() || self.clients.lock().contains_key(&client_id) {
+                if client_id.is_empty() {
                     conn.send_to_client(FromServer::Response {
                         id,
-                        outcome: Err(RpcError::new(-1, "duplicate or empty client_id")),
+                        outcome: Err(RpcError::new(-1, "empty client_id")),
                     });
                     return;
                 }
+                // Same client_id reconnect: the old entry is stale (the client
+                // dropped its previous in-process connection, but the server-side
+                // dispatch loop never noticed). Cancel any outstanding
+                // ServerCall waiters on the old peer, close the old channel so
+                // its serve_connection loop exits promptly, then re-seat the
+                // entry with a fresh generation.
+                if let Some(old) = self.clients.lock().get(&client_id) {
+                    old.peer.cancel_all(RpcError::new(-1, "client reconnected"));
+                    old.conn.disconnect();
+                }
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let hello = ClientHello {
                     client_id: client_id.clone(),
                     capabilities,
@@ -156,6 +174,7 @@ impl AgentServerInner {
                         conn: conn.clone(),
                         peer: RpcPeer::new(),
                         hello: hello.clone(),
+                        generation,
                     },
                 );
                 for s in &hello.sessions {
@@ -172,7 +191,7 @@ impl AgentServerInner {
                 conn.send_to_client(FromServer::Notification {
                     note: ServerNote::Ready,
                 });
-                client_id
+                (client_id, generation)
             }
             other => {
                 let id = match other {
@@ -229,7 +248,7 @@ impl AgentServerInner {
             }
         }
         // Client disconnected: release ownerships; ownerless sessions drop.
-        self.remove_client(&client_id);
+        self.remove_client(&client_id, generation);
     }
 
     // ── Pure state accessors (no spawning). ─────────────────────────────────
@@ -265,11 +284,11 @@ impl AgentServerInner {
     }
 
     fn add_owner(&self, session_id: &str, client_id: &str) {
-        self.session_owners
-            .lock()
-            .entry(session_id.to_string())
-            .or_default()
-            .push(client_id.to_string());
+        let mut owners = self.session_owners.lock();
+        let list = owners.entry(session_id.to_string()).or_default();
+        if !list.contains(&client_id.to_string()) {
+            list.push(client_id.to_string());
+        }
     }
 
     fn remove_owner(&self, client_id: &str, session_id: &str) {
@@ -282,7 +301,17 @@ impl AgentServerInner {
         }
     }
 
-    fn remove_client(&self, client_id: &str) {
+    fn remove_client(&self, client_id: &str, generation: u64) {
+        // Generation guard: if the entry for this client_id has been replaced
+        // by a newer connection (same-client-id reconnect), do not delete it.
+        let should_remove = self
+            .clients
+            .lock()
+            .get(client_id)
+            .is_some_and(|e| e.generation == generation);
+        if !should_remove {
+            return;
+        }
         self.clients.lock().remove(client_id);
         let mut owners = self.session_owners.lock();
         let orphaned: Vec<String> = owners
@@ -357,6 +386,38 @@ impl AgentServerInner {
         );
         self.route_note(
             session_id,
+            ServerNote::ThreadInfo {
+                session_id: session_id.into(),
+                info: Box::new(self.build_thread_info_payload(thread, session_id)),
+            },
+        );
+    }
+
+    /// Like `emit_history_and_info` but sends only to one specific client
+    /// (used for same-client-id reopen to avoid disturbing other owners).
+    fn emit_history_and_info_to(
+        &self,
+        thread: &ThreadHandle,
+        session_id: &str,
+        restored: bool,
+        client_id: &str,
+    ) {
+        let messages = thread.read(|t| strip_messages_for_wire(t.messages()));
+        let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
+            .unwrap_or_else(|_| json!([]));
+        self.note_to_client(
+            client_id,
+            ServerNote::ThreadHistory {
+                session_id: session_id.into(),
+                messages,
+                display_history,
+                auto_approved_tools: None,
+                restored,
+                loading: false,
+            },
+        );
+        self.note_to_client(
+            client_id,
             ServerNote::ThreadInfo {
                 session_id: session_id.into(),
                 info: Box::new(self.build_thread_info_payload(thread, session_id)),
@@ -579,16 +640,17 @@ async fn open_session(
     session_id: &str,
 ) -> Result<Value, RpcError> {
     // Idempotent reopen: a live session replays its snapshots instead of
-    // loading a second copy.
+    // loading a second copy. Use directed sending (not broadcast) to avoid
+    // disturbing other owners (e.g. a background thread on the same client).
     if let Some(thread) = inner.session_thread(session_id) {
         inner.add_owner(session_id, owner);
-        inner.route_note(
-            session_id,
+        inner.note_to_client(
+            owner,
             ServerNote::SessionCreated {
                 session_id: session_id.into(),
             },
         );
-        inner.emit_history_and_info(&thread, session_id, true);
+        inner.emit_history_and_info_to(&thread, session_id, true, owner);
         return Ok(json!({ "restored": true }));
     }
     let thread = manox_agent::thread_store::global().with_mut(|s| s.load_thread(session_id));
@@ -2960,6 +3022,186 @@ mod tests {
 
         drop(client_a);
         drop(client_b);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn reinitialize_same_client_id_reseats_and_reopen_loads() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        // First open of s1: must succeed.
+        client.send(FromClient::Request {
+            id: MsgId::new("open-1"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { restored: true, .. }
+                }
+            )
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadInfo { .. }
+                }
+            )
+        });
+        // Simulate reconnect: a second connection with the same client_id.
+        let (client_reconn_conn, server_reconn_conn) = in_process_pair();
+        server.accept(std::sync::Arc::new(server_reconn_conn));
+        let client_reconn = Client {
+            conn: client_reconn_conn,
+        };
+        client_reconn.send(FromClient::Request {
+            id: MsgId::new("init-reconn"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "test".into(),
+                capabilities: vec![],
+                sessions: vec![],
+            }),
+        });
+        // Must NOT be rejected — must get ack + Ready.
+        let resp = client_reconn.recv();
+        assert!(
+            matches!(resp, FromServer::Response { outcome: Ok(_), .. }),
+            "reconnect must not be rejected: {resp:?}"
+        );
+        let ready = client_reconn.recv();
+        assert!(
+            matches!(
+                ready,
+                FromServer::Notification {
+                    note: ServerNote::Ready
+                }
+            ),
+            "reconnect must receive Ready: {ready:?}"
+        );
+        // Reopen s1 on the new connection: must load the session again.
+        client_reconn.send(FromClient::Request {
+            id: MsgId::new("open-reconn"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client_reconn,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        expect(&client_reconn, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { restored: true, .. }
+                }
+            )
+        });
+        drop(client);
+        drop(client_reconn);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    #[test]
+    fn add_owner_is_idempotent_no_duplicate_notes() {
+        // A fresh session (no disk restore, so no racing engine drain), then a
+        // second idempotent `OpenSession` from the same client. If `add_owner`
+        // pushed a duplicate owner entry, the turn's event would be routed to
+        // the same connection twice. `expect` returns on the FIRST match and
+        // then asserts nothing else is queued — proving single delivery.
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        // Second open from the same client — the idempotent reopen path calls
+        // `add_owner` again; it must not add a duplicate owner.
+        client.send(FromClient::Request {
+            id: MsgId::new("open-2"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        // Drain the reopen's directed snapshot (history + info) so the channel
+        // is clean before we probe single-delivery of the turn event.
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { .. }
+                }
+            )
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadInfo { .. }
+                }
+            )
+        });
+        // Drive one turn: exactly one TurnStarted must reach the client.
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "s1".into(),
+                text: "idempotency probe".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { session_id } } if session_id == "s1"),
+        );
+        // Nothing further may be queued: a duplicate owner would have delivered
+        // a second TurnStarted (or any second note) here.
+        std::thread::sleep(Duration::from_millis(100));
+        let mut extras = Vec::new();
+        while let Ok(extra) = client.conn.server_rx().try_recv() {
+            extras.push(extra);
+        }
+        assert!(
+            extras.is_empty(),
+            "duplicate delivery after idempotent reopen: {extras:?}"
+        );
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnFinished { session_id, .. } } if session_id == "s1"),
+        );
+        drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
     }

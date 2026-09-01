@@ -3803,8 +3803,11 @@ impl Workspace {
             });
         } else if old_id != new_id {
             // Idle switch: the outgoing session has nothing in flight. The
-            // AgentServer removes the owner on disconnect; the thread persists
-            // in the db for a later `OpenSession`.
+            // In in-process transport the server never detects connection
+            // drop, so owners are not automatically cleaned up. Owner
+            // removal happens via same-client-id reconnect replacement or
+            // explicit DetachSession; the thread persists in the db for a
+            // later `OpenSession`.
             self.store = None;
             self.client_conn = None;
             self.session_id = None;
