@@ -14,23 +14,23 @@
 [workspace]
 members = [
     "crates/manox-agent",
-    "crates/agent-ui",
-"crates/manox",
-	    "crates/manox-harness",
-	    "crates/manox-terminal",
-    "crates/terminal-ui",
-"crates/manox-components",
-	    "crates/supervisor",
-	    "crates/lsp",
-"crates/manox-webview",
-		    "crates/manox-webview-macros",
+    "apps/desktop/agent-ui",
+    "apps/desktop/manox",
+    "crates/manox-harness",
+    "crates/manox-terminal",
+    "apps/desktop/terminal-ui",
+    "apps/desktop/manox-components",
+    "crates/supervisor",
+    "crates/lsp",
+    "apps/desktop/manox-webview",
+    "apps/desktop/manox-webview-macros",
     "crates/cx",
-"crates/manox-providers",
-	    "crates/manox-session-core",
-	    "crates/manox-napi",
-	    "crates/manox-webui",
-	    "crates/manox-protocol",
-	    "crates/hyperlinks",
+    "crates/manox-providers",
+    "crates/manox-session-core",
+    "apps/vscode/manox-napi",
+    "crates/manox-webui",
+    "crates/manox-protocol",
+    "crates/hyperlinks",
 ]
 resolver = "2"
 
@@ -43,15 +43,15 @@ publish = false
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 manox-agent = { path = "crates/manox-agent" }
-agent-ui = { path = "crates/agent-ui" }
-manox = { path = "crates/manox" }
+agent-ui = { path = "apps/desktop/agent-ui" }
+manox = { path = "apps/desktop/manox" }
 manox-terminal = { path = "crates/manox-terminal" }
-terminal-ui = { path = "crates/terminal-ui" }
-manox-components = { path = "crates/manox-components" }
+terminal-ui = { path = "apps/desktop/terminal-ui" }
+manox-components = { path = "apps/desktop/manox-components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
-manox-webview = { path = "crates/manox-webview" }
-manox-webview-macros = { path = "crates/manox-webview-macros" }
+manox-webview = { path = "apps/desktop/manox-webview" }
+manox-webview-macros = { path = "apps/desktop/manox-webview-macros" }
 		manox-session-core = { path = "crates/manox-session-core" }
 manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }

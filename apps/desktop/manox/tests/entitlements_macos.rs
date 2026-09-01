@@ -13,10 +13,10 @@ const ENTITLEMENTS: &str = include_str!("../resources/manox.entitlements");
 fn bundle_script() -> PathBuf {
     let crate_root = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(crate_root)
-        .join("../../script/bundle-mac")
+        .join("../../../script/bundle-mac")
         // Joining keeps it filesystem-agnostic; the test only reads the file.
         .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from(crate_root).join("../../script/bundle-mac"))
+        .unwrap_or_else(|_| PathBuf::from(crate_root).join("../../../script/bundle-mac"))
 }
 
 #[test]

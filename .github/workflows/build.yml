@@ -74,7 +74,7 @@ jobs:
         run: cargo test --workspace --all-targets
 
       - name: Offline example gate
-        run: ./crates/pi/scripts/check_examples.sh
+        run: ./crates/manox-harness/scripts/check_examples.sh
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -82,36 +82,36 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: |
-            vscode/package-lock.json
-            webui/package-lock.json
+            apps/vscode/package-lock.json
+            apps/web/webui/package-lock.json
 
       - name: Build napi binding
         run: cargo build -p manox-napi
 
       - name: Install webui dependencies
-        working-directory: webui
+        working-directory: apps/web/webui
         run: npm ci
 
       - name: Build webui (bundle + contract staging)
-        working-directory: webui
+        working-directory: apps/web/webui
         run: npm run build
 
       - name: Install extension dependencies
-        working-directory: vscode
+        working-directory: apps/vscode
         run: npm ci
 
       - name: Type-check and compile extension host
-        working-directory: vscode
+        working-directory: apps/vscode
         run: npm run compile
 
       - name: Unit tests
-        working-directory: vscode
+        working-directory: apps/vscode
         run: npm test
 
       - name: Stage napi binding
-        working-directory: vscode
+        working-directory: apps/vscode
         run: |
-          for candidate in ../target/debug/libmanox_napi.dylib ../target/debug/libmanox_napi.so ../target/debug/manox_napi.dll; do
+          for candidate in ../../target/debug/libmanox_napi.dylib ../../target/debug/libmanox_napi.so ../../target/debug/manox_napi.dll; do
             if [ -f "$candidate" ]; then cp "$candidate" manox_napi.node; break; fi
           done
           test -f manox_napi.node
@@ -120,7 +120,7 @@ jobs:
           strip manox_napi.node
 
       - name: Package vsix
-        working-directory: vscode
+        working-directory: apps/vscode
         run: npx vsce package --no-dependencies --out manox-vscode.vsix
 
       - name: Save target cache

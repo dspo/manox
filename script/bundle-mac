@@ -9,7 +9,7 @@ set -euo pipefail
 #   --harness <pi|manox>  Which harness core the app is built on (default: manox).
 #                         The flavors get distinct names/identifiers from
 #                         [package.metadata.bundle.harness.<h>] in
-#                         crates/manox/Cargo.toml, so both can coexist in
+#                         apps/desktop/manox/Cargo.toml, so both can coexist in
 #                         /Applications.
 #   -d    Compile in debug mode
 #   -o    Open the resulting .app after bundling
@@ -78,8 +78,8 @@ fi
 cargo build ${build_flag} ${feature_args[@]+"${feature_args[@]}"} --package manox --target "$target_triple"
 
 # --- Read bundle configuration from Cargo.toml ---
-# Single source of truth: [package.metadata.bundle] in crates/manox/Cargo.toml.
-bundle_toml="crates/manox/Cargo.toml"
+# Single source of truth: [package.metadata.bundle] in apps/desktop/manox/Cargo.toml.
+bundle_toml="apps/desktop/manox/Cargo.toml"
 # Extract values from the bundle section (not the [package] section).
 # The bundle "name" is the display name ("Manox"), distinct from the crate
 # name ("manox"). Per-harness tables ([package.metadata.bundle.harness.<h>])
@@ -112,7 +112,7 @@ app_version=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
 app_path="target/${target_triple}/${target_dir}/${app_name}.app"
 macos_dir="${app_path}/Contents/MacOS"
 resources_dir="${app_path}/Contents/Resources"
-icon_resources_dir="crates/manox/resources"
+icon_resources_dir="apps/desktop/manox/resources"
 
 # --- Assemble .app bundle ---
 echo "Creating .app bundle at ${app_path}"
