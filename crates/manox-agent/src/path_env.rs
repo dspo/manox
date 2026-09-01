@@ -8,7 +8,7 @@
 //! subprocess inheriting that PATH loses `gh`, `rg`, `fd`, etc. — the
 //! failure that motivated the retired manox harness's `path_env` module.
 //!
-//! The pi path has a single injection point: the process environment itself.
+//! The manox harness has a single injection point: the process environment itself.
 //! Every spawn site inherits it — the pi kernel's bash tool
 //! (`TokioExecutionEnv`), LSP servers (`crates/lsp`), MCP stdio servers
 //! (supervisor bus), and monitor/background commands (pi-extensions).

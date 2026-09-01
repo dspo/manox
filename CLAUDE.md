@@ -6,6 +6,37 @@ Guidance for Claude Code working in this repo.
 
 manox 是进程内 native agent 工作台，三层架构（核心逻辑 `crates/manox-agent` / UI 层 `apps/desktop/agent-ui` / 薄 bin `apps/desktop/manox`，另有 `crates/manox-terminal` + `apps/desktop/terminal-ui`）。基于 GPUI（GPU 加速 UI 框架）+ gpui-component（longbridge 组件库），LLM 通过 `~/.manox/cx.providers.config.yaml` 直连 provider。**单二进制、单进程**。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
 
+### 代码结构
+
+```
+crates/                    # Rust workspace 成员
+  manox-agent/             # 核心 agent 逻辑（宿主层）
+  manox-terminal/          # 终端仿真器
+  manox-providers/         # LLM provider 配置与路由
+  manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
+    src/core/              # TS Pi 内核移植（纯内核，无业务逻辑）
+    src/ext/               # 经内核拓展点扩展的业务能力
+  manox-protocol/          # 协议定义
+  manox-session-core/      # 会话核心
+  manox-webui/             # Web UI 共享逻辑
+  supervisor/              # 子进程监督
+  hyperlinks/              # 超链接解析
+  lsp/                     # LSP 集成
+  cx/                      # cx CLI 路由域
+
+apps/                      # 应用二进制与 UI
+  desktop/                 # 桌面应用
+    manox/                 # 主二进制入口
+    agent-ui/              # GPUI UI 层（Workspace/MessageList/Composer 等）
+    terminal-ui/           # 终端 UI
+    manox-components/      # 共享 UI 组件库
+    manox-webview/         # WebView 桥
+    manox-webview-macros/  # WebView 过程宏
+  vscode/                  # VS Code 扩展（TS） + manox-napi
+  web/                     # Web UI 前端
+    webui/                 # 前端源码
+```
+
 ## 构建与开发命令
 
 ```bash
@@ -37,7 +68,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 ## 提示词系统
 
-非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/pi-extensions/agents/*.md`（`include_str!`）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
+非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/manox-harness/src/ext/agents/*.md`（`include_str!`）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
 ## 运行时配置（`~/.manox/`）
 
@@ -62,26 +93,26 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 GPUI 栈走 git 仓库地址（crates.io 无 gpui-component）：`gpui`/`gpui_platform` pin zed rev，`gpui-component`/`gpui-component-assets` pin longbridge rev，**三者必须同一 gpui 版本**。`gpui-rich-text`（`crates/rich_text`）是 manox first-party crate。gpui 相关依赖在 debug 下需 opt-level=3。
 
-## crates/pi 接线开发纪律（pi harness 分层）
+## crates/manox-harness 接线开发纪律（harness 分层）
 
-manox 的 harness 已切换到 pi 内核（`crates/pi`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
+manox 的 harness 已切换到 manox-harness 内核（`crates/manox-harness/src/core`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
 
 ### 分层与依赖链
 
-`agent（宿主）→ pi-extensions（扩展）→ pi（内核）`；`manox-providers` 不进扩展层（仅服务 cx 路由域/外部 CLI 会话）。
+`manox-agent（宿主）→ manox-harness/ext（扩展）→ manox-harness/core（内核）`；`manox-providers` 不进扩展层（仅服务 cx 路由域/外部 CLI 会话）。
 
-- **crates/pi 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
-- **crates/pi-extensions**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
-- **agent / agent-ui 宿主**：装配 + UI chrome + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。pi 是唯一 harness 后端（harness 选择 feature 已移除）。
+- **crates/manox-harness/src/core 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
+- **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
+- **manox-agent / agent-ui 宿主**：装配 + UI chrome + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
 
 ### 能力定层判定（每条新能力开工前必做）
 
 先对照 `~/projects/github/pi`（TS 上游）与老 manox 实现（git 历史 / `origin/Manox` 分支）实证，再按三分法定层：
 
-1. **TS pi 原生支持 → 照搬进 crates/pi**（parity）：wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook；`HookPoint` 集即 TS extension 事件的镜像）。
-2. **TS 无、pi 拓展点可承载 → pi-extensions**。
+1. **TS pi 原生支持 → 照搬进 crates/manox-harness/src/core**（parity）：wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook；`HookPoint` 集即 TS extension 事件的镜像）。
+2. **TS 无、pi 拓展点可承载 → manox-harness/src/ext**。
 3. **TS 无、manox 原创 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
-4. **偏离 TS 必须显式注明理由**（写进 PR 的 Assumptions，例：省略 `streamingBehavior`、pi 的 MCP 工具比老 manox 更保守地过审批门控）。
+4. **偏离 TS 必须显式注明理由**（写进 PR 的 Assumptions，例：省略 `streamingBehavior`、manox-harness 的 MCP 工具比老 manox 更保守地过审批门控）。
 
 ### 内核纪律红线
 

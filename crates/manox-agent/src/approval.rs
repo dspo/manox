@@ -1,8 +1,8 @@
-//! Permission gating for the pi harness (host-layer policy).
+//! Permission gating for the manox harness (host-layer policy).
 //!
 //! The pi kernel exposes the `requires_approval` seam on `AgentTool` but
 //! deliberately ships no gate — permission policy is a harness concern. This
-//! module is the pi path's gate: pure mode-based allow/deny, fully
+//! module is the manox harness's gate: pure mode-based allow/deny, fully
 //! synchronous, no reviewer and no interactive approval round trip.
 //!
 //! - `DangerFullAccess` runs every gated call ungated (bash unsandboxed).
