@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 
-use gpui::App;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::unbounded_channel;
 
@@ -24,15 +23,11 @@ use manox_protocol::{
 };
 use manox_session_core::agent_server::AgentServer;
 
-/// Command-direction poll period; event direction is push, so only commands
-/// ride this timer.
-const POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
 /// Start the pump and expose its inbound channel to the WS server. Call once
-/// on the gpui main thread at app startup. Each WS connection is handed to
-/// the AgentServer over an in-process pair; a tokio `spawn_shuttle` task
-/// bridges the browser's WebviewToHost/HostToWebview to the protocol.
-pub fn spawn_pump(cx: &mut App) {
+/// at app startup. Each WS connection is handed to the AgentServer over an
+/// in-process pair; a tokio `spawn_shuttle` task bridges the browser's
+/// WebviewToHost/HostToWebview to the protocol.
+pub fn spawn_server() {
     let (main_tx, mut main_rx) = unbounded_channel::<ToMain>();
     crate::MAIN_CHANNEL
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -41,7 +36,7 @@ pub fn spawn_pump(cx: &mut App) {
         .replace(main_tx);
     let cwd = crate::bridge::resolve_cwd();
     let server = AgentServer::new(std::path::PathBuf::from(cwd.clone()));
-    cx.spawn(async move |cx| {
+    manox_agent::runtime::handle().spawn(async move {
         let mut shuttles: HashMap<
             u64,
             (
@@ -49,35 +44,31 @@ pub fn spawn_pump(cx: &mut App) {
                 manox_protocol::InProcessConnection,
             ),
         > = HashMap::new();
-        loop {
-            while let Ok(msg) = main_rx.try_recv() {
-                match msg {
-                    ToMain::Connect(handle) => {
-                        let (client_conn, server_conn) = in_process_pair();
-                        server.accept(Arc::new(server_conn));
-                        let pending_ready = Arc::new(std::sync::Mutex::new(HashMap::new()));
-                        let shuttle = spawn_shuttle(
-                            client_conn.clone(),
-                            handle.cmd_rx,
-                            handle.outbound.clone(),
-                            pending_ready,
-                            format!("webui-{}", handle.id),
-                            cwd.clone(),
-                        );
-                        shuttles.insert(handle.id, (shuttle, client_conn));
-                    }
-                    ToMain::Disconnect(id) => {
-                        if let Some((shuttle, conn)) = shuttles.remove(&id) {
-                            conn.disconnect();
-                            shuttle.abort();
-                        }
+        while let Some(msg) = main_rx.recv().await {
+            match msg {
+                ToMain::Connect(handle) => {
+                    let (client_conn, server_conn) = in_process_pair();
+                    server.accept(Arc::new(server_conn));
+                    let pending_ready = Arc::new(std::sync::Mutex::new(HashMap::new()));
+                    let shuttle = spawn_shuttle(
+                        client_conn.clone(),
+                        handle.cmd_rx,
+                        handle.outbound.clone(),
+                        pending_ready,
+                        format!("webui-{}", handle.id),
+                        cwd.clone(),
+                    );
+                    shuttles.insert(handle.id, (shuttle, client_conn));
+                }
+                ToMain::Disconnect(id) => {
+                    if let Some((shuttle, conn)) = shuttles.remove(&id) {
+                        conn.disconnect();
+                        shuttle.abort();
                     }
                 }
             }
-            cx.background_executor().timer(POLL).await;
         }
-    })
-    .detach();
+    });
 }
 
 /// δ₁-b: shuttle one WebUI connection through the AgentServer. The WS worker
