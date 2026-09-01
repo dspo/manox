@@ -491,7 +491,11 @@ pub(crate) fn claude_project_dir_for_cwd_in(cwd: &Path, home: &Path) -> Option<P
 /// `~/.codex/sessions` into each launch's CODEX_HOME, so rollouts from
 /// cx-launched codex land here. `None`: no HOME.
 pub(crate) fn codex_sessions_dir() -> Option<PathBuf> {
-    Some(manox_agent::paths::home_dir()?.join(".codex").join("sessions"))
+    Some(
+        manox_agent::paths::home_dir()?
+            .join(".codex")
+            .join("sessions"),
+    )
 }
 
 /// Names of `*.jsonl` regular files directly in `dir` — subdirectories are

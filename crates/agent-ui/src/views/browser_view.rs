@@ -8,7 +8,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use manox_agent::thread_engine::BrowserTabId;
 use gpui::{
     AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, Styled as _, Subscription, Window, div,
@@ -18,6 +17,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputEvent, InputState},
 };
+use manox_agent::thread_engine::BrowserTabId;
 
 /// URL a browser tab loads when opened without one (e.g. via the keybinding).
 /// A stable, offline-tolerant page so the tab is immediately useful without
@@ -85,7 +85,8 @@ impl BrowserView {
         let webview = cx.new(|cx| manox_webview::webview::WebView::new(wry, window, cx));
 
         let address = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(manox_agent::i18n::t("browser-address-placeholder"))
+            InputState::new(window, cx)
+                .placeholder(manox_agent::i18n::t("browser-address-placeholder"))
         });
         address.update(cx, |s, cx| s.set_value(url, window, cx));
 

@@ -1,8 +1,8 @@
 //! GPUI-aware i18n helpers — thin wrappers over `manox_agent::i18n` that return
 //! `gpui::SharedString` for use in gpui element/component APIs.
 
-pub use manox_agent::i18n::{Language, set_ui_language};
 use gpui::SharedString;
+pub use manox_agent::i18n::{Language, set_ui_language};
 
 /// Resolve `key` with no arguments as a `SharedString`.
 pub fn t(key: &str) -> SharedString {

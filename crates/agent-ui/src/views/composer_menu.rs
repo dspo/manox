@@ -12,7 +12,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::i18n;
-use manox_agent::language_model::MessageContent;
 use base64::Engine as _;
 use gpui::{SharedString, prelude::*};
 use gpui_component::{
@@ -20,6 +19,7 @@ use gpui_component::{
     menu::{PopupMenu, PopupMenuItem},
     v_flex,
 };
+use manox_agent::language_model::MessageContent;
 
 /// Static row for the `+` menu: an icon, a name, and a description.
 /// `name`/`desc` are fluent message ids for localized rows, or literal English

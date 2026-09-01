@@ -6,9 +6,9 @@
 
 mod common;
 
-use manox_agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
+use manox_agent::ThreadEvent;
 
 #[gpui::test]
 async fn background_plan_ready_resurfaces_on_switch_back(cx: &mut TestAppContext) {

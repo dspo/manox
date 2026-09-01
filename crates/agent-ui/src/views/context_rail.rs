@@ -22,7 +22,6 @@
 
 use crate::client_store_handle::ClientStoreHandle;
 use crate::i18n;
-use manox_agent::ThreadEvent;
 use gpui::{
     AnyElement, App, ClickEvent, ClipboardItem, Context, Entity, MouseButton, MouseUpEvent, Render,
     SharedString, WeakEntity, Window, prelude::*, px,
@@ -31,6 +30,7 @@ use gpui_component::{
     ActiveTheme as _, Icon, IconName, Sizable as _, TITLE_BAR_HEIGHT, Theme, WindowExt as _,
     h_flex, notification::Notification, tooltip::Tooltip, v_flex,
 };
+use manox_agent::ThreadEvent;
 use std::collections::HashMap;
 use std::path::PathBuf;
 

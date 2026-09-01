@@ -179,8 +179,8 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     manox_agent::refresh_thread_list();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let listed =
-            manox_agent::thread_store_global().read(|s| s.summaries().iter().any(|s| s.id == new_id));
+        let listed = manox_agent::thread_store_global()
+            .read(|s| s.summaries().iter().any(|s| s.id == new_id));
         if listed {
             break;
         }

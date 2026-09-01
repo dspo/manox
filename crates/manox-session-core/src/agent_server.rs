@@ -1063,14 +1063,14 @@ impl AgentServerInner {
         };
         let plan_file = plan_file.to_string();
         let lang = thread.read(|t| t.agent_language());
-        let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file)
-        {
-            Ok(text) => text,
-            Err(e) => {
-                thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-                return;
-            }
-        };
+        let seed_text =
+            match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
+                Ok(text) => text,
+                Err(e) => {
+                    thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+                    return;
+                }
+            };
         thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1366,15 +1366,16 @@ fn apply_plan_verdict(
     }
     let compact = choice == "execute_compact";
     let lang = thread.read(|t| t.agent_language());
-    let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
-        Ok(text) => text,
-        Err(e) => {
-            thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-            return;
-        }
-    };
-    let compact_instructions =
-        compact.then(|| manox_agent::collaboration_mode::plan_compact_instructions(lang, &plan_file));
+    let seed_text =
+        match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
+            Ok(text) => text,
+            Err(e) => {
+                thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+                return;
+            }
+        };
+    let compact_instructions = compact
+        .then(|| manox_agent::collaboration_mode::plan_compact_instructions(lang, &plan_file));
     thread.with_mut(|t| {
         t.set_plan_review_pending(false);
         let ui = MessageUiMetadata {
@@ -1536,7 +1537,8 @@ fn spawn_pump(
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
                     let id = session_id.clone();
-                    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_auth(&id, true));
+                    manox_agent::thread_store::global()
+                        .with_mut(|s| s.mark_pending_auth(&id, true));
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
@@ -1548,7 +1550,8 @@ fn spawn_pump(
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
                     let id = session_id.clone();
-                    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(&id, true));
+                    manox_agent::thread_store::global()
+                        .with_mut(|s| s.mark_pending_plan(&id, true));
                     thread.with_mut(|t| t.set_plan_review_pending(true));
                     // β-3b: initiate PlanVerdict (carries the plan body) and
                     // skip translate's bare PlanReady note — the call is the

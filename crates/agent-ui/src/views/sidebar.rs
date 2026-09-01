@@ -16,8 +16,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::i18n;
-use manox_agent::thread::PermissionMode;
-use manox_agent::thread_store::StoreHandle;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity,
     EventEmitter, Pixels, Render, ScrollHandle, SharedString, Subscription, Transformation,
@@ -33,6 +31,8 @@ use gpui_component::{
     tooltip::Tooltip,
     v_flex,
 };
+use manox_agent::thread::PermissionMode;
+use manox_agent::thread_store::StoreHandle;
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so

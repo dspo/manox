@@ -31,7 +31,6 @@ pub mod path_env;
 pub mod path_policy;
 pub mod paths;
 pub mod permission;
-pub mod provider_glue;
 pub mod plan;
 pub mod plan_mode;
 pub mod plugin;
@@ -39,6 +38,7 @@ pub mod plugin_hooks;
 pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
+pub mod provider_glue;
 pub mod runtime;
 pub mod sandbox;
 pub mod settings;
@@ -59,9 +59,9 @@ pub mod thread_engine;
 pub mod thread_registry;
 pub mod thread_store;
 
-pub mod monitor_bridge;
 pub mod approval;
 pub mod engine;
+pub mod monitor_bridge;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};

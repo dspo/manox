@@ -24,11 +24,11 @@ use pi_extensions::monitor::{MonitorManager, MonitorTool};
 use pi_extensions::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
+use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
 use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE, UiNoteRecord};
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
-use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 

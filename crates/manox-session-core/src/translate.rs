@@ -290,9 +290,9 @@ mod tests {
     #[test]
     fn compaction_note_carries_the_retained_tail() {
         let tail = vec![
-            manox_agent::message::Message::assistant(vec![manox_agent::language_model::MessageContent::Text(
-                "kept answer".into(),
-            )]),
+            manox_agent::message::Message::assistant(vec![
+                manox_agent::language_model::MessageContent::Text("kept answer".into()),
+            ]),
             manox_agent::message::Message::user("kept follow-up".into()),
         ];
         let translated = translate(

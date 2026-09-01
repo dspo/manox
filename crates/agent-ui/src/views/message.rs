@@ -27,9 +27,6 @@ use crate::conversation::{
     UserImage, UserTurnMeta,
 };
 use crate::i18n;
-use manox_agent::language_model::{LanguageModelToolResult, MessageContent, Role};
-use manox_agent::thread::PermissionMode;
-use manox_agent::{Message, TokenUsage, ToolCallStatus};
 use base64::Engine as _;
 use chrono::{Datelike as _, Local, TimeZone as _};
 use gpui::prelude::*;
@@ -46,6 +43,9 @@ use gpui_component::{
     Disableable as _,
     tag::{Tag, TagVariant},
 };
+use manox_agent::language_model::{LanguageModelToolResult, MessageContent, Role};
+use manox_agent::thread::PermissionMode;
+use manox_agent::{Message, TokenUsage, ToolCallStatus};
 use manox_components::markdown::ast::LinkKind;
 use manox_components::markdown::terminal_panel::GitSummary;
 use manox_components::markdown::{HeadingMode, Markdown, PanelKind, TerminalPanel};
@@ -3402,7 +3402,8 @@ impl ItemBuilder {
                                         status: ToolCallStatus::Success,
                                         is_error: false,
                                     }));
-                                } else if tu.name.as_ref() == manox_agent::tools::ASK_USER_QUESTION {
+                                } else if tu.name.as_ref() == manox_agent::tools::ASK_USER_QUESTION
+                                {
                                     // An inline clarify card: stays a top-level
                                     // ToolCall so `render_ask_user_card` can drive
                                     // its interactive snapshot while pending; the
@@ -3628,10 +3629,10 @@ fn pair_tool_result(items: &mut Vec<ConvItem>, tr: &LanguageModelToolResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manox_agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
     use gpui::{
         AnyWindowHandle, Bounds, Pixels, Render, TestAppContext, VisualTestContext, Window, size,
     };
+    use manox_agent::language_model::{LanguageModelToolResult, LanguageModelToolUse};
 
     #[test]
     fn live_tail_short_output_unchanged() {

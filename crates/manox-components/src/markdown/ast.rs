@@ -624,7 +624,10 @@ mod tests {
             _ => panic!("expected paragraph"),
         };
         assert_eq!(runs.link_spans.len(), 1);
-        assert_eq!(runs.link_spans[0].url, "crates/manox-agent/src/thread.rs:508");
+        assert_eq!(
+            runs.link_spans[0].url,
+            "crates/manox-agent/src/thread.rs:508"
+        );
         assert_eq!(runs.link_spans[0].kind, LinkKind::FilePath);
     }
 

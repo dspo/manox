@@ -15,7 +15,6 @@
 //! notice texts say so.
 
 use crate::i18n;
-use manox_agent::plugin::PluginManager;
 use gpui::{AnyElement, Context, Entity, Hsla, Render, SharedString, Window, div, prelude::*, px};
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, Theme,
@@ -27,6 +26,7 @@ use gpui_component::{
     tag::{Tag, TagVariant},
     v_flex,
 };
+use manox_agent::plugin::PluginManager;
 
 use crate::views::braille_spinner::BrailleSpinner;
 

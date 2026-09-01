@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 use manox_agent::ThreadEvent;
 use manox_agent::db::{HistoryEntry, UiNoteKind, UiNoteRecord};
 use manox_agent::language_model::StopReason;
 use manox_agent::thread::PermissionMode;
 use manox_agent::{Message, TokenUsage, ToolCallStatus};
-use gpui::{App, AppContext as _, Entity, SharedString, WeakEntity};
 
 use crate::Workspace;
 use crate::views::message::{AutoCollapseTarget, ItemBuilder, MessageItem, schedule_auto_collapse};
@@ -75,7 +75,10 @@ impl UserTurnMeta {
         }
     }
 
-    pub(crate) fn from_message(message: &Message, recipient: Option<manox_agent::MessageAuthor>) -> Self {
+    pub(crate) fn from_message(
+        message: &Message,
+        recipient: Option<manox_agent::MessageAuthor>,
+    ) -> Self {
         let ui = message.ui.as_ref();
         Self {
             timestamp: message.timestamp,
@@ -210,7 +213,9 @@ fn recent_background_task_output(task_id: &str) -> Vec<String> {
     latest_background_task_output(task.recent_events())
 }
 
-fn latest_background_task_output(events: Vec<manox_agent::background_task::TaskEvent>) -> Vec<String> {
+fn latest_background_task_output(
+    events: Vec<manox_agent::background_task::TaskEvent>,
+) -> Vec<String> {
     let mut output: Vec<String> = events
         .into_iter()
         .rev()

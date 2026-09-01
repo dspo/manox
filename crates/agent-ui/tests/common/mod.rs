@@ -11,15 +11,15 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use agent_ui::Workspace;
+use gpui::{AppContext as _, Entity, TestAppContext, px, size};
+use gpui_component::Theme;
 use manox_agent::Thread;
 use manox_agent::ThreadEvent;
 use manox_agent::db::ThreadSummary;
 use manox_agent::language_model::{LanguageModelToolUse, MessageContent, TokenUsage};
 use manox_agent::message::Message;
 use manox_agent::thread_engine::{BackendNotice, ThreadEngine};
-use agent_ui::Workspace;
-use gpui::{AppContext as _, Entity, TestAppContext, px, size};
-use gpui_component::Theme;
 use pi::types::{ContentBlock, Model as PiModel};
 
 /// Minimal backend for the workspace tests: no actor, fixed history. The
@@ -114,7 +114,10 @@ pub fn open_workspace(
 /// creation, so the test swaps in the fake before anything runs. Returns the
 /// gpui-free `ThreadHandle`; the workspace binds its own `ClientStoreHandle`
 /// on `attach_thread`, and tests drive it through `emit`.
-pub fn fake_thread(cx: &mut TestAppContext, history: Vec<Message>) -> manox_agent::thread::ThreadHandle {
+pub fn fake_thread(
+    cx: &mut TestAppContext,
+    history: Vec<Message>,
+) -> manox_agent::thread::ThreadHandle {
     let (_, events) = tokio::sync::mpsc::unbounded_channel::<BackendNotice>();
     cx.update(|_cx| {
         let thread = Thread::landing(PathBuf::from("/tmp"));

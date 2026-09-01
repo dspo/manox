@@ -8,9 +8,9 @@
 
 mod common;
 
-use manox_agent::ThreadEvent;
 use common::{emit, fake_thread, init_harness, open_workspace, write_plan_file};
 use gpui::{TestAppContext, VisualTestContext};
+use manox_agent::ThreadEvent;
 
 #[gpui::test]
 async fn foreground_plan_card_survives_normal_turn_end(cx: &mut TestAppContext) {

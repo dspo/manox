@@ -16,12 +16,6 @@ use std::time::Duration;
 
 use crate::i18n;
 use crate::views::launcher::LauncherPick;
-use manox_agent::PermissionDecision;
-use manox_agent::collaboration_mode::PlanReviewChoice;
-use manox_agent::language_model::StopReason;
-use manox_agent::thread::PermissionMode;
-use manox_agent::thread_engine::BrowserTabId;
-use manox_agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use gpui::DismissEvent;
 use gpui::{
     Anchor, Animation, AnimationExt as _, AnyElement, App, Context, Entity, FocusHandle,
@@ -50,6 +44,12 @@ use gpui_component::{
 /// `WindowExt::push_notification` + `Notification` are shared: the
 /// ChatGPT.app launch path (#410) reports outcomes under either harness.
 use gpui_component::{WindowExt as _, notification::Notification, tooltip::Tooltip};
+use manox_agent::PermissionDecision;
+use manox_agent::collaboration_mode::PlanReviewChoice;
+use manox_agent::language_model::StopReason;
+use manox_agent::thread::PermissionMode;
+use manox_agent::thread_engine::BrowserTabId;
+use manox_agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 use serde::{Deserialize, Serialize};
@@ -773,7 +773,8 @@ impl Workspace {
         // thread the workspace renders and the thread the server drives are
         // the same conversation.
         let landing_id = uuid::Uuid::new_v4().to_string();
-        let thread = Thread::landing_with_id(manox_agent::ThreadId(landing_id.clone()), cwd.clone());
+        let thread =
+            Thread::landing_with_id(manox_agent::ThreadId(landing_id.clone()), cwd.clone());
         let (store, client_conn, session_id) = {
             let session_id = landing_id.clone();
             let (client_conn, server_conn) = manox_protocol::in_process_pair();
@@ -1340,14 +1341,16 @@ impl Workspace {
                         .as_ref()
                         .map(|s| s.read(cx).store.messages.clone())
                         .expect("foreground store present");
-                    if let Some(snapshot) =
-                        manox_agent::plan::rebuild_from_messages(&messages).or_else(|| {
+                    if let Some(snapshot) = manox_agent::plan::rebuild_from_messages(&messages)
+                        .or_else(|| {
                             this.store
                                 .as_ref()
                                 .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
                                 .and_then(|v| {
-                                    serde_json::from_value::<manox_agent::plan::PlanSnapshot>(v.clone())
-                                        .ok()
+                                    serde_json::from_value::<manox_agent::plan::PlanSnapshot>(
+                                        v.clone(),
+                                    )
+                                    .ok()
                                 })
                         })
                     {
@@ -1529,16 +1532,14 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.store.as_ref().and_then(|s| {
-                        s.read(cx)
-                            .store
-                            .last_token_usage
-                            .as_ref()
-                            .map(|u| manox_agent::TokenUsage {
+                        s.read(cx).store.last_token_usage.as_ref().map(|u| {
+                            manox_agent::TokenUsage {
                                 input_tokens: u.input,
                                 output_tokens: u.output,
                                 cache_creation_input_tokens: u.cache_creation,
                                 cache_read_input_tokens: u.cache_read,
-                            })
+                            }
+                        })
                     });
                     let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
@@ -1593,8 +1594,10 @@ impl Workspace {
                                             .as_ref()
                                             .and_then(|s| s.read(cx).store.goal.clone())
                                             .and_then(|v| {
-                                                serde_json::from_value::<manox_agent::goal::ThreadGoal>(v)
-                                                    .ok()
+                                                serde_json::from_value::<
+                                                    manox_agent::goal::ThreadGoal,
+                                                >(v)
+                                                .ok()
                                             })
                                             .is_some()
                                 });
@@ -1689,7 +1692,12 @@ impl Workspace {
                         // append rides the actor queue behind the settling run;
                         // a crash before the actor drains it loses the card
                         // (accepted window for an annotation).
-                        this.append_ui_note(manox_agent::db::UiNoteKind::Error, e.to_string(), None, cx);
+                        this.append_ui_note(
+                            manox_agent::db::UiNoteKind::Error,
+                            e.to_string(),
+                            None,
+                            cx,
+                        );
                         // An error is a terminal state symmetric to a terminal
                         // `Stop`: the turn aborted, so any pending plan review
                         // is now stale and must not linger over an idle thread.
@@ -1793,16 +1801,14 @@ impl Workspace {
                     let weak = cx.weak_entity();
                     let role = this.model_label(cx);
                     let usage = this.store.as_ref().and_then(|s| {
-                        s.read(cx)
-                            .store
-                            .last_token_usage
-                            .as_ref()
-                            .map(|u| manox_agent::TokenUsage {
+                        s.read(cx).store.last_token_usage.as_ref().map(|u| {
+                            manox_agent::TokenUsage {
                                 input_tokens: u.input,
                                 output_tokens: u.output,
                                 cache_creation_input_tokens: u.cache_creation,
                                 cache_read_input_tokens: u.cache_read,
-                            })
+                            }
+                        })
                     });
                     let cwd = thread_cwd(&this.thread, &this.store, cx);
                     let outcome = this.conversation.update(cx, |c, cx| {
@@ -2006,7 +2012,9 @@ impl Workspace {
             let is_queued = matches!(&item.state, FollowUpState::Queued);
             if is_queued {
                 let mut content: Vec<manox_agent::language_model::MessageContent> =
-                    vec![manox_agent::language_model::MessageContent::Text(item.turn.text)];
+                    vec![manox_agent::language_model::MessageContent::Text(
+                        item.turn.text,
+                    )];
                 content.extend(item.turn.images);
                 let ui = item.turn.ui;
                 thread.with_mut(|t| {
@@ -3905,8 +3913,10 @@ impl Workspace {
                     .background_tasks
                     .iter()
                     .filter_map(|t| {
-                        serde_json::from_value::<manox_agent::background_task::TaskSnapshot>(t.clone())
-                            .ok()
+                        serde_json::from_value::<manox_agent::background_task::TaskSnapshot>(
+                            t.clone(),
+                        )
+                        .ok()
                     })
                     .collect::<Vec<_>>()
             })
@@ -4008,7 +4018,9 @@ impl Workspace {
             self.store
                 .as_ref()
                 .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
-                .and_then(|v| serde_json::from_value::<manox_agent::plan::PlanSnapshot>(v.clone()).ok())
+                .and_then(|v| {
+                    serde_json::from_value::<manox_agent::plan::PlanSnapshot>(v.clone()).ok()
+                })
         });
         self.context_rail.update(cx, |r, cx| {
             // Rebind the rail to the incoming thread. Without this the rail
@@ -4714,8 +4726,8 @@ impl Workspace {
         weak: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        use manox_agent::language_model::MessageContent;
         use base64::Engine as _;
+        use manox_agent::language_model::MessageContent;
         // UI state tracking (always) — conversation bubble + list housekeeping.
         self.conversation.update(cx, |c, cx| {
             c.push_user(
@@ -4762,8 +4774,8 @@ impl Workspace {
         if self.queued_follow_ups.is_empty() {
             return;
         }
-        use manox_agent::language_model::MessageContent;
         use base64::Engine as _;
+        use manox_agent::language_model::MessageContent;
         let weak = cx.weak_entity();
         let follow_tail = self.list_state.is_following_tail();
         let mut retain: Vec<QueuedFollowUp> = Vec::new();
@@ -4992,9 +5004,11 @@ impl Workspace {
     /// Decode provider-bound image contents into UI-preview `UserImage`s. The
     /// canonical `MessageContent::Image` bytes still go to the thread; this
     /// only rebuilds a gpui image for the user bubble.
-    fn decode_user_images(images: &[manox_agent::language_model::MessageContent]) -> Vec<UserImage> {
-        use manox_agent::language_model::MessageContent;
+    fn decode_user_images(
+        images: &[manox_agent::language_model::MessageContent],
+    ) -> Vec<UserImage> {
         use base64::Engine as _;
+        use manox_agent::language_model::MessageContent;
         images
             .iter()
             .filter_map(|c| match c {
@@ -5919,7 +5933,10 @@ impl Workspace {
             return;
         }
         self.thread.with_mut(|thread| {
-            thread.respond_authorization(&id, manox_agent::ToolAuthorizationResponse::Decision(decision));
+            thread.respond_authorization(
+                &id,
+                manox_agent::ToolAuthorizationResponse::Decision(decision),
+            );
         });
         cx.notify();
     }
@@ -6203,17 +6220,19 @@ impl Workspace {
             return;
         }
         let lang = manox_agent::settings::load().resolve().agent;
-        let seed_text =
-            match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &review.plan_file) {
-                Ok(text) => text,
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to render plan execution seed");
-                    format!(
-                        "Read and implement the approved plan at {}",
-                        review.plan_file
-                    )
-                }
-            };
+        let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(
+            lang,
+            &review.plan_file,
+        ) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to render plan execution seed");
+                format!(
+                    "Read and implement the approved plan at {}",
+                    review.plan_file
+                )
+            }
+        };
         let mut meta = self.user_turn_meta(cx);
         // The expanded plan directive is written by the harness on the user's
         // behalf, so the bubble header names the harness, not the human and
@@ -6502,7 +6521,10 @@ impl Workspace {
             // Identity is the registration name (unique per wire endpoint), so
             // wire variants of one provider stay separate; only exact
             // duplicates collapse.
-            if !seen.insert((m.provider.clone(), manox_agent::provider_glue::config_id(&m))) {
+            if !seen.insert((
+                m.provider.clone(),
+                manox_agent::provider_glue::config_id(&m),
+            )) {
                 continue;
             }
             match providers.iter_mut().find(|(name, _)| *name == prov) {
@@ -6563,8 +6585,12 @@ impl Workspace {
             let ws = workspace.clone();
             let themed = themed.clone();
             let label = match effort {
-                manox_agent::language_model::ReasoningEffort::High => i18n::t("workspace-reasoning-high"),
-                manox_agent::language_model::ReasoningEffort::Max => i18n::t("workspace-reasoning-max"),
+                manox_agent::language_model::ReasoningEffort::High => {
+                    i18n::t("workspace-reasoning-high")
+                }
+                manox_agent::language_model::ReasoningEffort::Max => {
+                    i18n::t("workspace-reasoning-max")
+                }
             };
             let selected = effort == current_effort;
             menu = menu.item(
@@ -7238,27 +7264,32 @@ impl Workspace {
                 h_flex()
                     .justify_end()
                     .gap_1()
-                    .when(goal_status == manox_agent::goal::GoalStatus::Active, |row| {
-                        row.child(
-                            Button::new("goal-pause")
-                                .small()
-                                .label(pause_label)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
-                                    let _ =
-                                        this.send_note(|sid| manox_protocol::ClientNote::Goal {
-                                            session_id: sid.into(),
-                                            action: "pause".into(),
-                                            objective: None,
-                                            budget: None,
-                                            max_rounds: None,
+                    .when(
+                        goal_status == manox_agent::goal::GoalStatus::Active,
+                        |row| {
+                            row.child(
+                                Button::new("goal-pause")
+                                    .small()
+                                    .label(pause_label)
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, _cx| {
+                                        let _ = this.send_note(|sid| {
+                                            manox_protocol::ClientNote::Goal {
+                                                session_id: sid.into(),
+                                                action: "pause".into(),
+                                                objective: None,
+                                                budget: None,
+                                                max_rounds: None,
+                                            }
                                         });
-                                })),
-                        )
-                    })
+                                    })),
+                            )
+                        },
+                    )
                     .when(
                         matches!(
                             goal_status,
-                            manox_agent::goal::GoalStatus::Paused | manox_agent::goal::GoalStatus::Blocked
+                            manox_agent::goal::GoalStatus::Paused
+                                | manox_agent::goal::GoalStatus::Blocked
                         ),
                         |row| {
                             row.child(
@@ -7353,14 +7384,17 @@ impl Workspace {
                             )
                         },
                     )
-                    .when(goal_status == manox_agent::goal::GoalStatus::Complete, |row| {
-                        row.child(Button::new("goal-new").small().label(new_label).on_click(
-                            cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                this.goal_popover_open = false;
-                                this.begin_goal_new(window, cx);
-                            }),
-                        ))
-                    })
+                    .when(
+                        goal_status == manox_agent::goal::GoalStatus::Complete,
+                        |row| {
+                            row.child(Button::new("goal-new").small().label(new_label).on_click(
+                                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.goal_popover_open = false;
+                                    this.begin_goal_new(window, cx);
+                                }),
+                            ))
+                        },
+                    )
                     .child(
                         Button::new("goal-clear")
                             .small()
@@ -10435,7 +10469,10 @@ mod tests {
         let new_id = "t-attach-2".to_string();
         visual.update(|_window, cx| {
             ws.update(cx, |ws, cx| {
-                let new = manox_agent::Thread::new_fresh(manox_agent::ThreadId(new_id.clone()), "/".into());
+                let new = manox_agent::Thread::new_fresh(
+                    manox_agent::ThreadId(new_id.clone()),
+                    "/".into(),
+                );
                 ws.attach_thread(new, false, _window, cx);
             });
         });

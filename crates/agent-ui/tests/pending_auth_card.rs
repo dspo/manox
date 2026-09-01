@@ -7,9 +7,9 @@
 
 mod common;
 
-use manox_agent::PermissionDecision;
 use common::{init_harness, open_workspace};
 use gpui::{TestAppContext, VisualTestContext};
+use manox_agent::PermissionDecision;
 
 #[gpui::test]
 async fn escalation_authorization_surfaces_as_generic_card(cx: &mut TestAppContext) {

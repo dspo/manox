@@ -426,9 +426,9 @@ impl AgentBus {
             .notice_tx
             .send(BackendNotice::Event(Box::new(ThreadEvent::SubagentChild {
                 id: addr.clone(),
-                child: crate::thread::SubagentChildEvent::Model(crate::provider_glue::display_name(
-                    session.model(),
-                )),
+                child: crate::thread::SubagentChildEvent::Model(
+                    crate::provider_glue::display_name(session.model()),
+                ),
             })));
 
         // Register background task for the sidebar card.

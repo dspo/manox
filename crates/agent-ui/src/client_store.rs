@@ -127,10 +127,11 @@ impl ClientStore {
                 self.model_name = name.clone();
             }
             ServerNote::PermissionModeChanged { mode, .. } => {
-                self.permission_mode = serde_json::from_value::<manox_agent::thread::PermissionMode>(
-                    Value::String(mode.clone()),
-                )
-                .unwrap_or_default();
+                self.permission_mode =
+                    serde_json::from_value::<manox_agent::thread::PermissionMode>(Value::String(
+                        mode.clone(),
+                    ))
+                    .unwrap_or_default();
             }
             ServerNote::ReasoningEffortChanged { effort, .. } => {
                 self.reasoning_effort = serde_json::from_value::<
@@ -225,9 +226,9 @@ impl ClientStore {
             Value::String(info.permission_mode.clone()),
         )
         .unwrap_or_default();
-        self.reasoning_effort = serde_json::from_value::<manox_agent::language_model::ReasoningEffort>(
-            Value::String(info.reasoning_effort.clone()),
-        )
+        self.reasoning_effort = serde_json::from_value::<
+            manox_agent::language_model::ReasoningEffort,
+        >(Value::String(info.reasoning_effort.clone()))
         .unwrap_or_default();
         self.pinned = info.pinned;
         self.archived = info.archived;
@@ -243,13 +244,15 @@ impl ClientStore {
             .browser_suites
             .iter()
             .filter_map(|s| {
-                serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(s.clone()))
-                    .ok()
+                serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(
+                    s.clone(),
+                ))
+                .ok()
             })
             .collect();
-        self.history_phase = serde_json::from_value::<manox_agent::thread::HistoryPhase>(Value::String(
-            info.history_phase.clone(),
-        ))
+        self.history_phase = serde_json::from_value::<manox_agent::thread::HistoryPhase>(
+            Value::String(info.history_phase.clone()),
+        )
         .unwrap_or_default();
         self.running = info.running;
         self.has_interacted = info.has_interacted;

@@ -6,12 +6,12 @@
 
 use std::sync::Arc;
 
-use manox_agent::{i18n, version};
 use gpui::{prelude::*, *};
 use gpui_component::{
     StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
 };
+use manox_agent::{i18n, version};
 
 struct AboutWindow {
     focus_handle: FocusHandle,

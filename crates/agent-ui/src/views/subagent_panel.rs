@@ -16,15 +16,15 @@
 use std::collections::HashMap;
 
 use crate::i18n;
-use manox_agent::Message;
-use manox_agent::ToolCallStatus;
-use manox_agent::language_model::{MessageContent, TokenUsage};
-use manox_agent::thread::{SubagentChildEvent, ThreadEvent};
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, Pixels, Render, ScrollHandle, WeakEntity, Window, px,
 };
 use gpui_component::{ActiveTheme as _, ElementExt as _, h_flex, v_flex};
+use manox_agent::Message;
+use manox_agent::ToolCallStatus;
+use manox_agent::language_model::{MessageContent, TokenUsage};
+use manox_agent::thread::{SubagentChildEvent, ThreadEvent};
 
 use crate::Workspace;
 use crate::conversation::{ApplyCtx, ConversationState};
@@ -137,9 +137,9 @@ impl SubagentPanel {
         if backfill.is_empty()
             && let Some(final_text) = final_text
         {
-            display.push(manox_agent::db::HistoryEntry::Message(Message::assistant(vec![
-                MessageContent::Text(final_text),
-            ])));
+            display.push(manox_agent::db::HistoryEntry::Message(Message::assistant(
+                vec![MessageContent::Text(final_text)],
+            )));
         }
         let empty_usage: HashMap<String, TokenUsage> = HashMap::new();
         let recipient_author = manox_agent::MessageAuthor::Agent(recipient.clone());

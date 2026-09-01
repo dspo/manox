@@ -19,9 +19,9 @@ pub fn set_runtime(handle: tokio::runtime::Handle) {
 
 /// The registered runtime handle. Panics if [`set_runtime`] was not called.
 pub fn handle() -> &'static tokio::runtime::Handle {
-    HANDLE
-        .get()
-        .expect("terminal runtime not initialized; call manox_manox_terminal::runtime::set_runtime first")
+    HANDLE.get().expect(
+        "terminal runtime not initialized; call manox_manox_terminal::runtime::set_runtime first",
+    )
 }
 
 /// The registered runtime handle, or `None` before registration.
