@@ -262,6 +262,7 @@ impl SandboxedBashOperations {
     /// escalation-approved root stays for the session. The same derivation
     /// the fs fence applies, so a call one surface passed the other never
     /// denies.
+    #[cfg(target_os = "macos")]
     fn policy_for(&self, cwd: &Path) -> SandboxPolicy {
         SandboxPolicy::for_project(&self.workspace)
             .with_extra_roots(self.granted_roots.roots_for(cwd))
