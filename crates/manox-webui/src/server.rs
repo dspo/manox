@@ -26,9 +26,9 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::bridge::{self, Outbound};
 
-/// The committed `webui/dist` build — embedded into the binary so the app
-/// stays single-process. Rebuilt by `npm run build` in `webui/`.
-static WEBUI_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../webui/dist");
+/// The committed `apps/web/webui/dist` build — embedded into the binary so the app
+/// stays single-process. Rebuilt by `npm run build` in `apps/web/webui/`.
+static WEBUI_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../apps/web/webui/dist");
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -264,7 +264,7 @@ mod tests {
         assert!(html.contains("/assets/webview/bundle.js"));
     }
 
-    /// The committed `webui/dist` build is embedded; `/assets/webview/bundle.js`
+    /// The committed `apps/web/webui/dist` build is embedded; `/assets/webview/bundle.js`
     /// must resolve so the browser actually boots the app (an empty shell is a
     /// routing regression, not the intended home state).
     #[tokio::test]

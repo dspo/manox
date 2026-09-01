@@ -1,7 +1,7 @@
 {
   "name": "manox-vscode",
   "displayName": "manox",
-  "description": "manox agent workbench inside VS Code — pi kernel via napi (crates/manox-napi), tools on the vscode API.",
+  "description": "manox agent workbench inside VS Code — pi kernel via napi (apps/vscode/manox-napi), tools on the vscode API.",
   "version": "0.4.0",
   "publisher": "dspo",
   "license": "MIT",
@@ -128,7 +128,7 @@
   },
   "main": "./out/extension.js",
   "scripts": {
-    "precompile": "cd ../webui && npm run build:contracts",
+    "precompile": "cd ../web/webui && npm run build:contracts",
     "compile": "tsc -p ./",
     "test": "vitest run",
     "package": "npm run compile && vsce package --no-dependencies"

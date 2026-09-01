@@ -32,13 +32,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- Ensure npm dependencies (npm ci when missing or lockfile newer) ---
-if [[ ! -d vscode/node_modules || vscode/package-lock.json -nt vscode/node_modules ]]; then
+if [[ ! -d apps/vscode/node_modules || apps/vscode/package-lock.json -nt apps/vscode/node_modules ]]; then
     echo "Installing npm dependencies"
-    (cd vscode && npm ci)
+    (cd apps/vscode && npm ci)
 fi
 
 # --- Build the extension (release napi binding) ---
-bash vscode/build.sh --release
+bash apps/vscode/build.sh --release
 
 # --- Locate the VS Code CLI ---
 code_bin="/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"
@@ -51,7 +51,7 @@ if [[ -z "$code_bin" ]]; then
 fi
 
 # --- Install the vsix ---
-vsix="$ROOT/vscode/manox-vscode.vsix"
+vsix="$ROOT/apps/vscode/manox-vscode.vsix"
 echo "Installing ${vsix} via ${code_bin}"
 "$code_bin" --install-extension "$vsix" --force
 

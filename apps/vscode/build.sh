@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the manox napi core + package the VS Code extension into a vsix.
 #
-# Usage: vscode/build.sh [options]
+# Usage: apps/vscode/build.sh [options]
 # Options:
 #   --release   Build the napi binding in release mode (default: debug)
 #   -h          Display this help and exit
@@ -34,11 +34,11 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
 # 0. Build the shared webui package (bundle + contract staging).
-bash webui/build.sh
+bash apps/web/webui/build.sh
 
 # 1. Build the napi core (cdylib) and stage it next to the compiled extension.
 cargo build ${build_args[@]+"${build_args[@]}"} -p manox-napi
@@ -50,14 +50,14 @@ for candidate in target/${profile_dir}/libmanox_napi.dylib target/${profile_dir}
   fi
 done
 [ -n "$LIB" ] || { echo "napi cdylib not found"; exit 1; }
-cp "$LIB" vscode/manox_napi.node
+cp "$LIB" apps/vscode/manox_napi.node
 # Strip debug info: the unstripped debug cdylib (~0.5GB on Linux) makes vsce's
 # secret scanner error out and bloats the packaged vsix. `-S` strips debug
 # sections on both GNU and Apple strip; plain strip rejects macOS dylibs.
-strip -S vscode/manox_napi.node 2>/dev/null || true
+strip -S apps/vscode/manox_napi.node 2>/dev/null || true
 
 # 2. Compile the host TypeScript (webview typecheck lives in webui/).
-cd vscode
+cd apps/vscode
 npx tsc -p ./
 
 # 3. Package a local vsix (no network deps — the .node and bundles are packaged).
