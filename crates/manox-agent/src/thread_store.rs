@@ -195,7 +195,7 @@ static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::
 pub(crate) fn sessions_dir() -> PathBuf {
     crate::paths::manox_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("pi-sessions")
+        .join("sessions")
 }
 
 /// Open the session directory, seed the summary list, and register the

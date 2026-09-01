@@ -708,7 +708,7 @@ impl Thread {
         let model = crate::pi_providers::default_model();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join("pi-sessions");
+            .join("sessions");
         // Goal bridge seeds from the persisted goal (restore path) and is
         // shared with the engine's goal tools; db unavailability degrades
         // goal features off rather than blocking the thread.
@@ -785,7 +785,7 @@ impl Thread {
         let model = self.model.clone();
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join("pi-sessions");
+            .join("sessions");
         let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
             cwd.clone(),
             model,
@@ -1539,7 +1539,7 @@ impl Thread {
         let reasoning_effort = self.reasoning_effort;
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
-            .join("pi-sessions");
+            .join("sessions");
         let SpawnedEngine { engine, events } = crate::pi_engine::spawn_engine(
             cwd.clone(),
             model.clone(),
@@ -2180,7 +2180,7 @@ impl Thread {
         };
         let Some(sessions_dir) = crate::paths::manox_config_dir()
             .ok()
-            .map(|dir| dir.join("pi-sessions"))
+            .map(|dir| dir.join("sessions"))
         else {
             return;
         };
@@ -2202,7 +2202,7 @@ impl Thread {
         };
         let Some(sessions_dir) = crate::paths::manox_config_dir()
             .ok()
-            .map(|dir| dir.join("pi-sessions"))
+            .map(|dir| dir.join("sessions"))
         else {
             return;
         };

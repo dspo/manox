@@ -1945,7 +1945,7 @@ mod tests {
         hermetic_home();
         let sessions = manox_agent::paths::manox_config_dir()
             .expect("config dir")
-            .join("pi-sessions");
+            .join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         seed_session_file(&sessions, "s1", "/proj");
         init_globals();
@@ -2464,7 +2464,7 @@ mod tests {
         hermetic_home();
         let sessions = manox_agent::paths::manox_config_dir()
             .expect("config dir")
-            .join("pi-sessions");
+            .join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         seed_session_file(&sessions, "s1", "/proj");
         init_globals();

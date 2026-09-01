@@ -27,7 +27,7 @@ use gpui::{AppContext as _, FollowMode, TestAppContext, VisualTestContext, px, s
 use gpui_component::Theme;
 
 const FIXTURE: &str =
-    "/Users/chenzhongrun/.manox/pi-sessions/dfd73eed-847d-4f42-97e5-72692ef39277.jsonl";
+    "/Users/chenzhongrun/.manox/sessions/dfd73eed-847d-4f42-97e5-72692ef39277.jsonl";
 
 fn load_real_session_messages() -> Vec<manox_agent::Message> {
     let source = std::fs::read_to_string(FIXTURE).expect("real session fixture");

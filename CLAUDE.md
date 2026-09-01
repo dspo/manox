@@ -47,8 +47,8 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
 - 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork。
-- pi 会话（.jsonl）：`~/.manox/pi-sessions/`
-- 子代理会话：`~/.manox/pi-sessions/subagents/`（持久化、不进侧栏；cx stats 计入 manox）
+- pi 会话（.jsonl）：`~/.manox/sessions/`
+- 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏；cx stats 计入 manox）
 - 外部会话：`~/.manox/external-sessions/`
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`

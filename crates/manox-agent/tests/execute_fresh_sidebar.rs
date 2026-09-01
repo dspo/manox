@@ -112,7 +112,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
     // Isolate config + sessions under a temp HOME.
     let home = std::env::temp_dir().join(format!("manox-execute-fresh-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(home.join(".manox")).unwrap();
-    std::fs::create_dir_all(home.join(".manox/pi-sessions")).unwrap();
+    std::fs::create_dir_all(home.join(".manox/sessions")).unwrap();
     std::fs::write(
         home.join(".manox/cx.providers.config.yaml"),
         format!(
@@ -188,7 +188,7 @@ fn execute_fresh_spawned_thread_surfaces_in_store() {
             // Debug dump: what does the session repository actually contain?
             let dir = manox_agent::paths::manox_config_dir()
                 .expect("manox config dir")
-                .join("pi-sessions");
+                .join("sessions");
             let mut files = Vec::new();
             if let Ok(rd) = std::fs::read_dir(&dir) {
                 for entry in rd.flatten() {
