@@ -4,8 +4,9 @@
 //! - `completedAt`：请求完成时间（ISO8601），作为日期与 timestamp 来源。
 //! - `model.modelId` / `model.role`：模型名与角色（main / subagent）。
 //! - usage 有两份口径，只取其一（见函数内注释）：首选
-//!   `response.providerMetadata.<provider>.usage`（snake_case，单次请求增量）；
-//!   回退 `response.usage`（camelCase，会话累计，需减去 cacheRead 还原增量）。
+//!   `response.providerMetadata.<provider>.usage`（snake_case，单次请求增量，
+//!   input_tokens 不含 cache_read）；回退 `response.usage`（camelCase，单次请求
+//!   总量，inputTokens 含 cacheRead，需做差还原 non-cached input）。
 //! - `sessionId`：记录内会话 ID；缺失时回退文件名。
 //! - session 粒度是文件级：主会话 `model-io-sess_<id>.jsonl`，subagent 会话
 //!   `model-io-sess_subagent_agent_<id>.jsonl`。subagent 记录标记 `is_sidechain`。
@@ -14,6 +15,7 @@ use serde_json::Value;
 use std::path::Path;
 
 use super::{RawEntry, u64_field};
+use crate::stats::AGENT_ZCODE;
 use crate::stats::date::{date_from_iso, timestamp_secs_from_iso};
 
 const FILE_PREFIX: &str = "model-io-sess_";
@@ -36,10 +38,10 @@ pub(super) fn parse(content: &str, path: &Path) -> Vec<RawEntry> {
         };
 
         // usage 有两份口径，必须只取其一：
-        // - `response.providerMetadata.anthropic.usage`（snake_case）：单次请求的原始
-        //   增量，input_tokens 不含 cache_read。首选。
-        // - `response.usage`（camelCase）：会话内累计值，inputTokens 包含
-        //   cacheReadTokens 且随轮次累加。仅作回退，且需减去 cacheRead 还原增量。
+        // - `response.providerMetadata.<provider>.usage`（snake_case）：单次请求的
+        //   原始增量，input_tokens 不含 cache_read。首选。
+        // - `response.usage`（camelCase）：单次请求的总量口径，inputTokens 包含
+        //   cacheReadTokens。仅作回退，且需减去 cacheRead 还原 non-cached input。
         let provider_usage = v
             .get("response")
             .and_then(|r| r.get("providerMetadata"))
@@ -106,7 +108,7 @@ pub(super) fn parse(content: &str, path: &Path) -> Vec<RawEntry> {
                 .is_some_and(|role| role != "main");
 
         out.push(RawEntry {
-            agent: "zcode".to_string(),
+            agent: AGENT_ZCODE.to_string(),
             model,
             date,
             input_tokens: input,
@@ -195,7 +197,7 @@ mod tests {
 
     #[test]
     fn falls_back_to_cumulative_camel_usage_and_subtracts_cache_read() {
-        // camelCase usage 是会话累计：inputTokens 包含 cacheReadTokens，需做差还原增量
+        // camelCase usage 的 inputTokens 包含 cacheReadTokens，需做差还原增量
         let content = concat!(
             r#"{"completedAt":"2026-09-02T10:00:00Z","model":{"modelId":"glm-5.2"},"response":{"usage":{"inputTokens":56170,"outputTokens":474,"cacheReadTokens":56064,"cacheWriteTokens":0}}}"#,
             "\n",
