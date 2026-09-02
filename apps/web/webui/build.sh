@@ -5,7 +5,7 @@
 # (PR3 embeds it with include_dir!); the contract output is a build product.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 cd "$ROOT/apps/web/webui"
 
 # 1. Webview bundle + staging under apps/vscode/dist (the host loads it from
