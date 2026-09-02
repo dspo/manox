@@ -1,32 +1,30 @@
 //! WebUI host surface: an in-process HTTP + WebSocket server that serves the
 //! shared webview bundle to a browser.
 //!
-//! The browser is a dumb terminal — every command is driven on the app main
-//! thread against the same `Entity<Thread>`s the desktop Workspace operates,
-//! through the `AgentServer` protocol gateway. The `pump` is a foreground
-//! task that polls per-connection command queues; the HTTP and WS workers run
-//! on the global tokio runtime (`manox_agent::runtime::handle`). Each connection is
-//! one independent bridge, matching the vscode multi-surface model; on
-//! disconnect it detaches its sessions without
+//! The browser speaks the typed `FromClient`/`FromServer` protocol directly
+//! over the WebSocket (no legacy translation layer): each WS connection is
+//! wrapped in a `WebSocketConnection` and handed straight to the `AgentServer`
+//! protocol gateway. The HTTP and WS workers run on the global tokio runtime
+//! (`manox_agent::runtime::handle`). Each connection is one independent
+//! bridge; on disconnect the AgentServer detaches its sessions without
 //! cancelling turns, so a browser refresh never kills a desktop turn.
 
 mod bridge;
-mod proto_translate;
 mod pump;
 mod server;
+mod ws_connection;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde_json::{Value, json};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-
-use crate::bridge::Outbound;
+use serde_json::json;
 
 pub use pump::spawn_server;
+pub(crate) use pump::webui_agent_server;
 
-/// The foreground pump's inbound channel: the server registers/tears down
-/// connections here; the pump holds the receiver on the main thread.
-pub(crate) static MAIN_CHANNEL: OnceLock<Mutex<Option<UnboundedSender<ToMain>>>> = OnceLock::new();
+/// The shared AgentServer every browser WebSocket registers with. Created by
+/// `spawn_server` at app startup; `handle_ws` reads it to accept connections.
+pub(crate) static AGENT_SERVER: OnceLock<Arc<manox_session_core::agent_server::AgentServer>> =
+    OnceLock::new();
 
 /// Server lifecycle: never started, starting, or serving with a URL.
 static STATE: OnceLock<Mutex<ServerState>> = OnceLock::new();
@@ -43,18 +41,6 @@ pub struct WebuiService {
     pub url: String,
     pub port: u16,
     token: String,
-}
-
-pub(crate) enum ToMain {
-    Connect(ConnectionHandle),
-    Disconnect(u64),
-}
-
-/// Everything the pump needs to own one connection's command/event channels.
-pub(crate) struct ConnectionHandle {
-    pub id: u64,
-    pub cmd_rx: UnboundedReceiver<Value>,
-    pub outbound: Arc<Outbound>,
 }
 
 /// Returns a snapshot of the current server state.
@@ -157,11 +143,4 @@ fn open_url(url: &str) {
     if let Err(e) = open::that(url) {
         tracing::warn!(error = %e, url, "failed to open webui url");
     }
-}
-
-/// The server clones the pump's sender so WS workers can register
-/// connections. `None` before `spawn_server` runs (app startup guarantees the
-/// pump is live before any tray open).
-pub(crate) fn main_channel_sender() -> Option<UnboundedSender<ToMain>> {
-    MAIN_CHANNEL.get().and_then(|m| m.lock().unwrap().clone())
 }
