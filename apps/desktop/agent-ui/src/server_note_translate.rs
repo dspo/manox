@@ -326,7 +326,7 @@ mod tests {
     fn history_restored_derives_from_thread_history() {
         let note = ServerNote::ThreadHistory {
             session_id: "s1".into(),
-            messages: serde_json::json!([]),
+            messages: vec![],
             display_history: serde_json::json!([]),
             auto_approved_tools: None,
             restored: false,

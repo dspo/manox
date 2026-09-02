@@ -25,8 +25,10 @@ use manox_protocol::client::ImageAttachment;
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize};
 use manox_protocol::server::ThreadInfoPayload;
 use manox_protocol::{
-    ClientCall, ClientNote, FromClient, FromServer, MsgId, RpcConnection, RpcError, RpcPeer,
-    ServerCall, ServerNote,
+    ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
+    RpcPeer, ServerCall, ServerNote, ThreadListItem, WireContentBlock, WireMessage,
+    WireMessageAuthor, WireMessageProvenance, WireMessageUi, WireRole, WireToolResult,
+    WireToolUse,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -221,15 +223,13 @@ impl AgentServerInner {
                         _ => None,
                     };
                     let outcome = handle_call(&self, &client_id, call).await;
-                    if let Some(push) = push_after
-                        && let Ok(value) = &outcome
-                    {
+                    if let Some(push) = push_after {
                         let note = match push {
                             ListPush::Models => ServerNote::Models {
-                                models: value.clone(),
+                                models: self.models_snapshot(),
                             },
                             ListPush::Threads => ServerNote::ThreadsUpdated {
-                                threads: value.clone(),
+                                threads: self.threads_snapshot(),
                             },
                         };
                         conn.send_to_client(FromServer::Notification { note });
@@ -370,7 +370,7 @@ impl AgentServerInner {
 
     // ── Snapshots (queries). ────────────────────────────────────────────────
     fn emit_history_and_info(&self, thread: &ThreadHandle, session_id: &str, restored: bool) {
-        let messages = thread.read(|t| strip_messages_for_wire(t.messages()));
+        let messages = thread.read(|t| to_wire_messages(t.messages()));
         let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
             .unwrap_or_else(|_| json!([]));
         self.route_note(
@@ -402,7 +402,7 @@ impl AgentServerInner {
         restored: bool,
         client_id: &str,
     ) {
-        let messages = thread.read(|t| strip_messages_for_wire(t.messages()));
+        let messages = thread.read(|t| to_wire_messages(t.messages()));
         let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
             .unwrap_or_else(|_| json!([]));
         self.note_to_client(
@@ -470,41 +470,36 @@ impl AgentServerInner {
         })
     }
 
-    fn threads_snapshot(&self) -> Value {
+    fn threads_snapshot(&self) -> Vec<ThreadListItem> {
         let store = manox_agent::thread_store_global();
         store.read(|s| {
-            let threads: Vec<Value> = s
-                .summaries()
+            s.summaries()
                 .iter()
-                .map(|t| {
-                    json!({
-                        "id": t.id,
-                        "title": t.display_title(),
-                        "updated_at": t.updated_at,
-                        "running": s.is_running(&t.id),
-                        "unread": t.has_unread,
-                        "errored": t.errored,
-                        "pending_auth": s.pending_auth_contains(&t.id),
-                        "pending_plan": s.pending_plan_contains(&t.id),
-                        "background_work": s.background_work_contains(&t.id),
-                        "model_id": t.model_id,
-                        "pinned": t.pinned,
-                        "archived": t.archived,
-                        "parent_id": t.parent_id,
-                        "depth": t.depth,
-                    })
+                .map(|t| ThreadListItem {
+                    id: t.id.clone(),
+                    title: t.display_title().to_string(),
+                    updated_at: t.updated_at as i32,
+                    running: s.is_running(&t.id),
+                    unread: t.has_unread,
+                    errored: t.errored,
+                    pending_auth: s.pending_auth_contains(&t.id),
+                    pending_plan: s.pending_plan_contains(&t.id),
+                    background_work: s.background_work_contains(&t.id),
+                    model_id: t.model_id.clone(),
+                    pinned: t.pinned,
+                    archived: t.archived,
+                    parent_id: t.parent_id.clone(),
+                    depth: t.depth,
                 })
-                .collect();
-            json!(threads)
+                .collect()
         })
     }
 
-    fn models_snapshot(&self) -> Value {
-        let models: Vec<Value> = deduped_models(manox_agent::provider_glue::global().models())
+    fn models_snapshot(&self) -> Vec<ModelInfo> {
+        deduped_models(manox_agent::provider_glue::global().models())
             .iter()
-            .map(model_json)
-            .collect();
-        json!(models)
+            .map(model_to_wire)
+            .collect()
     }
 
     fn commands_snapshot(&self) -> Value {
@@ -571,8 +566,10 @@ async fn handle_call(
     match call {
         ClientCall::Initialize(_) => Err(RpcError::new(-1, "already initialized")),
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
-        ClientCall::ListThreads => Ok(inner.threads_snapshot()),
-        ClientCall::ListModels => Ok(inner.models_snapshot()),
+        ClientCall::ListThreads => serde_json::to_value(inner.threads_snapshot())
+            .map_err(|_| RpcError::new(-1, "threads serialization failed")),
+        ClientCall::ListModels => serde_json::to_value(inner.models_snapshot())
+            .map_err(|_| RpcError::new(-1, "models serialization failed")),
         ClientCall::ListCommands => Ok(inner.commands_snapshot()),
         ClientCall::GetUsage { session_id } => inner
             .session_thread(&session_id)
@@ -1709,32 +1706,81 @@ fn to_message_content(text: String, images: Vec<(String, String)>) -> Vec<Messag
         .collect()
 }
 
-/// Serialize messages with image bytes trimmed (bounded wire payload).
-fn strip_messages_for_wire(messages: &[Message]) -> Value {
-    let mut value = serde_json::to_value(messages).unwrap_or(Value::Array(Vec::new()));
-    let Some(list) = value.as_array_mut() else {
-        return value;
-    };
-    for msg in list {
-        let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for block in content {
-            let Some(map) = block.as_object_mut() else {
-                continue;
-            };
-            if let Some(image) = map.get_mut("Image").and_then(Value::as_object_mut) {
-                let byte_len = image
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .map(base64_byte_len)
-                    .unwrap_or(0);
-                image.remove("data");
-                image.insert("byte_len".into(), json!(byte_len));
-            }
-        }
+/// Project messages into the wire shape: image blocks are deflated to a
+/// `byte_len` placeholder (bounded wire payload) and every other block maps
+/// 1:1. Replaces the prior JSON-mutation hack with a typed conversion so the
+/// `ServerNote::ThreadHistory.messages` field is `Vec<WireMessage>`.
+fn to_wire_messages(messages: &[Message]) -> Vec<WireMessage> {
+    messages.iter().map(wire_message).collect()
+}
+
+fn wire_message(msg: &Message) -> WireMessage {
+    WireMessage {
+        id: msg.id.clone(),
+        timestamp: msg.timestamp as i32,
+        parent_id: msg.parent_id.clone(),
+        provenance: match msg.provenance {
+            manox_agent::MessageProvenance::User => WireMessageProvenance::User,
+            manox_agent::MessageProvenance::Assistant => WireMessageProvenance::Assistant,
+            manox_agent::MessageProvenance::Tool => WireMessageProvenance::Tool,
+        },
+        role: match msg.role {
+            manox_agent::language_model::Role::User => WireRole::User,
+            manox_agent::language_model::Role::Assistant => WireRole::Assistant,
+            manox_agent::language_model::Role::System => WireRole::System,
+        },
+        content: msg.content.iter().map(wire_content_block).collect(),
+        ui: msg.ui.as_ref().map(wire_message_ui),
     }
-    value
+}
+
+fn wire_content_block(block: &MessageContent) -> WireContentBlock {
+    match block {
+        MessageContent::Text(text) => WireContentBlock::Text(text.clone()),
+        MessageContent::Thinking { text, signature } => WireContentBlock::Thinking {
+            text: text.clone(),
+            signature: signature.clone(),
+        },
+        MessageContent::Image { data, mime_type } => WireContentBlock::Image {
+            mime_type: mime_type.clone(),
+            byte_len: base64_byte_len(data) as u32,
+        },
+        MessageContent::ToolUse(tool) => WireContentBlock::ToolUse(WireToolUse {
+            id: tool.id.clone(),
+            name: tool.name.to_string(),
+            raw_input: tool.raw_input.clone(),
+            input: tool.input.clone(),
+            is_input_complete: tool.is_input_complete,
+            thought_signature: tool.thought_signature.clone(),
+        }),
+        MessageContent::ToolResult(result) => WireContentBlock::ToolResult(WireToolResult {
+            tool_use_id: result.tool_use_id.clone(),
+            tool_name: result.tool_name.to_string(),
+            is_error: result.is_error,
+            content: result.content.clone(),
+        }),
+        MessageContent::Compaction(text) => WireContentBlock::Compaction(text.clone()),
+    }
+}
+
+fn wire_message_ui(ui: &MessageUiMetadata) -> WireMessageUi {
+    WireMessageUi {
+        model_id: ui.model_id.clone(),
+        approval_mode: ui.approval_mode.map(|x| x as i32),
+        steered: ui.steered,
+        external_event: ui.external_event,
+        author: ui.author.as_ref().map(wire_message_author),
+        peer: ui.peer,
+        display_text: ui.display_text.clone(),
+    }
+}
+
+fn wire_message_author(author: &manox_agent::MessageAuthor) -> WireMessageAuthor {
+    match author {
+        manox_agent::MessageAuthor::Lead => WireMessageAuthor::Lead,
+        manox_agent::MessageAuthor::Harness => WireMessageAuthor::Harness,
+        manox_agent::MessageAuthor::Agent(name) => WireMessageAuthor::Agent(name.clone()),
+    }
 }
 
 fn base64_byte_len(b64: &str) -> u64 {
@@ -1759,16 +1805,16 @@ fn deduped_models(models: Vec<manox_harness::types::Model>) -> Vec<manox_harness
         .collect()
 }
 
-fn model_json(model: &manox_harness::types::Model) -> Value {
-    json!({
-        "id": model.id,
-        "name": manox_agent::provider_glue::display_name(model),
-        "provider": model.provider,
-        "provider_name": manox_agent::provider_glue::display_provider_name(model),
-        "api": model.api,
-        "context_window": model.context_window,
-        "max_tokens": model.max_tokens,
-    })
+fn model_to_wire(model: &manox_harness::types::Model) -> ModelInfo {
+    ModelInfo {
+        id: model.id.clone(),
+        name: manox_agent::provider_glue::display_name(model),
+        provider: model.provider.clone(),
+        provider_name: Some(manox_agent::provider_glue::display_provider_name(model)),
+        api: model.api.clone(),
+        context_window: model.context_window as u32,
+        max_tokens: Some(model.max_tokens as u32),
+    }
 }
 
 #[cfg(test)]

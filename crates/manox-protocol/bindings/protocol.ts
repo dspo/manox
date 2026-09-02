@@ -49,6 +49,27 @@ data: string, mimeType: string, };
 export type Initialize = { clientId: string, capabilities: Array<HookKind>, sessions: Array<string>, };
 
 /**
+ * One selectable model in the models list — the wire schema for
+ * [`crate::ServerNote::Models`] `models`. Field names are snake_case on the
+ * wire to match the existing client contract.
+ */
+export type ModelInfo = { id: string, name: string, provider: string, 
+/**
+ * Provider display name (e.g. "DeepSeek" for the "DeepSeek-anthropic"
+ * registration id). Absent only from older actors.
+ */
+provider_name?: string, 
+/**
+ * Wire API shape ("anthropic", "openai_responses", …); drives the
+ * cascade menu's badge and tint.
+ */
+api: string, context_window: number, 
+/**
+ * Per-model output budget; absent from older actors.
+ */
+max_tokens?: number, };
+
+/**
  * Correlation id for a request/response or call/reply pair. Opaque to the
  * transport; minted by the caller and echoed verbatim by the responder.
  */
@@ -77,7 +98,7 @@ export type ServerCall = { "method": "approve", sessionId: string, authId: strin
 /**
  * Server → client streaming notifications.
  */
-export type ServerNote = { "method": "ready" } | { "method": "sessionCreated", sessionId: string, } | { "method": "sessionDisposed", sessionId: string, } | { "method": "turnStarted", sessionId: string, } | { "method": "turnFinished", sessionId: string, cancelled: boolean, failed: boolean, strandedSteerIds: Array<string>, } | { "method": "stop", sessionId: string, reason: string | null, } | { "method": "agentText", sessionId: string, text: string, } | { "method": "agentThinking", sessionId: string, text: string, } | { "method": "toolCall", sessionId: string, id: string, name: string, title: string, status: string, input: JsonValue | null, } | { "method": "toolResult", sessionId: string, id: string, output: string, isError: boolean, } | { "method": "toolOutput", sessionId: string, id: string, chunk: string, } | { "method": "threadHistory", sessionId: string, messages: JsonValue, displayHistory: JsonValue, autoApprovedTools: Array<string> | null, restored: boolean, loading: boolean, } | { "method": "threadInfo", sessionId: string, info: ThreadInfoPayload, } | { "method": "threadsUpdated", threads: JsonValue, } | { "method": "models", models: JsonValue, } | { "method": "usage", sessionId: string, usage: JsonValue, cost: number, } | { "method": "usageSnapshot", sessionId: string, cumulative: TokenUsageSnapshot, perModel: { [key in string]?: TokenUsageSnapshot }, cumulativeCost: number, perModelCost: { [key in string]?: number }, perRequest: { [key in string]?: TokenUsageSnapshot }, } | { "method": "currentModel", sessionId: string, id: string | null, name: string | null, } | { "method": "planReady", sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "planUpdated", sessionId: string, snapshot: JsonValue | null, } | { "method": "planModeChanged", sessionId: string, enabled: boolean, } | { "method": "goalChanged", sessionId: string, snapshot: JsonValue | null, } | { "method": "cwdChanged", sessionId: string, path: string, } | { "method": "permissionModeChanged", sessionId: string, mode: string, } | { "method": "reasoningEffortChanged", sessionId: string, effort: string, } | { "method": "browserSuitesChanged", sessionId: string, suites: Array<string>, } | { "method": "compactionStarted", sessionId: string, tokensBefore: bigint, } | { "method": "compaction", sessionId: string, summary: string, 
+export type ServerNote = { "method": "ready" } | { "method": "sessionCreated", sessionId: string, } | { "method": "sessionDisposed", sessionId: string, } | { "method": "turnStarted", sessionId: string, } | { "method": "turnFinished", sessionId: string, cancelled: boolean, failed: boolean, strandedSteerIds: Array<string>, } | { "method": "stop", sessionId: string, reason: string | null, } | { "method": "agentText", sessionId: string, text: string, } | { "method": "agentThinking", sessionId: string, text: string, } | { "method": "toolCall", sessionId: string, id: string, name: string, title: string, status: string, input: JsonValue | null, } | { "method": "toolResult", sessionId: string, id: string, output: string, isError: boolean, } | { "method": "toolOutput", sessionId: string, id: string, chunk: string, } | { "method": "threadHistory", sessionId: string, messages: Array<WireMessage>, displayHistory: JsonValue, autoApprovedTools: Array<string> | null, restored: boolean, loading: boolean, } | { "method": "threadInfo", sessionId: string, info: ThreadInfoPayload, } | { "method": "threadsUpdated", threads: Array<ThreadListItem>, } | { "method": "models", models: Array<ModelInfo>, } | { "method": "usage", sessionId: string, usage: JsonValue, cost: number, } | { "method": "usageSnapshot", sessionId: string, cumulative: TokenUsageSnapshot, perModel: { [key in string]?: TokenUsageSnapshot }, cumulativeCost: number, perModelCost: { [key in string]?: number }, perRequest: { [key in string]?: TokenUsageSnapshot }, } | { "method": "currentModel", sessionId: string, id: string | null, name: string | null, } | { "method": "planReady", sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "planUpdated", sessionId: string, snapshot: JsonValue | null, } | { "method": "planModeChanged", sessionId: string, enabled: boolean, } | { "method": "goalChanged", sessionId: string, snapshot: JsonValue | null, } | { "method": "cwdChanged", sessionId: string, path: string, } | { "method": "permissionModeChanged", sessionId: string, mode: string, } | { "method": "reasoningEffortChanged", sessionId: string, effort: string, } | { "method": "browserSuitesChanged", sessionId: string, suites: Array<string>, } | { "method": "compactionStarted", sessionId: string, tokensBefore: bigint, } | { "method": "compaction", sessionId: string, summary: string, 
 /**
  * The retained tail of messages after compaction: the server folds
  * older history into the summary and keeps the most recent messages.
@@ -102,8 +123,125 @@ export type ThreadInfoPayload = { cwd: string, project: string | null, displayTi
 model: JsonValue | null, permissionMode: string, reasoningEffort: string, pinned: boolean, archived: boolean, depth: number, agentLabel: string, selfAuthor: string, cwdPath: string | null, branch: string | null, goal: JsonValue | null, goalElapsedSeconds: bigint | null, planMode: boolean, browserSuites: Array<string>, historyPhase: string, running: boolean, hasInteracted: boolean, };
 
 /**
+ * One row in the threads list — the wire schema for
+ * [`crate::ServerNote::ThreadsUpdated`] `threads`. Combines the persisted
+ * [`manox_agent::db::ThreadSummary`] columns with the live runtime flags
+ * (`running` / `pending_auth` / `pending_plan` / `background_work`) the
+ * thread store tracks; the server projects both into this flat shape so the
+ * client list never reads two sources. Field names are snake_case on the
+ * wire to match the existing client contract.
+ */
+export type ThreadListItem = { id: string, title: string, 
+/**
+ * Unix seconds of the last interaction.
+ */
+updated_at: number, running: boolean, unread: boolean, errored: boolean, pending_auth: boolean, 
+/**
+ * A plan review verdict is due; the row shows the static blue wheel.
+ */
+pending_plan: boolean, 
+/**
+ * Live monitors / background bash keep the loop self-advancing; the row
+ * spins even with no turn in flight.
+ */
+background_work: boolean, model_id: string, pinned: boolean, archived: boolean, 
+/**
+ * Leader session id for a team worker row; null for a top-level row.
+ */
+parent_id: string | null, 
+/**
+ * Nesting level: 0 is top-level, 1 is a team member of a top-level
+ * leader, and so on.
+ */
+depth: number, };
+
+/**
  * Typed token usage breakdown for [`ServerNote::UsageSnapshot`]. Defined in
  * the protocol crate (not re-exported from `agent`) so the client can
  * project every field without hardcoding JSON key names.
  */
 export type TokenUsageSnapshot = { input: bigint, output: bigint, cacheCreation: bigint, cacheRead: bigint, };
+
+/**
+ * One content block of a [`WireMessage`]. Externally tagged (serde default):
+ * `{"Text": "..."}` | `{"Thinking": {"text","signature"}}` |
+ * `{"Image": {"mime_type","byte_len"}}` | `{"ToolUse": {...}}` |
+ * `{"ToolResult": {...}}` | `{"Compaction": "..."}`. The `Image` payload is
+ * the deflated wire shape — `byte_len` replaces the base64 `data` the storage
+ * type carries.
+ */
+export type WireContentBlock = { "Text": string } | { "Thinking": { text: string, signature: string | null, } } | { "Image": { mime_type: string, byte_len: number, } } | { "ToolUse": WireToolUse } | { "ToolResult": WireToolResult } | { "Compaction": string };
+
+/**
+ * Wire form of [`manox_agent::message::Message`]. Content blocks are
+ * externally tagged; image blocks arrive deflated to `{ mime_type, byte_len }`.
+ */
+export type WireMessage = { id: string, 
+/**
+ * Unix seconds.
+ */
+timestamp: number, parent_id: string | null, provenance: WireMessageProvenance, role: WireRole, content: Array<WireContentBlock>, ui?: WireMessageUi, };
+
+/**
+ * Wire form of [`manox_agent::message::MessageAuthor`] (snake_case,
+ * externally tagged: `"lead"` | `"harness"` | `{"agent": "..."}`).
+ */
+export type WireMessageAuthor = "lead" | "harness" | { "agent": string };
+
+/**
+ * Stable origin of a persisted message. Mirrors
+ * [`manox_agent::message::MessageProvenance`] (snake_case).
+ */
+export type WireMessageProvenance = "user" | "assistant" | "tool";
+
+/**
+ * Wire form of [`manox_agent::message::MessageUiMetadata`]. All fields are
+ * optional — omitted from the wire when absent/false so the client treats
+ * every key as optional.
+ */
+export type WireMessageUi = { model_id?: string, 
+/**
+ * `PermissionMode::as_i64`, stored as an integer to avoid coupling the
+ * message schema to enum names.
+ */
+approval_mode?: number, 
+/**
+ * Set when this user message was injected mid-turn via the steer queue.
+ */
+steered?: boolean, 
+/**
+ * Machine-generated background-task event; the UI must not attribute it to
+ * the human user.
+ */
+external_event?: boolean, 
+/**
+ * Originating agent of a user-role message the human did not type;
+ * absent = human input.
+ */
+author?: WireMessageAuthor, 
+/**
+ * This user message entered the session via team peer delivery.
+ */
+peer: boolean, 
+/**
+ * UI-only display form (e.g. the compact `/name args` for a slash turn).
+ */
+display_text?: string, };
+
+/**
+ * Conversation role. Mirrors [`manox_agent::language_model::Role`]
+ * (snake_case).
+ */
+export type WireRole = "user" | "assistant" | "system";
+
+/**
+ * Wire form of [`manox_agent::language_model::LanguageModelToolResult`].
+ * `tool_name` is a plain `String` on the wire (storage uses `Arc<str>`).
+ */
+export type WireToolResult = { tool_use_id: string, tool_name: string, is_error: boolean, content: string, };
+
+/**
+ * Wire form of [`manox_agent::language_model::LanguageModelToolUse`]. `name`
+ * is a plain `String` on the wire (storage uses `Arc<str>`).
+ */
+export type WireToolUse = { id: string, name: string, raw_input: string, input: JsonValue, is_input_complete: boolean, thought_signature: string | null, };
