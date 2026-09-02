@@ -10446,6 +10446,13 @@ mod tests {
             manox_agent::provider_glue::init();
             manox_agent::thread_store::init_for_test(db.clone());
         });
+        // The AgentServer runs on the real tokio runtime and replies to the
+        // gpui `ClientStoreHandle` pump across threads. That cross-thread wake
+        // is legitimate production behavior, but the deterministic test
+        // scheduler flags it unless parking is allowed; without this the test
+        // is flaky (fails on Linux CI where the tokio reply lands while the
+        // pump is parked on `server_rx.recv()`).
+        cx.background_executor.allow_parking();
 
         let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
