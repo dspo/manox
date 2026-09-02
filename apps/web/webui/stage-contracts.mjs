@@ -29,7 +29,7 @@ await writeFile(path.join(target, 'sidebar', 'messages.d.ts'), messagesDts);
 // staged protocol.d.ts so the vscode host can import both the legacy types
 // (ActorEvent, Command, etc.) and the AgentServer protocol types (FromClient,
 // FromServer, etc.) from the same module.
-const agentServerBindings = path.join(root, '..', '..', 'crates', 'manox-protocol', 'bindings', 'protocol.ts');
+const agentServerBindings = path.join(root, '..', '..', '..', 'crates', 'manox-protocol', 'bindings', 'protocol.ts');
 const agentServerContent = await readFile(agentServerBindings, 'utf8');
 const existingDts = path.join(target, 'protocol.d.ts');
 const existingContent = await readFile(existingDts, 'utf8');
@@ -53,6 +53,6 @@ await writeFile(existingDts, merged);
 // Also stage the serde_json/JsonValue type used by the AgentServer protocol.
 const serdeJsonTarget = path.join(target, 'serde_json');
 await mkdir(serdeJsonTarget, { recursive: true });
-await cp(path.join(root, '..', '..', 'crates', 'manox-protocol', 'bindings', 'serde_json', 'JsonValue.ts'), path.join(serdeJsonTarget, 'JsonValue.d.ts'));
+await cp(path.join(root, '..', '..', '..', 'crates', 'manox-protocol', 'bindings', 'serde_json', 'JsonValue.ts'), path.join(serdeJsonTarget, 'JsonValue.d.ts'));
 
 console.log('contracts staged into vscode/dist');
