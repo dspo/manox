@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Unified offline example gate: every example that exercises a full public
 # path must run end to end. Chat examples that need credentials are compile-
-# checked only (cargo check -p pi --examples covers them).
+# checked only (cargo check -p manox-harness --examples covers them).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -16,7 +16,7 @@ for example in \
   session_roundtrip \
   split_turn_compact; do
   echo "== $example =="
-  cargo run -p pi --example "$example"
+  cargo run -p manox-harness --example "$example"
 done
 
 echo "OK: all offline examples ran"

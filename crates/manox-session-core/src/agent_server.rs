@@ -1871,7 +1871,10 @@ mod tests {
             self.conn.send_to_server(msg);
         }
         fn recv(&self) -> FromServer {
-            self.recv_timeout(Duration::from_secs(10))
+            // 30s (not 10s): on slow CI runners the agent-runtime task that
+            // answers a call can spawn noticeably later than the test thread
+            // sends it, and a too-tight deadline flakes the test.
+            self.recv_timeout(Duration::from_secs(30))
         }
         fn recv_timeout(&self, timeout: Duration) -> FromServer {
             // Poll the async channel from the test thread (the dispatch/pump
