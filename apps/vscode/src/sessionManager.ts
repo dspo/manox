@@ -89,7 +89,7 @@ export class SessionManager {
           this.sessions.get(note.sessionId as string)?.emit('event', note);
           return;
         }
-        if (note.method === 'ready' && this.initPhase === 'starting') {
+        if (note.method === 'ready') {
           this.initPhase = 'ready';
         }
         this.global.emit('event', note);

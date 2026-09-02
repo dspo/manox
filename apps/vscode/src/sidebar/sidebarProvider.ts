@@ -468,7 +468,7 @@ function renderHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   <meta charset="UTF-8">
   <meta name="vscode-language" content="${vscode.env.language}">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'nonce-${nonce}'; font-src ${webview.cspSource};">
+    content="default-src 'none'; script-src ${webview.cspSource} 'nonce-${nonce}'; img-src ${webview.cspSource} data:; style-src ${webview.cspSource} 'nonce-${nonce}'; font-src ${webview.cspSource};">
   <link rel="stylesheet" href="${styleUri}">
 </head>
 <body>
