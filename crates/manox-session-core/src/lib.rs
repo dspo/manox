@@ -7,6 +7,7 @@
 //! language-model provider; `translate` projects `ThreadEvent`s onto
 //! `ServerNote`s.
 
+pub mod agent_client;
 pub mod agent_server;
 pub mod model_chat;
 pub mod translate;
