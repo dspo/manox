@@ -27,8 +27,7 @@ use manox_protocol::server::ThreadInfoPayload;
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem, WireContentBlock, WireMessage,
-    WireMessageAuthor, WireMessageProvenance, WireMessageUi, WireRole, WireToolResult,
-    WireToolUse,
+    WireMessageAuthor, WireMessageProvenance, WireMessageUi, WireRole, WireToolResult, WireToolUse,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -220,6 +219,7 @@ impl AgentServerInner {
                     let push_after = match &call {
                         ClientCall::ListModels => Some(ListPush::Models),
                         ClientCall::ListThreads => Some(ListPush::Threads),
+                        ClientCall::ListCommands => Some(ListPush::Commands),
                         _ => None,
                     };
                     let outcome = handle_call(&self, &client_id, call).await;
@@ -230,6 +230,9 @@ impl AgentServerInner {
                             },
                             ListPush::Threads => ServerNote::ThreadsUpdated {
                                 threads: self.threads_snapshot(),
+                            },
+                            ListPush::Commands => ServerNote::Commands {
+                                commands: self.commands_snapshot(),
                             },
                         };
                         conn.send_to_client(FromServer::Notification { note });
@@ -555,6 +558,7 @@ impl AgentServerInner {
 enum ListPush {
     Models,
     Threads,
+    Commands,
 }
 
 // ── ClientCall dispatch (free fn — borrowed inner, no move per call). ────────
@@ -1770,7 +1774,7 @@ fn wire_message_ui(ui: &MessageUiMetadata) -> WireMessageUi {
         steered: ui.steered,
         external_event: ui.external_event,
         author: ui.author.as_ref().map(wire_message_author),
-        peer: ui.peer,
+        peer: if ui.peer { Some(true) } else { None },
         display_text: ui.display_text.clone(),
     }
 }

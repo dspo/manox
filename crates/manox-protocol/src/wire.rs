@@ -128,8 +128,9 @@ pub struct WireMessageUi {
     #[ts(optional)]
     pub author: Option<WireMessageAuthor>,
     /// This user message entered the session via team peer delivery.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub peer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub peer: Option<bool>,
     /// UI-only display form (e.g. the compact `/name args` for a slash turn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -146,10 +147,6 @@ pub enum WireMessageAuthor {
     Lead,
     Harness,
     Agent(String),
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 /// One row in the threads list — the wire schema for

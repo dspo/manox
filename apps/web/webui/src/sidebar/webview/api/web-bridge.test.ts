@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createWebBridge } from './web-bridge';
+import type { FromClient, FromServer } from '../../../protocol';
 
 /** Fake WebSocket standing in for the browser transport in a node test env. */
 class MockWebSocket {
@@ -52,6 +53,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** A representative `FromClient` notification used to exercise posting. */
+const listThreads: FromClient = { kind: 'request', id: 'r1', call: { method: 'listThreads' } };
+
 describe('createWebBridge', () => {
   it('opens the same-origin /ws socket with the page token', () => {
     createWebBridge();
@@ -61,31 +65,46 @@ describe('createWebBridge', () => {
     );
   });
 
-  it('posts typed messages as JSON frames once the socket is open', () => {
+  it('sends the Initialize handshake as the first frame on open', () => {
+    createWebBridge();
+    const ws = MockWebSocket.instances[0];
+    ws.open();
+    expect(ws.sent).toHaveLength(1);
+    const init = JSON.parse(ws.sent[0]) as FromClient;
+    expect(init.kind).toBe('request');
+    expect((init as { call: unknown }).call).toMatchObject({ method: 'initialize' });
+  });
+
+  it('posts typed FromClient frames as JSON once the socket is open', () => {
     const bridge = createWebBridge();
     const ws = MockWebSocket.instances[0];
     ws.open();
-    bridge.post({ type: 'list_threads' });
-    expect(ws.sent).toEqual([JSON.stringify({ type: 'list_threads' })]);
+    ws.sent.length = 0; // drop the Initialize frame
+    bridge.post(listThreads);
+    expect(ws.sent).toEqual([JSON.stringify(listThreads)]);
   });
 
   it('drops posts while the socket is not open', () => {
     const bridge = createWebBridge();
     const ws = MockWebSocket.instances[0];
-    bridge.post({ type: 'list_threads' });
+    bridge.post(listThreads);
     expect(ws.sent).toEqual([]);
   });
 
-  it('parses incoming JSON frames and dispatches to subscribers', () => {
+  it('parses incoming FromServer frames and dispatches to subscribers', () => {
     const bridge = createWebBridge();
     const listener = vi.fn();
     const unsubscribe = bridge.onMessage(listener);
 
-    MockWebSocket.instances[0].receive({ type: 'session_disposed', sessionId: 's1' });
-    expect(listener).toHaveBeenCalledWith({ type: 'session_disposed', sessionId: 's1' });
+    const note: FromServer = {
+      kind: 'notification',
+      note: { method: 'sessionDisposed', sessionId: 's1' },
+    };
+    MockWebSocket.instances[0].receive(note);
+    expect(listener).toHaveBeenCalledWith(note);
 
     unsubscribe();
-    MockWebSocket.instances[0].receive({ type: 'ready' });
+    MockWebSocket.instances[0].receive({ kind: 'notification', note: { method: 'ready' } });
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
@@ -100,7 +119,7 @@ describe('createWebBridge', () => {
 
     const listener = vi.fn();
     bridge.onMessage(listener);
-    MockWebSocket.instances[1].receive({ type: 'ready' });
-    expect(listener).toHaveBeenCalledWith({ type: 'ready' });
+    MockWebSocket.instances[1].receive({ kind: 'notification', note: { method: 'ready' } });
+    expect(listener).toHaveBeenCalledWith({ kind: 'notification', note: { method: 'ready' } });
   });
 });

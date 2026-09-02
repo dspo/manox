@@ -215,7 +215,8 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
         | ModelText { .. }
         | ModelThinking { .. }
         | ModelToolCall { .. }
-        | ModelChatDone { .. } => return None,
+        | ModelChatDone { .. }
+        | Commands { .. } => return None,
     })
 }
 

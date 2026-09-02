@@ -25,7 +25,7 @@ import type {
   PlanStepWire,
   SubagentChildWire,
   SubagentSnapshot,
-  TokenUsageSnapshot,
+  UsageBreakdown,
 } from '../../../protocol';
 import { ThreadApi } from '../api/client';
 import { apiTint } from '../lib/api-tint';
@@ -186,7 +186,7 @@ const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
 };
 
 /** Occupied context for a usage row: live input plus everything cached. */
-const usedTokens = (u: TokenUsageSnapshot): number =>
+const usedTokens = (u: UsageBreakdown): number =>
   (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
 
 /** Sort key for plan steps: in-progress first, then pending, then completed;
@@ -276,7 +276,7 @@ const PlanTaskList = ({
 };
 
 /** Full lifetime total of a usage snapshot: occupied context plus output. */
-const totalTokens = (u: TokenUsageSnapshot): number => usedTokens(u) + (u.output_tokens ?? 0);
+const totalTokens = (u: UsageBreakdown): number => usedTokens(u) + (u.output_tokens ?? 0);
 
 const ModelUsageRow = ({
   modelKey,
@@ -287,12 +287,12 @@ const ModelUsageRow = ({
   lastUsage,
 }: {
   modelKey: string;
-  usage: TokenUsageSnapshot;
+  usage: UsageBreakdown;
   cost: number;
   models: ModelInfo[];
   last: boolean;
   /** Latest single request for this model; the budget numerator. */
-  lastUsage?: TokenUsageSnapshot;
+  lastUsage?: UsageBreakdown;
 }) => {
   const model = models.find((m) => `${m.provider}/${m.id}` === modelKey);
   const cap = model?.context_window;

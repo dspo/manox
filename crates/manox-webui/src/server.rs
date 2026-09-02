@@ -157,7 +157,9 @@ async fn handle_ws(socket: WebSocket, server: Arc<manox_session_core::agent_serv
 
 #[cfg(test)]
 mod tests {
-    use super::AppState;
+    use super::*;
+    use axum::body::to_bytes;
+    use axum::extract::Path;
     use manox_session_core::agent_server::AgentServer;
 
     fn test_state() -> AppState {

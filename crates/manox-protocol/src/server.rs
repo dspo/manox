@@ -188,6 +188,12 @@ pub enum ServerNote {
     Models {
         models: Vec<ModelInfo>,
     },
+    /// Slash-command / skill list snapshot. Pushed after a `ListCommands`
+    /// call so clients that read push delivery (not the Response body) stay
+    /// consistent with the `Models` / `ThreadsUpdated` notification pattern.
+    Commands {
+        commands: serde_json::Value,
+    },
     /// Per-request token usage (incremental delta).
     Usage {
         session_id: String,
