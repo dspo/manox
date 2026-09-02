@@ -14,9 +14,10 @@ use std::sync::Mutex;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
-use manox_protocol::handshake::{HookKind, Initialize};
-use manox_protocol::msg::{FromClient, MsgId};
-use manox_protocol::transport::{InProcessConnection, RpcConnection, in_process_pair};
+use manox_protocol::handshake::HookKind;
+use manox_protocol::msg::FromClient;
+use manox_protocol::transport::{InProcessConnection, RpcConnection};
+use manox_session_core::agent_client::AgentClient;
 use manox_session_core::agent_server::AgentServer;
 
 /// The "client" end of the in-process connection. The AgentServer holds the
@@ -76,13 +77,23 @@ pub fn start(event_cb: JsFunction) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    // Create the in-process connection pair and the AgentServer.
-    let (client_conn, server_conn) = in_process_pair();
+    // Create the AgentServer, then connect through the unified `AgentClient`
+    // wrapper (in-process pair + `Initialize` handshake).
     let server = AgentServer::new(std::path::PathBuf::from(&cwd));
-
-    // Accept the server-side connection (spawns the async handler on the agent
-    // tokio runtime).
-    server.accept(std::sync::Arc::new(server_conn));
+    let client = AgentClient::connect(
+        &server,
+        "vscode",
+        // VS Code has approval UI (sidebar), AskUserQuestion (answer_question
+        // in sidebar), and PlanVerdict (plan_verdict in sidebar). No browser
+        // or clipboard capabilities.
+        vec![
+            HookKind::Approve,
+            HookKind::AskUserQuestion,
+            HookKind::PlanVerdict,
+        ],
+        vec![],
+    );
+    let client_conn = client.into_conn();
 
     // Spawn the pump thread: reads `FromServer` messages from the client end
     // of the connection and pushes them as JSON strings to the Node callback.
@@ -103,24 +114,6 @@ pub fn start(event_cb: JsFunction) -> Result<()> {
             }
         })
         .map_err(|e| napi::Error::from_reason(format!("failed to spawn pump thread: {e}")))?;
-
-    // Send the Initialize handshake.
-    let init_msg = FromClient::Request {
-        id: MsgId::new("init"),
-        call: manox_protocol::ClientCall::Initialize(Initialize {
-            client_id: "vscode".into(),
-            // VS Code has approval UI (sidebar), AskUserQuestion (answer_question
-            // in sidebar), and PlanVerdict (plan_verdict in sidebar). No browser
-            // or clipboard capabilities.
-            capabilities: vec![
-                HookKind::Approve,
-                HookKind::AskUserQuestion,
-                HookKind::PlanVerdict,
-            ],
-            sessions: vec![],
-        }),
-    };
-    client_conn.send_to_server(init_msg);
 
     *slot = Some(ConnectionState {
         conn: client_conn,
