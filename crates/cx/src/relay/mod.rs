@@ -18,7 +18,6 @@ use std::sync::atomic::AtomicBool;
 use std::time::SystemTime;
 
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use portable_pty::ExitStatus as PtyExitStatus;
 use signal_hook::consts::signal::SIGWINCH;
 use signal_hook::flag as sig_flag;
 
@@ -162,50 +161,11 @@ fn print_exit_summary(
     println!();
 }
 
-/// Build the relay-time env slice (currently just the Warp session id, if any).
-pub(crate) fn warp_env(warp_session: &Option<WarpSession>) -> Vec<(&'static str, String)> {
-    match warp_session {
-        Some(ws) => vec![("CX_WARP_SESSION_ID", ws.session_id().to_string())],
-        None => Vec::new(),
-    }
-}
-
 /// Restore the terminal on panic; the normal path disables raw mode explicitly
 /// before finalizing. `disable_raw_mode` is idempotent, so a double call is harmless.
 struct RawGuard;
 impl Drop for RawGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-    }
-}
-
-/// Map a `portable_pty::ExitStatus` to a shell-style exit code.
-///
-/// `portable_pty` collapses signal deaths to `exit_code()==1` and keeps only the
-/// `strsignal` description (e.g. "Terminated"), so the 128+signal convention is
-/// best-effort; unmapped signals fall back to the reported exit code.
-pub(crate) fn pty_exit_code(status: &PtyExitStatus) -> i32 {
-    if status.success() {
-        return 0;
-    }
-    if let Some(sig) = status.signal()
-        && let Some(n) = signal_number(sig)
-    {
-        return 128 + n;
-    }
-    status.exit_code() as i32
-}
-
-/// Best-effort `strsignal` description → signal number for the common cases.
-fn signal_number(desc: &str) -> Option<i32> {
-    // strsignal returns localized descriptions; match the C-locale strings.
-    match desc {
-        "Hangup" => Some(libc::SIGHUP),
-        "Interrupt" => Some(libc::SIGINT),
-        "Quit" => Some(libc::SIGQUIT),
-        "Killed" => Some(libc::SIGKILL),
-        "Segmentation fault" | "Segmentation Fault" => Some(libc::SIGSEGV),
-        "Terminated" => Some(libc::SIGTERM),
-        _ => None,
     }
 }

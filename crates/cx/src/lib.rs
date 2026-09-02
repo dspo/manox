@@ -626,22 +626,6 @@ pub(crate) fn parse_model_context_suffix(model_id: &str) -> (&str, Option<i64>) 
 /// 插入点是首个 `wire_api = ...` 行之后——merge_codex_config 会整体丢弃用户
 /// `[model_providers.*]` 段并只重新生成本次注入的一个，因此首个匹配即注入段；
 /// 保留的用户内容排在其后，不受影响。找不到插入点时原样返回（防御）。
-fn inject_supports_websockets(config: &str, supports: bool) -> String {
-    let marker = "\nwire_api = ";
-    let Some(pos) = config.find(marker) else {
-        return config.to_string();
-    };
-    let rest = &config[pos + marker.len()..];
-    let Some(eol) = rest.find('\n') else {
-        return config.to_string();
-    };
-    let insert_at = pos + marker.len() + eol + 1;
-    let mut out = String::with_capacity(config.len() + 32);
-    out.push_str(&config[..insert_at]);
-    out.push_str(&format!("supports_websockets = {supports}\n"));
-    out.push_str(&config[insert_at..]);
-    out
-}
 
 fn prepare_codex_launch_home(
     model: &ResolvedModel,
@@ -695,87 +679,6 @@ fn prepare_codex_launch_home(
 /// 返回 `ChatGptAppPrepared`：codex_home 供调用方在启动子进程时设 `CODEX_HOME` 环境变量，
 /// env_key 是 config.toml 里 Codex 运行时读取 API Key 的环境变量名，
 /// reasoning_effort 是解析出的（或默认 "high"）推理强度，供注入脚本与下拉默认值保持一致。
-fn prepare_chatgpt_launch_home_for_app(
-    model: &ResolvedModel,
-    provider: &ResolvedProvider,
-    wire_api: WireApi,
-    injected_models: &[ResolvedModel],
-    chatgpt_settings: &ChatGptAppSettings,
-    provider_display_name: &str,
-) -> Result<ChatGptAppPrepared> {
-    let real_home = home_dir().context("无法解析用户主目录")?;
-    let codex_dir = cx_state_dir()?.join(".codex");
-    let real_codex_dir = real_home.join(".codex");
-
-    // 创建固定目录
-    if !codex_dir.exists() {
-        std::fs::create_dir_all(&codex_dir)?;
-    }
-
-    // Symlink 真实 .codex 内容（auth.json 等），config.toml 除外
-    materialize_passthrough_dir(&real_codex_dir, &codex_dir, &["config.toml"])?;
-
-    let provider_key = provider_config_key(&provider.name);
-    let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
-    // 读取真实 config.toml（如有）做保留
-    let existing_config = fs::read_to_string(real_codex_dir.join("config.toml")).ok();
-    let reasoning_effort =
-        extract_reasoning_effort(existing_config.as_deref()).unwrap_or_else(|| "high".to_string());
-    let (api_model_id, context_window) = parse_model_context_suffix(&model.id);
-    // 生成本地模型目录（收录带上下文后缀的模型），让引擎跳过 fallback 对上下文窗口的钳制。
-    // 无后缀模型时目录为空（引擎拒绝空目录），此时不写 model_catalog_json，保持现状。
-    let catalog_path = codex_dir.join("model-catalog.json");
-    let catalog = chatgpt_app::catalog::build_model_catalog(injected_models);
-    let has_catalog_entries = catalog["models"]
-        .as_array()
-        .map(|models| !models.is_empty())
-        .unwrap_or(false);
-    let suffix_count = catalog["models"].as_array().map(|a| a.len()).unwrap_or(0);
-    println!(
-        "[cx] 注入 {} 个模型（其中 {} 个有上下文后缀）",
-        injected_models.len(),
-        suffix_count
-    );
-    if !has_catalog_entries {
-        eprintln!("[cx] 警告: 无上下文后缀模型，所有模型将走引擎 fallback（258k）");
-    }
-    let model_catalog_json = if has_catalog_entries {
-        write_private_file(&catalog_path, &serde_json::to_string_pretty(&catalog)?)?;
-        println!("[cx] 注入模型目录: {}", catalog_path.display());
-        Some(catalog_path.to_string_lossy().to_string())
-    } else {
-        None
-    };
-    let merged_config = merge_codex_config(
-        existing_config.as_deref(),
-        model,
-        &env::current_dir()?,
-        wire_api,
-        &provider_key,
-        // 展示名可被昵称覆盖（ChatGPT.app 注入路径），provider key 不变。
-        provider_display_name,
-        &env_key,
-        api_model_id,
-        context_window,
-        model_catalog_json.as_deref(),
-    )?;
-    // supports_websockets（Settings → 外部工具开放项）：merge_codex_config 重新生成
-    // 且唯一持有 `[model_providers.*]` 段，在其后注入该行即可。未配置按 false——
-    // 自定义 provider 普遍不支持 WS 流式，引擎默认 true 会导致请求失败。
-    let merged_config = inject_supports_websockets(
-        &merged_config,
-        chatgpt_settings.supports_websockets.unwrap_or(false),
-    );
-    write_private_file(&codex_dir.join("config.toml"), &merged_config)?;
-    println!("[cx] 注入配置: {}", codex_dir.join("config.toml").display());
-
-    Ok(ChatGptAppPrepared {
-        codex_home: codex_dir,
-        env_key,
-        reasoning_effort,
-        custom_env: chatgpt_settings.env.clone(),
-    })
-}
 
 /// `prepare_chatgpt_launch_home_for_app` 的产物，供 chatgpt_app 启动编排使用。
 // struct ChatGptAppPrepared -- now in manox-ext-agents
@@ -1214,11 +1117,6 @@ fn base_reserved_env_keys() -> Vec<String> {
 
 /// cx 托管的保留环境变量键：用户自定义 env 不允许覆盖。
 /// 启动注入端使用：基础保留键 + 所选 provider 的 env_key。
-pub(crate) fn chatgpt_reserved_env_keys(env_key: &str) -> Vec<String> {
-    let mut keys = base_reserved_env_keys();
-    keys.push(env_key.to_string());
-    keys
-}
 
 /// 保存校验端保留键：基础保留键 + 全部 provider 的 env_key。
 /// 是启动端过滤的超集（「校验 ⊇ 启动过滤」不变量，见测试）。
@@ -1252,57 +1150,8 @@ pub fn validate_chatgpt_custom_env(env: &BTreeMap<String, String>) -> Result<()>
 
 /// 构造 VS Code 启动所需的 `Selection`：选中模型即唯一 BYOK 目标（无模型目录
 /// 注入——Claude Code 直接消费 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL env）。
-fn build_vscode_selection(
-    config: &CxConfig,
-    all_models: &[ResolvedModel],
-    provider_name: &str,
-    model_id: &str,
-) -> Result<Selection> {
-    let agent = find_agent(config, "VS Code").context("配置中缺少 `VS Code` agent")?;
-    let provider = providers_for_agent(config, "VS Code")
-        .into_iter()
-        .find(|p| p.name == provider_name)
-        .with_context(|| format!("`VS Code` 下未找到 provider `{provider_name}`"))?;
-    let model = all_models
-        .iter()
-        .find(|m| {
-            m.provider_name == provider_name
-                && m.id == model_id
-                && resolved_model_supports_agent(m, "VS Code")
-                // 显式确认 Anthropic wire（supports_agent 已隐含，防配置层不变量漂移）
-                && m.model_wire_apis.contains(&WireApi::Anthropic)
-        })
-        .with_context(|| {
-            format!("Provider `{provider_name}` 下未找到 VS Code 可用模型 `{model_id}`")
-        })?
-        .clone();
-    Ok(Selection {
-        agent_id: agent.id,
-        agent_binary: agent.binary,
-        agent_args: agent.args,
-        agent_env: agent.env,
-        selected_wire_api: WireApi::Anthropic,
-        provider,
-        model: Some(model),
-        injected_models: Vec::new(),
-    })
-}
 
 /// VS Code 的 API Key 非交互解析（GUI 嵌入路径）：无 stdin 可补齐，缺失即报错。
-fn resolve_vscode_apikey(provider: &ResolvedProvider) -> Result<String> {
-    let Some(source) = provider.apikey_source.as_deref() else {
-        bail!(
-            "Provider `{}` 需要 API Key 但未配置 apikey_source",
-            provider.name
-        );
-    };
-    let apikey = resolve_apikey(source)
-        .with_context(|| format!("解析 Provider `{}` 的 API Key 失败", provider.name))?;
-    if apikey.is_empty() {
-        bail!("VS Code 注入需要 API Key，但未提供");
-    }
-    Ok(apikey)
-}
 
 /// 加载 VS Code 注入设置（`vscode_app:` 段缺失时返回默认空设置）。
 pub fn vscode_app_settings() -> Result<VsCodeAppSettings> {
@@ -2509,51 +2358,6 @@ fn format_duration(d: std::time::Duration) -> String {
 /// the endpoint variant and must be agent-supported; without one the first
 /// agent-visible registration wins and the wire falls back to the first
 /// agent-supported wire the model offers, then the endpoint's own wire.
-pub(crate) fn resolve_launch_model(
-    all_models: &[ResolvedModel],
-    provider_name: &str,
-    agent: &ResolvedAgent,
-    model_id: &str,
-    wire: Option<WireApi>,
-) -> Result<(ResolvedModel, WireApi)> {
-    if let Some(w) = wire {
-        anyhow::ensure!(
-            agent.supports_wire_api(w),
-            "agent `{}` 不支持 wire `{}`",
-            agent.id,
-            w.display()
-        );
-    }
-    let model = all_models
-        .iter()
-        .find(|m| {
-            m.provider_name == provider_name
-                && resolved_model_supports_agent(m, &agent.id)
-                && m.id == model_id
-                && wire.map(|w| m.wire_api == w).unwrap_or(true)
-        })
-        .with_context(|| {
-            format!(
-                "provider `{}` 下未找到支持 `{}` 的 model `{}`{}",
-                provider_name,
-                agent.id,
-                model_id,
-                wire.map(|w| format!("（wire `{}`）", w.display()))
-                    .unwrap_or_default()
-            )
-        })?
-        .clone();
-    let selected = wire
-        .or_else(|| {
-            model
-                .model_wire_apis
-                .iter()
-                .find(|w| agent.supported_wire_apis.contains(w))
-                .copied()
-        })
-        .unwrap_or(model.wire_api);
-    Ok((model, selected))
-}
 
 fn build_launch_spec(
     selection: &Selection,
@@ -4707,39 +4511,6 @@ mod tests {
         let _ = fs::remove_dir_all(fake_binary.parent().unwrap());
     }
 
-    #[test]
-    fn build_vscode_selection_resolves_provider_and_model() {
-        let config: CxConfig = r#"
-providers:
-- name: test
-  apikey_source: literal:k
-  models:
-    m1:
-      wire_apis: [anthropic]
-  endpoints:
-    anthropic:
-      url: https://example.com/anthropic
-agents:
-- id: claude
-  binary: claude
-  wire_apis: [anthropic]
-"#
-        .parse()
-        .expect("parse");
-        let all_models = config.resolve_all_models();
-        let selection =
-            build_vscode_selection(&config, &all_models, "test", "m1").expect("selection");
-        assert_eq!(selection.agent_id, "VS Code");
-        assert_eq!(selection.selected_wire_api, WireApi::Anthropic);
-        assert_eq!(selection.provider.name, "test");
-        assert_eq!(selection.model.as_ref().unwrap().id, "m1");
-        assert!(selection.injected_models.is_empty());
-
-        // 未知 provider / model 明确报错
-        assert!(build_vscode_selection(&config, &all_models, "nope", "m1").is_err());
-        assert!(build_vscode_selection(&config, &all_models, "test", "nope").is_err());
-    }
-
     /// 双 provider 测试配置：`both` 同时有 Anthropic（b1/b2）与 Responses（b1）
     /// 模型；`anthropic-only` 仅 Anthropic（a1）。
     fn vscode_settings_test_config() -> CxConfig {
@@ -6448,51 +6219,6 @@ trust_level = "trusted"
     }
 
     #[test]
-    fn inject_supports_websockets_inserts_after_wire_api() {
-        let config = "model = \"m\"\nmodel_provider = \"p\"\n\n[model_providers.\"p\"]\n\
-                      name = \"P\"\nbase_url = \"https://example.com\"\nenv_key = \"K\"\n\
-                      wire_api = \"responses\"\n\n[projects.\"/w\"]\n\ntrust_level = \"trusted\"\n";
-        let injected = inject_supports_websockets(config, false);
-        assert!(injected.contains("wire_api = \"responses\"\nsupports_websockets = false\n"));
-        // 注入行只出现一次，且其后内容（projects 段）原样保留。
-        assert_eq!(injected.matches("supports_websockets").count(), 1);
-        assert!(injected.contains("[projects.\"/w\"]"));
-        assert!(injected.contains("trust_level = \"trusted\""));
-    }
-
-    #[test]
-    fn inject_supports_websockets_no_marker_returns_original() {
-        let config = "model = \"m\"\n";
-        assert_eq!(inject_supports_websockets(config, true), config);
-    }
-
-    #[test]
-    fn chatgpt_reserved_env_keys_include_dynamic_key() {
-        let keys = chatgpt_reserved_env_keys("DASHSCOPE_API_KEY");
-        assert!(keys.contains(&"CODEX_HOME".to_string()));
-        assert!(keys.contains(&"CX_MODEL".to_string()));
-        assert!(keys.contains(&"CX_WARP_SESSION_ID".to_string()));
-        assert!(keys.contains(&"DASHSCOPE_API_KEY".to_string()));
-    }
-
-    #[test]
-    fn validate_reserved_keys_superset_launch_filter() {
-        // 不变量：保存端校验的保留键集合 ⊇ 启动端过滤集合，
-        // 即「保存通过 → 启动必不丢弃」。对每个 provider 的 env_key 成立。
-        let config = minimal_test_config();
-        let all = all_reserved_env_keys(&config);
-        for provider in &config.providers {
-            let env_key = env_key_for_apikey_source(provider.apikey_source.as_deref());
-            for key in chatgpt_reserved_env_keys(&env_key) {
-                assert!(
-                    all.contains(&key),
-                    "save-side validation must cover launch-side reserved key {key}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn normalize_chatgpt_app_settings_drops_false_keeps_true() {
         let off = ChatGptAppSettings {
             supports_websockets: Some(false),
@@ -7058,66 +6784,5 @@ agents:
         );
         assert_eq!(resolved.env.get("PROVIDER_ONLY"), Some(&"yes".to_string()));
         assert_eq!(resolved.env.get("MODEL_ONLY"), Some(&"yes".to_string()));
-    }
-
-    fn wire_test_agent(id: &str, wires: &[WireApi]) -> ResolvedAgent {
-        ResolvedAgent {
-            id: id.into(),
-            binary: id.into(),
-            args: Vec::new(),
-            supported_wire_apis: wires.to_vec(),
-            env: BTreeMap::new(),
-            hidden: false,
-        }
-    }
-
-    /// One config model registered through every wire endpoint; `visible_agents`
-    /// narrowed to copilot (the only built-in seeing all three wires).
-    fn wire_variant_model(wire: WireApi) -> ResolvedModel {
-        let mut m = test_resolved_model("m", "https://p.example", wire);
-        m.provider_name = "P".into();
-        m.visible_agents = vec!["copilot".into()];
-        m.model_wire_apis = vec![WireApi::Anthropic, WireApi::Responses, WireApi::Completions];
-        m
-    }
-
-    #[test]
-    fn resolve_launch_model_explicit_wire_pins_variant() {
-        let models = vec![
-            wire_variant_model(WireApi::Anthropic),
-            wire_variant_model(WireApi::Completions),
-        ];
-        let agent = wire_test_agent(
-            "copilot",
-            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        );
-        let (model, selected) =
-            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).unwrap();
-        assert_eq!(model.wire_api, WireApi::Completions);
-        assert_eq!(selected, WireApi::Completions);
-    }
-
-    #[test]
-    fn resolve_launch_model_without_wire_keeps_first_match() {
-        let models = vec![
-            wire_variant_model(WireApi::Anthropic),
-            wire_variant_model(WireApi::Completions),
-        ];
-        let agent = wire_test_agent(
-            "copilot",
-            &[WireApi::Anthropic, WireApi::Responses, WireApi::Completions],
-        );
-        let (model, selected) = resolve_launch_model(&models, "P", &agent, "m", None).unwrap();
-        assert_eq!(model.wire_api, WireApi::Anthropic);
-        assert_eq!(selected, WireApi::Anthropic);
-    }
-
-    #[test]
-    fn resolve_launch_model_rejects_agent_unsupported_wire() {
-        let models = vec![wire_variant_model(WireApi::Anthropic)];
-        let agent = wire_test_agent("claude", &[WireApi::Anthropic]);
-        assert!(
-            resolve_launch_model(&models, "P", &agent, "m", Some(WireApi::Completions)).is_err()
-        );
     }
 }
