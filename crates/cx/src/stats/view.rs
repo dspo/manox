@@ -2364,6 +2364,7 @@ mod tests {
                 ("pi", "Pi"),
                 ("manox", "Manox"),
                 ("dsh", "DeepSeek Harness"),
+                ("zcode", "ZCode"),
             ]
         );
     }

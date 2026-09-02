@@ -127,6 +127,7 @@ pub(crate) const AGENT_MIMO: &str = "mimo";
 pub(crate) const AGENT_PI: &str = "pi";
 pub(crate) const AGENT_MANOX: &str = "manox";
 pub(crate) const AGENT_DSH: &str = "dsh";
+pub(crate) const AGENT_ZCODE: &str = "zcode";
 
 pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_CLAUDE, "Claude Code"),
@@ -138,6 +139,7 @@ pub(crate) const MATRIX_AGENTS: &[(&str, &str)] = &[
     (AGENT_PI, "Pi"),
     (AGENT_MANOX, "Manox"),
     (AGENT_DSH, "DeepSeek Harness"),
+    (AGENT_ZCODE, "ZCode"),
 ];
 
 /// 折线图调色板（与 Claude `/usage` 风格相近）。
@@ -221,6 +223,12 @@ fn log_sources() -> Vec<LogSource> {
             root: home.join(".manox/sessions"),
             extra_file: None,
             kind: SourceKind::PiSession(AGENT_MANOX),
+        },
+        // ZCode CLI 的 model-io rollout：主会话与 subagent 会话各一个 jsonl 文件。
+        LogSource {
+            root: home.join(".zcode/cli/rollout"),
+            extra_file: None,
+            kind: SourceKind::Zcode,
         },
     ];
     // deepseek-harness home resolves through $DSH_HOME, else ~/.dsh; a

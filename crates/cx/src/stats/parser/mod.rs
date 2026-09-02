@@ -13,6 +13,7 @@ pub(super) mod manox;
 pub(super) mod mimo;
 pub(super) mod omp_session;
 pub(super) mod pi;
+pub(super) mod zcode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -81,6 +82,9 @@ pub(super) enum SourceKind {
     /// deepseek-harness session jsonl（$DSH_HOME/sessions，默认 ~/.dsh），
     /// 默认 zstd 压缩（session.jsonl.zstd，多 frame 拼接）。
     DshSession,
+    /// ZCode CLI model-io rollout jsonl（~/.zcode/cli/rollout/），
+    /// 主会话与 subagent 会话各一个文件。
+    Zcode,
 }
 
 pub(super) struct ParseResult {
@@ -93,7 +97,10 @@ impl SourceKind {
     pub(super) fn supports_append_scan(self) -> bool {
         matches!(
             self,
-            SourceKind::Claude | SourceKind::OmpSession | SourceKind::PiSession(_)
+            SourceKind::Claude
+                | SourceKind::OmpSession
+                | SourceKind::PiSession(_)
+                | SourceKind::Zcode
         )
     }
 }
@@ -166,6 +173,7 @@ fn parse_jsonl_content(path: &Path, kind: SourceKind, content: &str) -> Vec<RawE
         SourceKind::Copilot(agent) => copilot::parse(content, agent, path),
         SourceKind::OmpSession => omp_session::parse(content),
         SourceKind::PiSession(agent) => pi::parse_with_agent(content, agent),
+        SourceKind::Zcode => zcode::parse(content, path),
         SourceKind::MimoSession | SourceKind::ManoxSession | SourceKind::DshSession => {
             unreachable!()
         }
@@ -266,6 +274,7 @@ mod tests {
         assert!(SourceKind::OmpSession.supports_append_scan());
         assert!(SourceKind::PiSession("pi").supports_append_scan());
         assert!(SourceKind::PiSession("manox").supports_append_scan());
+        assert!(SourceKind::Zcode.supports_append_scan());
         assert!(!SourceKind::CodexLike("codex").supports_append_scan());
         assert!(!SourceKind::Copilot("copilot").supports_append_scan());
         assert!(!SourceKind::MimoSession.supports_append_scan());
