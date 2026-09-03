@@ -267,7 +267,6 @@ struct SubagentPrompt {
 struct BackgroundThread {
     entity: manox_agent::thread::ThreadHandle,
     store: Option<gpui::Entity<ClientStoreHandle>>,
-    client_conn: Option<manox_protocol::InProcessConnection>,
     session_id: Option<String>,
     _sub: Subscription,
 }
@@ -327,25 +326,14 @@ pub struct Workspace {
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
     /// T-D: the shared single-connection multiplexer. One app-level
     /// `AgentClient` (client_id "desktop") carries every session; the
-    /// per-session handles are leaves fed by its demux pump. The legacy
-    /// `client_conn` field below is retained as `None` and removed in a
-    /// follow-up slice.
+    /// per-session handles are leaves fed by its demux pump.
     pub(crate) multiplexer: gpui::Entity<crate::multiplexer::SessionMultiplexer>,
     /// T-D: the shared app-level client used by the fire-and-forget
     /// `send_note` and `Reply` verdict paths (no per-session connection).
     pub(crate) client: std::sync::Arc<manox_session_core::agent_client::AgentClient>,
-    /// γ-3: the client-side connection for sending `FromClient` commands to the
-    /// AgentServer. None until the landing
-    /// thread wires it.
-    pub(crate) client_conn: Option<manox_protocol::InProcessConnection>,
     /// γ-3: the AgentServer session_id for the landing thread. Used as the
     /// `session_id` field in `FromClient` commands.
     pub(crate) session_id: Option<String>,
-    /// The shared AgentServer every foreground/background session connects
-    /// to. Created at landing and handed to the `SessionMultiplexer`; retained
-    /// on the workspace for the follow-up slices that still reference it.
-    #[allow(dead_code)]
-    pub(crate) agent_server: std::sync::Arc<manox_session_core::agent_server::AgentServer>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
     /// in the background and persist via the spawned-task save backstop. Each
@@ -839,9 +827,7 @@ impl Workspace {
             store: Some(store),
             multiplexer,
             client,
-            client_conn: None,
             session_id: Some(session_id),
-            agent_server,
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
@@ -3790,7 +3776,6 @@ impl Workspace {
                 store.with_mut(|s| s.mark_background_work(&old_id, true));
             }
             let old_store = self.store.take();
-            let old_conn = self.client_conn.take();
             let old_sid = self.session_id.take();
             let sub = self.subscribe_background_thread(
                 old_store
@@ -3802,27 +3787,30 @@ impl Workspace {
             self.background_threads.push(BackgroundThread {
                 entity: old_thread,
                 store: old_store,
-                client_conn: old_conn,
                 session_id: old_sid,
                 _sub: sub,
             });
         } else if old_id != new_id {
-            // Idle switch: the outgoing session has nothing in flight. Drop the
-            // local handle (the server-side owner still leaks until a later
-            // `DetachSession` — T-D slice ② wires that). Forgetting it from the
-            // multiplexer lets the leaf Entity drop, matching the pre-multiplex
-            // behavior where the handle and its connection were both released.
+            // Idle switch: the outgoing session has nothing in flight. Detach
+            // it from the shared connection so the server releases the owner
+            // (the session itself survives for a later `OpenSession`), then
+            // drop the local handle. No owner leak — the pre-multiplex path
+            // leaked because the in-process transport never signalled drop.
+            self.client
+                .send_note(manox_protocol::ClientNote::DetachSession {
+                    session_id: old_id.clone(),
+                });
             self.multiplexer.update(cx, |m, _| {
                 m.forget(&old_id);
             });
             self.store = None;
-            self.client_conn = None;
             self.session_id = None;
         }
 
         // If the new thread was previously parked in the background, reclaim it
-        // (entity + store + connection) so it becomes the foreground thread
-        // and is no longer double-held.
+        // (entity + store) so it becomes the foreground thread and is no longer
+        // double-held. The parked session stayed attached to the shared
+        // connection, so no `OpenSession` is needed on reclaim.
         if let Some(pos) = self
             .background_threads
             .iter()
@@ -3830,7 +3818,6 @@ impl Workspace {
         {
             let bg = self.background_threads.remove(pos);
             self.store = bg.store;
-            self.client_conn = bg.client_conn;
             self.session_id = bg.session_id;
         }
 
