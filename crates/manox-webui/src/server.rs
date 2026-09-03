@@ -11,20 +11,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use futures::{SinkExt, StreamExt};
 use include_dir::{Dir, include_dir};
-use serde_json::Value;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
-
-use crate::bridge::{self, Outbound};
 
 /// The committed `apps/web/webui/dist` build — embedded into the binary so the app
 /// stays single-process. Rebuilt by `npm run build` in `apps/web/webui/`.
@@ -35,7 +29,7 @@ static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(crate) struct AppState {
     token: String,
-    conn_tx: UnboundedSender<crate::ToMain>,
+    server: Arc<manox_session_core::agent_server::AgentServer>,
     port: u16,
 }
 
@@ -47,8 +41,8 @@ pub(crate) async fn bind_and_serve() -> anyhow::Result<()> {
     let port = listener.local_addr()?.port();
     let token = uuid::Uuid::new_v4().simple().to_string();
     let url = format!("http://127.0.0.1:{port}/");
-    let conn_tx =
-        crate::main_channel_sender().ok_or_else(|| anyhow::anyhow!("webui pump not started"))?;
+    let server = crate::webui_agent_server()
+        .ok_or_else(|| anyhow::anyhow!("webui agent server not started"))?;
     crate::service_started(crate::WebuiService {
         url,
         token: token.clone(),
@@ -56,7 +50,7 @@ pub(crate) async fn bind_and_serve() -> anyhow::Result<()> {
     });
     let state = AppState {
         token,
-        conn_tx,
+        server,
         port,
     };
     axum::serve(listener, build_router(state)).await?;
@@ -147,107 +141,31 @@ async fn ws_upgrade(
     if !origin_ok {
         return StatusCode::FORBIDDEN.into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws(socket, state.conn_tx.clone()))
+    ws.on_upgrade(move |socket| handle_ws(socket, state.server))
 }
 
-async fn handle_ws(socket: WebSocket, conn_tx: UnboundedSender<crate::ToMain>) {
-    let (ws_tx, mut ws_rx) = socket.split();
-    let (cmd_tx, cmd_rx) = unbounded_channel::<Value>();
-    let (frame_tx, frame_rx) = unbounded_channel::<Value>();
-    let (tick_tx, tick_rx) = unbounded_channel::<()>();
-    let outbound = Arc::new(Outbound::new(frame_tx, tick_tx));
+async fn handle_ws(socket: WebSocket, server: Arc<manox_session_core::agent_server::AgentServer>) {
     let id = NEXT_CONN_ID.fetch_add(1, Ordering::SeqCst);
-    if conn_tx
-        .send(crate::ToMain::Connect(crate::ConnectionHandle {
-            id,
-            cmd_rx,
-            outbound: outbound.clone(),
-        }))
-        .is_err()
-    {
-        return;
-    }
-    let sender = spawn_sender(tick_rx, frame_rx, ws_tx, outbound.clone());
-    while let Some(Ok(msg)) = ws_rx.next().await {
-        let text = match msg {
-            Message::Text(t) => t.to_string(),
-            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-            _ => continue,
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&text) else {
-            continue;
-        };
-        if cmd_tx.send(v).is_err() {
-            break;
-        }
-    }
-    let _ = conn_tx.send(crate::ToMain::Disconnect(id));
-    drop(sender);
-    drop(outbound);
-    drop(cmd_tx);
-}
-
-/// The per-connection outbound task: coalesces batched events into 33ms
-/// frames and relays bypass frames (`thread_info`, `session_ready`, global
-/// snapshots) immediately. Exits when the pump drops the connection's
-/// outbound (closing the frame/tick channels) or the socket errors.
-fn spawn_sender(
-    mut tick_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
-    mut frame_rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
-    ws_tx: futures::stream::SplitSink<WebSocket, Message>,
-    outbound: Arc<Outbound>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ws_tx = ws_tx;
-        let mut flush_at: Option<tokio::time::Instant> = None;
-        let sleep = tokio::time::sleep(Duration::ZERO);
-        tokio::pin!(sleep);
-        loop {
-            tokio::select! {
-                frame = frame_rx.recv() => {
-                    match frame {
-                        Some(frame) => {
-                            if ws_tx
-                                .send(Message::Text(frame.to_string().into()))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                tick = tick_rx.recv() => {
-                    if tick.is_none() {
-                        break;
-                    }
-                    while tick_rx.try_recv().is_ok() {}
-                    let deadline = tokio::time::Instant::now()
-                        + Duration::from_millis(bridge::BATCH_MS);
-                    flush_at = Some(deadline);
-                    sleep.as_mut().reset(deadline);
-                }
-                _ = &mut sleep, if flush_at.is_some() => {
-                    outbound.flush();
-                    flush_at = None;
-                }
-            }
-        }
-    })
+    // The browser speaks the typed FromClient/FromServer protocol directly;
+    // the WebSocketConnection pumps frames to/from the AgentServer. The
+    // browser must send the Initialize handshake first (client_id webui-{id}
+    // is minted by the browser; the id here is only for logging/tracing).
+    let _ = id;
+    let conn = crate::ws_connection::WebSocketConnection::new(socket);
+    server.accept(conn);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use axum::extract::{Path, State};
-    use tokio::sync::mpsc::unbounded_channel;
+    use axum::extract::Path;
+    use manox_session_core::agent_server::AgentServer;
 
     fn test_state() -> AppState {
         AppState {
             token: "tok123".to_string(),
-            conn_tx: unbounded_channel().0,
+            server: Arc::new(AgentServer::new(std::path::PathBuf::from("/"))),
             port: 4321,
         }
     }

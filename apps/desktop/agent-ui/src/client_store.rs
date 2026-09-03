@@ -112,7 +112,12 @@ impl ClientStore {
                 display_history,
                 ..
             } => {
-                match serde_json::from_value::<Vec<Message>>(messages.clone()) {
+                // WireMessage deflates Image.data to byte_len; the storage
+                // Message ignores the extra byte_len (its Image.data is
+                // #[serde(default)]) and accepts the identical field names,
+                // so the typed payload round-trips into Vec<Message>.
+                let value = serde_json::to_value(messages).unwrap_or_default();
+                match serde_json::from_value::<Vec<Message>>(value) {
                     Ok(msgs) => self.messages = msgs,
                     Err(e) => {
                         tracing::warn!(error = %e, "ThreadHistory parse failed; keeping stale messages")
@@ -370,9 +375,11 @@ mod tests {
             )]),
         ];
         let history = serde_json::to_value(&msgs).unwrap();
+        let wire_messages: Vec<manox_protocol::WireMessage> =
+            serde_json::from_value(history).expect("wire round-trip");
         store.apply_server_note(&ServerNote::ThreadHistory {
             session_id: "s1".into(),
-            messages: history.clone(),
+            messages: wire_messages,
             display_history: serde_json::Value::Array(Vec::new()),
             auto_approved_tools: None,
             restored: false,

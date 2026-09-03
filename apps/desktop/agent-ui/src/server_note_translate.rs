@@ -215,7 +215,8 @@ pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
         | ModelText { .. }
         | ModelThinking { .. }
         | ModelToolCall { .. }
-        | ModelChatDone { .. } => return None,
+        | ModelChatDone { .. }
+        | Commands { .. } => return None,
     })
 }
 
@@ -326,7 +327,7 @@ mod tests {
     fn history_restored_derives_from_thread_history() {
         let note = ServerNote::ThreadHistory {
             session_id: "s1".into(),
-            messages: serde_json::json!([]),
+            messages: vec![],
             display_history: serde_json::json!([]),
             auto_approved_tools: None,
             restored: false,

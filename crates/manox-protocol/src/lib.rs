@@ -25,9 +25,14 @@ pub mod handshake;
 pub mod msg;
 pub mod server;
 pub mod transport;
+pub mod wire;
 
 pub use client::{ClientCall, ClientNote, ImageAttachment};
 pub use handshake::{ClientHello, HookKind, Initialize};
 pub use msg::{FromClient, FromServer, MsgId, RpcError};
 pub use server::{ServerCall, ServerNote};
 pub use transport::{InProcessConnection, RpcConnection, RpcPeer, in_process_pair};
+pub use wire::{
+    ModelInfo, ThreadListItem, WireContentBlock, WireMessage, WireMessageAuthor,
+    WireMessageProvenance, WireMessageUi, WireRole, WireToolResult, WireToolUse,
+};

@@ -7,7 +7,7 @@
   "scripts": {
     "build": "bash build.sh",
     "build:webview": "node esbuild.mjs && tailwindcss -i src/sidebar/webview/styles/tokens.css -o dist/webview/bundle.css --minify",
-    "build:contracts": "tsc -p tsconfig.build.json && node stage-contracts.mjs",
+    "build:contracts": "node stage-contracts.mjs",
     "dev": "node dev-server.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"

@@ -1,58 +1,59 @@
-// Copy the compiled contract modules (protocol/messages) under vscode/dist
-// so the host's tsc emits require()s that resolve both in development and
-// inside the packaged vsix (vsce packages vscode/dist unconditionally). The
-// sources stay owned by webui/.
+// Stage the typed protocol contract under apps/vscode/dist so the VS Code
+// host's tsc resolves `FromClient` / `FromServer` / `ServerNote` / UI
+// projections (ThreadInfoSnapshot, CommandEntry, …) and the webview↔host
+// `ToHost` / `ToWebview` shapes. No tsc emit: the contract is type-only, so
+// the sources are staged as .d.ts directly.
 //
-// Also stage the AgentServer protocol types (ts-rs generated bindings from
-// crates/manox-protocol) merged into the protocol.d.ts so the vscode host
-// can import FromClient, FromServer, and related types alongside the legacy
-// ActorEvent-based types.
+//   vscode/dist/protocol.d.ts        = ts-rs bindings (crates/.../protocol.ts)
+//                                      + the webui UI-projection types from
+//                                      src/protocol.ts (with its bindings
+//                                      re-export line stripped, since the
+//                                      bindings are inlined above them).
+//   vscode/dist/serde_json/JsonValue.d.ts
+//                                    = the JsonValue sibling the bindings
+//                                      import.
+//   vscode/dist/sidebar/messages.d.ts = src/sidebar/messages.ts verbatim
+//                                      (its `../protocol` import resolves to
+//                                      the staged protocol.d.ts).
 import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const target = path.join(root, '..', '..', 'vscode', 'dist');
+const bindingsDir = path.join(root, '..', '..', '..', 'crates', 'manox-protocol', 'bindings');
 
 await mkdir(path.join(target, 'sidebar'), { recursive: true });
-await cp(path.join(root, 'dist', 'protocol.js'), path.join(target, 'protocol.js'));
-await cp(path.join(root, 'dist', 'protocol.d.ts'), path.join(target, 'protocol.d.ts'));
-await cp(path.join(root, 'dist', 'sidebar', 'messages.js'), path.join(target, 'sidebar', 'messages.js'));
-// Transform the sidebar messages.d.ts to use Record<string, unknown>[] for
-// events instead of ActorEvent[], since the vscode host now emits ServerNote
-// notifications (not legacy ActorEvent objects).
-let messagesDts = await readFile(path.join(root, 'dist', 'sidebar', 'messages.d.ts'), 'utf8');
-messagesDts = messagesDts.replace(/events: ActorEvent\[\];/g, 'events: Record<string, unknown>[];');
-await writeFile(path.join(target, 'sidebar', 'messages.d.ts'), messagesDts);
+await mkdir(path.join(target, 'serde_json'), { recursive: true });
 
-// Merge the AgentServer protocol types (ts-rs generated bindings) into the
-// staged protocol.d.ts so the vscode host can import both the legacy types
-// (ActorEvent, Command, etc.) and the AgentServer protocol types (FromClient,
-// FromServer, etc.) from the same module.
-const agentServerBindings = path.join(root, '..', '..', '..', 'crates', 'manox-protocol', 'bindings', 'protocol.ts');
-const agentServerContent = await readFile(agentServerBindings, 'utf8');
-const existingDts = path.join(target, 'protocol.d.ts');
-const existingContent = await readFile(existingDts, 'utf8');
+// ── protocol.d.ts: bindings + webui UI projections ────────────────────────
+const bindings = (await readFile(path.join(bindingsDir, 'protocol.ts'), 'utf8'))
+	.split('\n')
+	.filter((l) => !l.startsWith('import type { JsonValue }'))
+	.join('\n');
 
-// Remove the import line from the agent-server bindings (it imports JsonValue
-// which we handle separately by adding a re-export) and append the AgentServer types.
-const lines = agentServerContent.split('\n');
-const cleanLines = lines.filter((l) => !l.startsWith("import type { JsonValue }"));
-let merged = existingContent.trimEnd() + '\n\n// ── AgentServer protocol types (ts-rs generated) ────────────────\n' + cleanLines.join('\n');
+const webuiProtocol = await readFile(path.join(root, 'src', 'protocol.ts'), 'utf8');
+// Drop the bindings re-export (the bindings are inlined above); keep only the
+// UI-projection types that reference the inlined bindings.
+const uiTypes = webuiProtocol
+	.split('\n')
+	.filter((l) => !l.includes("export * from '") && !l.includes('export * from "'))
+	.join('\n');
 
-// Add JsonValue re-export if not already present.
-if (!merged.includes('export type { JsonValue }') && !merged.includes("export type { JsonValue } from")) {
-  // JsonValue is needed by the AgentServer types; add a re-export at the
-  // very top of the file, before any type definitions.
-  const importLine = "export type { JsonValue } from './serde_json/JsonValue';\n";
-  merged = importLine + merged;
-}
+const jsonValueReExport = "export type { JsonValue } from './serde_json/JsonValue';\n";
+const protocolDts = `${jsonValueReExport}\n${bindings}\n\n${uiTypes}\n`;
+await writeFile(path.join(target, 'protocol.d.ts'), protocolDts);
 
-await writeFile(existingDts, merged);
+// ── serde_json/JsonValue.d.ts ─────────────────────────────────────────────
+await cp(
+	path.join(bindingsDir, 'serde_json', 'JsonValue.ts'),
+	path.join(target, 'serde_json', 'JsonValue.d.ts'),
+);
 
-// Also stage the serde_json/JsonValue type used by the AgentServer protocol.
-const serdeJsonTarget = path.join(target, 'serde_json');
-await mkdir(serdeJsonTarget, { recursive: true });
-await cp(path.join(root, '..', '..', '..', 'crates', 'manox-protocol', 'bindings', 'serde_json', 'JsonValue.ts'), path.join(serdeJsonTarget, 'JsonValue.d.ts'));
+// ── sidebar/messages.d.ts (verbatim; `../protocol` resolves to staged) ────
+await cp(
+	path.join(root, 'src', 'sidebar', 'messages.ts'),
+	path.join(target, 'sidebar', 'messages.d.ts'),
+);
 
 console.log('contracts staged into vscode/dist');

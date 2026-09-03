@@ -8,6 +8,7 @@ publish.workspace = true
 manox-agent = { workspace = true }
 manox-session-core = { workspace = true }
 manox-protocol = { workspace = true }
+async-channel = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }

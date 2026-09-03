@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::wire::{ModelInfo, ThreadListItem, WireMessage};
+
 /// Server → client adjudication / capability calls; the client answers with a
 /// [`crate::FromClient::Reply`]. Routed by session ownership ∩ declared
 /// [`crate::HookKind`] capability; no capable owner fails closed.
@@ -165,7 +167,7 @@ pub enum ServerNote {
     /// server is still streaming the preview and the client should gate input.
     ThreadHistory {
         session_id: String,
-        messages: serde_json::Value,
+        messages: Vec<WireMessage>,
         display_history: serde_json::Value,
         auto_approved_tools: Option<Vec<String>>,
         restored: bool,
@@ -181,10 +183,16 @@ pub enum ServerNote {
         info: Box<ThreadInfoPayload>,
     },
     ThreadsUpdated {
-        threads: serde_json::Value,
+        threads: Vec<ThreadListItem>,
     },
     Models {
-        models: serde_json::Value,
+        models: Vec<ModelInfo>,
+    },
+    /// Slash-command / skill list snapshot. Pushed after a `ListCommands`
+    /// call so clients that read push delivery (not the Response body) stay
+    /// consistent with the `Models` / `ThreadsUpdated` notification pattern.
+    Commands {
+        commands: serde_json::Value,
     },
     /// Per-request token usage (incremental delta).
     Usage {
@@ -501,7 +509,7 @@ mod tests {
     fn thread_history_expanded_round_trips() {
         let note = ServerNote::ThreadHistory {
             session_id: "t1".into(),
-            messages: serde_json::json!([]),
+            messages: vec![],
             display_history: serde_json::json!([]),
             auto_approved_tools: None,
             restored: true,

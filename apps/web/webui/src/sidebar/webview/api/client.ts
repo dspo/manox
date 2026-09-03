@@ -1,16 +1,31 @@
-// Typed bridge to the extension host: postMessage out, typed HostToWebview
-// payloads in. Every per-thread call carries its sessionId so the store can
-// address any live thread; view switching stays inside the webview and never
-// crosses this boundary.
+// Typed bridge to the host: `FromClient` out (notifications, fire-and-forget
+// list requests, and `Reply` verdicts to `ServerCall`s), `FromServer` in.
+// The store is driven entirely by push delivery — list-type calls
+// (`listThreads` / `listModels` / `listCommands`) send a `Request` whose
+// `Response` the client ignores; the matching `ThreadsUpdated` / `Models` /
+// `Commands` notification folds the result into state. No request/response
+// correlation is needed on the webview side.
+//
+// Session lifecycle (new / open / plan-execute-fresh) is host-dependent: the
+// VS Code extension intercepts it (its `SessionManager` owns the napi
+// connection and per-session event routing); the browser host has no such
+// orchestrator, so the webview posts the equivalent `FromClient` sequence
+// directly. The host-verb `HostVerb` type carries the VS Code-only lifecycle.
 
 import type {
-  ApprovalMode,
-  GoalAction,
-  ImageAttachment,
-  PlanVerdictChoice,
-  ReasoningEffort,
+	ApprovalMode,
+	ClientCall,
+	ClientNote,
+	FromClient,
+	FromServer,
+	GoalAction,
+	HookKind,
+	ImageAttachment,
+	MsgId,
+	PlanVerdictChoice,
+	ReasoningEffort,
 } from '../../../protocol';
-import type { HostToWebview, WebviewToHost } from '../../messages';
+import type { HostVerb, ToWebview } from '../../messages';
 import type { Bridge } from './bridge';
 import { createVscodeBridge, isVscodeHost } from './vscode-bridge';
 import { createWebBridge } from './web-bridge';
@@ -20,140 +35,243 @@ import { createWebBridge } from './web-bridge';
 const bridge: Bridge = isVscodeHost() ? createVscodeBridge() : createWebBridge();
 
 const navigatorListeners = new Set<() => void>();
-bridge.onMessage((message) => {
-  if (message.type === 'open_turn_navigator') {
-    for (const listener of navigatorListeners) listener();
-  }
+let storeDispatch: ((msg: FromServer) => void) | null = null;
+let storeOpenRemote: ((sessionId: string) => void) | null = null;
+
+bridge.onMessage((message: ToWebview) => {
+	// Host-only UI toggle (macOS cmd+m) never reaches the agent wire.
+	if (
+		typeof message === 'object' &&
+		'kind' in message &&
+		(message as { kind: string }).kind === 'open_turn_navigator'
+	) {
+		for (const listener of navigatorListeners) listener();
+		return;
+	}
+	// `Response` frames are replies to fire-and-forget list requests the
+	// store ignores (push delivery supersedes them) — drop them so the store
+	// only ever folds `Notification` / `Request` (ServerCall) frames.
+	const fs = message as FromServer;
+	if (fs.kind === 'response') return;
+	storeDispatch?.(fs);
 });
 
 /** Subscribe to host-requested turn-navigator toggles (macOS cmd+m, where
  * the OS minimize accelerator would swallow the key before the DOM). */
 export function onOpenTurnNavigator(listener: () => void): () => void {
-  navigatorListeners.add(listener);
-  return () => navigatorListeners.delete(listener);
+	navigatorListeners.add(listener);
+	return () => navigatorListeners.delete(listener);
 }
 
-/** Subscribe to host messages; returns an unsubscribe function. */
-export function onHostMessage(listener: (message: HostToWebview) => void): () => void {
-  return bridge.onMessage(listener);
+/** Wire the store's dispatch entry point. The bridge folds `Notification`
+ * and `Request` (ServerCall) frames into state; `Response` frames are
+ * dropped above. */
+export function connectStore(store: {
+	dispatch: (msg: FromServer) => void;
+	openRemote: (sessionId: string) => void;
+}): void {
+	storeDispatch = store.dispatch.bind(store);
+	storeOpenRemote = store.openRemote.bind(store);
 }
 
-function post(message: WebviewToHost): void {
-  bridge.post(message);
+let msgSeq = 0;
+const nextId = (): MsgId => `webui-${++msgSeq}`;
+
+function post(msg: FromClient): void {
+	bridge.post(msg);
+}
+
+function postNote(note: ClientNote): void {
+	post({ kind: 'notification', note });
+}
+
+function postRequest(call: ClientCall): void {
+	post({ kind: 'request', id: nextId(), call });
+}
+
+/** Post a `Reply` to a `ServerCall`. `id` is the request id the server used
+ * (Approve/AskUserQuestion echo the `authId`; PlanVerdict uses the session
+ * id; other capability calls echo the server-minted id). */
+function postReply(id: MsgId, ok: Record<string, unknown>): void {
+	post({ kind: 'reply', id, outcome: { Ok: ok as never } });
+}
+
+function postVerb(verb: HostVerb): void {
+	bridge.post(verb);
 }
 
 /** Per-thread command surface; one instance per live thread id. */
 export class ThreadApi {
-  constructor(readonly sessionId: string) {}
+	constructor(readonly sessionId: string) {}
 
-  submit(text: string, images?: ImageAttachment[], clientId?: string): void {
-    post({ type: 'submit', sessionId: this.sessionId, text, images, clientId });
-  }
+	submit(text: string, images?: ImageAttachment[], clientId?: string): void {
+		postNote({
+			method: 'submit',
+			sessionId: this.sessionId,
+			text,
+			images: images ?? [],
+			clientId: clientId ?? null,
+		});
+	}
 
-  /** Turn the queued message identified by `clientId` into a steer of the
-   * running turn; the actor replies with `steer_pending`. */
-  steer(clientId: string, text: string, images?: ImageAttachment[]): void {
-    post({ type: 'steer', sessionId: this.sessionId, clientId, text, images });
-  }
+	/** Turn the queued message identified by `clientId` into a steer of the
+	 * running turn; the server replies with `steerPending`. */
+	steer(clientId: string, text: string, images?: ImageAttachment[]): void {
+		postNote({
+			method: 'steer',
+			sessionId: this.sessionId,
+			clientId,
+			text,
+			images: images ?? [],
+		});
+	}
 
-  /** Drop a queued message (its echo bubble is removed locally too). */
-  dropQueued(clientId: string): void {
-    post({ type: 'drop_queued', sessionId: this.sessionId, clientId });
-  }
+	/** Drop a queued message (its echo bubble is removed locally too). */
+	dropQueued(clientId: string): void {
+		postNote({ method: 'dropQueued', sessionId: this.sessionId, clientId });
+	}
 
-  approve(id: string, allow: boolean): void {
-    post({ type: 'approve', sessionId: this.sessionId, id, allow });
-  }
+	/** Resolve a `ServerCall::Approve` — reply `{ allow }` (the server's
+	 * deterministic id for Approve is the `authId` the card carries). */
+	approve(authId: string, allow: boolean): void {
+		postReply(authId, { allow });
+	}
 
-  /** Resolve an `AskUserQuestion` card: per-question selections (labels
-   * joined by ", ") plus an optional free-form supplemental note. */
-  answerQuestion(id: string, answers: [string, string][], response: string | null): void {
-    post({ type: 'answer_question', sessionId: this.sessionId, id, answers, response });
-  }
+	/** Resolve an `AskUserQuestion` card: per-question selections (labels
+	 * joined by ", ") plus an optional free-form supplemental note. */
+	answerQuestion(authId: string, answers: [string, string][], response: string | null): void {
+		postReply(authId, { answers, response });
+	}
 
-  cancel(): void {
-    post({ type: 'cancel', sessionId: this.sessionId });
-  }
-  setModel(id: string): void {
-    post({ type: 'set_model', sessionId: this.sessionId, id });
-  }
+	cancel(): void {
+		postNote({ method: 'cancelTurn', sessionId: this.sessionId });
+	}
+	setModel(id: string): void {
+		postNote({ method: 'setModel', sessionId: this.sessionId, id });
+	}
 
-  setReasoningEffort(effort: ReasoningEffort): void {
-    post({ type: 'set_reasoning_effort', sessionId: this.sessionId, effort });
-  }
+	setReasoningEffort(effort: ReasoningEffort): void {
+		postNote({ method: 'setReasoningEffort', sessionId: this.sessionId, effort });
+	}
 
-  setApprovalMode(mode: ApprovalMode): void {
-    post({ type: 'set_approval_mode', sessionId: this.sessionId, mode });
-  }
+	setApprovalMode(mode: ApprovalMode): void {
+		postNote({ method: 'setApprovalMode', sessionId: this.sessionId, mode });
+	}
 
-  setPlanMode(enabled: boolean): void {
-    post({ type: 'set_plan_mode', sessionId: this.sessionId, enabled });
-  }
+	setPlanMode(enabled: boolean): void {
+		postNote({ method: 'setPlanMode', sessionId: this.sessionId, enabled });
+	}
 
-  planVerdict(choice: PlanVerdictChoice): void {
-    post({ type: 'plan_verdict', sessionId: this.sessionId, choice });
-  }
+	/** Resolve a `ServerCall::PlanVerdict` (the server's deterministic id is
+	 * the session id). */
+	planVerdict(choice: PlanVerdictChoice): void {
+		postReply(this.sessionId, { choice });
+	}
 
-  /** Execute-fresh: the host archives this session and seeds a new one with
-   * the plan (host-side orchestration via `plan_execute_fresh`). */
-  planExecuteFresh(planFile: string, cwd: string): void {
-    post({ type: 'plan_execute_fresh', sessionId: this.sessionId, planFile, cwd });
-  }
+	/** Execute-fresh: archive this session and seed a new one with the plan.
+	 * VS Code orchestrates host-side; the browser posts the `FromClient`
+	 * sequence directly (archive + create + seed). */
+	planExecuteFresh(planFile: string, cwd: string): void {
+		if (isVscodeHost()) {
+			postVerb({ kind: 'plan_execute_fresh', sessionId: this.sessionId, planFile, cwd });
+			return;
+		}
+		const freshId = globalThis.crypto.randomUUID();
+		postNote({ method: 'archiveThread', sessionId: this.sessionId, archived: true });
+		postNote({ method: 'createSession', sessionId: freshId, cwd: null });
+		postNote({ method: 'planSeedExecution', sessionId: freshId, planFile });
+	}
 
-  goal(action: GoalAction, objective?: string, budget?: number): void {
-    post({ type: 'goal', sessionId: this.sessionId, action, objective, budget });
-  }
+	goal(action: GoalAction, objective?: string, budget?: number): void {
+		postNote({
+			method: 'goal',
+			sessionId: this.sessionId,
+			action,
+			objective: objective ?? null,
+			budget: budget != null ? BigInt(budget) : null,
+			maxRounds: null,
+		});
+	}
 
-  stopBackgroundTask(taskId: string): void {
-    post({ type: 'stop_background_task', sessionId: this.sessionId, taskId });
-  }
+	stopBackgroundTask(taskId: string): void {
+		postNote({ method: 'stopBackgroundTask', sessionId: this.sessionId, taskId });
+	}
 
-  requestUsage(): void {
-    post({ type: 'request_usage', sessionId: this.sessionId });
-  }
+	requestUsage(): void {
+		postRequest({ method: 'getUsage', sessionId: this.sessionId });
+	}
 
-  requestThreadInfo(): void {
-    post({ type: 'request_thread_info', sessionId: this.sessionId });
-  }
+	requestThreadInfo(): void {
+		postRequest({ method: 'threadInfo', sessionId: this.sessionId });
+	}
 
-  focus(): void {
-    post({ type: 'focus_thread', sessionId: this.sessionId });
-  }
+	focus(): void {
+		postNote({ method: 'focusThread', sessionId: this.sessionId });
+	}
 }
 
 /** Global command surface (thread registry, models, slash entries). */
 export const api = {
-  requestModels(): void {
-    post({ type: 'request_models' });
-  },
-  /** Optional payload = home-composer first message: the caller picks the id
-   * so an optimistic draft can render before the session exists. */
-  newSession(opts: {
-    sessionId?: string;
-    text?: string;
-    images?: ImageAttachment[];
-    modelId?: string;
-  }): void {
-    post({ type: 'new_session', ...opts });
-  },
-  listThreads(): void {
-    post({ type: 'list_threads' });
-  },
-  archiveThread(sessionId: string, archived: boolean): void {
-    post({ type: 'archive_thread', sessionId, archived });
-  },
-  pinThread(sessionId: string, pinned: boolean): void {
-    post({ type: 'pin_thread', sessionId, pinned });
-  },
-  openThread(sessionId: string): void {
-    post({ type: 'open_thread', sessionId });
-  },
-  /** Clear the focused thread (leaving the conversation view) so turns that
-   * finish afterwards mark it unread. */
-  blurThread(): void {
-    post({ type: 'focus_thread' });
-  },
-  listCommands(): void {
-    post({ type: 'list_commands' });
-  },
+	requestModels(): void {
+		postRequest({ method: 'listModels' });
+	},
+	/** Optional payload = home-composer first message: the caller picks the id
+	 * so an optimistic draft can render before the session exists. */
+	newSession(opts: {
+		sessionId?: string;
+		text?: string;
+		images?: ImageAttachment[];
+		modelId?: string;
+	}): void {
+		if (isVscodeHost()) {
+			postVerb({ kind: 'new_session', ...opts });
+			return;
+		}
+		// Browser: post the `FromClient` sequence the VS Code host would have
+		// orchestrated. The caller has already drafted the thread locally.
+		const sessionId = opts.sessionId ?? globalThis.crypto.randomUUID();
+		postNote({ method: 'createSession', sessionId, cwd: null });
+		if (opts.modelId) postNote({ method: 'setModel', sessionId, id: opts.modelId });
+		if (opts.text || opts.images?.length) {
+			postNote({
+				method: 'submit',
+				sessionId,
+				text: opts.text ?? '',
+				images: opts.images ?? [],
+				clientId: null,
+			});
+		}
+	},
+	listThreads(): void {
+		postRequest({ method: 'listThreads' });
+	},
+	listCommands(): void {
+		postRequest({ method: 'listCommands' });
+	},
+	archiveThread(sessionId: string, archived: boolean): void {
+		postNote({ method: 'archiveThread', sessionId, archived });
+	},
+	pinThread(sessionId: string, pinned: boolean): void {
+		postNote({ method: 'pinThread', sessionId, pinned });
+	},
+	openThread(sessionId: string): void {
+		if (isVscodeHost()) {
+			postVerb({ kind: 'open_thread', sessionId });
+			return;
+		}
+		// Browser: the server replays history via notifications on
+		// `OpenSession`; switch the view optimistically (the store's
+		// `SessionCreated` fold confirms it) and let `ThreadHistory` settle.
+		storeOpenRemote?.(sessionId);
+		postRequest({ method: 'openSession', sessionId });
+	},
+	/** Clear the focused thread (leaving the conversation view) so turns that
+	 * finish afterwards mark it unread. */
+	blurThread(): void {
+		postNote({ method: 'focusThread', sessionId: null });
+	},
 };
+
+/** Re-export for component ergonomics (the host capability set the webview
+ * declares). */
+export type { HookKind };
