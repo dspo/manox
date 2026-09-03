@@ -201,6 +201,16 @@ pub(crate) fn sessions_dir() -> PathBuf {
 /// Open the session directory, seed the summary list, and register the
 /// process-global handle. Call at App startup.
 pub fn init() {
+    // Pre-rename installs keep their transcripts under `~/.manox/pi-sessions`;
+    // move them into `sessions/` before the first scan so pre-rename history
+    // shows up in the sidebar.
+    let migrated = crate::paths::migrate_legacy_sessions_dir();
+    if migrated > 0 {
+        tracing::info!(
+            entries = migrated,
+            "migrated legacy pi-sessions into sessions"
+        );
+    }
     let dir = sessions_dir();
     let db_path = crate::db::default_db_path().expect("Failed to resolve threads.db path");
     let db = Arc::new(
