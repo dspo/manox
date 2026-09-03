@@ -1141,20 +1141,24 @@ impl Workspace {
     /// session asynchronously, then asks the workspace to re-render once the
     /// restored history lands.
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
-        let messages: Vec<manox_agent::Message> = self
+        // Derive everything the rebuild needs (message count + sub-agent rows)
+        // inside one store read — cloning the full transcript here would copy
+        // the whole thread on the main thread for every rebuild.
+        let (messages_len, subagent_rows) = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.messages.clone())
+            .map(|s| {
+                let msgs = &s.read(cx).store.messages;
+                (
+                    msgs.len(),
+                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
+                )
+            })
             .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .and_then(|s| {
-                serde_json::from_value::<Vec<manox_agent::db::HistoryEntry>>(
-                    s.read(cx).store.display_history.clone(),
-                )
-                .ok()
-            })
+            .map(|s| s.read(cx).store.display_entries.clone())
             .expect("foreground store present");
         let usage = self
             .store
@@ -1208,14 +1212,14 @@ impl Workspace {
         self.list_count = count;
         // The authoritative list is fully rendered now; future preview
         // batches append from here.
-        self.history_rendered = messages.len();
+        self.history_rendered = messages_len;
         // `Tail` natively pins to the end and keeps following; an upward user
         // scroll disengages it and landing back at the bottom re-arms it.
         self.list_state.set_follow_mode(FollowMode::Tail);
         // Recover the settled sub-agent observation rows alongside the
         // conversation: a restored transcript is the only record of runs that
         // finished (or were killed) before the restart / switch.
-        self.rebuild_subagent_observation(&messages, cx);
+        self.apply_subagent_rows(subagent_rows, cx);
         cx.notify();
     }
 
@@ -1362,13 +1366,20 @@ impl Workspace {
                         .expect("foreground store present")
                         .is_loading()
                     {
-                        let messages: Vec<manox_agent::Message> = this
+                        let messages_len = this
                             .store
                             .as_ref()
-                            .map(|s| s.read(cx).store.messages.clone())
+                            .map(|s| s.read(cx).store.messages.len())
                             .expect("foreground store present");
-                        if messages.len() > this.history_rendered {
-                            let new_messages = messages[this.history_rendered..].to_vec();
+                        if messages_len > this.history_rendered {
+                            // Clone only the not-yet-rendered tail instead of
+                            // the whole transcript on every preview batch.
+                            let from = this.history_rendered;
+                            let new_messages: Vec<manox_agent::Message> = this
+                                .store
+                                .as_ref()
+                                .map(|s| s.read(cx).store.messages[from..].to_vec())
+                                .expect("foreground store present");
                             let usage = this
                                 .store
                                 .as_ref()
@@ -1403,7 +1414,7 @@ impl Workspace {
                                     cx,
                                 )
                             });
-                            this.history_rendered = messages.len();
+                            this.history_rendered = messages_len;
                             this.apply_list_outcome(outcome, cx);
                         }
                     }
@@ -3860,20 +3871,25 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.id.0.clone())
             .expect("foreground store present");
-        let messages: Vec<manox_agent::Message> = self
+        // Derive the message count, the transcript's plan, and the sub-agent
+        // rows inside one store read — cloning the full transcript here would
+        // copy the whole thread on the main thread on every switch.
+        let (messages_len, plan_from_messages, subagent_rows) = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.messages.clone())
+            .map(|s| {
+                let msgs = &s.read(cx).store.messages;
+                (
+                    msgs.len(),
+                    manox_agent::plan::rebuild_from_messages(msgs),
+                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
+                )
+            })
             .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .and_then(|s| {
-                serde_json::from_value::<Vec<manox_agent::db::HistoryEntry>>(
-                    s.read(cx).store.display_history.clone(),
-                )
-                .ok()
-            })
+            .map(|s| s.read(cx).store.display_entries.clone())
             .expect("foreground store present");
         let usage = self
             .store
@@ -3972,7 +3988,7 @@ impl Workspace {
         self.list_count = count;
         // All of the thread's current messages are rendered (a restoring
         // thread has none yet — the preview batches append from here).
-        self.history_rendered = messages.len();
+        self.history_rendered = messages_len;
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
         self.pending_auth = None;
@@ -4007,7 +4023,7 @@ impl Workspace {
         // calls, falling back to the independent sidecar snapshot (the facade
         // mirrors the persisted copy on every `PlanUpdated` / `Ready`).
         let new_thread_for_rail = self.thread.clone();
-        let restored_plan = manox_agent::plan::rebuild_from_messages(&messages).or_else(|| {
+        let restored_plan = plan_from_messages.or_else(|| {
             self.store
                 .as_ref()
                 .and_then(|s| s.read(cx).store.persisted_plan.as_ref())
@@ -4030,7 +4046,7 @@ impl Workspace {
         // Recover the settled sub-agent observation rows for the incoming
         // thread after the rail reset above (a restoring thread has no
         // messages yet — its rows land with the `HistoryRestored` rebuild).
-        self.rebuild_subagent_observation(&messages, cx);
+        self.apply_subagent_rows(subagent_rows, cx);
         // If the new thread has pending interactions (e.g. it was parked
         // waiting for a user answer), re-surface them so the question card
         // appears immediately upon switching back.
@@ -5689,12 +5705,14 @@ impl Workspace {
     /// `SubagentProgress` events, which die with the process; this recovers
     /// the settled rows after a restart or a thread switch-back so the rail
     /// and panels are not left empty. Idempotent: rows upsert by address.
-    fn rebuild_subagent_observation(
+    /// Takes precomputed rows (derived inside the store-read closure) so the
+    /// callers never clone the full transcript just for this scan.
+    fn apply_subagent_rows(
         &mut self,
-        messages: &[manox_agent::Message],
+        rows: Vec<manox_agent::subagent_restore::RestoredSubagent>,
         cx: &mut Context<Self>,
     ) {
-        for row in manox_agent::subagent_restore::rebuild_from_messages(messages) {
+        for row in rows {
             let first_line = manox_agent::steer_bus::first_line(&row.prompt);
             self.subagent_prompts.insert(
                 row.address.clone(),
