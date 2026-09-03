@@ -2478,10 +2478,14 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { .. } }),
-        );
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            )
+        });
 
         // Now switch the working directory. The project header must stay at
         // the create-time cwd; only the engine's cwd advances.
