@@ -15,7 +15,10 @@ use serde_json::Value;
 pub struct ClientStore {
     pub id: ThreadId,
     pub messages: Vec<Message>,
-    pub display_history: Value,
+    /// The `ThreadHistory` display payload parsed once at fold time; consumers
+    /// clone the typed entries instead of re-parsing the raw `JsonValue` on
+    /// every conversation rebuild (hot path for large transcripts).
+    pub display_entries: Vec<manox_agent::db::HistoryEntry>,
     pub display_title: String,
     pub model_id: Option<String>,
     pub model_name: Option<String>,
@@ -59,7 +62,7 @@ impl Default for ClientStore {
         Self {
             id: ThreadId::default(),
             messages: Vec::new(),
-            display_history: Value::Array(Vec::new()),
+            display_entries: Vec::new(),
             display_title: String::new(),
             model_id: None,
             model_name: None,
@@ -123,7 +126,18 @@ impl ClientStore {
                         tracing::warn!(error = %e, "ThreadHistory parse failed; keeping stale messages")
                     }
                 }
-                self.display_history = display_history.clone();
+                // Parse the display payload once here (fold time) instead of
+                // on every conversation rebuild; a parse failure keeps the
+                // previous entries rather than blanking the thread.
+                match serde_json::from_value::<Vec<manox_agent::db::HistoryEntry>>(
+                    display_history.clone(),
+                ) {
+                    Ok(entries) => self.display_entries = entries,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "ThreadHistory display parse failed; keeping stale entries"
+                    ),
+                }
             }
             ServerNote::TurnStarted { .. } => self.running = true,
             ServerNote::TurnFinished { .. } => self.running = false,
