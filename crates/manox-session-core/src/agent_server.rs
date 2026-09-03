@@ -428,6 +428,20 @@ impl AgentServerInner {
         );
     }
 
+    /// Re-send the current `ThreadInfo` snapshot to the session's owners —
+    /// history untouched. The composer chips (model / project / effort /
+    /// permission mode) mirror `ThreadInfoPayload`, so a mutation that no
+    /// other note refreshes must republish the header (idempotent).
+    fn emit_thread_info(&self, thread: &ThreadHandle, session_id: &str) {
+        self.route_note(
+            session_id,
+            ServerNote::ThreadInfo {
+                session_id: session_id.into(),
+                info: Box::new(self.build_thread_info_payload(thread, session_id)),
+            },
+        );
+    }
+
     /// Gather every `ThreadInfoPayload` field in a single read closure (no
     /// re-entrant locking of the handle).
     fn build_thread_info_payload(
@@ -1049,7 +1063,10 @@ impl AgentServerInner {
         };
         let registry = manox_agent::provider_glue::global();
         match manox_harness::model_ref::resolve_model_ref(&registry, id) {
-            Some(model) => thread.with_mut(|t| t.set_model(model)),
+            Some(model) => {
+                thread.with_mut(|t| t.set_model(model));
+                self.emit_thread_info(&thread, session_id);
+            }
             None => self.note_error(session_id, "unknown model"),
         }
     }
@@ -1067,15 +1084,22 @@ impl AgentServerInner {
             }
         };
         thread.with_mut(|t| t.set_reasoning_effort(effort));
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_approval_mode(&self, session_id: &str, mode: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        let mode = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
-            .unwrap_or_default();
+        // Parse strictly: an unparseable mode must not settle on the default —
+        // the ThreadInfo re-publish below would make that a visible chip
+        // bounce-back instead of a silent no-op.
+        let Ok(mode) = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
+        else {
+            return self.note_error(session_id, &format!("unknown approval mode: {mode}"));
+        };
         thread.with_mut(|t| t.set_permission_mode(mode));
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) {
@@ -1095,6 +1119,7 @@ impl AgentServerInner {
             t.set_project(cwd.into());
             t.set_cwd(cwd.into());
         });
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
@@ -1836,6 +1861,7 @@ mod tests {
     struct FakeEngine {
         runs: StdMutex<Vec<String>>,
         steer_calls: StdMutex<Vec<String>>,
+        cwds: StdMutex<Vec<PathBuf>>,
         notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
         auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
         pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
@@ -1851,6 +1877,7 @@ mod tests {
                 Arc::new(Self {
                     runs: StdMutex::new(Vec::new()),
                     steer_calls: StdMutex::new(Vec::new()),
+                    cwds: StdMutex::new(Vec::new()),
                     notices,
                     auth_responses: StdMutex::new(Vec::new()),
                     pending_auth: StdMutex::new(Vec::new()),
@@ -1888,7 +1915,9 @@ mod tests {
         fn set_thinking_level(&self, _: Option<String>) {}
         fn open_session(&self, _: PathBuf) {}
         fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}
-        fn set_cwd(&self, _path: std::path::PathBuf) {}
+        fn set_cwd(&self, path: std::path::PathBuf) {
+            self.cwds.lock().unwrap().push(path);
+        }
 
         fn active_session_path(&self) -> Option<PathBuf> {
             None
@@ -2031,6 +2060,49 @@ mod tests {
                 return *info;
             }
         }
+    }
+
+    /// Await the one-shot provider-registration background build so a
+    /// `register_test_model` below cannot be clobbered by its snapshot swap
+    /// (the swap lands exactly once per process).
+    fn await_provider_registry() {
+        manox_agent::runtime::handle().block_on(manox_agent::provider_glue::wait_ready());
+    }
+
+    /// Register an Anthropic-shaped endpoint exposing model `id` into the
+    /// process-wide provider registry. Append-only: the registry exposes no
+    /// deregister/reload hook, so later tests in this binary see these models
+    /// (and their first-sorted default) — keep registrations to tests that
+    /// assert model values, and never rely on the registry being empty.
+    fn register_test_model(id: &str) {
+        use manox_harness::provider_registry::{
+            Api, Cost, InputModality, ProviderConfig, ProviderModelConfig,
+        };
+        manox_agent::provider_glue::global()
+            .register_provider(
+                &format!("test-{id}"),
+                ProviderConfig {
+                    name: Some("Test".into()),
+                    base_url: Some("https://test.example".into()),
+                    api_key: Some("k".into()),
+                    api: Some(Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![ProviderModelConfig {
+                        id: id.into(),
+                        name: id.into(),
+                        reasoning: false,
+                        input: vec![InputModality::Text],
+                        context_window: 1000,
+                        max_tokens: 100,
+                        cost: Cost::default(),
+                        api: None,
+                        base_url: None,
+                        metadata: HashMap::new(),
+                    }],
+                },
+            )
+            .unwrap();
     }
 
     #[test]
@@ -2289,8 +2361,19 @@ mod tests {
         let _g = lock_globals();
         hermetic_home();
         init_globals();
+        await_provider_registry();
+        // Two resolvable models so the SetModel step is a real switch, not a
+        // no-op. `alpha-model` sorts first, so it is the default model
+        // `create_session` picks at spawn time (empty hermetic HOME otherwise
+        // has no default at all); the SetModel target is `beta-model`.
+        register_test_model("alpha-model");
+        register_test_model("beta-model");
         let (server, client) = harness(vec![]);
         create(&server, &client, "s1");
+        // A no-op engine so the SetCwd project binding never materializes a
+        // real pi engine actor (same pattern as the submit tests).
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
         // ThreadInfo carries the typed payload with all 22 fields populated.
         client.send(FromClient::Request {
             id: MsgId::new("ti"),
@@ -2316,6 +2399,127 @@ mod tests {
         assert_eq!(info.self_author, "lead");
         assert!(!info.running);
         assert!(!info.plan_mode);
+        // `create_session` seeds the default: the hermetic HOME has no settings
+        // `default_model` reference, so `default_model()` resolves to the
+        // first-sorted registered model — `alpha-model`.
+        assert_eq!(
+            info.model_id.as_deref(),
+            Some("alpha-model"),
+            "create-time default model should be the first-sorted registered model"
+        );
+
+        // Composer-chip regression: a mutation re-publishes the ThreadInfo
+        // mirror unprompted (no query) — the narrow `CurrentModel`-style
+        // notes never refresh the chip-read typed fields. Drain to the next
+        // pushed ThreadInfo note.
+        let pushed_thread_info = || -> ThreadInfoPayload {
+            loop {
+                if let FromServer::Notification {
+                    note: ServerNote::ThreadInfo { info, .. },
+                } = client.recv()
+                {
+                    return *info;
+                }
+            }
+        };
+        client.send(FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: "s1".into(),
+                id: "beta-model".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(
+            info.model_id.as_deref(),
+            Some("beta-model"),
+            "SetModel to a different model must re-publish a ThreadInfo carrying it"
+        );
+        assert!(
+            info.model.is_some(),
+            "chip reads the typed model, not just model_id/name"
+        );
+        client.send(FromClient::Notification {
+            note: ClientNote::SetCwd {
+                session_id: "s1".into(),
+                cwd: "/proj".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(info.cwd, "/proj");
+        assert_eq!(info.project.as_deref(), Some("/proj"));
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// A conversation's project never re-binds: once the thread has interacted,
+    /// `SetCwd` moves only the engine's working directory, leaving the bound
+    /// project and the header cwd untouched — but the mutation still re-publishes
+    /// the ThreadInfo mirror (the chip must observe the sticky-cwd switch).
+    #[test]
+    fn set_cwd_after_interaction_moves_engine_not_project() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+
+        // Mark the thread as having interacted with a real submit turn. Stop
+        // at `TurnStarted` without settling: `Settled` re-reads the transcript
+        // through `engine.history()` — empty on the fake — which would wipe
+        // the user message and the interaction state the guard depends on.
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "s1".into(),
+                text: "hello".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::TurnStarted { .. }
+                }
+            )
+        });
+
+        // Now switch the working directory. The project header must stay at
+        // the create-time cwd; only the engine's cwd advances.
+        client.send(FromClient::Notification {
+            note: ClientNote::SetCwd {
+                session_id: "s1".into(),
+                cwd: "/moved".into(),
+            },
+        });
+        // Drain to the mutation's ThreadInfo re-publish (unprompted).
+        let pushed = loop {
+            if let FromServer::Notification {
+                note: ServerNote::ThreadInfo { info, .. },
+            } = client.recv()
+            {
+                break *info;
+            }
+        };
+        assert_eq!(
+            pushed.project.as_deref(),
+            None,
+            "an interacted thread's project never re-binds via SetCwd"
+        );
+        assert!(pushed.has_interacted);
+        assert_eq!(pushed.cwd, "/", "header cwd is untouched by SetCwd");
+        assert!(
+            engine
+                .cwds
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == std::path::Path::new("/moved")),
+            "the working-directory switch must reach the engine"
+        );
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
