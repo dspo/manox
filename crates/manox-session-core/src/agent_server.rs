@@ -3281,4 +3281,125 @@ mod tests {
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
     }
+
+    // ── T-D regression: one connection multiplexing many sessions; the
+    //    Detach/Open semantics that make idle-switch leak-free. ─────────────
+
+    /// One client owns two sessions on the shared connection; both
+    /// `SessionCreated` arrive on it and the server lists the client as the
+    /// sole owner of each — the ownership table the multiplexer demuxes on.
+    #[test]
+    fn single_connection_multiplexes_multiple_sessions() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "sa");
+        create(&server, &client, "sb");
+        assert_eq!(server.0.owners("sa"), vec!["test".to_string()]);
+        assert_eq!(server.0.owners("sb"), vec!["test".to_string()]);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// `DetachSession` releases the server-side owner without killing the
+    /// client; the detaching client is told `SessionDisposed` and `owners()`
+    /// is empty afterwards — the pre-multiplex idle-switch leak is gone.
+    #[test]
+    fn detach_session_releases_owner_no_leak() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        assert_eq!(server.0.owners("s1"), vec!["test".to_string()]);
+        client.send(FromClient::Notification {
+            note: ClientNote::DetachSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionDisposed { session_id } } if session_id == "s1"),
+        );
+        assert!(
+            server.0.owners("s1").is_empty(),
+            "DetachSession must release the owner"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// Reopening a detached session is idempotent: the persisted thread
+    /// survives detach (only the in-memory owner is dropped), so a later
+    /// `OpenSession` re-adds the owner and replays `SessionCreated` +
+    /// `ThreadHistory { restored: true }`.
+    #[test]
+    fn detach_then_reopen_replays_history() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s1", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        client.send(FromClient::Request {
+            id: MsgId::new("open"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        // Drain the first replay's history so the channel is clean.
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { .. }
+                }
+            )
+        });
+        // Detach drops the owner; the disk file survives.
+        client.send(FromClient::Notification {
+            note: ClientNote::DetachSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionDisposed { session_id } } if session_id == "s1"),
+        );
+        assert!(server.0.owners("s1").is_empty());
+        // Reopen: idempotent load from disk → re-added owner + history replay.
+        client.send(FromClient::Request {
+            id: MsgId::new("reopen"),
+            call: ClientCall::OpenSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
+        );
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::ThreadHistory { restored: true, .. }
+                }
+            )
+        });
+        assert_eq!(server.0.owners("s1"), vec!["test".to_string()]);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
 }
