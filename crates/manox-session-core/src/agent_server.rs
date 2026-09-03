@@ -428,6 +428,20 @@ impl AgentServerInner {
         );
     }
 
+    /// Re-send the current `ThreadInfo` snapshot to the session's owners —
+    /// history untouched. The composer chips (model / project / effort /
+    /// permission mode) mirror `ThreadInfoPayload`, so a mutation that no
+    /// other note refreshes must republish the header (idempotent).
+    fn emit_thread_info(&self, thread: &ThreadHandle, session_id: &str) {
+        self.route_note(
+            session_id,
+            ServerNote::ThreadInfo {
+                session_id: session_id.into(),
+                info: Box::new(self.build_thread_info_payload(thread, session_id)),
+            },
+        );
+    }
+
     /// Gather every `ThreadInfoPayload` field in a single read closure (no
     /// re-entrant locking of the handle).
     fn build_thread_info_payload(
@@ -1049,7 +1063,10 @@ impl AgentServerInner {
         };
         let registry = manox_agent::provider_glue::global();
         match manox_harness::model_ref::resolve_model_ref(&registry, id) {
-            Some(model) => thread.with_mut(|t| t.set_model(model)),
+            Some(model) => {
+                thread.with_mut(|t| t.set_model(model));
+                self.emit_thread_info(&thread, session_id);
+            }
             None => self.note_error(session_id, "unknown model"),
         }
     }
@@ -1067,6 +1084,7 @@ impl AgentServerInner {
             }
         };
         thread.with_mut(|t| t.set_reasoning_effort(effort));
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_approval_mode(&self, session_id: &str, mode: &str) {
@@ -1076,6 +1094,7 @@ impl AgentServerInner {
         let mode = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
             .unwrap_or_default();
         thread.with_mut(|t| t.set_permission_mode(mode));
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) {
@@ -1095,6 +1114,7 @@ impl AgentServerInner {
             t.set_project(cwd.into());
             t.set_cwd(cwd.into());
         });
+        self.emit_thread_info(&thread, session_id);
     }
 
     fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
@@ -2033,6 +2053,46 @@ mod tests {
         }
     }
 
+    /// Await the one-shot provider-registration background build so a
+    /// `register_test_model` below cannot be clobbered by its snapshot swap
+    /// (the swap lands exactly once per process).
+    fn await_provider_registry() {
+        manox_agent::runtime::handle().block_on(manox_agent::provider_glue::wait_ready());
+    }
+
+    /// Register an Anthropic-shaped endpoint exposing model `id` into the
+    /// process-wide provider registry.
+    fn register_test_model(id: &str) {
+        use manox_harness::provider_registry::{
+            Api, Cost, InputModality, ProviderConfig, ProviderModelConfig,
+        };
+        manox_agent::provider_glue::global()
+            .register_provider(
+                &format!("test-{id}"),
+                ProviderConfig {
+                    name: Some("Test".into()),
+                    base_url: Some("https://test.example".into()),
+                    api_key: Some("k".into()),
+                    api: Some(Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: false,
+                    models: vec![ProviderModelConfig {
+                        id: id.into(),
+                        name: id.into(),
+                        reasoning: false,
+                        input: vec![InputModality::Text],
+                        context_window: 1000,
+                        max_tokens: 100,
+                        cost: Cost::default(),
+                        api: None,
+                        base_url: None,
+                        metadata: HashMap::new(),
+                    }],
+                },
+            )
+            .unwrap();
+    }
+
     #[test]
     fn handshake_registers_client_and_sends_ready() {
         let _g = lock_globals();
@@ -2289,8 +2349,16 @@ mod tests {
         let _g = lock_globals();
         hermetic_home();
         init_globals();
+        await_provider_registry();
+        // A resolvable model for the SetModel step; the default model picked
+        // at create time never equals it.
+        register_test_model("beta-model");
         let (server, client) = harness(vec![]);
         create(&server, &client, "s1");
+        // A no-op engine so the SetCwd project binding never materializes a
+        // real pi engine actor (same pattern as the submit tests).
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
         // ThreadInfo carries the typed payload with all 22 fields populated.
         client.send(FromClient::Request {
             id: MsgId::new("ti"),
@@ -2316,6 +2384,42 @@ mod tests {
         assert_eq!(info.self_author, "lead");
         assert!(!info.running);
         assert!(!info.plan_mode);
+
+        // Composer-chip regression: a mutation re-publishes the ThreadInfo
+        // mirror unprompted (no query) — the narrow `CurrentModel`-style
+        // notes never refresh the chip-read typed fields. Drain to the next
+        // pushed ThreadInfo note.
+        let pushed_thread_info = || -> ThreadInfoPayload {
+            loop {
+                if let FromServer::Notification {
+                    note: ServerNote::ThreadInfo { info, .. },
+                } = client.recv()
+                {
+                    return *info;
+                }
+            }
+        };
+        client.send(FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: "s1".into(),
+                id: "beta-model".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(info.model_id.as_deref(), Some("beta-model"));
+        assert!(
+            info.model.is_some(),
+            "chip reads the typed model, not just model_id/name"
+        );
+        client.send(FromClient::Notification {
+            note: ClientNote::SetCwd {
+                session_id: "s1".into(),
+                cwd: "/proj".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(info.cwd, "/proj");
+        assert_eq!(info.project.as_deref(), Some("/proj"));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
