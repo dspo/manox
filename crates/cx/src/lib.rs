@@ -1596,7 +1596,11 @@ fn run_send(session: Option<String>, clear_buffer: bool, text: Option<String>) -
 fn run_web(_port: Option<u16>, no_open: bool) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("failed to build web runtime")?;
     rt.block_on(async move {
-        manox_agent::runtime::init();
+        // Full agent boot (PATH, runtime, i18n, providers, MCP, ThreadStore,
+        // skill/command/hook registries) — `runtime::init()` alone leaves the
+        // ThreadStore uninitialized, so the first `listThreads`/`listModels`
+        // would panic. Mirrors the napi/VS Code startup path.
+        manox_agent::init();
         manox_webui::spawn_server();
         manox_webui::start_server();
 
