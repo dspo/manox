@@ -1,116 +1,65 @@
-//! gpui wrapper around `ClientStore` that pumps `FromServer` messages from an
-//! `RpcConnection` into the store. γ-1b: the Entity wrapper + pump; γ-2 wires
-//! the views read from this.
+//! Per-session gpui leaf over a [`ClientStore`]. T-D: the handle no longer
+//! owns a connection or pump — it is a pure leaf (store + emitter) fed by the
+//! app-level [`crate::multiplexer::SessionMultiplexer`], which demuxes the
+//! single shared connection by `session_id` and calls
+//! [`ClientStoreHandle::apply_from_server`].
 
-use gpui::{Context, EventEmitter, Task};
+use gpui::{Context, EventEmitter};
 use manox_agent::ThreadEvent;
-use manox_protocol::{FromServer, RpcConnection};
+use manox_protocol::FromServer;
 
 use crate::client_store::ClientStore;
 use crate::server_note_translate::{server_call_to_thread_event, server_note_to_thread_event};
 
-/// A gpui entity that owns a `ClientStore` and a background pump. The pump
-/// reads `FromServer` messages from the connection's server channel, applies
-/// each `ServerNote` to the store, re-emits the note as the `ThreadEvent` the
-/// workspace's conversation layer consumes, and calls `cx.notify()`.
+/// A gpui entity that owns a single session's `ClientStore` and re-emits
+/// `ServerNote`s / `ServerCall`s as the `ThreadEvent`s the workspace's
+/// conversation layer consumes. The multiplexer is the sole writer.
 pub struct ClientStoreHandle {
     pub store: ClientStore,
-    _pump: Task<()>,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
 
 impl ClientStoreHandle {
-    /// Create a handle that pumps `FromServer` messages into the store and
-    /// re-emits them as `ThreadEvent`s.
-    pub fn new(client: manox_protocol::InProcessConnection, cx: &mut Context<Self>) -> Self {
-        let server_rx = client.server_rx();
-        let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            while let Ok(msg) = server_rx.recv().await {
-                match msg {
-                    FromServer::Notification { note } => {
-                        let _ = this.update(cx, |h, cx| {
-                            h.store.apply_server_note(&note);
-                            if let Some(ev) = server_note_to_thread_event(&note) {
-                                cx.emit(ev);
-                            }
-                            cx.notify();
-                        });
-                    }
-                    FromServer::Request { id, call } => {
-                        let _ = this.update(cx, |h, cx| {
-                            if let Some(auth_id) = auth_id_of(&call) {
-                                h.store.pending_auth.insert(auth_id, id.clone());
-                                cx.notify();
-                            }
-                            if let Some(plan_file) = plan_file_of(&call) {
-                                h.store.pending_plan_verdict.insert(plan_file, id.clone());
-                                cx.notify();
-                            }
-                            if let Some(ev) = server_call_to_thread_event(&call) {
-                                cx.emit(ev);
-                            }
-                        });
-                    }
-                    FromServer::Response { .. } => {}
-                }
-            }
-        });
+    /// A fresh leaf for `session_id`. The store's `id` is set when the
+    /// `SessionCreated` note (routed by the multiplexer) lands.
+    pub fn leaf(_session_id: &str, _cx: &mut Context<Self>) -> Self {
         Self {
             store: ClientStore::default(),
-            _pump,
         }
     }
 
-    /// Create a handle wired to a live `AgentServer` session: the server
-    /// accepts the in-process connection and the client immediately declares
-    /// itself (handshake + session creation), so the pump starts mirroring
-    /// `ServerNote`s for `session_id`. The desktop's transitional read path —
-    /// Create a handle wired to a live `AgentServer` session. `reopen` picks
-    /// the binding: `false` declares a fresh thread (`CreateSession`), `true`
-    /// reopens an existing one (`OpenSession` — idempotent: a live session
-    /// replays its snapshots, a persisted one loads from disk; the history
-    /// arrives via `ServerNote`s, so the Request response is ignored).
-    pub fn for_session(
-        server: &manox_session_core::agent_server::AgentServer,
-        session_id: &str,
-        cwd: &str,
-        reopen: bool,
-        cx: &mut Context<Self>,
-    ) -> (Self, manox_protocol::InProcessConnection) {
-        use manox_protocol::*;
-        let (client_conn, server_conn) = in_process_pair();
-        server.accept(std::sync::Arc::new(server_conn));
-        client_conn.send_to_server(FromClient::Request {
-            id: MsgId::new("init"),
-            call: ClientCall::Initialize(Initialize {
-                client_id: format!("desktop-{session_id}"),
-                capabilities: vec![
-                    handshake::HookKind::Approve,
-                    handshake::HookKind::PlanVerdict,
-                    handshake::HookKind::AskUserQuestion,
-                ],
-                sessions: vec![],
-            }),
-        });
-        if reopen {
-            client_conn.send_to_server(FromClient::Request {
-                id: MsgId::new("open"),
-                call: ClientCall::OpenSession {
-                    session_id: session_id.into(),
-                },
-            });
-        } else {
-            client_conn.send_to_server(FromClient::Notification {
-                note: ClientNote::CreateSession {
-                    session_id: session_id.into(),
-                    cwd: Some(cwd.into()),
-                },
-            });
+    /// Apply one routed `FromServer` frame: fold the `ServerNote` into the
+    /// store (and re-emit a `ThreadEvent`), or record a `ServerCall`'s
+    /// `MsgId` against its `auth_id` / `plan_file` for the reply path.
+    /// `Response` frames are ignored — readiness derives from
+    /// `SessionCreated` / `ThreadHistory` push delivery.
+    pub fn apply_from_server(&mut self, msg: FromServer, cx: &mut Context<Self>) {
+        match msg {
+            FromServer::Notification { note } => {
+                self.store.apply_server_note(&note);
+                if let Some(ev) = server_note_to_thread_event(&note) {
+                    cx.emit(ev);
+                }
+                cx.notify();
+            }
+            FromServer::Request { id, call } => {
+                if let Some(auth_id) = auth_id_of(&call) {
+                    self.store.pending_auth.insert(auth_id, id.clone());
+                    cx.notify();
+                }
+                if let Some(plan_file) = plan_file_of(&call) {
+                    self.store
+                        .pending_plan_verdict
+                        .insert(plan_file, id.clone());
+                    cx.notify();
+                }
+                if let Some(ev) = server_call_to_thread_event(&call) {
+                    cx.emit(ev);
+                }
+            }
+            FromServer::Response { .. } => {}
         }
-        let sender = client_conn.clone();
-        let handle = Self::new(client_conn, cx);
-        (handle, sender)
     }
 }
 
@@ -118,27 +67,46 @@ impl ClientStoreHandle {
 mod tests {
     use super::*;
     use gpui::{AppContext as _, TestAppContext};
-    use manox_protocol::{ServerNote, in_process_pair};
+    use manox_protocol::{RpcConnection as _, ServerNote, in_process_pair};
+    use manox_session_core::agent_client::AgentClient;
+    use std::sync::Arc;
+
+    use crate::multiplexer::SessionMultiplexer;
+
+    /// A multiplexer backed by a raw connection pair so a test can inject
+    /// `FromServer` frames from the server side without a live AgentServer.
+    fn test_mux(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<SessionMultiplexer>,
+        manox_protocol::InProcessConnection,
+    ) {
+        let (client_conn, server_conn) = in_process_pair();
+        let client = Arc::new(AgentClient::from_conn(client_conn));
+        let mux = cx.new(|cx| SessionMultiplexer::with_client(client, cx));
+        (mux, server_conn)
+    }
 
     #[gpui::test]
     async fn pump_feeds_server_note_to_store(cx: &mut TestAppContext) {
-        let (client_conn, server_conn) = in_process_pair();
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
         server_conn.send_to_client(FromServer::Notification {
             note: ServerNote::TurnStarted {
                 session_id: "s1".into(),
             },
         });
-        let entity = cx.new(|cx| ClientStoreHandle::new(client_conn, cx));
         cx.run_until_parked();
         assert!(
-            entity.update(cx, |h, _| h.store.running),
-            "the pump should have applied TurnStarted → running=true"
+            handle.update(cx, |h, _| h.store.running),
+            "the multiplexer should route TurnStarted → running=true"
         );
     }
 
     #[gpui::test]
     async fn pump_applies_thread_info(cx: &mut TestAppContext) {
-        let (client_conn, server_conn) = in_process_pair();
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
         let info = manox_protocol::server::ThreadInfoPayload {
             cwd: "/proj".into(),
             project: None,
@@ -169,14 +137,13 @@ mod tests {
                 info: std::boxed::Box::new(info),
             },
         });
-        let entity = cx.new(|cx| ClientStoreHandle::new(client_conn, cx));
         cx.run_until_parked();
         assert_eq!(
-            entity.update(cx, |h, _| h.store.display_title.clone()),
+            handle.update(cx, |h, _| h.store.display_title.clone()),
             "Test"
         );
-        assert_eq!(entity.update(cx, |h, _| h.store.cwd.clone()), "/proj");
-        assert!(!entity.update(cx, |h, _| h.store.running));
+        assert_eq!(handle.update(cx, |h, _| h.store.cwd.clone()), "/proj");
+        assert!(!handle.update(cx, |h, _| h.store.running));
     }
 }
 

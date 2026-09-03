@@ -85,7 +85,6 @@ use crate::{
     ToggleTurnNavigator,
 };
 use crate::{FocusConversation, OpenSettings};
-use manox_protocol::RpcConnection;
 use manox_terminal::Terminal;
 use terminal_ui::TerminalView;
 use terminal_ui::terminal_proxy::TerminalProxy;
@@ -326,6 +325,15 @@ pub struct Workspace {
     /// the workspace for the next wiring step (re-handling the store on
     /// thread switch) — written at landing, read there.
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
+    /// T-D: the shared single-connection multiplexer. One app-level
+    /// `AgentClient` (client_id "desktop") carries every session; the
+    /// per-session handles are leaves fed by its demux pump. The legacy
+    /// `client_conn` field below is retained as `None` and removed in a
+    /// follow-up slice.
+    pub(crate) multiplexer: gpui::Entity<crate::multiplexer::SessionMultiplexer>,
+    /// T-D: the shared app-level client used by the fire-and-forget
+    /// `send_note` and `Reply` verdict paths (no per-session connection).
+    pub(crate) client: std::sync::Arc<manox_session_core::agent_client::AgentClient>,
     /// γ-3: the client-side connection for sending `FromClient` commands to the
     /// AgentServer. None until the landing
     /// thread wires it.
@@ -334,8 +342,9 @@ pub struct Workspace {
     /// `session_id` field in `FromClient` commands.
     pub(crate) session_id: Option<String>,
     /// The shared AgentServer every foreground/background session connects
-    /// to. Created at landing; `attach_thread` opens per-thread sessions on
-    /// it via `ClientStoreHandle::for_session`.
+    /// to. Created at landing and handed to the `SessionMultiplexer`; retained
+    /// on the workspace for the follow-up slices that still reference it.
+    #[allow(dead_code)]
     pub(crate) agent_server: std::sync::Arc<manox_session_core::agent_server::AgentServer>,
     /// Threads that were running when the user switched away. Holding strong
     /// references keeps their `run_turn_loop` tasks alive so they can finish
@@ -775,30 +784,24 @@ impl Workspace {
         let landing_id = uuid::Uuid::new_v4().to_string();
         let thread =
             Thread::landing_with_id(manox_agent::ThreadId(landing_id.clone()), cwd.clone());
-        let (store, client_conn, session_id) = {
+        let client = std::sync::Arc::new(manox_session_core::agent_client::AgentClient::connect(
+            &agent_server,
+            "desktop",
+            vec![
+                manox_protocol::handshake::HookKind::Approve,
+                manox_protocol::handshake::HookKind::PlanVerdict,
+                manox_protocol::handshake::HookKind::AskUserQuestion,
+            ],
+            vec![],
+        ));
+        let multiplexer =
+            cx.new(|cx| crate::multiplexer::SessionMultiplexer::with_client(client.clone(), cx));
+        let (store, session_id) = {
             let session_id = landing_id.clone();
-            let (client_conn, server_conn) = manox_protocol::in_process_pair();
-            agent_server.accept(std::sync::Arc::new(server_conn));
-            client_conn.send_to_server(manox_protocol::FromClient::Request {
-                id: manox_protocol::MsgId::new("init"),
-                call: manox_protocol::ClientCall::Initialize(manox_protocol::Initialize {
-                    client_id: format!("desktop-{session_id}"),
-                    capabilities: vec![
-                        manox_protocol::handshake::HookKind::Approve,
-                        manox_protocol::handshake::HookKind::PlanVerdict,
-                        manox_protocol::handshake::HookKind::AskUserQuestion,
-                    ],
-                    sessions: vec![],
-                }),
+            let store = multiplexer.update(cx, |m, cx| {
+                m.open_or_create(&session_id, cwd.to_str().unwrap_or_default(), false, cx)
             });
-            client_conn.send_to_server(manox_protocol::FromClient::Notification {
-                note: manox_protocol::ClientNote::CreateSession {
-                    session_id: session_id.clone(),
-                    cwd: Some(cwd.to_str().unwrap_or_default().into()),
-                },
-            });
-            let store = cx.new(|cx| ClientStoreHandle::new(client_conn.clone(), cx));
-            (store, client_conn, session_id)
+            (store, session_id)
         };
 
         let input_state = cx.new(|cx| {
@@ -834,7 +837,9 @@ impl Workspace {
             cwd,
             thread,
             store: Some(store),
-            client_conn: Some(client_conn),
+            multiplexer,
+            client,
+            client_conn: None,
             session_id: Some(session_id),
             agent_server,
             background_threads: Vec::new(),
@@ -3802,12 +3807,14 @@ impl Workspace {
                 _sub: sub,
             });
         } else if old_id != new_id {
-            // Idle switch: the outgoing session has nothing in flight. The
-            // in-process transport never detects connection drop, so owners
-            // are not automatically cleaned up. Owner removal happens via
-            // same-client-id reconnect replacement or
-            // explicit DetachSession; the thread persists in the db for a
-            // later `OpenSession`.
+            // Idle switch: the outgoing session has nothing in flight. Drop the
+            // local handle (the server-side owner still leaks until a later
+            // `DetachSession` — T-D slice ② wires that). Forgetting it from the
+            // multiplexer lets the leaf Entity drop, matching the pre-multiplex
+            // behavior where the handle and its connection were both released.
+            self.multiplexer.update(cx, |m, _| {
+                m.forget(&old_id);
+            });
             self.store = None;
             self.client_conn = None;
             self.session_id = None;
@@ -3827,24 +3834,20 @@ impl Workspace {
             self.session_id = bg.session_id;
         }
 
-        // A brand-new foreground thread gets its own session: `reopen` binds
-        // an existing thread via `OpenSession` (history arrives as
-        // `ServerNote`s), otherwise a fresh one via `CreateSession`.
+        // A brand-new foreground thread gets its own session on the shared
+        // connection: `reopen` binds an existing thread via `OpenSession`
+        // (history arrives as `ServerNote`s), otherwise a fresh one via
+        // `CreateSession`. The multiplexer registers the leaf handle before
+        // sending so the server's reply routes straight to it.
         if self.store.is_none() {
-            let server = self.agent_server.clone();
             let new_sid = new_id.clone();
             let cwd = thread_cwd(&new_thread, &None, cx)
                 .unwrap_or_default()
                 .to_string();
-            let mut conn_slot: Option<manox_protocol::InProcessConnection> = None;
-            let store = cx.new(|cx| {
-                let (handle, conn) =
-                    ClientStoreHandle::for_session(&server, &new_sid, &cwd, reopen, cx);
-                conn_slot = Some(conn);
-                handle
-            });
+            let store = self
+                .multiplexer
+                .update(cx, |m, cx| m.open_or_create(&new_sid, &cwd, reopen, cx));
             self.store = Some(store);
-            self.client_conn = conn_slot;
             self.session_id = Some(new_sid);
         }
 
@@ -5927,12 +5930,9 @@ impl Workspace {
             .store
             .as_ref()
             .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
-            && let Some(conn) = &self.client_conn
         {
-            conn.send_to_server(manox_protocol::FromClient::Reply {
-                id: msg_id,
-                outcome: Ok(serde_json::json!({ "allow": allow })),
-            });
+            self.client
+                .send_reply(msg_id, Ok(serde_json::json!({ "allow": allow })));
             return;
         }
         self.thread.with_mut(|thread| {
@@ -6117,15 +6117,14 @@ impl Workspace {
             .store
             .as_ref()
             .and_then(|s| s.read(cx).store.pending_auth.get(&id).cloned())
-            && let Some(conn) = &self.client_conn
         {
-            conn.send_to_server(manox_protocol::FromClient::Reply {
-                id: msg_id,
-                outcome: Ok(serde_json::json!({
+            self.client.send_reply(
+                msg_id,
+                Ok(serde_json::json!({
                     "answers": answers,
                     "response": response,
                 })),
-            });
+            );
             return;
         }
         self.thread.with_mut(|thread| {
@@ -6166,8 +6165,8 @@ impl Workspace {
         &self,
         note_fn: impl FnOnce(&str) -> manox_protocol::ClientNote,
     ) -> bool {
-        if let (Some(conn), Some(sid)) = (&self.client_conn, &self.session_id) {
-            conn.send_to_server(manox_protocol::FromClient::Notification { note: note_fn(sid) });
+        if let Some(sid) = &self.session_id {
+            self.client.send_note(note_fn(sid));
             true
         } else {
             false
@@ -6329,12 +6328,9 @@ impl Workspace {
                     .pending_plan_verdict
                     .get(&review.plan_file)
                     .cloned()
-            }) && let Some(conn) = &self.client_conn
-            {
-                conn.send_to_server(manox_protocol::FromClient::Reply {
-                    id: msg_id,
-                    outcome: Ok(serde_json::json!({ "choice": choice_str })),
-                });
+            }) {
+                self.client
+                    .send_reply(msg_id, Ok(serde_json::json!({ "choice": choice_str })));
             } else {
                 self.thread.with_mut(|thread| {
                     thread.approve_plan(compact, compact_instructions, seed_text, Some(ui));

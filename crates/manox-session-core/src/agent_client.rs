@@ -96,6 +96,18 @@ impl AgentClient {
     pub fn send_reply(&self, id: MsgId, outcome: Result<serde_json::Value, RpcError>) {
         self.conn.send_to_server(FromClient::Reply { id, outcome });
     }
+
+    /// Wrap a raw connection without a handshake — for tests that inject
+    /// `FromServer` frames from the server side and exercise the multiplexer
+    /// routing in isolation. Benign constructor (no side effects); exposed so
+    /// downstream test crates can reach it without a `test-support` feature
+    /// on this crate (which is deliberately kept out of the feature graph).
+    pub fn from_conn(conn: InProcessConnection) -> Self {
+        Self {
+            conn,
+            client_id: "test".into(),
+        }
+    }
 }
 
 #[cfg(test)]
