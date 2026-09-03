@@ -483,11 +483,6 @@ pub(crate) fn format_tokens_compact(n: u64) -> String {
 }
 
 pub fn run_stats(config: StatsOutputConfig) -> Result<()> {
-    // Pre-rename installs keep transcripts under `~/.manox/pi-sessions`; fold
-    // them into `sessions/` before scanning so `cx stats` matches the app's
-    // view. Idempotent no-op once migrated (or on fresh installs).
-    manox_agent::paths::migrate_legacy_sessions_dir();
-
     let today = date::today_date_string()?;
 
     let db_path = db::db_path()?;
