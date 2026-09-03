@@ -112,11 +112,10 @@ impl ClientStore {
                 display_history,
                 ..
             } => {
-                // `messages` is the typed `Vec<WireMessage>` (image bytes
-                // deflated to `byte_len`). The storage `Message` shape is
-                // serde-compatible (its `Image.data` is `#[serde(default)]`,
-                // and the extra `byte_len` is ignored), so round-trip through
-                // a Value to recover `Vec<Message>`.
+                // WireMessage deflates Image.data to byte_len; the storage
+                // Message ignores the extra byte_len (its Image.data is
+                // #[serde(default)]) and accepts the identical field names,
+                // so the typed payload round-trips into Vec<Message>.
                 let value = serde_json::to_value(messages).unwrap_or_default();
                 match serde_json::from_value::<Vec<Message>>(value) {
                     Ok(msgs) => self.messages = msgs,
