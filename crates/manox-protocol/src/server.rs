@@ -57,6 +57,21 @@ pub enum ServerCall {
     OpenExternal { session_id: String, url: String },
 }
 
+impl ServerCall {
+    /// Every adjudication / capability call is scoped to a session; a
+    /// multiplexed client routes the reply back along the same connection.
+    pub fn session_id(&self) -> &str {
+        match self {
+            ServerCall::Approve { session_id, .. }
+            | ServerCall::PlanVerdict { session_id, .. }
+            | ServerCall::AskUserQuestion { session_id, .. }
+            | ServerCall::BrowserOp { session_id, .. }
+            | ServerCall::ClipboardRead { session_id, .. }
+            | ServerCall::OpenExternal { session_id, .. } => session_id,
+        }
+    }
+}
+
 /// Typed thread metadata — the schema for [`ServerNote::ThreadInfo`].
 /// Replaces the prior opaque `info: serde_json::Value` with a fixed contract
 /// so the client store can project every field without a second implicit

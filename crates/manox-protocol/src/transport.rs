@@ -47,6 +47,67 @@ impl ServerNote {
             _ => BackpressurePolicy::Disconnect,
         }
     }
+
+    /// The session a notification belongs to, if any. `Error` carries an
+    /// optional session id (a global error has none); the bare-model
+    /// completion notes (`ModelText`/`ModelThinking`/`ModelToolCall`/
+    /// `ModelChatDone`) are keyed by `request_id`, not session; the registry
+    /// snapshots (`Ready`/`Models`/`ThreadsUpdated`/`Commands`) are global.
+    /// A multiplexed client routes on this to demux one connection across
+    /// many sessions.
+    pub fn session_id(&self) -> Option<&str> {
+        use ServerNote::*;
+        match self {
+            SessionCreated { session_id, .. }
+            | SessionDisposed { session_id, .. }
+            | TurnStarted { session_id, .. }
+            | TurnFinished { session_id, .. }
+            | Stop { session_id, .. }
+            | AgentText { session_id, .. }
+            | AgentThinking { session_id, .. }
+            | ToolCall { session_id, .. }
+            | ToolResult { session_id, .. }
+            | ToolOutput { session_id, .. }
+            | ThreadHistory { session_id, .. }
+            | ThreadInfo { session_id, .. }
+            | Usage { session_id, .. }
+            | UsageSnapshot { session_id, .. }
+            | CurrentModel { session_id, .. }
+            | PlanReady { session_id, .. }
+            | PlanUpdated { session_id, .. }
+            | PlanModeChanged { session_id, .. }
+            | GoalChanged { session_id, .. }
+            | CwdChanged { session_id, .. }
+            | PermissionModeChanged { session_id, .. }
+            | ReasoningEffortChanged { session_id, .. }
+            | BrowserSuitesChanged { session_id, .. }
+            | CompactionStarted { session_id, .. }
+            | Compaction { session_id, .. }
+            | CacheInvalidation { session_id, .. }
+            | SubagentStarted { session_id, .. }
+            | SubagentProgress { session_id, .. }
+            | SubagentChild { session_id, .. }
+            | BackgroundTaskUpdated { session_id, .. }
+            | SteerPending { session_id, .. }
+            | SteerInjected { session_id, .. }
+            | ApprovalDecision { session_id, .. }
+            | Branch { session_id, .. }
+            | GitStats { session_id, .. }
+            | HistoryProgress { session_id, .. }
+            | Retry { session_id, .. }
+            | PeerMessage { session_id, .. }
+            | TokenUsage { session_id, .. } => Some(session_id),
+            Error { session_id, .. } => session_id.as_deref(),
+            Ready
+            | Models { .. }
+            | ThreadsUpdated { .. }
+            | Commands { .. }
+            | ModelText { .. }
+            | ModelThinking { .. }
+            | ModelToolCall { .. }
+            | ModelChatDone { .. } => None,
+        }
+    }
 }
 
 /// One full-duplex connection between the agent server and a frontend.

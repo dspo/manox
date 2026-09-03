@@ -32,6 +32,7 @@ impl ThreadEngine for FakeEngine {
     fn is_running(&self) -> bool {
         false
     }
+    fn set_cwd(&self, _path: PathBuf) {}
     fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
         self.history
             .lock()
