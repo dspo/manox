@@ -22,15 +22,18 @@
 //! Protocol v2 (architecture doc §D) adds the journal / projection / host /
 //! stream vocabulary: [`journal`] (`JournalWireEvent`, §C.2), [`stream`]
 //! (`StreamFrame` / `SessionSnapshot` / `ProjectionsFrame` / `StreamEndReason`
-//! / `HostEvent`, §D.1/D.5/D.7) and the L12 declaration tables in
-//! [`surface`]. The v1 envelopes above stay intact through the migration
-//! window (§K.5 dual-protocol); their stream/host upgrades land with the
-//! T4/T5 consumer migration.
+//! / `HostEvent`, §D.1/D.5/D.7), the L12 declaration tables in
+//! [`surface`], and the client-side stitching engine
+//! [`journal_stream`] (§F.1 — dsh journal-stream.ts algebra). The v1
+//! envelopes above stay intact through the migration window (§K.5
+//! dual-protocol); their stream/host upgrades land with the T4/T5 consumer
+//! migration.
 
 pub mod base64_bytes;
 pub mod client;
 pub mod handshake;
 pub mod journal;
+pub mod journal_stream;
 pub mod msg;
 pub mod server;
 pub mod stream;

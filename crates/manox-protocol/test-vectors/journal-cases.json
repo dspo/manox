@@ -1,0 +1,173 @@
+[
+  {
+    "name": "normal-open-and-append",
+    "events": [
+      { "kind": "opened", "cursor": 2, "entries": [0, 1, 2] },
+      { "kind": "entry", "seq": 3 },
+      { "kind": "entry", "seq": 4 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1, 2], "hasMore": false },
+      { "type": "append", "seq": 3 },
+      { "type": "append", "seq": 4 }
+    ],
+    "expectedCursors": { "first": 0, "last": 4, "resume": 4 }
+  },
+  {
+    "name": "duplicate-entries-dropped-silently",
+    "events": [
+      { "kind": "opened", "cursor": 2, "entries": [0, 1, 2] },
+      { "kind": "entry", "seq": 2 },
+      { "kind": "entry", "seq": 1 },
+      { "kind": "entry", "seq": 0 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1, 2], "hasMore": false }
+    ],
+    "expectedCursors": { "first": 0, "last": 2, "resume": 2 }
+  },
+  {
+    "name": "partially-overlapping-entry-violates",
+    "events": [
+      { "kind": "opened", "cursor": 1, "entries": [0, 1] },
+      { "kind": "entry", "first": 1, "last": 2 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1], "hasMore": false }
+    ],
+    "expectedFail": "journal emitted a partially overlapping entry"
+  },
+  {
+    "name": "gap-repair-merges-window-and-queued-entry",
+    "events": [
+      { "kind": "journal", "entries": [0, 1, 2, 3, 4, 5] },
+      { "kind": "opened", "cursor": 2, "entries": [0, 1, 2] },
+      { "kind": "entry", "seq": 5 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1, 2], "hasMore": false },
+      { "type": "replace", "entries": [0, 1, 2, 3, 4, 5], "hasMore": false }
+    ],
+    "expectedCursors": { "first": 0, "last": 5, "resume": 5 }
+  },
+  {
+    "name": "gap-repair-with-packed-run-page",
+    "events": [
+      { "kind": "journal", "entries": [0, 1, 2, 3, 4, 5, 6] },
+      { "kind": "opened", "cursor": 2, "entries": [0, 1, 2] },
+      { "kind": "gap-repair", "through": 6, "entries": [0, 1, 2, 3, { "first": 4, "last": 5 }, 6] },
+      { "kind": "entry", "seq": 6 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1, 2], "hasMore": false },
+      {
+        "type": "replace",
+        "entries": [0, 1, 2, 3, { "first": 4, "last": 5 }, 6],
+        "hasMore": false
+      }
+    ],
+    "expectedCursors": { "first": 0, "last": 6, "resume": 6 }
+  },
+  {
+    "name": "gap-repair-page-short-of-opening-cursor-violates",
+    "events": [
+      { "kind": "opened", "cursor": 1, "entries": [0, 1] },
+      { "kind": "gap-repair", "through": 3, "entries": [] },
+      { "kind": "entry", "seq": 3 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1], "hasMore": false }
+    ],
+    "expectedFail": "journal ended while reading its replacement page"
+  },
+  {
+    "name": "gap-repair-page-does-not-end-at-requested-cursor-violates",
+    "events": [
+      { "kind": "opened", "cursor": 2, "entries": [0, 1, 2] },
+      { "kind": "gap-repair", "through": 8, "entries": [3, 4] },
+      { "kind": "entry", "first": 7, "last": 8 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [0, 1, 2], "hasMore": false }
+    ],
+    "expectedFail": "journal page did not end at its requested cursor"
+  },
+  {
+    "name": "resume-behind-last-applied-entry-violates",
+    "events": [
+      { "kind": "opened", "cursor": 5, "entries": [3, 4, 5] },
+      { "kind": "generation" },
+      { "kind": "opened", "cursor": 4, "entries": [2, 3, 4] }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [3, 4, 5], "hasMore": true }
+    ],
+    "expectedFail": "journal resumed at a cursor behind the last applied entry"
+  },
+  {
+    "name": "seamless-restart-replaces-window-at-resume-cursor",
+    "events": [
+      { "kind": "opened", "cursor": 5, "entries": [3, 4, 5] },
+      { "kind": "generation" },
+      { "kind": "opened", "cursor": 5, "entries": [3, 4, 5] },
+      { "kind": "entry", "seq": 6 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [3, 4, 5], "hasMore": true },
+      { "type": "replace", "entries": [3, 4, 5], "hasMore": true },
+      { "type": "append", "seq": 6 }
+    ],
+    "expectedCursors": { "first": 3, "last": 6, "resume": 6 }
+  },
+  {
+    "name": "prepend-history-page-succeeds",
+    "events": [
+      { "kind": "opened", "cursor": 5, "entries": [3, 4, 5] },
+      { "kind": "prepend", "entries": [0, 1, 2], "hasMore": false }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [3, 4, 5], "hasMore": true },
+      { "type": "prepend", "entries": [0, 1, 2], "hasMore": false }
+    ],
+    "expectedCursors": { "first": 0, "last": 5, "resume": 5 }
+  },
+  {
+    "name": "prepend-discontinuous-page-violates",
+    "events": [
+      { "kind": "opened", "cursor": 5, "entries": [3, 4, 5] },
+      { "kind": "prepend", "entries": [0, 1], "hasMore": true }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [3, 4, 5], "hasMore": true },
+      { "type": "prepend", "entries": [], "hasMore": false }
+    ],
+    "expectedFail": "journal history page is discontinuous",
+    "expectedCursors": { "first": 3, "last": 5, "resume": 5 }
+  },
+  {
+    "name": "generation-before-opening-violates",
+    "events": [
+      { "kind": "generation" }
+    ],
+    "expectedPublish": [],
+    "expectedFail": "journal generation restart before opening"
+  },
+  {
+    "name": "opened-empty-page-keeps-window-empty",
+    "events": [
+      { "kind": "opened", "cursor": 0, "entries": [] }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [], "hasMore": false }
+    ],
+    "expectedCursors": { "first": null, "last": null, "resume": 0 }
+  },
+  {
+    "name": "inverted-entry-range-violates",
+    "events": [
+      { "kind": "opened", "cursor": 1, "entries": [0, { "first": 2, "last": 1 }] }
+    ],
+    "expectedPublish": [],
+    "expectedFail": "journal entry has an inverted cursor range"
+  }
+]
