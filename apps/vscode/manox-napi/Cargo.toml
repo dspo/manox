@@ -5,7 +5,9 @@ edition.workspace = true
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` for the packaged `.node` binding; `rlib` so `cargo test` can link
+# the unit tests against the crate as a regular library (napi-rs convention).
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi4"] }
