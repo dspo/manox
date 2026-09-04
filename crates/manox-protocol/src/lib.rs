@@ -22,7 +22,7 @@
 pub mod base64_bytes;
 pub mod client;
 pub mod handshake;
-pub mod journal;
+pub mod journal_stream;
 pub mod msg;
 pub mod server;
 pub mod transport;

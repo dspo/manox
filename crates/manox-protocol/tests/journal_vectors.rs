@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use manox_protocol::journal::{
+use manox_protocol::journal_stream::{
     JournalChange, JournalEntry, JournalInput, JournalSource, JournalStream,
 };
 use serde::Deserialize;
