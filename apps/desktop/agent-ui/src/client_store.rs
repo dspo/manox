@@ -178,7 +178,10 @@ impl Default for ClientStore {
             errored: false,
             unread: false,
             pending_auth_set: HashSet::new(),
-            stream_drives_render: false,
+            // T10: the v2 journal stream drives rendering; the v1 note
+            // fold is dead code pending removal (server emission deleted in
+            // the same sweep).
+            stream_drives_render: true,
         }
     }
 }
