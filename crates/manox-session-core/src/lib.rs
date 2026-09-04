@@ -10,6 +10,7 @@
 pub mod agent_client;
 pub mod agent_server;
 pub mod model_chat;
+pub mod projections;
 pub mod translate;
 
 /// Suite-wide test scaffolding: session-creating tests mutate `HOME` and
