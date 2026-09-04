@@ -48,13 +48,15 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 | 组 | 条目 | 载荷要点 |
 |---|---|---|
-| transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；user 携带 `originRpc?`（乐观回显退休） |
+| transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；条目携带 `origin?`（乐观回显退休；**as-built**：Submit 的 origin_rpc 经 `SessionCmd::Prompt` → `Session::set_pending_user_origin` → 持久化中间件在本 turn 首个 user 消息落盘时一次性消费，`append_message_with_origin` 钉入条目） |
 | transcript | `ui_note` | 现 AppendUiNote 改 durable |
 | lifecycle | `turn_start` / `turn_finish{cancelled,failed,strandedSteerIds}` / `stop{reason}` / `retry{attempt,maxAttempts,delaySecs,reason}` / `error{message}` | `anyhow::Error` 过线/落盘转 `{message}` |
-| 流式 delta | `agent_text_delta{s}` / `agent_thinking_delta{s}` / `tool_call{callId,name,title,status,input}` / `tool_result{callId,output,isError}` / `tool_output_chunk{callId,chunk}` / `subagent_child{agentId,event}` / `subagent_progress{agentId,...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义）；`callId`/`agentId` 遵守 §C.1 信封键独占规则 |
-| 状态变更 | `model_change{from?,to}`（to=canonical）/ `cwd_change{path}` / `project_change{path?}` / `permission_mode_change{mode}` / `reasoning_effort_change{effort}` / `plan_mode_change{enabled}` / `plan_update{snapshot}` / `goal{goal?}` / `title{title}` / `browser_suites{suites}` / `background_task{snapshot}` / `approval{kind:request|decision, ...}` / `pinned_archived{pinned,archived}` | approval request+decision 双态入日志，投影 `pending_auth` 的 fold 源 |
-| 压缩/树 | `compaction{summary,messagesCompacted,tokensBefore,retainedTail,firstKeptEntryId}` / `branch_summary` / `label` / `session_info` / `leaf{targetId}` | 沿用现 SessionTreeEntry 语义 |
-| metrics | `metrics{kind:prefix_stability|cache_invalidation|side_call|main_call|token_usage, ...}` | 诊断面；入日志但可声明「低优先」 |
+| 流式 delta | `agent_text_delta{delta}` / `agent_thinking_delta{delta}` / `tool_call{callId,name,title,status,input}` / `tool_result{callId,output,isError}` / `tool_output_chunk{callId,chunk}` / `subagent_child{agentId,event}` / `subagent_progress{agentId,...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义）；`callId`/`agentId` 遵守 §C.1 信封键独占规则（**as-built**：kernel 侧字段名为 `delta`，wire 映射在 translate 层改名 `s`→`delta` 或直接沿用，见 T4 报告） |
+| 状态变更 | `model_change{from?,to}`（to=canonical）/ `cwd_change{cwd}`（**as-built**：沿用 v3 字段名 `cwd`）/ `project_change{path?}` / `permission_mode_change{mode}` / `reasoning_effort_change{effort}`（**as-built**：复用既有 `thinking_level_change` 条目，字段 `thinking_level`）/ `plan_mode_change{enabled}` / `plan_update{snapshot}` / `goal{goal?}` / `title{title}` / `browser_suites{suites}` / `background_task{snapshot}` / `approval{kind:request|decision, authId, payload}` / `pinned_archived{pinned,archived}` | approval request+decision 双态入日志，投影 `pending_auth` 的 fold 源 |
+| 压缩/树 | `compaction{...}` / `compaction_started{tokensBefore}` / `branch_summary` / `label` / `session_info` / `active_tools_change` / `custom` / `custom_message` / `leaf{targetId}` | 沿用现 SessionTreeEntry 语义 |
+| metrics | `metrics{metricType,data}` | 诊断面；入日志但可声明「低优先」 |
+
+**供 T6/T7 的 as-built 摘要**：宿主侧 journal 供给 = `ThreadHandle::subscribe_journal_feed()`（`JournalFeed::{Event{seq,entry}, Lagged}`）+ `ThreadHandle::journal_snapshot()`（整链冷读）；投影 = `crates/manox-session-core/src/projections.rs::ProjectionSet`（seed+apply+drain_changed/baseline）；waterfall = `src/waterfall.rs::Waterfall`（reply/expire/cancelled_recipients）；origin = message 条目 `origin` 字段（wire 名 `origin`）。
 
 **不成为条目的**（快照边界语义承载）：`HistoryProgress/HistoryRestored` → Snapshot 帧边界；`compaction_started` → 并入 `compaction` 的前置状态或独立条目（选独立条目，UI spinner 需要）。
 
