@@ -40,7 +40,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 ### C.1 文件与信封
 - 路径 `~/.manox/sessions/<thread_id>.jsonl`。第 0 行 header：`{"type":"session","version":4,"id","timestamp","cwd","parentSession"?,"metadata"?}`。
-- 条目行：`{"seq":u64,"id":uuid,"parentId":uuid,"timestamp":iso,"type":camelCase,...payload}`。
+- 条目行：`{"seq":u64,"id":uuid,"parentId":uuid,"timestamp":iso,"type":camelCase,...payload}`。**信封键独占规则**：`seq/id/parentId/timestamp/type` 为信封保留键，事件载荷不得使用同名键（`#[serde(flatten)]` 下同名会互抢/产生重复键）——tool 事件的句柄叫 `callId`，subagent 事件的句柄叫 `agentId`。
 - **seq = 活动链深度**：链上稠密 0-based。分叉共享前缀 seq、新后缀续编号；中插（merged follow-up）= 新链 + `leaf` 重定向（现状语义 + seq）。加载时沿 leaf 链校验稠密，违例报错。
 - **v3 兼容**：旧文件（version:3、无 seq）读入时按链深回填 seq，内存使用；下次 append 时以 v4 写出（懒迁移）。`leaf.targetId` 游标重定向语义不变。
 
@@ -51,7 +51,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 | transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；user 携带 `originRpc?`（乐观回显退休） |
 | transcript | `ui_note` | 现 AppendUiNote 改 durable |
 | lifecycle | `turn_start` / `turn_finish{cancelled,failed,strandedSteerIds}` / `stop{reason}` / `retry{attempt,maxAttempts,delaySecs,reason}` / `error{message}` | `anyhow::Error` 过线/落盘转 `{message}` |
-| 流式 delta | `agent_text_delta{s}` / `agent_thinking_delta{s}` / `tool_call{id,name,title,status,input}` / `tool_result{id,output,isError}` / `tool_output_chunk{id,chunk}` / `subagent_child{id,event}` / `subagent_progress{...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义） |
+| 流式 delta | `agent_text_delta{s}` / `agent_thinking_delta{s}` / `tool_call{callId,name,title,status,input}` / `tool_result{callId,output,isError}` / `tool_output_chunk{callId,chunk}` / `subagent_child{agentId,event}` / `subagent_progress{agentId,...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义）；`callId`/`agentId` 遵守 §C.1 信封键独占规则 |
 | 状态变更 | `model_change{from?,to}`（to=canonical）/ `cwd_change{path}` / `project_change{path?}` / `permission_mode_change{mode}` / `reasoning_effort_change{effort}` / `plan_mode_change{enabled}` / `plan_update{snapshot}` / `goal{goal?}` / `title{title}` / `browser_suites{suites}` / `background_task{snapshot}` / `approval{kind:request|decision, ...}` / `pinned_archived{pinned,archived}` | approval request+decision 双态入日志，投影 `pending_auth` 的 fold 源 |
 | 压缩/树 | `compaction{summary,messagesCompacted,tokensBefore,retainedTail,firstKeptEntryId}` / `branch_summary` / `label` / `session_info` / `leaf{targetId}` | 沿用现 SessionTreeEntry 语义 |
 | metrics | `metrics{kind:prefix_stability|cache_invalidation|side_call|main_call|token_usage, ...}` | 诊断面；入日志但可声明「低优先」 |

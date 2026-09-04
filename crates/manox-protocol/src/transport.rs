@@ -28,14 +28,40 @@ pub const BACKPRESSURE_CAPACITY: usize = 1024;
 pub enum BackpressurePolicy {
     /// Streaming payload: drop the message (caller may coalesce and re-send
     /// with a gap marker). The connection stays up.
+    ///
+    /// Legacy (v1) class only: under protocol v2 (§D.7) the Drop class is
+    /// DOOMED — durable delta traffic moves to
+    /// [`crate::stream::StreamFrame::Entry`], which is [`Self::BoundedResync`]
+    /// (L5: snapshots never drop, overflow resyncs; silent drops of journal
+    /// entries would open gaps a client cannot close).
     Drop,
     /// Control / lifecycle message: the client is presumed dead; disconnect.
+    /// §D.7 "control frames block, never drop": Request/Response/Reply and
+    /// host traffic take this class (blocking send on the in-process pair).
     Disconnect,
+    /// §D.7: `StreamItem(Snapshot | Projections)` and `StreamEnd` — must
+    /// never be dropped; the sender blocks until capacity frees (same
+    /// mechanics as [`Self::Disconnect`] on the in-process pair).
+    NeverDrop,
+    /// §D.7: `StreamItem(Entry)` — a bounded queue
+    /// ([`crate::stream::ENTRY_BACKPRESSURE_CAPACITY`]); when full, the
+    /// stream is ended with
+    /// [`StreamEndReason::Resync`](crate::stream::StreamEndReason::Resync)
+    /// and the client re-follows from a fresh snapshot (L5 — no server-side
+    /// replay buffers).
+    BoundedResync,
 }
 
 impl ServerNote {
-    /// Streaming payloads tolerate loss; everything else is control traffic a
-    /// dead client must not silently miss.
+    /// Legacy (v1) streaming classification — kept verbatim because live
+    /// consumers (webui ws pump, session-core pumps) compare against
+    /// `Drop`/`Disconnect`. The §D.7 successor strategy is expressed over
+    /// the v2 vocabulary: [`crate::stream::StreamFrame::backpressure_policy`]
+    /// (Snapshot/Projections/StreamEnd never drop; Entry bounded ⇒ resync)
+    /// and [`crate::stream::v2_backpressure_policy`] for the host/legacy
+    /// notification stream. Wiring those into the transports (and deleting
+    /// the `Drop` class with the doomed notes) is the T4/T5 envelope
+    /// migration.
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         match self {
             ServerNote::AgentText { .. }

@@ -6,6 +6,18 @@
 //! [`crate::ServerNote`] are themselves internally tagged by `method`, nested
 //! under the `call` / `note` field, so every wire message is fully
 //! self-describing.
+//!
+//! Protocol v2 (§D.1) adds the stream classes — `FromClient::StreamOpen /
+//! StreamCancel` and `FromServer::StreamItem / StreamEnd` — over the payload
+//! vocabulary in [`crate::stream`] ([`StreamKind`](crate::stream::StreamKind),
+//! [`StreamFrame`](crate::stream::StreamFrame),
+//! [`StreamEndReason`](crate::stream::StreamEndReason),
+//! [`HostEvent`](crate::stream::HostEvent)). T2 ships the payload types and
+//! the frame round-trip / policy they obey; the envelope variants themselves
+//! are added by the T4/T5 consumer migration: these two enums are matched
+//! exhaustively without a wildcard arm in `manox-session-core` /
+//! `agent-ui`, so extending them here first would break the workspace
+//! (verified at T2 dispatch; see the delivery report's stop-rule notes).
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -51,6 +63,46 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// Stable application error codes for v2 failures (§D.7). The numeric `code`
+/// stays an `i32` for wire-compat with v1 consumers; v2 servers carry one of
+/// these strings in [`RpcError::data`] under the key `"code"` (e.g.
+/// `RpcError::new(-1, msg).with_code(CODE_MODEL_UNRESOLVABLE)`).
+pub const RPC_ERROR_CODES: &[&str] = &[
+    "session/not-found",
+    "session/busy",
+    "gateway/bad-request",
+    "gateway/internal",
+    "resync-required",
+    "model/unresolvable",
+];
+
+/// `session/not-found` (§D.7).
+pub const CODE_SESSION_NOT_FOUND: &str = "session/not-found";
+/// `session/busy` (§D.7).
+pub const CODE_SESSION_BUSY: &str = "session/busy";
+/// `gateway/bad-request` (§D.7).
+pub const CODE_GATEWAY_BAD_REQUEST: &str = "gateway/bad-request";
+/// `gateway/internal` (§D.7).
+pub const CODE_GATEWAY_INTERNAL: &str = "gateway/internal";
+/// `resync-required` (§D.7): follow stream must be re-opened from a fresh
+/// snapshot (L5 companion of `StreamEndReason::Resync`).
+pub const CODE_RESYNC_REQUIRED: &str = "resync-required";
+/// `model/unresolvable` (§D.7): a [`ModelRef`](crate::journal::ModelRef) did
+/// not resolve server-side (the single convergence point is
+/// `resolve_model_ref`, L8).
+pub const CODE_MODEL_UNRESOLVABLE: &str = "model/unresolvable";
+
+impl RpcError {
+    /// Builder: tag this error with a §D.7 stable code (stored in
+    /// `data.code`).
+    pub fn with_code(self, code: &'static str) -> Self {
+        Self {
+            data: Some(serde_json::json!({ "code": code })),
+            ..self
+        }
+    }
+}
+
 /// Client → server message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
@@ -85,7 +137,10 @@ pub enum FromServer {
         id: MsgId,
         call: crate::server::ServerCall,
     },
-    /// Streaming update.
+    /// Streaming update. v2 (§D.5) re-types this payload as
+    /// [`HostEvent`](crate::stream::HostEvent) — the global host vocabulary
+    /// that replaces the doomed `ServerNote` domain arms; the swap waits on
+    /// the consumer migration (see module docs).
     Notification { note: crate::server::ServerNote },
 }
 
@@ -327,5 +382,48 @@ mod tests {
             let back: FromServer = serde_json::from_str(&json).unwrap();
             assert_eq!(msg, &back, "FromServer serde round-trip failed: {json}");
         }
+    }
+
+    /// L12 / §D.8: an unknown journal entry tag must be *tolerable* on the
+    /// read side — clients probe the `type` against
+    /// [`crate::surface::JOURNAL_ENTRIES`] and drop + log the frame without
+    /// erroring the connection (the strict parse is `is_err`, the tolerant
+    /// path never panics).
+    #[test]
+    fn unknown_journal_entry_tag_is_tolerated_not_fatal() {
+        let unknown = serde_json::json!({
+            "seq": 5,
+            "id": "x-1",
+            "parentId": null,
+            "timestamp": "2026-09-04T00:00:00Z",
+            "type": "someFutureEntry"
+        });
+        // Strict typed parse fails cleanly (an error value, not a panic)…
+        assert!(
+            serde_json::from_value::<crate::journal::JournalWireEntry>(unknown.clone()).is_err()
+        );
+        // …and the tolerant client path: the tag is absent from the declared
+        // surface, so the frame is dropped + logged; the connection stays up.
+        let tag = unknown["type"].as_str().unwrap();
+        assert!(!crate::surface::JOURNAL_ENTRIES.contains(&tag));
+        // A declared tag, by contrast, parses.
+        let known = serde_json::json!({
+            "seq": 6,
+            "id": "x-2",
+            "parentId": null,
+            "timestamp": "2026-09-04T00:00:00Z",
+            "type": "turnStart"
+        });
+        assert!(crate::surface::JOURNAL_ENTRIES.contains(&"turnStart"));
+        assert!(serde_json::from_value::<crate::journal::JournalWireEntry>(known).is_ok());
+    }
+
+    /// §D.7: the v2 stable error-code set.
+    #[test]
+    fn rpc_error_code_set_is_wired_into_data() {
+        let err = RpcError::new(1, "gone").with_code(CODE_SESSION_NOT_FOUND);
+        assert_eq!(err.data.as_ref().unwrap()["code"], "session/not-found");
+        assert!(RPC_ERROR_CODES.contains(&"resync-required"));
+        assert!(RPC_ERROR_CODES.contains(&CODE_MODEL_UNRESOLVABLE));
     }
 }

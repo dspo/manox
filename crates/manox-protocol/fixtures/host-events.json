@@ -1,0 +1,78 @@
+[
+  {
+    "epoch": 2,
+    "type": "ready"
+  },
+  {
+    "models": [
+      {
+        "api": "anthropic",
+        "context_window": 131072,
+        "id": "deepseek-chat",
+        "max_tokens": 8192,
+        "name": "DeepSeek Chat",
+        "provider": "DeepSeek-anthropic",
+        "provider_name": "DeepSeek"
+      }
+    ],
+    "type": "models"
+  },
+  {
+    "commands": [
+      {
+        "name": "/compact"
+      }
+    ],
+    "type": "commands"
+  },
+  {
+    "threads": [
+      {
+        "archived": false,
+        "background_work": false,
+        "depth": 0,
+        "errored": false,
+        "id": "s1",
+        "model_id": "DeepSeek-anthropic/deepseek-chat",
+        "parent_id": null,
+        "pending_auth": false,
+        "pending_plan": false,
+        "pinned": false,
+        "running": true,
+        "title": "v2 migration",
+        "unread": false,
+        "updated_at": 1756947200
+      }
+    ],
+    "type": "threadsUpdated"
+  },
+  {
+    "backgroundWork": false,
+    "errored": false,
+    "pendingAuth": false,
+    "pendingPlan": null,
+    "running": true,
+    "sessionId": "s1",
+    "type": "sessionStatus",
+    "unread": true
+  },
+  {
+    "header": {
+      "createdAt": "2026-09-04T00:00:00Z",
+      "cwd": "/proj",
+      "id": "s1",
+      "metadata": null,
+      "parentSession": null
+    },
+    "sessionId": "s1",
+    "type": "sessionCreated"
+  },
+  {
+    "sessionId": "s1",
+    "type": "sessionDisposed"
+  },
+  {
+    "message": "gateway/internal",
+    "type": "error"
+  }
+]
