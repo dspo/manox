@@ -232,7 +232,17 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 - 迁移窗口双协议（新帧与旧 note 并存）从 T4 起至 T10 拆旧止，终局 grep 门禁保证无双协议残留。
 - 大 PR 审查负担：以 wave tag 分 commit 段 + 本文档作为 PR 描述骨架。
 
-### K.5.1 T10 拆除与集成清单（as-built 盘点，2026-09-04 wave/3 后）
+### K.5.1 T10 拆除与集成清单（**已完成**，2026-09-05 终局门禁全绿）
+
+**终局状态**：translate 只余裁决路由；桌面渲染与 restore 全走 v2 流（含重开回归锁 `reopen_snapshot_restores_transcript_and_rearms_rebuild`）；v1 快照发射面（ThreadHistory/ThreadInfo/GetUsage/GetCurrentModel/残余 PermissionModeChanged/SteerPending）删除；37 个 DOOMED ServerNote 变体删除（保留 11 个：owner 控制 ×3、过渡列表通道 ×3、服务端 Error、ModelChat 侧流 ×4）；双端 v1 fold 清除；绑定/守卫/fixtures 再生成；桌面 usage 面板接 Q 面（committed 边沿，含回归测试）；全仓门禁 2285 Rust 测试 + webui 152 vitest + vscode tsc + grep 零残留。
+
+以下为 **PR 后润色项**（不阻塞）：
+1. Models/ThreadsUpdated/Commands 列表通道 v1 note → Host 帧迁移；
+2. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，客户端合成 key 的抖动根因）；
+3. steer→parked-submit 的 message_id 关联语义与内核对齐一次；
+4. `GetConversationInfo` 的 git 字段（host git 查询）。
+
+原盘点（历史）：
 
 **拆除**：translate.rs 的 4 处 DOOMED note 发射臂；agent_server.rs 的 13 处 DOOMED 引用（含 `republish_if_first_interaction` ×5 与 GetUsage/GetCurrentModel 的 dispatch 臂）；client_store.rs 的 v1 `apply_server_note`（先翻 `stream_drives_render=true` 验证渲染，再删 v1 fold 与 `server_note_translate`）；protocol 的 DOOMED ServerNote 变体 + 守卫/绑定/fixtures 再生成；grep 门禁（§J.6）终检。
 
