@@ -232,5 +232,15 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 - 迁移窗口双协议（新帧与旧 note 并存）从 T4 起至 T10 拆旧止，终局 grep 门禁保证无双协议残留。
 - 大 PR 审查负担：以 wave tag 分 commit 段 + 本文档作为 PR 描述骨架。
 
+### K.5.1 T10 拆除与集成清单（as-built 盘点，2026-09-04 wave/3 后）
+
+**拆除**：translate.rs 的 4 处 DOOMED note 发射臂；agent_server.rs 的 13 处 DOOMED 引用（含 `republish_if_first_interaction` ×5 与 GetUsage/GetCurrentModel 的 dispatch 臂）；client_store.rs 的 v1 `apply_server_note`（先翻 `stream_drives_render=true` 验证渲染，再删 v1 fold 与 `server_note_translate`）；protocol 的 DOOMED ServerNote 变体 + 守卫/绑定/fixtures 再生成；grep 门禁（§J.6）终检。
+
+**集成复核（T6/T7 交付时上报的事项）**：
+1. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，T7 报的 React key 抖动根因）——协议+follow.rs+两端解析器一次改齐；
+2. steer→parked-submit 的 message_id 关联语义（§D.2 vs 无 DropQueued）与 `turnFinish.strandedSteerIds` 的客户端匹配——与 server 对一次；
+3. 重连 `StreamEnd{Closed}` 旧代竞态——T7 已用每代轮换 streamId 缓解，T9 同方案，或服务端 re-seat 不重放旧 Closed；
+4. `GetConversationInfo` 的 git 字段仍为 null（host git 查询，可选补）。
+
 ### K.6 显式不做（本迭代范围外，架构已预留钩子）
 动态 host 插件（WASM/JS eval 沙箱）、插件市场与分发、皮肤 token 体系完整化、桌面动态 slot、terminal/ModelChat 域并入 journal。
