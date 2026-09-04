@@ -442,6 +442,22 @@ impl AgentServerInner {
         );
     }
 
+    /// The first user message flips the thread's `has_interacted` header —
+    /// a mutation no other note carries and no client can observe without a
+    /// ThreadInfo republish. `was` is the interaction state captured before
+    /// the transcript mutation; the mirror is republished exactly on the
+    /// false → true transition.
+    fn republish_if_first_interaction(
+        &self,
+        thread: &ThreadHandle,
+        session_id: &str,
+        was_interacted: bool,
+    ) {
+        if !was_interacted && thread.read(|t| t.has_interacted()) {
+            self.emit_thread_info(thread, session_id);
+        }
+    }
+
     /// Gather every `ThreadInfoPayload` field in a single read closure (no
     /// re-entrant locking of the handle).
     fn build_thread_info_payload(
@@ -966,6 +982,7 @@ impl AgentServerInner {
             });
             return;
         }
+        let interacted = thread.read(|t| t.has_interacted());
         thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -993,6 +1010,7 @@ impl AgentServerInner {
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
             t.run_turn();
         });
+        self.republish_if_first_interaction(&thread, session_id, interacted);
     }
 
     fn steer(
@@ -1021,6 +1039,7 @@ impl AgentServerInner {
             .lock()
             .unwrap()
             .retain(|q| q.client_id != client_id);
+        let interacted = thread.read(|t| t.has_interacted());
         let steer_pending: Option<String> = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1048,6 +1067,7 @@ impl AgentServerInner {
                 },
             );
         }
+        self.republish_if_first_interaction(&thread, session_id, interacted);
     }
 
     fn drop_queued(&self, session_id: &str, client_id: String) {
@@ -1150,6 +1170,7 @@ impl AgentServerInner {
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
             .collect();
+        let interacted = thread.read(|t| t.has_interacted());
         thread.with_mut(|t| {
             let ui = manox_agent::MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1159,6 +1180,7 @@ impl AgentServerInner {
             let content = to_message_content(text, images);
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
         });
+        self.republish_if_first_interaction(&thread, session_id, interacted);
     }
 
     fn compact(&self, session_id: &str, instructions: Option<String>) {
@@ -1629,6 +1651,7 @@ fn spawn_pump(
                             .collect::<Vec<_>>();
                         let drained_any = !drained.is_empty();
                         if drained_any {
+                            let interacted = thread.read(|t| t.has_interacted());
                             thread.with_mut(|t| {
                                 for q in drained {
                                     let content = to_message_content(q.text, q.images);
@@ -1638,6 +1661,7 @@ fn spawn_pump(
                                     );
                                 }
                             });
+                            inner.republish_if_first_interaction(&thread, &session_id, interacted);
                         }
                         thread.with_mut(|t| {
                             if drained_any || t.has_pending_prompts() {
@@ -2520,6 +2544,52 @@ mod tests {
                 .any(|p| p == std::path::Path::new("/moved")),
             "the working-directory switch must reach the engine"
         );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// The first user message must republish `ThreadInfo` unprompted:
+    /// `has_interacted` rides only on that note, so a client that opened a
+    /// fresh (un-interacted) session and then submitted would never learn
+    /// the flip without the republish — e.g. the context rail stays hidden.
+    #[test]
+    fn submit_republishes_thread_info_on_first_interaction() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "s1".into(),
+                text: "hello".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        // Drain to the unprompted republish. The create-time snapshot also
+        // carries a ThreadInfo, but with `has_interacted: false` — settle on
+        // the flipped mirror, not on the first note. Stop at `TurnStarted`
+        // without settling: `Settled` re-reads the transcript through
+        // `engine.history()` — empty on the fake — which would wipe the user
+        // message and the interaction state the assertion depends on.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ThreadInfo never republished with the interaction flip"
+            );
+            if let FromServer::Notification {
+                note: ServerNote::ThreadInfo { info, .. },
+            } = client.recv_timeout(Duration::from_secs(2))
+                && info.has_interacted
+            {
+                break;
+            }
+        }
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
