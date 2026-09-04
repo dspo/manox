@@ -70,6 +70,7 @@ pub struct SessionMultiplexer {
     /// `StreamId` → session id: routes `StreamItem`/`StreamEnd` frames.
     streams: HashMap<StreamId, String>,
     /// Awaiting `PageHistory` responses correlated by their request `MsgId`.
+    info_fetches: HashMap<MsgId, String>,
     page_fetches: HashMap<MsgId, String>,
     leaf_tx: async_channel::Sender<LeafRequest>,
     /// `ClientCall::CreateSession` responses correlated by request `MsgId`
@@ -111,6 +112,7 @@ impl SessionMultiplexer {
             client,
             sessions: HashMap::new(),
             streams: HashMap::new(),
+            info_fetches: HashMap::new(),
             page_fetches: HashMap::new(),
             leaf_tx,
             create_callbacks: HashMap::new(),
@@ -121,6 +123,15 @@ impl SessionMultiplexer {
 
     fn handle_leaf_request(&mut self, req: LeafRequest) {
         match req {
+            LeafRequest::ConversationInfo { id, session_id } => {
+                let call = ClientCall::GetConversationInfo {
+                    session_id: session_id.clone(),
+                };
+                self.info_fetches.insert(id.clone(), session_id);
+                self.client
+                    .conn()
+                    .send_to_server(FromClient::Request { id, call });
+            }
             LeafRequest::Reopen {
                 session_id,
                 stream_id,
@@ -240,6 +251,15 @@ impl SessionMultiplexer {
                         },
                     };
                     cb(done, cx);
+                    return;
+                }
+                if let Some(session_id) = self.info_fetches.remove(id) {
+                    let outcome = outcome.clone();
+                    if let Some(handle) = self.sessions.get(&session_id).cloned() {
+                        handle.update(cx, |h, cx| {
+                            h.apply_conversation_info_response(id.clone(), outcome, cx)
+                        });
+                    }
                     return;
                 }
                 if let Some(session_id) = self.page_fetches.remove(id) {

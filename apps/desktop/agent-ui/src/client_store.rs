@@ -59,8 +59,10 @@ pub struct ClientStore {
     /// `message.usage` + `metrics{token_usage}` sidecars). Successor of the
     /// `UsageSnapshot` note's `per_request`.
     pub per_request_usage: HashMap<String, UsageSnapshot>,
-    // T10c: the `UsageSnapshot` note fold is deleted; the cumulative /
-    // per-model totals below are UNWRITTEN display placeholders (the server
+    // §D.6 successor wired: the Q face (`GetConversationInfo`) fills these
+    // on the committed edge (a message row landing in the window — per-turn
+    // frequency, no timer debounce needed). Never synthesize totals from
+    // the window client-side (L6).
     // stopped pushing them in T10b). Their §D.6 successor is the §E.3 Q-face
     // (`GetConversationInfo`) port; until then the context rail reads the
     // zero values. Never synthesize totals client-side from the window (L6).
@@ -207,6 +209,42 @@ impl ClientStore {
     /// Returns `true` when the display sequence changed *structurally*
     /// (a rebuild signal); appends fold incrementally and return `false`
     /// (the live render path consumes the appended entries directly).
+    /// Fold one §E.3 `GetConversationInfo` payload into the usage panel
+    /// fields (mechanical transcription of the server's fold — L6).
+    pub fn apply_conversation_info(&mut self, payload: &serde_json::Value) {
+        let snap = |v: &serde_json::Value| UsageSnapshot {
+            input: v.get("input").and_then(|x| x.as_u64()).unwrap_or(0),
+            output: v.get("output").and_then(|x| x.as_u64()).unwrap_or(0),
+            cache_creation: v.get("cacheWrite").and_then(|x| x.as_u64()).unwrap_or(0),
+            cache_read: v.get("cacheRead").and_then(|x| x.as_u64()).unwrap_or(0),
+        };
+        if let Some(cu) = payload.get("cumulativeUsage") {
+            self.cumulative_usage = Some(snap(cu));
+        }
+        if let Some(cost) = payload.get("cumulativeCost").and_then(|v| v.as_f64()) {
+            self.cumulative_cost = cost;
+        }
+        self.per_model_usage.clear();
+        self.per_model_cost.clear();
+        if let Some(models) = payload.get("models").and_then(|v| v.as_array()) {
+            for row in models {
+                let key = format!(
+                    "{}/{}",
+                    row.get("provider").and_then(|v| v.as_str()).unwrap_or(""),
+                    row.get("model").and_then(|v| v.as_str()).unwrap_or("")
+                );
+                self.per_model_usage.insert(key.clone(), snap(row));
+            }
+        }
+        if let Some(costs) = payload.get("perModelCost").and_then(|v| v.as_object()) {
+            for (key, cost) in costs {
+                if let Some(c) = cost.as_f64() {
+                    self.per_model_cost.insert(key.clone(), c);
+                }
+            }
+        }
+    }
+
     pub fn apply_window_change(&mut self, change: crate::journal_fold::WindowChange) -> bool {
         use crate::journal_fold::WindowChange as C;
         match change {

@@ -35,6 +35,9 @@ pub enum LeafRequest {
         session_id: String,
         through_seq: u64,
     },
+    /// §E.3 Q-face fetch: send `GetConversationInfo` and route the Response
+    /// back by MsgId.
+    ConversationInfo { id: MsgId, session_id: String },
 }
 
 /// A gpui entity that owns a single session's [`ClientStore`], the v2
@@ -49,6 +52,10 @@ pub struct ClientStoreHandle {
     /// The MsgId of the `PageHistory` request currently in flight (so a late
     /// reply after a reset is dropped).
     pending_page: Option<MsgId>,
+    /// In-flight `GetConversationInfo` correlation id (§E.3 Q face).
+    pending_info: Option<MsgId>,
+    /// Message-row count at the last info fetch (the committed edge).
+    info_committed: usize,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
@@ -63,6 +70,8 @@ impl ClientStoreHandle {
             session_id: session_id.to_string(),
             outbound: None,
             pending_page: None,
+            pending_info: None,
+            info_committed: 0,
         }
     }
 
@@ -219,6 +228,26 @@ impl ClientStoreHandle {
             _ => Vec::new(),
         };
         self.store.apply_window_change(change);
+        // §E.3 Q face: a message row landing in the window is the committed
+        // edge — refresh the usage panel (per-turn frequency, no debounce
+        // needed; the wire usage rows themselves ride the transcript).
+        let committed = self
+            .store
+            .window
+            .iter()
+            .filter(|e| matches!(&e.event, manox_protocol::JournalWireEvent::Message { .. }))
+            .count();
+        if committed != self.info_committed {
+            self.info_committed = committed;
+            if let Some(outbound) = self.outbound.clone() {
+                let id = MsgId::new(format!("info-{}-{}", self.session_id, committed));
+                self.pending_info = Some(id.clone());
+                let _ = outbound.try_send(LeafRequest::ConversationInfo {
+                    id,
+                    session_id: self.session_id.clone(),
+                });
+            }
+        }
         if self.store.stream_drives_render {
             if structural {
                 cx.emit(ThreadEvent::HistoryRestored);
@@ -259,6 +288,24 @@ impl ClientStoreHandle {
         };
         let outs = self.fold.deliver_page(records);
         self.handle_fold_outs(outs, cx);
+    }
+
+    /// Deliver a `GetConversationInfo` response (§E.3) the leaf requested.
+    /// Correlated by MsgId; a late/foreign reply is dropped.
+    pub fn apply_conversation_info_response(
+        &mut self,
+        id: MsgId,
+        outcome: Result<serde_json::Value, manox_protocol::RpcError>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_info.as_ref() != Some(&id) {
+            return;
+        }
+        self.pending_info = None;
+        if let Ok(payload) = outcome {
+            self.store.apply_conversation_info(&payload);
+            cx.notify();
+        }
     }
 
     fn request_reopen(&mut self, cx: &mut Context<Self>) {
@@ -326,7 +373,9 @@ fn plan_file_of(call: &manox_protocol::ServerCall) -> Option<String> {
 mod tests {
     use super::*;
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use manox_protocol::{RpcConnection as _, ServerNote, in_process_pair, journal::ThreadHeader};
+    use manox_protocol::{
+        FromClient, RpcConnection as _, ServerNote, in_process_pair, journal::ThreadHeader,
+    };
     use manox_session_core::agent_client::AgentClient;
     use std::sync::Arc;
 
@@ -344,6 +393,110 @@ mod tests {
         let client = Arc::new(AgentClient::from_conn(client_conn));
         let mux = cx.new(|cx| SessionMultiplexer::with_client(client, cx));
         (mux, server_conn)
+    }
+
+    /// §E.3 Q face wiring: a message row landing in the window (the
+    /// committed edge) triggers a `GetConversationInfo` request whose
+    /// Response fills the usage panel fields (per-model rows + totals).
+    #[gpui::test]
+    async fn conversation_info_fills_usage_panel_on_committed_edge(cx: &mut TestAppContext) {
+        use manox_protocol::journal::JournalWireEntry;
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
+        cx.run_until_parked();
+
+        // A snapshot carrying one user + one assistant message row (the
+        // assistant with a usage payload) lands: committed = 2.
+        let entry = |seq: u64, role: &str, usage: Option<manox_protocol::journal::UsagePayload>| {
+            let mut value = serde_json::json!({
+                "seq": seq,
+                "id": format!("e-{seq}"),
+                "parentId": if seq == 0 { serde_json::Value::Null } else { serde_json::json!(format!("e-{}", seq - 1)) },
+                "timestamp": "2026-09-05T00:00:00Z",
+                "type": "message",
+                "role": role,
+                "content": [],
+                "usage": usage,
+                "originRpc": serde_json::Value::Null,
+            });
+            serde_json::from_value::<JournalWireEntry>(value.take()).unwrap()
+        };
+        let usage = manox_protocol::journal::UsagePayload {
+            input: 100,
+            output: 40,
+            cache_read: 10,
+            cache_write: 5,
+            reasoning: 0,
+        };
+        let frame =
+            manox_protocol::StreamFrame::Snapshot(manox_protocol::stream::SessionSnapshot {
+                session_id: "s1".into(),
+                header: ThreadHeader {
+                    id: "s1".into(),
+                    cwd: "/w".into(),
+                    parent_session: None,
+                    metadata: None,
+                    created_at: "2026-09-05T00:00:00Z".into(),
+                },
+                cursor: 1,
+                records: vec![entry(0, "user", None), entry(1, "assistant", Some(usage))],
+                has_more: false,
+                projections: Default::default(),
+                projections_as_of_seq: 1,
+            });
+        // Drive the snapshot directly through the leaf (the sibling stream
+        // tests' pattern); the outbound LeafRequest channel still runs
+        // through the real multiplexer to the raw pair.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                FromServer::StreamItem {
+                    stream_id: StreamId::new("s1"),
+                    frame,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // The committed edge fired: the server side of the pair must have
+        // received a GetConversationInfo Request for s1.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut info_id = None;
+        let rx = server_conn.client_rx();
+        while info_id.is_none() && std::time::Instant::now() < deadline {
+            while let Ok(msg) = rx.try_recv() {
+                if let FromClient::Request { id, call } = msg
+                    && matches!(call, manox_protocol::ClientCall::GetConversationInfo { .. })
+                {
+                    info_id = Some(id);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let info_id = info_id.expect("committed edge must issue GetConversationInfo");
+
+        // The Q-face answer fills the panel fields (mechanical fold).
+        server_conn.send_to_client(FromServer::Response {
+            id: info_id,
+            outcome: Ok(serde_json::json!({
+                "cumulativeUsage": {"input": 100, "output": 40, "cacheWrite": 5, "cacheRead": 10},
+                "cumulativeCost": 0.42,
+                "models": [
+                    {"provider": "P", "model": "m", "input": 100, "output": 40,
+                     "cacheRead": 10, "cacheWrite": 5}
+                ],
+                "perModelCost": {"P/m": 0.42},
+            })),
+        });
+        cx.run_until_parked();
+        handle.update(cx, |h, _| {
+            let st = &h.store;
+            let cumulative = st.cumulative_usage.as_ref().expect("cumulative filled");
+            assert_eq!((cumulative.input, cumulative.output), (100, 40));
+            assert_eq!(st.per_model_usage.len(), 1);
+            assert!((st.cumulative_cost - 0.42).abs() < 1e-9);
+            assert_eq!(st.per_model_cost.get("P/m"), Some(&0.42));
+        });
     }
 
     #[gpui::test]

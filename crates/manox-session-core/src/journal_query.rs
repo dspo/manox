@@ -222,6 +222,20 @@ fn fold_conversation_info(
         // (the journal's usage rows are per-model inputs; the engine already
         // maintains the authoritative priced total — read it once here).
         "cumulativeCost": thread.read(|t| t.cumulative_cost()),
+        "cumulativeUsage": thread.read(|t| {
+            let u = t.cumulative_token_usage();
+            json!({
+                "input": u.input_tokens,
+                "output": u.output_tokens,
+                "cacheWrite": u.cache_creation_input_tokens,
+                "cacheRead": u.cache_read_input_tokens,
+            })
+        }),
+        "perModelCost": thread.read(|t|
+            t.per_model_cost()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, f64>>()
+        ),
         // Git stats are a host lookup (§E.3 note); null placeholder in T4.
         "git": Value::Null,
     })
