@@ -114,11 +114,15 @@ impl ProjectionSet {
         Self { slots }
     }
 
-    /// Fold one journal record. The exhaustive match is the coverage gate:
-    /// a new vocabulary kind must be classified here to compile.
+    /// Fold one journal record (delegates to [`Self::apply_event`]).
     pub fn apply(&mut self, record: &JournalRecord) {
-        let seq = record.seq;
-        match &record.entry {
+        self.apply_event(record.seq, &record.entry);
+    }
+
+    /// Fold one journal event. The exhaustive match is the coverage gate:
+    /// a new vocabulary kind must be classified here to compile.
+    pub fn apply_event(&mut self, seq: u64, entry: &SessionTreeEntry) {
+        match entry {
             // ── transcript: the first user message is the has_interacted
             //    edge (the T1 bug's projection successor) ──────────────────
             SessionTreeEntry::Message { message, .. } => {

@@ -23,6 +23,7 @@ parking_lot.workspace = true
 tracing.workspace = true
 # §D.2 `CreateSession` mints session ids server-side for v2 clients.
 uuid.workspace = true
+async-channel.workspace = true
 
 [dev-dependencies]
 # The session tests swap scripted engines via `set_engine_for_test` and tear

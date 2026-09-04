@@ -25,7 +25,7 @@ use manox_protocol::client::ImageAttachment;
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize};
 use manox_protocol::journal::StreamId;
 use manox_protocol::server::ThreadInfoPayload;
-use manox_protocol::stream::{StreamEndReason, StreamKind};
+use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem, WireContentBlock, WireMessage,
@@ -163,6 +163,17 @@ impl AgentServerInner {
             }
         }
     }
+}
+
+/// The process-global server (L11: one `AgentServer` per process — the
+/// desktop, the embedded web UI and every future frontend route through it,
+/// so ownership/routing tables are shared). First caller wins; later cwd
+/// arguments are ignored (a second window shares the first window's cwd).
+pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
+    static GLOBAL: std::sync::OnceLock<std::sync::Arc<AgentServer>> = std::sync::OnceLock::new();
+    GLOBAL
+        .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
+        .clone()
 }
 
 impl AgentServer {
@@ -504,6 +515,15 @@ impl AgentServerInner {
     }
 
     // ── Note routing. ──────────────────────────────────────────────────────
+    /// §D.5: broadcast a host event to EVERY connected client (global,
+    /// change-driven — not owner-scoped like `route_note`).
+    fn broadcast_host(&self, host: manox_protocol::stream::HostEvent) {
+        let frame = FromServer::Host { host };
+        for entry in self.clients.lock().values() {
+            entry.conn.send_to_client(frame.clone());
+        }
+    }
+
     fn route_note(&self, session_id: &str, note: ServerNote) {
         let conns = self.owner_conns(session_id);
         if conns.is_empty() {
@@ -1208,16 +1228,17 @@ impl AgentServerInner {
     }
 
     fn dispose_session(&self, owner: &str, session_id: &str) {
-        // Notify while the disposing client is still an owner (route_note is
-        // owner-based; after remove_owner an orphaned session has no
-        // recipient). β-3a: single-owner; multi-client dispose semantics
-        // (preserve the session for remaining owners) land in β-3b.
-        self.route_note(
-            session_id,
-            ServerNote::SessionDisposed {
-                session_id: session_id.into(),
-            },
-        );
+        // §D.5 dispose semantics: only the REQUESTING client is told — the
+        // session survives for every other owner (broadcasting here made a
+        // second client's UI drop a still-live session). Owner-table
+        // removal below is per-client regardless.
+        if let Some(conn) = self.clients.lock().get(owner).map(|e| e.conn.clone()) {
+            conn.send_to_client(FromServer::Notification {
+                note: ServerNote::SessionDisposed {
+                    session_id: session_id.into(),
+                },
+            });
+        }
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty()
             && let Some(session) = self.sessions.lock().remove(session_id)
@@ -1647,20 +1668,30 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         },
         _ => ReplyCtx::Other, // β-3b-ii: BrowserOp/ClipboardRead/OpenExternal (capability seam).
     };
-    // Find an owner that also declared this capability; register the waiter
-    // under the clients lock (brief — register is synchronous).
-    let target = {
+    // §D.4: adjudication kinds (Approve / AskUserQuestion / PlanVerdict)
+    // fan out to EVERY owner that declared the capability — all must answer
+    // next to proceed, any rejection (or per-delivery timeout) settles
+    // fail-closed (see [`crate::waterfall`]). Capability calls
+    // (BrowserOp/...) stay single-target.
+    let adjudication = matches!(
+        ctx,
+        ReplyCtx::Approve { .. } | ReplyCtx::AskUser { .. } | ReplyCtx::PlanVerdict { .. }
+    );
+
+    // Register a waiter per eligible owner under the clients lock (brief —
+    // register is synchronous).
+    let targets = {
         let owners = inner.owners(session_id);
         let clients = inner.clients.lock();
         owners
             .iter()
-            .find(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
+            .filter(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
             .map(|cid| {
                 let entry = clients.get(cid).expect("just checked");
-                // Deterministic MsgId per kind so a client without bridge state
-                // can correlate its Reply: Approve/AskUser echo the auth_id the
-                // card carries; PlanVerdict uses the session id (one pending
-                // review per session); Other (β-3b-ii capability calls) mints a
+                // Deterministic MsgId per kind so a client without bridge
+                // state can correlate its Reply: Approve/AskUser echo the
+                // auth_id the card carries; PlanVerdict uses the session id
+                // (one pending review per session); capability calls mint a
                 // fresh opaque id.
                 let id = match &ctx {
                     ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => {
@@ -1670,13 +1701,23 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                     ReplyCtx::Other => inner.next_call_id(),
                 };
                 let rx = entry.peer.register(id.clone());
-                let conn = entry.conn.clone();
-                (conn, rx, id)
+                (cid.clone(), entry.conn.clone(), rx, id)
             })
+            .collect::<Vec<_>>()
     };
-    let Some((conn, rx, id)) = target else {
+    if targets.is_empty() {
         fail_closed(inner, session_id, &ctx);
         return;
+    }
+
+    if adjudication {
+        route_waterfall(inner, session_id, ctx, call, targets).await;
+        return;
+    }
+
+    let (conn, rx, id) = {
+        let (_, conn, rx, id) = targets.into_iter().next().expect("non-empty checked");
+        (conn, rx, id)
     };
     conn.send_to_client(FromServer::Request { id, call });
     let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
@@ -1691,6 +1732,79 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
             ServerNote::Error {
                 session_id: Some(session_id.into()),
                 message: "capability call timed out or cancelled".into(),
+            },
+        );
+    }
+    apply_reply(inner, session_id, ctx, outcome);
+}
+
+/// §D.4 fan-out/fan-in: deliver the adjudication Request to every target,
+/// funnel their replies (each bounded by [`CALL_TIMEOUT`]) into a
+/// [`crate::waterfall::Waterfall`], and apply the SETTLING reply's payload
+/// (the first rejection, or the final next). Recipients that never answered
+/// by settlement are owed a cancel in a future wire addition; until then
+/// the `pending_auth` projection is the truth clients reconcile against.
+/// One adjudication delivery: (client id, connection, reply receiver,
+/// deterministic MsgId).
+type AdjudicationTarget = (
+    String,
+    Arc<dyn RpcConnection>,
+    async_channel::Receiver<Result<Value, RpcError>>,
+    MsgId,
+);
+
+async fn route_waterfall(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    ctx: ReplyCtx,
+    call: ServerCall,
+    targets: Vec<AdjudicationTarget>,
+) {
+    let (funnel_tx, mut funnel_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Result<Value, RpcError>)>();
+    let mut waterfall = crate::waterfall::Waterfall::new(session_id.to_string(), {
+        let mut ids = targets
+            .iter()
+            .map(|(cid, ..)| cid.clone())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    });
+    for (cid, conn, rx, id) in targets {
+        conn.send_to_client(FromServer::Request {
+            id,
+            call: call.clone(),
+        });
+        let tx = funnel_tx.clone();
+        manox_agent::runtime::handle().spawn(async move {
+            let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
+                Ok(Ok(o)) => o,
+                _ => Err(RpcError::new(-1, "adjudication reply timed out")),
+            };
+            let _ = tx.send((cid, outcome));
+        });
+    }
+    drop(funnel_tx);
+    let mut settled: Option<Result<Value, RpcError>> = None;
+    while let Some((cid, outcome)) = funnel_rx.recv().await {
+        let next = outcome.is_ok();
+        if let Some(outcome_of_settler) = waterfall.reply(&cid, next).map(|_why| outcome) {
+            settled = Some(outcome_of_settler);
+            break;
+        }
+    }
+    let outcome = settled.unwrap_or_else(|| {
+        Err(
+            RpcError::new(-1, "adjudication unsettled (all deliveries expired)")
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+        )
+    });
+    if outcome.is_err() {
+        inner.route_note(
+            session_id,
+            ServerNote::Error {
+                session_id: Some(session_id.into()),
+                message: "adjudication rejected or timed out".into(),
             },
         );
     }
@@ -1963,6 +2077,34 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     }
 }
 
+/// The settable subset of a `SessionStatus` delta (§D.5).
+#[derive(Default)]
+struct SessionStatusDelta {
+    running: Option<bool>,
+    errored: Option<bool>,
+    unread: Option<bool>,
+    pending_auth: Option<bool>,
+    pending_plan: Option<bool>,
+    background_work: Option<bool>,
+}
+
+/// Build a `SessionStatus` delta (§D.5): only the fields the closure sets
+/// travel; clients merge monotonically (unread only rises until focus,
+/// errored edge-set, running latest-wins).
+fn host_status(session_id: &str, set: impl FnOnce(&mut SessionStatusDelta)) -> HostEvent {
+    let mut d = SessionStatusDelta::default();
+    set(&mut d);
+    HostEvent::SessionStatus {
+        session_id: session_id.to_string(),
+        running: d.running,
+        errored: d.errored,
+        unread: d.unread,
+        pending_auth: d.pending_auth,
+        pending_plan: d.pending_plan,
+        background_work: d.background_work,
+    }
+}
+
 // ── Event pump. ─────────────────────────────────────────────────────────────
 fn spawn_pump(
     inner: Arc<AgentServerInner>,
@@ -1989,6 +2131,10 @@ fn spawn_pump(
                         s.mark_running(&id);
                         s.set_errored(&id, false);
                     });
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.running = Some(true);
+                        f.errored = Some(false);
+                    }));
                 }
                 ThreadEvent::TurnFinished {
                     cancelled, failed, ..
@@ -2007,6 +2153,14 @@ fn spawn_pump(
                             s.set_unread(&id, true);
                         }
                     });
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.running = Some(false);
+                        f.pending_auth = Some(false);
+                        f.pending_plan = Some(false);
+                        if unread {
+                            f.unread = Some(true);
+                        }
+                    }));
                     if !*cancelled {
                         let drained = pending_submits
                             .lock()
@@ -2043,6 +2197,9 @@ fn spawn_pump(
                     let id = session_id.clone();
                     manox_agent::thread_store::global()
                         .with_mut(|s| s.mark_pending_auth(&id, true));
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.pending_auth = Some(true);
+                    }));
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
@@ -2051,6 +2208,10 @@ fn spawn_pump(
                         s.mark_pending_plan(&id, false);
                         s.mark_background_work(&id, false);
                     });
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.errored = Some(true);
+                        f.running = Some(false);
+                    }));
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
                     let id = session_id.clone();
@@ -3945,9 +4106,33 @@ mod tests {
                 .collect()
         };
         let (nip, nsl) = (normalize(seq_ip), normalize(seq_sl));
+        // Host frames (§D.5) originate on the pump task, whose interleaving
+        // with serve-loop frames is scheduler-dependent — equivalence is
+        // exact-order for everything else + multiset for host frames.
+        let split = |seq: Vec<serde_json::Value>| {
+            let mut hosts: Vec<serde_json::Value> = Vec::new();
+            let rest: Vec<serde_json::Value> = seq
+                .into_iter()
+                .filter(|v| {
+                    let is_host = v.get("kind").and_then(|k| k.as_str()) == Some("host");
+                    if is_host {
+                        hosts.push(v.clone());
+                    }
+                    !is_host
+                })
+                .collect();
+            hosts.sort_by_key(|h| h.to_string());
+            (rest, hosts)
+        };
+        let (rest_ip, hosts_ip) = split(nip);
+        let (rest_sl, hosts_sl) = split(nsl);
         assert_eq!(
-            nip, nsl,
-            "in-process and serde paths must produce identical FromServer sequences"
+            rest_ip, rest_sl,
+            "in-process and serde paths must produce identical FromServer sequences (non-host frames)"
+        );
+        assert_eq!(
+            hosts_ip, hosts_sl,
+            "host frames must be identical as a multiset across transports"
         );
 
         drop(client_ip);
@@ -4413,7 +4598,17 @@ mod tests {
         assert!(!snapshot.has_more);
         // §D.1 T4 scope: empty projection baseline, stamped at the cursor
         // (the registry is T5).
-        assert!(snapshot.projections.is_empty());
+        // T5: the snapshot baseline carries exactly the declared projection
+        // surface (§E.2 / L12) — the registry seeded from the thread and
+        // folded over the snapshot records.
+        let mut want: Vec<&str> = manox_protocol::surface::PROJECTION_KEYS.to_vec();
+        want.sort_unstable();
+        let mut got: Vec<&str> = snapshot.projections.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(
+            got, want,
+            "snapshot baseline IS the declared projection surface"
+        );
         assert_eq!(snapshot.projections_as_of_seq, snapshot.cursor);
         assert_eq!(snapshot.header.id, "s1");
 
@@ -4438,6 +4633,7 @@ mod tests {
             );
         }
         let mut last = snapshot.cursor;
+        let mut projection_frames = 0usize;
         for (seq, _make, tag) in &live {
             let (got, event) = loop {
                 match client.recv() {
@@ -4445,6 +4641,20 @@ mod tests {
                         frame: manox_protocol::StreamFrame::Entry { seq, event },
                         ..
                     } => break (seq, event),
+                    // The P face interleaves changed-key frames after the
+                    // entries that produced them (§E.1); count them for the
+                    // assertion below.
+                    FromServer::StreamItem {
+                        frame: manox_protocol::StreamFrame::Projections(frame),
+                        ..
+                    } => {
+                        assert!(
+                            frame.as_of_seq <= last + 1,
+                            "projection stamp stays with the stream cursor"
+                        );
+                        projection_frames += 1;
+                        continue;
+                    }
                     // Compat-window v1 push may interleave; skip it.
                     FromServer::Notification { .. } => continue,
                     other => panic!("expected Entry frames, got {other:?}"),
@@ -4461,6 +4671,9 @@ mod tests {
             last = got;
         }
         assert_eq!(last, 9, "cursor advanced across the whole live run");
+        // The scripted live run contains state changes (turn finish, model
+        // change, …) — the P face must have published at least one delta.
+        assert!(projection_frames > 0, "P face publishes changed keys");
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();

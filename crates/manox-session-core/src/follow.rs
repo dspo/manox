@@ -144,7 +144,13 @@ async fn run_follow_stream(
         SnapshotResult::Data(data) => {
             let mut records: Vec<manox_protocol::journal::JournalWireEntry> =
                 Vec::with_capacity(data.records.len());
+            // The per-stream projection set (P face, §E): seeded from the
+            // live thread, folded forward by every record — including the
+            // wire-projection-less ones (folds are kernel-level). After the
+            // loop the baseline is consistent with the snapshot cursor.
+            let mut projections = crate::projections::ProjectionSet::seed(&thread);
             for record in &data.records {
+                projections.apply_event(record.seq, &record.entry);
                 match wire_entry(record.seq, &record.entry) {
                     Some(entry) => records.push(entry),
                     None => tracing::trace!(
@@ -172,14 +178,23 @@ async fn run_follow_stream(
                 has_more,
                 // T5 projection registry: no keys folded yet — empty
                 // baseline, as of the read cursor (§D.1).
-                projections: std::collections::BTreeMap::new(),
+                projections: projections.baseline(),
                 projections_as_of_seq: data.cursor,
             };
             conn.send_to_client(FromServer::StreamItem {
                 stream_id: stream_id.clone(),
                 frame: StreamFrame::Snapshot(snapshot),
             });
-            forward_entries(&conn, &stream_id, &mut feed, &cancel, &reason).await
+            forward_entries(
+                &conn,
+                &stream_id,
+                &session_id,
+                &mut feed,
+                &mut projections,
+                &cancel,
+                &reason,
+            )
+            .await
         }
         SnapshotResult::Unavailable => {
             requested_reason(&reason).unwrap_or(StreamEndReason::Failure {
@@ -219,10 +234,13 @@ async fn snapshot_with_retry(thread: &ThreadHandle, cancel: &CancellationToken) 
 
 /// Forward live feed events as Entry frames until cancelled / Lagged /
 /// channel close. Returns the [`StreamEndReason`] to terminate with.
+#[allow(clippy::too_many_arguments)] // stream plumbing: each input is distinct
 async fn forward_entries(
     conn: &Arc<dyn RpcConnection>,
     stream_id: &StreamId,
+    session_id: &str,
     feed: &mut tokio::sync::broadcast::Receiver<JournalFeed>,
+    projections: &mut crate::projections::ProjectionSet,
     cancel: &CancellationToken,
     reason: &Arc<StdMutex<Option<StreamEndReason>>>,
 ) -> StreamEndReason {
@@ -255,6 +273,21 @@ async fn forward_entries(
                     // Wire-projection-less entries do not open a gap on the
                     // client (§F.1 rule 2): the seq stays unclaimed and the
                     // next Entry seals the window.
+                    // P face: fold server-side regardless of wire
+                    // projection, then publish changed keys (§E.1).
+                    projections.apply_event(event.seq, &event.entry);
+                    if let Some((as_of_seq, values)) = projections.drain_changed() {
+                        conn.send_to_client(FromServer::StreamItem {
+                            stream_id: stream_id.clone(),
+                            frame: StreamFrame::Projections(
+                                manox_protocol::stream::ProjectionsFrame {
+                                    session_id: session_id.to_string(),
+                                    as_of_seq,
+                                    values,
+                                },
+                            ),
+                        });
+                    }
                 }
                 Ok(JournalFeed::Lagged(n)) => {
                     tracing::warn!(

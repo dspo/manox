@@ -12,9 +12,12 @@ use manox_session_core::agent_server::AgentServer;
 /// Create the single `AgentServer` and store it in the crate global. Call
 /// once at app startup, before any WS connection is accepted.
 pub fn spawn_server() {
+    // L11: adopt the process-global AgentServer (the desktop window created
+    // it at startup); only a standalone webui run boots a fresh one, which
+    // `global()` itself get-or-inits — there is never a second instance.
     let cwd = crate::bridge::resolve_cwd();
-    let server = AgentServer::new(std::path::PathBuf::from(cwd));
-    let _ = crate::AGENT_SERVER.set(Arc::new(server));
+    let server = manox_session_core::agent_server::global(std::path::PathBuf::from(cwd));
+    let _ = crate::AGENT_SERVER.set(server);
 }
 
 /// The shared AgentServer handle, if `spawn_server` has run.

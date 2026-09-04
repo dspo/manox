@@ -762,9 +762,9 @@ impl Workspace {
         if let Some(home) = manox_agent::paths::home_dir() {
             cwd = home;
         }
-        let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
-            cwd.clone(),
-        ));
+        // L11: the process-global server — every window and the embedded
+        // web UI share one AgentServer (one ownership/routing table).
+        let agent_server = manox_session_core::agent_server::global(cwd.clone());
         // The landing thread id doubles as its AgentServer session id
         // (`CreateSession` uses the session id as the `ThreadId`), so the
         // thread the workspace renders and the thread the server drives are

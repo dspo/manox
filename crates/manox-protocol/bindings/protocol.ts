@@ -24,7 +24,7 @@ export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | {
 /**
  * Server → client message.
  */
-export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, } | { "kind": "streamItem", streamId: StreamId, frame: StreamFrame, } | { "kind": "streamEnd", streamId: StreamId, reason: StreamEndReason, };
+export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, } | { "kind": "host", host: HostEvent, } | { "kind": "streamItem", streamId: StreamId, frame: StreamFrame, } | { "kind": "streamEnd", streamId: StreamId, reason: StreamEndReason, };
 
 /**
  * Capabilities a client can answer when the server issues a [`super::ServerCall`].

@@ -69,6 +69,10 @@ impl ClientStoreHandle {
             FromServer::StreamEnd { stream_id, reason } => {
                 tracing::debug!(stream = %stream_id.0, ?reason, "agent-ui: ignoring StreamEnd (T4 envelope, consumed at T6)");
             }
+            // T5 envelope compat: §D.5 host events arrive at T6.
+            FromServer::Host { host } => {
+                tracing::debug!(?host, "agent-ui: ignoring HostEvent (T5 envelope, consumed at T6)");
+            }
         }
     }
 }

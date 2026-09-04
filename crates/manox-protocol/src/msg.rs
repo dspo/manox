@@ -161,6 +161,10 @@ pub enum FromServer {
     /// that replaces the doomed `ServerNote` domain arms; the swap waits on
     /// the consumer migration (see module docs).
     Notification { note: crate::server::ServerNote },
+    /// v2 host event (§D.5): global, change-driven broadcasts
+    /// (`SessionStatus` deltas, `Models`/`Commands` refresh pushes, …)
+    /// addressed to every connected client, not to a session's owners.
+    Host { host: crate::stream::HostEvent },
     /// One frame of a live stream (§D.1). `Snapshot` / `Projections` and the
     /// terminal `StreamEnd` never drop under backpressure (L5 / §D.7);
     /// `Entry` frames ride a bounded queue that resyncs on overflow.

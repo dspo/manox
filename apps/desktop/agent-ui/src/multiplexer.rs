@@ -99,6 +99,12 @@ impl SessionMultiplexer {
                 tracing::debug!(stream = %stream_id.0, ?reason, "agent-ui: dropping StreamEnd (consumed at T6)");
                 return;
             }
+            // T5 envelope compat: §D.5 host events are global broadcasts
+            // (no session routing); the desktop consumes them at T6.
+            FromServer::Host { host } => {
+                tracing::debug!(?host, "agent-ui: dropping HostEvent (consumed at T6)");
+                return;
+            }
         };
         let Some(sid) = sid else { return };
         let Some(handle) = self.sessions.get(&sid).cloned() else {
