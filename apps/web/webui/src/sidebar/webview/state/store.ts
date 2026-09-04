@@ -1138,7 +1138,11 @@ export class Store {
 			// higher-seq-wins (equal seq keeps the newer frame — the frame
 			// ordering the server guarantees within a stream).
 			if (!prev || asOfSeq >= prev.seq) {
-				runtime.projections.set(key, { value, seq: asOfSeq });
+				// Freeze on write so `projection()` can hand out a stable
+				// reference between changes — the `useSyncExternalStore`
+				// contract `useProjection` relies on (a fresh object per read
+				// would loop the subscriber).
+				runtime.projections.set(key, Object.freeze({ value, seq: asOfSeq }));
 			}
 		}
 	}
@@ -1200,11 +1204,10 @@ export class Store {
 	}
 
 	/** §E.2 read seam: the `{ value, seq }` slot of one projection key
-	 * (frozen object — stable identity between changes, safe as a
+	 * (frozen at write — stable identity between changes, safe as a
 	 * `useSyncExternalStore` source). `undefined` while unseen. */
 	projection(sessionId: string, key: string): Readonly<ProjectionSlot> | undefined {
-		const slot = this.sessions.get(sessionId)?.projections.get(key);
-		return slot ? Object.freeze({ ...slot }) : undefined;
+		return this.sessions.get(sessionId)?.projections.get(key);
 	}
 
 	/** §E.3 write seam for the conversation-info plugin: park the folded
