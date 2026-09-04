@@ -2867,16 +2867,17 @@ async fn run_actor(
         };
         let Some(cmd) = cmd else { break };
         match cmd {
-            // `_origin_rpc` is retained for the follow-up echo-retirement
-            // wiring (T5b prompt-pipeline threading, deferred — see the
-            // `SessionCmd::Prompt` field doc): the user message is appended by
-            // the shared persistence middleware, which does not yet carry the
-            // origin to that append, so it is unused here.
             SessionCmd::Prompt {
                 text,
                 images,
-                origin_rpc: _origin_rpc,
+                origin_rpc,
             } => {
+                // Echo retirement (§F.2): pin the client's RPC id onto this
+                // turn's first user message; the persistence middleware
+                // drains it on exactly that append.
+                if origin_rpc.is_some() {
+                    session.set_pending_user_origin(origin_rpc.clone());
+                }
                 // Plugin lifecycle: `SessionStart` fires once per session,
                 // before the first user turn (fail-open, detached).
                 if !state.session_start_fired.swap(true, Ordering::SeqCst) {

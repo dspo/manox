@@ -611,6 +611,11 @@ pub struct Session<S: SessionStorage> {
     /// the same leaf and fork sibling branches — the linearized per-session
     /// append queue of the TS storage (upstream 4488ad55c).
     append_lock: tokio::sync::Mutex<()>,
+    /// The RPC id a client pinned to THIS turn's first user message (the
+    /// echo-retirement contract, §F.2): the host sets it when Submit carries
+    /// `origin_rpc`; the persistence middleware drains it on exactly that
+    /// append. One-shot by construction.
+    pending_user_origin: std::sync::Mutex<Option<String>>,
 }
 
 /// Authorship of a persisted compaction: whether a before-compact hook
@@ -628,7 +633,19 @@ impl<S: SessionStorage> Session<S> {
         Session {
             storage,
             append_lock: tokio::sync::Mutex::new(()),
+            pending_user_origin: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Pin the origin RPC id for this turn's first user message (§F.2).
+    pub fn set_pending_user_origin(&self, origin: Option<String>) {
+        *self.pending_user_origin.lock().unwrap() = origin;
+    }
+
+    /// Drain the pending origin (the persistence middleware's one-shot take
+    /// on the user-message append).
+    pub fn take_pending_user_origin(&self) -> Option<String> {
+        self.pending_user_origin.lock().unwrap().take()
     }
 
     pub fn storage(&self) -> &S {
