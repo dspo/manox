@@ -2452,6 +2452,102 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// Cross-provider model selection contract: a bare model id resolves
+    /// the first-sorted registration (ambiguous when two providers expose
+    /// the same id), so selection surfaces must emit the registration-
+    /// qualified `{provider}/{model-id}` reference to pin the clicked row.
+    #[test]
+    fn set_model_qualified_ref_pins_provider() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        await_provider_registry();
+        register_test_model("alpha-model");
+        // Two registrations sharing one model id; `a-…` sorts before `z-…`.
+        for (reg, display) in [
+            ("zeta-dup-a-provider", "Alpha Dup"),
+            ("zeta-dup-z-provider", "Zulu Dup"),
+        ] {
+            use manox_harness::provider_registry::{
+                Api, Cost, InputModality, ProviderConfig, ProviderModelConfig,
+            };
+            manox_agent::provider_glue::global()
+                .register_provider(
+                    reg,
+                    ProviderConfig {
+                        name: Some(display.into()),
+                        base_url: Some("https://dup.example".into()),
+                        api_key: Some("k".into()),
+                        api: Some(Api::AnthropicMessages),
+                        headers: None,
+                        auth_header: false,
+                        models: vec![ProviderModelConfig {
+                            id: "dup-ref-model".into(),
+                            name: "dup-ref-model".into(),
+                            reasoning: false,
+                            input: vec![InputModality::Text],
+                            context_window: 1000,
+                            max_tokens: 100,
+                            cost: Cost::default(),
+                            api: None,
+                            base_url: None,
+                            metadata: HashMap::new(),
+                        }],
+                    },
+                )
+                .unwrap();
+        }
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let pushed_thread_info = || -> ThreadInfoPayload {
+            loop {
+                if let FromServer::Notification {
+                    note: ServerNote::ThreadInfo { info, .. },
+                } = client.recv()
+                {
+                    return *info;
+                }
+            }
+        };
+        fn model_provider(info: &ThreadInfoPayload) -> Option<&str> {
+            info.model
+                .as_ref()
+                .and_then(|v| v.get("provider"))
+                .and_then(|s| s.as_str())
+        }
+
+        // A qualified reference pins the second (non-first-sorted) provider.
+        client.send(FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: "s1".into(),
+                id: "zeta-dup-z-provider/dup-ref-model".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(info.model_id.as_deref(), Some("dup-ref-model"));
+        assert_eq!(
+            model_provider(&info),
+            Some("zeta-dup-z-provider"),
+            "a registration-qualified reference must pin the clicked provider"
+        );
+
+        // A bare id resolves the first-sorted registration — the ambiguity
+        // that obligates the qualified form on selection surfaces.
+        client.send(FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: "s1".into(),
+                id: "dup-ref-model".into(),
+            },
+        });
+        let info = pushed_thread_info();
+        assert_eq!(model_provider(&info), Some("zeta-dup-a-provider"));
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
     /// A conversation's project never re-binds: once the thread has interacted,
     /// `SetCwd` moves only the engine's working directory, leaving the bound
     /// project and the header cwd untouched — but the mutation still re-publishes

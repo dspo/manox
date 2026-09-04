@@ -6508,6 +6508,8 @@ impl Workspace {
     /// A config model registered through several wire apis appears once per
     /// wire endpoint (exact duplicates collapse), so the responses and
     /// completions variants stay selectable alongside the anthropic one.
+    /// Rows select through a registration-qualified reference so a model id
+    /// shared across providers pins the clicked row's exact endpoint.
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
@@ -6564,12 +6566,12 @@ impl Workspace {
                                 .child(model_name.clone())
                         })
                         .on_click(move |_, _, cx: &mut gpui::App| {
-                            let model = model.clone();
+                            let reference = manox_agent::provider_glue::qualified_ref(&model);
                             let _ = ws.update(cx, |this, _cx| {
                                 let _ =
                                     this.send_note(|sid| manox_protocol::ClientNote::SetModel {
                                         session_id: sid.into(),
-                                        id: model.id.clone(),
+                                        id: reference,
                                     });
                             });
                         }),
