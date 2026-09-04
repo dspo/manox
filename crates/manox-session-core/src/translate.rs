@@ -414,33 +414,87 @@ use Translated::*;
 mod tests {
     use super::*;
 
-    /// The compaction tail must flow through the REAL translate path, not a
+    /// T10 (§D.6): the v1 `Compaction` note mirror is gone — the transcript
+    /// replace signal is the §C.2 `compaction` journal row, forwarded over the
+    /// follow stream. The tail must flow through the REAL wire mapping, not a
     /// synthetic empty array: the client store replaces its transcript with
-    /// `summary + retained`, so an empty-by-default field would wipe every
-    /// protocol client's transcript on each real compaction.
+    /// `summary + retainedTail`, so an empty-by-default field would wipe every
+    /// client's transcript on each real compaction. (The `None`-tail round-trip
+    /// is pinned by the coverage test below; this one pins tail survival.)
     #[test]
-    fn compaction_note_carries_the_retained_tail() {
+    fn compaction_wire_row_carries_the_retained_tail() {
+        let now = chrono::Utc::now();
         let tail = vec![
-            manox_agent::message::Message::assistant(vec![
-                manox_agent::language_model::MessageContent::Text("kept answer".into()),
-            ]),
-            manox_agent::message::Message::user("kept follow-up".into()),
-        ];
-        let translated = translate(
-            &::manox_agent::thread::ThreadEvent::Compaction {
-                summary: "folded".into(),
-                messages_compacted: 9,
-                tokens_before: 100_000,
-                retained_tail: tail.clone(),
+            AgentMessage::Assistant {
+                content: vec![manox_harness::types::ContentBlock::Text {
+                    text: "kept answer".into(),
+                    signature: None,
+                }],
+                model: "m".into(),
+                provider: "p".into(),
+                api: "anthropic".into(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                stop_reason: Some(manox_harness::types::StopReason::Stop),
+                raw_stop_reason: None,
+                usage: Box::default(),
+                error_message: None,
+                timestamp: now,
             },
-            "s1",
-        );
-        let Translated::Note(ServerNote::Compaction { retained, .. }) = translated else {
-            panic!("expected a Compaction note");
+            AgentMessage::User {
+                content: vec![manox_harness::types::ContentBlock::Text {
+                    text: "kept follow-up".into(),
+                    signature: None,
+                }],
+                timestamp: now,
+            },
+        ];
+        let entry = wire_entry(
+            7,
+            &manox_harness::session::SessionTreeEntry::Compaction {
+                id: "c1".into(),
+                parent_id: None,
+                timestamp: now,
+                summary: "folded".into(),
+                first_kept_entry_id: None,
+                tokens_before: 100_000,
+                retained_tail: Some(tail.clone()),
+                usage: None,
+                details: None,
+                from_hook: None,
+            },
+        )
+        .expect("compaction maps to a wire row");
+        let JournalWireEvent::Compaction {
+            summary,
+            tokens_before,
+            retained_tail,
+            ..
+        } = &entry.event
+        else {
+            panic!("expected a compaction wire row");
         };
-        let round: Vec<manox_agent::message::Message> =
-            serde_json::from_value(retained).expect("retained deserializes back");
-        assert_eq!(round.len(), 2, "the tail survives the wire form");
+        assert_eq!(summary, "folded");
+        assert_eq!(*tokens_before, 100_000);
+        assert_eq!(retained_tail.len(), 2, "the tail survives the wire form");
+        // And it survives the JSON form the follow stream actually carries
+        // (§C.1: the event is flattened into the entry envelope).
+        let json = serde_json::to_value(&entry).expect("row serializes");
+        assert_eq!(json["type"].as_str(), Some("compaction"));
+        assert_eq!(
+            json["retainedTail"].as_array().map(Vec::len),
+            Some(2),
+            "retained tail is present, not empty-by-default"
+        );
+        let back: JournalWireEntry = serde_json::from_value(json).expect("row parses back");
+        assert_eq!(entry, back);
+        // Each carried block round-trips to the kernel message shape the
+        // transcript rebuild consumes.
+        let round: Vec<AgentMessage> = retained_tail
+            .iter()
+            .map(|v| serde_json::from_value(v.clone()).expect("retained message deserializes back"))
+            .collect();
         assert_eq!(round.len(), tail.len());
     }
 

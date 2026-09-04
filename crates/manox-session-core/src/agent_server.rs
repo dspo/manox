@@ -2773,6 +2773,32 @@ mod tests {
         }
     }
 
+    /// §D.5 / T10: the v2 turn-edge signal. Drain until a
+    /// `Host{SessionStatus}` delta for `session_id` whose set fields pass
+    /// `check`. Host frames are broadcast to every connection and may
+    /// interleave with other traffic, so the match is a drain loop — the
+    /// closure only ever sees frames for this session.
+    fn expect_host_status<F>(client: &Client, session_id: &str, check: F)
+    where
+        F: Fn(Option<bool>, Option<bool>, Option<bool>, Option<bool>) -> bool,
+    {
+        expect(client, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id: sid,
+                        running,
+                        errored,
+                        unread,
+                        pending_auth,
+                        ..
+                    }
+                } if sid == session_id && check(*running, *errored, *unread, *pending_auth)
+            )
+        });
+    }
+
     /// Query `ThreadInfo` and return the typed payload.
     fn thread_info(client: &Client, session_id: &str) -> ThreadInfoPayload {
         client.send(FromClient::Request {
@@ -2859,10 +2885,10 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { session_id } } if session_id == "s1"),
-        );
+        // v2 turn edges (§D.5): the pump's `SessionStatus` host deltas replace
+        // the doomed TurnStarted/TurnFinished notes — running rises to true on
+        // the turn, falls back to false on settle.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         engine
             .notices
             .send(BackendNotice::Settled {
@@ -2872,10 +2898,7 @@ mod tests {
                 stranded: Vec::new(),
             })
             .unwrap();
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnFinished { session_id, .. } } if session_id == "s1"),
-        );
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -2941,14 +2964,8 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // Turn edge as a v2 host delta (§D.5), not the doomed TurnStarted note.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         engine
             .notices
             .send(BackendNotice::Event(Box::new(
@@ -3004,14 +3021,7 @@ mod tests {
                 stranded: Vec::new(),
             })
             .unwrap();
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnFinished { .. }
-                }
-            )
-        });
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -3035,14 +3045,8 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // Turn edge as a v2 host delta (§D.5), not the doomed TurnStarted note.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         engine
             .notices
             .send(BackendNotice::Event(Box::new(
@@ -3207,14 +3211,10 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // v2 turn edge (§D.5): stop at the running=true host delta without
+        // settling, exactly as the old TurnStarted-note gate did — `Settled`
+        // would wipe the interaction state through the fake's empty history().
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
 
         // Now switch the working directory. The project header must stay at
         // the create-time cwd; only the engine's cwd advances.
@@ -3317,14 +3317,8 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // v2 turn edge (§D.5) replaces the TurnStarted note gate.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         // Detach drops ownership without cancelling; the engine keeps its run.
         client.send(FromClient::Notification {
             note: ClientNote::DetachSession {
@@ -3358,14 +3352,8 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // v2 turn edge (§D.5) replaces the TurnStarted note gate.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         engine
             .notices
             .send(BackendNotice::Event(Box::new(
@@ -3419,14 +3407,7 @@ mod tests {
                 stranded: Vec::new(),
             })
             .unwrap();
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnFinished { .. }
-                }
-            )
-        });
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -3519,14 +3500,8 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            )
-        });
+        // v2 turn edge (§D.5) replaces the TurnStarted note gate.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         // Inject a BrowserRequest; the AgentServer's impl routes it to the client.
         let (tx, rx) = async_channel::bounded(1);
         engine
@@ -3625,27 +3600,32 @@ mod tests {
         });
         // Now inject an event — the pump subscribed before the snapshot
         // was sent, so the event must arrive via the subscription stream.
+        // v2 (§D.5/§D.6): the turn edge surfaces as a `SessionStatus` host
+        // delta, not a TurnStarted note.
         let (engine, events) = FakeEngine::new();
         server.set_session_engine_for_test("s1", engine.clone(), events);
         engine
             .notices
             .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
             .unwrap();
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { session_id } } if session_id == "s1"),
-        );
-        // Verify no duplicate TurnStarted. The snapshot is empty (fresh
-        // thread with no history), so the subscription should deliver the
-        // event exactly once.
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
+        // Verify no duplicate edge. The snapshot is empty (fresh thread with
+        // no history), so the subscription should deliver the event exactly
+        // once — the pump must not have re-emitted a second running=true
+        // SessionStatus for the same edge.
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         loop {
             match client.conn.server_rx().try_recv() {
-                Ok(FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. },
-                }) => {
+                Ok(FromServer::Host {
+                    host:
+                        HostEvent::SessionStatus {
+                            session_id: sid,
+                            running: Some(true),
+                            ..
+                        },
+                }) if sid == "s1" => {
                     panic!(
-                        "duplicate TurnStarted delivered — event is in both snapshot and subscription"
+                        "duplicate turn-start edge delivered — event is in both snapshot and subscription"
                     );
                 }
                 Ok(_) => continue,
@@ -3826,19 +3806,29 @@ mod tests {
             client_sl.send(FromClient::Notification { note });
         }
 
-        // Sequence the script: TurnStarted must land on BOTH paths before the
-        // auth notice is injected — otherwise the dispatch task's TurnStarted
-        // and the pump task's Approve interleave non-deterministically (two
-        // concurrent server-side sources, not a transport difference).
+        // Sequence the script: the v2 turn edge (§D.5 `SessionStatus`
+        // running=true) must land on BOTH paths before the auth notice is
+        // injected — otherwise the dispatch task's turn start and the pump
+        // task's Approve interleave non-deterministically (two concurrent
+        // server-side sources, not a transport difference). The gate frame
+        // itself is pushed into the collected sequence, so the host-frame
+        // multiset comparison below still verifies transport identity of the
+        // edge signal.
+        let is_turn_edge = |m: &FromServer| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        running: Some(true),
+                        ..
+                    }
+                }
+            )
+        };
         let mut seq_ip: Vec<FromServer> = Vec::new();
         loop {
             let m = client_ip.recv();
-            let hit = matches!(
-                &m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            );
+            let hit = is_turn_edge(&m);
             seq_ip.push(m);
             if hit {
                 break;
@@ -3847,12 +3837,7 @@ mod tests {
         let mut seq_sl: Vec<FromServer> = Vec::new();
         loop {
             let m = client_sl.recv_timeout(Duration::from_secs(10));
-            let hit = matches!(
-                &m,
-                FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                }
-            );
+            let hit = is_turn_edge(&m);
             seq_sl.push(m);
             if hit {
                 break;
@@ -3860,7 +3845,7 @@ mod tests {
         }
 
         // Engine-side script: one authorization round-trip per session,
-        // injected only after both paths settled TurnStarted.
+        // injected only after both paths settled the turn edge.
         for engine in [&engine_ip, &engine_sl] {
             engine
                 .notices
@@ -4142,7 +4127,8 @@ mod tests {
     }
 
     /// ε-2b: multi-client routing — two clients, two sessions, one server.
-    /// Broadcast notes reach every owner; the spec is the observed behavior.
+    /// Session-scoped notes reach every owner; §D.5 host deltas reach every
+    /// connection (global broadcast). The spec is the observed behavior.
     #[test]
     fn multi_client_broadcast_and_dispose_semantics() {
         let _g = lock_globals();
@@ -4176,39 +4162,71 @@ mod tests {
         let (engine, events) = FakeEngine::new();
         server.set_session_engine_for_test("sa", engine.clone(), events);
 
-        // A note for sa reaches ONLY sa's owner (session routing, not a
-        // global broadcast): client_b must not see it.
+        // A v2 session-scoped domain signal for sa must reach EVERY client:
+        // `SessionStatus` host deltas are broadcast globally (§D.5), not
+        // owner-routed like `route_note` — the replaceable-note domain moved
+        // onto this global lane in T10, so the ownership routing proof rides
+        // it now. Injecting `TurnStarted` (a doomed-note event in v1) is also
+        // a pin that the pump emits NO session-scoped Notification for it.
         engine
             .notices
-            .send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                anyhow::anyhow!("routing probe"),
-            ))))
+            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
             .unwrap();
-        expect(&client_a, |m| {
+        // b is a non-owner: it must still get sa's host frame (broadcast),
+        // while every owner-scoped frame it might hold (Ready, its own
+        // create acks, ...) may drain past.
+        expect(&client_b, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id,
+                        running: Some(true),
+                        ..
+                    }
+                } if session_id == "sa"
+            )
+        });
+        // Drain everything still queued on both clients and classify.
+        let drain = |c: &Client| {
+            let mut v = Vec::new();
+            while let Ok(m) = c.conn.server_rx().try_recv() {
+                v.push(m);
+            }
+            v
+        };
+        let a_pending = drain(&client_a);
+        let b_pending = drain(&client_b);
+        // Spec: (1) neither owner sees a doomed-note Notification — translate
+        // no longer mirrors any session-domain note for the turn edge;
+        // (2) every session-scoped host frame a or b holds belongs to sa —
+        // only sa's engine is wired, so no foreign session can leak.
+        let doomed = |m: &FromServer| {
             matches!(
                 m,
                 FromServer::Notification {
-                    note: ServerNote::Error { .. }
+                    note: ServerNote::TurnStarted { .. }
+                        | ServerNote::TurnFinished { .. }
+                        | ServerNote::Stop { .. }
+                        | ServerNote::Error { .. }
                 }
             )
-        });
-        // Routing spec: b may hold unrelated pending traffic, but never one of
-        // sa's session notes. Drain-and-classify instead of asserting emptiness.
-        let mut b_pending = Vec::new();
-        while let Ok(m) = client_b.conn.server_rx().try_recv() {
-            b_pending.push(m);
-        }
-        let leaked = b_pending.iter().any(|m| {
+        };
+        let foreign = |m: &FromServer| {
             matches!(
                 m,
-                FromServer::Notification {
-                    note: ServerNote::Error { .. }
-                }
+                FromServer::Host {
+                    host: HostEvent::SessionStatus { session_id, .. }
+                } if session_id != "sa"
             )
-        });
+        };
         assert!(
-            !leaked,
-            "client_b must never receive sa's notes: {b_pending:?}"
+            !a_pending.iter().any(doomed) && !b_pending.iter().any(doomed),
+            "translate must emit no session-domain notes (v1 mirrors removed): a={a_pending:?} b={b_pending:?}"
+        );
+        assert!(
+            !a_pending.iter().any(foreign) && !b_pending.iter().any(foreign),
+            "no foreign-session host frames may reach either client: a={a_pending:?} b={b_pending:?}"
         );
 
         // Dispose: each client detaches its own session; the other is
@@ -4378,7 +4396,8 @@ mod tests {
                 }
             )
         });
-        // Drive one turn: exactly one TurnStarted must reach the client.
+        // Drive one turn: exactly one turn edge (v2: `SessionStatus`
+        // running=true host delta, §D.5) must reach the client.
         client.send(FromClient::Notification {
             note: ClientNote::Submit {
                 session_id: "s1".into(),
@@ -4387,12 +4406,9 @@ mod tests {
                 client_id: None,
             },
         });
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnStarted { session_id } } if session_id == "s1"),
-        );
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
         // Nothing further may be queued: a duplicate owner would have delivered
-        // a second TurnStarted (or any second note) here.
+        // a second turn edge here.
         std::thread::sleep(Duration::from_millis(100));
         let mut extras = Vec::new();
         while let Ok(extra) = client.conn.server_rx().try_recv() {
@@ -4411,10 +4427,7 @@ mod tests {
                 stranded: Vec::new(),
             })
             .unwrap();
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::TurnFinished { session_id, .. } } if session_id == "s1"),
-        );
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
