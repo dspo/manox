@@ -65,6 +65,9 @@ struct QueuedSubmit {
     text: String,
     images: Vec<(String, String)>,
     ui: MessageUiMetadata,
+    /// The Submit's origin RPC id (echo retirement, §F.2). A drained batch
+    /// merges into one turn, so the last non-None origin wins.
+    origin: Option<String>,
 }
 
 /// One connected frontend.
@@ -1265,9 +1268,6 @@ impl AgentServerInner {
         client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, RpcError> {
-        if origin_rpc.is_some() {
-            tracing::debug!("Submit originRpc accepted; kernel origin row lands at T5 (gap)");
-        }
         let receipt = |accepted: bool, message_id: Option<String>| {
             Ok(json!({ "accepted": accepted, "message_id": message_id }))
         };
@@ -1312,6 +1312,7 @@ impl AgentServerInner {
                 text,
                 images,
                 ui,
+                origin: origin_rpc,
             });
             return receipt(true, None);
         }
@@ -1325,6 +1326,7 @@ impl AgentServerInner {
             Inserted,
         }
         let outcome = thread.with_mut(|t| {
+            t.set_pending_turn_origin(origin_rpc);
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
@@ -1373,11 +1375,10 @@ impl AgentServerInner {
         message_id: String,
         text: String,
         images: Vec<ImageAttachment>,
-        origin_rpc: Option<String>,
+        // The steer id IS the echo correlation (the client retires its
+        // echo when the steer's own injection settles); no origin pin.
+        _origin_rpc: Option<String>,
     ) -> Result<Value, RpcError> {
-        if origin_rpc.is_some() {
-            tracing::debug!("Steer originRpc accepted; kernel origin row lands at T5 (gap)");
-        }
         let images: Vec<(String, String)> = images
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
@@ -2013,10 +2014,14 @@ fn spawn_pump(
                             .drain(..)
                             .collect::<Vec<_>>();
                         let drained_any = !drained.is_empty();
+                        let mut batch_origin: Option<String> = None;
                         if drained_any {
                             let interacted = thread.read(|t| t.has_interacted());
                             thread.with_mut(|t| {
                                 for q in drained {
+                                    if q.origin.is_some() {
+                                        batch_origin = q.origin.clone();
+                                    }
                                     let content = to_message_content(q.text, q.images);
                                     t.insert_user_message_with_content_and_ui_metadata(
                                         content,
@@ -2028,6 +2033,7 @@ fn spawn_pump(
                         }
                         thread.with_mut(|t| {
                             if drained_any || t.has_pending_prompts() {
+                                t.set_pending_turn_origin(batch_origin);
                                 t.run_turn();
                             }
                         });
@@ -4788,6 +4794,7 @@ mod tests {
                     parent_id: parent,
                     timestamp: chrono::Utc::now(),
                     message,
+                    origin: None,
                 }
             };
         engine.set_journal(

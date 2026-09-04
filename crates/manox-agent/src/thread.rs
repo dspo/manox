@@ -329,6 +329,12 @@ pub struct Thread {
     /// Text of user messages inserted since the last run, drained by
     /// `run_turn` into one prompt.
     pending_prompts: Vec<String>,
+    /// The client RPC id pinned onto THIS turn's first user message (echo
+    /// retirement, §F.2): set by the host right before `run_turn`, consumed
+    /// by it. One turn carries one origin — a queued batch merges into a
+    /// single turn, so the last non-None origin wins (documented; receipts
+    /// keep per-call correlation).
+    pending_turn_origin: Option<String>,
     /// Image blocks attached to the pending prompts, drained by `run_turn`
     /// onto the engine (kernel `ContentBlock::Image`).
     pending_images: Vec<manox_harness::types::ContentBlock>,
@@ -672,6 +678,7 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -757,6 +764,7 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -1156,6 +1164,12 @@ impl Thread {
         id
     }
 
+    /// Pin the origin RPC id for the next turn (§F.2). Must be set before
+    /// `run_turn`; cleared by it.
+    pub fn set_pending_turn_origin(&mut self, origin: Option<String>) {
+        self.pending_turn_origin = origin;
+    }
+
     pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
@@ -1163,12 +1177,13 @@ impl Thread {
         self.ensure_engine(self.project.clone());
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
+        let origin = self.pending_turn_origin.take();
         self.running = true;
         self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
-            .run(prompt, images);
+            .run_with_origin(prompt, images, origin);
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -1609,6 +1624,7 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -2460,6 +2476,7 @@ pub(crate) mod tests {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,

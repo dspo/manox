@@ -173,6 +173,18 @@ pub trait ThreadEngine: Send + Sync {
     ) {
     }
 
+    /// `run` with the client's origin RPC id pinned onto this turn's first
+    /// user message (§F.2). Engines without origin support ignore it.
+    fn run_with_origin(
+        &self,
+        prompt: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) {
+        let _ = origin;
+        self.run(prompt, images);
+    }
+
     /// Run a manual context-compaction pass (`/compact`). Backends without
     /// kernel compaction ignore this; backends that require an idle
     /// transcript no-op while a turn is in flight.

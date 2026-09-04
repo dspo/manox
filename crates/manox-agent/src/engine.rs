@@ -695,6 +695,18 @@ fn spawn_history_preview(
 }
 
 impl ThreadEngine for PiEngine {
+    fn run_with_origin(
+        &self,
+        prompt: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) {
+        let _ = self.cmd_tx.send(SessionCmd::Prompt {
+            text: prompt,
+            images,
+            origin_rpc: origin,
+        });
+    }
     fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Relaxed)
     }

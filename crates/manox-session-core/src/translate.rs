@@ -312,16 +312,17 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
     use JournalWireEvent as W;
     Some(match entry {
         // ── transcript ──────────────────────────────────────────────────
-        SessionTreeEntry::Message { message, .. } => match message {
+        SessionTreeEntry::Message {
+            message, origin, ..
+        } => match message {
             AgentMessage::User { content, .. } => W::Message {
                 role: "user".into(),
                 content: content_blocks(content),
                 usage: None,
-                // `originRpc` on the durable user row is a kernel-type gap
-                // (harness `AgentMessage::User` has no origin field; the
-                // kernel lands it in T5) — the Submit receipt carries the
-                // correlation meanwhile (L7).
-                origin_rpc: None,
+                // The kernel pins the Submit's RPC id on exactly this entry
+                // (T5b pending-origin middleware drain) — the echo-retirement
+                // correlation travels on the durable row itself (§F.2).
+                origin_rpc: origin.clone(),
             },
             AgentMessage::Assistant { content, usage, .. } => W::Message {
                 role: "assistant".into(),
@@ -636,6 +637,7 @@ mod tests {
                     content: vec![],
                     timestamp: now,
                 },
+                origin: None,
             },
             E::Compaction {
                 id: id(),

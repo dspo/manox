@@ -345,6 +345,7 @@ mod tests {
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hello"),
+                origin: None,
             },
         );
         set.apply(&user);
