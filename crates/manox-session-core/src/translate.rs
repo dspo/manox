@@ -277,6 +277,307 @@ pub fn token_usage_snapshot(usage: &manox_agent::language_model::TokenUsage) -> 
     }
 }
 
+// ── v4 journal → wire mapping (§C.2 / §D.1, T4) ─────────────────────────────
+//
+// The kernel `SessionTreeEntry` vocabulary (37 variants, journal v4) projects
+// onto the wire [`manox_protocol::JournalWireEvent`] (34 variants). Three
+// kernel variants have no §C.2 wire row — `ActiveToolsChange`, `Custom`,
+// `CustomMessage` — and map to `None` (the follow stream skips them without
+// opening a §F.1 gap: an unclaimed seq is sealed by the next Entry). The
+// two new wire fields carried by every entry (`id`/`parentId`) and the
+// `seq` stamp ride [`wire_entry`]; `id → callId` / `agentId` renames follow
+// the §C.1 envelope-key exclusivity rule.
+
+use manox_harness::session::SessionTreeEntry;
+use manox_harness::types::AgentMessage;
+use manox_protocol::journal::{JournalWireEntry, JournalWireEvent, ModelRef, UsagePayload};
+
+/// One journal record as the wire carries it (§C.1 entry envelope). `None`
+/// when the kernel variant has no §C.2 wire row.
+pub fn wire_entry(seq: u64, entry: &SessionTreeEntry) -> Option<JournalWireEntry> {
+    Some(JournalWireEntry {
+        seq,
+        id: entry.id().to_string(),
+        parent_id: entry.parent_id().map(str::to_string),
+        timestamp: entry
+            .timestamp()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        event: wire_event(entry)?,
+    })
+}
+
+/// The §C.2 event projection of one kernel entry. `None` = no wire row
+/// (see the module comment above).
+pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
+    use JournalWireEvent as W;
+    Some(match entry {
+        // ── transcript ──────────────────────────────────────────────────
+        SessionTreeEntry::Message { message, .. } => match message {
+            AgentMessage::User { content, .. } => W::Message {
+                role: "user".into(),
+                content: content_blocks(content),
+                usage: None,
+                // `originRpc` on the durable user row is a kernel-type gap
+                // (harness `AgentMessage::User` has no origin field; the
+                // kernel lands it in T5) — the Submit receipt carries the
+                // correlation meanwhile (L7).
+                origin_rpc: None,
+            },
+            AgentMessage::Assistant { content, usage, .. } => W::Message {
+                role: "assistant".into(),
+                content: content_blocks(content),
+                usage: Some(UsagePayload {
+                    input: usage.input_tokens,
+                    output: usage.output_tokens,
+                    cache_read: usage.cache_read_input_tokens,
+                    cache_write: usage.cache_creation_input_tokens,
+                    reasoning: usage.reasoning_tokens.unwrap_or(0),
+                }),
+                origin_rpc: None,
+            },
+            AgentMessage::ToolResult { .. } | AgentMessage::BashExecution { .. } => W::Message {
+                role: "tool".into(),
+                content: message_value(message),
+                usage: None,
+                origin_rpc: None,
+            },
+            // Kernel-extension message roles ride the generic transcript row
+            // with the kernel JSON shape verbatim (wire-opaque, §C.2).
+            AgentMessage::Custom { .. } => W::Message {
+                role: "custom".into(),
+                content: message_value(message),
+                usage: None,
+                origin_rpc: None,
+            },
+        },
+        SessionTreeEntry::UiNote { note, .. } => W::UiNote {
+            kind: note
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("notice")
+                .to_string(),
+            data: note.clone(),
+        },
+        // ── lifecycle ───────────────────────────────────────────────────
+        SessionTreeEntry::TurnStart { .. } => W::TurnStart,
+        SessionTreeEntry::TurnFinish {
+            cancelled,
+            failed,
+            stranded_steer_ids,
+            ..
+        } => W::TurnFinish {
+            cancelled: *cancelled,
+            failed: *failed,
+            stranded_steer_ids: stranded_steer_ids.clone(),
+        },
+        SessionTreeEntry::Stop { reason, .. } => W::Stop {
+            reason: reason.clone(),
+        },
+        SessionTreeEntry::Retry {
+            attempt,
+            max_attempts,
+            delay_secs,
+            reason,
+            detail,
+            ..
+        } => W::Retry {
+            attempt: *attempt,
+            max_attempts: *max_attempts,
+            delay_secs: *delay_secs,
+            // The kernel's diagnostic `detail` folds into the wire reason;
+            // the §C.2 retry row carries one string.
+            reason: match detail {
+                Some(d) if !d.is_empty() => format!("{reason}: {d}"),
+                _ => reason.clone(),
+            },
+        },
+        SessionTreeEntry::ErrorEvent { message, .. } => W::Error {
+            message: message.clone(),
+        },
+        // ── streaming delta ─────────────────────────────────────────────
+        SessionTreeEntry::AgentTextDelta { delta, .. } => W::AgentTextDelta { s: delta.clone() },
+        SessionTreeEntry::AgentThinkingDelta { delta, .. } => {
+            W::AgentThinkingDelta { s: delta.clone() }
+        }
+        SessionTreeEntry::ToolCall {
+            call_id,
+            name,
+            title,
+            status,
+            input,
+            ..
+        } => W::ToolCall {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            title: title.clone(),
+            status: status.clone(),
+            input: input.clone().unwrap_or(serde_json::Value::Null),
+        },
+        SessionTreeEntry::ToolResult {
+            call_id,
+            output,
+            is_error,
+            ..
+        } => W::ToolResult {
+            call_id: call_id.clone(),
+            output: output.clone(),
+            is_error: *is_error,
+        },
+        SessionTreeEntry::ToolOutputChunk { call_id, chunk, .. } => W::ToolOutputChunk {
+            call_id: call_id.clone(),
+            chunk: chunk.clone(),
+        },
+        SessionTreeEntry::SubagentChild {
+            agent_id, event, ..
+        } => W::SubagentChild {
+            agent_id: agent_id.clone(),
+            event: event.clone(),
+        },
+        SessionTreeEntry::SubagentProgress {
+            agent_id,
+            agent_type,
+            tool_uses,
+            latest_activity,
+            status,
+            ..
+        } => W::SubagentProgress {
+            agent_id: agent_id.clone(),
+            agent_type: agent_type.clone(),
+            tool_uses: *tool_uses,
+            latest_activity: latest_activity.clone(),
+            status: status.clone(),
+        },
+        // ── state change ────────────────────────────────────────────────
+        SessionTreeEntry::ModelChange {
+            provider, model_id, ..
+        } => W::ModelChange {
+            from: None,
+            // Canonical `{provider}/{model}` on the wire (L8).
+            to: ModelRef::new(format!("{provider}/{model_id}")),
+        },
+        SessionTreeEntry::CwdChange { cwd, .. } => W::CwdChange { path: cwd.clone() },
+        // The kernel records the reasoning tier as a thinking level; the
+        // §C.2 row names it `reasoningEffortChange`.
+        SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => W::ReasoningEffortChange {
+            effort: thinking_level.clone(),
+        },
+        SessionTreeEntry::ProjectChange { path, .. } => W::ProjectChange { path: path.clone() },
+        SessionTreeEntry::PermissionModeChange { mode, .. } => {
+            W::PermissionModeChange { mode: mode.clone() }
+        }
+        SessionTreeEntry::PlanModeChange { enabled, .. } => W::PlanModeChange { enabled: *enabled },
+        SessionTreeEntry::PlanUpdate { snapshot, .. } => W::PlanUpdate {
+            snapshot: snapshot.clone(),
+        },
+        SessionTreeEntry::Goal { goal, .. } => W::Goal { goal: goal.clone() },
+        SessionTreeEntry::Title { title, .. } => W::Title {
+            title: title.clone(),
+        },
+        SessionTreeEntry::BrowserSuites { suites, .. } => W::BrowserSuites {
+            suites: suites.clone(),
+        },
+        SessionTreeEntry::BackgroundTask { snapshot, .. } => W::BackgroundTask {
+            snapshot: snapshot.clone(),
+        },
+        SessionTreeEntry::Approval {
+            kind,
+            auth_id,
+            payload,
+            ..
+        } => W::Approval {
+            kind: kind.clone(),
+            auth_id: auth_id.clone(),
+            tool_name: payload
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tool_call_id: payload
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            verdict: payload
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            reason: payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
+        SessionTreeEntry::PinnedArchived {
+            pinned, archived, ..
+        } => W::PinnedArchived {
+            pinned: *pinned,
+            archived: *archived,
+        },
+        // ── compaction / tree ───────────────────────────────────────────
+        SessionTreeEntry::Compaction {
+            summary,
+            tokens_before,
+            first_kept_entry_id,
+            retained_tail,
+            ..
+        } => W::Compaction {
+            summary: summary.clone(),
+            // The kernel stores the retained tail but not the compacted
+            // count / pre-boundary tokens as separate rows; derive the
+            // count from the tail's absence semantics: 0 until the kernel
+            // stamps it (§C.2 payload best-effort, T5 fold source).
+            messages_compacted: 0,
+            tokens_before: *tokens_before,
+            retained_tail: retained_tail
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect(),
+            first_kept_entry_id: first_kept_entry_id.clone(),
+        },
+        SessionTreeEntry::CompactionStarted { tokens_before, .. } => W::CompactionStarted {
+            tokens_before: *tokens_before,
+        },
+        SessionTreeEntry::BranchSummary { summary, .. } => W::BranchSummary {
+            text: summary.clone(),
+        },
+        SessionTreeEntry::Label { label, .. } => W::Label {
+            label: label.clone().unwrap_or_default(),
+        },
+        SessionTreeEntry::SessionInfo { name, .. } => W::SessionInfo {
+            data: serde_json::json!({ "name": name }),
+        },
+        SessionTreeEntry::Leaf { target_id, .. } => W::Leaf {
+            // A `None` target resets the leaf to the root; the §C.2 row
+            // names the target id (empty = root reset).
+            target_id: target_id.clone().unwrap_or_default(),
+        },
+        // ── metrics ─────────────────────────────────────────────────────
+        SessionTreeEntry::Metrics {
+            metric_type, data, ..
+        } => W::Metrics {
+            kind: metric_type.clone(),
+            data: data.clone(),
+        },
+        // ── kernel rows with no §C.2 wire vocabulary ────────────────────
+        SessionTreeEntry::ActiveToolsChange { .. }
+        | SessionTreeEntry::Custom { .. }
+        | SessionTreeEntry::CustomMessage { .. } => return None,
+    })
+}
+
+/// Kernel content blocks pass through the wire opaque (§C.2 "storage shape");
+/// an unspecifiable block is dropped rather than failing the frame.
+fn content_blocks(blocks: &[manox_harness::types::ContentBlock]) -> Vec<serde_json::Value> {
+    blocks
+        .iter()
+        .filter_map(|b| serde_json::to_value(b).ok())
+        .collect()
+}
+
+/// The full kernel JSON object of a non-transcript message (wire-opaque).
+fn message_value(message: &AgentMessage) -> Vec<serde_json::Value> {
+    vec![serde_json::to_value(message).unwrap_or(serde_json::Value::Null)]
+}
+
 use Translated::*;
 
 #[cfg(test)]

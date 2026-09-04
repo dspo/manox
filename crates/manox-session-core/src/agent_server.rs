@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use manox_protocol::base64_bytes;
 use manox_protocol::client::ImageAttachment;
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize};
+use manox_protocol::journal::StreamId;
 use manox_protocol::server::ThreadInfoPayload;
+use manox_protocol::stream::{StreamEndReason, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem, WireContentBlock, WireMessage,
@@ -37,6 +39,8 @@ use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{Message, MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 
+use crate::follow::{self, StreamHandle};
+use crate::journal_query;
 use crate::translate::{Translated, translate};
 
 /// How long the server waits for a client to answer a `ServerCall` before
@@ -83,6 +87,9 @@ struct AgentServerInner {
     /// session_id → client_ids that own (view) it. A session may have several
     /// owners; each receives its streamed notes.
     session_owners: Mutex<HashMap<String, Vec<String>>>,
+    /// Live §D.1 streams: `(client_id, stream_id)` → control handle. The
+    /// key pair mirrors the stream id's per-connection uniqueness (§D.1).
+    streams: Mutex<HashMap<(String, StreamId), StreamHandle>>,
     focused: Arc<StdMutex<Option<String>>>,
     call_seq: AtomicU64,
     /// In-flight bare-model completions by request id (the LanguageModelChat
@@ -91,6 +98,68 @@ struct AgentServerInner {
     /// Monotonically increasing counter for client entry generations, used to
     /// detect stale entries during same-client-id reconnection.
     next_generation: AtomicU64,
+    /// §E.3 Q-face cache: `(thread_id, cursor)` → the folded conversation
+    /// info payload (recomputed only when the cursor advances).
+    conversation_info_cache: Arc<StdMutex<journal_query::ConversationInfoCache>>,
+}
+
+impl AgentServerInner {
+    /// Register a live stream and return its control handle.
+    fn track_stream(&self, client_id: &str, stream_id: &StreamId, handle: StreamHandle) {
+        self.streams
+            .lock()
+            .insert((client_id.to_string(), stream_id.clone()), handle);
+    }
+
+    /// Forget a stream after its task sent the terminal `StreamEnd`
+    /// (identity-guarded so a re-open with the same id is never deleted by
+    /// the superseded task).
+    fn untrack_stream(&self, client_id: &str, stream_id: &StreamId, handle: &StreamHandle) {
+        let mut streams = self.streams.lock();
+        let key = (client_id.to_string(), stream_id.clone());
+        if streams
+            .get(&key)
+            .is_some_and(|live| live.is_same_handle(handle))
+        {
+            streams.remove(&key);
+        }
+    }
+
+    /// End every live stream of a session with `reason` (dispose /
+    /// ownership-lost: §D.1 `Closed`). Returns the ended handles' ids for
+    /// logging.
+    fn end_streams_for_session(&self, session_id: &str, reason: StreamEndReason) {
+        let keys: Vec<(String, StreamId)> = self
+            .streams
+            .lock()
+            .iter()
+            .filter(|(_, h)| h.session_id() == session_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            let handle = self.streams.lock().remove(&key);
+            if let Some(handle) = handle {
+                handle.end(reason.clone());
+            }
+        }
+    }
+
+    /// End every stream owned by a disconnected client (§D.1 `Closed`).
+    fn end_streams_for_client(&self, client_id: &str) {
+        let keys: Vec<(String, StreamId)> = self
+            .streams
+            .lock()
+            .keys()
+            .filter(|(cid, _)| cid == client_id)
+            .cloned()
+            .collect();
+        for key in keys {
+            let handle = self.streams.lock().remove(&key);
+            if let Some(handle) = handle {
+                handle.end(StreamEndReason::Closed);
+            }
+        }
+    }
 }
 
 impl AgentServer {
@@ -100,10 +169,14 @@ impl AgentServer {
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
             focused: Arc::new(StdMutex::new(None)),
             call_seq: AtomicU64::new(0),
             model_chats: Arc::new(StdMutex::new(HashMap::new())),
             next_generation: AtomicU64::new(1),
+            conversation_info_cache: Arc::new(StdMutex::new(
+                journal_query::ConversationInfoCache::default(),
+            )),
         }))
     }
 
@@ -162,6 +235,10 @@ impl AgentServerInner {
                 if let Some(old) = self.clients.lock().get(&client_id) {
                     old.peer.cancel_all(RpcError::new(-1, "client reconnected"));
                     old.conn.disconnect();
+                    // §D.1: the replaced connection's streams die with it
+                    // (`Closed`). Safe here — the new connection cannot have
+                    // opened any stream yet (handshake is first).
+                    self.end_streams_for_client(&client_id);
                 }
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let hello = ClientHello {
@@ -252,22 +329,21 @@ impl AgentServerInner {
                     stream_id,
                     stream_kind,
                 } => {
-                    // T4 placeholder: replaced by the follow-stream service in
-                    // the same task branch (see `follow::open_stream`).
-                    let _ = stream_kind;
-                    conn.send_to_client(FromServer::StreamEnd {
-                        stream_id,
-                        reason: manox_protocol::stream::StreamEndReason::Failure {
-                            code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.into(),
-                            message: "stream services not wired yet (T4)".into(),
-                        },
-                    });
+                    self.open_stream(&client_id, conn.clone(), stream_id, stream_kind);
                 }
                 FromClient::StreamCancel { stream_id } => {
-                    // T4 placeholder: no live stream can exist yet, so the
-                    // cancel is a no-op (a real one would answer
-                    // `StreamEnd { Cancelled }`).
-                    tracing::debug!(stream = %stream_id.0, "stream cancel with no live stream");
+                    let handle = self
+                        .streams
+                        .lock()
+                        .remove(&(client_id.clone(), stream_id.clone()));
+                    match handle {
+                        Some(handle) => handle.end(StreamEndReason::Cancelled),
+                        // Unknown / already-ended stream: nothing to cancel
+                        // (the terminal StreamEnd was already delivered).
+                        None => {
+                            tracing::debug!(stream = %stream_id.0, "stream cancel for unknown stream");
+                        }
+                    }
                 }
             }
         }
@@ -281,6 +357,53 @@ impl AgentServerInner {
             .lock()
             .get(session_id)
             .map(|s| s.thread.clone())
+    }
+
+    // ── §D.1 stream services. ───────────────────────────────────────────────
+    fn open_stream(
+        self: &Arc<Self>,
+        client_id: &str,
+        conn: Arc<dyn RpcConnection>,
+        stream_id: StreamId,
+        kind: StreamKind,
+    ) {
+        let StreamKind::FollowSession {
+            session_id,
+            max_messages,
+        } = kind;
+        let Some(thread) = self.session_thread(&session_id) else {
+            // §D.7 `session/not-found` as a terminal failure frame.
+            conn.send_to_client(FromServer::StreamEnd {
+                stream_id,
+                reason: StreamEndReason::Failure {
+                    code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
+                    message: format!("unknown session {session_id}"),
+                },
+            });
+            return;
+        };
+        let handle = StreamHandle::new(
+            session_id.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(StdMutex::new(None)),
+        );
+        let key = (client_id.to_string(), stream_id.clone());
+        self.track_stream(client_id, &stream_id, handle.clone());
+        let inner = Arc::clone(self);
+        let (k, h) = (key, handle.clone());
+        // The task's JoinHandle is owned by the runtime; the stream's own
+        // terminal StreamEnd + [`untrack_stream`] retire the registry entry.
+        let _task = follow::spawn_follow_stream(
+            conn,
+            stream_id,
+            session_id,
+            max_messages,
+            thread,
+            &handle,
+            move |_end| {
+                inner.untrack_stream(&k.0, &k.1, &h);
+            },
+        );
     }
 
     /// Deliver a note to one connected client (request-scoped traffic such
@@ -336,6 +459,9 @@ impl AgentServerInner {
         if !should_remove {
             return;
         }
+        // Disconnect clears this connection's live streams (§D.1 `Closed`;
+        // the sends into the closed connection are no-ops by then).
+        self.end_streams_for_client(client_id);
         self.clients.lock().remove(client_id);
         let mut owners = self.session_owners.lock();
         let orphaned: Vec<String> = owners
@@ -356,6 +482,9 @@ impl AgentServerInner {
         let mut sessions = self.sessions.lock();
         for sid in orphaned {
             sessions.remove(&sid);
+            // Ownership lost ⇒ every live stream of the session closes
+            // (§D.1 `Closed`).
+            self.end_streams_for_session(&sid, StreamEndReason::Closed);
         }
     }
 
@@ -620,6 +749,59 @@ async fn handle_call(
 ) -> Result<Value, RpcError> {
     match call {
         ClientCall::Initialize(_) => Err(RpcError::new(-1, "already initialized")),
+        // ── v2 write calls (§D.2: receipts only, L7). ───────────────────────
+        ClientCall::CreateSession {
+            cwd,
+            project,
+            initial_model,
+            approval_mode,
+            reasoning_effort,
+        } => AgentServerInner::create_session_request(
+            inner,
+            client_id,
+            SessionIntent {
+                session_id: None,
+                cwd,
+                project,
+                initial_model,
+                approval_mode,
+                reasoning_effort,
+            },
+        ),
+        ClientCall::Submit {
+            session_id,
+            text,
+            images,
+            origin_rpc,
+        } => inner.submit(client_id, &session_id, text, images, None, origin_rpc),
+        ClientCall::Steer {
+            session_id,
+            message_id,
+            text,
+            images,
+            origin_rpc,
+        } => inner.steer(&session_id, message_id, text, images, origin_rpc),
+        // ── v2 journal read calls (§D.2 PageHistory, §E.3 Q face). ─────────
+        ClientCall::PageHistory {
+            session_id,
+            through_seq,
+            before_seq,
+            max_messages,
+        } => {
+            let thread = inner.session_thread(&session_id).ok_or_else(|| {
+                RpcError::new(-1, "unknown session")
+                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
+            })?;
+            journal_query::page_history(&thread, through_seq, before_seq, max_messages).await
+        }
+        ClientCall::GetConversationInfo { session_id } => {
+            let thread = inner.session_thread(&session_id).ok_or_else(|| {
+                RpcError::new(-1, "unknown session")
+                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
+            })?;
+            journal_query::conversation_info(&inner.conversation_info_cache, &thread, &session_id)
+                .await
+        }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
         ClientCall::ListThreads => serde_json::to_value(inner.threads_snapshot())
             .map_err(|_| RpcError::new(-1, "threads serialization failed")),
@@ -765,7 +947,20 @@ async fn open_session(
 async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNote) {
     match note {
         ClientNote::CreateSession { session_id, cwd } => {
-            AgentServerInner::create_session(inner, owner, &session_id, cwd);
+            // Compat entry (§D.3 dual-protocol window): forward to the §D.2
+            // request path (no intent fields beyond cwd) and discard the
+            // receipt — v1 clients never await it. The explicit
+            // `session_id` is passed through so the desktop/webui ids stay
+            // stable; the request path is idempotent on a live session.
+            let intent = SessionIntent {
+                session_id: Some(session_id),
+                cwd,
+                project: None,
+                initial_model: None,
+                approval_mode: None,
+                reasoning_effort: None,
+            };
+            let _ = AgentServerInner::create_session_request(inner, owner, intent);
         }
         ClientNote::DisposeSession { session_id } => inner.dispose_session(owner, &session_id),
         ClientNote::DetachSession { session_id } => inner.detach_session(owner, &session_id),
@@ -774,13 +969,19 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             text,
             images,
             client_id,
-        } => inner.submit(owner, &session_id, text, images, client_id),
+        } => {
+            // Compat entry: forward to the §D.2 receipt path, discard.
+            let _ = inner.submit(owner, &session_id, text, images, client_id, None);
+        }
         ClientNote::Steer {
             session_id,
             client_id,
             text,
             images,
-        } => inner.steer(&session_id, client_id, text, images),
+        } => {
+            // Compat entry: the note's `client_id` is the steer id.
+            let _ = inner.steer(&session_id, client_id, text, images, None);
+        }
         ClientNote::DropQueued {
             session_id,
             client_id,
@@ -862,31 +1063,120 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
 }
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
+
+/// The §D.2 `CreateSession` intent: optional explicit id (the compat
+/// `ClientNote::CreateSession` always supplies one; the v2 request mints
+/// server-side), working directory, project binding, and the initial
+/// model / approval mode / reasoning effort the session opens with (the
+/// "project/model inheritance" defect regression, §J.7).
+struct SessionIntent {
+    session_id: Option<String>,
+    cwd: Option<String>,
+    project: Option<String>,
+    initial_model: Option<manox_protocol::ModelRef>,
+    approval_mode: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
 impl AgentServerInner {
-    fn create_session(
+    /// §D.2 `CreateSession`: build a live session from the intent and answer
+    /// `{session_id}`. The thread opens on the `new_in_project` path when a
+    /// project is given (fresh session bound to the project in one step,
+    /// no orphaned pre-project file), else `new_fresh`; `initial_model`
+    /// resolves through the single convergence point
+    /// `resolve_model_ref` (L8) *before* anything is created — an
+    /// unresolvable canonical ref answers `model/unresolvable` without a
+    /// side effect. Re-opening a live session id is idempotent: the
+    /// existing id answers and the live session is left untouched.
+    fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
-        session_id: &str,
-        cwd: Option<String>,
-    ) {
-        let cwd = cwd.map(PathBuf::from).unwrap_or_else(|| inner.cwd.clone());
-        let thread = Thread::new_fresh(ThreadId(session_id.into()), cwd);
-        if let Some(model) = manox_agent::provider_glue::default_model() {
-            thread.with_mut(|t| t.set_model(model));
+        intent: SessionIntent,
+    ) -> Result<Value, RpcError> {
+        // Resolve every intent field that can fail before touching state.
+        let model = match intent.initial_model.as_ref() {
+            None => None,
+            Some(m) => {
+                let registry = manox_agent::provider_glue::global();
+                match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
+                    Some(model) => Some(model),
+                    None => {
+                        return Err(RpcError::new(-1, format!("unknown model: {}", m.0))
+                            .with_code(manox_protocol::msg::CODE_MODEL_UNRESOLVABLE));
+                    }
+                }
+            }
+        };
+        let approval = match intent.approval_mode.as_deref() {
+            None => None,
+            Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string()))
+            {
+                Ok(mode) => Some(mode),
+                Err(_) => {
+                    return Err(RpcError::new(-1, format!("unknown approval mode: {s}"))
+                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+                }
+            },
+        };
+        let effort = match intent.reasoning_effort.as_deref() {
+            None => None,
+            Some("high") => Some(ReasoningEffort::High),
+            Some("max") => Some(ReasoningEffort::Max),
+            Some(other) => {
+                return Err(
+                    RpcError::new(-1, format!("unknown reasoning effort: {other}"))
+                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST),
+                );
+            }
+        };
+        // Idempotent re-open of a live session (§D.2).
+        if let Some(existing) = intent.session_id.as_deref() {
+            if inner.sessions.lock().contains_key(existing) {
+                inner.add_owner(existing, owner);
+                return Ok(json!({ "session_id": existing }));
+            }
         }
+        let session_id = intent
+            .session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let project = intent.project.as_ref().map(PathBuf::from);
+        let cwd = intent
+            .cwd
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| project.clone().unwrap_or_else(|| inner.cwd.clone()));
+        let thread = match &project {
+            Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone()),
+            None => Thread::new_fresh(ThreadId(session_id.clone()), cwd),
+        };
+        // Intent application: model (explicit canonical or the global
+        // default), approval mode, reasoning effort.
+        let initial = model.or_else(manox_agent::provider_glue::default_model);
+        thread.with_mut(|t| {
+            if let Some(model) = initial {
+                t.set_model(model);
+            }
+            if let Some(mode) = approval {
+                t.set_permission_mode(mode);
+            }
+            if let Some(effort) = effort {
+                t.set_reasoning_effort(effort);
+            }
+        });
         let mode = thread.read(|t| t.permission_mode());
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(StdMutex::new(Vec::new()));
         let pump = spawn_pump(
             Arc::clone(inner),
-            session_id.into(),
+            session_id.clone(),
             thread.clone(),
             turn_active.clone(),
             pending_submits.clone(),
             inner.focused.clone(),
         );
         inner.sessions.lock().insert(
-            session_id.into(),
+            session_id.clone(),
             ServerSession {
                 thread: thread.clone(),
                 _pump: pump,
@@ -894,23 +1184,24 @@ impl AgentServerInner {
                 pending_submits,
             },
         );
-        inner.add_owner(session_id, owner);
+        inner.add_owner(&session_id, owner);
         inner.route_note(
-            session_id,
+            &session_id,
             ServerNote::SessionCreated {
-                session_id: session_id.into(),
+                session_id: session_id.clone(),
             },
         );
         inner.route_note(
-            session_id,
+            &session_id,
             ServerNote::PermissionModeChanged {
-                session_id: session_id.into(),
+                session_id: session_id.clone(),
                 mode: serde_json::to_value(mode)
                     .ok()
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_default(),
             },
         );
+        Ok(json!({ "session_id": session_id }))
     }
 
     fn dispose_session(&self, owner: &str, session_id: &str) {
@@ -927,10 +1218,14 @@ impl AgentServerInner {
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty()
             && let Some(session) = self.sessions.lock().remove(session_id)
-            && session.turn_active.load(Ordering::SeqCst)
         {
-            session.thread.with_mut(|t| t.cancel());
-            manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
+            // Disposal closes every live stream of the session (§D.1
+            // `Closed`).
+            self.end_streams_for_session(session_id, StreamEndReason::Closed);
+            if session.turn_active.load(Ordering::SeqCst) {
+                session.thread.with_mut(|t| t.cancel());
+                manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
+            }
         }
     }
 
@@ -949,9 +1244,18 @@ impl AgentServerInner {
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty() {
             self.sessions.lock().remove(session_id);
+            // Ownership lost ⇒ live streams close (§D.1 `Closed`).
+            self.end_streams_for_session(session_id, StreamEndReason::Closed);
         }
     }
 
+    /// §D.2 `Submit`: performs the submission and answers with the receipt
+    /// `{accepted, message_id?}` (L7 — the transcript arrives through the
+    /// follow stream). The `origin_rpc` correlation is accepted but not
+    /// journaled: the kernel user-message row has no origin field yet
+    /// (kernel-type change, lands at T5 — T4 gap in the delivery report);
+    /// the receipt + `message_id` is the interim retirement key. The
+    /// compat `ClientNote::Submit` forwards here with `origin_rpc = None`.
     fn submit(
         &self,
         owner: &str,
@@ -959,7 +1263,14 @@ impl AgentServerInner {
         text: String,
         images: Vec<ImageAttachment>,
         client_id: Option<String>,
-    ) {
+        origin_rpc: Option<String>,
+    ) -> Result<Value, RpcError> {
+        if origin_rpc.is_some() {
+            tracing::debug!("Submit originRpc accepted; kernel origin row lands at T5 (gap)");
+        }
+        let receipt = |accepted: bool, message_id: Option<String>| {
+            Ok(json!({ "accepted": accepted, "message_id": message_id }))
+        };
         let images: Vec<(String, String)> = images
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
@@ -975,7 +1286,7 @@ impl AgentServerInner {
             && matches!(builtin.name, "exit" | "new")
         {
             self.archive_thread(owner, session_id, true);
-            return;
+            return receipt(true, None);
         }
         let Some(session) = self.sessions.lock().get(session_id).map(|s| {
             (
@@ -985,7 +1296,8 @@ impl AgentServerInner {
             )
         }) else {
             self.note_error(session_id, "unknown session");
-            return;
+            return Err(RpcError::new(-1, "unknown session")
+                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
         };
         let (thread, turn_active, pending_submits) = session;
         let client_id = client_id.unwrap_or_else(|| owner.to_string());
@@ -1001,10 +1313,18 @@ impl AgentServerInner {
                 images,
                 ui,
             });
-            return;
+            return receipt(true, None);
         }
         let interacted = thread.read(|t| t.has_interacted());
-        thread.with_mut(|t| {
+        // `slash` consumed the text display; the outcome distinguishes an
+        // empty submission (accepted = false) from a command / transcript
+        // insert.
+        enum Outcome {
+            Slash,
+            Empty,
+            Inserted,
+        }
+        let outcome = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
@@ -1021,26 +1341,43 @@ impl AgentServerInner {
                 let skill_hit = manox_agent::skill::try_global().is_some()
                     && t.submit_skill(&name, &args, Some(slash_ui));
                 if builtin_hit || command_hit || skill_hit {
-                    return;
+                    return Outcome::Slash;
                 }
             }
             let content = to_message_content(text, images);
             if content.is_empty() {
-                return;
+                return Outcome::Empty;
             }
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
             t.run_turn();
+            Outcome::Inserted
         });
         self.republish_if_first_interaction(&thread, session_id, interacted);
+        match outcome {
+            Outcome::Empty => receipt(false, None),
+            Outcome::Slash => receipt(true, None),
+            Outcome::Inserted => {
+                let message_id = thread.read(|t| t.last_user_message_id().map(str::to_string));
+                receipt(true, message_id)
+            }
+        }
     }
 
+    /// §D.2 `Steer`: injects the steer and answers with the receipt
+    /// `{accepted, message_id?}` (the echo of the call's steer id). The
+    /// compat `ClientNote::Steer` forwards here with its `client_id` as
+    /// `message_id`.
     fn steer(
         &self,
         session_id: &str,
-        client_id: String,
+        message_id: String,
         text: String,
         images: Vec<ImageAttachment>,
-    ) {
+        origin_rpc: Option<String>,
+    ) -> Result<Value, RpcError> {
+        if origin_rpc.is_some() {
+            tracing::debug!("Steer originRpc accepted; kernel origin row lands at T5 (gap)");
+        }
         let images: Vec<(String, String)> = images
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
@@ -1052,14 +1389,15 @@ impl AgentServerInner {
             .map(|s| (s.thread.clone(), s.pending_submits.clone()))
         else {
             self.note_error(session_id, "unknown session");
-            return;
+            return Err(RpcError::new(-1, "unknown session")
+                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
         };
         // A steer removes its own parked follow-up so the turn-end drain does
         // not resend the same text as a plain follow-up.
         pending_submits
             .lock()
             .unwrap()
-            .retain(|q| q.client_id != client_id);
+            .retain(|q| q.client_id != message_id);
         let interacted = thread.read(|t| t.has_interacted());
         let steer_pending: Option<String> = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
@@ -1078,17 +1416,21 @@ impl AgentServerInner {
         });
         // Emit outside the write lock so the thread stays available to the
         // engine pump while the SteerPending note is delivered.
-        if let Some(message_id) = steer_pending {
+        if let Some(id) = steer_pending {
             self.route_note(
                 session_id,
                 ServerNote::SteerPending {
                     session_id: session_id.into(),
-                    client_id,
-                    message_id,
+                    client_id: message_id.clone(),
+                    message_id: id,
                 },
             );
         }
         self.republish_if_first_interaction(&thread, session_id, interacted);
+        Ok(json!({
+            "accepted": true,
+            "message_id": message_id,
+        }))
     }
 
     fn drop_queued(&self, session_id: &str, client_id: String) {
