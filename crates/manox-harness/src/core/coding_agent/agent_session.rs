@@ -834,6 +834,16 @@ impl AgentSession {
             .await
     }
 
+    /// Append a typed v4 journal entry by wire kind (§C.2); id, parent and
+    /// timestamp are assigned at the session's single append point.
+    pub async fn append_typed(
+        &self,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, anyhow::Error> {
+        self.harness.session().append_typed(kind, payload).await
+    }
+
     /// The compaction-aware active entry list (every entry type, in tree
     /// order) — the display projection source for host UI mirrors.
     pub async fn context_entries(

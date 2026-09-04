@@ -480,6 +480,53 @@ impl SessionTreeEntry {
         self.envelope().timestamp
     }
 
+    /// Build a typed entry from its wire kind + payload (§C.2). The payload
+    /// object is merged over the envelope fields and the result must
+    /// deserialize as exactly one typed variant — an unknown kind or a
+    /// payload with wrong/missing fields fails loudly rather than falling
+    /// back to `custom` (the typed vocabulary is the declared surface, L12).
+    /// Envelope-key exclusivity (§C.1) is enforced by refusing payload keys
+    /// `id`/`parentId`/`timestamp`/`type`/`seq`.
+    pub fn from_kind_payload(
+        kind: &str,
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        payload: JsonValue,
+    ) -> Result<Self, anyhow::Error> {
+        let payload = payload
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("journal payload for {kind} must be an object"))?;
+        for reserved in ["id", "parentId", "timestamp", "type", "seq"] {
+            if payload.contains_key(reserved) {
+                anyhow::bail!(
+                    "journal payload for {kind} uses reserved envelope key {reserved} (§C.1)"
+                );
+            }
+        }
+        if matches!(kind, "message" | "compaction") {
+            anyhow::bail!(
+                "kind {kind} owns a dedicated append path; append_typed refuses to bypass it"
+            );
+        }
+        let mut value = serde_json::json!({
+            "type": kind,
+            "id": id,
+            "parentId": parent_id,
+            "timestamp": timestamp,
+        });
+        if let Some(obj) = value.as_object_mut() {
+            for (key, field) in payload {
+                obj.insert(key.clone(), field.clone());
+            }
+        }
+        serde_json::from_value(value).map_err(|err| {
+            anyhow::anyhow!(
+                "journal payload for kind {kind} does not match the typed variant: {err}"
+            )
+        })
+    }
+
     /// The leaf cursor after appending this entry: a `leaf` entry redirects to
     /// its `targetId`; every other entry's cursor is its own id.
     pub(crate) fn leaf_cursor_after(&self) -> Option<String> {
@@ -840,6 +887,25 @@ impl<S: SessionStorage> Session<S> {
         };
         self.storage.append_entry(&entry).await?;
         Ok(id)
+    }
+
+    /// Append a typed v4 journal entry by its wire kind (§C.2). The payload
+    /// object's keys must match the variant's camelCase field names;
+    /// `id`/`parentId`/`timestamp` are assigned here so the chain stays
+    /// single-writer. `message`/`compaction` are refused — they own richer
+    /// append paths (`append_message`, the compaction flow) that must not be
+    /// bypassed.
+    pub async fn append_typed(
+        &self,
+        kind: &str,
+        payload: JsonValue,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+        let entry = SessionTreeEntry::from_kind_payload(kind, id, parent_id, Utc::now(), payload)?;
+        self.storage.append_entry(&entry).await?;
+        Ok(entry.id().to_string())
     }
 
     /// Append a `custom_message` entry whose payload the harness does not

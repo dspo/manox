@@ -114,6 +114,15 @@ pub(crate) enum SessionCmd {
     /// The single actor queue makes send order the persist order, so a note
     /// dispatched before a prompt lands before the prompt's user entry.
     AppendUiNote(UiNoteRecord),
+    /// Append a typed v4 journal entry (§C.2) at the session leaf. Fed by
+    /// the notice-channel tap (`durable_journal_payload`): every durable
+    /// `BackendNotice::Event` rides the same actor queue, so persist order
+    /// equals notice order (L3/L4 — the journal covers every transition by
+    /// construction, never by remembering call sites).
+    AppendJournal {
+        kind: String,
+        payload: serde_json::Value,
+    },
     /// Close the session and stop the actor.
     Shutdown,
 }
@@ -135,6 +144,9 @@ struct EngineState {
     /// Mid-run `AppendUiNote`s park here (the run owns the session); the
     /// idle loop drains and persists them.
     pending_ui_notes: Mutex<Vec<UiNoteRecord>>,
+    /// Mid-run journal appends park here (same run-owns-the-session rule as
+    /// `pending_ui_notes`); the idle loop drains them in arrival order.
+    pending_journal: Mutex<Vec<(String, serde_json::Value)>>,
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
@@ -212,6 +224,240 @@ pub struct PiEngine {
     bus: Arc<crate::steer_bus::AgentBus>,
 }
 
+/// Map a facade event to its durable journal entry (§C.2): `(wire kind,
+/// payload)`. `None` means the event is not journaled — because it is
+/// already persisted by its owning flow (`model_change`, `thinking_level`,
+/// `cwd_change`, `compaction`, messages) or is snapshot-semantics
+/// (`HistoryProgress/Restored`, `PlanReady`) or not in the vocabulary
+/// (`PeerMessage`, steer bookkeeping — steer rides messages).
+///
+/// This is the single mapping point the notice tap consumes; payload keys
+/// are the variant's camelCase serde names (envelope-key exclusivity §C.1:
+/// handles are callId/agentId, never id).
+fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Value)> {
+    use serde_json::json;
+    let status_str = |status: &crate::thread::ToolCallStatus| {
+        serde_json::to_value(status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+    };
+    let stop_reason_str = |reason: &Option<crate::language_model::StopReason>| {
+        reason.map(|r| match r {
+            crate::language_model::StopReason::EndTurn => "end_turn",
+            crate::language_model::StopReason::MaxTokens => "max_tokens",
+            crate::language_model::StopReason::ToolUse => "tool_use",
+            crate::language_model::StopReason::Refusal => "refusal",
+            crate::language_model::StopReason::Cancelled => "cancelled",
+        })
+    };
+    Some(match ev {
+        // ── lifecycle ────────────────────────────────────────────────────
+        ThreadEvent::TurnStarted => ("turn_start".into(), json!({})),
+        ThreadEvent::TurnFinished {
+            cancelled,
+            failed,
+            stranded_steer_ids,
+        } => (
+            "turn_finish".into(),
+            json!({
+                "cancelled": cancelled,
+                "failed": failed,
+                "strandedSteerIds": stranded_steer_ids,
+            }),
+        ),
+        ThreadEvent::Stop(reason) => (
+            "stop".into(),
+            json!({ "reason": stop_reason_str(&Some(*reason)) }),
+        ),
+        ThreadEvent::Retry {
+            attempt,
+            max_attempts,
+            delay_secs,
+            reason,
+            detail,
+        } => (
+            "retry".into(),
+            json!({
+                "attempt": attempt,
+                "maxAttempts": max_attempts,
+                "delaySecs": delay_secs,
+                "reason": reason,
+                "detail": detail,
+            }),
+        ),
+        ThreadEvent::Error(err) => ("error".into(), json!({ "message": format!("{err:#}") })),
+        // ── streaming deltas ─────────────────────────────────────────────
+        ThreadEvent::AgentText(text) => ("agent_text_delta".into(), json!({ "delta": text })),
+        ThreadEvent::AgentThinking(text) => {
+            ("agent_thinking_delta".into(), json!({ "delta": text }))
+        }
+        ThreadEvent::ToolCall {
+            id,
+            name,
+            title,
+            status,
+            input,
+        } => (
+            "tool_call".into(),
+            json!({
+                "callId": id,
+                "name": name,
+                "title": title,
+                "status": status_str(status)?,
+                "input": input,
+            }),
+        ),
+        ThreadEvent::ToolResult {
+            id,
+            output,
+            is_error,
+        } => (
+            "tool_result".into(),
+            json!({ "callId": id, "output": output, "isError": is_error }),
+        ),
+        ThreadEvent::ToolOutput { id, chunk } => (
+            "tool_output_chunk".into(),
+            json!({ "callId": id, "chunk": chunk }),
+        ),
+        ThreadEvent::SubagentStarted {
+            id,
+            subagent_type,
+            description,
+            child,
+        } => (
+            "subagent_child".into(),
+            json!({
+                "agentId": id,
+                "event": {
+                    "type": "started",
+                    "subagentType": subagent_type,
+                    "description": description,
+                    "childId": child.0,
+                },
+            }),
+        ),
+        ThreadEvent::SubagentProgress {
+            id,
+            subagent_type,
+            tool_uses,
+            token_usage,
+            latest_activity,
+            status,
+            ..
+        } => (
+            "subagent_progress".into(),
+            json!({
+                "agentId": id,
+                "agentType": subagent_type,
+                "toolUses": tool_uses,
+                "tokenUsage": serde_json::to_value(token_usage).unwrap_or(serde_json::Value::Null),
+                "latestActivity": latest_activity,
+                "status": status_str(status)?,
+            }),
+        ),
+        ThreadEvent::SubagentChild { id, child } => (
+            "subagent_child".into(),
+            json!({
+                "agentId": id,
+                "event": serde_json::to_value(child).unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        // ── state changes (sidecar writes continue during migration; the
+        //    journal entry is the future single truth, L10) ───────────────
+        ThreadEvent::PermissionModeChanged { mode } => (
+            "permission_mode_change".into(),
+            json!({ "mode": format!("{mode:?}") }),
+        ),
+        ThreadEvent::PlanModeChanged { enabled } => {
+            ("plan_mode_change".into(), json!({ "enabled": enabled }))
+        }
+        ThreadEvent::PlanUpdated { snapshot } => (
+            "plan_update".into(),
+            json!({ "snapshot": serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null) }),
+        ),
+        ThreadEvent::GoalChanged { goal } => (
+            "goal".into(),
+            json!({ "goal": serde_json::to_value(goal).unwrap_or(serde_json::Value::Null) }),
+        ),
+        ThreadEvent::TitleChanged { title } => ("title".into(), json!({ "title": title })),
+        ThreadEvent::BrowserSuitesChanged { suites } => (
+            "browser_suites".into(),
+            json!({
+                "suites": serde_json::to_value(suites)
+                    .unwrap_or(serde_json::Value::Null)
+            }),
+        ),
+        ThreadEvent::BackgroundTaskUpdated { snapshot } => (
+            "background_task".into(),
+            json!({ "snapshot": serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null) }),
+        ),
+        ThreadEvent::ToolCallAuthorization {
+            id,
+            tool_name,
+            summary,
+            input,
+        } => (
+            "approval".into(),
+            json!({
+                "kind": "request",
+                "authId": id,
+                "payload": { "toolName": tool_name, "summary": summary, "input": input },
+            }),
+        ),
+        ThreadEvent::CompactionStarted { tokens_before } => (
+            "compaction_started".into(),
+            json!({ "tokensBefore": tokens_before }),
+        ),
+        // ── metrics (low wire priority, still logged) ─────────────────────
+        ThreadEvent::TokenUsageUpdated(usage) => (
+            "metrics".into(),
+            json!({
+                "metricType": "token_usage",
+                "data": serde_json::to_value(usage).unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        ThreadEvent::PrefixStability {
+            stability_pct,
+            system_changed,
+            tools_changed,
+        } => (
+            "metrics".into(),
+            json!({
+                "metricType": "prefix_stability",
+                "data": { "stabilityPct": stability_pct, "systemChanged": system_changed, "toolsChanged": tools_changed },
+            }),
+        ),
+        ThreadEvent::CacheInvalidation { reprocessed_tokens } => (
+            "metrics".into(),
+            json!({ "metricType": "cache_invalidation", "data": { "reprocessedTokens": reprocessed_tokens } }),
+        ),
+        ThreadEvent::SideCallMetricsUpdated(metrics) => (
+            "metrics".into(),
+            json!({
+                "metricType": "side_call",
+                "data": serde_json::to_value(metrics).unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        ThreadEvent::MainCallMetricsUpdated(metric) => (
+            "metrics".into(),
+            json!({
+                "metricType": "main_call",
+                "data": serde_json::to_value(metric).unwrap_or(serde_json::Value::Null),
+            }),
+        ),
+        // Already durable through their owning flows / not journaled.
+        ThreadEvent::ModelChanged { .. }
+        | ThreadEvent::ReasoningEffortChanged { .. }
+        | ThreadEvent::CwdChanged { .. }
+        | ThreadEvent::Compaction { .. }
+        | ThreadEvent::PlanReady { .. }
+        | ThreadEvent::HistoryProgress
+        | ThreadEvent::HistoryRestored
+        | ThreadEvent::SteerInjected { .. }
+        | ThreadEvent::PeerMessage { .. } => return None,
+    })
+}
+
 /// Spawn the pi actor and return the engine handle plus its notice receiver.
 /// The facade drains the receiver on the gpui thread. `initial_path`, when
 /// given, opens that session file instead of restoring the newest one.
@@ -228,7 +474,25 @@ pub fn spawn_engine(
     parent_session: Option<String>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (notice_tx, notice_rx) = mpsc::unbounded_channel();
+    // The journal tap (architecture §C, L3/L4): every BackendNotice funnels
+    // through `notice_tx`; the tap forwards each one to the facade FIRST (UI
+    // latency unchanged) and, for durable events, queues a typed journal
+    // append onto the same actor command channel — persist order equals
+    // notice order, and no future emission site can forget to persist.
+    let (notice_tx, tap_rx) = mpsc::unbounded_channel();
+    let (tap_tx, notice_rx) = mpsc::unbounded_channel();
+    let tap_cmd_tx = cmd_tx.clone();
+    crate::runtime::handle().spawn(async move {
+        let mut tap_rx = tap_rx;
+        while let Some(notice) = tap_rx.recv().await {
+            if let BackendNotice::Event(event) = &notice
+                && let Some((kind, payload)) = durable_journal_payload(event)
+            {
+                let _ = tap_cmd_tx.send(SessionCmd::AppendJournal { kind, payload });
+            }
+            let _ = tap_tx.send(notice);
+        }
+    });
     // The Steer bus is engine-scoped, not session-scoped: spawned-member
     // and live-subagent tracking must survive session swaps so a user
     // cancel always reaches every derivative this thread spawned.
@@ -244,6 +508,7 @@ pub fn spawn_engine(
         notes: Mutex::new(Vec::new()),
         notes_gen: AtomicU64::new(0),
         pending_ui_notes: Mutex::new(Vec::new()),
+        pending_journal: Mutex::new(Vec::new()),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
@@ -1503,6 +1768,15 @@ where
                     mirror_ui_note(state, record.clone());
                     state.pending_ui_notes.lock().unwrap().push(record);
                 }
+                Some(SessionCmd::AppendJournal { kind, payload }) => {
+                    // Same run-owns-the-session rule: park in arrival order;
+                    // the idle loop (or the post-settle sync) persists them.
+                    state
+                        .pending_journal
+                        .lock()
+                        .unwrap()
+                        .push((kind, payload));
+                }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
                     // loop applies it right after settle (P2: a mid-run click
@@ -1569,6 +1843,12 @@ async fn settle_run(
     let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
     for record in parked {
         let _ = persist_ui_note(session, &record).await;
+    }
+    let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
+    for (kind, payload) in parked_journal {
+        if let Err(err) = session.append_typed(&kind, payload).await {
+            tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
+        }
     }
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
@@ -2374,6 +2654,12 @@ async fn run_actor(
         for record in parked {
             let _ = persist_ui_note(&session, &record).await;
         }
+        let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
+        for (kind, payload) in parked_journal {
+            if let Err(err) = session.append_typed(&kind, payload).await {
+                tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
+            }
+        }
         // A mid-run browser-suite toggle parked itself for the same reason;
         // apply it now that the session is idle again. The guard is dropped
         // before the await so the future stays `Send`.
@@ -3005,6 +3291,13 @@ async fn run_actor(
                 // next authoritative sync.
                 if persist_ui_note(&session, &record).await {
                     mirror_ui_note(&state, record);
+                }
+            }
+            SessionCmd::AppendJournal { kind, payload } => {
+                // Typed v4 journal entry from the notice tap: one durable
+                // append per durable notice, in actor-queue order.
+                if let Err(err) = session.append_typed(&kind, payload).await {
+                    tracing::warn!(kind = %kind, error = %err, "journal append failed");
                 }
             }
             SessionCmd::Shutdown => break,
@@ -4641,6 +4934,135 @@ mod tests {
         assert!(text.contains("Shall we?"));
     }
 
+    /// L3机械化验证：每个被 tap 映射的 ThreadEvent，其 (kind, payload) 都
+    /// 必须能构造出类型化 journal 条目——映射与词汇表永不脱钩。
+    #[test]
+    fn durable_journal_mapping_round_trips_every_journaled_event() {
+        use crate::thread::{SubagentChildEvent, ThreadEvent, ToolCallStatus};
+        let events: Vec<ThreadEvent> = vec![
+            ThreadEvent::TurnStarted,
+            ThreadEvent::TurnFinished {
+                cancelled: false,
+                failed: true,
+                stranded_steer_ids: vec!["s-1".into()],
+            },
+            ThreadEvent::Stop(crate::language_model::StopReason::MaxTokens),
+            ThreadEvent::Retry {
+                attempt: 2,
+                max_attempts: 5,
+                delay_secs: 3,
+                reason: "rate limited".into(),
+                detail: Some("429".into()),
+            },
+            ThreadEvent::Error(anyhow::anyhow!("provider exploded")),
+            ThreadEvent::AgentText("delta".into()),
+            ThreadEvent::AgentThinking("think".into()),
+            ThreadEvent::ToolCall {
+                id: "tc-1".into(),
+                name: "Bash".into(),
+                title: "run ls".into(),
+                status: ToolCallStatus::Running,
+                input: Some(serde_json::json!({"command": "ls"})),
+            },
+            ThreadEvent::ToolResult {
+                id: "tc-1".into(),
+                output: "a b".into(),
+                is_error: false,
+            },
+            ThreadEvent::ToolOutput {
+                id: "tc-1".into(),
+                chunk: "a".into(),
+            },
+            ThreadEvent::SubagentStarted {
+                id: "sub-1".into(),
+                subagent_type: "explore".into(),
+                description: "scout".into(),
+                child: crate::thread::ThreadId("child-1".into()),
+            },
+            ThreadEvent::SubagentProgress {
+                id: "sub-1".into(),
+                subagent_type: "explore".into(),
+                tool_uses: 4,
+                token_usage: Default::default(),
+                latest_activity: Some("reading".into()),
+                status: ToolCallStatus::Running,
+                health: None,
+            },
+            ThreadEvent::SubagentChild {
+                id: "sub-1".into(),
+                child: SubagentChildEvent::Text("hi".into()),
+            },
+            ThreadEvent::PermissionModeChanged {
+                mode: manox_harness::sandbox::PermissionMode::default(),
+            },
+            ThreadEvent::PlanModeChanged { enabled: true },
+            ThreadEvent::PlanUpdated {
+                snapshot: crate::plan::PlanSnapshot {
+                    explanation: None,
+                    steps: vec![],
+                },
+            },
+            ThreadEvent::GoalChanged { goal: None },
+            ThreadEvent::TitleChanged { title: "t".into() },
+            ThreadEvent::BrowserSuitesChanged {
+                suites: vec![crate::engine::BrowserSuite::ChromeUse],
+            },
+            // BackgroundTaskUpdated omitted: TaskSnapshot has no cheap test
+            // constructor; its mapping is a mechanical to_value into a
+            // JsonValue entry field covered by from_kind_payload tests.
+            ThreadEvent::ToolCallAuthorization {
+                id: "auth-1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                input: serde_json::json!({"command": "ls"}),
+            },
+            ThreadEvent::CompactionStarted { tokens_before: 42 },
+            ThreadEvent::TokenUsageUpdated(Default::default()),
+            ThreadEvent::PrefixStability {
+                stability_pct: 90,
+                system_changed: false,
+                tools_changed: false,
+            },
+            ThreadEvent::CacheInvalidation {
+                reprocessed_tokens: 10,
+            },
+            ThreadEvent::SideCallMetricsUpdated(vec![]),
+            ThreadEvent::MainCallMetricsUpdated(Default::default()),
+        ];
+        for event in &events {
+            let (kind, payload) = durable_journal_payload(event)
+                .unwrap_or_else(|| panic!("{event:?} must map to a journal kind"));
+            let entry = manox_harness::session::SessionTreeEntry::from_kind_payload(
+                &kind,
+                "e-test".into(),
+                None,
+                chrono::Utc::now(),
+                payload,
+            )
+            .unwrap_or_else(|err| panic!("kind {kind} payload must construct: {err}"));
+            assert_eq!(entry.id(), "e-test");
+        }
+        // 已由各自归属流程持久化/快照语义的事件不得重复入日志。
+        let excluded = vec![
+            ThreadEvent::ModelChanged {
+                from: None,
+                to: "m".into(),
+            },
+            ThreadEvent::ReasoningEffortChanged {
+                effort: crate::language_model::ReasoningEffort::High,
+            },
+            ThreadEvent::CwdChanged { path: "/p".into() },
+            ThreadEvent::HistoryProgress,
+            ThreadEvent::HistoryRestored,
+        ];
+        for event in &excluded {
+            assert!(
+                durable_journal_payload(event).is_none(),
+                "{event:?} must not journal (owned by another flow)"
+            );
+        }
+    }
+
     fn test_engine_state() -> Arc<EngineState> {
         let cwd = std::env::temp_dir();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
@@ -4653,6 +5075,7 @@ mod tests {
             notes: Mutex::new(Vec::new()),
             notes_gen: AtomicU64::new(0),
             pending_ui_notes: Mutex::new(Vec::new()),
+            pending_journal: Mutex::new(Vec::new()),
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),
