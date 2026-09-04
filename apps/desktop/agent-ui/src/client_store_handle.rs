@@ -24,10 +24,17 @@ use crate::server_note_translate::{server_call_to_thread_event, server_note_to_t
 #[derive(Debug, Clone)]
 pub enum LeafRequest {
     /// Open (re-open) the follow stream for this session.
-    Reopen { session_id: String, stream_id: StreamId },
+    Reopen {
+        session_id: String,
+        stream_id: StreamId,
+    },
     /// Fetch a journal page ending at `through_seq` and deliver it back via
     /// [`ClientStoreHandle::apply_page_response`] correlated by `id`.
-    PageHistory { id: MsgId, session_id: String, through_seq: u64 },
+    PageHistory {
+        id: MsgId,
+        session_id: String,
+        through_seq: u64,
+    },
 }
 
 /// A gpui entity that owns a single session's [`ClientStore`], the v2
@@ -127,9 +134,7 @@ impl ClientStoreHandle {
                 if snap.session_id != self.session_id {
                     return;
                 }
-                let outs = self
-                    .fold
-                    .snapshot(snap.cursor, snap.records.clone());
+                let outs = self.fold.snapshot(snap.cursor, snap.records.clone());
                 // The snapshot's full projection baseline (§D.1) seeds the
                 // P-face; merge it before folding so materialized fields are
                 // current for the rebuild.
@@ -314,11 +319,11 @@ fn plan_file_of(call: &manox_protocol::ServerCall) -> Option<String> {
     }
 }
 
-#[cfg(all(test, feature = "test-support"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{AppContext as _, Entity, TestAppContext};
-    use manox_protocol::{ServerNote, in_process_pair};
+    use manox_protocol::{RpcConnection as _, ServerNote, in_process_pair, journal::ThreadHeader};
     use manox_session_core::agent_client::AgentClient;
     use std::sync::Arc;
 
@@ -395,5 +400,271 @@ mod tests {
         );
         assert_eq!(handle.update(cx, |h, _| h.store.cwd.clone()), "/proj");
         assert!(!handle.update(cx, |h, _| h.store.running));
+    }
+
+    // ── v2 stream fold / echo / resync / status (spec T6-6) ────────────────
+
+    use manox_protocol::journal::{JournalWireEntry, JournalWireEvent};
+    use manox_protocol::stream::{HostEvent, ProjectionsFrame, SessionSnapshot};
+    use std::collections::BTreeMap;
+
+    fn wire(seq: u64, event: JournalWireEvent) -> JournalWireEntry {
+        JournalWireEntry {
+            seq,
+            id: format!("w{seq}"),
+            parent_id: None,
+            timestamp: "2026-09-04T00:00:00.000Z".into(),
+            event,
+        }
+    }
+
+    fn snapshot(session_id: &str, cursor: u64, records: Vec<JournalWireEntry>) -> StreamFrame {
+        StreamFrame::Snapshot(SessionSnapshot {
+            session_id: session_id.into(),
+            header: ThreadHeader {
+                id: session_id.into(),
+                cwd: "/p".into(),
+                parent_session: None,
+                metadata: None,
+                created_at: "2026-09-04T00:00:00.000Z".into(),
+            },
+            cursor,
+            records,
+            has_more: false,
+            projections: BTreeMap::new(),
+            projections_as_of_seq: cursor,
+        })
+    }
+
+    fn item(session_id: &str, frame: StreamFrame) -> FromServer {
+        FromServer::StreamItem {
+            stream_id: StreamId::new(session_id),
+            frame,
+        }
+    }
+
+    #[gpui::test]
+    async fn stream_snapshot_entry_projections_fold_store(cx: &mut TestAppContext) {
+        let (mux, _conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/p", true, cx));
+        let user = wire(
+            0,
+            JournalWireEvent::Message {
+                role: "user".into(),
+                content: vec![serde_json::json!({"type": "text", "text": "hi"})],
+                usage: None,
+                origin_rpc: None,
+            },
+        );
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(item("s1", snapshot("s1", 0, vec![user.clone()])), cx)
+        });
+        cx.run_until_parked();
+        // Snapshot folded into window + display.
+        handle.update(cx, |h, _| {
+            assert_eq!(h.store.window.len(), 1);
+            assert_eq!(
+                h.store.display.len(),
+                1,
+                "user message projected to display"
+            );
+        });
+        // A live assistant delta appends to the window (no display item).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 1,
+                        event: JournalWireEvent::AgentTextDelta { s: "yo".into() },
+                    },
+                ),
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| assert_eq!(h.store.window.len(), 2));
+        // A Projections frame merges (higher-seq-wins) and materializes.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Projections(ProjectionsFrame {
+                        session_id: "s1".into(),
+                        as_of_seq: 1,
+                        values: BTreeMap::from([(
+                            "title".to_string(),
+                            serde_json::json!("Renamed"),
+                        )]),
+                    }),
+                ),
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| {
+            assert_eq!(h.store.display_title, "Renamed");
+            assert_eq!(
+                h.store.projection("title").unwrap().value,
+                serde_json::json!("Renamed")
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn stream_resync_reopens_from_snapshot(cx: &mut TestAppContext) {
+        let (mux, _conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/p", true, cx));
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    snapshot("s1", 0, vec![wire(0, JournalWireEvent::TurnStart)]),
+                ),
+                cx,
+            )
+        });
+        // A gap opens (seq 5 after tail 0) with no page source wired (the raw
+        // pair's server never replies), so the leaf stays repairing; instead
+        // drive the resync terminal frame directly.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                FromServer::StreamEnd {
+                    stream_id: StreamId::new("s1"),
+                    reason: manox_protocol::StreamEndReason::Resync,
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        // After the re-open, a fresh contiguous snapshot replaces the window
+        // seamlessly (cursor >= tail).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    snapshot(
+                        "s1",
+                        2,
+                        vec![
+                            wire(0, JournalWireEvent::TurnStart),
+                            wire(
+                                1,
+                                JournalWireEvent::TurnFinish {
+                                    cancelled: false,
+                                    failed: false,
+                                    stranded_steer_ids: vec![],
+                                },
+                            ),
+                            wire(2, JournalWireEvent::TurnStart),
+                        ],
+                    ),
+                ),
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| {
+            assert_eq!(
+                h.store.window.len(),
+                3,
+                "re-open converged to the full chain"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn echo_retires_on_durable_origin_rpc(cx: &mut TestAppContext) {
+        let (mux, _conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/p", true, cx));
+        handle.update(cx, |h, _| h.store.push_echo("rpc-42", "hello"));
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    snapshot(
+                        "s1",
+                        0,
+                        vec![wire(
+                            0,
+                            JournalWireEvent::Message {
+                                role: "user".into(),
+                                content: vec![serde_json::json!({"type": "text", "text": "hello"})],
+                                usage: None,
+                                origin_rpc: Some("rpc-42".into()),
+                            },
+                        )],
+                    ),
+                ),
+                cx,
+            )
+        });
+        // Snapshot (Replace) does not run the per-entry echo retirement; only
+        // Append does, matching §F.2 (a durable row arriving live). Feed the
+        // same row as an Append to exercise the retire.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 1,
+                        event: JournalWireEvent::Message {
+                            role: "user".into(),
+                            content: vec![serde_json::json!({"type": "text", "text": "hello"})],
+                            usage: None,
+                            origin_rpc: Some("rpc-42".into()),
+                        },
+                    },
+                ),
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| {
+            assert!(
+                h.store.echo.is_empty(),
+                "durable originRpc retired the echo"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn session_status_mirrors_monotonically(cx: &mut TestAppContext) {
+        let (mux, _conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/p", true, cx));
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id: "s1".into(),
+                        running: None,
+                        errored: None,
+                        unread: Some(true),
+                        pending_auth: None,
+                        pending_plan: None,
+                        background_work: None,
+                    },
+                },
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| assert!(h.store.unread));
+        // A later `unread=false` delta does not clear it (only focus does).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id: "s1".into(),
+                        running: Some(true),
+                        errored: None,
+                        unread: Some(false),
+                        pending_auth: None,
+                        pending_plan: None,
+                        background_work: None,
+                    },
+                },
+                cx,
+            )
+        });
+        handle.update(cx, |h, _| {
+            assert!(h.store.unread, "unread survives until focus");
+            assert!(h.store.running, "running takes the latest value");
+        });
     }
 }

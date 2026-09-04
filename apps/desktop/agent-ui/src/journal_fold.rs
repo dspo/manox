@@ -29,7 +29,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use manox_protocol::journal::{JournalWireEntry, JournalWireEvent};
-use manox_protocol::journal_stream::{JournalChange, JournalEntry, JournalInput, JournalSource, JournalStream};
+use manox_protocol::journal_stream::{
+    JournalChange, JournalEntry, JournalInput, JournalSource, JournalStream,
+};
 
 /// One journal wire entry boxed as an engine entry. `first`/`last` are both
 /// the dense seq (single-seq rows); the range primitive is kept for the
@@ -55,14 +57,26 @@ pub struct PageRequest {
 
 /// A committed window change the store folds into its display.
 #[derive(Debug, Clone)]
+// The `Append` variant (a whole entry inline) versus the page variants is an
+// inherent shape of the change vocabulary — pages are consumed immediately.
+#[allow(clippy::large_enum_variant)]
 pub enum WindowChange {
-    Replace { entries: Vec<JournalWireEntry>, has_more: bool },
-    Prepend { entries: Vec<JournalWireEntry>, has_more: bool },
+    Replace {
+        entries: Vec<JournalWireEntry>,
+        has_more: bool,
+    },
+    Prepend {
+        entries: Vec<JournalWireEntry>,
+        has_more: bool,
+    },
     Append(JournalWireEntry),
 }
 
 /// An output event the gpui leaf reacts to.
 #[derive(Debug, Clone)]
+// `Change` carries a page-sized `WindowChange` inline; folds consume it at
+// once, so boxing would only add churn (see the window-change note above).
+#[allow(clippy::large_enum_variant)]
 pub enum FoldOut {
     /// A window change was committed (`publish` fired).
     Change(WindowChange),
@@ -159,13 +173,13 @@ impl JournalFold {
         // needs a repair page (async) before the entry may be fed.
         let tail = engine.cursors().last;
         let first = entry.first();
-        if let Some(tail) = tail {
-            if first > tail + 1 {
-                self.repairing = Some(entry.last());
-                let through = entry.last();
-                self.queued.push_back(entry);
-                return vec![FoldOut::NeedPage(PageRequest { through_seq: through })];
-            }
+        if let Some(tail) = tail
+            && first > tail + 1
+        {
+            self.repairing = Some(entry.last());
+            let through = entry.last();
+            self.queued.push_back(entry);
+            return vec![FoldOut::NeedPage(PageRequest { through_seq: through })];
         }
         self.take(|engine| engine.apply(JournalInput::Entry(entry)))
     }
@@ -214,11 +228,7 @@ impl JournalFold {
     }
 
     /// Feed a backwards history page (the `Prepend` path).
-    pub fn prepend_page(
-        &mut self,
-        records: Vec<JournalWireEntry>,
-        has_more: bool,
-    ) -> Vec<FoldOut> {
+    pub fn prepend_page(&mut self, records: Vec<JournalWireEntry>, has_more: bool) -> Vec<FoldOut> {
         let page: Vec<FoldEntry> = records.into_iter().map(FoldEntry).collect();
         self.take(|engine| engine.apply(JournalInput::Prepend { page, has_more }))
     }
@@ -288,18 +298,14 @@ impl JournalFold {
 fn change_to_foldout(change: JournalChange<FoldEntry>) -> Option<FoldOut> {
     let mapped = |entries: Vec<FoldEntry>| entries.into_iter().map(|e| e.0).collect();
     Some(match change {
-        JournalChange::Replace { entries, has_more } => {
-            FoldOut::Change(WindowChange::Replace {
-                entries: mapped(entries),
-                has_more,
-            })
-        }
-        JournalChange::Prepend { entries, has_more } => {
-            FoldOut::Change(WindowChange::Prepend {
-                entries: mapped(entries),
-                has_more,
-            })
-        }
+        JournalChange::Replace { entries, has_more } => FoldOut::Change(WindowChange::Replace {
+            entries: mapped(entries),
+            has_more,
+        }),
+        JournalChange::Prepend { entries, has_more } => FoldOut::Change(WindowChange::Prepend {
+            entries: mapped(entries),
+            has_more,
+        }),
         JournalChange::Append(entry) => FoldOut::Change(WindowChange::Append(entry.0)),
     })
 }
@@ -314,13 +320,24 @@ mod tests {
     use manox_protocol::journal::JournalWireEvent as E;
 
     fn entry(seq: u64) -> E {
-        E::AgentTextDelta { s: format!("tok-{seq}") }
+        E::AgentTextDelta {
+            s: format!("tok-{seq}"),
+        }
     }
 
     #[test]
     fn snapshot_then_append() {
         let mut fold = JournalFold::new();
-        let snap = fold.snapshot(0, vec![JournalWireEntry { seq: 0, id: "a".into(), parent_id: None, timestamp: String::new(), event: entry(0) }]);
+        let snap = fold.snapshot(
+            0,
+            vec![JournalWireEntry {
+                seq: 0,
+                id: "a".into(),
+                parent_id: None,
+                timestamp: String::new(),
+                event: entry(0),
+            }],
+        );
         assert!(matches!(
             snap.as_slice(),
             [FoldOut::Change(WindowChange::Replace { entries, .. })] if entries.len() == 1
@@ -336,7 +353,16 @@ mod tests {
     #[test]
     fn stale_entry_drops_silently() {
         let mut fold = JournalFold::new();
-        fold.snapshot(0, vec![JournalWireEntry { seq: 0, id: "a".into(), parent_id: None, timestamp: String::new(), event: entry(0) }]);
+        fold.snapshot(
+            0,
+            vec![JournalWireEntry {
+                seq: 0,
+                id: "a".into(),
+                parent_id: None,
+                timestamp: String::new(),
+                event: entry(0),
+            }],
+        );
         let outs = fold.entry(0, entry(0));
         assert!(outs.is_empty(), "stale replay must not emit a change");
     }
@@ -344,10 +370,22 @@ mod tests {
     #[test]
     fn gap_requests_page_then_converges() {
         let mut fold = JournalFold::new();
-        fold.snapshot(0, vec![JournalWireEntry { seq: 0, id: "a".into(), parent_id: None, timestamp: String::new(), event: entry(0) }]);
+        fold.snapshot(
+            0,
+            vec![JournalWireEntry {
+                seq: 0,
+                id: "a".into(),
+                parent_id: None,
+                timestamp: String::new(),
+                event: entry(0),
+            }],
+        );
         // seq 2 skips 1 → gap, repair page must end at through=2.
         let outs = fold.entry(2, entry(2));
-        assert!(matches!(outs.as_slice(), [FoldOut::NeedPage(PageRequest { through_seq: 2 })]));
+        assert!(matches!(
+            outs.as_slice(),
+            [FoldOut::NeedPage(PageRequest { through_seq: 2 })]
+        ));
         assert!(fold.repairing());
         // seq 3 arrives during repair: it queues (fed after the page).
         let outs2 = fold.entry(3, entry(3));
@@ -355,7 +393,16 @@ mod tests {
         // Deliver the repair page ending at seq 2; the engine merges the
         // queued entry (seq 2 already inside the page) and publishes a
         // Replace, then seq 3 appends contiguously.
-        let page = vec![1u64, 2].into_iter().map(|s| JournalWireEntry { seq: s, id: format!("e{s}"), parent_id: None, timestamp: String::new(), event: entry(s) }).collect();
+        let page = vec![1u64, 2]
+            .into_iter()
+            .map(|s| JournalWireEntry {
+                seq: s,
+                id: format!("e{s}"),
+                parent_id: None,
+                timestamp: String::new(),
+                event: entry(s),
+            })
+            .collect();
         let outs3 = fold.deliver_page(page);
         assert!(
             outs3.iter().any(|o| matches!(

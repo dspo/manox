@@ -63,19 +63,22 @@ pub fn history_entries_of(entry: &JournalWireEntry) -> Vec<HistoryEntry> {
             "tool" => tool_row_to_entries(entry, content),
             "custom" => custom_row_to_entries(entry, content),
             other => {
-                tracing::debug!(role = other, "journal display fold: unknown message role skipped");
+                tracing::debug!(
+                    role = other,
+                    "journal display fold: unknown message role skipped"
+                );
                 Vec::new()
             }
         },
-        JournalWireEvent::UiNote { data, .. } => match serde_json::from_value::<UiNoteRecord>(
-            data.clone(),
-        ) {
-            Ok(record) => vec![HistoryEntry::Note(record)],
-            Err(err) => {
-                tracing::warn!(error = %err, "journal display fold: unparseable ui_note skipped");
-                Vec::new()
+        JournalWireEvent::UiNote { data, .. } => {
+            match serde_json::from_value::<UiNoteRecord>(data.clone()) {
+                Ok(record) => vec![HistoryEntry::Note(record)],
+                Err(err) => {
+                    tracing::warn!(error = %err, "journal display fold: unparseable ui_note skipped");
+                    Vec::new()
+                }
             }
-        },
+        }
         JournalWireEvent::Compaction {
             summary,
             retained_tail,
@@ -212,19 +215,15 @@ pub fn thread_event_of(entry: &JournalWireEntry) -> Option<ThreadEvent> {
             to: to.0.clone(),
         },
         JournalWireEvent::CwdChange { path } => ThreadEvent::CwdChanged { path: path.clone() },
-        JournalWireEvent::PermissionModeChange { mode } => {
-            ThreadEvent::PermissionModeChanged {
-                mode: parse_permission_mode(mode),
-            }
-        }
-        JournalWireEvent::ReasoningEffortChange { effort } => {
-            ThreadEvent::ReasoningEffortChanged {
-                effort: parse_reasoning_effort(effort),
-            }
-        }
-        JournalWireEvent::PlanModeChange { enabled } => ThreadEvent::PlanModeChanged {
-            enabled: *enabled,
+        JournalWireEvent::PermissionModeChange { mode } => ThreadEvent::PermissionModeChanged {
+            mode: parse_permission_mode(mode),
         },
+        JournalWireEvent::ReasoningEffortChange { effort } => ThreadEvent::ReasoningEffortChanged {
+            effort: parse_reasoning_effort(effort),
+        },
+        JournalWireEvent::PlanModeChange { enabled } => {
+            ThreadEvent::PlanModeChanged { enabled: *enabled }
+        }
         JournalWireEvent::PlanUpdate { snapshot } => ThreadEvent::PlanUpdated {
             snapshot: serde_json::from_value(snapshot.clone()).ok()?,
         },
@@ -261,11 +260,9 @@ pub fn thread_event_of(entry: &JournalWireEntry) -> Option<ThreadEvent> {
             status: parse_status(status),
             health: None,
         },
-        JournalWireEvent::CompactionStarted { tokens_before } => {
-            ThreadEvent::CompactionStarted {
-                tokens_before: *tokens_before,
-            }
-        }
+        JournalWireEvent::CompactionStarted { tokens_before } => ThreadEvent::CompactionStarted {
+            tokens_before: *tokens_before,
+        },
         JournalWireEvent::Compaction {
             summary,
             tokens_before,
@@ -647,32 +644,50 @@ mod tests {
 
     #[test]
     fn lifecycle_rows_map_to_thread_events() {
-        let cases: Vec<(JournalWireEvent, fn(&ThreadEvent) -> bool)> = vec![
+        type MapCheck = fn(&ThreadEvent) -> bool;
+        let cases: Vec<(JournalWireEvent, MapCheck)> = vec![
             (
                 JournalWireEvent::AgentTextDelta { s: "tok".into() },
                 |e| matches!(e, ThreadEvent::AgentText(t) if t == "tok"),
             ),
-            (JournalWireEvent::TurnStart, |e| matches!(e, ThreadEvent::TurnStarted)),
+            (JournalWireEvent::TurnStart, |e| {
+                matches!(e, ThreadEvent::TurnStarted)
+            }),
             (
                 JournalWireEvent::TurnFinish {
                     cancelled: true,
                     failed: false,
                     stranded_steer_ids: vec![],
                 },
-                |e| matches!(e, ThreadEvent::TurnFinished { cancelled: true, .. }),
+                |e| {
+                    matches!(
+                        e,
+                        ThreadEvent::TurnFinished {
+                            cancelled: true,
+                            ..
+                        }
+                    )
+                },
             ),
             (
-                JournalWireEvent::Error { message: "boom".into() },
+                JournalWireEvent::Error {
+                    message: "boom".into(),
+                },
                 |e| matches!(e, ThreadEvent::Error(_)),
             ),
             (
-                JournalWireEvent::CwdChange { path: "/new".into() },
+                JournalWireEvent::CwdChange {
+                    path: "/new".into(),
+                },
                 |e| matches!(e, ThreadEvent::CwdChanged { path } if path == "/new"),
             ),
         ];
         for (event, check) in cases {
             let ev = thread_event_of(&wire(9, event));
-            assert!(ev.as_ref().is_some_and(check), "event mapping failed: {ev:?}");
+            assert!(
+                ev.as_ref().is_some_and(check),
+                "event mapping failed: {ev:?}"
+            );
         }
     }
 

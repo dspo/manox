@@ -4135,7 +4135,7 @@ impl Workspace {
         let worktree_branch = self
             .store
             .as_ref()
-            .and_then(|s| s.read(cx).store.branch.clone());
+            .and_then(|s| s.read(cx).store.with(|st| st.branch.clone()));
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
             // file writes into a single git call.
@@ -5842,12 +5842,24 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn model_label(&self, _cx: &mut Context<Self>) -> String {
+    pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
         {
-            self.thread
-                .read(|t| t.model().cloned())
-                .map(|model| manox_agent::provider_glue::display_name(&model))
-                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+            // Selector read face (§J11): the composer model chip derives from
+            // the store's projection-materialized model, falling back to the
+            // bound thread mirror only while no projection has landed yet.
+            self.store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .with(|st| st.model_name.clone().or_else(|| st.model_id.clone()))
+                })
+                .unwrap_or_else(|| {
+                    self.thread
+                        .read(|t| t.model().cloned())
+                        .map(|model| manox_agent::provider_glue::display_name(&model))
+                        .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+                })
         }
     }
 
@@ -6200,13 +6212,12 @@ impl Workspace {
                 h.store.push_echo(&origin_rpc, text.clone());
             });
         }
-        self.client
-            .send_call(manox_protocol::ClientCall::Submit {
-                session_id: sid,
-                text,
-                images,
-                origin_rpc: Some(origin_rpc),
-            });
+        self.client.send_call(manox_protocol::ClientCall::Submit {
+            session_id: sid,
+            text,
+            images,
+            origin_rpc: Some(origin_rpc),
+        });
         true
     }
 
@@ -7539,10 +7550,13 @@ impl Workspace {
     /// on the right). The popover is `w(360)` to fit the longest bilingual
     /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Selector read face (§J11): the composer's access chip derives its
+        // permission mode through `ClientStore::with` instead of reaching the
+        // field directly.
         let mode = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.permission_mode)
+            .map(|s| s.read(cx).store.with(|st| st.permission_mode))
             .expect("foreground store present");
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
@@ -8657,7 +8671,7 @@ impl Workspace {
             let s = self
                 .store
                 .as_ref()
-                .map(|s| s.read(cx).store.display_title.clone())
+                .map(|s| s.read(cx).store.with(|st| st.display_title.clone()))
                 .expect("foreground store present");
             if s.is_empty() { "manox".to_string() } else { s }
         }

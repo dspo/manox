@@ -226,7 +226,10 @@ impl ClientStore {
                 }
                 self.record_message_usage(&entry);
                 let items = journal_translate::history_entries_of(&entry);
-                let replaces = matches!(entry.event, manox_protocol::JournalWireEvent::Compaction { .. });
+                let replaces = matches!(
+                    entry.event,
+                    manox_protocol::JournalWireEvent::Compaction { .. }
+                );
                 if replaces {
                     // A compaction row is a transcript boundary: the display
                     // restarts at the summary + retained tail (the window
@@ -423,14 +426,8 @@ impl ClientStore {
         let snapshot = TokenUsageSnapshot {
             input: usage.get("input").and_then(Value::as_u64).unwrap_or(0),
             output: usage.get("output").and_then(Value::as_u64).unwrap_or(0),
-            cache_creation: usage
-                .get("cacheWrite")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            cache_read: usage
-                .get("cacheRead")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cache_creation: usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0),
+            cache_read: usage.get("cacheRead").and_then(Value::as_u64).unwrap_or(0),
         };
         if snapshot.input + snapshot.output + snapshot.cache_read + snapshot.cache_creation > 0 {
             self.per_request_usage
@@ -442,10 +439,8 @@ impl ClientStore {
 
     /// Register a local optimistic echo for `origin_rpc`.
     pub fn push_echo(&mut self, origin_rpc: &str, text: impl Into<String>) {
-        self.echo.insert(
-            origin_rpc.to_string(),
-            EchoEntry { text: text.into() },
-        );
+        self.echo
+            .insert(origin_rpc.to_string(), EchoEntry { text: text.into() });
     }
 
     /// Retire the echo a durable row confirms; `true` when it existed.
@@ -861,7 +856,10 @@ mod tests {
         assert!(rebuilt);
         assert_eq!(store.display.len(), 1);
         assert_eq!(store.window.len(), 1);
-        store.apply_window_change(WindowChange::Append(wire(1, E::AgentTextDelta { s: "yo".into() })));
+        store.apply_window_change(WindowChange::Append(wire(
+            1,
+            E::AgentTextDelta { s: "yo".into() },
+        )));
         assert_eq!(store.window.len(), 2);
         // A pure delta has no display item but lands in the window.
         assert_eq!(store.display.len(), 1);
@@ -899,7 +897,10 @@ mod tests {
             },
         );
         store.apply_window_change(WindowChange::Append(entry));
-        assert!(!store.echo.contains_key("rpc-77"), "echo retired by durable row");
+        assert!(
+            !store.echo.contains_key("rpc-77"),
+            "echo retired by durable row"
+        );
     }
 
     #[test]

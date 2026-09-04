@@ -31,6 +31,9 @@ use manox_session_core::agent_server::AgentServer;
 
 use crate::client_store_handle::{ClientStoreHandle, LeafRequest};
 
+/// The one-shot continuation for a §D.2 `CreateSession` intent.
+type CreateCallback = Box<dyn FnOnce(CreateSessionDone, &mut Context<SessionMultiplexer>)>;
+
 /// Outcome of a §D.2 `CreateSession` intent: on success the server-minted id
 /// plus the registered (and now-following) leaf handle; on failure a message.
 pub enum CreateSessionDone {
@@ -71,7 +74,7 @@ pub struct SessionMultiplexer {
     leaf_tx: async_channel::Sender<LeafRequest>,
     /// `ClientCall::CreateSession` responses correlated by request `MsgId`
     /// (the workspace attaches when the server-minted id lands).
-    create_callbacks: HashMap<MsgId, Box<dyn FnOnce(CreateSessionDone, &mut Context<Self>)>>,
+    create_callbacks: HashMap<MsgId, CreateCallback>,
     _pump: Task<()>,
     _leaf_pump: Task<()>,
 }
@@ -134,7 +137,9 @@ impl SessionMultiplexer {
                     max_messages: None,
                 };
                 self.page_fetches.insert(id.clone(), session_id);
-                self.client.conn().send_to_server(FromClient::Request { id, call });
+                self.client
+                    .conn()
+                    .send_to_server(FromClient::Request { id, call });
             }
         }
     }
@@ -147,7 +152,8 @@ impl SessionMultiplexer {
             tracing::warn!(session = %session_id, "open_follow: no leaf registered");
             return;
         }
-        self.streams.insert(stream_id.clone(), session_id.to_string());
+        self.streams
+            .insert(stream_id.clone(), session_id.to_string());
         self.client.conn().send_to_server(FromClient::StreamOpen {
             stream_id,
             stream_kind: StreamKind::FollowSession {
@@ -201,13 +207,12 @@ impl SessionMultiplexer {
                 // `open_or_create(reopen=false)` has no client-chosen id, so
                 // the id only lands here).
                 let sid = note.session_id().map(str::to_string);
-                if let Some(sid) = sid.as_ref() {
-                    if matches!(note, manox_protocol::ServerNote::SessionCreated { .. })
-                        && !self.has_follow(sid)
-                    {
-                        let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
-                        self.open_follow(sid, stream_id);
-                    }
+                if let Some(sid) = sid.as_ref()
+                    && matches!(note, manox_protocol::ServerNote::SessionCreated { .. })
+                    && !self.has_follow(sid)
+                {
+                    let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
+                    self.open_follow(sid, stream_id);
                 }
                 sid
             }
@@ -221,7 +226,10 @@ impl SessionMultiplexer {
                                 let handle = self.ensure_leaf(&sid, cx);
                                 let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
                                 self.open_follow(&sid, stream_id);
-                                CreateSessionDone::Created { session_id: sid, handle }
+                                CreateSessionDone::Created {
+                                    session_id: sid,
+                                    handle,
+                                }
                             }
                             None => CreateSessionDone::Failed {
                                 message: "create response without session_id".into(),
@@ -280,8 +288,7 @@ impl SessionMultiplexer {
             h.set_outbound(self.leaf_tx.clone());
             h
         });
-        self.sessions
-            .insert(session_id.to_string(), handle.clone());
+        self.sessions.insert(session_id.to_string(), handle.clone());
         if reopen {
             self.client.send_call(ClientCall::OpenSession {
                 session_id: session_id.into(),
@@ -330,7 +337,7 @@ impl SessionMultiplexer {
         initial_model: Option<String>,
         approval_mode: Option<String>,
         reasoning_effort: Option<String>,
-        on_done: Box<dyn FnOnce(CreateSessionDone, &mut Context<Self>)>,
+        on_done: CreateCallback,
     ) {
         let id = self.client.send_call(ClientCall::CreateSession {
             cwd,
@@ -346,6 +353,9 @@ impl SessionMultiplexer {
     /// sidebar flags: running takes the latest value, `errored` is a rising
     /// edge cleared by a fresh turn, `unread` only rises (focus clears it),
     /// the pending flags take the latest value.
+    // §D.5 SessionStatus carries six independent optional flags; the
+    // monotonic rules read each one by one — a struct would add ceremony.
+    #[allow(clippy::too_many_arguments)]
     fn mirror_session_status(
         &self,
         session_id: &str,
