@@ -34,6 +34,24 @@ pub trait ThreadEngine: Send + Sync {
     /// queue orders it against prompts.
     fn append_ui_note(&self, _record: crate::db::UiNoteRecord) {}
 
+    /// The thread's journal feed (§C.3): ordered appends across session
+    /// swaps; `Lagged` is the resync signal (L5). Backends without a
+    /// journal yield an immediately-closed channel.
+    fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        tokio::sync::broadcast::channel(1).0.subscribe()
+    }
+
+    /// A one-shot whole-chain journal read (§C.3). Backends without a
+    /// journal resolve the receiver with a send error.
+    fn journal_snapshot(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<crate::engine::JournalSnapshotData> {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        rx
+    }
+
     /// Token usage keyed by user-message id, as the env card renders it.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
 
