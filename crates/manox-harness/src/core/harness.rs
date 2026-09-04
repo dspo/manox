@@ -7903,6 +7903,7 @@ pub(crate) mod tests {
                 parent_id: Some("mc".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hello"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -7940,6 +7941,7 @@ pub(crate) mod tests {
                 parent_id: Some("bs1".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("after"),
+                origin: None,
             })
             .await
             .unwrap();
