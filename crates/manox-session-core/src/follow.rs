@@ -133,12 +133,15 @@ async fn run_follow_stream(
     // ── Atomicity: subscribe BEFORE the snapshot read. ─────────────────────
     let mut feed = thread.subscribe_journal_feed();
     // ── Snapshot (whole active chain via the kernel read seam, §C.3). ──────
-    let end = match thread.journal_snapshot().await {
-        None => StreamEndReason::Failure {
-            code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.into(),
-            message: "journal engine is not materialized".into(),
-        },
-        Some(data) => {
+    //
+    // The seam answers from the engine actor's command loop. While the
+    // engine is still booting (or has been replaced by `open_session`) the
+    // oneshot reply can be dropped without an answer, which surfaces as an
+    // `Err` -> `None` from `journal_snapshot()`. Treat that as "not materialized yet" and
+    // retry with a bounded backoff; a genuinely absent engine (landing
+    // thread) is answered with `Failure`.
+    let end = match snapshot_with_retry(&thread, &cancel).await {
+        SnapshotResult::Data(data) => {
             let mut records: Vec<manox_protocol::journal::JournalWireEntry> =
                 Vec::with_capacity(data.records.len());
             for record in &data.records {
@@ -178,8 +181,40 @@ async fn run_follow_stream(
             });
             forward_entries(&conn, &stream_id, &mut feed, &cancel, &reason).await
         }
+        SnapshotResult::Unavailable => {
+            requested_reason(&reason).unwrap_or(StreamEndReason::Failure {
+                code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.into(),
+                message: "journal engine is not materialized".into(),
+            })
+        }
     };
     finish(&conn, &stream_id, end)
+}
+
+/// Outcome of the opening snapshot read (§C.3 seam).
+enum SnapshotResult {
+    Data(manox_agent::engine::JournalSnapshotData),
+    Unavailable,
+}
+
+/// Read the whole active chain with a bounded retry window: the seam answers
+/// from the engine actor's command loop, so a reply dropped during engine
+/// boot / session replacement is retried (~30s at 100ms — a materializing
+/// PiEngine answers promptly; a never-materializing landing thread gets the
+/// `Failure` terminal frame).
+async fn snapshot_with_retry(thread: &ThreadHandle, cancel: &CancellationToken) -> SnapshotResult {
+    for _ in 0..300u32 {
+        if cancel.is_cancelled() {
+            return SnapshotResult::Unavailable;
+        }
+        match thread.journal_snapshot().await {
+            Some(data) => return SnapshotResult::Data(data),
+            None => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+    SnapshotResult::Unavailable
 }
 
 /// Forward live feed events as Entry frames until cancelled / Lagged /

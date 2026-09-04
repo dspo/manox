@@ -1130,11 +1130,11 @@ impl AgentServerInner {
             }
         };
         // Idempotent re-open of a live session (§D.2).
-        if let Some(existing) = intent.session_id.as_deref() {
-            if inner.sessions.lock().contains_key(existing) {
-                inner.add_owner(existing, owner);
-                return Ok(json!({ "session_id": existing }));
-            }
+        if let Some(existing) = intent.session_id.as_deref()
+            && inner.sessions.lock().contains_key(existing)
+        {
+            inner.add_owner(existing, owner);
+            return Ok(json!({ "session_id": existing }));
         }
         let session_id = intent
             .session_id
@@ -2252,6 +2252,12 @@ mod tests {
         notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
         auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
         pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
+        /// Journal read-seam override (§C.3): tests append `JournalEvent`s
+        /// through this sender and seed the snapshot read directly, so
+        /// follow streams / PageHistory / the fold are exercised without a
+        /// live PiEngine actor.
+        journal_tx: tokio::sync::broadcast::Sender<manox_agent::engine::JournalFeed>,
+        journal_data: StdMutex<manox_agent::engine::JournalSnapshotData>,
     }
 
     impl FakeEngine {
@@ -2268,9 +2274,31 @@ mod tests {
                     notices,
                     auth_responses: StdMutex::new(Vec::new()),
                     pending_auth: StdMutex::new(Vec::new()),
+                    journal_tx: tokio::sync::broadcast::channel(64).0,
+                    journal_data: StdMutex::new(manox_agent::engine::JournalSnapshotData {
+                        cursor: 0,
+                        records: Vec::new(),
+                    }),
                 }),
                 events,
             )
+        }
+
+        /// Replace the scripted whole-chain read (§C.3): the cursor and the
+        /// dense records the follow snapshot / page reads answer with.
+        fn set_journal(&self, cursor: u64, records: Vec<JournalRecord>) {
+            *self.journal_data.lock().unwrap() =
+                manox_agent::engine::JournalSnapshotData { cursor, records };
+        }
+
+        /// Append one live journal event onto the thread feed.
+        fn push_journal(&self, seq: u64, entry: Arc<SessionTreeEntry>) {
+            let _ = self
+                .journal_tx
+                .send(manox_agent::engine::JournalFeed::Event(JournalEvent {
+                    seq,
+                    entry,
+                }));
         }
     }
 
@@ -2308,6 +2336,18 @@ mod tests {
 
         fn active_session_path(&self) -> Option<PathBuf> {
             None
+        }
+        fn subscribe_journal_feed(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<manox_agent::engine::JournalFeed> {
+            self.journal_tx.subscribe()
+        }
+        fn journal_snapshot(
+            &self,
+        ) -> tokio::sync::oneshot::Receiver<manox_agent::engine::JournalSnapshotData> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = tx.send(self.journal_data.lock().unwrap().clone());
+            rx
         }
         fn session_list(&self) -> Vec<manox_agent::ThreadSummary> {
             Vec::new()
@@ -2411,6 +2451,141 @@ mod tests {
             format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"{cwd}\"}}\n"),
         )
         .unwrap();
+    }
+
+    // ── Journal-vocabulary builders for the scripted stream tests (§C.2). ──
+    use manox_harness::session::SessionTreeEntry;
+    use manox_harness::session::jsonl::{JournalEvent, JournalRecord};
+
+    /// A fixed envelope timestamp: scripted stream tests compare the two
+    /// transports byte-identically, so no wall-clock may leak into a record.
+    fn fixed_ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn jentry(
+        id: &str,
+        parent: Option<&str>,
+        entry: fn(String, Option<String>) -> SessionTreeEntry,
+    ) -> Arc<SessionTreeEntry> {
+        Arc::new(entry(id.into(), parent.map(str::to_string)))
+    }
+
+    fn ent_turn_start(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::TurnStart {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_stop(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Stop {
+            reason: Some("dual-path probe".into()),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_agent_text_delta(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::AgentTextDelta {
+            delta: "tok".into(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_tool_call(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ToolCall {
+            call_id: "tc-1".into(),
+            name: "Bash".into(),
+            title: "run ls".into(),
+            status: "running".into(),
+            input: Some(json!({"command": "ls"})),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_tool_result(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ToolResult {
+            call_id: "tc-1".into(),
+            output: "file".into(),
+            is_error: false,
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_model_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ModelChange {
+            provider: "test-prov".into(),
+            model_id: "m-1".into(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_permission_mode_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::PermissionModeChange {
+            mode: "workspace-write".into(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_title(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Title {
+            title: "streamed title".into(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_goal(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Goal {
+            goal: Some(json!({"objective": "ship T4"})),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_ui_note(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::UiNote {
+            note: json!({"kind": "error", "data": {"text": "oops"}}),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_error_event(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ErrorEvent {
+            message: "provider exploded".into(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+    fn ent_turn_finish(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::TurnFinish {
+            cancelled: false,
+            failed: false,
+            stranded_steer_ids: Vec::new(),
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+        }
+    }
+
+    fn open_follow(client: &Client, stream: &str, session: &str) {
+        client.send(FromClient::StreamOpen {
+            stream_id: StreamId::new(stream),
+            stream_kind: StreamKind::FollowSession {
+                session_id: session.into(),
+                max_messages: None,
+            },
+        });
     }
 
     /// Drain messages until one matches `check`, panicking after a deadline.
@@ -3605,8 +3780,145 @@ mod tests {
         }
         assert!(got_ip_info && got_sl_info, "both paths answered ThreadInfo");
 
+        // ── §D.1 stream round (T4 extension) ──
+        //
+        // The stream half reuses each path's scripted engine: seed an
+        // identical journal, open a follow stream, await the snapshot, push
+        // one live entry, await it, then cancel. Transport-identical frames
+        // are the assertion (the §C.3 read seam itself is exercised through
+        // the engine's `journal_snapshot`/`subscribe_journal_feed`, which
+        // `open_stream_emits_snapshot_then_gap_free_entries` pins end-to-end
+        // against a live PiEngine file).
+        let seed_journal = |engine: &FakeEngine| {
+            engine.set_journal(
+                1,
+                vec![
+                    JournalRecord {
+                        seq: 0,
+                        entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+                    },
+                    JournalRecord {
+                        seq: 1,
+                        entry: (*jentry("e-1", Some("e-0"), ent_turn_finish)).clone(),
+                    },
+                ],
+            );
+        };
+        seed_journal(&engine_ip);
+        seed_journal(&engine_sl);
+
+        open_follow(&client_ip, "stream-1", "sess-inproc");
+        client_sl.send(FromClient::StreamOpen {
+            stream_id: StreamId::new("stream-1"),
+            stream_kind: StreamKind::FollowSession {
+                session_id: "sess-serde".into(),
+                max_messages: None,
+            },
+        });
+        // Snapshot-first (§F.1 rule 1): collect until the opening frame on
+        // each path (anything ahead of it is shared noise, pushed verbatim).
+        for (path_ip, seq) in [(true, &mut seq_ip), (false, &mut seq_sl)] {
+            let is_snapshot = |m: &FromServer| {
+                matches!(
+                    m,
+                    FromServer::StreamItem {
+                        frame: manox_protocol::StreamFrame::Snapshot(_),
+                        ..
+                    }
+                )
+            };
+            let mut arrived = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !arrived {
+                let m = if path_ip {
+                    client_ip.recv_timeout(Duration::from_secs(10))
+                } else {
+                    client_sl.recv_timeout(Duration::from_secs(10))
+                };
+                arrived = is_snapshot(&m);
+                seq.push(m);
+                assert!(std::time::Instant::now() < deadline, "snapshot frame lost");
+            }
+        }
+
+        // One live append forwarded as an Entry frame (seq 2, after the
+        // cursor at 1).
+        for engine in [&engine_ip, &engine_sl] {
+            engine.push_journal(2, jentry("e-2", Some("e-1"), ent_stop));
+        }
+        for (path_ip, seq) in [(true, &mut seq_ip), (false, &mut seq_sl)] {
+            let is_entry = |m: &FromServer| {
+                matches!(
+                    m,
+                    FromServer::StreamItem {
+                        frame: manox_protocol::StreamFrame::Entry { seq: 2, .. },
+                        ..
+                    }
+                )
+            };
+            let mut arrived = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !arrived {
+                let m = if path_ip {
+                    client_ip.recv_timeout(Duration::from_secs(10))
+                } else {
+                    client_sl.recv_timeout(Duration::from_secs(10))
+                };
+                arrived = is_entry(&m);
+                seq.push(m);
+                assert!(std::time::Instant::now() < deadline, "entry frame lost");
+            }
+        }
+
+        // Cancel both streams; the terminal StreamEnd rides the same
+        // transport and must match too.
+        client_ip.send(FromClient::StreamCancel {
+            stream_id: StreamId::new("stream-1"),
+        });
+        client_sl.send(FromClient::StreamCancel {
+            stream_id: StreamId::new("stream-1"),
+        });
+        for (path_ip, seq) in [(true, &mut seq_ip), (false, &mut seq_sl)] {
+            let mut ended = false;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !ended {
+                let m = if path_ip {
+                    client_ip.recv_timeout(Duration::from_secs(10))
+                } else {
+                    client_sl.recv_timeout(Duration::from_secs(10))
+                };
+                ended = matches!(m, FromServer::StreamEnd { .. });
+                seq.push(m);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stream end frame lost"
+                );
+            }
+        }
+
         // ── Normalize + compare ──
         let normalize = |msgs: Vec<FromServer>| -> Vec<serde_json::Value> {
+            /// Stream frames carry wall-clock stamps (file timestamps from
+            /// the two independent seeds); scrub them to one value — the
+            /// transport-identity claim is about the frame protocol, not the
+            /// seed moments.
+            fn scrub(v: &mut serde_json::Value) {
+                match v {
+                    Value::Object(map) => {
+                        for (k, child) in map.iter_mut() {
+                            if k == "timestamp" || k == "createdAt" {
+                                *child = Value::String("TS".into());
+                            } else {
+                                scrub(child);
+                            }
+                        }
+                    }
+                    Value::Array(items) => items.iter_mut().for_each(scrub),
+                    other => {
+                        let _ = other;
+                    }
+                }
+            }
             msgs.into_iter()
                 .filter(|m| {
                     !matches!(
@@ -3616,7 +3928,8 @@ mod tests {
                     )
                 })
                 .map(|m| {
-                    let v = serde_json::to_value(&m).expect("serializable");
+                    let mut v = serde_json::to_value(&m).expect("serializable");
+                    scrub(&mut v);
                     let s = v.to_string();
                     let s = s
                         .replace("sess-inproc", "SESS")
@@ -3714,23 +4027,20 @@ mod tests {
                 session_id: "sa".into(),
             },
         });
-        client_b.send(FromClient::Notification {
-            note: ClientNote::Submit {
+        // Liveness proof for b after a's dispose, independent of the
+        // process-global provider registry: a request against b's still-live
+        // session must get a Response (server alive, sb retained), never a
+        // dropped connection. (The earlier "submit -> Error note" proof was
+        // order-fragile: it relied on sb's engine bailing with no default
+        // model, which a prior model-registering test defeats.)
+        client_b.send(FromClient::Request {
+            id: MsgId::new("b-alive"),
+            call: ClientCall::GetCurrentModel {
                 session_id: "sb".into(),
-                text: "still alive".into(),
-                images: vec![],
-                client_id: None,
             },
         });
-        // sb has no engine bound; the submit surfaces an error note to b —
-        // proof the server survived a's dispose.
         expect(&client_b, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::Error { .. }
-                }
-            )
+            matches!(m, FromServer::Response { outcome: Ok(_), .. })
         });
 
         drop(client_a);
@@ -4035,6 +4345,714 @@ mod tests {
             )
         });
         assert_eq!(server.0.owners("s1"), vec!["test".to_string()]);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── T4: §D.1 follow streams (§F server side). ─────────────────────────
+
+    /// A snapshot-first open followed by strictly gap-free live entries:
+    /// `Snapshot.cursor == journal_cursor` (the seeded chain end), then
+    /// Entry frames with consecutive dense seqs starting at cursor+1
+    /// (§F.1 rule 1/2 — the client engine's opening contract).
+    #[test]
+    fn open_stream_emits_snapshot_then_gap_free_entries() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        // Seed the whole-chain read: two dense records, cursor = 1.
+        engine.set_journal(
+            1,
+            vec![
+                JournalRecord {
+                    seq: 0,
+                    entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+                },
+                JournalRecord {
+                    seq: 1,
+                    entry: (*jentry("e-1", Some("e-0"), ent_turn_finish)).clone(),
+                },
+            ],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        open_follow(&client, "st-1", "s1");
+
+        let snapshot = loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::StreamFrame::Snapshot(s),
+                } if stream_id.0 == "st-1" => break s,
+                // Leftover v1 push (the compat CreateSession still emits
+                // its notes in the dual-protocol window) is skipped; the
+                // FIRST STREAM frame must be the snapshot (§F.1 rule 1).
+                FromServer::Notification { .. } => continue,
+                other => {
+                    panic!("first stream frame must be the Snapshot, got {other:?}");
+                }
+            }
+        };
+        assert_eq!(snapshot.session_id, "s1");
+        // Snapshot cursor equals the journal cursor: the read is the
+        // engine's whole active chain (§C.3), whose tail stamp is the cursor.
+        assert_eq!(snapshot.cursor, 1);
+        assert_eq!(snapshot.records.len(), 2);
+        assert_eq!(snapshot.records[0].seq, 0);
+        assert_eq!(snapshot.records[1].seq, 1);
+        assert!(!snapshot.has_more);
+        // §D.1 T4 scope: empty projection baseline, stamped at the cursor
+        // (the registry is T5).
+        assert!(snapshot.projections.is_empty());
+        assert_eq!(snapshot.projections_as_of_seq, snapshot.cursor);
+        assert_eq!(snapshot.header.id, "s1");
+
+        // Live entries: a varied, dense run of §C.2 rows forwarded as
+        // gap-free Entry frames — each maps through `translate::wire_event`
+        // and continues the cursor by exactly one (§F.1 rule 2).
+        type EntryBuilder = fn(String, Option<String>) -> SessionTreeEntry;
+        let live: Vec<(u64, EntryBuilder, &str)> = vec![
+            (2, ent_agent_text_delta, "agentTextDelta"),
+            (3, ent_tool_call, "toolCall"),
+            (4, ent_model_change, "modelChange"),
+            (5, ent_permission_mode_change, "permissionModeChange"),
+            (6, ent_title, "title"),
+            (7, ent_goal, "goal"),
+            (8, ent_ui_note, "uiNote"),
+            (9, ent_error_event, "error"),
+        ];
+        for (seq, make, _tag) in &live {
+            engine.push_journal(
+                *seq,
+                jentry(&format!("e-{seq}"), Some(&format!("e-{}", seq - 1)), *make),
+            );
+        }
+        let mut last = snapshot.cursor;
+        for (seq, _make, tag) in &live {
+            let (got, event) = loop {
+                match client.recv() {
+                    FromServer::StreamItem {
+                        frame: manox_protocol::StreamFrame::Entry { seq, event },
+                        ..
+                    } => break (seq, event),
+                    // Compat-window v1 push may interleave; skip it.
+                    FromServer::Notification { .. } => continue,
+                    other => panic!("expected Entry frames, got {other:?}"),
+                }
+            };
+            // Gap-free: every entry continues the cursor immediately.
+            assert_eq!(got, last + 1, "gap-free Entry stream (§F.1 rule 2)");
+            assert_eq!(got, *seq);
+            assert_eq!(
+                serde_json::to_value(&event).unwrap()["type"].as_str(),
+                Some(*tag),
+                "wire tag for seq {seq}"
+            );
+            last = got;
+        }
+        assert_eq!(last, 9, "cursor advanced across the whole live run");
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// `StreamCancel` terminates the stream with exactly one
+    /// `StreamEnd { Cancelled }` and nothing after it (§D.1).
+    #[test]
+    fn stream_cancel_ends_stream() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+            }],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        open_follow(&client, "st-1", "s1");
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamItem {
+                    frame: manox_protocol::StreamFrame::Snapshot(_),
+                    ..
+                }
+            )
+        });
+        client.send(FromClient::StreamCancel {
+            stream_id: StreamId::new("st-1"),
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamEnd {
+                    stream_id,
+                    reason: manox_protocol::StreamEndReason::Cancelled,
+                } if stream_id.0 == "st-1"
+            )
+        });
+        // Nothing may follow the terminal frame; a late entry or a second
+        // StreamEnd would violate the §F.1 contract.
+        let rx = client.conn.server_rx();
+        let deadline = std::time::Instant::now() + Duration::from_millis(200);
+        while std::time::Instant::now() < deadline {
+            assert!(
+                rx.try_recv().is_err(),
+                "traffic after StreamEnd on a cancelled stream"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// One connection, many streams (§D.1): two follow streams on two
+    /// sessions interleave without cross-talk — cancel one, the other keeps
+    /// delivering.
+    #[test]
+    fn multi_stream_one_connection() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        create(&server, &client, "s2");
+        let (engine1, events1) = FakeEngine::new();
+        engine1.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("a-0", None, ent_turn_start)).clone(),
+            }],
+        );
+        server.set_session_engine_for_test("s1", engine1.clone(), events1);
+        let (engine2, events2) = FakeEngine::new();
+        engine2.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("b-0", None, ent_title)).clone(),
+            }],
+        );
+        server.set_session_engine_for_test("s2", engine2.clone(), events2);
+
+        open_follow(&client, "st-a", "s1");
+        open_follow(&client, "st-b", "s2");
+        // Each stream opens with its own snapshot (dense, per session).
+        let mut snap_a = false;
+        let mut snap_b = false;
+        while !(snap_a && snap_b) {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::StreamFrame::Snapshot(s),
+                } => {
+                    if stream_id.0 == "st-a" {
+                        assert_eq!(s.session_id, "s1");
+                        snap_a = true;
+                    } else {
+                        assert_eq!(stream_id.0, "st-b");
+                        assert_eq!(s.session_id, "s2");
+                        snap_b = true;
+                    }
+                }
+                // Compat-window v1 notes are drained; any other frame on
+                // an unopened stream would be cross-talk.
+                FromServer::Notification { .. } => continue,
+                other => panic!("expected snapshots on both streams, got {other:?}"),
+            }
+        }
+        // Live entries route to the right stream only.
+        engine1.push_journal(1, jentry("a-1", Some("a-0"), ent_agent_text_delta));
+        let got = loop {
+            match client.recv() {
+                FromServer::StreamItem { stream_id, frame } => break (stream_id, frame),
+                FromServer::Notification { .. } => continue,
+                other => panic!("expected a live entry, got {other:?}"),
+            }
+        };
+        assert_eq!(got.0.0, "st-a", "entries must not cross streams");
+        assert!(matches!(
+            got.1,
+            manox_protocol::StreamFrame::Entry { seq: 1, .. }
+        ));
+        // Cancel one; the other stays live.
+        client.send(FromClient::StreamCancel {
+            stream_id: StreamId::new("st-a"),
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamEnd { stream_id, reason: manox_protocol::StreamEndReason::Cancelled }
+                    if stream_id.0 == "st-a"
+            )
+        });
+        engine2.push_journal(1, jentry("b-1", Some("b-0"), ent_agent_text_delta));
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamItem { stream_id, .. } if stream_id.0 == "st-b"
+            )
+        });
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// Dispose closes every live stream of the session (§D.1 `Closed`):
+    /// server-side termination, never a silent stall.
+    #[test]
+    fn dispose_session_closes_streams() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+            }],
+        );
+        server.set_session_engine_for_test("s1", engine, events);
+        open_follow(&client, "st-1", "s1");
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamItem {
+                    frame: manox_protocol::StreamFrame::Snapshot(_),
+                    ..
+                }
+            )
+        });
+        client.send(FromClient::Notification {
+            note: ClientNote::DisposeSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::StreamEnd {
+                    stream_id,
+                    reason: manox_protocol::StreamEndReason::Closed,
+                } if stream_id.0 == "st-1"
+            )
+        });
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── T4: §D.2 PageHistory + §E.3 GetConversationInfo. ──────────────────
+
+    fn request(client: &Client, id: &str, call: ClientCall) -> FromServer {
+        client.send(FromClient::Request {
+            id: MsgId::new(id),
+            call,
+        });
+        loop {
+            let m = client.recv();
+            if matches!(m, FromServer::Response { .. }) {
+                return m;
+            }
+        }
+    }
+
+    fn response_outcome(m: FromServer) -> Value {
+        match m {
+            FromServer::Response { outcome: Ok(v), .. } => v,
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => panic!("expected Ok response, got err {e:?}"),
+            other => panic!("expected a Response, got {other:?}"),
+        }
+    }
+
+    /// Cold chain pages round-trip through the §D.2 PageHistory surface:
+    /// `{records, has_more, cursor}` over the seeded chain (dense seq,
+    /// §F.1-compatible), through the real `translate::wire_entry` mapping.
+    #[test]
+    fn page_history_cold_read_round_trips() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            3,
+            vec![
+                JournalRecord {
+                    seq: 0,
+                    entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+                },
+                JournalRecord {
+                    seq: 1,
+                    entry: (*jentry("e-1", Some("e-0"), ent_agent_text_delta)).clone(),
+                },
+                JournalRecord {
+                    seq: 2,
+                    entry: (*jentry("e-2", Some("e-1"), ent_tool_call)).clone(),
+                },
+                JournalRecord {
+                    seq: 3,
+                    entry: (*jentry("e-3", Some("e-2"), ent_tool_result)).clone(),
+                },
+            ],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+
+        // Latest page: the whole chain, dense, oldest-first.
+        let v = response_outcome(request(
+            &client,
+            "ph-1",
+            ClientCall::PageHistory {
+                session_id: "s1".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+        ));
+        assert_eq!(v["cursor"], 3);
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["records"].as_array().unwrap().len(), 4);
+        for (i, r) in v["records"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(r["seq"], i as u64, "dense seq, oldest first");
+        }
+        assert_eq!(v["records"][0]["type"], "turnStart");
+        assert_eq!(v["records"][3]["type"], "toolResult");
+        assert_eq!(v["records"][3]["callId"], "tc-1", "C.1 handle rename");
+
+        // Backwards page: strictly before seq 2, capped at 1 message —
+        // has_more surfaces the older prefix.
+        let v = response_outcome(request(
+            &client,
+            "ph-2",
+            ClientCall::PageHistory {
+                session_id: "s1".into(),
+                through_seq: -1,
+                before_seq: Some(2),
+                max_messages: Some(1),
+            },
+        ));
+        let recs = v["records"].as_array().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0]["seq"], 1);
+        assert_eq!(v["cursor"], 1);
+        assert_eq!(v["has_more"], true, "seq 0 predates the window");
+
+        // The page round-trips the real wire type (§J.5 serde shape).
+        let back: Vec<manox_protocol::JournalWireEntry> =
+            serde_json::from_value(v["records"].clone()).expect("wire records parse");
+        assert_eq!(
+            back[0].event,
+            manox_protocol::JournalWireEvent::AgentTextDelta { s: "tok".into() }
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// §E.3: turns count `turn_start` rows, messages count `message` rows,
+    /// `models[]` aggregates assistant usage by canonical model.
+    #[test]
+    fn conversation_info_folds_usage() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        let msg =
+            |id: String, parent: Option<String>, message: manox_harness::types::AgentMessage| {
+                SessionTreeEntry::Message {
+                    id,
+                    parent_id: parent,
+                    timestamp: chrono::Utc::now(),
+                    message,
+                }
+            };
+        engine.set_journal(
+            3,
+            vec![
+                JournalRecord {
+                    seq: 0,
+                    entry: (*jentry("c-0", None, ent_turn_start)).clone(),
+                },
+                JournalRecord {
+                    seq: 1,
+                    entry: msg(
+                        "c-1".into(),
+                        Some("c-0".into()),
+                        manox_harness::types::AgentMessage::User {
+                            content: vec![manox_harness::types::ContentBlock::Text {
+                                text: "hi".into(),
+                                signature: None,
+                            }],
+                            timestamp: chrono::Utc::now(),
+                        },
+                    ),
+                },
+                JournalRecord {
+                    seq: 2,
+                    entry: msg(
+                        "c-2".into(),
+                        Some("c-1".into()),
+                        manox_harness::types::AgentMessage::Assistant {
+                            content: vec![],
+                            model: "m-1".into(),
+                            provider: "test-prov".into(),
+                            api: "anthropic".into(),
+                            response_model: None,
+                            response_id: None,
+                            diagnostics: None,
+                            stop_reason: None,
+                            raw_stop_reason: None,
+                            usage: Box::new(usage(10, 2, 1, 0, 0)),
+                            error_message: None,
+                            timestamp: chrono::Utc::now(),
+                        },
+                    ),
+                },
+                JournalRecord {
+                    seq: 3,
+                    entry: (*jentry("c-3", Some("c-2"), ent_turn_start)).clone(),
+                },
+            ],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let v = response_outcome(request(
+            &client,
+            "ci-1",
+            ClientCall::GetConversationInfo {
+                session_id: "s1".into(),
+            },
+        ));
+        assert_eq!(v["turns"], 2, "turn_start count");
+        assert_eq!(v["messages"], 2, "message count");
+        let models = v["models"].as_array().unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["provider"], "test-prov");
+        // Canonical wire identity (L8).
+        assert_eq!(models[0]["model"], "test-prov/m-1");
+        assert_eq!(models[0]["input"], 10);
+        assert_eq!(models[0]["output"], 2);
+        assert_eq!(models[0]["cacheRead"], 1);
+        assert_eq!(models[0]["calls"], 1);
+        // T4 placeholders: cost is T5, git stays null, token-meter fields
+        // null until the registry lands (§E.3 field sourcing).
+        assert_eq!(v["cumulativeCost"], 0.0);
+        assert!(v["git"].is_null());
+        // contextWindow tracks the thread's model (null only when the
+        // process-global provider registry happens to be empty); the
+        // fold must at least carry the key.
+        assert!(v.get("contextWindow").is_some());
+        assert!(models[0]["hitRate"].is_null());
+        assert!(models[0]["pct"].is_null());
+
+        // §E.3 cache: the same cursor replays the cached fold byte-identical.
+        let v2 = response_outcome(request(
+            &client,
+            "ci-2",
+            ClientCall::GetConversationInfo {
+                session_id: "s1".into(),
+            },
+        ));
+        assert_eq!(v, v2);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    fn usage(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: u64,
+    ) -> manox_harness::types::Usage {
+        manox_harness::types::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_input_tokens: cache_read,
+            cache_creation_input_tokens: cache_write,
+            cache_write_1h: None,
+            reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
+            total_tokens: input + output + cache_read + cache_write,
+            cost: None,
+        }
+    }
+
+    // ── T4: §D.2 request receipts + intent. ───────────────────────────────
+
+    /// `ClientCall::Submit` answers with the §D.2 receipt and the durable
+    /// path journals the submission: the engine sees the prompt, and the
+    /// receipt carries the `message_id` of the user row. `origin_rpc` is
+    /// accepted (receipt unchanged — the kernel origin row is a T5 type
+    /// change, see the delivery report gap note).
+    #[test]
+    fn submit_request_returns_receipt_and_journals_origin() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let v = response_outcome(request(
+            &client,
+            "sub-1",
+            ClientCall::Submit {
+                session_id: "s1".into(),
+                text: "hello v2".into(),
+                images: vec![],
+                origin_rpc: Some("rpc-echo-9".into()),
+            },
+        ));
+        assert_eq!(v["accepted"], true);
+        // The receipt names the durable user row (message_id present and
+        // stable across the journaling path).
+        let message_id = v["message_id"].as_str().unwrap().to_string();
+        assert!(!message_id.is_empty(), "receipt carries the message id");
+        // The submission reached the engine and the transcript journaling
+        // path (the kernel user row + the §C.2 message entry share the id).
+        assert_eq!(engine.runs.lock().unwrap().as_slice(), ["hello v2"]);
+        let v2 = response_outcome(request(
+            &client,
+            "sub-2",
+            ClientCall::Submit {
+                session_id: "s1".into(),
+                text: "second".into(),
+                images: vec![],
+                origin_rpc: None,
+            },
+        ));
+        assert_eq!(v2["accepted"], true);
+        // Unknown session: §D.7 stable code, not a silent note.
+        let m = request(
+            &client,
+            "sub-3",
+            ClientCall::Submit {
+                session_id: "nope".into(),
+                text: "x".into(),
+                images: vec![],
+                origin_rpc: None,
+            },
+        );
+        match m {
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => assert_eq!(e.data.unwrap()["code"], "session/not-found"),
+            other => panic!("expected not-found err, got {other:?}"),
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// §D.2 CreateSession intent: the session binds to `project` via the
+    /// `new_in_project` kernel path (project == cwd origin, no orphaned
+    /// pre-project file), `initial_model` resolves through the canonical
+    /// `resolve_model_ref` (L8), and `approval_mode` / `reasoning_effort`
+    /// land on the thread. An unresolvable model answers
+    /// `model/unresolvable` (§D.7).
+    #[test]
+    fn create_session_with_project_intent() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        await_provider_registry();
+        register_test_model("deepseek-chat");
+        let (server, client) = harness(vec![]);
+        let project = std::env::temp_dir().join("manox-t4-create-intent-proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let v = response_outcome(request(
+            &client,
+            "cs-1",
+            ClientCall::CreateSession {
+                cwd: None,
+                project: Some(project.to_string_lossy().into_owned()),
+                initial_model: Some(manox_protocol::ModelRef::new(
+                    "test-deepseek-chat/deepseek-chat",
+                )),
+                approval_mode: Some("read-only".into()),
+                reasoning_effort: Some("high".into()),
+            },
+        ));
+        let sid = v["session_id"].as_str().expect("session id").to_string();
+        let thread = server.0.session_thread(&sid).expect("live session");
+        let (proj, model, mode, effort) = thread.read(|t| {
+            (
+                t.project().map(|p| p.to_path_buf()),
+                t.model().map(|m| (m.provider.clone(), m.id.clone())),
+                t.permission_mode(),
+                t.reasoning_effort().wire_value().to_string(),
+            )
+        });
+        assert_eq!(
+            proj.as_deref(),
+            Some(project.as_path()),
+            "new_in_project binding"
+        );
+        // Canonical resolution (L8): the wire registration name, not a bare
+        // id, selects the model — provider + id both applied.
+        assert_eq!(
+            model,
+            Some(("test-deepseek-chat".into(), "deepseek-chat".into()))
+        );
+        assert_eq!(mode.wire(), "read-only");
+        assert_eq!(effort, "high");
+
+        // Unresolvable initial model: §D.7 code, zero side effects.
+        let m = request(
+            &client,
+            "cs-2",
+            ClientCall::CreateSession {
+                cwd: None,
+                project: None,
+                initial_model: Some(manox_protocol::ModelRef::new("prov/no-such-model")),
+                approval_mode: None,
+                reasoning_effort: None,
+            },
+        );
+        match m {
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => assert_eq!(e.data.unwrap()["code"], "model/unresolvable"),
+            other => panic!("expected model/unresolvable, got {other:?}"),
+        }
+        // A follow stream opens on the freshly created session and answers
+        // with a snapshot (the intent path is a normal session in every
+        // respect).
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(0, Vec::new());
+        server.set_session_engine_for_test(&sid, engine, events);
+        open_follow(&client, "st-cs", &sid);
+        expect(&client, |m| {
+            matches!(m, FromServer::StreamItem {
+                stream_id, frame: manox_protocol::StreamFrame::Snapshot(_),
+            } if stream_id.0 == "st-cs")
+        });
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
