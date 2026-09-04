@@ -106,7 +106,7 @@ pub async fn page_history(
 /// - `contextWindow` / `hitRate` / `pct` are token-meter semantics that need
 ///   the provider registry + cache accounting beyond the journal — `null`
 ///   in T4 (T5 projection/registry work);
-/// - `cumulativeCost` = 0.0 placeholder (real cost folding is T5);
+/// - `cumulativeCost` from the engine's priced accumulation;
 /// - `git` = null placeholder (git stats stay a host lookup, §E.3 note).
 pub async fn conversation_info(
     cache: &Arc<std::sync::Mutex<ConversationInfoCache>>,
@@ -218,7 +218,10 @@ fn fold_conversation_info(
         "models": model_rows,
         // Real cost folding is T5 (§E.3); 0.0 placeholder keeps the row
         // shape stable for clients.
-        "cumulativeCost": 0.0,
+        // Real thread-wide cost from the engine's rate-card accumulation
+        // (the journal's usage rows are per-model inputs; the engine already
+        // maintains the authoritative priced total — read it once here).
+        "cumulativeCost": thread.read(|t| t.cumulative_cost()),
         // Git stats are a host lookup (§E.3 note); null placeholder in T4.
         "git": Value::Null,
     })
