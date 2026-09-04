@@ -273,10 +273,11 @@ impl SessionMultiplexer {
     /// leaf handle for it — an existing leaf is REUSED (its window,
     /// projections and in-flight fold survive; a double `StreamOpen` would
     /// otherwise clobber the fold and double-route frames). `reopen = true`
-    /// rebinds an existing thread via `OpenSession` (history replays as
-    /// `ServerNote`s + a follow-stream `Snapshot`); `false` declares a fresh
-    /// one via the compat `CreateSession` note (the server answers
-    /// `SessionCreated`, which opens the follow stream — see `route`).
+    /// rebinds an existing thread via `OpenSession` (history replays as the
+    /// follow-stream `Snapshot` — T10c retired the v1 note replay); `false`
+    /// declares a fresh one via the compat `CreateSession` note (the server
+    /// answers `SessionCreated`, which opens the follow stream — see
+    /// `route`).
     pub fn open_or_create(
         &mut self,
         session_id: &str,

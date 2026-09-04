@@ -608,11 +608,18 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The store mirrors the session's effective cwd as a string.
-        let cwd_path = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read(cx).store.with(|st| st.cwd_path.clone()));
+        // The store mirrors the session's effective cwd as a string (the v2
+        // `cwd` projection; T10c retired the separate `cwd_path` note field —
+        // it was the same directory path).
+        let cwd_path = self.store.as_ref().and_then(|s| {
+            s.read(cx).store.with(|st| {
+                if st.cwd.is_empty() {
+                    None
+                } else {
+                    Some(st.cwd.clone())
+                }
+            })
+        });
         let display = self.git_branch_display.clone();
 
         // Branch label: branch / detached sha + (detached).

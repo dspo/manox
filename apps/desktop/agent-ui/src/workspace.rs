@@ -317,10 +317,10 @@ struct PendingPlanReview {
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: manox_agent::thread::ThreadHandle,
-    /// γ-2a transitional read path: the `AgentServer`-backed
-    /// `ClientStoreHandle`, mirroring kernel state via `ServerNote`s. `None`
-    /// until the workspace creates the AgentServer connection (landing
-    /// thread); views read the store mirror. Held on
+    /// The `AgentServer`-backed `ClientStoreHandle` — the v2 `SessionStore`
+    /// (journal window + projection face + echo map) fed by the multiplexer's
+    /// follow stream. `None` until the workspace creates the AgentServer
+    /// connection (landing thread); views read the store mirror. Held on
     /// the workspace for the next wiring step (re-handling the store on
     /// thread switch) — written at landing, read there.
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
@@ -530,11 +530,6 @@ pub struct Workspace {
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
-    /// Messages from the thread's mirrored history already rendered into the
-    /// conversation. The streaming preview (`ThreadEvent::HistoryProgress`)
-    /// appends only `thread.messages()[history_rendered..]`; reset whenever
-    /// the conversation is rebuilt from scratch.
-    history_rendered: usize,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
     view_mode: ViewMode,
@@ -895,7 +890,6 @@ impl Workspace {
             list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
             message_list_width: crate::views::MessageListWidthInvalidator::default(),
             list_count: 0,
-            history_rendered: 0,
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
@@ -1136,30 +1130,23 @@ impl Workspace {
         }));
     }
 
-    /// Rebuild the conversation view from the current thread's message
-    /// history. The harness-pi restore hook: `PiSession` rebuilds the pi
-    /// session asynchronously, then asks the workspace to re-render once the
-    /// restored history lands.
+    /// Rebuild the conversation view from the thread's v2 display fold. The
+    /// trigger is the follow stream's authoritative history boundary
+    /// (`WindowChange::Replace` → `ThreadEvent::HistoryRestored`, §D.1); the
+    /// T10c-era successor of the deleted `ThreadHistory` note replay.
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
-        // Derive everything the rebuild needs (message count + sub-agent rows)
-        // inside one store read — cloning the full transcript here would copy
-        // the whole thread on the main thread for every rebuild.
-        let (messages_len, subagent_rows) = self
-            .store
-            .as_ref()
-            .map(|s| {
-                let msgs = &s.read(cx).store.messages;
-                (
-                    msgs.len(),
-                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
-                )
-            })
-            .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.display_entries.clone())
+            .map(|s| s.read(cx).store.display.clone())
             .expect("foreground store present");
+        let subagent_rows = manox_agent::subagent_restore::rebuild_from_messages(
+            &self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.derived_messages())
+                .expect("foreground store present"),
+        );
         let usage = self
             .store
             .as_ref()
@@ -1210,9 +1197,6 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
-        // The authoritative list is fully rendered now; future preview
-        // batches append from here.
-        self.history_rendered = messages_len;
         // `Tail` natively pins to the end and keeps following; an upward user
         // scroll disengages it and landing back at the bottom re-arms it.
         self.list_state.set_follow_mode(FollowMode::Tail);
@@ -1318,12 +1302,14 @@ impl Workspace {
                     this.active_browser_suites = suites.clone();
                     cx.notify();
                 }
-                // The pi actor restores session history asynchronously; the
-                // attach-time conversation rebuild saw an empty transcript,
-                // so rebuild once the authoritative history lands (sidebar
-                // open). Without this a reopened thread strands on the
-                // loading screen, and a forked session's preview is corrected
-                // to the authoritative active branch here.
+                // v2 (T10c, §D.1): the follow stream's authoritative history
+                // boundary (`WindowChange::Replace` from the opening
+                // Snapshot / a seamless re-open) re-arms the conversation
+                // rebuild — the role the deleted `ThreadHistory` note's
+                // `restored` flag used to play. Without this a reopened
+                // thread strands on the loading screen; a window change that
+                // rewrites the branch is corrected to the authoritative
+                // active branch here.
                 ThreadEvent::HistoryRestored => {
                     this.rebuild_conversation_from_thread(cx);
                     // Re-seed the rail's plan now that the authoritative
@@ -1334,7 +1320,7 @@ impl Workspace {
                     let messages = this
                         .store
                         .as_ref()
-                        .map(|s| s.read(cx).store.messages.clone())
+                        .map(|s| s.read(cx).store.derived_messages())
                         .expect("foreground store present");
                     if let Some(snapshot) = manox_agent::plan::rebuild_from_messages(&messages)
                         .or_else(|| {
@@ -1351,72 +1337,6 @@ impl Workspace {
                     {
                         this.context_rail
                             .update(cx, |r, cx| r.set_plan(snapshot, cx));
-                    }
-                }
-                // A display-only preview batch landed while the authoritative
-                // restore is still running: append the newly available
-                // messages incrementally (paint as many as are loaded),
-                // keeping the list pinned at the tail while the user waits.
-                // Input stays gated on the thread's `HistoryPhase::Loading`.
-                ThreadEvent::HistoryProgress => {
-                    if this
-                        .store
-                        .as_ref()
-                        .map(|s| s.read(cx).store.history_phase)
-                        .expect("foreground store present")
-                        .is_loading()
-                    {
-                        let messages_len = this
-                            .store
-                            .as_ref()
-                            .map(|s| s.read(cx).store.messages.len())
-                            .expect("foreground store present");
-                        if messages_len > this.history_rendered {
-                            // Clone only the not-yet-rendered tail instead of
-                            // the whole transcript on every preview batch.
-                            let from = this.history_rendered;
-                            let new_messages: Vec<manox_agent::Message> = this
-                                .store
-                                .as_ref()
-                                .map(|s| s.read(cx).store.messages[from..].to_vec())
-                                .expect("foreground store present");
-                            let usage = this
-                                .store
-                                .as_ref()
-                                .map(|s| {
-                                    s.read(cx)
-                                        .store
-                                        .per_request_usage
-                                        .iter()
-                                        .map(|(k, v)| {
-                                            (
-                                                k.clone(),
-                                                manox_agent::TokenUsage {
-                                                    input_tokens: v.input,
-                                                    output_tokens: v.output,
-                                                    cache_creation_input_tokens: v.cache_creation,
-                                                    cache_read_input_tokens: v.cache_read,
-                                                },
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .expect("foreground store present");
-                            let role = this.model_label(cx);
-                            let cwd = thread_cwd(&this.thread, &this.store, cx);
-                            let weak = cx.weak_entity();
-                            let outcome = this.conversation.update(cx, |c, cx| {
-                                c.append_history_messages(
-                                    &new_messages,
-                                    &usage,
-                                    &role,
-                                    crate::conversation::ApplyCtx { weak, cwd },
-                                    cx,
-                                )
-                            });
-                            this.history_rendered = messages_len;
-                            this.apply_list_outcome(outcome, cx);
-                        }
                     }
                 }
                 ThreadEvent::ModelChanged { from, to } => {
@@ -3927,9 +3847,9 @@ impl Workspace {
 
         // A brand-new foreground thread gets its own session on the shared
         // connection: `reopen` binds an existing thread via `OpenSession`
-        // (history arrives as `ServerNote`s), otherwise a fresh one via
-        // `CreateSession`. The multiplexer registers the leaf handle before
-        // sending so the server's reply routes straight to it.
+        // (history replays as the follow-stream `Snapshot`), otherwise a
+        // fresh one via `CreateSession`. The multiplexer registers the leaf
+        // handle before sending so the server's reply routes straight to it.
         if self.store.is_none() {
             let new_sid = new_id.clone();
             let cwd = thread_cwd(&new_thread, &None, cx)
@@ -3964,25 +3884,25 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.id.0.clone())
             .expect("foreground store present");
-        // Derive the message count, the transcript's plan, and the sub-agent
-        // rows inside one store read — cloning the full transcript here would
-        // copy the whole thread on the main thread on every switch.
-        let (messages_len, plan_from_messages, subagent_rows) = self
+        // Derive the transcript's plan and the sub-agent rows inside one
+        // store read — the display fold's message rows ARE the messages
+        // (L6, mechanical transcription), and cloning the whole transcript
+        // here would copy it on the main thread on every switch.
+        let (plan_from_messages, subagent_rows) = self
             .store
             .as_ref()
             .map(|s| {
-                let msgs = &s.read(cx).store.messages;
+                let msgs = s.read(cx).store.derived_messages();
                 (
-                    msgs.len(),
-                    manox_agent::plan::rebuild_from_messages(msgs),
-                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
+                    manox_agent::plan::rebuild_from_messages(&msgs),
+                    manox_agent::subagent_restore::rebuild_from_messages(&msgs),
                 )
             })
             .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.display_entries.clone())
+            .map(|s| s.read(cx).store.display.clone())
             .expect("foreground store present");
         let usage = self
             .store
@@ -4079,9 +3999,6 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
-        // All of the thread's current messages are rendered (a restoring
-        // thread has none yet — the preview batches append from here).
-        self.history_rendered = messages_len;
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
         self.pending_auth = None;
@@ -4468,17 +4385,11 @@ impl Workspace {
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // History is still loading: nothing may be submitted (the composer is
-        // hidden, this guard covers keyboard paths that bypass the render).
-        if self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase)
-            .expect("foreground store present")
-            .is_loading()
-        {
-            return;
-        }
+        // T10c (§D.6): the v1 `history_phase` loading gate is gone — the
+        // follow stream's Snapshot → window Replace is the restore boundary,
+        // and HEAD already carried an unwritten (default `Ready`) phase.
+        // Successor gate (when §K.5 lands): a "no snapshot yet" flag on the
+        // v2 fold.
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
         if self.pending_ask.is_some() {
@@ -5738,12 +5649,13 @@ impl Workspace {
     }
 
     /// Final answer of a finished Agent call, for panels opened after a
-    /// reload when no live transcript was accumulated.
+    /// reload when no live transcript was accumulated. T10c: reads the v2
+    /// display fold (the message rows ARE the transcript).
     fn agent_final_text(&self, id: &str, cx: &App) -> Option<String> {
         use manox_agent::language_model::MessageContent;
         self.store
             .as_ref()
-            .map(|s| s.read(cx).store.messages.clone())
+            .map(|s| s.read(cx).store.derived_messages())
             .expect("foreground store present")
             .iter()
             .flat_map(|m| m.content.iter())
@@ -5845,11 +5757,9 @@ impl Workspace {
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
         if !editor_can_submit(
-            self.store
-                .as_ref()
-                .map(|s| s.read(cx).store.history_phase)
-                .expect("foreground store present")
-                .is_loading(),
+            // T10c: the v1 `history_phase` loading gate retired with the
+            // fold (the restore boundary is now the §D.1 snapshot).
+            false,
             self.store
                 .as_ref()
                 .map(|s| s.read(cx).store.running)
@@ -5926,13 +5836,12 @@ impl Workspace {
             // Selector read face (§J11): the composer model chip derives from
             // the store's projection-materialized model, falling back to the
             // bound thread mirror only while no projection has landed yet.
+            // T10c: the v1 `model_name` human label (CurrentModel/ThreadInfo
+            // notes) is gone — the `model` projection carries the canonical
+            // wire identity only; display names resolve via the provider glue.
             self.store
                 .as_ref()
-                .and_then(|s| {
-                    s.read(cx)
-                        .store
-                        .with(|st| st.model_name.clone().or_else(|| st.model_id.clone()))
-                })
+                .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
                 .unwrap_or_else(|| {
                     self.thread
                         .read(|t| t.model().cloned())
@@ -6112,15 +6021,9 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
-        if self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase)
-            .expect("foreground store present")
-            .is_loading()
-        {
-            return false;
-        }
+        // T10c: the v1 `history_phase` loading gate retired with the fold
+        // (the restore boundary is now the §D.1 snapshot; a pending-snapshot
+        // gate lands with the §K.5 closeout).
         if running {
             return true;
         }
@@ -8079,7 +7982,7 @@ impl Workspace {
                 let can_set = this
                     .store
                     .as_ref()
-                    .map(|s| s.read(cx).store.messages.is_empty())
+                    .map(|s| s.read(cx).store.derived_messages().is_empty())
                     .expect("foreground store present");
                 if !can_set {
                     return;
@@ -8762,12 +8665,12 @@ impl Workspace {
         // immediately, while submission remains gated until the transcript is
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        // Typed store: `history_phase` is `HistoryPhase`; read directly.
-        let loading = self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase.is_loading())
-            .expect("foreground store present");
+        // T10c (§D.6): the v1 `history_phase` mirror retired with the fold —
+        // at HEAD the field was unwritten (default `Ready`), so the loading
+        // branch already never fired. The §D.1 snapshot is the restore
+        // boundary; a pending-snapshot loading indicator belongs to the
+        // §K.5 closeout.
+        let loading = false;
         let composer_placement = composer_placement(editor_open && right_pane_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width

@@ -1,43 +1,38 @@
 //! Client-side mirror of a thread's state.
 //!
-//! v1 (§C.2-era): a pure projection of `ServerNote`s, the γ-1 data foundation
-//! — a pure projection with no gpui dependency, unit-testable headlessly.
+//! v1 (§C.2-era): a pure projection of `ServerNote`s, the γ-1 data foundation.
+//! **Retired at T10c (§D.6): the v1 `ServerNote` transcript/meta fold is
+//! deleted.** The views no longer read `messages`/`display_entries` — those
+//! fields existed only for the `ThreadHistory` / `Compaction` note arms that the
+//! server stopped emitting in T10b; the surviving `ServerNote` surface is the
+//! global registry / control set (`Ready`, `SessionCreated`, `SessionDisposed`,
+//! `Models`, `ThreadsUpdated`, `Commands`, `Error`) plus the model-chat side
+//! stream.
 //!
-//! v2 (T6, spec §F.2): the same struct becomes the `SessionStore` of the
-//! architecture doc. The transcript is now the gap-free **journal window**
-//! (`window: Vec<JournalWireEntry>`, maintained by the [`crate::journal_fold`]
-//! engine); the hot state is the **projection face** (`projections`,
-//! higher-seq-wins, §E.1/E.2); the optimistic UI is the **echo map** (a local
-//! bubble retired by the durable `message` row's `originRpc`); the transport
-//! state is `status`. The v1 `ServerNote` fold stays wired through the
-//! dual-protocol window (§K.5) — during the migration the server
-//! double-sends notes *and* streams, and both paths land on the same fields
-//! (the existing fields are the projection keys' home). The v2 `display`
-//! vector is the positive fold of the window; at T10 the views switch to it
-//! and `apply_server_note` retires.
+//! v2 (T6, spec §F.2): the `SessionStore` of the architecture doc. The
+//! transcript is the gap-free **journal window** (`window: Vec<JournalWireEntry>`,
+//! maintained by the [`crate::journal_fold`] engine); the hot state is the
+//! **projection face** (`projections`, higher-seq-wins, §E.1/E.2); the
+//! optimistic UI is the **echo map**; the transport state is `status`. The
+//! `display` vector is the positive fold of the window and is the sole render
+//! source.
 
 use std::collections::{HashMap, HashSet};
 
-use manox_agent::{Message, ThreadId};
+use manox_agent::ThreadId;
 use manox_protocol::ServerNote;
 use manox_protocol::journal::JournalWireEntry;
-use manox_protocol::server::{ThreadInfoPayload, TokenUsageSnapshot};
 use serde_json::Value;
 
 use crate::journal_translate;
 
-/// A client-side projection of one thread's state. Every field is set by a
-/// `ServerNote` (no recomputation). `apply_server_note` is the sole mutator.
+/// A client-side projection of one thread's state. v2 fields are set by the
+/// journal fold (`apply_window_change`, `merge_projection*`); the global note
+/// surface by `apply_server_note`. `with` is the view's sanctioned read face.
 pub struct ClientStore {
     pub id: ThreadId,
-    pub messages: Vec<Message>,
-    /// The `ThreadHistory` display payload parsed once at fold time; consumers
-    /// clone the typed entries instead of re-parsing the raw `JsonValue` on
-    /// every conversation rebuild (hot path for large transcripts).
-    pub display_entries: Vec<manox_agent::db::HistoryEntry>,
     pub display_title: String,
     pub model_id: Option<String>,
-    pub model_name: Option<String>,
     pub model: Option<serde_json::Value>,
     pub permission_mode: manox_agent::thread::PermissionMode,
     pub reasoning_effort: manox_agent::language_model::ReasoningEffort,
@@ -46,25 +41,33 @@ pub struct ClientStore {
     pub depth: u32,
     pub agent_label: String,
     pub self_author: manox_agent::MessageAuthor,
-    pub cwd_path: Option<String>,
     pub branch: Option<String>,
     pub goal: Option<Value>,
-    pub goal_elapsed_seconds: Option<u64>,
     pub plan_mode: bool,
     pub persisted_plan: Option<Value>,
     pub browser_suites: Vec<manox_agent::engine::BrowserSuite>,
-    pub history_phase: manox_agent::thread::HistoryPhase,
     pub running: bool,
     pub has_interacted: bool,
     pub cwd: String,
     pub project: Option<String>,
     pub background_tasks: Vec<Value>,
-    pub cumulative_usage: Option<TokenUsageSnapshot>,
-    pub per_model_usage: HashMap<String, TokenUsageSnapshot>,
-    pub last_token_usage: Option<TokenUsageSnapshot>,
+    /// Latest per-request usage, folded from the durable assistant `message`
+    /// row's `usage` payload (v2; §C.2 transcript group). Successor of the
+    /// deleted `TokenUsage` note.
+    pub last_token_usage: Option<UsageSnapshot>,
+    /// Per-request usage keyed by the assistant `message` row id (v2:
+    /// `message.usage` + `metrics{token_usage}` sidecars). Successor of the
+    /// `UsageSnapshot` note's `per_request`.
+    pub per_request_usage: HashMap<String, UsageSnapshot>,
+    // T10c: the `UsageSnapshot` note fold is deleted; the cumulative /
+    // per-model totals below are UNWRITTEN display placeholders (the server
+    // stopped pushing them in T10b). Their §D.6 successor is the §E.3 Q-face
+    // (`GetConversationInfo`) port; until then the context rail reads the
+    // zero values. Never synthesize totals client-side from the window (L6).
+    pub cumulative_usage: Option<UsageSnapshot>,
+    pub per_model_usage: HashMap<String, UsageSnapshot>,
     pub cumulative_cost: f64,
     pub per_model_cost: HashMap<String, f64>,
-    pub per_request_usage: HashMap<String, TokenUsageSnapshot>,
     /// Pending adjudication ServerCall (Approve/AskUser) from the AgentServer,
     /// keyed by `auth_id`. The workspace uses the MsgId to send the reply.
     pub pending_auth: HashMap<String, manox_protocol::MsgId>,
@@ -100,9 +103,19 @@ pub struct ClientStore {
     pub pending_auth_set: HashSet<String>,
     /// Whether the v2 journal stream is the sole render source (live
     /// `ThreadEvent`s emitted from the fold, rebuild driven off `display`).
-    /// `false` through the dual-protocol window (§K.5) — the v1 `ServerNote`
-    /// path still renders; flipped at T10 when the notes are deleted.
+    /// Flipped `true` at T10; the v1 note fold is deleted at T10c.
     pub stream_drives_render: bool,
+}
+
+/// Typed token usage breakdown — the client's own projection of the `usage`
+/// payload on assistant `message` rows and `metrics` sidecars. (T10c: formerly
+/// re-exported from the protocol crate's deleted `TokenUsageSnapshot`.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageSnapshot {
+    pub input: u64,
+    pub output: u64,
+    pub cache_creation: u64,
+    pub cache_read: u64,
 }
 
 /// One projection slot (§E.1): the whole value plus the producing seq.
@@ -136,11 +149,8 @@ impl Default for ClientStore {
     fn default() -> Self {
         Self {
             id: ThreadId::default(),
-            messages: Vec::new(),
-            display_entries: Vec::new(),
             display_title: String::new(),
             model_id: None,
-            model_name: None,
             model: None,
             permission_mode: manox_agent::thread::PermissionMode::default(),
             reasoning_effort: manox_agent::language_model::ReasoningEffort::default(),
@@ -149,14 +159,11 @@ impl Default for ClientStore {
             depth: 0,
             agent_label: String::new(),
             self_author: manox_agent::MessageAuthor::default(),
-            cwd_path: None,
             branch: None,
             goal: None,
-            goal_elapsed_seconds: None,
             plan_mode: false,
             persisted_plan: None,
             browser_suites: Vec::new(),
-            history_phase: manox_agent::thread::HistoryPhase::default(),
             running: false,
             has_interacted: false,
             cwd: String::new(),
@@ -179,8 +186,7 @@ impl Default for ClientStore {
             unread: false,
             pending_auth_set: HashSet::new(),
             // T10: the v2 journal stream drives rendering; the v1 note
-            // fold is dead code pending removal (server emission deleted in
-            // the same sweep).
+            // fold was deleted at T10c (server emission deleted in T10b).
             stream_drives_render: true,
         }
     }
@@ -409,14 +415,14 @@ impl ClientStore {
         {
             self.per_request_usage.insert(
                 entry.id.clone(),
-                TokenUsageSnapshot {
+                UsageSnapshot {
                     input: u.input,
                     output: u.output,
                     cache_creation: u.cache_write,
                     cache_read: u.cache_read,
                 },
             );
-            self.last_token_usage = Some(TokenUsageSnapshot {
+            self.last_token_usage = Some(UsageSnapshot {
                 input: u.input,
                 output: u.output,
                 cache_creation: u.cache_write,
@@ -426,7 +432,7 @@ impl ClientStore {
     }
 
     fn record_request_usage(&mut self, message_id: &str, usage: &Value) {
-        let snapshot = TokenUsageSnapshot {
+        let snapshot = UsageSnapshot {
             input: usage.get("input").and_then(Value::as_u64).unwrap_or(0),
             output: usage.get("output").and_then(Value::as_u64).unwrap_or(0),
             cache_creation: usage.get("cacheWrite").and_then(Value::as_u64).unwrap_or(0),
@@ -436,6 +442,21 @@ impl ClientStore {
             self.per_request_usage
                 .insert(message_id.to_string(), snapshot);
         }
+    }
+
+    /// Mechanical transcription of the display fold's message rows (v2):
+    /// the journal `message` rows ARE the messages (L6 — no client-side
+    /// re-derivation; the window's compaction boundary is already folded).
+    /// Replaces the v1 `messages` mirror for the transcript-rebuilding
+    /// consumers (plan / subagent restore, agent-final-text lookup).
+    pub fn derived_messages(&self) -> Vec<manox_agent::Message> {
+        self.display
+            .iter()
+            .filter_map(|entry| match entry {
+                manox_agent::db::HistoryEntry::Message(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     // ── echo (§F.2) ───────────────────────────────────────────────────────
@@ -501,181 +522,19 @@ impl ClientStore {
 }
 
 impl ClientStore {
-    /// Apply one `ServerNote`, updating the mirrored state.
+    /// Apply one retained `ServerNote` to the mirror. Post-T10c this is only
+    /// the session-id binding; the registry/control notes are consumed by the
+    /// multiplexer/views directly, the model-chat side stream bypasses the
+    /// store, and every session-domain fact rides the v2 fold (window /
+    /// projections / host status).
     pub fn apply_server_note(&mut self, note: &ServerNote) {
-        match note {
-            ServerNote::ThreadInfo { info, .. } => self.apply_thread_info(info),
-            // The session id is the thread id (`CreateSession` binds them);
-            // mirror it so `store.id` matches the bound thread without
-            // waiting for a `ThreadInfo` payload (which carries no id).
-            ServerNote::SessionCreated { session_id } => {
-                self.id = ThreadId(session_id.clone());
-            }
-            ServerNote::ThreadHistory {
-                messages,
-                display_history,
-                ..
-            } => {
-                // WireMessage deflates Image.data to byte_len; the storage
-                // Message ignores the extra byte_len (its Image.data is
-                // #[serde(default)]) and accepts the identical field names,
-                // so the typed payload round-trips into Vec<Message>.
-                let value = serde_json::to_value(messages).unwrap_or_default();
-                match serde_json::from_value::<Vec<Message>>(value) {
-                    Ok(msgs) => self.messages = msgs,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "ThreadHistory parse failed; keeping stale messages")
-                    }
-                }
-                // Parse the display payload once here (fold time) instead of
-                // on every conversation rebuild; a parse failure keeps the
-                // previous entries rather than blanking the thread.
-                match serde_json::from_value::<Vec<manox_agent::db::HistoryEntry>>(
-                    display_history.clone(),
-                ) {
-                    Ok(entries) => self.display_entries = entries,
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "ThreadHistory display parse failed; keeping stale entries"
-                    ),
-                }
-            }
-            ServerNote::TurnStarted { .. } => self.running = true,
-            ServerNote::TurnFinished { .. } => self.running = false,
-            ServerNote::CurrentModel { id, name, .. } => {
-                self.model_id = id.clone();
-                self.model_name = name.clone();
-            }
-            ServerNote::PermissionModeChanged { mode, .. } => {
-                self.permission_mode =
-                    serde_json::from_value::<manox_agent::thread::PermissionMode>(Value::String(
-                        mode.clone(),
-                    ))
-                    .unwrap_or_default();
-            }
-            ServerNote::ReasoningEffortChanged { effort, .. } => {
-                self.reasoning_effort = serde_json::from_value::<
-                    manox_agent::language_model::ReasoningEffort,
-                >(Value::String(effort.clone()))
-                .unwrap_or_default();
-            }
-            ServerNote::PlanModeChanged { enabled, .. } => self.plan_mode = *enabled,
-            ServerNote::PlanUpdated { snapshot, .. } => self.persisted_plan = snapshot.clone(),
-            ServerNote::GoalChanged { snapshot, .. } => self.goal = snapshot.clone(),
-            ServerNote::CwdChanged { path, .. } => {
-                self.cwd_path = Some(path.clone());
-            }
-            ServerNote::Branch { branch, .. } => self.branch = Some(branch.clone()),
-            ServerNote::BrowserSuitesChanged { suites, .. } => {
-                self.browser_suites = suites
-                    .iter()
-                    .filter_map(|s| {
-                        serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(
-                            s.clone(),
-                        ))
-                        .ok()
-                    })
-                    .collect();
-            }
-            ServerNote::BackgroundTaskUpdated { snapshot, .. } => {
-                if let Some(obj) = snapshot.as_object()
-                    && let Some(id) = obj.get("task_id").and_then(Value::as_str)
-                {
-                    if let Some(idx) = self
-                        .background_tasks
-                        .iter()
-                        .position(|t| t.get("task_id").and_then(Value::as_str) == Some(id))
-                    {
-                        self.background_tasks[idx] = snapshot.clone();
-                    } else {
-                        self.background_tasks.push(snapshot.clone());
-                    }
-                }
-            }
-            ServerNote::UsageSnapshot {
-                session_id: _,
-                cumulative,
-                per_model,
-                cumulative_cost,
-                per_model_cost,
-                per_request,
-            } => {
-                self.cumulative_usage = Some(cumulative.clone());
-                self.per_model_usage = per_model.clone();
-                self.cumulative_cost = *cumulative_cost;
-                self.per_model_cost = per_model_cost.clone();
-                self.per_request_usage = per_request.clone();
-            }
-            ServerNote::TokenUsage {
-                input,
-                output,
-                cache_creation,
-                cache_read,
-                ..
-            } => {
-                self.last_token_usage = Some(TokenUsageSnapshot {
-                    input: *input,
-                    output: *output,
-                    cache_creation: *cache_creation,
-                    cache_read: *cache_read,
-                });
-            }
-            // A compaction notification replaces the store's transcript with
-            // the retained tail (the server folds older history into the
-            // summary and keeps the most recent messages).
-            ServerNote::Compaction { retained, .. } => {
-                match serde_json::from_value::<Vec<Message>>(retained.clone()) {
-                    Ok(msgs) => self.messages = msgs,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Compaction retained parse failed; keeping stale messages")
-                    }
-                }
-            }
-            _ => {}
+        // The session id is the thread id (`CreateSession` binds them); mirror
+        // it so `store.id` matches the bound thread. Every other retained
+        // note (registry/control list channel, `Error`, model-chat side
+        // stream) is consumed by the multiplexer / views directly.
+        if let ServerNote::SessionCreated { session_id } = note {
+            self.id = ThreadId(session_id.clone());
         }
-    }
-
-    fn apply_thread_info(&mut self, info: &ThreadInfoPayload) {
-        self.cwd = info.cwd.clone();
-        self.project = info.project.clone();
-        self.display_title = info.display_title.clone();
-        self.model_id = info.model_id.clone();
-        self.model_name = info.model_name.clone();
-        self.model = info.model.clone();
-        self.permission_mode = serde_json::from_value::<manox_agent::thread::PermissionMode>(
-            Value::String(info.permission_mode.clone()),
-        )
-        .unwrap_or_default();
-        self.reasoning_effort = serde_json::from_value::<
-            manox_agent::language_model::ReasoningEffort,
-        >(Value::String(info.reasoning_effort.clone()))
-        .unwrap_or_default();
-        self.pinned = info.pinned;
-        self.archived = info.archived;
-        self.depth = info.depth;
-        self.agent_label = info.agent_label.clone();
-        self.self_author = manox_agent::MessageAuthor::from_routing(&info.self_author);
-        self.cwd_path = info.cwd_path.clone();
-        self.branch = info.branch.clone();
-        self.goal = info.goal.clone();
-        self.goal_elapsed_seconds = info.goal_elapsed_seconds;
-        self.plan_mode = info.plan_mode;
-        self.browser_suites = info
-            .browser_suites
-            .iter()
-            .filter_map(|s| {
-                serde_json::from_value::<manox_agent::engine::BrowserSuite>(Value::String(
-                    s.clone(),
-                ))
-                .ok()
-            })
-            .collect();
-        self.history_phase = serde_json::from_value::<manox_agent::thread::HistoryPhase>(
-            Value::String(info.history_phase.clone()),
-        )
-        .unwrap_or_default();
-        self.running = info.running;
-        self.has_interacted = info.has_interacted;
     }
 }
 
@@ -683,43 +542,46 @@ impl ClientStore {
 mod tests {
     use super::*;
 
-    fn sample_payload() -> ThreadInfoPayload {
-        ThreadInfoPayload {
-            cwd: "/proj".into(),
-            project: None,
-            display_title: "Test".into(),
-            model_id: Some("claude-sonnet".into()),
-            model_name: Some("Sonnet".into()),
-            model: None,
-            permission_mode: "workspace-write".into(),
-            reasoning_effort: "high".into(),
-            pinned: false,
-            archived: false,
-            depth: 0,
-            agent_label: "lead".into(),
-            self_author: "lead".into(),
-            cwd_path: None,
-            branch: None,
-            goal: None,
-            goal_elapsed_seconds: None,
-            plan_mode: false,
-            browser_suites: vec![],
-            history_phase: "ready".into(),
-            running: false,
-            has_interacted: false,
-        }
+    // T10c: the v1 note-fold tests retired with the fold. Their coverage
+    // moved to the v2 equivalents below / in the §F.2 section:
+    //   thread_info_updates_all_fields   → projections_materialize_mirror_fields
+    //   turn_started_finished_flip_running → running projection (same test)
+    //   plan_mode_changed_updates        → projections_materialize_mirror_fields
+    //   usage_snapshot_sets_cumulative   → assistant_usage_rows_fold_per_request
+    //   compaction_note_replaces_store_transcript
+    //                                     → compaction_row_restarts_display_fold
+
+    #[test]
+    fn session_created_note_binds_store_id() {
+        let mut store = ClientStore::default();
+        store.apply_server_note(&ServerNote::SessionCreated {
+            session_id: "s1".into(),
+        });
+        assert_eq!(store.id.0, "s1");
+        // Retained non-session notes are no-ops for the mirror.
+        store.apply_server_note(&ServerNote::Ready);
+        assert_eq!(store.id.0, "s1");
     }
 
     #[test]
-    fn thread_info_updates_all_fields() {
+    fn projections_materialize_mirror_fields() {
         let mut store = ClientStore::default();
-        store.apply_server_note(&ServerNote::ThreadInfo {
-            session_id: "s1".into(),
-            info: Box::new(sample_payload()),
-        });
-        assert_eq!(store.cwd, "/proj");
-        assert_eq!(store.display_title, "Test");
-        assert_eq!(store.model_id.as_deref(), Some("claude-sonnet"));
+        store.merge_projection(
+            "permission_mode",
+            Value::String("workspace-write".into()),
+            1,
+        );
+        store.merge_projection("reasoning_effort", Value::String("high".into()), 1);
+        store.merge_projection("plan_mode", Value::Bool(true), 1);
+        store.merge_projection("running", Value::Bool(true), 1);
+        store.merge_projection("depth", Value::from(2u64), 1);
+        store.merge_projection("agent_label", Value::String("lead".into()), 1);
+        store.merge_projection("self_author", Value::String("lead".into()), 1);
+        store.merge_projection(
+            "browser_suites",
+            Value::Array(vec![Value::String("webexplore".into())]),
+            1,
+        );
         assert_eq!(
             store.permission_mode,
             manox_agent::thread::PermissionMode::WorkspaceWrite
@@ -728,100 +590,104 @@ mod tests {
             store.reasoning_effort,
             manox_agent::language_model::ReasoningEffort::High
         );
-        assert!(!store.running);
-        assert!(!store.plan_mode);
-        assert_eq!(store.self_author.routing(), "lead");
-    }
-
-    #[test]
-    fn turn_started_finished_flip_running() {
-        let mut store = ClientStore::default();
-        store.apply_server_note(&ServerNote::TurnStarted {
-            session_id: "s1".into(),
-        });
-        assert!(store.running);
-        store.apply_server_note(&ServerNote::TurnFinished {
-            session_id: "s1".into(),
-            cancelled: false,
-            failed: false,
-            stranded_steer_ids: vec![],
-        });
-        assert!(!store.running);
-    }
-
-    #[test]
-    fn plan_mode_changed_updates() {
-        let mut store = ClientStore::default();
-        store.apply_server_note(&ServerNote::PlanModeChanged {
-            session_id: "s1".into(),
-            enabled: true,
-        });
         assert!(store.plan_mode);
-    }
-
-    #[test]
-    fn usage_snapshot_sets_cumulative() {
-        let mut store = ClientStore::default();
-        store.apply_server_note(&ServerNote::UsageSnapshot {
-            session_id: "s1".into(),
-            cumulative: TokenUsageSnapshot {
-                input: 100,
-                output: 50,
-                cache_creation: 0,
-                cache_read: 0,
-            },
-            per_model: HashMap::new(),
-            cumulative_cost: 0.01,
-            per_model_cost: HashMap::new(),
-            per_request: HashMap::new(),
-        });
-        assert_eq!(store.cumulative_usage.as_ref().unwrap().input, 100);
-        assert!((store.cumulative_cost - 0.01).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn compaction_note_replaces_store_transcript() {
-        let mut store = ClientStore::default();
-        // Seed the store with a pair of messages via ThreadHistory.
-        let msgs = vec![
-            Message::user("hello".into()),
-            Message::assistant(vec![manox_agent::language_model::MessageContent::Text(
-                "world".into(),
-            )]),
-        ];
-        let history = serde_json::to_value(&msgs).unwrap();
-        let wire_messages: Vec<manox_protocol::WireMessage> =
-            serde_json::from_value(history).expect("wire round-trip");
-        store.apply_server_note(&ServerNote::ThreadHistory {
-            session_id: "s1".into(),
-            messages: wire_messages,
-            display_history: serde_json::Value::Array(Vec::new()),
-            auto_approved_tools: None,
-            restored: false,
-            loading: false,
-        });
-        assert_eq!(store.messages.len(), 2, "should have two seeded messages");
-        // Apply a Compaction note with a summary and a retained tail that
-        // keeps only the assistant message.
-        let retained = serde_json::to_value(&msgs[1..]).unwrap();
-        store.apply_server_note(&ServerNote::Compaction {
-            session_id: "s1".into(),
-            summary: "compacted 1 message".into(),
-            retained,
-        });
-        // The store must replace (not append) its transcript: only the
-        // retained tail remains, plus the compaction summary message.
+        assert!(store.running);
+        assert_eq!(store.depth, 2);
+        assert_eq!(store.agent_label, "lead");
+        assert_eq!(store.self_author, manox_agent::MessageAuthor::Lead);
         assert_eq!(
-            store.messages.len(),
-            1,
-            "compaction should replace transcript, leaving only retained messages"
+            store.browser_suites,
+            vec![manox_agent::engine::BrowserSuite::WebExplore]
         );
-        // The retained message is the assistant's "world" reply.
+    }
+
+    #[test]
+    fn assistant_usage_rows_fold_per_request() {
+        use manox_protocol::journal::UsagePayload;
+        let mut store = ClientStore::default();
+        store.apply_window_change(WindowChange::Append(JournalWireEntry {
+            seq: 0,
+            id: "m-9".into(),
+            parent_id: None,
+            timestamp: "2026-09-04T00:00:00.000Z".into(),
+            event: manox_protocol::JournalWireEvent::Message {
+                role: "assistant".into(),
+                content: vec![],
+                usage: Some(UsagePayload {
+                    input: 100,
+                    output: 50,
+                    cache_read: 7,
+                    cache_write: 3,
+                    reasoning: 0,
+                }),
+                origin_rpc: None,
+            },
+        }));
+        let snap = &store.per_request_usage["m-9"];
+        assert_eq!(snap.input, 100);
+        assert_eq!(snap.output, 50);
+        assert_eq!(snap.cache_read, 7);
+        assert_eq!(snap.cache_creation, 3);
+        assert_eq!(store.last_token_usage.as_ref().unwrap().input, 100);
+    }
+
+    #[test]
+    fn compaction_row_restarts_display_fold() {
+        let mut store = ClientStore::default();
+        // Seed a two-row transcript via window appends.
+        store.apply_window_change(WindowChange::Append(JournalWireEntry {
+            seq: 0,
+            id: "m-0".into(),
+            parent_id: None,
+            timestamp: "2026-09-04T00:00:00.000Z".into(),
+            event: manox_protocol::JournalWireEvent::Message {
+                role: "user".into(),
+                content: vec![serde_json::json!({"type": "text", "text": "hello"})],
+                usage: None,
+                origin_rpc: None,
+            },
+        }));
+        store.apply_window_change(WindowChange::Append(JournalWireEntry {
+            seq: 1,
+            id: "m-1".into(),
+            parent_id: Some("m-0".into()),
+            timestamp: "2026-09-04T00:00:00.000Z".into(),
+            event: manox_protocol::JournalWireEvent::Message {
+                role: "assistant".into(),
+                content: vec![serde_json::json!({"type": "text", "text": "world"})],
+                usage: None,
+                origin_rpc: None,
+            },
+        }));
+        assert_eq!(store.derived_messages().len(), 2);
+        // A compaction row is a transcript boundary: the display restarts at
+        // the summary + retained tail (the window keeps the full chain).
+        store.apply_window_change(WindowChange::Append(JournalWireEntry {
+            seq: 2,
+            id: "m-2".into(),
+            parent_id: Some("m-1".into()),
+            timestamp: "2026-09-04T00:00:00.000Z".into(),
+            event: manox_protocol::JournalWireEvent::Compaction {
+                summary: "compacted 1 message".into(),
+                messages_compacted: 1,
+                tokens_before: 10,
+                retained_tail: vec![serde_json::json!({
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "world"}],
+                })],
+                first_kept_entry_id: None,
+            },
+        }));
+        let msgs = store.derived_messages();
+        // Summary carrier + retained assistant tail; the pre-compaction user
+        // row leaves the display fold (the window still holds it).
+        assert_eq!(msgs.len(), 2, "summary + retained tail");
         assert_eq!(
-            store.messages[0].role,
+            msgs[1].role,
             manox_agent::language_model::Role::Assistant,
             "retained tail should survive compaction"
         );
+        assert_eq!(store.window.len(), 3, "window keeps the full chain");
     }
 
     // ── v2 (§F.2) fold / projection / echo / host mirror ────────────────

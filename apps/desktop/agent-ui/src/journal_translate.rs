@@ -2,14 +2,14 @@
 //! desktop's display items and live events.
 //!
 //! This is the successor of [`crate::server_note_translate`] for the v2
-//! protocol: where that module reverse-projects a doomed `ServerNote` onto
+//! protocol: where that module reverse-projected doomed `ServerNote`s onto
 //! `ThreadEvent`, this module projects an authoritative §C.2 journal row
 //! forward onto the same surfaces — the display sequence (`HistoryEntry`,
 //! what `ConversationState::rebuild_from_display` consumes) and the live
 //! event stream (`ThreadEvent`, what the workspace handler consumes). The v1
-//! note path stays wired through the dual-protocol window (§K.5); this module
-//! is the v2 fold's translation table and the substrate T10 retires the v1
-//! path onto.
+//! note arms were deleted at T10c (§D.6); this module is the session-domain
+//! translation table, and [`crate::server_note_translate`] survives only for
+//! the adjudication `ServerCall` waterfall + the retained global notes.
 //!
 //! Shape notes (as-built §C.2):
 //! - `message` rows carry `role` + kernel `ContentBlock` payloads (the

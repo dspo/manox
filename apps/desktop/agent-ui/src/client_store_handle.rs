@@ -39,7 +39,8 @@ pub enum LeafRequest {
 
 /// A gpui entity that owns a single session's [`ClientStore`], the v2
 /// [`JournalFold`] engine, and re-emits the live fold as `ThreadEvent`s. The
-/// multiplexer is the sole writer (v1 notes) and the sole stream router (v2).
+/// multiplexer is the sole writer (retained `ServerNote`s) and the sole
+/// stream router (v2).
 pub struct ClientStoreHandle {
     pub store: ClientStore,
     fold: JournalFold,
@@ -202,24 +203,26 @@ impl ClientStoreHandle {
     }
 
     fn apply_change(&mut self, change: WindowChange, cx: &mut Context<Self>) {
-        // Dual-protocol window (§K.5): the *live* conversation render (deltas,
-        // tool cards, turn lifecycle) still rides the v1 `ServerNote` events,
-        // and the rebuild trigger stays the authoritative `ThreadHistory`
-        // note — not a v2 structural change (which would rebuild off a
-        // half-arrived v1 display and drop the in-flight turn). Emitting the
-        // §C.2 rows as `ThreadEvent`s here would double-render against the
-        // notes. The `stream_drives_render` switch (default `false`, flipped
-        // at T10 when the note path is deleted) turns the v2 fold into the
-        // sole render source; until then the fold maintains the store
-        // substrate only (window / display / echo / projections-materialized
-        // fields + the §D.5 host mirror).
-        let drive_render = self.store.stream_drives_render;
+        // T10c (§K.5 closeout): the v2 fold is the sole render source.
+        // Structural window changes (the snapshot `Replace` and gap-repair
+        // `Prepend`) re-arm the conversation rebuild — the §C.2-era
+        // authoritative-history-boundary role of the deleted `ThreadHistory`
+        // note, now triggered off the §D.1 snapshot itself. Appends emit
+        // their per-entry live events below (the same rows feed the store's
+        // `display` fold first).
+        let structural = matches!(
+            &change,
+            WindowChange::Replace { .. } | WindowChange::Prepend { .. }
+        );
         let live_events = match &change {
             WindowChange::Append(entry) => vec![entry.clone()],
             _ => Vec::new(),
         };
         self.store.apply_window_change(change);
-        if drive_render {
+        if self.store.stream_drives_render {
+            if structural {
+                cx.emit(ThreadEvent::HistoryRestored);
+            }
             for entry in live_events {
                 if let Some(ev) = journal_translate::thread_event_of(&entry) {
                     cx.emit(ev);
@@ -344,62 +347,105 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn pump_feeds_server_note_to_store(cx: &mut TestAppContext) {
+    async fn pump_feeds_retained_notes_to_store(cx: &mut TestAppContext) {
         let (mux, server_conn) = test_mux(cx);
         let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
         server_conn.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnStarted {
+            note: ServerNote::SessionCreated {
                 session_id: "s1".into(),
-            },
-        });
-        cx.run_until_parked();
-        assert!(
-            handle.update(cx, |h, _| h.store.running),
-            "the multiplexer should route TurnStarted → running=true"
-        );
-    }
-
-    #[gpui::test]
-    async fn pump_applies_thread_info(cx: &mut TestAppContext) {
-        let (mux, server_conn) = test_mux(cx);
-        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
-        let info = manox_protocol::server::ThreadInfoPayload {
-            cwd: "/proj".into(),
-            project: None,
-            display_title: "Test".into(),
-            model_id: None,
-            model_name: None,
-            model: None,
-            permission_mode: "workspace-write".into(),
-            reasoning_effort: "high".into(),
-            pinned: false,
-            archived: false,
-            depth: 0,
-            agent_label: "lead".into(),
-            self_author: "lead".into(),
-            cwd_path: None,
-            branch: None,
-            goal: None,
-            goal_elapsed_seconds: None,
-            plan_mode: false,
-            browser_suites: vec![],
-            history_phase: "ready".into(),
-            running: false,
-            has_interacted: false,
-        };
-        server_conn.send_to_client(FromServer::Notification {
-            note: ServerNote::ThreadInfo {
-                session_id: "s1".into(),
-                info: std::boxed::Box::new(info),
             },
         });
         cx.run_until_parked();
         assert_eq!(
-            handle.update(cx, |h, _| h.store.display_title.clone()),
-            "Test"
+            handle.update(cx, |h, _| h.store.id.0.clone()),
+            "s1",
+            "the multiplexer should route SessionCreated → store.id"
         );
-        assert_eq!(handle.update(cx, |h, _| h.store.cwd.clone()), "/proj");
-        assert!(!handle.update(cx, |h, _| h.store.running));
+        // A global note must not touch the mirror's session fields.
+        server_conn.send_to_client(FromServer::Notification {
+            note: ServerNote::Ready,
+        });
+        cx.run_until_parked();
+        assert_eq!(handle.update(cx, |h, _| h.store.id.0.clone()), "s1");
+    }
+
+    /// T10c e2e restore regression (the gap the v1-fold deletion exposed):
+    /// a reopen's follow-stream `Snapshot` carrying multiple history rows
+    /// must land in the leaf's `display` fold (the sole render source),
+    /// transcribe to `derived_messages`, and re-arm the conversation
+    /// rebuild via `HistoryRestored` — the v1 `ThreadHistory` note's old
+    /// job. At HEAD this rendered an empty transcript (the restore reads
+    /// still pointed at the note-fed `display_entries` field).
+    #[gpui::test]
+    async fn reopen_snapshot_restores_transcript_and_rearms_rebuild(cx: &mut TestAppContext) {
+        use std::cell::Cell;
+        let (mux, _server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", true, cx));
+        let rearmed = std::rc::Rc::new(Cell::new(false));
+        let sink = rearmed.clone();
+        let subscribed = handle.clone();
+        let _sub = handle.update(cx, move |_, cx| {
+            cx.subscribe(&subscribed, move |_, _, ev: &ThreadEvent, _| {
+                if matches!(ev, ThreadEvent::HistoryRestored) {
+                    sink.set(true);
+                }
+            })
+        });
+        let records = vec![
+            wire(
+                0,
+                JournalWireEvent::Message {
+                    role: "user".into(),
+                    content: vec![serde_json::json!({"type": "text", "text": "one"})],
+                    usage: None,
+                    origin_rpc: None,
+                },
+            ),
+            wire(
+                1,
+                JournalWireEvent::Message {
+                    role: "assistant".into(),
+                    content: vec![serde_json::json!({"type": "text", "text": "two"})],
+                    usage: None,
+                    origin_rpc: None,
+                },
+            ),
+            wire(
+                2,
+                JournalWireEvent::Message {
+                    role: "user".into(),
+                    content: vec![serde_json::json!({"type": "text", "text": "three"})],
+                    usage: None,
+                    origin_rpc: Some("rpc-9".into()),
+                },
+            ),
+        ];
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(item("s1", snapshot("s1", 2, records)), cx)
+        });
+        cx.run_until_parked();
+        handle.update(cx, |h, _| {
+            assert_eq!(h.store.window.len(), 3, "the window holds the chain");
+            assert_eq!(
+                h.store.display.len(),
+                3,
+                "the restored transcript must be non-empty and complete"
+            );
+            let msgs = h.store.derived_messages();
+            assert_eq!(msgs.len(), 3, "display rows transcribe to messages");
+            assert_eq!(
+                msgs.iter().map(|m| m.role).collect::<Vec<_>>(),
+                vec![
+                    manox_agent::language_model::Role::User,
+                    manox_agent::language_model::Role::Assistant,
+                    manox_agent::language_model::Role::User,
+                ]
+            );
+        });
+        assert!(
+            rearmed.get(),
+            "the snapshot Replace must re-arm the rebuild (HistoryRestored)"
+        );
     }
 
     // ── v2 stream fold / echo / resync / status (spec T6-6) ────────────────
