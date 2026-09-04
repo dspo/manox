@@ -24,12 +24,10 @@ use manox_protocol::base64_bytes;
 use manox_protocol::client::ImageAttachment;
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize};
 use manox_protocol::journal::StreamId;
-use manox_protocol::server::ThreadInfoPayload;
 use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
-    RpcPeer, ServerCall, ServerNote, ThreadListItem, WireContentBlock, WireMessage,
-    WireMessageAuthor, WireMessageProvenance, WireMessageUi, WireRole, WireToolResult, WireToolUse,
+    RpcPeer, ServerCall, ServerNote, ThreadListItem,
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -37,7 +35,7 @@ use serde_json::{Value, json};
 use manox_agent::language_model::{MessageContent, ReasoningEffort};
 use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
-use manox_agent::{Message, MessageUiMetadata, Thread, ThreadEvent, ThreadId};
+use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 
 use crate::follow::{self, StreamHandle};
 use crate::journal_query;
@@ -545,137 +543,11 @@ impl AgentServerInner {
     }
 
     // ── Snapshots (queries). ────────────────────────────────────────────────
-    fn emit_history_and_info(&self, thread: &ThreadHandle, session_id: &str, restored: bool) {
-        let messages = thread.read(|t| to_wire_messages(t.messages()));
-        let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
-            .unwrap_or_else(|_| json!([]));
-        self.route_note(
-            session_id,
-            ServerNote::ThreadHistory {
-                session_id: session_id.into(),
-                messages,
-                display_history,
-                auto_approved_tools: None,
-                restored,
-                loading: false,
-            },
-        );
-        self.route_note(
-            session_id,
-            ServerNote::ThreadInfo {
-                session_id: session_id.into(),
-                info: Box::new(self.build_thread_info_payload(thread, session_id)),
-            },
-        );
-    }
-
-    /// Like `emit_history_and_info` but sends only to one specific client
-    /// (used for same-client-id reopen to avoid disturbing other owners).
-    fn emit_history_and_info_to(
-        &self,
-        thread: &ThreadHandle,
-        session_id: &str,
-        restored: bool,
-        client_id: &str,
-    ) {
-        let messages = thread.read(|t| to_wire_messages(t.messages()));
-        let display_history = serde_json::to_value(thread.read(|t| t.display_history().to_vec()))
-            .unwrap_or_else(|_| json!([]));
-        self.note_to_client(
-            client_id,
-            ServerNote::ThreadHistory {
-                session_id: session_id.into(),
-                messages,
-                display_history,
-                auto_approved_tools: None,
-                restored,
-                loading: false,
-            },
-        );
-        self.note_to_client(
-            client_id,
-            ServerNote::ThreadInfo {
-                session_id: session_id.into(),
-                info: Box::new(self.build_thread_info_payload(thread, session_id)),
-            },
-        );
-    }
-
-    /// Re-send the current `ThreadInfo` snapshot to the session's owners —
-    /// history untouched. The composer chips (model / project / effort /
-    /// permission mode) mirror `ThreadInfoPayload`, so a mutation that no
-    /// other note refreshes must republish the header (idempotent).
-    fn emit_thread_info(&self, thread: &ThreadHandle, session_id: &str) {
-        self.route_note(
-            session_id,
-            ServerNote::ThreadInfo {
-                session_id: session_id.into(),
-                info: Box::new(self.build_thread_info_payload(thread, session_id)),
-            },
-        );
-    }
-
-    /// The first user message flips the thread's `has_interacted` header —
-    /// a mutation no other note carries and no client can observe without a
-    /// ThreadInfo republish. `was` is the interaction state captured before
-    /// the transcript mutation; the mirror is republished exactly on the
-    /// false → true transition.
-    fn republish_if_first_interaction(
-        &self,
-        thread: &ThreadHandle,
-        session_id: &str,
-        was_interacted: bool,
-    ) {
-        if !was_interacted && thread.read(|t| t.has_interacted()) {
-            self.emit_thread_info(thread, session_id);
-        }
-    }
-
-    /// Gather every `ThreadInfoPayload` field in a single read closure (no
-    /// re-entrant locking of the handle).
-    fn build_thread_info_payload(
-        &self,
-        thread: &ThreadHandle,
-        _session_id: &str,
-    ) -> ThreadInfoPayload {
-        thread.read(|t| {
-            let cwd_path = t.cwd_path().map(str::to_string);
-            ThreadInfoPayload {
-                cwd: t.cwd().to_string_lossy().into_owned(),
-                project: t.project().map(|p| p.to_string_lossy().into_owned()),
-                display_title: t.display_title(),
-                model_id: t.model().map(|m| m.id.clone()),
-                model_name: t.model().map(manox_agent::provider_glue::display_name),
-                model: t
-                    .model()
-                    .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null)),
-                permission_mode: serde_json::to_value(t.permission_mode())
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-                reasoning_effort: t.reasoning_effort().wire_value().to_string(),
-                pinned: t.is_pinned(),
-                archived: t.archived(),
-                depth: t.depth(),
-                agent_label: t.agent_label().to_string(),
-                self_author: t.self_author().routing().to_string(),
-                cwd_path,
-                branch: None, // β-3b: async git lookup → ServerNote::Branch.
-                goal: serde_json::to_value(t.goal()).ok(),
-                goal_elapsed_seconds: t.goal_elapsed_seconds(),
-                plan_mode: t.plan_mode(),
-                browser_suites: t
-                    .browser_suites()
-                    .iter()
-                    .map(|s| format!("{s:?}").to_lowercase())
-                    .collect(),
-                history_phase: format!("{:?}", t.history_phase()).to_lowercase(),
-                running: t.is_running(),
-                has_interacted: t.has_interacted(),
-            }
-        })
-    }
-
+    //
+    // T10 (§D.6): the v1 `ThreadHistory`/`ThreadInfo` snapshot emitters are
+    // gone. History replays through the §D.1 follow stream's opening
+    // `Snapshot` frame; thread meta-info rides the projection baseline +
+    // P-face deltas (§E); `has_interacted` is a projection key.
     fn threads_snapshot(&self) -> Vec<ThreadListItem> {
         let store = manox_agent::thread_store_global();
         store.read(|s| {
@@ -831,37 +703,17 @@ async fn handle_call(
         ClientCall::ListModels => serde_json::to_value(inner.models_snapshot())
             .map_err(|_| RpcError::new(-1, "models serialization failed")),
         ClientCall::ListCommands => Ok(inner.commands_snapshot()),
-        ClientCall::GetUsage { session_id } => inner
-            .session_thread(&session_id)
-            .ok_or_else(|| RpcError::new(-1, "unknown session"))
-            .map(|t| {
-                let (usage, cost) = t.read(|t| (t.cumulative_token_usage(), t.cumulative_cost()));
-                json!({ "usage": serde_json::to_value(usage).unwrap_or(json!({})), "cost": cost })
-            }),
-        ClientCall::GetCurrentModel { session_id } => inner
-            .session_thread(&session_id)
-            .ok_or_else(|| RpcError::new(-1, "unknown session"))
-            .map(|t| {
-                t.read(|t| {
-                    let model = t.model();
-                    json!({
-                        "id": model.map(|m| m.id.clone()),
-                        "name": model.map(manox_agent::provider_glue::display_name),
-                    })
-                })
-            }),
-        ClientCall::ThreadInfo { session_id } => {
-            let thread = inner
-                .session_thread(&session_id)
-                .ok_or_else(|| RpcError::new(-1, "unknown session"))?;
-            inner.route_note(
-                &session_id,
-                ServerNote::ThreadInfo {
-                    session_id: session_id.clone(),
-                    info: Box::new(inner.build_thread_info_payload(&thread, &session_id)),
-                },
-            );
-            Ok(json!({}))
+        // T10 (§D.6): the v1 query surface is retired — usage rides the
+        // journal (Q face `GetConversationInfo`), the model and every header
+        // chip field ride the projection baseline/deltas (§E). The variants
+        // stay in the enum for the dual-protocol window; answering with an
+        // explicit error is the removal signal.
+        ClientCall::GetUsage { .. }
+        | ClientCall::GetCurrentModel { .. }
+        | ClientCall::ThreadInfo { .. } => {
+            Err(RpcError::new(-1, "v1 query surface removed (T10): use the \
+                 follow stream, projections, and GetConversationInfo")
+                .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST))
         }
         ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
             Err(RpcError::new(-1, "terminal support lands in β-3b"))
@@ -919,10 +771,11 @@ async fn open_session(
     owner: &str,
     session_id: &str,
 ) -> Result<Value, RpcError> {
-    // Idempotent reopen: a live session replays its snapshots instead of
-    // loading a second copy. Use directed sending (not broadcast) to avoid
-    // disturbing other owners (e.g. a background thread on the same client).
-    if let Some(thread) = inner.session_thread(session_id) {
+    // Idempotent reopen: a live session is re-owned instead of loading a
+    // second copy. T10 (§D.6): no v1 snapshot replay here — the client's
+    // history comes from the §D.1 follow stream's `Snapshot` frame. Use
+    // directed `SessionCreated` (not broadcast) to avoid disturbing owners.
+    if inner.session_thread(session_id).is_some() {
         inner.add_owner(session_id, owner);
         inner.note_to_client(
             owner,
@@ -930,7 +783,6 @@ async fn open_session(
                 session_id: session_id.into(),
             },
         );
-        inner.emit_history_and_info_to(&thread, session_id, true, owner);
         return Ok(json!({ "restored": true }));
     }
     let thread = manox_agent::thread_store::global().with_mut(|s| s.load_thread(session_id));
@@ -962,7 +814,6 @@ async fn open_session(
             session_id: session_id.into(),
         },
     );
-    inner.emit_history_and_info(&thread, session_id, true);
     Ok(json!({ "restored": true }))
 }
 
@@ -1337,7 +1188,6 @@ impl AgentServerInner {
             });
             return receipt(true, None);
         }
-        let interacted = thread.read(|t| t.has_interacted());
         // `slash` consumed the text display; the outcome distinguishes an
         // empty submission (accepted = false) from a command / transcript
         // insert.
@@ -1375,7 +1225,6 @@ impl AgentServerInner {
             t.run_turn();
             Outcome::Inserted
         });
-        self.republish_if_first_interaction(&thread, session_id, interacted);
         match outcome {
             Outcome::Empty => receipt(false, None),
             Outcome::Slash => receipt(true, None),
@@ -1420,7 +1269,6 @@ impl AgentServerInner {
             .lock()
             .unwrap()
             .retain(|q| q.client_id != message_id);
-        let interacted = thread.read(|t| t.has_interacted());
         let steer_pending: Option<String> = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1448,7 +1296,6 @@ impl AgentServerInner {
                 },
             );
         }
-        self.republish_if_first_interaction(&thread, session_id, interacted);
         Ok(json!({
             "accepted": true,
             "message_id": message_id,
@@ -1469,8 +1316,9 @@ impl AgentServerInner {
         let registry = manox_agent::provider_glue::global();
         match manox_harness::model_ref::resolve_model_ref(&registry, id) {
             Some(model) => {
+                // T10: the v1 `ThreadInfo` republish is gone — the engine
+                // journals the change and the P-face delta refreshes chips.
                 thread.with_mut(|t| t.set_model(model));
-                self.emit_thread_info(&thread, session_id);
             }
             None => self.note_error(session_id, "unknown model"),
         }
@@ -1489,22 +1337,19 @@ impl AgentServerInner {
             }
         };
         thread.with_mut(|t| t.set_reasoning_effort(effort));
-        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_approval_mode(&self, session_id: &str, mode: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        // Parse strictly: an unparseable mode must not settle on the default —
-        // the ThreadInfo re-publish below would make that a visible chip
-        // bounce-back instead of a silent no-op.
+        // Parse strictly: an unparseable mode must not settle on the default
+        // (a silent no-op beats a chip bounce-back on a projected mutation).
         let Ok(mode) = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
         else {
             return self.note_error(session_id, &format!("unknown approval mode: {mode}"));
         };
         thread.with_mut(|t| t.set_permission_mode(mode));
-        self.emit_thread_info(&thread, session_id);
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) {
@@ -1524,7 +1369,6 @@ impl AgentServerInner {
             t.set_project(cwd.into());
             t.set_cwd(cwd.into());
         });
-        self.emit_thread_info(&thread, session_id);
     }
 
     fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
@@ -1555,7 +1399,6 @@ impl AgentServerInner {
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
             .collect();
-        let interacted = thread.read(|t| t.has_interacted());
         thread.with_mut(|t| {
             let ui = manox_agent::MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -1565,7 +1408,6 @@ impl AgentServerInner {
             let content = to_message_content(text, images);
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
         });
-        self.republish_if_first_interaction(&thread, session_id, interacted);
     }
 
     fn compact(&self, session_id: &str, instructions: Option<String>) {
@@ -2121,8 +1963,8 @@ fn spawn_pump(
     manox_agent::runtime::handle().spawn(async move {
         while let Ok(ev) = rx.recv().await {
             // Bookkeeping that mirrors the legacy host pump: thread-store list
-            // flags and the queued-follow-up drain. No note is emitted here
-            // except where translate returns Skip (HistoryRestored).
+            // flags and the queued-follow-up drain. T10 (§D.6): no v1 notes
+            // are emitted here — translate only carries adjudication calls.
             match &*ev {
                 ThreadEvent::TurnStarted => {
                     turn_active.store(true, Ordering::SeqCst);
@@ -2170,7 +2012,6 @@ fn spawn_pump(
                         let drained_any = !drained.is_empty();
                         let mut batch_origin: Option<String> = None;
                         if drained_any {
-                            let interacted = thread.read(|t| t.has_interacted());
                             thread.with_mut(|t| {
                                 for q in drained {
                                     if q.origin.is_some() {
@@ -2183,7 +2024,6 @@ fn spawn_pump(
                                     );
                                 }
                             });
-                            inner.republish_if_first_interaction(&thread, &session_id, interacted);
                         }
                         thread.with_mut(|t| {
                             if drained_any || t.has_pending_prompts() {
@@ -2243,12 +2083,6 @@ fn spawn_pump(
                         )
                     });
                 }
-                ThreadEvent::HistoryRestored => {
-                    // translate Skips this; the pump owns the enriched
-                    // authoritative snapshot.
-                    inner.emit_history_and_info(&thread, &session_id, false);
-                    continue;
-                }
                 _ => {}
             }
             match translate(&ev, &session_id) {
@@ -2287,89 +2121,6 @@ fn to_message_content(text: String, images: Vec<(String, String)>) -> Vec<Messag
                 .map(|(data, mime_type)| MessageContent::Image { data, mime_type }),
         )
         .collect()
-}
-
-/// Project messages into the wire shape: image blocks are deflated to a
-/// `byte_len` placeholder (bounded wire payload) and every other block maps
-/// 1:1. Replaces the prior JSON-mutation hack with a typed conversion so the
-/// `ServerNote::ThreadHistory.messages` field is `Vec<WireMessage>`.
-fn to_wire_messages(messages: &[Message]) -> Vec<WireMessage> {
-    messages.iter().map(wire_message).collect()
-}
-
-fn wire_message(msg: &Message) -> WireMessage {
-    WireMessage {
-        id: msg.id.clone(),
-        timestamp: msg.timestamp as i32,
-        parent_id: msg.parent_id.clone(),
-        provenance: match msg.provenance {
-            manox_agent::MessageProvenance::User => WireMessageProvenance::User,
-            manox_agent::MessageProvenance::Assistant => WireMessageProvenance::Assistant,
-            manox_agent::MessageProvenance::Tool => WireMessageProvenance::Tool,
-        },
-        role: match msg.role {
-            manox_agent::language_model::Role::User => WireRole::User,
-            manox_agent::language_model::Role::Assistant => WireRole::Assistant,
-            manox_agent::language_model::Role::System => WireRole::System,
-        },
-        content: msg.content.iter().map(wire_content_block).collect(),
-        ui: msg.ui.as_ref().map(wire_message_ui),
-    }
-}
-
-fn wire_content_block(block: &MessageContent) -> WireContentBlock {
-    match block {
-        MessageContent::Text(text) => WireContentBlock::Text(text.clone()),
-        MessageContent::Thinking { text, signature } => WireContentBlock::Thinking {
-            text: text.clone(),
-            signature: signature.clone(),
-        },
-        MessageContent::Image { data, mime_type } => WireContentBlock::Image {
-            mime_type: mime_type.clone(),
-            byte_len: base64_byte_len(data) as u32,
-        },
-        MessageContent::ToolUse(tool) => WireContentBlock::ToolUse(WireToolUse {
-            id: tool.id.clone(),
-            name: tool.name.to_string(),
-            raw_input: tool.raw_input.clone(),
-            input: tool.input.clone(),
-            is_input_complete: tool.is_input_complete,
-            thought_signature: tool.thought_signature.clone(),
-        }),
-        MessageContent::ToolResult(result) => WireContentBlock::ToolResult(WireToolResult {
-            tool_use_id: result.tool_use_id.clone(),
-            tool_name: result.tool_name.to_string(),
-            is_error: result.is_error,
-            content: result.content.clone(),
-        }),
-        MessageContent::Compaction(text) => WireContentBlock::Compaction(text.clone()),
-    }
-}
-
-fn wire_message_ui(ui: &MessageUiMetadata) -> WireMessageUi {
-    WireMessageUi {
-        model_id: ui.model_id.clone(),
-        approval_mode: ui.approval_mode.map(|x| x as i32),
-        steered: ui.steered,
-        external_event: ui.external_event,
-        author: ui.author.as_ref().map(wire_message_author),
-        peer: if ui.peer { Some(true) } else { None },
-        display_text: ui.display_text.clone(),
-    }
-}
-
-fn wire_message_author(author: &manox_agent::MessageAuthor) -> WireMessageAuthor {
-    match author {
-        manox_agent::MessageAuthor::Lead => WireMessageAuthor::Lead,
-        manox_agent::MessageAuthor::Harness => WireMessageAuthor::Harness,
-        manox_agent::MessageAuthor::Agent(name) => WireMessageAuthor::Agent(name.clone()),
-    }
-}
-
-fn base64_byte_len(b64: &str) -> u64 {
-    let quarters = (b64.len() as u64) * 3 / 4;
-    let padding = b64.bytes().rev().take_while(|&b| b == b'=').count() as u64;
-    quarters.saturating_sub(padding)
 }
 
 /// Split a `/name args` invocation; an empty name is not a slash turn.

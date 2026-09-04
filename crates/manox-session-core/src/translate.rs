@@ -7,7 +7,6 @@
 //! [`FromClient::Reply`]), and diagnostic-only events are dropped (they carry
 //! no UI-visible state and would clutter the wire for no projection benefit).
 
-use manox_protocol::server::TokenUsageSnapshot;
 use manox_protocol::{ServerCall, ServerNote};
 
 /// The translation result for one `ThreadEvent`.
@@ -93,16 +92,6 @@ pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Tra
         | ThreadEvent::SideCallMetricsUpdated(_)
         | ThreadEvent::MainCallMetricsUpdated(_)
         | ThreadEvent::CacheInvalidation { .. } => Skip,
-    }
-}
-
-/// Build a `TokenUsageSnapshot` from a kernel `TokenUsage`.
-pub fn token_usage_snapshot(usage: &manox_agent::language_model::TokenUsage) -> TokenUsageSnapshot {
-    TokenUsageSnapshot {
-        input: usage.input_tokens,
-        output: usage.output_tokens,
-        cache_creation: usage.cache_creation_input_tokens,
-        cache_read: usage.cache_read_input_tokens,
     }
 }
 
