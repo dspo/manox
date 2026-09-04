@@ -710,11 +710,12 @@ async fn handle_call(
         // explicit error is the removal signal.
         ClientCall::GetUsage { .. }
         | ClientCall::GetCurrentModel { .. }
-        | ClientCall::ThreadInfo { .. } => {
-            Err(RpcError::new(-1, "v1 query surface removed (T10): use the \
-                 follow stream, projections, and GetConversationInfo")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST))
-        }
+        | ClientCall::ThreadInfo { .. } => Err(RpcError::new(
+            -1,
+            "v1 query surface removed (T10): use the \
+                 follow stream, projections, and GetConversationInfo",
+        )
+        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
         ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
             Err(RpcError::new(-1, "terminal support lands in β-3b"))
         }
@@ -2167,6 +2168,11 @@ mod tests {
         runs: StdMutex<Vec<String>>,
         steer_calls: StdMutex<Vec<String>>,
         cwds: StdMutex<Vec<PathBuf>>,
+        /// Model ids the server pushed through `ThreadEngine::set_model`
+        /// (T10: the v1 ThreadInfo mirror is gone — the engine-side wiring
+        /// is what the server half of a model switch can be held to; the
+        /// real engine journals it and the P face publishes the delta).
+        model_switches: StdMutex<Vec<String>>,
         notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
         auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
         pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
@@ -2189,6 +2195,7 @@ mod tests {
                     runs: StdMutex::new(Vec::new()),
                     steer_calls: StdMutex::new(Vec::new()),
                     cwds: StdMutex::new(Vec::new()),
+                    model_switches: StdMutex::new(Vec::new()),
                     notices,
                     auth_responses: StdMutex::new(Vec::new()),
                     pending_auth: StdMutex::new(Vec::new()),
@@ -2244,7 +2251,9 @@ mod tests {
             false
         }
         fn abort(&self) {}
-        fn set_model(&self, _: manox_harness::types::Model) {}
+        fn set_model(&self, model: manox_harness::types::Model) {
+            self.model_switches.lock().unwrap().push(model.id);
+        }
         fn set_thinking_level(&self, _: Option<String>) {}
         fn open_session(&self, _: PathBuf) {}
         fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}
@@ -2314,6 +2323,29 @@ mod tests {
                     }
                     Err(_) => panic!("timed out waiting for a server message"),
                 }
+            }
+        }
+        /// Per-connection FIFO sync point: round-trip a benign read call so
+        /// every note sent earlier on this connection has been processed by
+        /// the same dispatch loop before the caller asserts on state. (T10:
+        /// the deleted v1 `ThreadInfo` query used to provide this rendezvous
+        /// implicitly.) Intervening frames are drained — callers must settle
+        /// only between assertions that do not consume wire frames.
+        fn settle(&self) {
+            self.send(FromClient::Request {
+                id: MsgId::new("settle"),
+                call: ClientCall::ListThreads,
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let m = self.recv();
+                if matches!(&m, FromServer::Response { id, .. } if id.0 == "settle") {
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "settle response never arrived (last frame: {m:?})"
+                );
             }
         }
     }
@@ -2550,22 +2582,86 @@ mod tests {
         });
     }
 
-    /// Query `ThreadInfo` and return the typed payload.
-    fn thread_info(client: &Client, session_id: &str) -> ThreadInfoPayload {
-        client.send(FromClient::Request {
-            id: MsgId::new(format!("ti-{session_id}")),
-            call: ClientCall::ThreadInfo {
-                session_id: session_id.into(),
-            },
-        });
+    /// Drain until the follow stream `stream_id` delivers its opening
+    /// `Snapshot` frame (anything ahead of it is other-traffic noise and is
+    /// skipped — the §F.1 rule 1 pin lives in
+    /// `open_stream_emits_snapshot_then_gap_free_entries`).
+    fn snapshot_for(client: &Client, stream_id: &str) -> manox_protocol::stream::SessionSnapshot {
         loop {
-            if let FromServer::Notification {
-                note: ServerNote::ThreadInfo { info, .. },
-            } = client.recv()
-            {
-                return *info;
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id: sid,
+                    frame: manox_protocol::StreamFrame::Snapshot(s),
+                } if sid.0 == stream_id => return s,
+                FromServer::StreamItem { stream_id: sid, .. } => {
+                    // A different stream's traffic may interleave (throwaway
+                    // probe streams); the §F.1 rule 1 pin (FIRST frame of the
+                    // TARGET stream is the Snapshot) is kept exactly.
+                    assert_ne!(
+                        sid.0, stream_id,
+                        "first {stream_id} frame must be the Snapshot"
+                    );
+                    continue;
+                }
+                // A cancelled probe stream's terminal frame is noise.
+                FromServer::StreamEnd { .. } => continue,
+                FromServer::Notification { .. } => continue,
+                other => panic!("expected {stream_id} Snapshot, got {other:?}"),
             }
         }
+    }
+
+    /// Drain until a `Projections` delta for `session_id` stamped exactly
+    /// `as_of_seq` arrives; returns the frame (its `values` carry the
+    /// changed keys, §E.1).
+    fn drain_until_projection(
+        client: &Client,
+        session_id: &str,
+        as_of_seq: u64,
+    ) -> manox_protocol::stream::ProjectionsFrame {
+        loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    frame: manox_protocol::StreamFrame::Projections(frame),
+                    ..
+                } if frame.session_id == session_id && frame.as_of_seq == as_of_seq => {
+                    return frame;
+                }
+                FromServer::StreamItem { .. } => continue,
+                FromServer::StreamEnd { .. } => continue,
+                FromServer::Notification { .. } => continue,
+                other => panic!("expected Projections frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// The thread's projection baseline over the real v2 surface (the §E
+    /// successor of the v1 `ClientCall::ThreadInfo` query): open a throwaway
+    /// follow stream, take its snapshot baseline, cancel the stream. With a
+    /// scripted empty journal the baseline is exactly the server-side seed of
+    /// the live thread state; folded records would only add journal-driven
+    /// changes on top.
+    fn projection_baseline_of(
+        client: &Client,
+        session_id: &str,
+        stream_id: &str,
+    ) -> serde_json::Value {
+        open_follow(client, stream_id, session_id);
+        let snap = snapshot_for(client, stream_id);
+        client.send(FromClient::StreamCancel {
+            stream_id: StreamId::new(stream_id),
+        });
+        serde_json::to_value(snap.projections).unwrap()
+    }
+
+    /// Direct header truth (the kernel state the deleted v1 `ThreadInfo`
+    /// payload mirrored): read `plan_mode` off the live thread.
+    fn plan_mode_of(server: &AgentServer, session_id: &str) -> bool {
+        server
+            .0
+            .session_thread(session_id)
+            .expect("session thread present")
+            .read(|t| t.plan_mode())
     }
 
     /// Await the one-shot provider-registration background build so a
@@ -2657,6 +2753,9 @@ mod tests {
 
     #[test]
     fn open_session_replays_thread_history() {
+        // T10 (§D.6): reopen no longer pushes the v1 history mirror — the
+        // authoritative replay is the follow stream's opening `Snapshot`,
+        // whose content rides the §C.2 journal wire vocabulary end to end.
         let _g = lock_globals();
         hermetic_home();
         let sessions = manox_agent::paths::manox_config_dir()
@@ -2677,22 +2776,51 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { restored: true, .. }
-                }
-            )
-        });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadInfo { .. }
-                }
-            )
-        });
+        match client.recv() {
+            FromServer::Response { id, outcome: Ok(v) } => {
+                assert_eq!(id.0, "open");
+                assert_eq!(v["restored"], true);
+            }
+            other => panic!("expected the open ack, got {other:?}"),
+        }
+        // The v2 replay: attach the scripted read seam and open the stream.
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            1,
+            vec![
+                JournalRecord {
+                    seq: 0,
+                    entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+                },
+                JournalRecord {
+                    seq: 1,
+                    entry: (*jentry("e-1", Some("e-0"), ent_turn_finish)).clone(),
+                },
+            ],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        open_follow(&client, "st-1", "s1");
+        let snap = snapshot_for(&client, "st-1");
+        assert_eq!(snap.session_id, "s1");
+        assert_eq!(snap.cursor, 1);
+        assert_eq!(snap.records.len(), 2);
+        assert_eq!(snap.records[0].seq, 0);
+        assert_eq!(snap.records[1].seq, 1);
+        assert!(!snap.has_more);
+        // The thread metadata that rode the deleted `ThreadInfo` note is
+        // baseline-side: the header carries the reopened cwd, the projection
+        // baseline declares the full §E surface.
+        assert_eq!(snap.header.cwd, "/proj");
+        assert_eq!(snap.header.id, "s1");
+        let mut want: Vec<&str> = manox_protocol::surface::PROJECTION_KEYS.to_vec();
+        want.sort_unstable();
+        let mut got: Vec<&str> = snap.projections.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, want, "the replay carries the declared surface");
+        assert_eq!(
+            snap.projections["cwd"],
+            serde_json::Value::String("/proj".into())
+        );
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -2842,6 +2970,10 @@ mod tests {
 
     #[test]
     fn set_model_and_thread_info() {
+        // T10 (§D.6): the `ThreadInfo` mirror is gone. Chip-relevant thread
+        // metadata rides the projection surface: the snapshot baseline seeds
+        // from live thread state, an engine-journaled mutation republishes
+        // unprompted through the P-face delta (§E.1).
         let _g = lock_globals();
         hermetic_home();
         init_globals();
@@ -2858,79 +2990,77 @@ mod tests {
         // real pi engine actor (same pattern as the submit tests).
         let (engine, events) = FakeEngine::new();
         server.set_session_engine_for_test("s1", engine.clone(), events);
-        // ThreadInfo carries the typed payload with all 22 fields populated.
-        client.send(FromClient::Request {
-            id: MsgId::new("ti"),
-            call: ClientCall::ThreadInfo {
-                session_id: "s1".into(),
-            },
-        });
-        let mut info: Option<ThreadInfoPayload> = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while std::time::Instant::now() < deadline {
-            if let FromServer::Notification {
-                note: ServerNote::ThreadInfo { info: payload, .. },
-            } = client.recv_timeout(Duration::from_secs(2))
-            {
-                info = Some(*payload);
-                break;
-            }
-        }
-        let info = info.expect("ThreadInfo never arrived");
-        assert_eq!(info.cwd, "/");
-        assert_eq!(info.history_phase, "ready");
-        assert_eq!(info.permission_mode, "workspace-write");
-        assert_eq!(info.self_author, "lead");
-        assert!(!info.running);
-        assert!(!info.plan_mode);
+        // The baseline carries the declared surface with the create-time
+        // state populated (the former 22-field `ThreadInfo` payload's
+        // projection successor).
+        open_follow(&client, "st-1", "s1");
+        let snap = snapshot_for(&client, "st-1");
+        let mut want: Vec<&str> = manox_protocol::surface::PROJECTION_KEYS.to_vec();
+        want.sort_unstable();
+        let mut got: Vec<&str> = snap.projections.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, want, "snapshot baseline IS the declared surface");
+        let p = &snap.projections;
+        assert_eq!(p["cwd"], json!("/"));
+        assert_eq!(p["permission_mode"], json!("workspace_write"));
+        assert_eq!(p["self_author"], json!("lead"));
+        assert_eq!(p["running"], json!(false));
+        assert_eq!(p["plan_mode"], json!(false));
+        assert_eq!(p["has_interacted"], json!(false));
         // `create_session` seeds the default: the hermetic HOME has no settings
         // `default_model` reference, so `default_model()` resolves to the
-        // first-sorted registered model — `alpha-model`.
+        // first-sorted registered model — `alpha-model`. The typed model pair
+        // (provider+modelId) replaces the payload's `model_id`/`model` fields.
         assert_eq!(
-            info.model_id.as_deref(),
-            Some("alpha-model"),
+            p["model"]["modelId"],
+            json!("alpha-model"),
             "create-time default model should be the first-sorted registered model"
         );
+        assert!(
+            p["model"]["provider"].is_string(),
+            "chips read the typed model pair, not just an id"
+        );
 
-        // Composer-chip regression: a mutation re-publishes the ThreadInfo
-        // mirror unprompted (no query) — the narrow `CurrentModel`-style
-        // notes never refresh the chip-read typed fields. Drain to the next
-        // pushed ThreadInfo note.
-        let pushed_thread_info = || -> ThreadInfoPayload {
-            loop {
-                if let FromServer::Notification {
-                    note: ServerNote::ThreadInfo { info, .. },
-                } = client.recv()
-                {
-                    return *info;
-                }
-            }
-        };
+        // Composer-chip regression: a model switch reaches the engine (which
+        // journals it), and the journal write republishes the `model` key
+        // unprompted — no query, no mirror note. The scripted journal entry
+        // stands in for the real engine's durable write (same fold path as
+        // `open_stream_emits_snapshot_then_gap_free_entries`).
         client.send(FromClient::Notification {
             note: ClientNote::SetModel {
                 session_id: "s1".into(),
                 id: "beta-model".into(),
             },
         });
-        let info = pushed_thread_info();
+        // FIFO sync: the note has been dispatched before we read the engine.
+        client.settle();
         assert_eq!(
-            info.model_id.as_deref(),
-            Some("beta-model"),
-            "SetModel to a different model must re-publish a ThreadInfo carrying it"
+            engine.model_switches.lock().unwrap().as_slice(),
+            ["beta-model".to_string()],
+            "SetModel must forward the resolved model to the engine"
         );
-        assert!(
-            info.model.is_some(),
-            "chip reads the typed model, not just model_id/name"
+        engine.push_journal(1, jentry("e-1", Some("e-0"), ent_model_change));
+        let frame = drain_until_projection(&client, "s1", 1);
+        assert_eq!(
+            frame.values["model"],
+            json!({ "provider": "test-prov", "modelId": "m-1" }),
+            "a journaled model change must republish the projection unprompted"
         );
+        // A freshly opened stream's baseline re-seeds from the live thread:
+        // it observes the switch the server applied.
+        let baseline = projection_baseline_of(&client, "s1", "st-2");
+        assert_eq!(baseline["model"]["modelId"], json!("beta-model"));
         client.send(FromClient::Notification {
             note: ClientNote::SetCwd {
                 session_id: "s1".into(),
                 cwd: "/proj".into(),
             },
         });
-        let info = pushed_thread_info();
-        assert_eq!(info.cwd, "/proj");
-        assert_eq!(info.project.as_deref(), Some("/proj"));
+        // Not-yet-interacted: SetCwd binds project + header cwd; the baseline
+        // of a fresh stream observes both.
+        let baseline = projection_baseline_of(&client, "s1", "st-3");
+        assert_eq!(baseline["cwd"], json!("/proj"));
+        assert_eq!(baseline["project"], json!("/proj"));
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -2938,8 +3068,9 @@ mod tests {
 
     /// A conversation's project never re-binds: once the thread has interacted,
     /// `SetCwd` moves only the engine's working directory, leaving the bound
-    /// project and the header cwd untouched — but the mutation still re-publishes
-    /// the ThreadInfo mirror (the chip must observe the sticky-cwd switch).
+    /// project and the header cwd untouched — and the projection baseline
+    /// still reports the untouched header fields (T10: the v1 `ThreadInfo`
+    /// republish this test drained to is gone; §E baseline is the successor).
     #[test]
     fn set_cwd_after_interaction_moves_engine_not_project() {
         let _g = lock_globals();
@@ -2975,22 +3106,18 @@ mod tests {
                 cwd: "/moved".into(),
             },
         });
-        // Drain to the mutation's ThreadInfo re-publish (unprompted).
-        let pushed = loop {
-            if let FromServer::Notification {
-                note: ServerNote::ThreadInfo { info, .. },
-            } = client.recv()
-            {
-                break *info;
-            }
-        };
+        let baseline = projection_baseline_of(&client, "s1", "st-probe");
         assert_eq!(
-            pushed.project.as_deref(),
-            None,
+            baseline["project"],
+            serde_json::Value::Null,
             "an interacted thread's project never re-binds via SetCwd"
         );
-        assert!(pushed.has_interacted);
-        assert_eq!(pushed.cwd, "/", "header cwd is untouched by SetCwd");
+        assert_eq!(baseline["has_interacted"], json!(true));
+        assert_eq!(
+            baseline["cwd"],
+            json!("/"),
+            "header cwd is untouched by SetCwd"
+        );
         assert!(
             engine
                 .cwds
@@ -3000,52 +3127,6 @@ mod tests {
                 .any(|p| p == std::path::Path::new("/moved")),
             "the working-directory switch must reach the engine"
         );
-        drop(client);
-        drop(server);
-        manox_agent::thread_store::drop_global_for_test();
-    }
-
-    /// The first user message must republish `ThreadInfo` unprompted:
-    /// `has_interacted` rides only on that note, so a client that opened a
-    /// fresh (un-interacted) session and then submitted would never learn
-    /// the flip without the republish — e.g. the context rail stays hidden.
-    #[test]
-    fn submit_republishes_thread_info_on_first_interaction() {
-        let _g = lock_globals();
-        hermetic_home();
-        init_globals();
-        let (server, client) = harness(vec![]);
-        create(&server, &client, "s1");
-        let (engine, events) = FakeEngine::new();
-        server.set_session_engine_for_test("s1", engine.clone(), events);
-        client.send(FromClient::Notification {
-            note: ClientNote::Submit {
-                session_id: "s1".into(),
-                text: "hello".into(),
-                images: vec![],
-                client_id: None,
-            },
-        });
-        // Drain to the unprompted republish. The create-time snapshot also
-        // carries a ThreadInfo, but with `has_interacted: false` — settle on
-        // the flipped mirror, not on the first note. Stop at `TurnStarted`
-        // without settling: `Settled` re-reads the transcript through
-        // `engine.history()` — empty on the fake — which would wipe the user
-        // message and the interaction state the assertion depends on.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "ThreadInfo never republished with the interaction flip"
-            );
-            if let FromServer::Notification {
-                note: ServerNote::ThreadInfo { info, .. },
-            } = client.recv_timeout(Duration::from_secs(2))
-                && info.has_interacted
-            {
-                break;
-            }
-        }
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -3179,8 +3260,12 @@ mod tests {
                 enabled: true,
             },
         });
+        client.settle(); // FIFO: the SetPlanMode note has been dispatched.
         // Before the verdict, plan_mode is on (confirms SetPlanMode applied).
-        assert!(thread_info(&client, "s1").plan_mode);
+        // T10: the v1 `ThreadInfo` query is gone — the header truth the
+        // deleted payload mirrored is the thread itself; the P-face fold of
+        // `PlanModeChange` is pinned in `projections`.
+        assert!(plan_mode_of(&server, "s1"));
         let plan_file =
             std::env::temp_dir().join(format!("manox-beta3b-plan-{}.md", std::process::id()));
         std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
@@ -3217,7 +3302,7 @@ mod tests {
         // applies the reply on the pump task; poll rather than race it).
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            if !thread_info(&client, "s1").plan_mode {
+            if !plan_mode_of(&server, "s1") {
                 break;
             }
             assert!(
@@ -3304,89 +3389,84 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// §D.1 atomicity (T10 successor of the v1 open-time snapshot race): the
+    /// follow task subscribes to the journal feed BEFORE the snapshot read,
+    /// so an entry that lands in between still forwards as exactly one live
+    /// `Entry` frame with no duplicate inside the snapshot (§F.1 rule 2).
+    /// An entry landing after the snapshot read must likewise never appear
+    /// in the snapshot — the §E fold sees it once.
     #[test]
     fn open_session_snapshot_subscribe_is_atomic() {
         let _g = lock_globals();
         hermetic_home();
-        let sessions = manox_agent::paths::manox_config_dir()
-            .expect("config dir")
-            .join("sessions");
-        std::fs::create_dir_all(&sessions).unwrap();
-        seed_session_file(&sessions, "s1", "/proj");
         init_globals();
         manox_agent::thread_store::init();
         let (server, client) = harness(vec![]);
-        // Open the session — the pump subscribes synchronously inside
-        // spawn_pump, then emit_history_and_info sends the snapshot. Any
-        // event that fires after the subscribe is captured by the
-        // subscription and must not appear in the snapshot.
-        client.send(FromClient::Request {
-            id: MsgId::new("open"),
-            call: ClientCall::OpenSession {
-                session_id: "s1".into(),
-            },
-        });
-        // Expect SessionCreated.
-        expect(
-            &client,
-            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
-        );
-        // Expect ThreadHistory (the snapshot).
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { session_id, .. }
-                } if session_id == "s1"
-            )
-        });
-        // Expect ThreadInfo.
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadInfo { session_id, .. }
-                } if session_id == "s1"
-            )
-        });
-        // Now inject an event — the pump subscribed before the snapshot
-        // was sent, so the event must arrive via the subscription stream.
-        // v2 (§D.5/§D.6): the turn edge surfaces as a `SessionStatus` host
-        // delta, not a TurnStarted note.
+        create(&server, &client, "s1");
         let (engine, events) = FakeEngine::new();
+        // Seed the whole-chain read: one dense record (cursor = 0).
+        engine.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+            }],
+        );
         server.set_session_engine_for_test("s1", engine.clone(), events);
-        engine
-            .notices
-            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
-            .unwrap();
-        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
-        // Verify no duplicate edge. The snapshot is empty (fresh thread with
-        // no history), so the subscription should deliver the event exactly
-        // once — the pump must not have re-emitted a second running=true
-        // SessionStatus for the same edge.
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        open_follow(&client, "st-1", "s1");
+        let snap = snapshot_for(&client, "st-1");
+        assert_eq!(snap.cursor, 0);
+        assert_eq!(snap.records.len(), 1);
+
+        // Inject the live edge right after the snapshot read: it must arrive
+        // exactly once as an Entry frame, never inside the snapshot.
+        engine.push_journal(1, jentry("e-1", Some("e-0"), ent_turn_finish));
+        let mut entry_frames = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            match client.conn.server_rx().try_recv() {
-                Ok(FromServer::Host {
-                    host:
-                        HostEvent::SessionStatus {
-                            session_id: sid,
-                            running: Some(true),
-                            ..
-                        },
-                }) if sid == "s1" => {
-                    panic!(
-                        "duplicate turn-start edge delivered — event is in both snapshot and subscription"
-                    );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "live entry after the snapshot read never forwarded"
+            );
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::StreamFrame::Entry { seq, .. },
+                } => {
+                    assert_eq!(stream_id.0, "st-1");
+                    assert_eq!(seq, 1, "gap-free continuation of the cursor");
+                    entry_frames += 1;
                 }
-                Ok(_) => continue,
-                Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(_) => break,
+                // The P-face delta for the turn-finish edge and any v1
+                // compat traffic are expected noise for this pin.
+                FromServer::StreamItem { .. } => continue,
+                FromServer::Notification { .. } => continue,
+                other => panic!("expected the live Entry frame, got {other:?}"),
             }
+            // Settle window: nothing further may deliver the same edge.
+            let settle = std::time::Instant::now() + Duration::from_millis(300);
+            loop {
+                match client.conn.server_rx().try_recv() {
+                    Ok(FromServer::StreamItem {
+                        frame: manox_protocol::StreamFrame::Entry { seq: 1, .. },
+                        ..
+                    }) => {
+                        panic!("duplicate live delivery of the same entry");
+                    }
+                    Ok(_) => continue,
+                    Err(_) if std::time::Instant::now() < settle => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+            break;
         }
+        assert_eq!(entry_frames, 1);
+        // The snapshot the client already holds never contained the edge —
+        // the read is the scripted chain, whose tail (seq 0) precedes it.
+        assert_eq!(snap.records.len(), 1);
+        assert_eq!(snap.records[0].seq, 0);
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -3652,14 +3732,15 @@ mod tests {
             }
         }
 
-        // Drain both until each has delivered a ThreadInfo response to a
-        // final request (bounded settle, no sleeps beyond the recv polling).
-        for (sid, send_ip) in [("sess-inproc", true), ("sess-serde", false)] {
+        // Drain both until each has answered a final `ListThreads` request
+        // (bounded settle through the same dispatch queue, no sleeps beyond
+        // the recv polling). T10: this was the v1 `ThreadInfo` query — any
+        // order-guaranteed read call serves the rendezvous; the comparison
+        // here is transport identity, not the payload's content.
+        for send_ip in [true, false] {
             let req = FromClient::Request {
-                id: MsgId::new("info"),
-                call: ClientCall::ThreadInfo {
-                    session_id: sid.into(),
-                },
+                id: MsgId::new("settle"),
+                call: ClientCall::ListThreads,
             };
             if send_ip {
                 client_ip.send(req);
@@ -3681,7 +3762,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(got_ip_info && got_sl_info, "both paths answered ThreadInfo");
+        assert!(
+            got_ip_info && got_sl_info,
+            "both paths answered ListThreads"
+        );
 
         // ── §D.1 stream round (T4 extension) ──
         //
@@ -3988,16 +4072,16 @@ mod tests {
             },
         });
         // Liveness proof for b after a's dispose, independent of the
-        // process-global provider registry: a request against b's still-live
-        // session must get a Response (server alive, sb retained), never a
-        // dropped connection. (The earlier "submit -> Error note" proof was
+        // process-global provider registry and of any session state: a plain
+        // read call must get a Response (server alive, connection served),
+        // never a dropped connection. T10: was `GetCurrentModel` — the v1
+        // per-session query is gone; the transport liveness proof does not
+        // need one. (The earlier "submit -> Error note" proof was
         // order-fragile: it relied on sb's engine bailing with no default
         // model, which a prior model-registering test defeats.)
         client_b.send(FromClient::Request {
             id: MsgId::new("b-alive"),
-            call: ClientCall::GetCurrentModel {
-                session_id: "sb".into(),
-            },
+            call: ClientCall::ListThreads,
         });
         expect(&client_b, |m| {
             matches!(m, FromServer::Response { outcome: Ok(_), .. })
@@ -4021,7 +4105,8 @@ mod tests {
         init_globals();
         manox_agent::thread_store::init();
         let (server, client) = harness(vec![]);
-        // First open of s1: must succeed.
+        // First open of s1: must succeed (ack + SessionCreated; T10: the v1
+        // snapshot push is gone — history replays via the follow stream).
         client.send(FromClient::Request {
             id: MsgId::new("open-1"),
             call: ClientCall::OpenSession {
@@ -4032,22 +4117,10 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { restored: true, .. }
-                }
-            )
-        });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadInfo { .. }
-                }
-            )
-        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "open-1"),
+        );
         // Simulate reconnect: a second connection with the same client_id.
         let (client_reconn_conn, server_reconn_conn) = in_process_pair();
         server.accept(std::sync::Arc::new(server_reconn_conn));
@@ -4078,7 +4151,9 @@ mod tests {
             ),
             "reconnect must receive Ready: {ready:?}"
         );
-        // Reopen s1 on the new connection: must load the session again.
+        // Reopen s1 on the new connection: must load the session again —
+        // directed ack, and the v2 replay lane (follow stream) answers the
+        // re-seated owner.
         client_reconn.send(FromClient::Request {
             id: MsgId::new("open-reconn"),
             call: ClientCall::OpenSession {
@@ -4089,14 +4164,23 @@ mod tests {
             &client_reconn,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        expect(&client_reconn, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { restored: true, .. }
-                }
-            )
-        });
+        expect(
+            &client_reconn,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "open-reconn"),
+        );
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            0,
+            vec![JournalRecord {
+                seq: 0,
+                entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+            }],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        open_follow(&client_reconn, "st-reopen", "s1");
+        let snap = snapshot_for(&client_reconn, "st-reopen");
+        assert_eq!(snap.session_id, "s1");
+        assert_eq!(snap.records.len(), 1);
         drop(client);
         drop(client_reconn);
         drop(server);
@@ -4129,24 +4213,12 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        // Drain the reopen's directed snapshot (history + info) so the channel
-        // is clean before we probe single-delivery of the turn event.
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { .. }
-                }
-            )
-        });
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadInfo { .. }
-                }
-            )
-        });
+        // T10: the reopen pushes no v1 snapshot — only the directed
+        // `SessionCreated` plus the ack above. The channel needs no drain.
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "open-2"),
+        );
         // Drive one turn: exactly one turn edge (v2: `SessionStatus`
         // running=true host delta, §D.5) must reach the client.
         client.send(FromClient::Notification {
@@ -4236,8 +4308,9 @@ mod tests {
 
     /// Reopening a detached session is idempotent: the persisted thread
     /// survives detach (only the in-memory owner is dropped), so a later
-    /// `OpenSession` re-adds the owner and replays `SessionCreated` +
-    /// `ThreadHistory { restored: true }`.
+    /// `OpenSession` re-adds the owner and the v2 replay lane — the follow
+    /// stream's opening `Snapshot` — delivers the history (T10: replaced the
+    /// `ThreadHistory { restored: true }` push).
     #[test]
     fn detach_then_reopen_replays_history() {
         let _g = lock_globals();
@@ -4260,15 +4333,6 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        // Drain the first replay's history so the channel is clean.
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { .. }
-                }
-            )
-        });
         // Detach drops the owner; the disk file survives.
         client.send(FromClient::Notification {
             note: ClientNote::DetachSession {
@@ -4280,7 +4344,7 @@ mod tests {
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionDisposed { session_id } } if session_id == "s1"),
         );
         assert!(server.0.owners("s1").is_empty());
-        // Reopen: idempotent load from disk → re-added owner + history replay.
+        // Reopen: idempotent load from disk → re-added owner + ack.
         client.send(FromClient::Request {
             id: MsgId::new("reopen"),
             call: ClientCall::OpenSession {
@@ -4291,15 +4355,34 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        expect(&client, |m| {
-            matches!(
-                m,
-                FromServer::Notification {
-                    note: ServerNote::ThreadHistory { restored: true, .. }
-                }
-            )
-        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "reopen"),
+        );
         assert_eq!(server.0.owners("s1"), vec!["test".to_string()]);
+        // The v2 replay: the reopened session's history arrives through the
+        // follow stream's `Snapshot` (scripted read seam as in
+        // `open_session_replays_thread_history`).
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal(
+            1,
+            vec![
+                JournalRecord {
+                    seq: 0,
+                    entry: (*jentry("e-0", None, ent_turn_start)).clone(),
+                },
+                JournalRecord {
+                    seq: 1,
+                    entry: (*jentry("e-1", Some("e-0"), ent_turn_finish)).clone(),
+                },
+            ],
+        );
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        open_follow(&client, "st-reopen", "s1");
+        let snap = snapshot_for(&client, "st-reopen");
+        assert_eq!(snap.session_id, "s1");
+        assert_eq!(snap.cursor, 1);
+        assert_eq!(snap.records.len(), 2, "replay carries the whole chain");
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
