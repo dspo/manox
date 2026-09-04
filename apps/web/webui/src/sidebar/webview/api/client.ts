@@ -126,8 +126,10 @@ export function onOpenTurnNavigator(listener: () => void): () => void {
 }
 
 /** Wire the store: install the transport effects seam (the api layer owns
- * the outbound calls the store makes — `openStream` / `pageHistory` /
- * `conversationInfo`) and become the frame sink. */
+ * the outbound calls the store makes — `openStream` / `pageHistory`) and
+ * become the frame sink. The §E.3 Q-face pull lives with its consumer: the
+ * conversation-info plugin calls {@link getConversationInfo} on committed
+ * edges (T8 §H). */
 export function connectStore(store: StoreSink): void {
 	storeSink = store;
 	store.attachEffects({
@@ -150,12 +152,22 @@ export function connectStore(store: StoreSink): void {
 				hasMore: receipt.has_more === true,
 			};
 		},
-		async conversationInfo(sessionId): Promise<ConversationInfo | null> {
-			const receipt = await request({ method: 'getConversationInfo', sessionId });
-			if (!receipt) return null;
-			return receipt as unknown as ConversationInfo;
-		},
 	});
+}
+
+/**
+ * §E.3 Q-face fetch seam (L5 extension surface, §H): a plugin calls this to
+ * run a `GetConversationInfo` fold. The request rides the same pending table
+ * as everything else — zero notes, zero emits (L7: the response carries fold
+ * output, not domain state; the durable data itself keeps arriving through
+ * the journal stream).
+ */
+export async function getConversationInfo(
+	sessionId: string,
+): Promise<ConversationInfo | null> {
+	const receipt = await request({ method: 'getConversationInfo', sessionId });
+	if (!receipt) return null;
+	return receipt as unknown as ConversationInfo;
 }
 
 let msgSeq = 0;

@@ -3,8 +3,10 @@
 //
 //   J  journal entries   → `TranscriptFold` (entries.ts) → `items`
 //   P  projections       → per-key {value, seq} higher-seq-wins → typed fields
-//   Q  GetConversationInfo (on-demand fold, committed-message edge, 120 ms
-//      debounce + visibility) — the only spend/context source
+//   Q  GetConversationInfo (on-demand fold) — §E.3: the store carries the
+//      durable committed-message count (`committed`, the refresh edge
+//      signal) and the `setConversationInfo` seam the conversation-info
+//      plugin writes through; the pull itself is plugin-owned (T8 §H)
 //   H  host events       → global registries + SessionStatus monotonic mirror
 //   client-owned         → view selection, drafts, echoes, focus/unread/errored
 //
@@ -108,8 +110,6 @@ export interface StoreEffects {
 	openStream(sessionId: string, streamId: string): void;
 	/** `PageHistory` through `throughSeq` (inclusive); resolve the page. */
 	pageHistory(sessionId: string, throughSeq: number): Promise<JournalPageData | null>;
-	/** `GetConversationInfo` (§E.3); resolve the fold payload or null. */
-	conversationInfo(sessionId: string): Promise<ConversationInfo | null>;
 }
 
 export interface ThreadState {
@@ -149,9 +149,15 @@ export interface ThreadState {
 	/** Streamed child-session events per sub-agent (fold-derived). */
 	subagentChildren: Record<string, SubagentChildWire[]>;
 	/** The §E.3 Q-face payload (spend tree / lifetime tokens / context
-	 * budget), refreshed on committed-message edges. This replaces the
-	 * doomed GetUsage / UsageSnapshot / ThreadInfo request-note path. */
+	 * budget). Written through the `setConversationInfo` seam by the
+	 * conversation-info plugin (T8 §H); the store only owns the edge
+	 * signal (`committed`). This replaces the doomed GetUsage /
+	 * UsageSnapshot / ThreadInfo request-note path. */
 	conversationInfo: ConversationInfo | null;
+	/** Durable user/assistant `message` rows inside the published journal
+	 * window — the §E.3 refresh edge signal (§E.3: the client pulls the Q
+	 * face only when this advances). */
+	committed: number;
 	/** Restored history still loading (open → first snapshot). */
 	loading: boolean;
 	/** Last error emitted for this thread; cleared when a new turn starts. */
@@ -205,6 +211,7 @@ const initThread = (sessionId: string): ThreadState => ({
 	subagents: [],
 	subagentChildren: {},
 	conversationInfo: null,
+	committed: 0,
 	loading: false,
 	error: null,
 	lastTurnDurationSec: null,
@@ -265,11 +272,9 @@ interface Runtime {
 	echoes: Echo[];
 	echoSeq: number;
 	/** committed = durable user/assistant `message` rows in the window: the
-	 * §E.3 refresh edge signal. */
+	 * §E.3 refresh edge signal (promoted onto `ThreadState`; the
+	 * conversation-info plugin watches it and pulls the Q face). */
 	committed: number;
-	infoTimer: ReturnType<typeof setTimeout> | undefined;
-	infoInFlight: boolean;
-	infoDirty: boolean;
 	paging: boolean;
 	/** Wall-clock of the in-flight turn (running edge), for the duration. */
 	turnStartedAt: number | null;
@@ -289,7 +294,6 @@ export class Store {
 	private effects: StoreEffects = {
 		openStream: () => undefined,
 		pageHistory: async () => null,
-		conversationInfo: async () => null,
 	};
 
 	subscribe = (listener: () => void): (() => void) => {
@@ -970,9 +974,6 @@ export class Store {
 			echoes: [],
 			echoSeq: 0,
 			committed: 0,
-			infoTimer: undefined,
-			infoInFlight: false,
-			infoDirty: false,
 			paging: false,
 			turnStartedAt: null,
 			lastTurnDurationSec: null,
@@ -1116,6 +1117,7 @@ export class Store {
 				status: a.status,
 			})),
 			subagentChildren: mapRecord(runtime.fold.subagentChildren),
+			committed: runtime.committed,
 			lastTurnDurationSec: runtime.lastTurnDurationSec,
 		};
 	}
@@ -1136,7 +1138,11 @@ export class Store {
 			// higher-seq-wins (equal seq keeps the newer frame — the frame
 			// ordering the server guarantees within a stream).
 			if (!prev || asOfSeq >= prev.seq) {
-				runtime.projections.set(key, { value, seq: asOfSeq });
+				// Freeze on write so `projection()` can hand out a stable
+				// reference between changes — the `useSyncExternalStore`
+				// contract `useProjection` relies on (a fresh object per read
+				// would loop the subscriber).
+				runtime.projections.set(key, Object.freeze({ value, seq: asOfSeq }));
 			}
 		}
 	}
@@ -1172,9 +1178,11 @@ export class Store {
 	}
 
 	/** Committed = durable user/assistant `message` rows inside the
-	 * published window. A change schedules the debounced
-	 * `GetConversationInfo` refresh (§E.3 edge signal, 120 ms debounce +
-	 * visibility awareness). */
+	 * published window. The count advances exactly when the Q face can
+	 * change (the §E.3 refresh edge signal); the pull itself belongs to the
+	 * conversation-info plugin (T8 §H), which watches `committed` on the
+	 * observable state and writes the payload back through
+	 * `setConversationInfo`. */
 	private trackCommitted(sessionId: string, runtime: Runtime): void {
 		const cursors = runtime.engine.cursors();
 		let count = 0;
@@ -1191,56 +1199,26 @@ export class Store {
 		}
 		if (count !== runtime.committed) {
 			runtime.committed = count;
-			this.scheduleConversationInfo(sessionId, runtime);
+			this.publishThread(sessionId);
 		}
 	}
 
-	private scheduleConversationInfo(sessionId: string, runtime: Runtime): void {
-		if (runtime.infoTimer !== undefined) clearTimeout(runtime.infoTimer);
-		runtime.infoTimer = setTimeout(() => {
-			runtime.infoTimer = undefined;
-			if (typeof document !== 'undefined' && document.hidden) {
-				runtime.infoDirty = true;
-				return;
-			}
-			void this.pullConversationInfo(sessionId, runtime);
-		}, 120);
+	/** §E.2 read seam: the `{ value, seq }` slot of one projection key
+	 * (frozen at write — stable identity between changes, safe as a
+	 * `useSyncExternalStore` source). `undefined` while unseen. */
+	projection(sessionId: string, key: string): Readonly<ProjectionSlot> | undefined {
+		return this.sessions.get(sessionId)?.projections.get(key);
 	}
 
-	private async pullConversationInfo(sessionId: string, runtime: Runtime): Promise<void> {
-		if (runtime.infoInFlight) {
-			runtime.infoDirty = true;
-			return;
-		}
-		runtime.infoInFlight = true;
-		runtime.infoDirty = false;
-		try {
-			const info = await this.effects.conversationInfo(sessionId);
-			if (info) {
-				this.patch(
-					updateThread(this.state, sessionId, (t) => ({ ...t, conversationInfo: info })),
-				);
-			}
-		} finally {
-			runtime.infoInFlight = false;
-			if (runtime.infoDirty) void this.pullConversationInfo(sessionId, runtime);
-		}
-	}
-
-	/** Visibility-aware flush (the api client wires `visibilitychange`
-	 * here): a dirty flag set while hidden drains when the page returns. */
-	flushConversationInfo(sessionId: string): void {
-		const runtime = this.sessions.get(sessionId);
-		if (!runtime || !runtime.infoDirty) return;
-		runtime.infoDirty = false;
-		void this.pullConversationInfo(sessionId, runtime);
-	}
-
-	/** Pull the Q-face immediately (open-thread / reseat paths). */
-	refreshConversationInfo(sessionId: string): void {
-		const runtime = this.sessions.get(sessionId);
-		if (!runtime) return;
-		void this.pullConversationInfo(sessionId, runtime);
+	/** §E.3 write seam for the conversation-info plugin: park the folded
+	 * payload on the thread state so every subscriber sees it through the
+	 * store (never a component-local mirror). */
+	setConversationInfo(sessionId: string, info: ConversationInfo | null): void {
+		const current = this.state.perThread[sessionId];
+		if (!current || current.conversationInfo === info) return;
+		this.patch(
+			updateThread(this.state, sessionId, (t) => ({ ...t, conversationInfo: info })),
+		);
 	}
 
 	// ── history paging (§D.2 PageHistory) ─────────────────────────────────

@@ -170,7 +170,7 @@ describe('follow-stream sequences', () => {
 		});
 	});
 
-	it('pageHistory and getConversationInfo ride the effects seam as Requests', async () => {
+	it('pageHistory rides the effects seam as a Request', async () => {
 		const { client } = await freshClient();
 		const store = fakeStore();
 		client.connectStore(store);
@@ -178,19 +178,32 @@ describe('follow-stream sequences', () => {
 		ws.open();
 
 		const pageP = store.effects.pageHistory('s1', 4);
-		const infoP = store.effects.conversationInfo('s1');
 		const pageReq = postedFrames(ws).find(
 			(f) => f.kind === 'request' && (f as { call: { method: string } }).call.method === 'pageHistory',
 		) as Extract<FromClient, { kind: 'request' }>;
-		const infoReq = postedFrames(ws).find(
-			(f) => f.kind === 'request' && (f as { call: { method: string } }).call.method === 'getConversationInfo',
-		) as Extract<FromClient, { kind: 'request' }>;
 		expect(pageReq.call).toMatchObject({ method: 'pageHistory', sessionId: 's1', throughSeq: 4 });
 		ws.receive(response(pageReq.id, { records: [{ seq: 4, id: 'e4', parentId: null, timestamp: '', type: 'turnStart' }], has_more: true, cursor: 4 }));
-		ws.receive(response(infoReq.id, { threadId: 's1', cursor: 4, models: [], cumulativeCost: 0 }));
 		const page = await pageP;
 		expect(page?.hasMore).toBe(true);
 		expect(page?.records[0]?.seq).toBe(4);
+	});
+
+	// §E.3 / T8 §H: the Q-face pull is plugin-owned now — `getConversationInfo`
+	// is an exported fetch seam on the api client (no store effect), riding the
+	// same pending-request table as every other Request.
+	it('getConversationInfo rides the pending table as a Request (plugin fetch seam)', async () => {
+		const { client } = await freshClient();
+		const store = fakeStore();
+		client.connectStore(store);
+		const ws = MockWebSocket.instances[0];
+		ws.open();
+
+		const infoP = client.getConversationInfo('s1');
+		const infoReq = postedFrames(ws).find(
+			(f) => f.kind === 'request' && (f as { call: { method: string } }).call.method === 'getConversationInfo',
+		) as Extract<FromClient, { kind: 'request' }>;
+		expect(infoReq.call).toMatchObject({ method: 'getConversationInfo', sessionId: 's1' });
+		ws.receive(response(infoReq.id, { threadId: 's1', cursor: 4, models: [], cumulativeCost: 0 }));
 		await expect(infoP).resolves.toMatchObject({ threadId: 's1' });
 	});
 });

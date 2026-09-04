@@ -12,6 +12,7 @@ import { hasCommandKey, t, type I18nKey } from '../../lib/i18n';
 import { enterAction } from '../../lib/ime';
 import { recallStep } from '../../lib/turn-recall';
 import { cn } from '../../lib/utils';
+import { Slot } from '../../slots.outlet';
 import { store } from '../../state/bridge';
 import {
   DropdownMenu,
@@ -21,7 +22,6 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
 import { Textarea } from '../ui/textarea';
-import { ModelPicker } from './model-picker';
 const MAX_IMAGE_EDGE_PX = 1568;
 // Trailing-key window after `compositionend`: only an Enter landing this
 // fast is the engine's post-composition echo, never a deliberate send.
@@ -484,13 +484,19 @@ export const Composer = ({
           </div>
         )}
         <div className="flex items-center gap-2">
-          <ModelPicker
-            currentModelRef={currentModelRef}
-            disabled={!ready || creating}
-            models={models}
-            onSelect={draft ? onModelChange : undefined}
-            reasoningEffort={reasoningEffort}
-            sessionId={sessionId}
+          {/* The model picker is contributed through the `conversation.
+           * composer.dock` slot (§G): the composer only opens the outlet and
+           * passes its owner props (session/display-ref/disabled/draft
+           * select); the picker component and its shared-data reads live in
+           * the slot defaults registration, not imported here. */}
+          <Slot
+            name="conversation.composer.dock"
+            owner={{
+              sessionId,
+              currentModelRef,
+              disabled: !ready || creating,
+              ...(draft ? { onModelChange } : {}),
+            }}
           />
           {turnActive && sessionId ? (
             <button

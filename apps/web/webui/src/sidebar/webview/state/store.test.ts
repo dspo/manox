@@ -535,9 +535,13 @@ describe('draft thread lifecycle', () => {
 	});
 });
 
-// ── §E.3 conversation-info edge trigger ──────────────────────────────────
+// ── §E.3 conversation-info edge signal + write seam ──────────────────────
+// The store no longer pulls the Q face (that moved to the conversation-info
+// plugin — see `plugins/conversation-info/client.test.ts`). It owns only the
+// durable `committed` edge signal (advanced exactly when the fold can change)
+// and the `setConversationInfo` write seam the plugin parks its payload on.
 
-describe('GetConversationInfo edge trigger', () => {
+describe('conversation-info edge signal (committed) + write seam', () => {
 	const fakeInfo: ConversationInfo = {
 		threadId: SESSION,
 		cursor: 1,
@@ -553,64 +557,38 @@ describe('GetConversationInfo edge trigger', () => {
 		git: null,
 	};
 
-	it('refreshes only on committed-message edges, debounced at 120 ms', async () => {
-		vi.useFakeTimers();
-		try {
-			const pin = new Store();
-			const pinInfo = vi.fn(async () => fakeInfo);
-			const pinOpen = vi.fn();
-			pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null), conversationInfo: pinInfo });
-			pin.openRemote(SESSION);
-			const id = pinOpen.mock.calls[0]![1] as string;
-			const pinItem = (frame: unknown): FromServer =>
-				({ kind: 'streamItem', streamId: id, frame }) as unknown as FromServer;
-			// Snapshot with one committed user message → one edge.
-			pin.dispatch(pinItem(snapshot([userMsg(0, 'a')])));
-			await vi.advanceTimersByTimeAsync(120);
-			expect(pinInfo).toHaveBeenCalledTimes(1);
-			// Non-message rows (deltas) do not re-trigger.
-			pin.dispatch(pinItem({ type: 'entry', seq: 1, event: { type: 'agentTextDelta', s: 'hi' } }));
-			await vi.advanceTimersByTimeAsync(120);
-			expect(pinInfo).toHaveBeenCalledTimes(1);
-			// An assistant message row counts as a commit edge.
-			pin.dispatch(pinItem({ type: 'entry', seq: 2, event: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'yo' }], usage: null, originRpc: null } }));
-			await vi.advanceTimersByTimeAsync(120);
-			expect(pinInfo).toHaveBeenCalledTimes(2);
-			// Two edges inside one debounce window collapse to one call.
-			pin.dispatch(pinItem({ type: 'entry', seq: 3, event: { type: 'message', role: 'user', content: [{ type: 'text', text: 'x' }], usage: null, originRpc: null } }));
-			pin.dispatch(pinItem({ type: 'entry', seq: 4, event: { type: 'message', role: 'user', content: [{ type: 'text', text: 'y' }], usage: null, originRpc: null } }));
-			await vi.advanceTimersByTimeAsync(120);
-			expect(pinInfo).toHaveBeenCalledTimes(3);
-			// The payload lands in thread state.
-			await vi.runAllTimersAsync();
-			expect(pin.get().perThread[SESSION]?.conversationInfo).toBe(fakeInfo);
-		} finally {
-			vi.useRealTimers();
-		}
+	it('committed advances only on durable message rows (the §E.3 refresh edge signal)', () => {
+		const pin = new Store();
+		const pinOpen = vi.fn();
+		pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null) });
+		pin.openRemote(SESSION);
+		const id = pinOpen.mock.calls[0]![1] as string;
+		const pinItem = (frame: unknown): FromServer =>
+			({ kind: 'streamItem', streamId: id, frame }) as unknown as FromServer;
+		expect(pin.get().perThread[SESSION]?.committed).toBe(0);
+		// Snapshot with one committed user message → committed = 1.
+		pin.dispatch(pinItem(snapshot([userMsg(0, 'a')])));
+		expect(pin.get().perThread[SESSION]?.committed).toBe(1);
+		// Non-message rows (deltas) do not advance the edge signal.
+		pin.dispatch(pinItem({ type: 'entry', seq: 1, event: { type: 'agentTextDelta', s: 'hi' } }));
+		expect(pin.get().perThread[SESSION]?.committed).toBe(1);
+		// An assistant message row is a commit.
+		pin.dispatch(pinItem({ type: 'entry', seq: 2, event: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'yo' }], usage: null, originRpc: null } }));
+		expect(pin.get().perThread[SESSION]?.committed).toBe(2);
 	});
 
-	it('a hidden document defers the refresh until it becomes visible', async () => {
-		vi.useFakeTimers();
-		const docHidden = { hidden: true };
-		vi.stubGlobal('document', docHidden);
-		try {
-			const pin = new Store();
-			const pinInfo = vi.fn(async () => fakeInfo);
-			const pinOpen = vi.fn();
-			pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null), conversationInfo: pinInfo });
-			pin.openRemote(SESSION);
-			const id = pinOpen.mock.calls[0]![1] as string;
-			pin.dispatch({ kind: 'streamItem', streamId: id, frame: snapshot([userMsg(0, 'a')]) } as unknown as FromServer);
-			await vi.advanceTimersByTimeAsync(120);
-			expect(pinInfo).not.toHaveBeenCalled();
-			docHidden.hidden = false;
-			pin.flushConversationInfo(SESSION);
-			await vi.advanceTimersByTimeAsync(0);
-			expect(pinInfo).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-			vi.unstubAllGlobals();
-		}
+	it('setConversationInfo parks the plugin payload on the thread state', () => {
+		const pin = new Store();
+		const pinOpen = vi.fn();
+		pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null) });
+		pin.openRemote(SESSION);
+		expect(pin.get().perThread[SESSION]?.conversationInfo).toBeNull();
+		pin.setConversationInfo(SESSION, fakeInfo);
+		expect(pin.get().perThread[SESSION]?.conversationInfo).toBe(fakeInfo);
+		// A repeat write with the same reference is a no-op (no new patch).
+		const before = pin.get();
+		pin.setConversationInfo(SESSION, fakeInfo);
+		expect(pin.get()).toBe(before);
 	});
 });
 
@@ -627,7 +605,6 @@ describe('history paging', () => {
 				records: [entryRow(4, { type: 'message', role: 'user', content: [{ type: 'text', text: 'old' }], usage: null, originRpc: null })] as unknown as WireRecord[],
 				hasMore: false,
 			})),
-			conversationInfo: vi.fn(async () => null),
 		});
 		pin.openRemote(SESSION);
 		const id = pinOpen.mock.calls[0]![1] as string;
