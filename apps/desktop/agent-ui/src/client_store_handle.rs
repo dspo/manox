@@ -59,6 +59,16 @@ impl ClientStoreHandle {
                 }
             }
             FromServer::Response { .. } => {}
+            // T4 envelope compat: the §D.1 stream frames ride the same
+            // envelope; the desktop store consumes the v1 note path until
+            // T6, so an unknown stream frame is logged and dropped —
+            // harmless, per the dual-protocol window (§K.5).
+            FromServer::StreamItem { stream_id, .. } => {
+                tracing::debug!(stream = %stream_id.0, "agent-ui: ignoring StreamItem (T4 envelope, consumed at T6)");
+            }
+            FromServer::StreamEnd { stream_id, reason } => {
+                tracing::debug!(stream = %stream_id.0, ?reason, "agent-ui: ignoring StreamEnd (T4 envelope, consumed at T6)");
+            }
         }
     }
 }

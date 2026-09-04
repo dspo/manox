@@ -1,7 +1,7 @@
 {
-  "createdAt": "2026-09-04T00:00:00Z",
-  "cwd": "/proj",
   "id": "s1",
+  "cwd": "/proj",
+  "parentSession": null,
   "metadata": null,
-  "parentSession": null
+  "createdAt": "2026-09-04T00:00:00Z"
 }

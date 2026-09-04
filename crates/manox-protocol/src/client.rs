@@ -65,6 +65,65 @@ pub enum ClientCall {
         messages: serde_json::Value,
         tools: serde_json::Value,
     },
+    // ── v2 write calls (§D.2, L7: writes answer with receipts only) ───────
+    /// Create a session with intent; the response is `{session_id}` (id on
+    /// an idempotent re-open of an existing session). `initial_model` is a
+    /// canonical [`ModelRef`](crate::journal::ModelRef) (L8); approval mode
+    /// and reasoning effort ride the server's wire vocabularies
+    /// (`read-only`/`workspace-write`/`danger-full-access`,
+    /// `low|medium|high`). Replaces the fire-and-forget
+    /// [`ClientNote::CreateSession`] (kept as a compat entry through the
+    /// migration window, §D.3).
+    CreateSession {
+        cwd: Option<String>,
+        project: Option<String>,
+        initial_model: Option<crate::journal::ModelRef>,
+        approval_mode: Option<String>,
+        reasoning_effort: Option<String>,
+    },
+    /// Submit a user message (starts a turn unless it is a slash command);
+    /// the response is the receipt `{accepted, message_id?}` — the
+    /// transcript itself arrives through the follow stream (L3/L7).
+    /// `origin_rpc` echoes on the durable user-message entry's origin
+    /// field once the kernel carries it (kernel-type change; T4 gap), so
+    /// clients can retire their optimistic echo by correlation. Replaces
+    /// the fire-and-forget [`ClientNote::Submit`] (compat entry kept).
+    Submit {
+        session_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        origin_rpc: Option<String>,
+    },
+    /// Steer a message into the running turn; receipt response
+    /// (`{accepted, message_id?}`). `message_id` identifies the steer
+    /// (echo-retirement and `DropQueued` target); the durable steer entry
+    /// carries it. Replaces [`ClientNote::Steer`] (compat entry kept).
+    Steer {
+        session_id: String,
+        message_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        origin_rpc: Option<String>,
+    },
+    /// Cold page-read of the journal (§D.2): reads straight from the stored
+    /// active chain without activating the engine. `through_seq` is the
+    /// inclusive tail (`-1` = latest); `before_seq` is an exclusive upper
+    /// bound for backwards paging; `max_messages` bounds the page size.
+    /// The response is `{records, has_more, cursor}` — `records` are
+    /// [`JournalWireEntry`](crate::journal::JournalWireEntry) shapes.
+    PageHistory {
+        session_id: String,
+        through_seq: i64,
+        before_seq: Option<i64>,
+        max_messages: Option<u32>,
+    },
+    /// On-demand conversation fold (§E.3, Q face): the server folds the
+    /// journal (turns / messages / per-model usage), cached by
+    /// `(thread_id, cursor)`. The response is the §E.3 payload; fields the
+    /// fold cannot source yet are `null`.
+    GetConversationInfo {
+        session_id: String,
+    },
 }
 
 /// Client → server fire-and-forget commands.
@@ -76,6 +135,11 @@ pub enum ClientCall {
     rename_all_fields = "camelCase"
 )]
 pub enum ClientNote {
+    /// Compat entry (§D.3 dual-protocol window): superseded by
+    /// [`ClientCall::CreateSession`] (§D.2), which carries the session
+    /// intent and answers with the id receipt. The server forwards this
+    /// note internally to the request path; the receipt is discarded.
+    /// Removal is scheduled at T10.
     CreateSession {
         session_id: String,
         cwd: Option<String>,
@@ -86,12 +150,18 @@ pub enum ClientNote {
     DetachSession {
         session_id: String,
     },
+    /// Compat entry (§D.3 window): superseded by [`ClientCall::Submit`]
+    /// (§D.2 receipt + `originRpc` echo retirement). Forwarded internally
+    /// to the request path; removal at T10.
     Submit {
         session_id: String,
         text: String,
         images: Vec<ImageAttachment>,
         client_id: Option<String>,
     },
+    /// Compat entry (§D.3 window): superseded by [`ClientCall::Steer`].
+    /// Forwarded internally (the note's `client_id` becomes the call's
+    /// `message_id`); removal at T10.
     Steer {
         session_id: String,
         client_id: String,

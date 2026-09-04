@@ -9,6 +9,8 @@
 
 pub mod agent_client;
 pub mod agent_server;
+pub mod follow;
+pub mod journal_query;
 pub mod model_chat;
 pub mod translate;
 

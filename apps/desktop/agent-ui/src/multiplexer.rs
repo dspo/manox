@@ -87,6 +87,18 @@ impl SessionMultiplexer {
             FromServer::Notification { note } => note.session_id().map(str::to_string),
             FromServer::Request { call, .. } => Some(call.session_id().to_string()),
             FromServer::Response { .. } => None,
+            // T4 envelope compat: the §D.1 stream frames carry their session
+            // inside the frame payload; the desktop store consumes the v1
+            // note path until T6, so an unknown stream frame is logged and
+            // dropped here (harmless, per the §K.5 dual-protocol window).
+            FromServer::StreamItem { stream_id, .. } => {
+                tracing::debug!(stream = %stream_id.0, "agent-ui: dropping StreamItem (consumed at T6)");
+                return;
+            }
+            FromServer::StreamEnd { stream_id, reason } => {
+                tracing::debug!(stream = %stream_id.0, ?reason, "agent-ui: dropping StreamEnd (consumed at T6)");
+                return;
+            }
         };
         let Some(sid) = sid else { return };
         let Some(handle) = self.sessions.get(&sid).cloned() else {

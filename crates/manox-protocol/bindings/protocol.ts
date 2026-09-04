@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Client → server queries; each expects a [`crate::FromServer::Response`].
  */
-export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, };
+export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, } | { "method": "createSession", cwd: string | null, project: string | null, initialModel: ModelRef | null, approvalMode: string | null, reasoningEffort: string | null, } | { "method": "submit", sessionId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "steer", sessionId: string, messageId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "pageHistory", sessionId: string, throughSeq: bigint, beforeSeq: bigint | null, maxMessages: number | null, } | { "method": "getConversationInfo", sessionId: string, };
 
 /**
  * Client identity + capability declaration carried on connect.
@@ -19,12 +19,12 @@ export type ClientNote = { "method": "createSession", sessionId: string, cwd: st
 /**
  * Client → server message.
  */
-export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, };
+export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "streamOpen", streamId: StreamId, streamKind: StreamKind, } | { "kind": "streamCancel", streamId: StreamId, };
 
 /**
  * Server → client message.
  */
-export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, };
+export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, } | { "kind": "streamItem", streamId: StreamId, frame: StreamFrame, } | { "kind": "streamEnd", streamId: StreamId, reason: StreamEndReason, };
 
 /**
  * Capabilities a client can answer when the server issues a [`super::ServerCall`].

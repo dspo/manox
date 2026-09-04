@@ -1,336 +1,336 @@
 [
   {
-    "content": [
-      {
-        "text": "hello",
-        "type": "text"
-      }
-    ],
-    "id": "e-0",
-    "originRpc": "rpc-1",
-    "parentId": null,
-    "role": "user",
     "seq": 0,
+    "id": "e-0",
+    "parentId": null,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "message",
-    "usage": null
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "hello"
+      }
+    ],
+    "usage": null,
+    "originRpc": "rpc-1"
   },
   {
+    "seq": 1,
+    "id": "e-1",
+    "parentId": "e-0",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "uiNote",
+    "kind": "error",
     "data": {
       "text": "oops"
-    },
-    "id": "e-1",
-    "kind": "error",
-    "parentId": "e-0",
-    "seq": 1,
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "uiNote"
+    }
   },
   {
+    "seq": 2,
     "id": "e-2",
     "parentId": "e-1",
-    "seq": 2,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "turnStart"
   },
   {
-    "cancelled": false,
-    "failed": true,
+    "seq": 3,
     "id": "e-3",
     "parentId": "e-2",
-    "seq": 3,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "turnFinish",
+    "cancelled": false,
+    "failed": true,
     "strandedSteerIds": [
       "st-1"
-    ],
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "turnFinish"
+    ]
   },
   {
+    "seq": 4,
     "id": "e-4",
     "parentId": "e-3",
-    "reason": "user stop",
-    "seq": 4,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "stop"
+    "type": "stop",
+    "reason": "user stop"
   },
   {
-    "attempt": 2,
-    "delaySecs": 3,
-    "id": "e-5",
-    "maxAttempts": 5,
-    "parentId": "e-4",
-    "reason": "overloaded",
     "seq": 5,
+    "id": "e-5",
+    "parentId": "e-4",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "retry"
+    "type": "retry",
+    "attempt": 2,
+    "maxAttempts": 5,
+    "delaySecs": 3,
+    "reason": "overloaded"
   },
   {
-    "id": "e-6",
-    "message": "provider exploded",
-    "parentId": "e-5",
     "seq": 6,
+    "id": "e-6",
+    "parentId": "e-5",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "error"
+    "type": "error",
+    "message": "provider exploded"
   },
   {
+    "seq": 7,
     "id": "e-7",
     "parentId": "e-6",
-    "s": "to",
-    "seq": 7,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "agentTextDelta"
+    "type": "agentTextDelta",
+    "s": "to"
   },
   {
+    "seq": 8,
     "id": "e-8",
     "parentId": "e-7",
-    "s": "k",
-    "seq": 8,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "agentThinkingDelta"
+    "type": "agentThinkingDelta",
+    "s": "k"
   },
   {
-    "callId": "tc-1",
+    "seq": 9,
     "id": "e-9",
+    "parentId": "e-8",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "toolCall",
+    "callId": "tc-1",
+    "name": "Bash",
+    "title": "run ls",
+    "status": "running",
     "input": {
       "command": "ls"
-    },
-    "name": "Bash",
-    "parentId": "e-8",
-    "seq": 9,
-    "status": "running",
-    "timestamp": "2026-09-04T00:00:00Z",
-    "title": "run ls",
-    "type": "toolCall"
+    }
   },
   {
-    "callId": "tc-1",
-    "id": "e-10",
-    "isError": false,
-    "output": "a  b\n",
-    "parentId": "e-9",
     "seq": 10,
+    "id": "e-10",
+    "parentId": "e-9",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "toolResult"
+    "type": "toolResult",
+    "callId": "tc-1",
+    "output": "a  b\n",
+    "isError": false
   },
   {
-    "callId": "tc-1",
-    "chunk": "a",
+    "seq": 11,
     "id": "e-11",
     "parentId": "e-10",
-    "seq": 11,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "toolOutputChunk"
+    "type": "toolOutputChunk",
+    "callId": "tc-1",
+    "chunk": "a"
   },
   {
+    "seq": 12,
+    "id": "e-12",
+    "parentId": "e-11",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "subagentChild",
     "agentId": "sub-1",
     "event": {
       "type": "message"
-    },
-    "id": "e-12",
-    "parentId": "e-11",
-    "seq": 12,
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "subagentChild"
+    }
   },
   {
+    "seq": 13,
+    "id": "e-13",
+    "parentId": "e-12",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "subagentProgress",
     "agentId": "sub-1",
     "agentType": "explore",
-    "id": "e-13",
-    "latestActivity": "reading files",
-    "parentId": "e-12",
-    "seq": 13,
-    "status": "running",
-    "timestamp": "2026-09-04T00:00:00Z",
     "toolUses": 4,
-    "type": "subagentProgress"
+    "latestActivity": "reading files",
+    "status": "running"
   },
   {
-    "from": "anthropic-main/claude-sonnet-4",
+    "seq": 14,
     "id": "e-14",
     "parentId": "e-13",
-    "seq": 14,
     "timestamp": "2026-09-04T00:00:00Z",
-    "to": "DeepSeek-anthropic/deepseek-chat",
-    "type": "modelChange"
+    "type": "modelChange",
+    "from": "anthropic-main/claude-sonnet-4",
+    "to": "DeepSeek-anthropic/deepseek-chat"
   },
   {
+    "seq": 15,
     "id": "e-15",
     "parentId": "e-14",
-    "path": "/new",
-    "seq": 15,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "cwdChange"
+    "type": "cwdChange",
+    "path": "/new"
   },
   {
+    "seq": 16,
     "id": "e-16",
     "parentId": "e-15",
-    "path": "/proj",
-    "seq": 16,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "projectChange"
+    "type": "projectChange",
+    "path": "/proj"
   },
   {
-    "id": "e-17",
-    "mode": "accept-edit",
-    "parentId": "e-16",
     "seq": 17,
+    "id": "e-17",
+    "parentId": "e-16",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "permissionModeChange"
+    "type": "permissionModeChange",
+    "mode": "accept-edit"
   },
   {
-    "effort": "high",
+    "seq": 18,
     "id": "e-18",
     "parentId": "e-17",
-    "seq": 18,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "reasoningEffortChange"
+    "type": "reasoningEffortChange",
+    "effort": "high"
   },
   {
-    "enabled": true,
+    "seq": 19,
     "id": "e-19",
     "parentId": "e-18",
-    "seq": 19,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "planModeChange"
+    "type": "planModeChange",
+    "enabled": true
   },
   {
+    "seq": 20,
     "id": "e-20",
     "parentId": "e-19",
-    "seq": 20,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "planUpdate",
     "snapshot": {
       "body": "# plan"
-    },
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "planUpdate"
+    }
   },
   {
-    "goal": {
-      "budget": 10,
-      "objective": "ship v2"
-    },
+    "seq": 21,
     "id": "e-21",
     "parentId": "e-20",
-    "seq": 21,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "goal"
+    "type": "goal",
+    "goal": {
+      "objective": "ship v2",
+      "budget": 10
+    }
   },
   {
+    "seq": 22,
     "id": "e-22",
     "parentId": "e-21",
-    "seq": 22,
     "timestamp": "2026-09-04T00:00:00Z",
-    "title": "v2 migration",
-    "type": "title"
+    "type": "title",
+    "title": "v2 migration"
   },
   {
+    "seq": 23,
     "id": "e-23",
     "parentId": "e-22",
-    "seq": 23,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "browserSuites",
     "suites": [
       "web_explore"
-    ],
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "browserSuites"
+    ]
   },
   {
+    "seq": 24,
     "id": "e-24",
     "parentId": "e-23",
-    "seq": 24,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "backgroundTask",
     "snapshot": {
       "tasks": []
-    },
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "backgroundTask"
+    }
   },
   {
-    "authId": "auth-1",
-    "id": "e-25",
-    "kind": "request",
-    "parentId": "e-24",
-    "reason": null,
     "seq": 25,
+    "id": "e-25",
+    "parentId": "e-24",
     "timestamp": "2026-09-04T00:00:00Z",
-    "toolCallId": "tc-1",
-    "toolName": "Bash",
     "type": "approval",
-    "verdict": null
+    "kind": "request",
+    "authId": "auth-1",
+    "toolName": "Bash",
+    "toolCallId": "tc-1",
+    "verdict": null,
+    "reason": null
   },
   {
-    "archived": false,
+    "seq": 26,
     "id": "e-26",
     "parentId": "e-25",
-    "pinned": true,
-    "seq": 26,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "pinnedArchived"
+    "type": "pinnedArchived",
+    "pinned": true,
+    "archived": false
   },
   {
-    "firstKeptEntryId": "e-30",
+    "seq": 27,
     "id": "e-27",
-    "messagesCompacted": 12,
     "parentId": "e-26",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "compaction",
+    "summary": "…",
+    "messagesCompacted": 12,
+    "tokensBefore": 40000,
     "retainedTail": [
       {
         "role": "user"
       }
     ],
-    "seq": 27,
-    "summary": "…",
-    "timestamp": "2026-09-04T00:00:00Z",
-    "tokensBefore": 40000,
-    "type": "compaction"
+    "firstKeptEntryId": "e-30"
   },
   {
+    "seq": 28,
     "id": "e-28",
     "parentId": "e-27",
-    "seq": 28,
     "timestamp": "2026-09-04T00:00:00Z",
-    "tokensBefore": 40000,
-    "type": "compactionStarted"
+    "type": "compactionStarted",
+    "tokensBefore": 40000
   },
   {
+    "seq": 29,
     "id": "e-29",
     "parentId": "e-28",
-    "seq": 29,
-    "text": "fork note",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "branchSummary"
+    "type": "branchSummary",
+    "text": "fork note"
   },
   {
-    "id": "e-30",
-    "label": "checkpoint",
-    "parentId": "e-29",
     "seq": 30,
+    "id": "e-30",
+    "parentId": "e-29",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "label"
+    "type": "label",
+    "label": "checkpoint"
   },
   {
-    "data": {
-      "k": "v"
-    },
+    "seq": 31,
     "id": "e-31",
     "parentId": "e-30",
-    "seq": 31,
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "sessionInfo"
+    "type": "sessionInfo",
+    "data": {
+      "k": "v"
+    }
   },
   {
+    "seq": 32,
     "id": "e-32",
     "parentId": "e-31",
-    "seq": 32,
-    "targetId": "e-12",
     "timestamp": "2026-09-04T00:00:00Z",
-    "type": "leaf"
+    "type": "leaf",
+    "targetId": "e-12"
   },
   {
+    "seq": 33,
+    "id": "e-33",
+    "parentId": "e-32",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "metrics",
+    "kind": "cache_invalidation",
     "data": {
       "reprocessedTokens": 12345
-    },
-    "id": "e-33",
-    "kind": "cache_invalidation",
-    "parentId": "e-32",
-    "seq": 33,
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "metrics"
+    }
   }
 ]

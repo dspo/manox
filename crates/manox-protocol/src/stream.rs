@@ -6,12 +6,12 @@
 //!
 //! These are the v2 frame *payload* types. The §D.1 envelope variants that
 //! carry them (`FromClient::StreamOpen/StreamCancel`,
-//! `FromServer::StreamItem/StreamEnd`, `FromServer::Notification { host }`)
-//! cannot extend the live v1 enums without breaking the exhaustive matches in
-//! `manox-session-core` / `agent-ui` (see the T2 delivery report); the T4/T5
-//! envelope migration consumes these types. The backpressure policy below is
-//! the §D.7 strategy expressed over the frame vocabulary, ready for that
-//! wiring.
+//! `FromServer::StreamItem/StreamEnd`) landed with the T4 stream services;
+//! the `FromServer::Notification { host }` re-type onto [`HostEvent`] still
+//! waits on the T5 host-event migration (the live payload is the v1
+//! [`ServerNote`]). The backpressure policy below is the §D.7 strategy
+//! expressed over the frame vocabulary, wired by `manox-session-core`'s
+//! follow stream.
 
 use std::collections::BTreeMap;
 

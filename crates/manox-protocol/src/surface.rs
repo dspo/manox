@@ -130,8 +130,7 @@ pub const FRAMES: &[&str] = &[
 
 /// `ClientCall` wire methods. v2 (§D.2) upgrades `Submit`/`Steer`/
 /// `CreateSession` to request form with `originRpc` + session intent fields
-/// and adds `pageHistory` / `getConversationInfo`; those land with the
-/// envelope migration (see T2 delivery report).
+/// and adds `pageHistory` / `getConversationInfo` (T4 envelope migration).
 pub const CLIENT_CALLS: &[&str] = &[
     "initialize",
     "openSession",
@@ -144,6 +143,12 @@ pub const CLIENT_CALLS: &[&str] = &[
     "terminalAttach",
     "terminalSnapshot",
     "modelChat",
+    // v2 write/read calls (§D.2, T4).
+    "createSession",
+    "submit",
+    "steer",
+    "pageHistory",
+    "getConversationInfo",
 ];
 
 /// `ClientNote` wire methods; the §D.3 keep set (`DetachSession`,
@@ -588,57 +593,48 @@ pub fn snapshot_sample() -> SessionSnapshot {
 
 /// The scripted conversation: a follow request, the snapshot frame, one entry
 /// frame per declared journal event (dense seq), the projections delta, and
-/// the end reason. Drives the T4/T5-extendable coverage harness; on the v1
-/// wire the frames ride as `FromServer::Response` outcome payloads because
-/// the envelope cannot yet carry `StreamItem` (stop-rule notes, T2 report).
+/// the end reason — all on the real §D.1 envelope (`FromServer::StreamItem` /
+/// `StreamEnd`, added by T4). The coverage harness walks it exactly as a
+/// client would consume a live follow stream.
 pub fn scripted_session() -> Vec<FromServer> {
+    use crate::journal::StreamId;
+    let stream_1 = StreamId::new("stream-1");
     let mut out = Vec::new();
-    for (seq, frame) in frame_samples().into_iter().enumerate() {
-        let payload = serde_json::json!({
-            "streamId": "stream-1",
-            "frame": frame,
-        });
-        out.push(FromServer::Response {
-            id: MsgId::new(format!("stream-item-{seq}")),
-            outcome: Ok(payload),
+    for frame in frame_samples() {
+        out.push(FromServer::StreamItem {
+            stream_id: stream_1.clone(),
+            frame,
         });
     }
     // Then every journal entry, one frame each, dense continuing seq.
     for (i, event) in journal_samples().into_iter().enumerate() {
-        let payload = serde_json::json!({
-            "streamId": "stream-1",
-            "frame": StreamFrame::Entry {
+        out.push(FromServer::StreamItem {
+            stream_id: stream_1.clone(),
+            frame: StreamFrame::Entry {
                 seq: (10 + i) as u64,
                 event,
             },
         });
-        out.push(FromServer::Response {
-            id: MsgId::new(format!("journal-{i}")),
-            outcome: Ok(payload),
-        });
     }
-    // Stream lifecycle endings (§D.1 StreamEnd analogue) — one per declared
-    // reason, each on its own stream id so the emit-coverage walk sees every
+    // Stream lifecycle endings (§D.1 StreamEnd) — one per declared reason,
+    // each on its own stream id so the emit-coverage walk sees every
     // `FRAMES` tail name in a single scripted session.
     let endings = [
-        ("stream-1", StreamEndReason::Closed),
-        ("stream-2", StreamEndReason::Cancelled),
-        ("stream-3", StreamEndReason::Resync),
+        (stream_1, StreamEndReason::Closed),
+        (StreamId::new("stream-2"), StreamEndReason::Cancelled),
+        (StreamId::new("stream-3"), StreamEndReason::Resync),
         (
-            "stream-4",
+            StreamId::new("stream-4"),
             StreamEndReason::Failure {
                 code: "gateway/internal".into(),
                 message: "scripted failure".into(),
             },
         ),
     ];
-    for (i, (stream, reason)) in endings.into_iter().enumerate() {
-        out.push(FromServer::Response {
-            id: MsgId::new(format!("stream-end-{i}")),
-            outcome: Ok(serde_json::json!({
-                "streamId": stream,
-                "reason": reason,
-            })),
+    for (stream, reason) in endings {
+        out.push(FromServer::StreamEnd {
+            stream_id: stream,
+            reason,
         });
     }
     out
@@ -658,14 +654,12 @@ pub fn scripted_host_events() -> Vec<FromServer> {
         .collect()
 }
 
-/// The scripted `FromClient` opening: the follow request as a v1 `Request`
-/// envelope carrying a `StreamKind` payload (§D.1 `StreamOpen` analogue).
+/// The scripted `FromClient` opening: the real §D.1 `StreamOpen` envelope
+/// carrying a `FollowSession` kind (T4).
 pub fn scripted_stream_open() -> FromClient {
-    FromClient::Request {
-        id: MsgId::new("open-1"),
-        call: crate::client::ClientCall::OpenSession {
-            session_id: "s1".into(),
-        },
+    FromClient::StreamOpen {
+        stream_id: crate::journal::StreamId::new("stream-1"),
+        stream_kind: stream_kind_follow("s1"),
     }
 }
 
