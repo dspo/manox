@@ -10,7 +10,7 @@ import { Loader2, RotateCw, Send, Trash2 } from 'lucide-react';
 import { memo } from 'react';
 
 import type { ApprovalMode } from '../../../../protocol';
-import { ThreadApi } from '../../api/client';
+import { ThreadApi, mintRpcId } from '../../api/client';
 import { t } from '../../lib/i18n';
 import { cn } from '../../lib/utils';
 import { store } from '../../state/bridge';
@@ -57,8 +57,11 @@ export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageP
       <button
         className={actionClass}
         onClick={() => {
-          store.markSteerPending(sessionId, item.clientId!);
-          new ThreadApi(sessionId).steer(item.clientId!, item.text);
+          // §T7.3: the steer rides the echo's originRpc (the durable
+          // entry's retirement key); the chip state is local.
+          const originRpc = item.originRpc ?? mintRpcId();
+          store.markSteerPending(sessionId, originRpc);
+          void new ThreadApi(sessionId).steer(originRpc, item.text);
         }}
         title={t('steer_now')}
         type="button"
@@ -69,8 +72,9 @@ export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageP
       <button
         className={actionClass}
         onClick={() => {
-          new ThreadApi(sessionId).dropQueued(item.clientId!);
-          store.removeUser(sessionId, item.clientId!);
+          // v2 has no `DropQueued` command (§D.3); removing the local echo
+          // drops the optimistic bubble.
+          store.removeUser(sessionId, item.originRpc ?? item.id);
         }}
         title={t('drop_queued')}
         type="button"
@@ -83,8 +87,11 @@ export const UserMessage = memo(({ item, approvalMode, sessionId }: UserMessageP
     <button
       className={actionClass}
       onClick={() => {
-        new ThreadApi(sessionId).submit(item.text);
-        store.removeUser(sessionId, item.clientId!);
+        const originRpc = mintRpcId();
+        // Re-submit the stranded steer's text as a plain message.
+        store.echoUser(sessionId, item.text, item.images, { originRpc });
+        void new ThreadApi(sessionId).submit(item.text, undefined, originRpc);
+        store.removeUser(sessionId, item.originRpc ?? item.id);
       }}
       title={t('steer_retry')}
       type="button"

@@ -3,9 +3,9 @@
 // which view is shown, so switching never interrupts or loses a running
 // turn.
 
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 
-import { api, ThreadApi } from './api/client';
+import { api } from './api/client';
 import { ConversationView } from './components/conversation-view';
 import { ThreadsView } from './components/threads-view';
 import { useChatState } from './state/bridge';
@@ -13,8 +13,6 @@ import { useChatState } from './state/bridge';
 export const App = () => {
   const state = useChatState();
   const thread = state.activeThreadId ? (state.perThread[state.activeThreadId] ?? null) : null;
-  const turnActive = thread?.turnActive ?? false;
-  const prevTurnActive = useRef(false);
 
   // Global registries (models, threads, slash entries) load once on mount;
   // the host pushes updates afterwards.
@@ -24,16 +22,9 @@ export const App = () => {
     api.listCommands();
   }, []);
 
-  // The active turn flag's falling edge refreshes usage and the info
-  // snapshot (spend tree, git stats) for the finished turn.
-  useEffect(() => {
-    if (prevTurnActive.current && !turnActive && thread) {
-      const threadApi = new ThreadApi(thread.sessionId);
-      threadApi.requestUsage();
-      threadApi.requestThreadInfo();
-    }
-    prevTurnActive.current = turnActive;
-  }, [turnActive, thread]);
+  // Spend/context (§E.3) is store-driven (committed-message edge → debounced
+  // `GetConversationInfo`); the old turn-falling-edge usage refresh is a
+  // §D.6 dead path and no longer lives here.
 
   if (state.view === 'conversation' && thread) {
     return (

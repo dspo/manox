@@ -144,6 +144,59 @@ export interface GitStats {
 	untracked: number;
 }
 
+// ── §E.3 Q-face: the `GetConversationInfo` response payload ────────────────
+// The server-side journal fold (conversation-info plugin mode) replaces the
+// doomed GetUsage / UsageSnapshot / ThreadInfo request-note path. Field
+// names mirror the Rust `fold_conversation_info` json keys (camelCase).
+
+/** One per-model aggregate row of the §E.3 fold (`models[]`).
+ * `contextWindow` / `hitRate` / `pct` are token-meter semantics the server
+ * fills in from the provider registry; `null` while unavailable. */
+export interface ConversationModelRow {
+	provider: string;
+	/** Canonical wire identity (L8): `{provider}/{model}`. */
+	model: string;
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	reasoning: number;
+	calls: number;
+	/** Last request's full context numerator. */
+	lastTotal: number;
+	contextWindow: number | null;
+	hitRate: number | null;
+	pct: number | null;
+}
+
+/** Working-tree stats inside the §E.3 fold (`git`; null placeholder until
+ * the host lookup lands). */
+export interface ConversationGit {
+	branch: string;
+	ahead: number;
+	behind: number;
+	dirty: number;
+}
+
+/** The §E.3 `GetConversationInfo` response (on-demand fold, cached by
+ * `(thread_id, cursor)` server-side; the client refreshes on committed-message
+ * edges only). */
+export interface ConversationInfo {
+	threadId: string;
+	cursor: number;
+	title: string | null;
+	cwd: string | null;
+	project: string | null;
+	/** Canonical `{provider}/{model}` display ref. */
+	model: string | null;
+	contextWindow: number | null;
+	turns: number;
+	messages: number;
+	models: ConversationModelRow[];
+	cumulativeCost: number;
+	git: ConversationGit | null;
+}
+
 /** Conversation info panel snapshot — a client-side composite assembled from
  * the split `ThreadInfo` + `UsageSnapshot` + `PlanUpdated` + `GoalChanged` +
  * `GitStats` + `Subagent*` notes (the legacy `thread_info` event carried one

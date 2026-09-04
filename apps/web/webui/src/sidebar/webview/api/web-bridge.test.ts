@@ -123,3 +123,112 @@ describe('createWebBridge', () => {
     expect(listener).toHaveBeenCalledWith({ kind: 'notification', note: { method: 'ready' } });
   });
 });
+
+// ── T7 additions: frame guards, receipts, persisted client_id, generations ─
+
+describe('createWebBridge (v2 frame routing)', () => {
+	/** A storage-backed sessionStorage stand-in. */
+	function stubSessionStorage(): Map<string, string> {
+		const map = new Map<string, string>();
+		vi.stubGlobal('sessionStorage', {
+			getItem: (k: string) => map.get(k) ?? null,
+			setItem: (k: string, v: string) => map.set(k, v),
+		} as unknown as Storage);
+		return map;
+	}
+
+	const initOk = {
+		kind: 'response',
+		id: 'init-1',
+		outcome: { Ok: { ack: true } },
+	};
+
+	it('forwards Response frames to listeners (receipts are no longer dropped)', () => {
+		stubSessionStorage();
+		const bridge = createWebBridge();
+		const listener = vi.fn();
+		bridge.onMessage(listener);
+		MockWebSocket.instances[0].receive(initOk);
+		expect(listener).toHaveBeenCalledWith(expect.objectContaining({ kind: 'response' }));
+	});
+
+	it('drops unknown envelope kinds, malformed stream frames, and unknown host tags', () => {
+		stubSessionStorage();
+		const bridge = createWebBridge();
+		const listener = vi.fn();
+		bridge.onMessage(listener);
+		MockWebSocket.instances[0].receive({ kind: 'what-is-this' });
+		MockWebSocket.instances[0].receive({
+			kind: 'streamItem',
+			streamId: 's',
+			frame: { type: 'entry', seq: 1, event: { type: 'turnStart' }, extraKey: true },
+		});
+		MockWebSocket.instances[0].receive({ kind: 'host', host: { type: 'notAHostTag' } });
+		expect(listener).not.toHaveBeenCalled();
+	});
+
+	it('forwards valid stream + host frames with guarded payloads', () => {
+		stubSessionStorage();
+		const bridge = createWebBridge();
+		const listener = vi.fn();
+		bridge.onMessage(listener);
+		MockWebSocket.instances[0].receive({
+			kind: 'streamItem',
+			streamId: 's1',
+			frame: { type: 'entry', seq: 1, event: { type: 'turnStart' } },
+		});
+		MockWebSocket.instances[0].receive({
+			kind: 'host',
+			host: {
+				type: 'sessionStatus',
+				sessionId: 's1',
+				running: true,
+				errored: null,
+				unread: null,
+				pendingAuth: null,
+				pendingPlan: null,
+				backgroundWork: null,
+			},
+		});
+		expect(listener).toHaveBeenCalledTimes(2);
+	});
+
+	it('mints a stable client_id in sessionStorage and reuses it across reconnects', () => {
+		const store = stubSessionStorage();
+		const bridge = createWebBridge();
+		bridge.onMessage(() => undefined);
+		const first = MockWebSocket.instances[0];
+		first.open();
+		const init = JSON.parse(first.sent[0]) as FromClient;
+		const clientId = (init as { call: { clientId: string } }).call.clientId;
+		expect(clientId).toMatch(/^webui-/);
+		expect(store.get('manox.webui.client-id')).toBe(clientId);
+		first.drop();
+		vi.advanceTimersByTime(500);
+		const second = MockWebSocket.instances[1];
+		second.open();
+		const init2 = JSON.parse(second.sent[0]) as FromClient;
+		expect((init2 as { call: { clientId: string } }).call.clientId).toBe(clientId);
+	});
+
+	it('fires onConnection once per generation (init ack), onDisconnect on drop', () => {
+		stubSessionStorage();
+		const bridge = createWebBridge();
+		const on = vi.fn();
+		const off = vi.fn();
+		bridge.onConnection?.(on, off);
+		const first = MockWebSocket.instances[0];
+		first.open();
+		// Ack before Ready.
+		first.receive(initOk);
+		expect(on).toHaveBeenCalledTimes(1);
+		first.drop();
+		expect(off).toHaveBeenCalledTimes(1);
+		vi.advanceTimersByTime(500);
+		const second = MockWebSocket.instances[1];
+		second.open();
+		// The v1 `ready` note also marks the generation established.
+		second.receive({ kind: 'notification', note: { method: 'ready' } });
+		expect(on).toHaveBeenCalledTimes(2);
+	});
+});

@@ -1,537 +1,643 @@
-// Store behaviour: per-thread ServerNote folding, tool-card folding, restored
-// history mapping, and the view/thread bookkeeping around them. The store is
-// driven by `FromServer` push delivery — `Response` frames are dropped by the
-// bridge before dispatch, so only `Notification` / `Request` (ServerCall)
-// frames reach the fold.
+// Store v2 behaviour tests (T7). The store is driven purely by `dispatch`
+// of v2 `FromServer` frames — no timers, no transport. Fixtures from
+// `crates/manox-protocol/fixtures/` exercise the guards + fold path; the
+// hand-built sequences exercise engine/echo/projection/host semantics.
 
 import { describe, expect, it, vi } from 'vitest';
 
-import type {
-	FromServer,
-	ServerCall,
-	ServerNote,
-	ThreadListItem,
-	WireMessage,
-} from '../../../protocol';
-import { Store, wireMessagesToTranscriptItems } from './store';
-import { foldToolStatus, userTurnHeader } from './transcript';
+import type { FromServer } from '../../../protocol';
+import snapshotFrame from '../../../../../../../crates/manox-protocol/fixtures/frames-snapshot.json';
+import journalEntries from '../../../../../../../crates/manox-protocol/fixtures/journal-entries.json';
+import hostEvents from '../../../../../../../crates/manox-protocol/fixtures/host-events.json';
+import { Store, type JournalPageData, type StoreEffects } from './store';
+import type { ConversationInfo } from '../../../protocol';
+import type { WireRecord } from './entries';
+import type { TranscriptItem } from './transcript';
 
-/** Wrap a ServerNote as a `FromServer` notification. */
-const note = (n: ServerNote): FromServer => ({ kind: 'notification', note: n });
+const SESSION = 's1';
 
-/** Wrap a ServerCall as a `FromServer` request. */
-const callReq = (id: string, c: ServerCall): FromServer => ({ kind: 'request', id, call: c });
-
-const listItem = (partial: Partial<ThreadListItem> & { id: string }): ThreadListItem => ({
-	title: 't',
-	updated_at: 1,
-	running: false,
-	unread: false,
-	errored: false,
-	pending_auth: false,
-	pending_plan: false,
-	background_work: false,
-	model_id: 'm',
-	pinned: false,
-	archived: false,
-	parent_id: null,
-	depth: 0,
-	...partial,
+/** A snapshot frame carrying `records` (dense 0-based) — the wire `cursor`
+ * is the entry count (§D.1), which the store translates to the engine's
+ * inclusive tail. */
+const snapshot = (records: unknown[], extra: Record<string, unknown> = {}) => ({
+	type: 'snapshot',
+	sessionId: SESSION,
+	header: { id: SESSION, cwd: '/proj', parentSession: null, metadata: null, createdAt: '' },
+	cursor: records.length === 0 ? 0 : (records[records.length - 1] as { seq: number }).seq + 1,
+	records,
+	hasMore: false,
+	projections: {},
+	projectionsAsOfSeq: 0,
+	...extra,
 });
 
-/** A fresh session: the store switches view on `SessionCreated`. */
-const startSession = (sessionId = 's'): Store => {
+const host = (event: unknown): FromServer => ({ kind: 'host', host: event }) as FromServer;
+
+const note = (n: Record<string, unknown>): FromServer =>
+	({ kind: 'notification', note: n }) as unknown as FromServer;
+
+const callReq = (id: string, c: Record<string, unknown>): FromServer =>
+	({ kind: 'request', id, call: c }) as unknown as FromServer;
+
+/** A store with a pre-opened follow stream (the effect allocates the id). */
+function openStore(): {
+	store: Store;
+	effects: ReturnType<typeof spyEffects>;
+	/** Wrap a frame as a `StreamItem` on the session's stream. */
+	item(frame: unknown): FromServer;
+	/** Wrap a reason as a `StreamEnd` on the session's stream. */
+	end(reason: unknown): FromServer;
+} {
 	const store = new Store();
-	store.dispatch(note({ method: 'sessionCreated', sessionId }));
-	return store;
-};
+	const effects = spyEffects();
+	store.attachEffects(effects);
+	store.openRemote(SESSION);
+	expect(effects.openStream).toHaveBeenCalledWith(SESSION, expect.any(String));
+	const streamId = effects.openStream.mock.calls[0]![1] as string;
+	return {
+		store,
+		effects,
+		item: (frame: unknown) => ({ kind: 'streamItem', streamId, frame }) as unknown as FromServer,
+		end: (reason: unknown) => ({ kind: 'streamEnd', streamId, reason }) as unknown as FromServer,
+	};
+}
 
-/** A restored session: open then replay history with `restored: true`. */
-const restoreSession = (sessionId = 's', messages: WireMessage[] = []): Store => {
-	const store = new Store();
-	store.openRemote(sessionId);
-	store.dispatch(
+function spyEffects() {
+	return {
+		openStream: vi.fn(),
+		pageHistory: vi.fn(async (): Promise<JournalPageData | null> => null),
+		conversationInfo: vi.fn(async (): Promise<ConversationInfo | null> => null),
+	};
+}
+
+const items = (store: Store): TranscriptItem[] => store.get().perThread[SESSION]?.items ?? [];
+
+const thread = (store: Store) => store.get().perThread[SESSION];
+
+/** Minimal §C.1 envelope row. */
+const entryRow = (seq: number, event: Record<string, unknown>): Record<string, unknown> => ({
+	seq,
+	id: `e-${seq}`,
+	parentId: seq === 0 ? null : `e-${seq - 1}`,
+	timestamp: '2026-09-04T00:00:00Z',
+	...event,
+});
+
+const userMsg = (seq: number, text: string, originRpc: string | null = null) =>
+	entryRow(seq, { type: 'message', role: 'user', content: [{ type: 'text', text }], usage: null, originRpc });
+
+const assistantMsg = (seq: number, text: string) =>
+	entryRow(seq, {
+		type: 'message',
+		role: 'assistant',
+		content: [{ type: 'text', text }],
+		usage: { input: 5, output: 2, cacheRead: 0, cacheWrite: 0, reasoning: 0 },
+		originRpc: null,
+	});
+
+// ── snapshot / entry folding ──────────────────────────────────────────────
+
+describe('snapshot → entries → projections fold', () => {
+	it('a fixture snapshot seeds the window, projections and ready flag', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		const t = thread(store);
+		expect(t?.ready).toBe(true);
+		expect(t?.loading).toBe(false);
+		expect(t?.cwd).toBe('/proj');
+		// The single user message row folded into a `user` item.
+		expect(t?.items).toHaveLength(1);
+		expect(t?.items[0]?.kind).toBe('user');
+		expect((t?.items[0] as { text: string }).text).toBe('hello');
+	});
+
+	it('live entry frames fold into items in order', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hello')])));
+		store.dispatch(item({ type: 'entry', seq: 1, event: { type: 'turnStart' } }));
+		store.dispatch(item({ type: 'entry', seq: 2, event: { type: 'agentTextDelta', s: 'hi' } }));
+		store.dispatch(item({ type: 'entry', seq: 3, event: { type: 'agentTextDelta', s: '! there' } }));
+		const t = thread(store);
+		const assistant = t?.items.filter((i) => i.kind === 'assistant');
+		expect(assistant).toHaveLength(1);
+		expect((assistant[0] as { text: string }).text).toBe('hi! there');
+	});
+
+	it('the durable assistant row finalizes the streamed draft (no duplicate)', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hi')])));
+		store.dispatch(item({ type: 'entry', seq: 1, event: { type: 'agentTextDelta', s: 'hel' } }));
+		store.dispatch(item({ type: 'entry', seq: 2, event: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'hello world' }], usage: null, originRpc: null } }));
+		const t = thread(store);
+		const assistant = t?.items.filter((i) => i.kind === 'assistant');
+		expect(assistant).toHaveLength(1);
+		expect((assistant[0] as { text: string }).text).toBe('hello world');
+	});
+
+	it('projection frames update typed fields with higher-seq-wins', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		store.dispatch(
+			item({
+				type: 'projections',
+				sessionId: SESSION,
+				asOfSeq: 3,
+				values: { title: 'v2 migration', running: true },
+			}),
+		);
+		expect(thread(store)?.title).toBe('v2 migration');
+		expect(thread(store)?.turnActive).toBe(true);
+		// A stale (lower seq) frame must not regress the value.
+		store.dispatch(
+			item({
+				type: 'projections',
+				sessionId: SESSION,
+				asOfSeq: 2,
+				values: { title: 'stale' },
+			}),
+		);
+		expect(thread(store)?.title).toBe('v2 migration');
+	});
+
+	it('the model projection maps to a canonical display ref', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		store.dispatch(
+			item({
+				type: 'projections',
+				sessionId: SESSION,
+				asOfSeq: 4,
+				values: { model: { provider: 'DeepSeek-anthropic', modelId: 'deepseek-chat' } },
+			}),
+		);
+		expect(thread(store)?.modelRef).toBe('DeepSeek-anthropic/deepseek-chat');
+	});
+
+	it('permission_mode snake_case projection normalizes to the client union', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		store.dispatch(
+			item({
+				type: 'projections',
+				sessionId: SESSION,
+				asOfSeq: 5,
+				values: { permission_mode: 'danger_full_access' },
+			}),
+		);
+		expect(thread(store)?.approvalMode).toBe('danger-full-access');
+	});
+
+	it('the running projection falling edge records the turn duration', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		store.dispatch(
+			item({ type: 'projections', sessionId: SESSION, asOfSeq: 6, values: { running: true } }),
+		);
+		expect(thread(store)?.turnActive).toBe(true);
+		store.dispatch(
+			item({ type: 'projections', sessionId: SESSION, asOfSeq: 7, values: { running: false } }),
+		);
+		expect(thread(store)?.turnActive).toBe(false);
+		expect(thread(store)?.lastTurnDurationSec).toBeTypeOf('number');
+	});
+});
+
+// ── echo retirement ───────────────────────────────────────────────────────
+
+describe('optimistic echo retirement', () => {
+	it('an echo is retired when the durable user entry carries its originRpc', () => {
+		const { store, item } = openStore();
+		// No snapshot yet: echo stands alone.
+		store.echoUser(SESSION, 'ping', undefined, { originRpc: 'rpc-42' });
+		expect(items(store)).toHaveLength(1);
+		expect((items(store)[0] as { id: string }).id).toMatch(/^echo-/);
+		// Durable row with matching origin arrives on the snapshot.
+		store.dispatch(item(snapshot([userMsg(0, 'ping', 'rpc-42')])));
+		// The durable entry replaced the echo (exactly one user item).
+		const userItems = items(store).filter((i) => i.kind === 'user');
+		expect(userItems).toHaveLength(1);
+		expect((userItems[0] as { id: string }).id).toBe('e-0');
+	});
+
+	it('an echo whose origin never arrives is not retired', () => {
+		const { store, item } = openStore();
+		store.echoUser(SESSION, 'hi', undefined, { originRpc: 'rpc-99' });
+		store.dispatch(item(snapshot([userMsg(0, 'hi', 'other-rpc')])));
+		// Both survive: the durable entry + the unretired echo.
+		expect(items(store).filter((i) => i.kind === 'user')).toHaveLength(2);
+	});
+
+	it('a live entry frame retires the echo too', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'first')])));
+		store.echoUser(SESSION, 'later', undefined, { originRpc: 'rpc-2' });
+		expect(items(store).filter((i) => i.kind === 'user')).toHaveLength(2);
+		store.dispatch(item({ type: 'entry', seq: 1, event: { type: 'message', role: 'user', content: [{ type: 'text', text: 'later' }], usage: null, originRpc: 'rpc-2' } }));
+		const userItems = items(store).filter((i) => i.kind === 'user');
+		expect(userItems).toHaveLength(2); // durable first + durable later
+		expect((userItems[0] as { id: string }).id).toBe('e-0');
+		expect((userItems[1] as { id: string }).id).toBe('e-1');
+	});
+});
+
+// ── resync / reconnect ────────────────────────────────────────────────────
+
+describe('resync and reseat', () => {
+	it('StreamEnd{resync} re-issues a follow stream (seamless resume)', () => {
+		const { store, effects, item, end } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hello')])));
+		const first = effects.openStream.mock.calls[0]![1] as string;
+		effects.openStream.mockClear();
+		store.dispatch(end({ type: 'resync' }));
+		// A new follow request is issued on the same stream id (reseat).
+		expect(effects.openStream).toHaveBeenCalledWith(SESSION, first);
+		// The next snapshot resumes at the same tail — seamless.
+		store.dispatch(item(snapshot([userMsg(0, 'hello')])));
+		expect(thread(store)?.ready).toBe(true);
+	});
+
+	it('a snapshot behind the last applied tail is a violation → re-follow', () => {
+		const { store, effects, item, end } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'a'), userMsg(1, 'b')]))); // tail 1
+		effects.openStream.mockClear();
+		store.dispatch(end({ type: 'resync' })); // restart
+		const before = effects.openStream.mock.calls.length;
+		store.dispatch(item(snapshot([userMsg(0, 'a')]))); // resume at tail 0 < 1
+		// The engine rejected the behind resume; the store re-followed.
+		expect(effects.openStream.mock.calls.length).toBeGreaterThan(before);
+	});
+
+	it('an entry beyond the window opens a gap and re-follows (L5)', () => {
+		const { store, effects, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hello')]))); // tail 0
+		const before = effects.openStream.mock.calls.length;
+		store.dispatch(item({ type: 'entry', seq: 5, event: { type: 'turnStart' } }));
+		// Gap repair reads nothing (async PageHistory is not the engine's
+		// sync source) → violation → resync.
+		expect(effects.openStream.mock.calls.length).toBeGreaterThan(before);
+	});
+
+	it('reseat rotates a fresh stream id and re-follows each live session', () => {
+		const { store, effects, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hello')])));
+		const first = effects.openStream.mock.calls[0]![1] as string;
+		effects.openStream.mockClear();
+		store.reseat();
+		// A new connection generation gets a NEW stream id (so a stale
+		// Closed/snapshot from the old generation cannot collide, §D.1).
+		expect(effects.openStream).toHaveBeenCalledWith(SESSION, expect.any(String));
+		const next = effects.openStream.mock.calls[0]![1] as string;
+		expect(next).not.toBe(first);
+		// The old window stays published until the new snapshot lands.
+		expect(thread(store)?.items.some((i) => i.kind === 'user')).toBe(true);
+		// The resume snapshot on the new id lands seamlessly (tail 0 >= 0).
+		store.dispatch({ kind: 'streamItem', streamId: next, frame: snapshot([userMsg(0, 'hello')]) } as unknown as FromServer);
+		expect(thread(store)?.ready).toBe(true);
+	});
+});
+
+// ── SessionStatus monotonic mirror ────────────────────────────────────────
+
+describe('Host SessionStatus mirror', () => {
+	const rowOf = (running = false, errored = false): FromServer =>
 		note({
-			method: 'sessionCreated',
-			sessionId,
-		}),
-	);
-	store.dispatch(
-		note({
-			method: 'threadHistory',
-			sessionId,
-			messages,
-			displayHistory: [],
-			autoApprovedTools: null,
-			restored: true,
-			loading: false,
-		}),
-	);
-	return store;
-};
-
-const thread = (store: Store, id = 's') => store.get().perThread[id];
-
-const toolCard = (store: Store, id: string, sessionId = 's') => {
-	const item = thread(store, sessionId)?.items.find((i) => i.kind === 'tool' && i.id === id);
-	return item && item.kind === 'tool' ? item.tool : undefined;
-};
-
-describe('foldToolStatus', () => {
-	it('folds terminal wire statuses into UI semantics', () => {
-		expect(foldToolStatus('success')).toBe('completed');
-		expect(foldToolStatus('error')).toBe('failed');
-		expect(foldToolStatus('denied')).toBe('denied');
-		expect(foldToolStatus('cancelled')).toBe('cancelled');
-	});
-	it('passes authorization and progress statuses through', () => {
-		expect(foldToolStatus('pending-approval')).toBe('pending-approval');
-		expect(foldToolStatus('running')).toBe('running');
-	});
-	it('treats unknown statuses as running', () => {
-		expect(foldToolStatus('weird')).toBe('running');
-	});
-});
-
-describe('thread routing', () => {
-	it('SessionCreated opens the conversation view with a fresh thread state', () => {
-		const store = startSession('s');
-		expect(store.get().view).toBe('conversation');
-		expect(store.get().activeThreadId).toBe('s');
-		expect(thread(store, 's')).toBeTruthy();
-	});
-	it('a restored session starts in the loading state via openRemote', () => {
-		const store = new Store();
-		store.openRemote('s');
-		expect(thread(store, 's').loading).toBe(true);
-		store.dispatch(
-			note({
-				method: 'threadHistory',
-				sessionId: 's',
-				messages: [],
-				displayHistory: [],
-				autoApprovedTools: null,
-				restored: true,
-				loading: false,
-			}),
-		);
-		expect(thread(store, 's').loading).toBe(false);
-	});
-	it('routes events to their own thread only', () => {
-		const store = startSession('a');
-		store.dispatch(note({ method: 'sessionCreated', sessionId: 'b' }));
-		store.dispatch(note({ method: 'agentText', sessionId: 'a', text: 'hi' }));
-		expect(thread(store, 'a').items).toHaveLength(1);
-		expect(thread(store, 'b').items).toHaveLength(0);
-	});
-	it('sessionDisposed drops the thread and falls back to the list', () => {
-		const store = startSession('s');
-		store.dispatch(note({ method: 'sessionDisposed', sessionId: 's' }));
-		expect(store.get().perThread['s']).toBeUndefined();
-		expect(store.get().view).toBe('threads');
-	});
-	it('openLocal and backToList switch views without touching thread state', () => {
-		const store = startSession('s');
-		store.backToList();
-		expect(store.get().view).toBe('threads');
-		store.openLocal('s');
-		expect(store.get().view).toBe('conversation');
-	});
-});
-
-describe('home-composer drafts', () => {
-	it('draftThread opens the conversation view with the echoed first message', () => {
-		const store = new Store();
-		store.draftThread('d1', 'hello');
-		expect(store.get().view).toBe('conversation');
-		expect(store.isCreating('d1')).toBe(true);
-		expect(thread(store, 'd1').items[0]).toMatchObject({ kind: 'user', text: 'hello' });
-	});
-	it('SessionCreated clears the draft guard and keeps the echoed items', () => {
-		const store = new Store();
-		store.draftThread('d1', 'hello');
-		store.dispatch(note({ method: 'sessionCreated', sessionId: 'd1' }));
-		expect(store.isCreating('d1')).toBe(false);
-		expect(thread(store, 'd1').items).toHaveLength(1);
-	});
-	it('a global error during a pending draft releases the guard and returns to the list', () => {
-		const store = new Store();
-		store.draftThread('d1', 'hello');
-		store.dispatch(note({ method: 'error', sessionId: null, message: 'boom' }));
-		expect(store.isCreating('d1')).toBe(false);
-		expect(store.get().view).toBe('threads');
-		expect(store.get().perThread['d1']).toBeUndefined();
-	});
-	it('a global error without a pending draft leaves the view alone', () => {
-		const store = startSession('s');
-		store.dispatch(note({ method: 'error', sessionId: null, message: 'boom' }));
-		expect(store.get().view).toBe('conversation');
-	});
-});
-
-describe('transcript folding', () => {
-	it('streams text into the trailing item of the same kind', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'agentText', sessionId: 's', text: 'hel' }));
-		store.dispatch(note({ method: 'agentText', sessionId: 's', text: 'lo' }));
-		expect(thread(store).items).toHaveLength(1);
-		expect(thread(store).items[0]).toMatchObject({ kind: 'assistant', text: 'hello' });
-	});
-	it('stamps assistant items with the model the turn started with', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'currentModel', sessionId: 's', id: 'gpt-5', name: null }));
-		store.dispatch(note({ method: 'turnStarted', sessionId: 's' }));
-		store.dispatch(note({ method: 'agentText', sessionId: 's', text: 'hi' }));
-		expect(thread(store).items[0]).toMatchObject({ modelId: 'gpt-5' });
-	});
-	it('inserts tool cards with folded wire status', () => {
-		const store = startSession();
-		store.dispatch(
-			note({
-				method: 'toolCall',
-				sessionId: 's',
-				id: 't1',
-				name: 'Bash',
-				title: 'Bash',
-				status: 'running',
-				input: null,
-			}),
-		);
-		expect(toolCard(store, 't1')?.status).toBe('running');
-		store.dispatch(
-			note({
-				method: 'toolCall',
-				sessionId: 's',
-				id: 't1',
-				name: 'Bash',
-				title: 'Bash',
-				status: 'success',
-				input: null,
-			}),
-		);
-		expect(toolCard(store, 't1')?.status).toBe('completed');
-	});
-	it('records live output and the final result', () => {
-		const store = startSession();
-		store.dispatch(
-			note({ method: 'toolOutput', sessionId: 's', id: 't1', chunk: 'out-' }),
-		);
-		store.dispatch(note({ method: 'toolOutput', sessionId: 's', id: 't1', chunk: 'put' }));
-		store.dispatch(
-			note({ method: 'toolResult', sessionId: 's', id: 't1', output: 'output', isError: false }),
-		);
-		expect(toolCard(store, 't1')?.output).toBe('output');
-		expect(toolCard(store, 't1')?.status).toBe('completed');
-	});
-	it('approvalDecision allow stamps the tool card badge', () => {
-		const store = startSession();
-		store.dispatch(
-			note({
-				method: 'toolCall',
-				sessionId: 's',
-				id: 't1',
-				name: 'Bash',
-				title: 'Bash',
-				status: 'running',
-				input: null,
-			}),
-		);
-		store.dispatch(
-			note({
-				method: 'approvalDecision',
-				sessionId: 's',
-				toolCallId: 't1',
-				toolName: 'Bash',
-				toolTitle: 'Bash',
-				verdict: 'allow',
-				reason: null,
-			}),
-		);
-		expect(toolCard(store, 't1')?.autoApproved).toBe(true);
-	});
-	it('drives the turn flag', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'turnStarted', sessionId: 's' }));
-		expect(thread(store).turnActive).toBe(true);
-		store.dispatch(
-			note({
-				method: 'turnFinished',
-				sessionId: 's',
-				cancelled: false,
-				failed: false,
-				strandedSteerIds: [],
-			}),
-		);
-		expect(thread(store).turnActive).toBe(false);
-	});
-	it('routes session errors to their own thread only', () => {
-		const store = startSession('a');
-		store.dispatch(note({ method: 'sessionCreated', sessionId: 'b' }));
-		store.dispatch(note({ method: 'error', sessionId: 'a', message: 'boom' }));
-		expect(thread(store, 'a').error).toBe('boom');
-		expect(thread(store, 'b').error).toBeNull();
-	});
-	it('clears a thread error when its next turn starts', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'error', sessionId: 's', message: 'boom' }));
-		store.dispatch(note({ method: 'turnStarted', sessionId: 's' }));
-		expect(thread(store).error).toBeNull();
-	});
-	it('tracks model, approval-mode, and reasoning-effort changes per thread', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'currentModel', sessionId: 's', id: 'm1', name: null }));
-		store.dispatch(note({ method: 'permissionModeChanged', sessionId: 's', mode: 'read-only' }));
-		store.dispatch(note({ method: 'reasoningEffortChanged', sessionId: 's', effort: 'max' }));
-		expect(thread(store).currentModelId).toBe('m1');
-		expect(thread(store).approvalMode).toBe('read-only');
-		expect(thread(store).reasoningEffort).toBe('max');
-	});
-});
-
-describe('approval ServerCall cards', () => {
-	it('adds an approval card from a ServerCall and keeps it on decision', () => {
-		const store = startSession();
-		store.dispatch(
-			callReq('auth1', {
-				method: 'approve',
-				sessionId: 's',
-				authId: 'auth1',
-				toolName: 'Bash',
-				summary: 'rm -rf',
-				input: null,
-			}),
-		);
-		const card = thread(store).items.find((i) => i.kind === 'approval');
-		expect(card).toMatchObject({ kind: 'approval', id: 'auth1', toolName: 'Bash' });
-		store.decideApproval('s', 'auth1');
-		expect(thread(store).items.find((i) => i.kind === 'approval')).toBeUndefined();
-	});
-});
-
-describe('plan, goal, and compaction events', () => {
-	it('folds plan mode and goal changes into the info card', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'planModeChanged', sessionId: 's', enabled: true }));
-		expect(thread(store).planMode).toBe(true);
-		store.dispatch(
-			note({
-				method: 'goalChanged',
-				sessionId: 's',
-				snapshot: { thread_id: 's', goal_id: 'g', objective: 'o', status: 'active' },
-			}),
-		);
-		expect(thread(store).info?.goal).toMatchObject({ objective: 'o' });
-	});
-	it('renders a live compaction as a transcript recap item', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'compaction', sessionId: 's', summary: 'compacted', retained: [] }));
-		expect(thread(store).items.find((i) => i.kind === 'compaction')).toMatchObject({
-			summary: 'compacted',
-		});
-	});
-	it('PlanVerdict ServerCall stages a review card', () => {
-		const store = startSession();
-		store.dispatch(
-			callReq('s', {
-				method: 'planVerdict',
-				sessionId: 's',
-				planFile: '/p.md',
-				title: 'T',
-				content: 'body',
-			}),
-		);
-		expect(thread(store).pendingPlan).toMatchObject({ planFile: '/p.md', content: 'body' });
-		store.clearPlanReview('s');
-		expect(thread(store).pendingPlan).toBeNull();
-	});
-});
-
-describe('global folds', () => {
-	it('stores models, commands, threads, and surfaces global errors', () => {
-		const store = startSession();
-		store.dispatch(note({ method: 'models', models: [] }));
-		store.dispatch(note({ method: 'commands', commands: [] }));
-		store.dispatch(note({ method: 'error', sessionId: null, message: 'boom' }));
-		expect(store.get().models).toEqual([]);
-		expect(store.get().commands).toEqual([]);
-		expect(store.get().error).toBe('boom');
-	});
-	it('threads snapshots sync titles and running into live thread states', () => {
-		const store = startSession('a');
-		store.dispatch(note({ method: 'sessionCreated', sessionId: 'b' }));
-		store.dispatch(
-			note({
-				method: 'threadsUpdated',
-				threads: [listItem({ id: 'a', title: 'A', running: true }), listItem({ id: 'b' })],
-			}),
-		);
-		expect(thread(store, 'a').title).toBe('A');
-		expect(thread(store, 'a').turnActive).toBe(true);
-	});
-});
-
-describe('turn-active recovery', () => {
-	it('syncs turnActive from the thread list running flag', () => {
-		const store = startSession('a');
-		store.dispatch(
-			note({
-				method: 'threadsUpdated',
-				threads: [listItem({ id: 'a', running: true })],
-			}),
-		);
-		expect(thread(store, 'a').turnActive).toBe(true);
-	});
-});
-
-describe('steer lifecycle', () => {
-	it('marks a queued bubble pending then clears it on injection', () => {
-		const store = startSession();
-		store.echoUser('s', 'go', undefined, { queued: true, clientId: 'c1' });
-		store.dispatch(
-			note({ method: 'steerPending', sessionId: 's', clientId: 'c1', messageId: 'mid' }),
-		);
-		expect(thread(store).items[0]).toMatchObject({ steerPendingId: 'mid' });
-		store.dispatch(note({ method: 'steerInjected', sessionId: 's', messageId: 'mid' }));
-		expect((thread(store).items[0] as { steerPendingId?: string | null }).steerPendingId).toBeNull();
-	});
-});
-
-describe('wireMessagesToTranscriptItems', () => {
-	const userMsg = (partial: Partial<WireMessage> = {}): WireMessage => ({
-		id: 'u1',
-		timestamp: 1,
-		parent_id: null,
-		provenance: 'user',
-		role: 'user',
-		content: [{ Text: 'hello' }],
-		...partial,
-	});
-	it('maps user text with ui metadata and deflated images', () => {
-		const items = wireMessagesToTranscriptItems([
-			userMsg({
-				ui: { display_text: '/greet', model_id: 'm' },
-				content: [{ Text: 'expanded body' }, { Image: { mime_type: 'image/png', byte_len: 99 } }],
-			}),
-		]);
-		expect(items[0]).toMatchObject({ kind: 'user', text: 'expanded body', displayText: '/greet' });
-		expect((items[0] as { images?: { byteLen: number }[] }).images?.[0]).toMatchObject({ mimeType: 'image/png', byteLen: 99 });
-	});
-	it('passes the authoring agent through as the turn header from', () => {
-		expect(userTurnHeader({ agent: 'researcher' }, '', null, null)).toBe('researcher');
-	});
-	it('skips empty user messages', () => {
-		const items = wireMessagesToTranscriptItems([userMsg({ content: [] })]);
-		expect(items).toHaveLength(0);
-	});
-	it('maps assistant text and tool-use blocks into transcript items', () => {
-		const items = wireMessagesToTranscriptItems([
-			{
-				id: 'a1',
-				timestamp: 2,
-				parent_id: null,
-				provenance: 'assistant',
-				role: 'assistant',
-				content: [
-					{ Text: 'sure' },
-					{ ToolUse: { id: 't1', name: 'Bash', raw_input: 'ls', input: {}, is_input_complete: true, thought_signature: null } },
-				],
-			},
-		]);
-		expect(items).toHaveLength(2);
-		expect(items[1]).toMatchObject({ kind: 'tool', id: 't1' });
-	});
-});
-
-describe('threadInfo payload merge', () => {
-	it('maps ThreadInfoPayload fields into thread state', () => {
-		const store = startSession();
-		store.dispatch(
-			note({
-				method: 'threadInfo',
-				sessionId: 's',
-				info: {
-					cwd: '/w',
-					project: null,
-					displayTitle: 'My Thread',
-					modelId: 'm1',
-					modelName: 'M1',
-					model: null,
-					permissionMode: 'read-only',
-					reasoningEffort: 'max',
-					pinned: true,
+			method: 'threadsUpdated',
+			threads: [
+				{
+					id: SESSION,
+					title: 't',
+					updated_at: 1,
+					running,
+					unread: false,
+					errored,
+					pending_auth: false,
+					pending_plan: false,
+					background_work: false,
+					model_id: 'm',
+					pinned: false,
 					archived: false,
+					parent_id: null,
 					depth: 0,
-					agentLabel: 'lead',
-					selfAuthor: 'lead',
-					cwdPath: '/w',
-					branch: 'main',
-					goal: null,
-					goalElapsedSeconds: null,
-					planMode: true,
-					browserSuites: [],
-					historyPhase: 'idle',
-					running: false,
-					hasInteracted: true,
 				},
+			],
+		});
+
+	const status = (partial: Record<string, unknown>): FromServer =>
+		host({
+			type: 'sessionStatus',
+			sessionId: SESSION,
+			running: null,
+			errored: null,
+			unread: null,
+			pendingAuth: null,
+			pendingPlan: null,
+			backgroundWork: null,
+			...partial,
+		});
+
+	const row = (store: Store) => store.get().threads.find((r) => r.id === SESSION);
+
+	it('mirrors running / pendingAuth / backgroundWork latest-wins', () => {
+		const { store } = openStore();
+		store.dispatch(rowOf());
+		store.dispatch(status({ running: true, pendingAuth: true, backgroundWork: true }));
+		expect(row(store)?.running).toBe(true);
+		expect(row(store)?.pending_auth).toBe(true);
+		expect(row(store)?.background_work).toBe(true);
+		store.dispatch(status({ running: false }));
+		expect(row(store)?.running).toBe(false);
+	});
+
+	it('errored is a set edge: a later false does not clear it', () => {
+		const { store } = openStore();
+		store.dispatch(rowOf(true));
+		store.dispatch(status({ errored: true }));
+		expect(row(store)?.errored).toBe(true);
+		store.dispatch(status({ errored: false }));
+		// Monotonic: errored stays until the next ThreadsUpdated snapshot.
+		expect(row(store)?.errored).toBe(true);
+	});
+
+	it('unread only increases until focus (the active row never sticks)', () => {
+		const { store } = openStore();
+		store.dispatch(rowOf());
+		// SESSION is the active thread (openRemote switched to it).
+		store.dispatch(status({ unread: true }));
+		expect(row(store)?.unread).toBe(false);
+	});
+
+	it('unread sticks for non-focused rows and clears on a false edge', () => {
+		const store = new Store();
+		const effects = spyEffects();
+		store.attachEffects(effects);
+		store.dispatch(
+			note({
+				method: 'threadsUpdated',
+				threads: [
+					{
+						id: 'other',
+						title: 'o',
+						updated_at: 1,
+						running: false,
+						unread: false,
+						errored: false,
+						pending_auth: false,
+						pending_plan: false,
+						background_work: false,
+						model_id: 'm',
+						pinned: false,
+						archived: false,
+						parent_id: null,
+						depth: 0,
+					},
+				],
 			}),
 		);
-		expect(thread(store).title).toBe('My Thread');
-		expect(thread(store).currentModelId).toBe('m1');
-		expect(thread(store).approvalMode).toBe('read-only');
-		expect(thread(store).planMode).toBe(true);
-		expect(thread(store).branch).toBe('main');
-		expect(thread(store).info?.cwd_path).toBe('/w');
+		store.dispatch(
+			host({
+				type: 'sessionStatus',
+				sessionId: 'other',
+				running: null,
+				errored: null,
+				unread: true,
+				pendingAuth: null,
+				pendingPlan: null,
+				backgroundWork: null,
+			}),
+		);
+		expect(store.get().threads[0]?.unread).toBe(true);
+		// Focus clears it (client-owned selection).
+		store.openLocal('other');
+		expect(store.get().threads[0]?.unread).toBe(false);
 	});
 });
 
-describe('subagent and background tasks', () => {
-	it('aggregates sub-agent start and progress into the info snapshot', () => {
-		const store = startSession();
-		store.dispatch(
-			note({
-				method: 'subagentStarted',
-				sessionId: 's',
-				id: 'sa1',
-				agentType: 'researcher',
-				description: 'digging',
-			}),
-		);
-		expect(thread(store).info?.agents[0]).toMatchObject({ id: 'sa1', agent_type: 'researcher' });
-		store.dispatch(
-			note({
-				method: 'subagentProgress',
-				sessionId: 's',
-				id: 'sa1',
-				agentType: 'researcher',
-				toolUses: 3,
-				latestActivity: 'x',
-				status: 'running',
-			}),
-		);
-		expect(thread(store).info?.agents[0]?.tool_uses).toBe(3);
+// ── guard tolerance ───────────────────────────────────────────────────────
+
+describe('guard tolerance', () => {
+	it('unknown host event tags are dropped, not applied', () => {
+		const { store } = openStore();
+		const before = store.get().threads.length;
+		store.dispatch(host({ type: 'frobnicated', whatever: 1 }));
+		expect(store.get().threads).toHaveLength(before);
 	});
-	it('adds a background-task card and keeps the snapshot map live', () => {
-		const store = startSession();
+
+	it('unknown stream frame types are dropped', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshotFrame));
+		const before = items(store).length;
+		store.dispatch(item({ type: 'nonsense', foo: 1 }));
+		expect(items(store)).toHaveLength(before);
+	});
+
+	it('unknown journal tags on live entries are dropped (L12)', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshot([userMsg(0, 'hello')])));
+		const before = items(store).length;
+		store.dispatch(item({ type: 'entry', seq: 1, event: { type: 'notAJournalTag' } }));
+		expect(items(store)).toHaveLength(before);
+	});
+
+	it('the full §C.2 vocabulary parses through guards without throwing', () => {
+		const { store, item } = openStore();
+		store.dispatch(item(snapshot(journalEntries as unknown[])));
+		expect(thread(store)?.ready).toBe(true);
+		expect(thread(store)!.items.length).toBeGreaterThan(0);
+	});
+});
+
+// ── serverCall adjudication cards ─────────────────────────────────────────
+
+describe('ServerCall cards', () => {
+	it('an approve call adds an approval card; decide removes it', () => {
+		const { store, item } = openStore();
 		store.dispatch(
-			note({
-				method: 'backgroundTaskUpdated',
-				sessionId: 's',
-				snapshot: {
-					task_id: 'bg1',
-					kind: 'BackgroundBash',
-					owner_thread_id: 's',
-					description: 'watch',
-					status: 'Running',
-					created_at_ms: 1,
-					ended_at_ms: null,
-					event_count: 0,
-					total_bytes: 0,
-					exit_code: null,
-					failure_summary: null,
-				},
+			callReq('a1', {
+				method: 'approve',
+				sessionId: SESSION,
+				authId: 'a1',
+				toolName: 'Bash',
+				summary: 'run ls',
+				input: {},
 			}),
 		);
-		expect(thread(store).items.find((i) => i.kind === 'background_task')).toBeTruthy();
-		expect(thread(store).backgroundTasks['bg1']).toBeTruthy();
+		expect(items(store).some((i) => i.kind === 'approval' && i.id === 'a1')).toBe(true);
+		// A rebuilt journal window must never drop a pending card.
+		store.dispatch(item(snapshot([userMsg(0, 'x')])));
+		expect(items(store).some((i) => i.kind === 'approval' && i.id === 'a1')).toBe(true);
+		store.decideApproval(SESSION, 'a1');
+		expect(items(store).some((i) => i.kind === 'approval')).toBe(false);
+	});
+
+	it('a planVerdict call upserts a single review card', () => {
+		const { store } = openStore();
+		store.dispatch(
+			callReq('s1', {
+				method: 'planVerdict',
+				sessionId: SESSION,
+				planFile: '/p.md',
+				title: 'Ship it',
+				content: '# plan',
+			}),
+		);
+		expect(items(store).filter((i) => i.kind === 'plan_review')).toHaveLength(1);
+	});
+});
+
+// ── v1 control/registry notes (still emitted at wave/2) ───────────────────
+
+describe('v1 control/registry notes and host mirrors', () => {
+	it('models flow into global state from both the note and the host tag', () => {
+		const { store } = openStore();
+		const models = (hostEvents.find((e) => e.type === 'models') as { models: unknown[] }).models;
+		store.dispatch(note({ method: 'models', models }));
+		expect(store.get().models).toHaveLength(1);
+		store.dispatch(host({ type: 'models', models: [] }));
+		expect(store.get().models).toHaveLength(0);
+	});
+
+	it('a sessionCreated switches to conversation view', () => {
+		const store = new Store();
+		const effects = spyEffects();
+		store.attachEffects(effects);
+		store.dispatch(note({ method: 'sessionCreated', sessionId: 'fresh' }));
+		expect(store.get().view).toBe('conversation');
+		expect(store.get().activeThreadId).toBe('fresh');
+	});
+});
+
+// ── draft lifecycle ───────────────────────────────────────────────────────
+
+describe('draft thread lifecycle', () => {
+	it('draft → confirmDraft rekeys state and the echo rides the originRpc', () => {
+		const store = new Store();
+		const effects = spyEffects();
+		store.attachEffects(effects);
+		store.draftThread('local-1', 'hello world', undefined, { originRpc: 'rpc-7' });
+		expect(store.isCreating('local-1')).toBe(true);
+		expect(store.get().activeThreadId).toBe('local-1');
+		store.confirmDraft('local-1', 'server-9');
+		expect(store.get().activeThreadId).toBe('server-9');
+		expect(store.get().perThread['server-9']?.items.some((i) => i.kind === 'user')).toBe(true);
+		// The rekeyed session is live: the snapshot retires the echo.
+		store.openRemote('server-9');
+		const streamId = effects.openStream.mock.calls.at(-1)![1] as string;
+		store.dispatch(
+			{
+				kind: 'streamItem',
+				streamId,
+				frame: snapshot([userMsg(0, 'hello world', 'rpc-7')]),
+			} as unknown as FromServer,
+		);
+		expect(
+			store.get().perThread['server-9']?.items.filter((i) => i.kind === 'user'),
+		).toHaveLength(1);
+	});
+});
+
+// ── §E.3 conversation-info edge trigger ──────────────────────────────────
+
+describe('GetConversationInfo edge trigger', () => {
+	const fakeInfo: ConversationInfo = {
+		threadId: SESSION,
+		cursor: 1,
+		title: null,
+		cwd: null,
+		project: null,
+		model: null,
+		contextWindow: null,
+		turns: 0,
+		messages: 0,
+		models: [],
+		cumulativeCost: 0,
+		git: null,
+	};
+
+	it('refreshes only on committed-message edges, debounced at 120 ms', async () => {
+		vi.useFakeTimers();
+		try {
+			const pin = new Store();
+			const pinInfo = vi.fn(async () => fakeInfo);
+			const pinOpen = vi.fn();
+			pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null), conversationInfo: pinInfo });
+			pin.openRemote(SESSION);
+			const id = pinOpen.mock.calls[0]![1] as string;
+			const pinItem = (frame: unknown): FromServer =>
+				({ kind: 'streamItem', streamId: id, frame }) as unknown as FromServer;
+			// Snapshot with one committed user message → one edge.
+			pin.dispatch(pinItem(snapshot([userMsg(0, 'a')])));
+			await vi.advanceTimersByTimeAsync(120);
+			expect(pinInfo).toHaveBeenCalledTimes(1);
+			// Non-message rows (deltas) do not re-trigger.
+			pin.dispatch(pinItem({ type: 'entry', seq: 1, event: { type: 'agentTextDelta', s: 'hi' } }));
+			await vi.advanceTimersByTimeAsync(120);
+			expect(pinInfo).toHaveBeenCalledTimes(1);
+			// An assistant message row counts as a commit edge.
+			pin.dispatch(pinItem({ type: 'entry', seq: 2, event: { type: 'message', role: 'assistant', content: [{ type: 'text', text: 'yo' }], usage: null, originRpc: null } }));
+			await vi.advanceTimersByTimeAsync(120);
+			expect(pinInfo).toHaveBeenCalledTimes(2);
+			// Two edges inside one debounce window collapse to one call.
+			pin.dispatch(pinItem({ type: 'entry', seq: 3, event: { type: 'message', role: 'user', content: [{ type: 'text', text: 'x' }], usage: null, originRpc: null } }));
+			pin.dispatch(pinItem({ type: 'entry', seq: 4, event: { type: 'message', role: 'user', content: [{ type: 'text', text: 'y' }], usage: null, originRpc: null } }));
+			await vi.advanceTimersByTimeAsync(120);
+			expect(pinInfo).toHaveBeenCalledTimes(3);
+			// The payload lands in thread state.
+			await vi.runAllTimersAsync();
+			expect(pin.get().perThread[SESSION]?.conversationInfo).toBe(fakeInfo);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it('a hidden document defers the refresh until it becomes visible', async () => {
+		vi.useFakeTimers();
+		const docHidden = { hidden: true };
+		vi.stubGlobal('document', docHidden);
+		try {
+			const pin = new Store();
+			const pinInfo = vi.fn(async () => fakeInfo);
+			const pinOpen = vi.fn();
+			pin.attachEffects({ openStream: pinOpen, pageHistory: vi.fn(async () => null), conversationInfo: pinInfo });
+			pin.openRemote(SESSION);
+			const id = pinOpen.mock.calls[0]![1] as string;
+			pin.dispatch({ kind: 'streamItem', streamId: id, frame: snapshot([userMsg(0, 'a')]) } as unknown as FromServer);
+			await vi.advanceTimersByTimeAsync(120);
+			expect(pinInfo).not.toHaveBeenCalled();
+			docHidden.hidden = false;
+			pin.flushConversationInfo(SESSION);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(pinInfo).toHaveBeenCalledTimes(1);
+		} finally {
+			vi.useRealTimers();
+			vi.unstubAllGlobals();
+		}
+	});
+});
+
+// ── §D.2 PageHistory paging (prepend) ────────────────────────────────────
+
+describe('history paging', () => {
+	it('requestOlder prepends a backwards page into the window', async () => {
+		const pin = new Store();
+		const pinOpen = vi.fn();
+		pin.attachEffects({
+			openStream: pinOpen,
+			pageHistory: vi.fn(async () => ({
+				// The page must adjoin the window head (seq 5) ⇒ ends at 4.
+				records: [entryRow(4, { type: 'message', role: 'user', content: [{ type: 'text', text: 'old' }], usage: null, originRpc: null })] as unknown as WireRecord[],
+				hasMore: false,
+			})),
+			conversationInfo: vi.fn(async () => null),
+		});
+		pin.openRemote(SESSION);
+		const id = pinOpen.mock.calls[0]![1] as string;
+		const pinItem = (frame: unknown): FromServer =>
+			({ kind: 'streamItem', streamId: id, frame }) as unknown as FromServer;
+		pin.dispatch(pinItem(snapshot([userMsg(5, 'new')])));
+		expect(pin.hasMoreHistory(SESSION)).toBe(true);
+		await pin.requestOlder(SESSION);
+		const users = pin.get().perThread[SESSION]!.items.filter((i) => i.kind === 'user');
+		expect(users.map((u) => (u as { text: string }).text)).toEqual(['old', 'new']);
+		expect(pinOpen).toHaveBeenCalledTimes(1);
 	});
 });
