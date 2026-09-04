@@ -130,8 +130,7 @@ pub const FRAMES: &[&str] = &[
 
 /// `ClientCall` wire methods. v2 (§D.2) upgrades `Submit`/`Steer`/
 /// `CreateSession` to request form with `originRpc` + session intent fields
-/// and adds `pageHistory` / `getConversationInfo`; those land with the
-/// envelope migration (see T2 delivery report).
+/// and adds `pageHistory` / `getConversationInfo` (T4 envelope migration).
 pub const CLIENT_CALLS: &[&str] = &[
     "initialize",
     "openSession",
@@ -144,6 +143,12 @@ pub const CLIENT_CALLS: &[&str] = &[
     "terminalAttach",
     "terminalSnapshot",
     "modelChat",
+    // v2 write/read calls (§D.2, T4).
+    "createSession",
+    "submit",
+    "steer",
+    "pageHistory",
+    "getConversationInfo",
 ];
 
 /// `ClientNote` wire methods; the §D.3 keep set (`DetachSession`,

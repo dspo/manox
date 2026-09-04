@@ -89,6 +89,55 @@ fn client_call_samples() -> Vec<(String, ClientCall)> {
                 tools: serde_json::json!([]),
             },
         ),
+        (
+            "createSession".into(),
+            ClientCall::CreateSession {
+                cwd: Some("/proj".into()),
+                project: Some("/proj".into()),
+                initial_model: Some(manox_protocol::ModelRef::new(
+                    "DeepSeek-anthropic/deepseek-chat",
+                )),
+                approval_mode: Some("workspace-write".into()),
+                reasoning_effort: Some("high".into()),
+            },
+        ),
+        (
+            "submit".into(),
+            ClientCall::Submit {
+                session_id: "s1".into(),
+                text: "hello".into(),
+                images: vec![ImageAttachment {
+                    data: vec![1, 2, 3],
+                    mime_type: "image/png".into(),
+                }],
+                origin_rpc: Some("rpc-echo-1".into()),
+            },
+        ),
+        (
+            "steer".into(),
+            ClientCall::Steer {
+                session_id: "s1".into(),
+                message_id: "m-1".into(),
+                text: "left".into(),
+                images: vec![],
+                origin_rpc: None,
+            },
+        ),
+        (
+            "pageHistory".into(),
+            ClientCall::PageHistory {
+                session_id: "s1".into(),
+                through_seq: -1,
+                before_seq: Some(40),
+                max_messages: Some(32),
+            },
+        ),
+        (
+            "getConversationInfo".into(),
+            ClientCall::GetConversationInfo {
+                session_id: "s1".into(),
+            },
+        ),
     ]
 }
 
