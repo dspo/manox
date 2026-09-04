@@ -2128,6 +2128,16 @@ impl Workspace {
     /// one-shot; actors await readiness themselves). A project binds at
     /// construction time — a single session creation, no orphaned session
     /// file.
+    ///
+    /// T6: the double path is deleted — the workspace no longer pre-builds an
+    /// engine-owning `Thread` (which spawned a second, server-duplicating
+    /// engine for the same id and raced its jsonl materialization). The new
+    /// conversation runs on the AgentServer-owned session; the handle built
+    /// here is the detached *rendering mirror* (a landing thread, like the
+    /// startup landing), bound to the same id the session is created under.
+    /// The session file materializes exactly once — server-side, on the first
+    /// submit — and the follow stream (`StreamOpen` → `Snapshot`) opens when
+    /// the `SessionCreated` note lands (see [`crate::multiplexer`]).
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
@@ -2136,8 +2146,12 @@ impl Workspace {
     ) {
         let id = ThreadId(uuid::Uuid::new_v4().to_string());
         let new = match &project {
-            Some(dir) => Thread::new_in_project(id, dir.clone()),
-            None => Thread::new_fresh(id, self.cwd.clone()),
+            Some(dir) => {
+                let handle = Thread::landing_with_id(id.clone(), dir.clone());
+                handle.with_mut(|t| t.restore_project(dir.clone()));
+                handle
+            }
+            None => Thread::landing_with_id(id, self.cwd.clone()),
         };
         if let Some(dir) = &project {
             Self::register_project_in_store(dir, cx);
@@ -4312,13 +4326,14 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.permission_mode)
             .unwrap_or_else(|| old.read(|t| t.permission_mode()));
-        let new = match &project {
-            Some(dir) => {
-                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
-            }
-            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
-        };
+        // T6: detached rendering mirror (see `start_new_thread`) — no
+        // pre-spawned engine; the inherited state rides the facade and the
+        // session materializes server-side on first submit.
+        let new = Thread::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd);
         new.with_mut(|t| {
+            if let Some(dir) = &project {
+                t.restore_project(dir.clone());
+            }
             if let Some(model) = model {
                 t.set_model(model.clone());
             }
@@ -4578,12 +4593,7 @@ impl Workspace {
         };
         if hit {
             let submit_text = format!("/{key} {args}");
-            let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                session_id: sid.into(),
-                text: submit_text,
-                images: Vec::new(),
-                client_id: None,
-            });
+            let _ = self.send_submit_v2(submit_text, Vec::new(), cx);
         } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
@@ -4766,12 +4776,7 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: turn.text.clone(),
-            images: attachments,
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -4841,13 +4846,11 @@ impl Workspace {
                     images: attachments,
                 });
             } else {
-                // Last: insert + start the turn.
-                let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                    session_id: sid.into(),
-                    text: turn.text.clone(),
-                    images: attachments,
-                    client_id: None,
-                });
+                // Last: insert + start the turn. The v2 Submit carries the
+                // origin_rpc so the optimistic bubble retires when the durable
+                // user row lands (batched predecessors insert without a turn
+                // via the compat note and have no echo to retire).
+                let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
             }
         }
         refresh_thread_list();
@@ -5784,12 +5787,7 @@ impl Workspace {
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: text.clone(),
-            images: Vec::new(),
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(text.clone(), Vec::new(), cx);
         refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -6176,6 +6174,40 @@ impl Workspace {
         } else {
             false
         }
+    }
+
+    /// v2 §D.2 submit path: mint an `origin_rpc` correlation id, register the
+    /// optimistic echo in the foreground store, and send the
+    /// [`ClientCall::Submit`] (receipt-only per L7 — the durable user row
+    /// arrives through the follow stream and retires the echo by matching its
+    /// `originRpc`). The conversation's optimistic bubble was already pushed by
+    /// the caller; retirement just clears the store's echo bookkeeping so the
+    /// row is not treated as a remote (unmatched) insertion.
+    ///
+    /// Returns `true` when the submit rode the connection (session bound).
+    pub(crate) fn send_submit_v2(
+        &mut self,
+        text: String,
+        images: Vec<manox_protocol::ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sid) = self.session_id.clone() else {
+            return false;
+        };
+        let origin_rpc = uuid::Uuid::new_v4().to_string();
+        if let Some(store) = self.store.as_ref() {
+            store.update(cx, |h, _| {
+                h.store.push_echo(&origin_rpc, text.clone());
+            });
+        }
+        self.client
+            .send_call(manox_protocol::ClientCall::Submit {
+                session_id: sid,
+                text,
+                images,
+                origin_rpc: Some(origin_rpc),
+            });
+        true
     }
 
     /// Toggle plan mode on the current thread (persisted by the engine).

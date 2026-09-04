@@ -98,6 +98,11 @@ pub struct ClientStore {
     /// `pending_auth` projection (the snapshot-style set — replaces the v1
     /// per-event accumulation for display, spec T6-5).
     pub pending_auth_set: HashSet<String>,
+    /// Whether the v2 journal stream is the sole render source (live
+    /// `ThreadEvent`s emitted from the fold, rebuild driven off `display`).
+    /// `false` through the dual-protocol window (§K.5) — the v1 `ServerNote`
+    /// path still renders; flipped at T10 when the notes are deleted.
+    pub stream_drives_render: bool,
 }
 
 /// One projection slot (§E.1): the whole value plus the producing seq.
@@ -173,6 +178,7 @@ impl Default for ClientStore {
             errored: false,
             unread: false,
             pending_auth_set: HashSet::new(),
+            stream_drives_render: false,
         }
     }
 }

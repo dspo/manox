@@ -197,22 +197,29 @@ impl ClientStoreHandle {
     }
 
     fn apply_change(&mut self, change: WindowChange, cx: &mut Context<Self>) {
-        // Live rendering still rides the v1 note path during the dual-protocol
-        // window (§K.5); the v2 fold additionally emits live events for the
-        // rows the notes also carry, but the conversation rebuild is triggered
-        // by structural window changes only (Replace/Prepend).
+        // Dual-protocol window (§K.5): the *live* conversation render (deltas,
+        // tool cards, turn lifecycle) still rides the v1 `ServerNote` events,
+        // and the rebuild trigger stays the authoritative `ThreadHistory`
+        // note — not a v2 structural change (which would rebuild off a
+        // half-arrived v1 display and drop the in-flight turn). Emitting the
+        // §C.2 rows as `ThreadEvent`s here would double-render against the
+        // notes. The `stream_drives_render` switch (default `false`, flipped
+        // at T10 when the note path is deleted) turns the v2 fold into the
+        // sole render source; until then the fold maintains the store
+        // substrate only (window / display / echo / projections-materialized
+        // fields + the §D.5 host mirror).
+        let drive_render = self.store.stream_drives_render;
         let live_events = match &change {
             WindowChange::Append(entry) => vec![entry.clone()],
             _ => Vec::new(),
         };
-        let structural = self.store.apply_window_change(change);
-        for entry in live_events {
-            if let Some(ev) = journal_translate::thread_event_of(&entry) {
-                cx.emit(ev);
+        self.store.apply_window_change(change);
+        if drive_render {
+            for entry in live_events {
+                if let Some(ev) = journal_translate::thread_event_of(&entry) {
+                    cx.emit(ev);
+                }
             }
-        }
-        if structural {
-            cx.emit(ThreadEvent::HistoryRestored);
         }
         cx.notify();
     }

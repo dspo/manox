@@ -164,13 +164,32 @@ impl SessionMultiplexer {
     /// for its session).
     fn route(&mut self, msg: FromServer, cx: &mut Context<Self>) {
         // §D.5 host events are global: fan out to all leaves, then return.
-        if let FromServer::Host { .. } = msg {
-            let msg_clone = match msg {
-                FromServer::Host { host } => FromServer::Host { host },
-                _ => unreachable!(),
-            };
+        if let FromServer::Host { host } = &msg {
+            // Mirror `SessionStatus` into the thread-store (sidebar) flags
+            // under the §D.5 monotonic rules, so parked and foreground rows
+            // stay honest even without a live per-thread subscription.
+            if let manox_protocol::stream::HostEvent::SessionStatus {
+                session_id,
+                running,
+                errored,
+                unread,
+                pending_auth,
+                pending_plan,
+                background_work,
+            } = host
+            {
+                self.mirror_session_status(
+                    session_id,
+                    *running,
+                    *errored,
+                    *unread,
+                    *pending_auth,
+                    *pending_plan,
+                    *background_work,
+                );
+            }
             for handle in self.sessions.values() {
-                let m = clone_host(&msg_clone);
+                let m = FromServer::Host { host: host.clone() };
                 handle.update(cx, |h, cx| h.apply_from_server(m, cx));
             }
             return;
@@ -323,6 +342,48 @@ impl SessionMultiplexer {
         self.create_callbacks.insert(id, on_done);
     }
 
+    /// §D.5 monotonic mirror of a `SessionStatus` delta into the thread-store
+    /// sidebar flags: running takes the latest value, `errored` is a rising
+    /// edge cleared by a fresh turn, `unread` only rises (focus clears it),
+    /// the pending flags take the latest value.
+    fn mirror_session_status(
+        &self,
+        session_id: &str,
+        running: Option<bool>,
+        errored: Option<bool>,
+        unread: Option<bool>,
+        pending_auth: Option<bool>,
+        pending_plan: Option<bool>,
+        background_work: Option<bool>,
+    ) {
+        use manox_agent::thread_store::global;
+        let id = session_id.to_string();
+        global().with_mut(|s| {
+            if running == Some(true) {
+                // A fresh turn supersedes the previous turn's error edge.
+                s.set_errored(&id, false);
+                s.mark_running(&id);
+            } else if running == Some(false) {
+                s.mark_idle(&id);
+            }
+            if errored == Some(true) {
+                s.set_errored(&id, true);
+            }
+            if unread == Some(true) {
+                s.set_unread(&id, true);
+            }
+            if let Some(p) = pending_auth {
+                s.mark_pending_auth(&id, p);
+            }
+            if let Some(p) = pending_plan {
+                s.mark_pending_plan(&id, p);
+            }
+            if let Some(b) = background_work {
+                s.mark_background_work(&id, b);
+            }
+        });
+    }
+
     /// Drop a session from the multiplexer (the server-side owner is released
     /// separately via `DetachSession`). Keeps parked handles addressable.
     pub fn forget(&mut self, session_id: &str) -> Option<Entity<ClientStoreHandle>> {
@@ -354,13 +415,5 @@ impl SessionMultiplexer {
 
     fn has_follow(&self, session_id: &str) -> bool {
         self.streams.values().any(|s| s == session_id)
-    }
-}
-
-/// §D.5 host events are broadcast; `HostEvent` is `Clone`.
-fn clone_host(msg: &FromServer) -> FromServer {
-    match msg {
-        FromServer::Host { host } => FromServer::Host { host: host.clone() },
-        _ => unreachable!("clone_host only for Host frames"),
     }
 }
