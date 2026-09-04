@@ -28,6 +28,13 @@ pub enum SessionTreeEntry {
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         message: AgentMessage,
+        /// The RPC id this message was submitted under (§C.2 `originRpc`,
+        /// dsh `source.rpcId`). The server pins the client's Submit
+        /// `origin_rpc` on the user message's journal entry so the client can
+        /// retire its optimistic echo (echo/retire protocol, §F.2). Absent on
+        /// every other entry and on older session files.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     #[serde(rename = "compaction", rename_all = "camelCase")]
     Compaction {
@@ -604,6 +611,11 @@ pub struct Session<S: SessionStorage> {
     /// the same leaf and fork sibling branches — the linearized per-session
     /// append queue of the TS storage (upstream 4488ad55c).
     append_lock: tokio::sync::Mutex<()>,
+    /// The RPC id a client pinned to THIS turn's first user message (the
+    /// echo-retirement contract, §F.2): the host sets it when Submit carries
+    /// `origin_rpc`; the persistence middleware drains it on exactly that
+    /// append. One-shot by construction.
+    pending_user_origin: std::sync::Mutex<Option<String>>,
 }
 
 /// Authorship of a persisted compaction: whether a before-compact hook
@@ -621,7 +633,19 @@ impl<S: SessionStorage> Session<S> {
         Session {
             storage,
             append_lock: tokio::sync::Mutex::new(()),
+            pending_user_origin: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Pin the origin RPC id for this turn's first user message (§F.2).
+    pub fn set_pending_user_origin(&self, origin: Option<String>) {
+        *self.pending_user_origin.lock().unwrap() = origin;
+    }
+
+    /// Drain the pending origin (the persistence middleware's one-shot take
+    /// on the user-message append).
+    pub fn take_pending_user_origin(&self) -> Option<String> {
+        self.pending_user_origin.lock().unwrap().take()
     }
 
     pub fn storage(&self) -> &S {
@@ -630,6 +654,20 @@ impl<S: SessionStorage> Session<S> {
 
     /// Append a message entry and return the entry ID.
     pub async fn append_message(&self, message: AgentMessage) -> Result<String, anyhow::Error> {
+        self.append_message_with_origin(message, None).await
+    }
+
+    /// Append a message entry carrying an optional `origin` (the RPC id it was
+    /// submitted under, §C.2 `originRpc`) and return the entry ID. The server
+    /// pins the client Submit's `origin_rpc` on the user message's journal
+    /// entry so the client can retire its optimistic echo (§F.2). A `None`
+    /// origin serializes to no `origin` key, byte-identical to the pre-T5b
+    /// wire form.
+    pub async fn append_message_with_origin(
+        &self,
+        message: AgentMessage,
+        origin: Option<String>,
+    ) -> Result<String, anyhow::Error> {
         let _guard = self.append_lock.lock().await;
         let id = self.storage.create_entry_id().await?;
         let parent_id = self.storage.get_leaf_id().await?;
@@ -639,6 +677,7 @@ impl<S: SessionStorage> Session<S> {
             parent_id,
             timestamp: Utc::now(),
             message,
+            origin,
         };
         self.storage.append_entry(&entry).await?;
         Ok(id)
@@ -1256,6 +1295,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             timestamp: Utc::now(),
             message: AgentMessage::user(text),
+            origin: None,
         }
     }
 
@@ -1348,6 +1388,7 @@ mod tests {
                 error_message: None,
                 timestamp: Utc::now(),
             },
+            origin: None,
         };
         let path = vec![
             SessionTreeEntry::ModelChange {
@@ -1434,6 +1475,39 @@ mod tests {
                 assert_eq!(parent_id.as_deref(), Some("m1"));
             }
             other => panic!("expected CwdChange, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn message_origin_is_skipped_when_none_and_pinned_when_some() {
+        // Echo retirement (§F.2) hinges on the wire form: a message with no
+        // origin must be byte-identical to the pre-T5b form (no `origin` key),
+        // and one with an origin must carry `originRpc`'s wire name `origin`.
+        let base = |origin: Option<String>| SessionTreeEntry::Message {
+            id: "m1".into(),
+            parent_id: None,
+            timestamp: Utc::now(),
+            message: AgentMessage::user("hi"),
+            origin,
+        };
+
+        let none_wire = serde_json::to_string(&base(None)).unwrap();
+        assert!(
+            !none_wire.contains("origin"),
+            "an absent origin must not leak a key onto disk: {none_wire}"
+        );
+
+        let some_wire = serde_json::to_string(&base(Some("rpc-7".into()))).unwrap();
+        assert!(
+            some_wire.contains(r#""origin":"rpc-7""#),
+            "a pinned origin must serialize under the `origin` wire name: {some_wire}"
+        );
+        let back: SessionTreeEntry = serde_json::from_str(&some_wire).unwrap();
+        match back {
+            SessionTreeEntry::Message { origin, .. } => {
+                assert_eq!(origin.as_deref(), Some("rpc-7"));
+            }
+            other => panic!("expected Message, got {other:?}"),
         }
     }
 
@@ -2189,6 +2263,7 @@ mod branch_query_tests {
                 parent_id: Some("missing-parent".into()),
                 timestamp: Utc::now(),
                 message: AgentMessage::user("orphan"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -2216,6 +2291,7 @@ mod branch_query_tests {
                 parent_id: Some("cycle-b".into()),
                 timestamp: Utc::now(),
                 message: AgentMessage::user("a"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -2226,6 +2302,7 @@ mod branch_query_tests {
                 parent_id: Some("cycle-a".into()),
                 timestamp: Utc::now(),
                 message: AgentMessage::user("b"),
+                origin: None,
             })
             .await
             .unwrap();

@@ -205,6 +205,7 @@ mod tests {
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         }
     }
 
@@ -217,6 +218,7 @@ mod tests {
                 content: vec![],
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         }
     }
 
@@ -239,6 +241,7 @@ mod tests {
                     added_tool_names: None,
                     timestamp: chrono::Utc::now(),
                 },
+                origin: None,
             },
             SessionTreeEntry::Compaction {
                 id: "c".into(),

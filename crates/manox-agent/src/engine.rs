@@ -44,6 +44,14 @@ pub(crate) enum SessionCmd {
     Prompt {
         text: String,
         images: Vec<manox_harness::types::ContentBlock>,
+        /// The RPC id the client submitted this turn under (dsh `source.rpcId`,
+        /// §C.2 `originRpc`). The server pins it on the prompt's user-message
+        /// journal entry so the client can retire its optimistic echo (§F.2).
+        /// `None` for internally-driven turns (goal rounds, plan seeds). The
+        /// actor currently threads the prompt through the shared persistence
+        /// middleware, which does not yet carry the origin to the user-message
+        /// append; the field is retained here for the follow-up wiring.
+        origin_rpc: Option<String>,
     },
     /// Inject a steer into the running turn.
     Steer {
@@ -744,6 +752,7 @@ impl ThreadEngine for PiEngine {
         let _ = self.cmd_tx.send(SessionCmd::Prompt {
             text: prompt,
             images,
+            origin_rpc: None,
         });
     }
 
@@ -2858,7 +2867,17 @@ async fn run_actor(
         };
         let Some(cmd) = cmd else { break };
         match cmd {
-            SessionCmd::Prompt { text, images } => {
+            SessionCmd::Prompt {
+                text,
+                images,
+                origin_rpc,
+            } => {
+                // Echo retirement (§F.2): pin the client's RPC id onto this
+                // turn's first user message; the persistence middleware
+                // drains it on exactly that append.
+                if origin_rpc.is_some() {
+                    session.set_pending_user_origin(origin_rpc.clone());
+                }
                 // Plugin lifecycle: `SessionStart` fires once per session,
                 // before the first user turn (fail-open, detached).
                 if !state.session_start_fired.swap(true, Ordering::SeqCst) {

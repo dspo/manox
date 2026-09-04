@@ -844,6 +844,11 @@ impl AgentSession {
         self.harness.session().append_typed(kind, payload).await
     }
 
+    /// Pin this turn's origin RPC id (echo retirement, §F.2).
+    pub fn set_pending_user_origin(&self, origin: Option<String>) {
+        self.harness.session().set_pending_user_origin(origin);
+    }
+
     /// Subscribe to this session's ordered journal appends (the §C.3 read
     /// face; the host relays this to session-core's follow streams).
     pub fn subscribe_journal(

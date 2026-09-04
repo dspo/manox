@@ -811,6 +811,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("hello"),
+            origin: None,
         };
         storage.append_entry(&entry).await.unwrap();
 
@@ -851,6 +852,7 @@ mod tests {
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         }
     }
 
@@ -871,6 +873,7 @@ mod tests {
                 parent_id: Some("a1".into()),
                 timestamp: chrono::Utc::now(),
                 message: crate::types::AgentMessage::user("hi"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -965,6 +968,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: crate::types::AgentMessage::user("hi"),
+            origin: None,
         };
         storage.append_entry(&target).await.unwrap();
         for (id, label) in [
@@ -1054,6 +1058,7 @@ mod tests {
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
                 message: crate::types::AgentMessage::user("hi"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -1106,6 +1111,7 @@ mod tests {
                     parent_id: (i > 0).then(|| format!("m{}", i - 1)),
                     timestamp: chrono::Utc::now(),
                     message: crate::types::AgentMessage::user(format!("{i}")),
+                    origin: None,
                 })
                 .await
                 .unwrap();
@@ -1162,6 +1168,7 @@ mod tests {
                     exclude_from_context: Some(true),
                     timestamp: chrono::Utc::now(),
                 },
+                origin: None,
             })
             .await
             .unwrap();
@@ -1210,6 +1217,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("hi"),
+            origin: None,
         };
         storage.append_entry(&msg).await.unwrap();
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
@@ -1260,6 +1268,7 @@ mod tests {
                 parent_id: None,
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hi"),
+                origin: None,
             };
             storage.append_entry(&msg).await.unwrap();
             // No `leaf` entry exists; the cursor is the last appended entry.
@@ -1411,18 +1420,21 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
+            origin: None,
         };
         let child = SessionTreeEntry::Message {
             id: "child".into(),
             parent_id: Some("root".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("child"),
+            origin: None,
         };
         let leaf = SessionTreeEntry::Message {
             id: "leaf".into(),
             parent_id: Some("child".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("leaf"),
+            origin: None,
         };
 
         storage.append_entry(&root).await.unwrap();
@@ -1453,6 +1465,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("pre-compaction"),
+            origin: None,
         };
         let compaction = SessionTreeEntry::Compaction {
             id: "comp".into(),
@@ -1471,6 +1484,7 @@ mod tests {
             parent_id: Some("comp".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("post-compaction"),
+            origin: None,
         };
 
         storage.append_entry(&pre).await.unwrap();
@@ -1519,6 +1533,7 @@ mod tests {
             parent_id: Some(parent.into()),
             timestamp: base + chrono::Duration::seconds(secs),
             message: AgentMessage::user(id),
+            origin: None,
         };
 
         let root = SessionTreeEntry::Message {
@@ -1526,6 +1541,7 @@ mod tests {
             parent_id: None,
             timestamp: base,
             message: AgentMessage::user("root"),
+            origin: None,
         };
         storage.append_entry(&root).await.unwrap();
         storage
@@ -1573,12 +1589,14 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("root"),
+            origin: None,
         };
         let child = SessionTreeEntry::Message {
             id: "child".into(),
             parent_id: Some("root".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("child"),
+            origin: None,
         };
         storage.append_entry(&root).await.unwrap();
         storage.append_entry(&child).await.unwrap();
@@ -2212,6 +2230,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("first"),
+            origin: None,
         };
         storage.append_entry(&entry).await.unwrap();
         let dup = SessionTreeEntry::Message {
@@ -2219,6 +2238,7 @@ mod tests {
             parent_id: Some("m1".into()),
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("second"),
+            origin: None,
         };
         let err = storage.append_entry(&dup).await.unwrap_err();
         assert!(err.to_string().contains("duplicate entry id m1"), "{err}");
@@ -2242,6 +2262,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user("bad"),
+            origin: None,
         };
         let err = storage.append_entry(&entry).await.unwrap_err();
         assert!(err.to_string().contains("empty id"), "{err}");
@@ -2381,6 +2402,7 @@ mod tests {
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user(text),
+                origin: None,
             }
         }
 
@@ -2585,6 +2607,164 @@ mod tests {
             assert!(
                 err.to_string().contains("ghost"),
                 "the append names the unknown parent: {err}"
+            );
+        }
+    }
+
+    // ── origin / echo-retirement field (T5b, §C.2 originRpc / §F.2) ────────
+
+    /// `append_message_with_origin` survives a disk round-trip: the pinned
+    /// origin comes back on reopen, while a plain `append_message` still reads
+    /// `None`.
+    #[tokio::test]
+    async fn append_message_with_origin_round_trips_through_disk() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        let session = Session::new(storage);
+
+        session
+            .append_message_with_origin(AgentMessage::user("echo me"), Some("rpc-42".into()))
+            .await
+            .unwrap();
+        session
+            .append_message(AgentMessage::user("no origin"))
+            .await
+            .unwrap();
+
+        let before: Vec<Option<String>> = session
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            before,
+            vec![Some("rpc-42".to_string()), None],
+            "origin is visible before reopen"
+        );
+
+        drop(session);
+        let reopened = Session::new(JsonlSessionStorage::open(&path).await.unwrap());
+        let after: Vec<Option<String>> = reopened
+            .storage()
+            .get_entries(Default::default())
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            after,
+            vec![Some("rpc-42".to_string()), None],
+            "the pinned origin survives a reopen; the plain append stays None"
+        );
+    }
+
+    /// Message lines written without an `origin` key — the pre-T5b v3 and v4
+    /// wire forms, including a v3/v4 mixed sample — deserialize to
+    /// `origin: None` (the field defaults), and the origin is only on disk when
+    /// present (skip-serializing).
+    #[tokio::test]
+    async fn message_lines_without_origin_key_deserialize_to_none() {
+        let ts = "2020-01-01T00:00:01Z";
+        let header = |version: u32, id: &str| {
+            format!(
+                r#"{{"type":"session","version":{version},"id":"{id}","cwd":"/t","timestamp":"{ts}"}}"#
+            )
+        };
+        // Build a message line from a real serialized `AgentMessage`, pinned in
+        // the v3/v4 envelope, deliberately omitting the `origin` key (the
+        // pre-T5b wire form). `message` round-trips whatever the current
+        // `AgentMessage` repr is, so the sample cannot drift from the schema.
+        let message_line = |seq: Option<u64>,
+                            id: &str,
+                            parent: Option<&str>,
+                            msg: AgentMessage|
+         -> String {
+            let parent_json = match parent {
+                Some(p) => format!(r#""{p}""#),
+                None => "null".to_string(),
+            };
+            let seq_json = match seq {
+                Some(s) => format!(r#""seq":{s},"#),
+                None => String::new(),
+            };
+            let body = serde_json::to_string(&msg).expect("AgentMessage serializes");
+            format!(
+                r#"{{"type":"message",{seq_json}"id":"{id}","parentId":{parent_json},"timestamp":"{ts}","message":{body}}}"#
+            )
+        };
+
+        // A v3 file: header version 3 (no per-entry seq) and a user line.
+        let v3 = vec![
+            header(3, "s3"),
+            message_line(None, "m1", None, AgentMessage::user("old")),
+        ];
+        // A v4 file: header version 4 and two message lines — a v3-style user
+        // line and a richer assistant line — neither carrying `origin`.
+        let assistant = AgentMessage::Assistant {
+            content: vec![crate::types::ContentBlock::Text {
+                text: "b".into(),
+                signature: None,
+            }],
+            model: "m".into(),
+            provider: "anthropic".into(),
+            api: "anthropic".into(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(crate::types::StopReason::Stop),
+            usage: Box::default(),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        };
+        let v4 = vec![
+            header(4, "s4"),
+            message_line(Some(0), "m1", None, AgentMessage::user("a")),
+            message_line(Some(1), "m2", Some("m1"), assistant),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, lines) in [("legacy_v3.jsonl", v3), ("legacy_v4.jsonl", v4)] {
+            let path = dir.path().join(name);
+            // Assert the raw sample genuinely has no origin key before writing.
+            assert!(
+                !lines[1..].iter().any(|l| l.contains("\"origin\"")),
+                "sample {name} must not carry an origin key"
+            );
+            tokio::fs::write(&path, (lines.join("\n") + "\n").as_bytes())
+                .await
+                .unwrap();
+            let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            let origins: Vec<Option<String>> = storage
+                .get_entries(Default::default())
+                .await
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    SessionTreeEntry::Message { origin, .. } => Some(origin.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !origins.is_empty(),
+                "{name} should have parsed at least one message"
+            );
+            assert!(
+                origins.iter().all(|o| o.is_none()),
+                "{name} message lines without an origin key must read None: {origins:?}"
             );
         }
     }
