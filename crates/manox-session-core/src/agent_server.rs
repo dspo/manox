@@ -248,6 +248,27 @@ impl AgentServerInner {
                         entry.peer.complete(&id, outcome);
                     }
                 }
+                FromClient::StreamOpen {
+                    stream_id,
+                    stream_kind,
+                } => {
+                    // T4 placeholder: replaced by the follow-stream service in
+                    // the same task branch (see `follow::open_stream`).
+                    let _ = stream_kind;
+                    conn.send_to_client(FromServer::StreamEnd {
+                        stream_id,
+                        reason: manox_protocol::stream::StreamEndReason::Failure {
+                            code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.into(),
+                            message: "stream services not wired yet (T4)".into(),
+                        },
+                    });
+                }
+                FromClient::StreamCancel { stream_id } => {
+                    // T4 placeholder: no live stream can exist yet, so the
+                    // cancel is a no-op (a real one would answer
+                    // `StreamEnd { Cancelled }`).
+                    tracing::debug!(stream = %stream_id.0, "stream cancel with no live stream");
+                }
             }
         }
         // Client disconnected: release ownerships; ownerless sessions drop.

@@ -12,12 +12,10 @@
 //! vocabulary in [`crate::stream`] ([`StreamKind`](crate::stream::StreamKind),
 //! [`StreamFrame`](crate::stream::StreamFrame),
 //! [`StreamEndReason`](crate::stream::StreamEndReason),
-//! [`HostEvent`](crate::stream::HostEvent)). T2 ships the payload types and
-//! the frame round-trip / policy they obey; the envelope variants themselves
-//! are added by the T4/T5 consumer migration: these two enums are matched
-//! exhaustively without a wildcard arm in `manox-session-core` /
-//! `agent-ui`, so extending them here first would break the workspace
-//! (verified at T2 dispatch; see the delivery report's stop-rule notes).
+//! [`HostEvent`](crate::stream::HostEvent)). The variants landed with the T4
+//! stream services; v1 consumers tolerate them per L12 (unknown variants are
+//! dropped + logged, never fatal), and the §D.5 `HostEvent` re-type of
+//! `FromServer::Notification` still waits on the T5 consumer migration.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -106,7 +104,11 @@ impl RpcError {
 /// Client → server message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum FromClient {
     /// A query needing a [`FromServer::Response`].
     Request {
@@ -120,12 +122,29 @@ pub enum FromClient {
         id: MsgId,
         outcome: Result<serde_json::Value, RpcError>,
     },
+    /// Open a server→client stream (§D.1): the server answers with
+    /// [`FromServer::StreamItem`] frames and exactly one terminal
+    /// [`FromServer::StreamEnd`]. `stream_id` is client-minted, unique per
+    /// connection. The kind field is `streamKind` on the wire — the §D.1
+    /// field name `kind` would collide with this enum's internal `kind` tag
+    /// (same envelope-key exclusivity rule as §C.1).
+    StreamOpen {
+        stream_id: crate::journal::StreamId,
+        stream_kind: crate::stream::StreamKind,
+    },
+    /// Cancel a live stream (§D.1); the server closes it with
+    /// `StreamEnd { reason: Cancelled }`.
+    StreamCancel { stream_id: crate::journal::StreamId },
 }
 
 /// Server → client message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum FromServer {
     /// The server's answer to a [`FromClient::Request`] (`ClientCall`).
     Response {
@@ -142,6 +161,19 @@ pub enum FromServer {
     /// that replaces the doomed `ServerNote` domain arms; the swap waits on
     /// the consumer migration (see module docs).
     Notification { note: crate::server::ServerNote },
+    /// One frame of a live stream (§D.1). `Snapshot` / `Projections` and the
+    /// terminal `StreamEnd` never drop under backpressure (L5 / §D.7);
+    /// `Entry` frames ride a bounded queue that resyncs on overflow.
+    StreamItem {
+        stream_id: crate::journal::StreamId,
+        frame: crate::stream::StreamFrame,
+    },
+    /// The terminal frame of a stream (§D.1): exactly one per opened stream,
+    /// never dropped (§D.7). After it the `stream_id` may be reopened.
+    StreamEnd {
+        stream_id: crate::journal::StreamId,
+        reason: crate::stream::StreamEndReason,
+    },
 }
 
 #[cfg(test)]
@@ -287,6 +319,16 @@ mod tests {
                 id: MsgId::new("rep-2"),
                 outcome: Err(RpcError::new(-1, "denied")),
             },
+            FromClient::StreamOpen {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                stream_kind: crate::stream::StreamKind::FollowSession {
+                    session_id: "s1".into(),
+                    max_messages: Some(64),
+                },
+            },
+            FromClient::StreamCancel {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();
@@ -375,6 +417,21 @@ mod tests {
                     per_model_cost: std::collections::HashMap::new(),
                     per_request: std::collections::HashMap::new(),
                 },
+            },
+            FromServer::StreamItem {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                frame: crate::stream::StreamFrame::Entry {
+                    seq: 3,
+                    event: crate::journal::JournalWireEvent::AgentTextDelta { s: "tok".into() },
+                },
+            },
+            FromServer::StreamItem {
+                stream_id: crate::journal::StreamId::new("stream-2"),
+                frame: crate::stream::StreamFrame::Snapshot(crate::surface::snapshot_sample()),
+            },
+            FromServer::StreamEnd {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                reason: crate::stream::StreamEndReason::Resync,
             },
         ];
         for msg in &msgs {

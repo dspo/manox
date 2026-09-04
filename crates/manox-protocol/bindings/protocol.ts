@@ -19,12 +19,12 @@ export type ClientNote = { "method": "createSession", sessionId: string, cwd: st
 /**
  * Client → server message.
  */
-export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, };
+export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "streamOpen", streamId: StreamId, streamKind: StreamKind, } | { "kind": "streamCancel", streamId: StreamId, };
 
 /**
  * Server → client message.
  */
-export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, };
+export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, } | { "kind": "streamItem", streamId: StreamId, frame: StreamFrame, } | { "kind": "streamEnd", streamId: StreamId, reason: StreamEndReason, };
 
 /**
  * Capabilities a client can answer when the server issues a [`super::ServerCall`].
