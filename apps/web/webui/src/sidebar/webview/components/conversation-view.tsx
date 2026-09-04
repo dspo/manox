@@ -3,8 +3,8 @@
 // container: the conversation alone, then the conversation info card
 // floats over the transcript, then the session list joins on the left.
 
-import { ArrowLeft, Search } from 'lucide-react';
-import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft } from 'lucide-react';
+import { memo, useEffect, useMemo, useRef } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, onOpenTurnNavigator, ThreadApi } from '../api/client';
@@ -12,8 +12,10 @@ import { t } from '../lib/i18n';
 import { chatLayoutForWidth, INFO_CARD_GUTTER_PX, INFO_CARD_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
 import { collectUserTurns } from '../lib/turn-nav';
 import { useContainerWidth } from '../lib/use-container-width';
+import { setOverlayOpen, toggleOverlay, useOverlayOpen } from '../lib/ui-overlays';
 import type { ThreadState, TranscriptItem } from '../state/bridge';
 import { store } from '../state/bridge';
+import { Slot } from '../slots.outlet';
 import { Composer } from './chrome/composer';
 import { PlanModeBanner } from './chrome/plan-mode-banner';
 import { ErrorBanner } from './chrome/error-banner';
@@ -53,14 +55,16 @@ export const ConversationView = memo(({
   // Backwards-paging affordance: true while records exist before the
   // published window head (§D.2 PageHistory).
   const hasMore = store.hasMoreHistory(thread.sessionId);
-  // The conversation-info pull (§E.3 Q face) is store-driven: the
-  // committed-message edge from the journal window schedules the debounced
-  // `GetConversationInfo`; no per-view request effects any more.
-  const [navigatorOpen, setNavigatorOpen] = useState(false);
+  // The turn navigator is a `shell` overlay toggled through the module-local
+  // overlay registry (§F.2: selection/overlays are client view state, never
+  // folded): the header-utility chip contributed via the
+  // `conversation.session.header.utilities` slot flips the flag and this data
+  // owner reads it — no component import crosses the boundary.
+  const navigatorOpen = useOverlayOpen('turn-navigator');
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   // macOS cmd+m arrives from the host (VS Code keybinding command) and
   // toggles the navigator, mirroring the gpui host's global binding.
-  useEffect(() => onOpenTurnNavigator(() => setNavigatorOpen((open) => !open)), []);
+  useEffect(() => onOpenTurnNavigator(() => toggleOverlay('turn-navigator')), []);
   // The collect pass only matters while the overlay is open; the transcript
   // streams a new item reference on every token during a turn.
   const turns = useMemo(
@@ -83,7 +87,7 @@ export const ConversationView = memo(({
   );
 
   const closeNavigator = () => {
-    setNavigatorOpen(false);
+    setOverlayOpen('turn-navigator', false);
     composerInputRef.current?.focus();
   };
 
@@ -105,14 +109,14 @@ export const ConversationView = memo(({
             <ArrowLeft className="size-4" />
           </Button>
         )}
-        <Button
-          onClick={() => setNavigatorOpen((open) => !open)}
-          size="icon-sm"
-          title={t('turn_navigator_title')}
-          variant="ghost"
-        >
-          <Search className="size-4" />
-        </Button>
+        {/* Header utilities (§G): the navigator chip and the conversation-info
+         * entry are contributed through the `conversation.session.header.
+         * utilities` slot (defaults + plugin registrations) — the header only
+         * opens the outlet and passes its owner props. */}
+        <Slot
+          name="conversation.session.header.utilities"
+          owner={{ sessionId: thread.sessionId, models }}
+        />
         <span className="min-w-0 flex-1 truncate font-medium text-sm">{thread.title}</span>
       </div>
       {thread.planMode && <PlanModeBanner sessionId={thread.sessionId} />}
@@ -186,7 +190,7 @@ export const ConversationView = memo(({
             creating={store.isCreating(thread.sessionId)}
             currentModelRef={thread.modelRef}
             models={models}
-            onOpenTurnNavigator={() => setNavigatorOpen(true)}
+            onOpenTurnNavigator={() => setOverlayOpen('turn-navigator', true)}
             planMode={thread.planMode}
             reasoningEffort={thread.reasoningEffort}
             sessionId={thread.sessionId}
