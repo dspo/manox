@@ -1,14 +1,15 @@
 import type { ModelInfo } from '../../../protocol';
 
-/** Resolve the picker's currently-selected model entry. Draft threads carry
- * the registration-qualified `provider/id` the picker sends on select; live
- * sessions report the bare model id on the wire — accept both. */
+/** Resolve the picker's currently-selected model entry from a canonical
+ * wire ref (L8). The ref is the `model` projection's `{provider, modelId}`
+ * joined as `{provider}/{modelId}` (the same form the picker sends on
+ * select); match is an exact comparison against the canonical identity —
+ * never a bare-id first-match (that resolution is server-only, and the
+ * old fallback mis-attributed same-bare-id registrations). */
 export const findCurrentModel = (
   models: ModelInfo[],
-  currentModelId: string | null,
+  currentModelRef: string | null,
 ): ModelInfo | undefined =>
-  currentModelId === null
+  currentModelRef === null
     ? undefined
-    : models.find(
-        (m) => `${m.provider}/${m.id}` === currentModelId || m.id === currentModelId,
-      );
+    : models.find((m) => `${m.provider}/${m.id}` === currentModelRef);

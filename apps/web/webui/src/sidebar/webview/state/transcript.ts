@@ -69,8 +69,12 @@ export type TranscriptItem =
        * input, so the header's `from` reads "You". Store-side pass-through
        * only — the bubble style does not branch on it. */
       author?: 'lead' | 'harness' | { agent: string } | null;
-      /** Echo id of a submission parked while a turn ran. */
+      /** Echo id of a submission parked while a turn ran; carries the
+       * `originRpc` the durable user entry retires it by (§F.2). */
       clientId?: string;
+      /** RPC id of the `Submit` that created this echo; retired when the
+       * durable user entry with the same `originRpc` lands (§F.2). */
+      originRpc?: string | null;
       /** Parked: the bubble shows the queued chip until the turn drains. */
       queued?: boolean;
       /** Kernel message id once the message was steered into the running

@@ -19,13 +19,13 @@ import {
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 import type {
+  ConversationInfo,
+  ConversationModelRow,
   GoalSnapshotWire,
   ModelInfo,
   PlanSnapshotWire,
   PlanStepWire,
   SubagentChildWire,
-  SubagentSnapshot,
-  UsageBreakdown,
 } from '../../../protocol';
 import { ThreadApi } from '../api/client';
 import { apiTint } from '../lib/api-tint';
@@ -76,7 +76,7 @@ const Section = ({
   </section>
 );
 
-const AgentStatusIcon = ({ status }: { status: SubagentSnapshot['status'] }) => {
+const AgentStatusIcon = ({ status }: { status: string }) => {
   if (status === 'running' || status === 'pending-approval') {
     return <BrailleSpinner className="text-accent-foreground" />;
   }
@@ -179,15 +179,19 @@ const CaptainStatusIcon = ({ thread }: { thread: ThreadState }) => {
   if (thread.error !== null) {
     return <XCircle className="size-3.5 shrink-0 text-danger" />;
   }
-  if (thread.turnActive || (thread.info?.pending_auth_count ?? 0) > 0) {
+  if (thread.turnActive || thread.pendingAuthIds.length > 0) {
     return <BrailleSpinner className="text-accent-foreground" />;
   }
   return <ShipWheel className="size-3.5 shrink-0 text-success" />;
 };
 
-/** Occupied context for a usage row: live input plus everything cached. */
-const usedTokens = (u: UsageBreakdown): number =>
-  (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+/** Occupied context for a §E.3 per-model row: the last request's full
+ * context numerator (input incl. cache classes + output). */
+const rowUsed = (row: ConversationModelRow): number => row.lastTotal;
+
+/** Lifetime input for a §E.3 row: uncached input only (cache reads are
+ * billed separately in the ↑/R columns). */
+const rowInput = (row: ConversationModelRow): number => row.input;
 
 /** Sort key for plan steps: in-progress first, then pending, then completed;
  * the stable sort keeps chronological order within each group. */
@@ -275,30 +279,28 @@ const PlanTaskList = ({
   );
 };
 
-/** Full lifetime total of a usage snapshot: occupied context plus output. */
-const totalTokens = (u: UsageBreakdown): number => usedTokens(u) + (u.output_tokens ?? 0);
+/** Full lifetime total of a §E.3 fold: everything across all model rows. */
+const infoTotal = (info: ConversationInfo): number =>
+  info.models.reduce(
+    (sum, row) => sum + row.input + row.output + row.cacheRead + row.cacheWrite,
+    0,
+  );
 
 const ModelUsageRow = ({
-  modelKey,
-  usage,
-  cost,
+  row,
   models,
   last,
-  lastUsage,
 }: {
-  modelKey: string;
-  usage: UsageBreakdown;
-  cost: number;
+  row: ConversationModelRow;
   models: ModelInfo[];
   last: boolean;
-  /** Latest single request for this model; the budget numerator. */
-  lastUsage?: UsageBreakdown;
 }) => {
-  const model = models.find((m) => `${m.provider}/${m.id}` === modelKey);
-  const cap = model?.context_window;
-  const used = lastUsage ? usedTokens(lastUsage) : 0;
-  const input = usage.input_tokens ?? 0;
-  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  // Canonical wire identity (L8): `{provider}/{model}`; exact match only.
+  const model = models.find((m) => `${m.provider}/${m.id}` === row.model);
+  const cap = row.contextWindow ?? model?.context_window;
+  const used = rowUsed(row);
+  const input = rowInput(row);
+  const cacheRead = row.cacheRead;
   // Cache-hit share of uncached input plus cache-read; `--` with no input.
   const hitRate =
     input + cacheRead > 0 ? `${((cacheRead / (input + cacheRead)) * 100).toFixed(1)}%` : '--';
@@ -306,7 +308,7 @@ const ModelUsageRow = ({
   const indent = last ? '    ' : '│   ';
   return (
     <div className="font-code text-[11px]">
-      <p className="truncate" title={modelKey}>
+      <p className="truncate" title={row.model}>
         {model ? (
           <>
             {branch}{' '}
@@ -314,10 +316,10 @@ const ModelUsageRow = ({
             <span className={apiTint(model.api)}>{model.name}</span>
           </>
         ) : (
-          `${branch} ${modelKey}`
+          `${branch} ${row.model}`
         )}
       </p>
-      {cap !== undefined && lastUsage !== undefined && (
+      {cap !== undefined && cap > 0 && row.lastTotal > 0 && (
         <p
           className={cn(
             'whitespace-pre overflow-hidden text-ellipsis',
@@ -328,11 +330,8 @@ const ModelUsageRow = ({
         </p>
       )}
       <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">
-        {`${indent}${cost > 0 ? '├─' : '└─'} ↑${formatTokensPi(input)} ↓${formatTokensPi(usage.output_tokens ?? 0)} R${formatTokensPi(cacheRead)} CH${hitRate}`}
+        {`${indent}└─ ↑${formatTokensPi(input)} ↓${formatTokensPi(row.output)} R${formatTokensPi(cacheRead)} CH${hitRate}`}
       </p>
-      {cost > 0 && (
-        <p className="text-muted-foreground whitespace-pre overflow-hidden text-ellipsis">{`${indent}└─ ${formatCost(cost)}`}</p>
-      )}
     </div>
   );
 };
@@ -344,13 +343,16 @@ export type InfoPanelProps = {
 };
 
 export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
-  const info = thread.info;
-  const usage = thread.usage;
-  const total = usage ? totalTokens(usage) : 0;
-  const gitStats = info?.git_stats;
+  // v2 (§E.3): the spend tree / lifetime totals come from the Q-face
+  // `GetConversationInfo` fold; plan/goal/cwd/title come from the P-face
+  // projections on `ThreadState`. The doomed ThreadInfo/UsageSnapshot
+  // composite is gone.
+  const info = thread.conversationInfo;
+  const total = info ? infoTotal(info) : 0;
+  const git = info?.git ?? null;
   // Same ordering as the host rail: heaviest spenders first.
-  const perModel = Object.entries(info?.per_model_usage ?? {}).sort(
-    ([, a], [, b]) => totalTokens(b) - totalTokens(a),
+  const perModel = [...(info?.models ?? [])].sort(
+    (a, b) => b.input + b.output + b.cacheRead - (a.input + a.output + a.cacheRead),
   );
   // Plan task list collapse state. The first plan seen per thread decides
   // the default by length (mirroring the host rail's auto-collapse above
@@ -359,12 +361,12 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
   const [planCollapsed, setPlanCollapsed] = useState(false);
   const planSeen = useRef<Set<string>>(new Set());
   useEffect(() => {
-    const plan = info?.plan;
+    const plan = thread.plan;
     if (plan && plan.steps.length > 0 && !planSeen.current.has(thread.sessionId)) {
       planSeen.current.add(thread.sessionId);
       setPlanCollapsed(plan.steps.length > 5);
     }
-  }, [info?.plan, thread.sessionId]);
+  }, [thread.plan, thread.sessionId]);
 
   return (
     <aside
@@ -384,7 +386,7 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
               <p className="truncate font-medium">{t('captain')}</p>
             </div>
           </li>
-          {(info?.agents ?? []).map((agent) => (
+          {thread.subagents.map((agent) => (
             <li className="flex items-start gap-1.5" key={agent.id}>
               <AgentStatusIcon status={agent.status} />
               <div className="min-w-0 flex-1">
@@ -405,27 +407,27 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
       <Section title={t('branch')}>
         <div className="flex items-center gap-1.5">
           <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
-          <span className="min-w-0 truncate">{thread.branch ?? '…'}</span>
-          {gitStats && (
+          <span className="min-w-0 truncate">{git?.branch ?? thread.branch ?? '…'}</span>
+          {git && (
             <span className="font-code ml-auto flex shrink-0 gap-1.5">
-              <span className="text-success">+{gitStats.added}</span>
-              <span className="text-danger">-{gitStats.deleted}</span>
-              <span className="text-muted-foreground">?{gitStats.untracked}</span>
+              {git.ahead > 0 && <span className="text-success">↑{git.ahead}</span>}
+              {git.behind > 0 && <span className="text-danger">↓{git.behind}</span>}
+              {git.dirty > 0 && <span className="text-muted-foreground">~{git.dirty}</span>}
             </span>
           )}
         </div>
       </Section>
 
-      {info?.cwd_path && (
+      {thread.cwd && (
         <div className="text-muted-foreground flex items-center gap-1.5">
           <GitBranch className="size-3.5 shrink-0 opacity-50" />
           <span className="min-w-0 truncate" title={t('cwd')}>
-            {info.cwd_path}
+            {thread.cwd}
           </span>
         </div>
       )}
 
-      {(thread.planMode || info?.plan) && (
+      {(thread.planMode || thread.plan) && (
         <Section title={t('plan')}>
           <p className="flex items-center gap-1.5">
             <span className="text-muted-foreground">{t('plan_mode')}</span>
@@ -433,28 +435,28 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
               {t(thread.planMode ? 'plan_mode_on' : 'plan_mode_off')}
             </span>
           </p>
-          {info?.plan && info.plan.steps.length > 0 && (
+          {thread.plan && thread.plan.steps.length > 0 && (
             <PlanTaskList
               collapsed={planCollapsed}
               onToggle={() => setPlanCollapsed((c) => !c)}
-              plan={info.plan}
+              plan={thread.plan}
             />
           )}
         </Section>
       )}
 
-      {info?.goal && (
+      {thread.goal && (
         <Section title={t('goal')}>
           <p className="flex items-start gap-1.5">
-            <span className="min-w-0 flex-1">{info.goal.objective}</span>
-            <span className="text-muted-foreground shrink-0">{goalStatusLabel(info.goal.status)}</span>
+            <span className="min-w-0 flex-1">{thread.goal.objective}</span>
+            <span className="text-muted-foreground shrink-0">{goalStatusLabel(thread.goal.status)}</span>
           </p>
-          {info.goal.token_budget !== null && (
+          {thread.goal.token_budget !== null && (
             <p className="text-muted-foreground">
-              {formatTokensPi(info.goal.token_budget)}
+              {formatTokensPi(thread.goal.token_budget)}
             </p>
           )}
-          <GoalActions goal={info.goal} sessionId={thread.sessionId} />
+          <GoalActions goal={thread.goal} sessionId={thread.sessionId} />
         </Section>
       )}
 
@@ -464,21 +466,18 @@ export const InfoPanel = ({ thread, models, className }: InfoPanelProps) => {
         trailing={
           <>
             {formatTokens(total)}
-            {thread.cost > 0 && ` · ${formatCost(thread.cost)}`}
+            {info && info.cumulativeCost > 0 && ` · ${formatCost(info.cumulativeCost)}`}
           </>
         }
       >
         {perModel.length > 0 && (
           <div className="space-y-1">
-            {perModel.map(([modelKey, modelUsage], index) => (
+            {perModel.map((row, index) => (
               <ModelUsageRow
-                cost={info?.per_model_cost?.[modelKey] ?? 0}
-                key={modelKey}
+                key={row.model}
                 last={index === perModel.length - 1}
-                lastUsage={info?.per_model_last_usage?.[modelKey]}
                 models={models}
-                modelKey={modelKey}
-                usage={modelUsage}
+                row={row}
               />
             ))}
           </div>

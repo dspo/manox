@@ -50,14 +50,12 @@ export const ConversationView = memo(({
     Math.max(SIDEBAR_MIN_PX, maxSessionListWidth(width)),
   );
 
-  // Restore the info snapshot whenever a thread comes into view; live
-  // plan/cwd/sub-agent events keep it fresh afterwards.
-  useEffect(() => {
-    const threadApi = new ThreadApi(thread.sessionId);
-    threadApi.requestThreadInfo();
-    threadApi.requestUsage();
-  }, [thread.sessionId]);
-
+  // Backwards-paging affordance: true while records exist before the
+  // published window head (§D.2 PageHistory).
+  const hasMore = store.hasMoreHistory(thread.sessionId);
+  // The conversation-info pull (§E.3 Q face) is store-driven: the
+  // committed-message edge from the journal window schedules the debounced
+  // `GetConversationInfo`; no per-view request effects any more.
   const [navigatorOpen, setNavigatorOpen] = useState(false);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   // macOS cmd+m arrives from the host (VS Code keybinding command) and
@@ -133,6 +131,20 @@ export const ConversationView = memo(({
         )}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="relative flex min-h-0 flex-1 flex-col">
+            {/* §D.2 PageHistory: backwards paging through the engine's
+             * prepend data source. Shown while older records exist before
+             * the published window head. */}
+            {hasMore && (
+              <div className="flex justify-center py-1">
+                <button
+                  className="text-muted-foreground hover:text-foreground cursor-pointer rounded-full border border-border px-2.5 py-0.5 text-xs transition-colors"
+                  onClick={() => void store.requestOlder(thread.sessionId)}
+                  type="button"
+                >
+                  {t('load_older')}
+                </button>
+              </div>
+            )}
             <MessageList
               approvalMode={thread.approvalMode}
               backgroundTasks={thread.backgroundTasks}
@@ -172,7 +184,7 @@ export const ConversationView = memo(({
             commands={commands}
             composerInputRef={composerInputRef}
             creating={store.isCreating(thread.sessionId)}
-            currentModelId={thread.currentModelId}
+            currentModelRef={thread.modelRef}
             models={models}
             onOpenTurnNavigator={() => setNavigatorOpen(true)}
             planMode={thread.planMode}
