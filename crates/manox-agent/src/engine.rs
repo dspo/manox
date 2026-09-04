@@ -123,12 +123,73 @@ pub(crate) enum SessionCmd {
         kind: String,
         payload: serde_json::Value,
     },
+    /// Read the whole active chain + cursor (the follow-stream snapshot
+    /// source, §C.3). Answered by the actor, which owns the session; parks
+    /// mid-run like every other session-owned read.
+    JournalSnapshot {
+        reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,
+    },
     /// Close the session and stop the actor.
     Shutdown,
 }
 
 // BackendNotice is the shared facade/backend contract (thread_engine.rs);
 // the actor sends it over the notice channel the facade drains.
+
+/// The thread's journal feed as exposed to the host (session-core follow
+/// streams subscribe to this). `Lagged` is the L5 resync signal: the
+/// subscriber must re-open from a fresh snapshot, never assume silence.
+#[derive(Debug, Clone)]
+pub enum JournalFeed {
+    Event(manox_harness::session::jsonl::JournalEvent),
+    Lagged(u64),
+}
+
+/// One whole-chain journal read (§C.3), answered by the actor.
+#[derive(Debug, Clone)]
+pub struct JournalSnapshotData {
+    pub cursor: u64,
+    pub records: Vec<manox_harness::session::jsonl::JournalRecord>,
+}
+
+/// Relay a session's ordered storage journal broadcast into the
+/// thread-scoped [`JournalFeed`] channel. One relay per live session; the
+/// relay exits when the session's storage drops (a swap closes the channel).
+fn spawn_journal_relay(
+    session: &AgentSession,
+    journal_tx: &tokio::sync::broadcast::Sender<JournalFeed>,
+) {
+    spawn_journal_relay_rx(session.subscribe_journal(), journal_tx.clone());
+}
+
+fn spawn_journal_relay_rx(
+    mut rx: tokio::sync::broadcast::Receiver<manox_harness::session::jsonl::JournalEvent>,
+    journal_tx: tokio::sync::broadcast::Sender<JournalFeed>,
+) {
+    crate::runtime::handle().spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    let _ = journal_tx.send(JournalFeed::Event(event));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let _ = journal_tx.send(JournalFeed::Lagged(n));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Answer a snapshot request from the session's journal read face.
+async fn reply_journal_snapshot(
+    session: &AgentSession,
+    reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,
+) {
+    let cursor = session.journal_cursor().await;
+    let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
+    let _ = reply.send(JournalSnapshotData { cursor, records });
+}
 
 /// Authoritative state the actor writes and the facade mirrors.
 struct EngineState {
@@ -147,6 +208,12 @@ struct EngineState {
     /// Mid-run journal appends park here (same run-owns-the-session rule as
     /// `pending_ui_notes`); the idle loop drains them in arrival order.
     pending_journal: Mutex<Vec<(String, serde_json::Value)>>,
+    /// Mid-run snapshot requests park here (run owns the session); drained
+    /// with `pending_journal` so replies stay in request order.
+    pending_snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<JournalSnapshotData>>>,
+    /// The thread-scoped journal feed (storage broadcasts relayed into it,
+    /// one relay per live session). Session-core follow streams subscribe.
+    journal_tx: tokio::sync::broadcast::Sender<JournalFeed>,
     request_usage: Mutex<HashMap<String, TokenUsage>>,
     /// Usage of each model's most recent request; the context-budget
     /// numerator behind the env card's `used / window` rows.
@@ -502,6 +569,9 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&model_slot),
     ));
+    // The thread-scoped journal feed; session relays publish into it as
+    // sessions come and go (capacity matches the storage broadcast, L5).
+    let (journal_feed_handle, _) = tokio::sync::broadcast::channel::<JournalFeed>(4096);
     let state = Arc::new(EngineState {
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
@@ -509,6 +579,8 @@ pub fn spawn_engine(
         notes_gen: AtomicU64::new(0),
         pending_ui_notes: Mutex::new(Vec::new()),
         pending_journal: Mutex::new(Vec::new()),
+        pending_snapshots: Mutex::new(Vec::new()),
+        journal_tx: journal_feed_handle.clone(),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
         cumulative: Mutex::new(TokenUsage::default()),
@@ -649,6 +721,16 @@ impl ThreadEngine for PiEngine {
 
     fn per_model_cost(&self) -> HashMap<String, f64> {
         self.state.per_model_cost.lock().unwrap().clone()
+    }
+
+    fn subscribe_journal_feed(&self) -> tokio::sync::broadcast::Receiver<JournalFeed> {
+        self.state.journal_tx.subscribe()
+    }
+
+    fn journal_snapshot(&self) -> tokio::sync::oneshot::Receiver<JournalSnapshotData> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.cmd_tx.send(SessionCmd::JournalSnapshot { reply: tx });
+        rx
     }
 
     fn model(&self) -> Option<PiModel> {
@@ -1777,6 +1859,11 @@ where
                         .unwrap()
                         .push((kind, payload));
                 }
+                Some(SessionCmd::JournalSnapshot { reply }) => {
+                    // Read parked with the appends; drained post-settle in
+                    // request order.
+                    state.pending_snapshots.lock().unwrap().push(reply);
+                }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
                     // loop applies it right after settle (P2: a mid-run click
@@ -1849,6 +1936,10 @@ async fn settle_run(
         if let Err(err) = session.append_typed(&kind, payload).await {
             tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
         }
+    }
+    let parked_snapshots = std::mem::take(&mut *state.pending_snapshots.lock().unwrap());
+    for reply in parked_snapshots {
+        reply_journal_snapshot(session, reply).await;
     }
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
@@ -2522,6 +2613,9 @@ async fn run_actor(
             }
         }
     };
+    // The journal relay for this session (exits by itself when a swap drops
+    // the storage; the next establishment spawns its own relay).
+    spawn_journal_relay(&session, &state.journal_tx);
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
     if let Some(project) = &project {
         write_project_sidecar(&sessions_dir, session.path(), project).await;
@@ -2659,6 +2753,10 @@ async fn run_actor(
             if let Err(err) = session.append_typed(&kind, payload).await {
                 tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
             }
+        }
+        let parked_snapshots = std::mem::take(&mut *state.pending_snapshots.lock().unwrap());
+        for reply in parked_snapshots {
+            reply_journal_snapshot(&session, reply).await;
         }
         // A mid-run browser-suite toggle parked itself for the same reason;
         // apply it now that the session is idle again. The guard is dropped
@@ -3242,6 +3340,7 @@ async fn run_actor(
                         // …and earns its own SessionStart on the first turn.
                         state.session_start_fired.store(false, Ordering::SeqCst);
                         session = s;
+                        spawn_journal_relay(&session, &state.journal_tx);
                         // The fresh session is pinned to the facade thread's id.
                         crate::thread_registry::set_active(&thread_id, &thread_id).await;
                         let new_path = session.path().to_path_buf();
@@ -3299,6 +3398,9 @@ async fn run_actor(
                 if let Err(err) = session.append_typed(&kind, payload).await {
                     tracing::warn!(kind = %kind, error = %err, "journal append failed");
                 }
+            }
+            SessionCmd::JournalSnapshot { reply } => {
+                reply_journal_snapshot(&session, reply).await;
             }
             SessionCmd::Shutdown => break,
         }
@@ -3389,6 +3491,8 @@ async fn rebuild_session(
             attach_plugin_hooks(&mut s, &cwd);
             adopt_session_model(&s, pi_model, state);
             *session = s;
+            // The rebuilt session owns a new storage: its own journal relay.
+            spawn_journal_relay(session, &state.journal_tx);
         }
         Err(err) => {
             let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
@@ -5063,6 +5167,53 @@ mod tests {
         }
     }
 
+    /// The journal relay maps storage appends (and Lagged) into the thread
+    /// feed in order — the §C.3 host read face T4's follow streams ride.
+    #[tokio::test]
+    async fn journal_relay_feeds_storage_appends_in_seq_order() {
+        crate::runtime::init();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+            &dir.path().join("s.jsonl"),
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: "s1".into(),
+                cwd: "/t".into(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        let state = test_engine_state();
+        spawn_journal_relay_rx(storage.subscribe_journal(), state.journal_tx.clone());
+        let mut feed = state.journal_tx.subscribe();
+
+        use manox_harness::session::{SessionStorage, SessionTreeEntry};
+        for i in 0..3 {
+            let parent = if i == 0 {
+                None
+            } else {
+                Some(format!("e{}", i - 1))
+            };
+            let parent = parent.as_deref();
+            storage
+                .append_entry(&SessionTreeEntry::TurnStart {
+                    id: format!("e{i}"),
+                    parent_id: parent.map(str::to_string),
+                    timestamp: chrono::Utc::now(),
+                })
+                .await
+                .unwrap();
+        }
+        for want in 0..3u64 {
+            match feed.recv().await.expect("feed event") {
+                JournalFeed::Event(ev) => assert_eq!(ev.seq, want),
+                JournalFeed::Lagged(n) => panic!("unexpected lag {n}"),
+            }
+        }
+    }
+
     fn test_engine_state() -> Arc<EngineState> {
         let cwd = std::env::temp_dir();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
@@ -5076,6 +5227,8 @@ mod tests {
             notes_gen: AtomicU64::new(0),
             pending_ui_notes: Mutex::new(Vec::new()),
             pending_journal: Mutex::new(Vec::new()),
+            pending_snapshots: Mutex::new(Vec::new()),
+            journal_tx: tokio::sync::broadcast::channel(4096).0,
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),

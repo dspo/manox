@@ -627,6 +627,23 @@ impl ThreadHandle {
     }
 }
 
+impl ThreadHandle {
+    /// The thread's journal feed (§C.3 read face for session-core follow
+    /// streams); a pre-engine (landing) thread yields a closed channel.
+    pub fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        self.read(|t| t.subscribe_journal_feed())
+    }
+
+    /// One whole-chain journal read (§C.3). The engine Arc is cloned under
+    /// the read lock and awaited outside it (L1: no lock across await).
+    pub async fn journal_snapshot(&self) -> Option<crate::engine::JournalSnapshotData> {
+        let engine = self.read(|t| t.engine.clone())?;
+        engine.journal_snapshot().await.ok()
+    }
+}
+
 impl Thread {
     /// The startup landing state: a detached thread with no engine. No
     /// session is loaded at launch — the user picks a conversation from the
@@ -1327,6 +1344,26 @@ impl Thread {
             .as_ref()
             .map(|e| e.cumulative_cost())
             .unwrap_or(0.0)
+    }
+
+    /// The thread's journal feed (§C.3 read face for session-core follow
+    /// streams); a pre-engine (landing) thread yields a closed channel.
+    pub fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        self.engine
+            .as_ref()
+            .map(|e| e.subscribe_journal_feed())
+            .unwrap_or_else(|| tokio::sync::broadcast::channel(1).0.subscribe())
+    }
+
+    /// One whole-chain journal read (§C.3); `None` when no engine is
+    /// materialized yet.
+    pub async fn journal_snapshot(&self) -> Option<crate::engine::JournalSnapshotData> {
+        match &self.engine {
+            Some(engine) => engine.journal_snapshot().await.ok(),
+            None => None,
+        }
     }
 
     pub fn per_model_cost(&self) -> HashMap<String, f64> {
