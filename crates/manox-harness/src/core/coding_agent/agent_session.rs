@@ -844,6 +844,32 @@ impl AgentSession {
         self.harness.session().append_typed(kind, payload).await
     }
 
+    /// Subscribe to this session's ordered journal appends (the §C.3 read
+    /// face; the host relays this to session-core's follow streams).
+    pub fn subscribe_journal(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::session::jsonl::JournalEvent> {
+        self.harness.session().storage().subscribe_journal()
+    }
+
+    /// The journal cursor (seq of the active leaf).
+    pub async fn journal_cursor(&self) -> u64 {
+        self.harness.session().storage().journal_cursor().await
+    }
+
+    /// Read a seq range off the active chain (inclusive, clamped).
+    pub async fn journal_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Result<Vec<crate::session::jsonl::JournalRecord>, anyhow::Error> {
+        self.harness
+            .session()
+            .storage()
+            .journal_range(from_seq, to_seq)
+            .await
+    }
+
     /// The compaction-aware active entry list (every entry type, in tree
     /// order) — the display projection source for host UI mirrors.
     pub async fn context_entries(
