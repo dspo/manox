@@ -15,6 +15,8 @@ pub mod dispatch;
 pub mod external_session;
 pub mod git_status;
 pub mod i18n;
+pub mod journal_fold;
+pub mod journal_translate;
 pub mod menu;
 pub mod multiplexer;
 pub(crate) mod overlap_diag;

@@ -2128,21 +2128,114 @@ impl Workspace {
     /// one-shot; actors await readiness themselves). A project binds at
     /// construction time — a single session creation, no orphaned session
     /// file.
+    ///
+    /// T6: the double path is deleted. The workspace no longer pre-builds a
+    /// local `Thread` and then attaches the AgentServer session to the same
+    /// id (two `Thread::new_*` calls on one id, both racing to materialize the
+    /// session file). It now sends the §D.2 `CreateSession` intent (the full
+    /// `{cwd, project?, initial_model?}` so the server owns creation) and,
+    /// when the server's `{session_id}` receipt lands, binds a detached
+    /// rendering mirror to that server-minted id and opens the follow stream.
+    /// Creation happens exactly once — on the server.
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = ThreadId(uuid::Uuid::new_v4().to_string());
-        let new = match &project {
-            Some(dir) => Thread::new_in_project(id, dir.clone()),
-            None => Thread::new_fresh(id, self.cwd.clone()),
+        // The park/draft bookkeeping is identical to `attach_thread`'s switch
+        // arm, but there is no outgoing-thread double-bind to preserve: the
+        // outgoing thread is detached on the park, the incoming id is unknown
+        // until the receipt.
+        let model = self
+            .thread
+            .read(|t| t.model().map(|m| format!("{}/{}", m.provider, m.id)));
+        let approval = serde_json::to_value(self.store.as_ref().map_or_else(
+            || self.thread.read(|t| t.permission_mode()),
+            |s| s.read(cx).store.with(|st| st.permission_mode),
+        ))
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+        let effort = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.with(|st| st.reasoning_effort))
+            .unwrap_or_else(|| self.thread.read(|t| t.reasoning_effort()));
+        let effort_str = match effort {
+            manox_agent::language_model::ReasoningEffort::High => Some("high".to_string()),
+            manox_agent::language_model::ReasoningEffort::Max => Some("max".to_string()),
         };
-        if let Some(dir) = &project {
-            Self::register_project_in_store(dir, cx);
-        }
-        self.attach_thread(new, false, window, cx);
+        let cwd = project
+            .as_ref()
+            .unwrap_or(&self.cwd)
+            .to_string_lossy()
+            .to_string();
+        let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
+        let ws = cx.weak_entity();
+        let dir_for_store = project.clone();
+        self.multiplexer.update(cx, |m, _| {
+            m.create_session_intent(
+                (project.is_none()).then(|| cwd.clone()),
+                project_str.clone(),
+                model,
+                approval,
+                effort_str,
+                Box::new(move |done, cx| {
+                    let sid = match done {
+                        crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
+                            session_id
+                        }
+                        crate::multiplexer::CreateSessionDone::Failed { message } => {
+                            tracing::warn!(error = %message, "CreateSession intent failed");
+                            return;
+                        }
+                    };
+                    // Defer the workspace bind out of the multiplexer's
+                    // update borrow: the intent callback runs inside the mux
+                    // pump, and `attach_created_session` re-enters the mux
+                    // (`open_or_create`), so it must land on a later tick.
+                    cx.spawn(async move |_, cx| {
+                        if let Some(dir) = &dir_for_store {
+                            let _ = ws.update(cx, |_ws, cx| {
+                                Workspace::register_project_in_store(dir, cx);
+                            });
+                        }
+                        let _ = ws.update_in(cx, |this, window, cx| {
+                            this.attach_created_session(&sid, window, cx);
+                        });
+                    })
+                    .detach();
+                }),
+            );
+        });
+        let _ = window;
+    }
+
+    /// Attach the workspace to a freshly created session (whose id the server
+    /// minted): reuse the standard switch bookkeeping (`attach_thread` parks
+    /// the outgoing thread, restores drafts/queues) against a thread handle
+    /// for the new id, then re-open — `open_or_create(reopen = true)`
+    /// idempotently re-runs `OpenSession` and binds the follow stream that
+    /// the create intent already opened. The handle is either the live
+    /// server-side thread (when present) or a detached *rendering mirror*
+    /// (a landing thread, no engine — the server owns the transcript, so no
+    /// second actor ever races the session file).
+    fn attach_created_session(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = manox_agent::thread_store::global();
+        let thread = store
+            .with_mut(|s| {
+                s.live_thread(session_id)
+                    .or_else(|| s.load_thread(session_id))
+            })
+            .unwrap_or_else(|| {
+                Thread::landing_with_id(ThreadId(session_id.to_string()), self.cwd.clone())
+            });
+        self.attach_thread(thread, true, window, cx);
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -4121,7 +4214,7 @@ impl Workspace {
         let worktree_branch = self
             .store
             .as_ref()
-            .and_then(|s| s.read(cx).store.branch.clone());
+            .and_then(|s| s.read(cx).store.with(|st| st.branch.clone()));
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
             // file writes into a single git call.
@@ -4312,13 +4405,14 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.permission_mode)
             .unwrap_or_else(|| old.read(|t| t.permission_mode()));
-        let new = match &project {
-            Some(dir) => {
-                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
-            }
-            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
-        };
+        // T6: detached rendering mirror (see `start_new_thread`) — no
+        // pre-spawned engine; the inherited state rides the facade and the
+        // session materializes server-side on first submit.
+        let new = Thread::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd);
         new.with_mut(|t| {
+            if let Some(dir) = &project {
+                t.restore_project(dir.clone());
+            }
             if let Some(model) = model {
                 t.set_model(model.clone());
             }
@@ -4578,12 +4672,7 @@ impl Workspace {
         };
         if hit {
             let submit_text = format!("/{key} {args}");
-            let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                session_id: sid.into(),
-                text: submit_text,
-                images: Vec::new(),
-                client_id: None,
-            });
+            let _ = self.send_submit_v2(submit_text, Vec::new(), cx);
         } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
@@ -4766,12 +4855,7 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: turn.text.clone(),
-            images: attachments,
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -4841,13 +4925,11 @@ impl Workspace {
                     images: attachments,
                 });
             } else {
-                // Last: insert + start the turn.
-                let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                    session_id: sid.into(),
-                    text: turn.text.clone(),
-                    images: attachments,
-                    client_id: None,
-                });
+                // Last: insert + start the turn. The v2 Submit carries the
+                // origin_rpc so the optimistic bubble retires when the durable
+                // user row lands (batched predecessors insert without a turn
+                // via the compat note and have no echo to retire).
+                let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
             }
         }
         refresh_thread_list();
@@ -5784,12 +5866,7 @@ impl Workspace {
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: text.clone(),
-            images: Vec::new(),
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(text.clone(), Vec::new(), cx);
         refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -5844,12 +5921,24 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn model_label(&self, _cx: &mut Context<Self>) -> String {
+    pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
         {
-            self.thread
-                .read(|t| t.model().cloned())
-                .map(|model| manox_agent::provider_glue::display_name(&model))
-                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+            // Selector read face (§J11): the composer model chip derives from
+            // the store's projection-materialized model, falling back to the
+            // bound thread mirror only while no projection has landed yet.
+            self.store
+                .as_ref()
+                .and_then(|s| {
+                    s.read(cx)
+                        .store
+                        .with(|st| st.model_name.clone().or_else(|| st.model_id.clone()))
+                })
+                .unwrap_or_else(|| {
+                    self.thread
+                        .read(|t| t.model().cloned())
+                        .map(|model| manox_agent::provider_glue::display_name(&model))
+                        .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+                })
         }
     }
 
@@ -6176,6 +6265,39 @@ impl Workspace {
         } else {
             false
         }
+    }
+
+    /// v2 §D.2 submit path: mint an `origin_rpc` correlation id, register the
+    /// optimistic echo in the foreground store, and send the
+    /// [`ClientCall::Submit`] (receipt-only per L7 — the durable user row
+    /// arrives through the follow stream and retires the echo by matching its
+    /// `originRpc`). The conversation's optimistic bubble was already pushed by
+    /// the caller; retirement just clears the store's echo bookkeeping so the
+    /// row is not treated as a remote (unmatched) insertion.
+    ///
+    /// Returns `true` when the submit rode the connection (session bound).
+    pub(crate) fn send_submit_v2(
+        &mut self,
+        text: String,
+        images: Vec<manox_protocol::ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sid) = self.session_id.clone() else {
+            return false;
+        };
+        let origin_rpc = uuid::Uuid::new_v4().to_string();
+        if let Some(store) = self.store.as_ref() {
+            store.update(cx, |h, _| {
+                h.store.push_echo(&origin_rpc, text.clone());
+            });
+        }
+        self.client.send_call(manox_protocol::ClientCall::Submit {
+            session_id: sid,
+            text,
+            images,
+            origin_rpc: Some(origin_rpc),
+        });
+        true
     }
 
     /// Toggle plan mode on the current thread (persisted by the engine).
@@ -7507,10 +7629,13 @@ impl Workspace {
     /// on the right). The popover is `w(360)` to fit the longest bilingual
     /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Selector read face (§J11): the composer's access chip derives its
+        // permission mode through `ClientStore::with` instead of reaching the
+        // field directly.
         let mode = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.permission_mode)
+            .map(|s| s.read(cx).store.with(|st| st.permission_mode))
             .expect("foreground store present");
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
@@ -8625,7 +8750,7 @@ impl Workspace {
             let s = self
                 .store
                 .as_ref()
-                .map(|s| s.read(cx).store.display_title.clone())
+                .map(|s| s.read(cx).store.with(|st| st.display_title.clone()))
                 .expect("foreground store present");
             if s.is_empty() { "manox".to_string() } else { s }
         }
@@ -10513,6 +10638,87 @@ mod tests {
         assert_eq!(rebound.2, new_id, "foreground thread swapped");
         drop(ws);
         drop(visual);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// T6: `start_new_thread` deletes the local pre-build — the session is
+    /// created server-side via the §D.2 `CreateSession` intent, and when the
+    /// `{session_id}` receipt lands the workspace binds to that server-minted
+    /// id (store + thread + session all agree, and it is NOT the landing id).
+    #[gpui::test]
+    fn start_new_thread_creates_via_intent_and_binds_server_id(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-intent-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+        let landing_id = ws.read_with(&visual, |ws, _| ws.thread.read(|t| t.id.0.clone()));
+
+        // Fire the intent-driven new-thread creation.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.start_new_thread(None, window, cx));
+        });
+
+        // The receipt + bind is async (server task → gpui pump); park until the
+        // session id moves off the landing id (bounded wait).
+        for i in 0..400 {
+            cx.run_until_parked();
+            if i % 40 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            let rebound = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if rebound.as_deref() != Some(landing_id.as_str()) && rebound.is_some() {
+                break;
+            }
+        }
+        let (session, store_id, thread_id) = ws.read_with(&visual, |ws, cx| {
+            (
+                ws.session_id.clone(),
+                ws.store.as_ref().map(|s| s.read(cx).store.id.0.clone()),
+                ws.thread.read(|t| t.id.0.clone()),
+            )
+        });
+        let new_id = session.expect("session bound after the create receipt");
+        assert_ne!(
+            new_id.as_str(),
+            landing_id.as_str(),
+            "server minted a new id"
+        );
+        assert_eq!(
+            store_id.as_deref(),
+            Some(new_id.as_str()),
+            "store follows the new id"
+        );
+        assert_eq!(
+            thread_id, new_id,
+            "foreground mirror binds to the server id"
+        );
+        drop(ws);
+        drop(visual);
+        let _ = std::fs::remove_file(&db_path);
         manox_agent::thread_store::drop_global_for_test();
     }
 }
