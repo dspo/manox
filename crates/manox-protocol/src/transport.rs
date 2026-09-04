@@ -64,12 +64,9 @@ impl ServerNote {
     /// migration.
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         match self {
-            ServerNote::AgentText { .. }
-            | ServerNote::AgentThinking { .. }
-            | ServerNote::ToolOutput { .. }
-            | ServerNote::ThreadHistory { .. }
-            | ServerNote::ModelText { .. }
-            | ServerNote::ModelThinking { .. } => BackpressurePolicy::Drop,
+            ServerNote::ModelText { .. } | ServerNote::ModelThinking { .. } => {
+                BackpressurePolicy::Drop
+            }
             _ => BackpressurePolicy::Disconnect,
         }
     }
@@ -84,45 +81,9 @@ impl ServerNote {
     pub fn session_id(&self) -> Option<&str> {
         use ServerNote::*;
         match self {
-            SessionCreated { session_id, .. }
-            | SessionDisposed { session_id, .. }
-            | TurnStarted { session_id, .. }
-            | TurnFinished { session_id, .. }
-            | Stop { session_id, .. }
-            | AgentText { session_id, .. }
-            | AgentThinking { session_id, .. }
-            | ToolCall { session_id, .. }
-            | ToolResult { session_id, .. }
-            | ToolOutput { session_id, .. }
-            | ThreadHistory { session_id, .. }
-            | ThreadInfo { session_id, .. }
-            | Usage { session_id, .. }
-            | UsageSnapshot { session_id, .. }
-            | CurrentModel { session_id, .. }
-            | PlanReady { session_id, .. }
-            | PlanUpdated { session_id, .. }
-            | PlanModeChanged { session_id, .. }
-            | GoalChanged { session_id, .. }
-            | CwdChanged { session_id, .. }
-            | PermissionModeChanged { session_id, .. }
-            | ReasoningEffortChanged { session_id, .. }
-            | BrowserSuitesChanged { session_id, .. }
-            | CompactionStarted { session_id, .. }
-            | Compaction { session_id, .. }
-            | CacheInvalidation { session_id, .. }
-            | SubagentStarted { session_id, .. }
-            | SubagentProgress { session_id, .. }
-            | SubagentChild { session_id, .. }
-            | BackgroundTaskUpdated { session_id, .. }
-            | SteerPending { session_id, .. }
-            | SteerInjected { session_id, .. }
-            | ApprovalDecision { session_id, .. }
-            | Branch { session_id, .. }
-            | GitStats { session_id, .. }
-            | HistoryProgress { session_id, .. }
-            | Retry { session_id, .. }
-            | PeerMessage { session_id, .. }
-            | TokenUsage { session_id, .. } => Some(session_id),
+            SessionCreated { session_id, .. } | SessionDisposed { session_id, .. } => {
+                Some(session_id)
+            }
             Error { session_id, .. } => session_id.as_deref(),
             Ready
             | Models { .. }
@@ -289,11 +250,11 @@ mod tests {
         // Fill the single buffer slot with a Disconnect-policy note —
         // send_blocking succeeds immediately while space exists.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnStarted {
+            note: ServerNote::SessionCreated {
                 session_id: "s1".into(),
             },
         });
-        // The buffer is full: a streaming note is dropped by policy, not
+        // The buffer is full: a streaming side-note is dropped by policy, not
         // queued — the connection stays up.
         server.send_to_client(FromServer::Notification {
             note: ServerNote::ModelThinking {
@@ -305,7 +266,7 @@ mod tests {
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnStarted { .. }
+                note: ServerNote::SessionCreated { .. }
             }
         ));
         // The dropped note never occupied a slot: the next receive is empty
@@ -313,17 +274,17 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Space freed: a further control note is delivered in order.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnFinished {
-                session_id: "s1".into(),
-                cancelled: false,
-                failed: false,
-                stranded_steer_ids: Vec::new(),
+            note: ServerNote::ModelToolCall {
+                request_id: "r1".into(),
+                id: "tc1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
             },
         });
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnFinished { .. }
+                note: ServerNote::ModelToolCall { .. }
             }
         ));
     }
@@ -353,15 +314,15 @@ mod tests {
     #[test]
     fn streaming_note_drops_when_full_control_disconnects() {
         assert_eq!(
-            ServerNote::AgentText {
-                session_id: "t".into(),
+            ServerNote::ModelText {
+                request_id: "r".into(),
                 text: "x".into()
             }
             .backpressure_policy(),
             BackpressurePolicy::Drop
         );
         assert_eq!(
-            ServerNote::TurnStarted {
+            ServerNote::SessionCreated {
                 session_id: "t".into()
             }
             .backpressure_policy(),

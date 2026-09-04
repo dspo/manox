@@ -1039,7 +1039,6 @@ impl AgentServerInner {
                 t.set_reasoning_effort(effort);
             }
         });
-        let mode = thread.read(|t| t.permission_mode());
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(StdMutex::new(Vec::new()));
         let pump = spawn_pump(
@@ -1066,16 +1065,10 @@ impl AgentServerInner {
                 session_id: session_id.clone(),
             },
         );
-        inner.route_note(
-            &session_id,
-            ServerNote::PermissionModeChanged {
-                session_id: session_id.clone(),
-                mode: serde_json::to_value(mode)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default(),
-            },
-        );
+        // T10 (§D.6): the create-time `PermissionModeChanged` mirror is gone —
+        // the mode rides the follow-stream snapshot's `permission_mode`
+        // projection (seeded from the live thread) and the
+        // `permissionModeChange` journal entry on later changes.
         Ok(json!({ "session_id": session_id }))
     }
 
@@ -1270,7 +1263,7 @@ impl AgentServerInner {
             .lock()
             .unwrap()
             .retain(|q| q.client_id != message_id);
-        let steer_pending: Option<String> = thread.with_mut(|t| {
+        thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
@@ -1278,25 +1271,16 @@ impl AgentServerInner {
             };
             let content = to_message_content(text, images);
             if t.is_running() {
-                Some(t.enqueue_steer(content, Some(ui)))
+                t.enqueue_steer(content, Some(ui));
             } else {
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();
-                None
             }
         });
-        // Emit outside the write lock so the thread stays available to the
-        // engine pump while the SteerPending note is delivered.
-        if let Some(id) = steer_pending {
-            self.route_note(
-                session_id,
-                ServerNote::SteerPending {
-                    session_id: session_id.into(),
-                    client_id: message_id.clone(),
-                    message_id: id,
-                },
-            );
-        }
+        // T10 (§D.6): the `SteerPending` note mirror is gone — the steer's
+        // durable identity is the `message` journal row (`originRpc` echo
+        // retirement for the submitting client; every owner sees the row on
+        // the follow stream).
         Ok(json!({
             "accepted": true,
             "message_id": message_id,
@@ -4032,18 +4016,17 @@ mod tests {
         };
         let a_pending = drain(&client_a);
         let b_pending = drain(&client_b);
-        // Spec: (1) neither owner sees a doomed-note Notification — translate
-        // no longer mirrors any session-domain note for the turn edge;
+        // Spec: (1) neither owner sees a domain-note Notification — translate
+        // no longer mirrors any session-domain note for the turn edge (the
+        // turn arms are gone from the enum post-T10; `Error` survives as the
+        // server-originated channel, which translate must not use either);
         // (2) every session-scoped host frame a or b holds belongs to sa —
         // only sa's engine is wired, so no foreign session can leak.
         let doomed = |m: &FromServer| {
             matches!(
                 m,
                 FromServer::Notification {
-                    note: ServerNote::TurnStarted { .. }
-                        | ServerNote::TurnFinished { .. }
-                        | ServerNote::Stop { .. }
-                        | ServerNote::Error { .. }
+                    note: ServerNote::Error { .. }
                 }
             )
         };

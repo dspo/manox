@@ -53,7 +53,4 @@ pub use stream::{
     StreamFrame, StreamKind,
 };
 pub use transport::{InProcessConnection, RpcConnection, RpcPeer, in_process_pair};
-pub use wire::{
-    ModelInfo, ThreadListItem, WireContentBlock, WireMessage, WireMessageAuthor,
-    WireMessageProvenance, WireMessageUi, WireRole, WireToolResult, WireToolUse,
-};
+pub use wire::{ModelInfo, ThreadListItem};

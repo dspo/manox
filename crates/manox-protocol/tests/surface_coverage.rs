@@ -15,12 +15,11 @@
 //! frame *construction* under test changes, never the tables.
 
 use manox_protocol::journal::JournalWireEntry;
-use manox_protocol::server::{ThreadInfoPayload, TokenUsageSnapshot};
 use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame};
 use manox_protocol::surface::{
-    CLIENT_CALLS, CLIENT_NOTES, DOOMED_SERVER_NOTES, FRAMES, HOST_EVENTS, JOURNAL_ENTRIES,
-    PROJECTION_KEYS, SERVER_CALLS, SERVER_NOTES, frame_samples, host_samples, journal_samples,
-    scripted_host_events, scripted_session, stream_end_samples,
+    CLIENT_CALLS, CLIENT_NOTES, FRAMES, HOST_EVENTS, JOURNAL_ENTRIES, PROJECTION_KEYS,
+    SERVER_CALLS, SERVER_NOTES, frame_samples, host_samples, journal_samples, scripted_host_events,
+    scripted_session, stream_end_samples,
 };
 use manox_protocol::wire::{ModelInfo, ThreadListItem};
 use manox_protocol::{
@@ -376,33 +375,6 @@ fn server_call_samples() -> Vec<(String, ServerCall)> {
     ]
 }
 
-fn thread_info_stub() -> Box<ThreadInfoPayload> {
-    Box::new(ThreadInfoPayload {
-        cwd: "/proj".into(),
-        project: None,
-        display_title: "t".into(),
-        model_id: Some("m".into()),
-        model_name: None,
-        model: None,
-        permission_mode: "read-only".into(),
-        reasoning_effort: "low".into(),
-        pinned: false,
-        archived: false,
-        depth: 0,
-        agent_label: "lead".into(),
-        self_author: "captain".into(),
-        cwd_path: None,
-        branch: None,
-        goal: None,
-        goal_elapsed_seconds: None,
-        plan_mode: false,
-        browser_suites: vec![],
-        history_phase: "ready".into(),
-        running: false,
-        has_interacted: false,
-    })
-}
-
 fn model_stub() -> ModelInfo {
     ModelInfo {
         id: "deepseek-chat".into(),
@@ -434,7 +406,8 @@ fn thread_stub() -> ThreadListItem {
     }
 }
 
-/// One instance per declared `ServerNote` arm, in table order.
+/// One instance per declared `ServerNote` arm, in table order. T10 (§D.6):
+/// the doomed arms are deleted; this is the retained face.
 fn server_note_samples() -> Vec<(String, ServerNote)> {
     use ServerNote::*;
     vec![
@@ -449,88 +422,6 @@ fn server_note_samples() -> Vec<(String, ServerNote)> {
             "sessionDisposed".into(),
             SessionDisposed {
                 session_id: "s1".into(),
-            },
-        ),
-        (
-            "turnStarted".into(),
-            TurnStarted {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "turnFinished".into(),
-            TurnFinished {
-                session_id: "s1".into(),
-                cancelled: false,
-                failed: false,
-                stranded_steer_ids: vec![],
-            },
-        ),
-        (
-            "stop".into(),
-            Stop {
-                session_id: "s1".into(),
-                reason: None,
-            },
-        ),
-        (
-            "agentText".into(),
-            AgentText {
-                session_id: "s1".into(),
-                text: "x".into(),
-            },
-        ),
-        (
-            "agentThinking".into(),
-            AgentThinking {
-                session_id: "s1".into(),
-                text: "x".into(),
-            },
-        ),
-        (
-            "toolCall".into(),
-            ToolCall {
-                session_id: "s1".into(),
-                id: "tc".into(),
-                name: "Bash".into(),
-                title: "ls".into(),
-                status: "pending".into(),
-                input: None,
-            },
-        ),
-        (
-            "toolResult".into(),
-            ToolResult {
-                session_id: "s1".into(),
-                id: "tc".into(),
-                output: "o".into(),
-                is_error: false,
-            },
-        ),
-        (
-            "toolOutput".into(),
-            ToolOutput {
-                session_id: "s1".into(),
-                id: "tc".into(),
-                chunk: "c".into(),
-            },
-        ),
-        (
-            "threadHistory".into(),
-            ThreadHistory {
-                session_id: "s1".into(),
-                messages: vec![],
-                display_history: serde_json::json!([]),
-                auto_approved_tools: None,
-                restored: true,
-                loading: false,
-            },
-        ),
-        (
-            "threadInfo".into(),
-            ThreadInfo {
-                session_id: "s1".into(),
-                info: thread_info_stub(),
             },
         ),
         (
@@ -549,218 +440,6 @@ fn server_note_samples() -> Vec<(String, ServerNote)> {
             "commands".into(),
             Commands {
                 commands: serde_json::json!([]),
-            },
-        ),
-        (
-            "usage".into(),
-            Usage {
-                session_id: "s1".into(),
-                usage: serde_json::json!({}),
-                cost: 0.0,
-            },
-        ),
-        (
-            "usageSnapshot".into(),
-            UsageSnapshot {
-                session_id: "s1".into(),
-                cumulative: TokenUsageSnapshot {
-                    input: 0,
-                    output: 0,
-                    cache_creation: 0,
-                    cache_read: 0,
-                },
-                per_model: Default::default(),
-                cumulative_cost: 0.0,
-                per_model_cost: Default::default(),
-                per_request: Default::default(),
-            },
-        ),
-        (
-            "currentModel".into(),
-            CurrentModel {
-                session_id: "s1".into(),
-                id: None,
-                name: None,
-            },
-        ),
-        (
-            "planReady".into(),
-            PlanReady {
-                session_id: "s1".into(),
-                plan_file: "/p.md".into(),
-                title: "P".into(),
-                content: None,
-            },
-        ),
-        (
-            "planUpdated".into(),
-            PlanUpdated {
-                session_id: "s1".into(),
-                snapshot: None,
-            },
-        ),
-        (
-            "planModeChanged".into(),
-            PlanModeChanged {
-                session_id: "s1".into(),
-                enabled: false,
-            },
-        ),
-        (
-            "goalChanged".into(),
-            GoalChanged {
-                session_id: "s1".into(),
-                snapshot: None,
-            },
-        ),
-        (
-            "cwdChanged".into(),
-            CwdChanged {
-                session_id: "s1".into(),
-                path: "/p".into(),
-            },
-        ),
-        (
-            "permissionModeChanged".into(),
-            PermissionModeChanged {
-                session_id: "s1".into(),
-                mode: "m".into(),
-            },
-        ),
-        (
-            "reasoningEffortChanged".into(),
-            ReasoningEffortChanged {
-                session_id: "s1".into(),
-                effort: "low".into(),
-            },
-        ),
-        (
-            "browserSuitesChanged".into(),
-            BrowserSuitesChanged {
-                session_id: "s1".into(),
-                suites: vec![],
-            },
-        ),
-        (
-            "compactionStarted".into(),
-            CompactionStarted {
-                session_id: "s1".into(),
-                tokens_before: 1,
-            },
-        ),
-        (
-            "compaction".into(),
-            Compaction {
-                session_id: "s1".into(),
-                summary: "s".into(),
-                retained: serde_json::json!([]),
-            },
-        ),
-        (
-            "cacheInvalidation".into(),
-            CacheInvalidation {
-                session_id: "s1".into(),
-                reprocessed_tokens: 2,
-            },
-        ),
-        (
-            "subagentStarted".into(),
-            SubagentStarted {
-                session_id: "s1".into(),
-                id: "sa".into(),
-                agent_type: "explore".into(),
-                description: "d".into(),
-            },
-        ),
-        (
-            "subagentProgress".into(),
-            SubagentProgress {
-                session_id: "s1".into(),
-                id: "sa".into(),
-                agent_type: "explore".into(),
-                tool_uses: 1,
-                latest_activity: None,
-                status: "running".into(),
-            },
-        ),
-        (
-            "subagentChild".into(),
-            SubagentChild {
-                session_id: "s1".into(),
-                id: "sa".into(),
-                event: serde_json::json!({}),
-            },
-        ),
-        (
-            "backgroundTaskUpdated".into(),
-            BackgroundTaskUpdated {
-                session_id: "s1".into(),
-                snapshot: serde_json::json!({}),
-            },
-        ),
-        (
-            "steerPending".into(),
-            SteerPending {
-                session_id: "s1".into(),
-                client_id: "c".into(),
-                message_id: "m".into(),
-            },
-        ),
-        (
-            "steerInjected".into(),
-            SteerInjected {
-                session_id: "s1".into(),
-                message_id: "m".into(),
-            },
-        ),
-        (
-            "approvalDecision".into(),
-            ApprovalDecision {
-                session_id: "s1".into(),
-                tool_call_id: "tc".into(),
-                tool_name: "Bash".into(),
-                tool_title: "ls".into(),
-                verdict: "allow".into(),
-                reason: None,
-            },
-        ),
-        (
-            "branch".into(),
-            Branch {
-                session_id: "s1".into(),
-                branch: "main".into(),
-            },
-        ),
-        (
-            "gitStats".into(),
-            GitStats {
-                session_id: "s1".into(),
-                stats: serde_json::json!({}),
-            },
-        ),
-        (
-            "historyProgress".into(),
-            HistoryProgress {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "retry".into(),
-            Retry {
-                session_id: "s1".into(),
-                attempt: 1,
-                max_attempts: 2,
-                delay_secs: 1,
-                reason: "overloaded".into(),
-                detail: None,
-            },
-        ),
-        (
-            "peerMessage".into(),
-            PeerMessage {
-                session_id: "s1".into(),
-                from: "p".into(),
-                content: "c".into(),
             },
         ),
         (
@@ -792,16 +471,6 @@ fn server_note_samples() -> Vec<(String, ServerNote)> {
                 request_id: "r".into(),
                 stop: None,
                 error: None,
-            },
-        ),
-        (
-            "tokenUsage".into(),
-            TokenUsage {
-                session_id: "s1".into(),
-                input: 1,
-                output: 1,
-                cache_creation: 0,
-                cache_read: 0,
             },
         ),
         (
@@ -1057,20 +726,24 @@ fn snapshot_projects_every_declared_projection_key() {
     assert_eq!(snap.projections.len(), PROJECTION_KEYS.len());
 }
 
-/// §D.6: the doomed set stays a strict subset of the live server-note
-/// vocabulary, and survives the full walk above (they still work — T10
-/// deletes them).
+/// §D.6 (T10 removal pass): a deleted arm must not resurface — an unknown
+/// `ServerNote` method is a deserialize error, and the retained-face walk
+/// above keeps the table, the samples, and the enum in lockstep.
 #[test]
-fn doomed_server_notes_are_declared_and_still_functional() {
-    assert!(DOOMED_SERVER_NOTES.len() < SERVER_NOTES.len());
-    for name in DOOMED_SERVER_NOTES {
-        assert!(SERVER_NOTES.contains(name));
+fn doomed_server_notes_are_gone() {
+    for name in [
+        "agentText",
+        "threadHistory",
+        "usageSnapshot",
+        "steerPending",
+    ] {
+        assert!(!SERVER_NOTES.contains(&name), "{name} resurfaced");
     }
-    // A doomed arm still round-trips (migration window keeps it honest).
-    let sample = ServerNote::AgentText {
-        session_id: "s1".into(),
-        text: "x".into(),
-    };
-    let back: ServerNote = serde_json::from_value(serde_json::to_value(&sample).unwrap()).unwrap();
-    assert_eq!(sample, back);
+    let err = serde_json::from_value::<ServerNote>(serde_json::json!({
+        "method": "agentText",
+        "sessionId": "s1",
+        "text": "x",
+    }))
+    .expect_err("agentText must no longer deserialize");
+    assert!(format!("{err}").contains("agentText") || format!("{err}").contains("variant"));
 }

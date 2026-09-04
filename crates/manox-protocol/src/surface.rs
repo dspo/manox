@@ -21,9 +21,11 @@
 //! The current call surface (the v1 `ClientCall` / `ClientNote` / `ServerCall`
 //! variants that survive into v2 per §D.2–D.4) is declared as auxiliary
 //! tables ([`CLIENT_CALLS`], [`CLIENT_NOTES`], [`SERVER_CALLS`],
-//! [`SERVER_NOTES`] + [`DOOMED_SERVER_NOTES`]) so the same coverage test can
-//! walk them; §D.2/D.3 v2 upgrades (`originRpc`, `PageHistory`, …) land with
-//! the T4/T5 envelope migration (stop-rule notes in the T2 delivery report).
+//! [`SERVER_NOTES`]) so the same coverage test can walk them; §D.2/D.3 v2
+//! upgrades (`originRpc`, `PageHistory`, …) land with the T4/T5 envelope
+//! migration (stop-rule notes in the T2 delivery report). The §D.6 doomed
+//! `ServerNote` arms were deleted at T10; the `SERVER_NOTES` table is the
+//! post-removal retained face.
 
 use crate::journal::{JournalWireEntry, JournalWireEvent, UsagePayload};
 use crate::stream::{ProjectionsFrame, SessionSnapshot, StreamEndReason, StreamFrame, StreamKind};
@@ -192,109 +194,24 @@ pub const SERVER_CALLS: &[&str] = &[
     "openExternal",
 ];
 
-/// The full current `ServerNote` method vocabulary (the migration window
-/// keeps it; the §D.6 doomed arms are marked below).
+/// The retained `ServerNote` method vocabulary (post-T10, §D.6 removal pass
+/// complete): owner control (`ready` / `sessionCreated` / `sessionDisposed`),
+/// the transitional registry-push list channel (`threadsUpdated` / `models` /
+/// `commands`), the server-originated `error`, and the `model_chat`
+/// side-stream (`modelText` / `modelThinking` / `modelToolCall` /
+/// `modelChatDone`, §K.6). The former [`DOOMED_SERVER_NOTES`] death list is
+/// deleted — its arms no longer exist.
 pub const SERVER_NOTES: &[&str] = &[
     "ready",
     "sessionCreated",
     "sessionDisposed",
-    "turnStarted",
-    "turnFinished",
-    "stop",
-    "agentText",
-    "agentThinking",
-    "toolCall",
-    "toolResult",
-    "toolOutput",
-    "threadHistory",
-    "threadInfo",
     "threadsUpdated",
     "models",
     "commands",
-    "usage",
-    "usageSnapshot",
-    "currentModel",
-    "planReady",
-    "planUpdated",
-    "planModeChanged",
-    "goalChanged",
-    "cwdChanged",
-    "permissionModeChanged",
-    "reasoningEffortChanged",
-    "browserSuitesChanged",
-    "compactionStarted",
-    "compaction",
-    "cacheInvalidation",
-    "subagentStarted",
-    "subagentProgress",
-    "subagentChild",
-    "backgroundTaskUpdated",
-    "steerPending",
-    "steerInjected",
-    "approvalDecision",
-    "branch",
-    "gitStats",
-    "historyProgress",
-    "retry",
-    "peerMessage",
     "modelText",
     "modelThinking",
     "modelToolCall",
     "modelChatDone",
-    "tokenUsage",
-    "error",
-];
-
-/// The §D.6 death list: `ServerNote` arms whose durable successors are
-/// journal entries / projections / host events / snapshot boundaries. They
-/// stay functional through the migration window (T4–T9) and are deleted at
-/// T10. `PlanReady` is listed in §D.6 with a "?" — kept *not* doomed per the
-/// spec's own uncertainty marker (it has no journal/projection successor
-/// today; T10 removes it only if §D.6 finalizes it).
-pub const DOOMED_SERVER_NOTES: &[&str] = &[
-    "agentText",
-    "agentThinking",
-    "toolCall",
-    "toolResult",
-    "toolOutput",
-    "turnStarted",
-    "turnFinished",
-    "stop",
-    "retry",
-    "compactionStarted",
-    "compaction",
-    "subagentStarted",
-    "subagentProgress",
-    "subagentChild",
-    "modelText",
-    "modelThinking",
-    "modelToolCall",
-    "modelChatDone",
-    "threadInfo",
-    "threadHistory",
-    "threadsUpdated",
-    "models",
-    "commands",
-    "usage",
-    "usageSnapshot",
-    "tokenUsage",
-    "currentModel",
-    "planUpdated",
-    "planModeChanged",
-    "goalChanged",
-    "cwdChanged",
-    "permissionModeChanged",
-    "reasoningEffortChanged",
-    "browserSuitesChanged",
-    "backgroundTaskUpdated",
-    "steerPending",
-    "steerInjected",
-    "approvalDecision",
-    "branch",
-    "gitStats",
-    "historyProgress",
-    "cacheInvalidation",
-    "peerMessage",
     "error",
 ];
 
@@ -691,13 +608,26 @@ mod tests {
     }
 
     #[test]
-    fn doomed_notes_are_a_subset_of_server_notes() {
-        for name in DOOMED_SERVER_NOTES {
-            assert!(
-                SERVER_NOTES.contains(name),
-                "doomed note {name} not in SERVER_NOTES"
-            );
-        }
+    fn server_note_table_is_the_post_t10_retained_face() {
+        // §D.6 removal pass complete: exactly the owner-control trio, the
+        // transitional list channel, the server-originated error, and the
+        // four model-chat side-stream arms.
+        assert_eq!(
+            SERVER_NOTES,
+            &[
+                "ready",
+                "sessionCreated",
+                "sessionDisposed",
+                "threadsUpdated",
+                "models",
+                "commands",
+                "modelText",
+                "modelThinking",
+                "modelToolCall",
+                "modelChatDone",
+                "error",
+            ]
+        );
     }
 
     #[test]

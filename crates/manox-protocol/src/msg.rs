@@ -389,37 +389,43 @@ mod tests {
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::TurnStarted {
-                    session_id: "s1".into(),
+                note: crate::server::ServerNote::ThreadsUpdated { threads: vec![] },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::Models {
+                    models: vec![crate::wire::ModelInfo {
+                        id: "deepseek-chat".into(),
+                        name: "DeepSeek Chat".into(),
+                        provider: "DeepSeek-anthropic".into(),
+                        provider_name: None,
+                        api: "anthropic".into(),
+                        context_window: 131_072,
+                        max_tokens: None,
+                    }],
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::CacheInvalidation {
-                    session_id: "s1".into(),
-                    reprocessed_tokens: 12345,
+                note: crate::server::ServerNote::Commands {
+                    commands: serde_json::json!([]),
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::TurnFinished {
-                    cancelled: false,
-                    failed: false,
-                    stranded_steer_ids: vec![],
-                    session_id: "s1".into(),
+                note: crate::server::ServerNote::Error {
+                    session_id: Some("s1".into()),
+                    message: "boom".into(),
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::UsageSnapshot {
-                    session_id: "s1".into(),
-                    cumulative: crate::server::TokenUsageSnapshot {
-                        input: 100,
-                        output: 50,
-                        cache_creation: 0,
-                        cache_read: 0,
-                    },
-                    per_model: std::collections::HashMap::new(),
-                    cumulative_cost: 0.01,
-                    per_model_cost: std::collections::HashMap::new(),
-                    per_request: std::collections::HashMap::new(),
+                note: crate::server::ServerNote::ModelText {
+                    request_id: "r1".into(),
+                    text: "delta".into(),
+                },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::ModelChatDone {
+                    request_id: "r1".into(),
+                    stop: Some("end_turn".into()),
+                    error: None,
                 },
             },
             FromServer::StreamItem {

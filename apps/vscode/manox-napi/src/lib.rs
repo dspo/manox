@@ -208,12 +208,12 @@ mod tests {
     use manox_protocol::stream::{
         HostEvent, SessionSnapshot, StreamEndReason, StreamFrame, StreamKind,
     };
-    use manox_protocol::transport::{in_process_pair, RpcConnection};
+    use manox_protocol::transport::{RpcConnection, in_process_pair};
     use manox_protocol::{
         ClientCall, ClientNote, FromClient, FromServer, MsgId, ServerCall, ServerNote, StreamId,
         ThreadHeader,
     };
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn header() -> ThreadHeader {
         ThreadHeader {
