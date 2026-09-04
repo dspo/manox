@@ -320,35 +320,8 @@ describe('listCommands', () => {
   });
 });
 
-describe('requestThreadInfo', () => {
-  it('resolves with the info snapshot', async () => {
-    const { transport, manager } = create();
-    // The session emitter must exist before awaiting on it.
-    const unsubscribe = manager.onSessionEvent('t1', () => {});
-    const pending = manager.requestThreadInfo('t1');
-    expect(transport.lastCommand()).toMatchObject({
-      kind: 'request',
-      call: { method: 'threadInfo', sessionId: 't1' },
-    });
-    transport.emit(note('threadInfo', {
-      sessionId: 't1',
-      info: {
-        reasoning_effort: 'high',
-        cwd_path: null,
-        plan: null,
-        goal: null,
-        usage: {},
-        cost: 0,
-        pending_auth_count: 0,
-        agents: [],
-      },
-    }));
-    await expect(pending).resolves.toEqual(
-      expect.objectContaining({ cwd_path: null, cost: 0 }),
-    );
-    unsubscribe();
-  });
-});
+  // T10c: the requestThreadInfo suite retired with the method (§D.6 — the
+  // doomed `threadInfo` note surface; successor §E.3 GetConversationInfo).
 
 describe('setApprovalMode', () => {
   it('broadcasts the policy to every live session', async () => {

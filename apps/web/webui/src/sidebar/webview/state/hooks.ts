@@ -20,7 +20,6 @@
 import { useCallback, useRef, useSyncExternalStore } from 'react';
 
 import type {
-	GitStats,
 	ModelInfo,
 	ReasoningEffort,
 	ConversationInfo,
@@ -217,5 +216,6 @@ export function useReasoningEffort(sessionId: string | null | undefined): Reason
 	);
 }
 
-/** The git stats §E.3 fold payload (branch row of the info card). */
-export type { GitStats };
+// T10c (§D.6): the `GitStats` v1-note projection is deleted — the branch
+// row's successor is the §E.3 fold's `ConversationInfo.git`
+// (`ConversationGit`).

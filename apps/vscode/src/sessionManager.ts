@@ -22,7 +22,6 @@ import type {
   FromServer,
   HostEvent,
   ModelInfo,
-  ThreadInfoSnapshot,
   ThreadListItem,
 } from '../dist/protocol';
 import { isSessionEvent, notification, request } from './protocolHelpers';
@@ -449,17 +448,11 @@ export class SessionManager {
     );
   }
 
-  requestThreadInfo(sessionId: string): Promise<ThreadInfoSnapshot> {
-    const info = this.awaitSession(
-      sessionId,
-      (ev) => ev.method === 'threadInfo',
-      'thread_info',
-    );
-    this.send(request({ method: 'threadInfo', sessionId }));
-    return info.then(
-      (ev) => (ev as Record<string, unknown> & { info: ThreadInfoSnapshot }).info,
-    );
-  }
+  // T10c (§D.6): the v1 `requestThreadInfo` path (awaiting the doomed
+  // `threadInfo` note) is deleted — the server's `ClientCall::ThreadInfo`
+  // arm answers a removed-surface error since T10b. Successors: the
+  // follow-stream snapshot's projection baseline (attach) and the §E.3
+  // `GetConversationInfo` fold (on-demand info card).
 
   /** Shut the transport down; `disposeShared` is the public entry point. */
   private async dispose(): Promise<void> {
