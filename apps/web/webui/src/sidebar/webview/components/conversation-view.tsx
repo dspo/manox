@@ -9,7 +9,7 @@ import { memo, useEffect, useMemo, useRef } from 'react';
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
 import { api, onOpenTurnNavigator, ThreadApi } from '../api/client';
 import { t } from '../lib/i18n';
-import { chatLayoutForWidth, INFO_CARD_GUTTER_PX, INFO_CARD_WIDTH_PX, maxSessionListWidth } from '../lib/layout';
+import { chatLayoutForWidth, INFO_CARD_GUTTER_PX, maxSessionListWidth } from '../lib/layout';
 import { collectUserTurns } from '../lib/turn-nav';
 import { useContainerWidth } from '../lib/use-container-width';
 import { setOverlayOpen, toggleOverlay, useOverlayOpen } from '../lib/ui-overlays';
@@ -19,7 +19,6 @@ import { Slot } from '../slots.outlet';
 import { Composer } from './chrome/composer';
 import { PlanModeBanner } from './chrome/plan-mode-banner';
 import { ErrorBanner } from './chrome/error-banner';
-import { InfoPanel } from './info-panel';
 import { openThread, SessionList } from './session-list';
 import { SidebarSash, SIDEBAR_MIN_PX, useSidebarWidth } from './sidebar-sash';
 import { MessageList } from './transcript/message-list';
@@ -161,18 +160,12 @@ export const ConversationView = memo(({
               sessionId={thread.sessionId}
               turnActive={thread.turnActive}
             />
-            {layout !== 'conversation' && (
-              <div
-                className="pointer-events-none absolute inset-y-4 right-4 flex flex-col"
-                style={{ width: INFO_CARD_WIDTH_PX }}
-              >
-                <InfoPanel
-                  className="pointer-events-auto max-h-full overflow-y-auto"
-                  models={models}
-                  thread={thread}
-                />
-              </div>
-            )}
+            {/* The info card is no longer rendered inline here: its entry chip
+             * (and the card itself) is contributed through the
+             * `conversation.session.header.utilities` slot by the
+             * conversation-info plugin (T8 §H). The `rightInsetPx` gutter above
+             * still reserves the card's column so the transcript never
+             * reflows when the card opens. */}
             {navigatorOpen && (
               <div
                 className="absolute inset-0 z-10 flex items-center justify-center bg-background/60"

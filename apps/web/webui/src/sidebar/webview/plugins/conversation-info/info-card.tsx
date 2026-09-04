@@ -26,14 +26,14 @@ import type {
   PlanSnapshotWire,
   PlanStepWire,
   SubagentChildWire,
-} from '../../../protocol';
-import { ThreadApi } from '../api/client';
-import { apiTint } from '../lib/api-tint';
-import { t } from '../lib/i18n';
-import { formatCost, formatTokens, formatTokensPi } from '../lib/usage-format';
-import { cn } from '../lib/utils';
-import type { ThreadState } from '../state/bridge';
-import { BrailleSpinner } from './ui/braille-spinner';
+} from '../../../../protocol';
+import { ThreadApi } from '../../api/client';
+import { apiTint } from '../../lib/api-tint';
+import { t } from '../../lib/i18n';
+import { formatCost, formatTokens, formatTokensPi } from '../../lib/usage-format';
+import { cn } from '../../lib/utils';
+import type { ThreadState } from '../../state/bridge';
+import { BrailleSpinner } from '../../components/ui/braille-spinner';
 
 /** Spend-section glyph, matching the host's scorpio mark. */
 const ScorpioIcon = ({ className }: { className?: string }) => (
