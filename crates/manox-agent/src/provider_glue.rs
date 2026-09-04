@@ -232,6 +232,14 @@ pub fn wire_key(model: &manox_harness::types::Model) -> Option<&'static str> {
     manox_harness::provider::model_api_to_wire_key(&model.api)
 }
 
+/// Registration-qualified model reference (`{provider}/{model-id}`) — the
+/// form `resolve_model_ref` uses to pin one exact registration: a bare id
+/// shared across providers resolves the first-sorted registration, so
+/// selection surfaces must qualify to stay unambiguous.
+pub fn qualified_ref(model: &manox_harness::types::Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +276,20 @@ mod tests {
             )]))),
             "deepseek-v4-flash"
         );
+    }
+
+    #[test]
+    fn qualified_ref_pins_registration_and_id() {
+        let model = manox_harness::types::Model {
+            provider: "百炼-anthropic".into(),
+            api: "anthropic".into(),
+            id: "deepseek-v4-flash".into(),
+            context_window: 200_000,
+            max_tokens: 8_192,
+            thinking: manox_harness::types::ThinkingKind::None,
+            metadata: std::collections::HashMap::new(),
+        };
+        assert_eq!(qualified_ref(&model), "百炼-anthropic/deepseek-v4-flash");
     }
 
     #[test]

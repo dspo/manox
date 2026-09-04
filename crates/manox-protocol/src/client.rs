@@ -105,6 +105,10 @@ pub enum ClientNote {
     CancelTurn {
         session_id: String,
     },
+    /// `id` is a model reference: selection surfaces emit the
+    /// registration-qualified form `{provider}/{model-id}` so a model id
+    /// shared across providers pins one registration; a bare id resolves
+    /// the first-sorted registration (ambiguous by contract).
     SetModel {
         session_id: String,
         id: String,
