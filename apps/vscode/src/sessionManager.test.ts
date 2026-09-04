@@ -366,3 +366,127 @@ describe('setApprovalMode', () => {
     });
   });
 });
+
+// ── T9: v2 frames through the host ───────────────────────────────────────
+
+/** Helper: a full ThreadListItem for mirror assertions. */
+function thread(id: string, fields: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id,
+    title: `t-${id}`,
+    updated_at: 1,
+    running: false,
+    unread: false,
+    errored: false,
+    pending_auth: false,
+    pending_plan: false,
+    background_work: false,
+    model_id: 'm',
+    pinned: false,
+    archived: false,
+    parent_id: null,
+    depth: 0,
+    ...fields,
+  };
+}
+
+/** Helper: a FromServer::Host frame. */
+function host(hostEvent: Record<string, unknown>): FromServer {
+  return { kind: 'host', host: hostEvent } as FromServer;
+}
+
+describe('v2 frames (T9)', () => {
+  it('onFrame relays every envelope kind unfiltered, in arrival order', () => {
+    const { transport, manager } = create();
+    const seen: FromServer[] = [];
+    const unsubscribe = manager.onFrame((msg) => seen.push(msg));
+
+    const frames = [
+      { kind: 'streamItem', streamId: 'st-1', frame: { type: 'entry', seq: 1 } },
+      { kind: 'streamEnd', streamId: 'st-1', reason: { type: 'closed' } },
+      host({ type: 'sessionStatus', sessionId: 's1' }),
+      { kind: 'response', id: 'x-1', outcome: { Ok: { accepted: true } } },
+      { kind: 'request', id: 'a-1', call: { method: 'approve', sessionId: 's1' } },
+      note('agentText', { sessionId: 's1', text: 'hi' }),
+    ] as unknown as FromServer[];
+    for (const frame of frames) transport.emit(frame);
+
+    expect(seen).toEqual(frames);
+    unsubscribe();
+    transport.emit(frames[0]);
+    expect(seen).toHaveLength(frames.length);
+  });
+
+  it('init resolves on the v2 host-ready frame (no legacy note needed)', async () => {
+    const { transport, manager } = create();
+    const pending = manager.init('/w');
+    await Promise.resolve();
+    transport.emit(host({ type: 'ready', epoch: 1 }));
+    await expect(pending).resolves.toBeUndefined();
+  });
+
+  it('listModels resolves from the v2 host-models frame', async () => {
+    const { transport, manager } = create();
+    const pending = manager.listModels();
+    transport.emit(host({ type: 'models', models: [{ id: 'm', name: 'M', provider: 'p', api: 'anthropic', context_window: 1 }] }));
+    await expect(pending).resolves.toHaveLength(1);
+  });
+
+  it('listThreads resolves from the §D.5 mirror, still refreshing via request', async () => {
+    const { transport, manager } = create();
+    transport.emit(host({ type: 'threadsUpdated', threads: [thread('t1')] }));
+    const pending = manager.listThreads();
+    // The request is still sent (the server answers with a fresh list note);
+    // the await short-circuits from the mirror.
+    expect(transport.lastCommand()).toMatchObject({
+      kind: 'request',
+      call: { method: 'listThreads' },
+    });
+    await expect(pending).resolves.toEqual([expect.objectContaining({ id: 't1' })]);
+  });
+
+  it('sessionStatus deltas seed and merge the thread mirror', async () => {
+    const { transport, manager } = create();
+    transport.emit(
+      host({
+        type: 'sessionStatus',
+        sessionId: 's1',
+        running: true,
+        errored: null,
+        unread: null,
+        pendingAuth: null,
+        pendingPlan: null,
+        backgroundWork: null,
+      }),
+    );
+    const seeded = await manager.listThreads();
+    expect(seeded).toEqual([expect.objectContaining({ id: 's1', running: true })]);
+
+    // A full snapshot replaces the mirror; a later status delta merges into it.
+    transport.emit(host({ type: 'threadsUpdated', threads: [thread('s1'), thread('s2')] }));
+    transport.emit(host({ type: 'sessionStatus', sessionId: 's2', running: true }));
+    const merged = await manager.listThreads();
+    expect(merged).toEqual([
+      expect.objectContaining({ id: 's1', title: 't-s1' }),
+      expect.objectContaining({ id: 's2', title: 't-s2', running: true }),
+    ]);
+  });
+
+  it('legacy threadsUpdated notes keep the mirror in sync', async () => {
+    const { transport, manager } = create();
+    manager.listThreads(); // prime: no snapshot yet, await registered
+    transport.emit(note('threadsUpdated', { threads: [thread('t9')] }));
+    await expect(manager.listThreads()).resolves.toEqual([
+      expect.objectContaining({ id: 't9' }),
+    ]);
+  });
+
+  it('unknown host variants and frames never throw', () => {
+    const { transport, manager } = create();
+    const received: Record<string, unknown>[] = [];
+    manager.onGlobalEvent((ev) => received.push(ev));
+    transport.emit(host({ type: 'someFutureEvent' }));
+    transport.emit({ kind: 'streamItem', streamId: 's', frame: { type: 'quantumLeap' } } as unknown as FromServer);
+    expect(received).toHaveLength(0);
+  });
+});

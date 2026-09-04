@@ -1,23 +1,19 @@
 // Sidebar host: a transparent typed relay between the webview renderer and
-// the shared agent server. The webview speaks `FromClient` / `FromServer`
-// directly; the host forwards `FromClient` to the napi `AgentServer`
-// connection and `FromServer` (notifications + ServerCall requests) back to
-// the webview verbatim. The few host-only lifecycle verbs (`HostVerb`) are
-// intercepted because the VS Code `SessionManager` owns the napi connection
-// and per-session event routing — the browser host has no such orchestrator
-// and posts the equivalent `FromClient` sequence itself.
+// the shared agent server (T9: the v2 envelope is relayed verbatim in both
+// directions). The webview speaks `FromClient` / `FromServer` directly; the
+// host forwards `FromClient` — `StreamOpen` / `StreamCancel` included — to
+// the napi `AgentServer` connection, and relays EVERY raw `FromServer` frame
+// (notification / request / response / host / streamItem / streamEnd) back
+// to the webview unfiltered: the shared v2 bundle in the webview owns frame
+// interpretation and answers `request` frames itself (the host never
+// intercepts them). Only the few host-only lifecycle verbs (`HostVerb`) are
+// intercepted, because the VS Code `SessionManager` owns the napi connection
+// and session lifecycle — the browser host has no such orchestrator and
+// posts the equivalent `FromClient` sequence itself.
 
 import * as crypto from 'node:crypto';
 import * as vscode from 'vscode';
-import type {
-	CommandEntry,
-	FromClient,
-	FromServer,
-	ImageAttachment,
-	ModelInfo,
-	ServerCall,
-	ServerNote,
-} from '../../dist/protocol';
+import type { FromClient, FromServer, ImageAttachment } from '../../dist/protocol';
 import { notification, request } from '../protocolHelpers';
 import { SessionManager, resolveWorkspaceCwd } from '../sessionManager';
 import type { HostVerb, ToHost, ToWebview } from '../../dist/sidebar/messages';
@@ -43,10 +39,13 @@ export function registerManoxSidebar(context: vscode.ExtensionContext): void {
 
 class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 	private view: vscode.WebviewView | null = null;
-	/** Live sessions: unsubscribe per session id. View switching never
-	 * removes entries — only teardown does. */
-	private readonly sessions = new Map<string, () => void>();
-	private unsubscribeGlobal: (() => void) | null = null;
+	/** Live session ids, for teardown disposal on the actor side. View
+	 * switching never removes entries — only teardown does. Frame delivery
+	 * needs no per-session subscription: the manager's raw `onFrame` relay
+	 * forwards every session's frames verbatim (T9), and the webview's v2
+	 * store routes them by `streamId` / `sessionId`. */
+	private readonly sessions = new Set<string>();
+	private unsubscribeFrames: (() => void) | null = null;
 	/** Monotonic token invalidated by teardown: an in-flight create/open
 	 * completing afterwards disposes its actor-side session instead of
 	 * attaching to a dead view. */
@@ -72,11 +71,14 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 		});
 		webviewView.onDidDispose(() => this.teardown());
 
-		// Global ServerNotes (ready / models / threadsUpdated / commands /
-		// untagged errors) forward verbatim — the store folds each by method.
-		this.unsubscribeGlobal = SessionManager.shared().onGlobalEvent((ev) => {
-			this.post({ kind: 'notification', note: ev as ServerNote });
-		});
+		// T9 raw relay: forward EVERY `FromServer` frame verbatim — legacy
+		// notification / response arms plus the v2 `streamItem` / `streamEnd`
+		// / `host` arms. The webview bundle interprets frames and answers
+		// `request` (ServerCall) frames itself; the host never filters or
+		// re-wraps anything.
+		this.unsubscribeFrames = SessionManager.shared().onFrame((msg: FromServer) =>
+			this.post(msg),
+		);
 
 		void this.initActor();
 	}
@@ -158,27 +160,13 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	/** Attach the view to a confirmed session: forward the session's
-	 * `ServerNote` notifications and `ServerCall` requests to the webview.
-	 * Readiness is derived client-side from `SessionCreated` (forwarded
-	 * synthetically here since the manager's await already consumed the
-	 * server's emission) and `ThreadHistory`. */
+	/** Track a confirmed session for teardown disposal. No per-session event
+	 * subscription is needed since T9: the raw `onFrame` relay already
+	 * forwards the session's frames (`sessionCreated`, journal streams,
+	 * ServerCall requests) verbatim to the webview, and the v2 store there
+	 * handles readiness and replies. */
 	private registerSession(sessionId: string): void {
-		const manager = SessionManager.shared();
-		this.post({
-			kind: 'notification',
-			note: { method: 'sessionCreated', sessionId },
-		});
-		const offEvents = manager.onSessionEvent(sessionId, (ev) => {
-			this.post({ kind: 'notification', note: ev as ServerNote });
-		});
-		const offCalls = manager.onSessionServerCall(sessionId, ({ id, call }) => {
-			this.post({ kind: 'request', id, call: call as ServerCall } as FromServer);
-		});
-		this.sessions.set(sessionId, () => {
-			offEvents();
-			offCalls();
-		});
+		this.sessions.add(sessionId);
 	}
 
 	private async onWebviewMessage(msg: ToHost): Promise<void> {
@@ -231,7 +219,8 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 			}
 		}
 		// Otherwise it is a typed `FromClient` (notification / request /
-		// reply): forward verbatim to the agent server.
+		// reply / streamOpen / streamCancel): forward verbatim to the agent
+		// server — the napi side accepts the full v2 envelope.
 		manager.send(msg as FromClient);
 	}
 
@@ -249,13 +238,10 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 	private teardown(): void {
 		this.sessionGeneration++;
 		const manager = SessionManager.shared();
-		for (const [sessionId, unsubscribe] of this.sessions) {
-			unsubscribe();
-			manager.disposeSession(sessionId);
-		}
+		for (const sessionId of this.sessions) manager.disposeSession(sessionId);
 		this.sessions.clear();
-		this.unsubscribeGlobal?.();
-		this.unsubscribeGlobal = null;
+		this.unsubscribeFrames?.();
+		this.unsubscribeFrames = null;
 		this.view = null;
 	}
 
