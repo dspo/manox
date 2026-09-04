@@ -12,6 +12,7 @@ pub mod agent_server;
 pub mod model_chat;
 pub mod projections;
 pub mod translate;
+pub mod waterfall;
 
 /// Suite-wide test scaffolding: session-creating tests mutate `HOME` and
 /// initialize `OnceLock` globals, so they must not interleave. Formerly the
