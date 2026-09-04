@@ -1,0 +1,60 @@
+{
+  "cursor": 1,
+  "hasMore": false,
+  "header": {
+    "createdAt": "2026-09-04T00:00:00Z",
+    "cwd": "/proj",
+    "id": "s1",
+    "metadata": null,
+    "parentSession": null
+  },
+  "projections": {
+    "agent_label": "agent_label",
+    "archived": "archived",
+    "background_tasks": "background_tasks",
+    "branch": "branch",
+    "browser_suites": "browser_suites",
+    "cwd": "cwd",
+    "depth": "depth",
+    "goal": "goal",
+    "has_interacted": "has_interacted",
+    "model": "model",
+    "pending_auth": "pending_auth",
+    "permission_mode": "permission_mode",
+    "pinned": "pinned",
+    "plan": "plan",
+    "plan_mode": "plan_mode",
+    "project": "project",
+    "reasoning_effort": "reasoning_effort",
+    "running": "running",
+    "self_author": "self_author",
+    "title": "title"
+  },
+  "projectionsAsOfSeq": 0,
+  "records": [
+    {
+      "content": [
+        {
+          "text": "hello",
+          "type": "text"
+        }
+      ],
+      "id": "e-0",
+      "originRpc": "rpc-echo-1",
+      "parentId": null,
+      "role": "user",
+      "seq": 0,
+      "timestamp": "2026-09-04T00:00:00Z",
+      "type": "message",
+      "usage": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 10,
+        "output": 2,
+        "reasoning": 0
+      }
+    }
+  ],
+  "sessionId": "s1",
+  "type": "snapshot"
+}
