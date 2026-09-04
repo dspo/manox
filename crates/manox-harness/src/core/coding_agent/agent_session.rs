@@ -3170,11 +3170,16 @@ mod tests {
                 .await
                 .unwrap();
             // A switches the model; B changes the thinking level. Both patch
-            // the shared settings file on different keys.
+            // the shared settings file on different keys. A's target model is
+            // non-thinking, so its patch writes ONLY defaultProvider/
+            // defaultModel — set_model conditionally declares a thinking
+            // default too, and with it the final defaultThinkingLevel would
+            // depend on patch ORDER (last writer wins), making the assertions
+            // below flaky by construction.
             let (ra, rb) = tokio::join!(
                 a.set_model(Model {
                     id: format!("beta-{round}"),
-                    thinking: crate::types::ThinkingKind::Enabled,
+                    thinking: crate::types::ThinkingKind::None,
                     ..test_model()
                 }),
                 b.set_thinking_level(Some("high".into()))
