@@ -179,6 +179,17 @@ const DICT = {
     en: 'Add optional context…',
     zh: '添加可选补充说明…',
   },
+  settings: { en: 'Settings', zh: '设置' },
+  close: { en: 'Close', zh: '关闭' },
+  settings_general: { en: 'General', zh: '通用' },
+  settings_general_desc: {
+    en: 'Built-in webui settings.',
+    zh: '内置 webui 设置。',
+  },
+  settings_models: {
+    en: (n: number) => `${n} models registered`,
+    zh: (n: number) => `已注册 ${n} 个模型`,
+  },
 } satisfies Record<string, Entry>;
 
 export type I18nKey = keyof typeof DICT;
