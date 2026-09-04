@@ -18,13 +18,41 @@
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::session::{SessionStorage, SessionTreeEntry};
 use serde_json::Value as JsonValue;
 
-/// Current on-disk session format version.
-const FORMAT_VERSION: u32 = 3;
+/// Current on-disk session format version (v4: chain-dense `seq` on every
+/// entry, the journal of architecture doc §C).
+const FORMAT_VERSION: u32 = 4;
+
+/// The previous format. v3 files still open (seq is backfilled from chain
+/// depth in memory) and are rewritten in full as v4 under the append lock on
+/// the first append — the lazy §C.1 migration.
+const LEGACY_FORMAT_VERSION: u32 = 3;
+
+/// Broadcast capacity for [`JournalEvent`] subscribers. A lagging subscriber
+/// gets [`broadcast::error::RecvError::Lagged`] and must resynchronize from a
+/// fresh chain read (the L5 companion rule; the session-core pump treats lag
+/// as a follow-stream resync, never as silent data loss).
+const JOURNAL_BROADCAST_CAPACITY: usize = 4096;
+
+/// One journal event as broadcast by [`JsonlSessionStorage`] at every append,
+/// in strict seq order (sent under the append lock).
+#[derive(Debug, Clone)]
+pub struct JournalEvent {
+    /// Chain depth of the appended entry (dense 0-based along its chain).
+    pub seq: u64,
+    pub entry: std::sync::Arc<SessionTreeEntry>,
+}
+
+/// One record of a chain read ([`JsonlSessionStorage::journal_range`]).
+#[derive(Debug, Clone)]
+pub struct JournalRecord {
+    pub seq: u64,
+    pub entry: SessionTreeEntry,
+}
 
 /// Session metadata written once as the file header and read back on reopen.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -69,6 +97,16 @@ pub struct JsonlSessionStorage {
     /// Current leaf cursor. For a `leaf` entry this is its `targetId`;
     /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
+    /// entry id → chain depth (§C.1 seq). Assigned at the single append point
+    /// under `append_lock` (L4); parents always precede children in file
+    /// order, so depths are computed incrementally on load.
+    seq_index: Mutex<std::collections::HashMap<String, u64>>,
+    /// The on-disk format version of the opened file (3 until the first
+    /// append rewrites it to 4).
+    file_version: Mutex<u32>,
+    /// Ordered journal append notifications (one per successful append, in
+    /// seq order, sent under the append lock).
+    journal_tx: broadcast::Sender<JournalEvent>,
     /// Serializes the write → index → cursor sequence so concurrent appends
     /// never interleave the three steps and diverge disk order from the
     /// in-memory index or the cursor.
@@ -123,10 +161,14 @@ impl JsonlSessionStorage {
         validate_header_wire(&serde_json::to_value(&header).expect("header serializes"))?;
         let line = serde_json::to_string(&header)? + "\n";
         tokio::fs::write(path, line).await?;
+        let (journal_tx, _) = broadcast::channel(JOURNAL_BROADCAST_CAPACITY);
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
             entries: Mutex::new(Vec::new()),
             leaf_id: Mutex::new(None),
+            seq_index: Mutex::new(std::collections::HashMap::new()),
+            file_version: Mutex::new(FORMAT_VERSION),
+            journal_tx,
             append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(false),
@@ -163,10 +205,14 @@ impl JsonlSessionStorage {
             metadata: metadata.metadata.clone(),
         };
         validate_header_wire(&serde_json::to_value(&header).expect("header serializes"))?;
+        let (journal_tx, _) = broadcast::channel(JOURNAL_BROADCAST_CAPACITY);
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
             entries: Mutex::new(Vec::new()),
             leaf_id: Mutex::new(None),
+            seq_index: Mutex::new(std::collections::HashMap::new()),
+            file_version: Mutex::new(FORMAT_VERSION),
+            journal_tx,
             append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(true),
@@ -210,6 +256,8 @@ impl JsonlSessionStorage {
 
         let mut entries = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
+        let mut seq_index = std::collections::HashMap::new();
+        let v4 = header.version >= FORMAT_VERSION;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -220,7 +268,7 @@ impl JsonlSessionStorage {
             // `parseEntryLine` treats a missing `parentId`/`targetId` as an
             // invalid entry).
             validate_entry_wire(&value)?;
-            let entry: SessionTreeEntry = serde_json::from_value(value)?;
+            let entry: SessionTreeEntry = serde_json::from_value(value.clone())?;
             // A duplicate id would make the walk index silently overwrite one
             // entry with the other — reject the file instead of restoring a
             // wrong ancestry.
@@ -230,16 +278,48 @@ impl JsonlSessionStorage {
             if !seen_ids.insert(entry.id().to_string()) {
                 anyhow::bail!("duplicate entry id {} in session file", entry.id());
             }
+            // §C.1 seq: chain depth computed incrementally (parents always
+            // precede children in an append-only file). A v4 line must carry
+            // the same value — a mismatch is corruption, not a renumbering.
+            let depth = match entry.parent_id() {
+                None => 0u64,
+                Some(parent) => match seq_index.get(parent) {
+                    Some(parent_depth) => parent_depth + 1,
+                    // A parent that never appeared earlier in the file means
+                    // the chain is broken; get_path would fail the same way.
+                    None => anyhow::bail!(
+                        "session entry {} references unknown parent {parent}",
+                        entry.id()
+                    ),
+                },
+            };
+            if v4 {
+                match value.get("seq").and_then(JsonValue::as_u64) {
+                    Some(seq) if seq == depth => {}
+                    Some(seq) => anyhow::bail!(
+                        "session entry {} carries seq {seq} but its chain depth is {depth}",
+                        entry.id()
+                    ),
+                    None => {
+                        anyhow::bail!("v4 session entry {} is missing its seq field", entry.id())
+                    }
+                }
+            }
+            seq_index.insert(entry.id().to_string(), depth);
             entries.push(entry);
         }
         // The cursor follows the last entry: a trailing `leaf` entry
         // redirects to its `targetId`, otherwise the last entry's own id.
         let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+        let (journal_tx, _) = broadcast::channel(JOURNAL_BROADCAST_CAPACITY);
 
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
             entries: Mutex::new(entries),
             leaf_id: Mutex::new(leaf_id),
+            seq_index: Mutex::new(seq_index),
+            file_version: Mutex::new(header.version),
+            journal_tx,
             append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(false),
@@ -260,6 +340,13 @@ impl JsonlSessionStorage {
     /// [`Self::append_lock`]. Trait methods take the lock and delegate here.
     /// A duplicate or empty id is refused before anything touches disk — the
     /// walk index would otherwise silently overwrite one entry with another.
+    ///
+    /// v4 (§C.1/L4): the seq — the new entry's chain depth — is assigned
+    /// here and nowhere else, stamped into the line, recorded in
+    /// `seq_index`, and broadcast in seq order while the lock is held.
+    /// Appending to a file still on v3 rewrites it in full as v4 first (the
+    /// lazy migration; the rewrite reuses the buffered-seq values computed
+    /// at load).
     async fn append_entry_locked(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
         if entry.id().is_empty() {
             anyhow::bail!("refusing entry with empty id");
@@ -273,7 +360,22 @@ impl JsonlSessionStorage {
         if exists {
             anyhow::bail!("duplicate entry id {}", entry.id());
         }
-        let line = serde_json::to_string(entry)? + "\n";
+        // Single stamp point: parent must already be indexed (append-only
+        // files guarantee parents precede children).
+        let seq = match entry.parent_id() {
+            None => 0u64,
+            Some(parent) => {
+                let seq_index = self.seq_index.lock().await;
+                match seq_index.get(parent) {
+                    Some(depth) => depth + 1,
+                    None => anyhow::bail!(
+                        "entry {} references unknown parent {parent}: chain is broken",
+                        entry.id()
+                    ),
+                }
+            }
+        };
+        let line = v4_line(entry, seq)?;
         // A deferred session materializes on the first assistant message: the
         // header plus every buffered entry are written in one shot, so the
         // on-disk order matches the in-memory index (TS `_persist`).
@@ -284,38 +386,144 @@ impl JsonlSessionStorage {
                 ..
             }
         );
+        let mut materialized = false;
         if *self.deferred.lock().await {
             if is_assistant {
-                let header = SessionHeader {
-                    type_tag: "session".into(),
-                    version: FORMAT_VERSION,
-                    id: self.metadata.id.clone(),
-                    timestamp: self.metadata.created_at,
-                    cwd: self.metadata.cwd.clone(),
-                    parent_session: self.metadata.parent_session_path.clone(),
-                    metadata: self.metadata.metadata.clone(),
-                };
-                let mut content = serde_json::to_string(&header)? + "\n";
-                for buffered in self.entries.lock().await.iter() {
-                    content.push_str(&serde_json::to_string(buffered)?);
-                    content.push('\n');
-                }
-                content.push_str(&line);
-                tokio::fs::write(&self.jsonl_path, content).await?;
+                self.rewrite_file_v4_locked(Some(&line)).await?;
                 *self.deferred.lock().await = false;
+                materialized = true;
             }
-        } else {
+        } else if *self.file_version.lock().await < FORMAT_VERSION {
+            // Lazy v3 → v4 migration: rewrite the whole file with stamped
+            // lines, appending the new one in the same write.
+            self.rewrite_file_v4_locked(Some(&line)).await?;
+            materialized = true;
+        }
+        if !materialized {
             self.append_line(&line).await?;
         }
         // Index the entry before moving the cursor, mirroring TS Pi's order:
         // a concurrent `get_leaf_id` must never see a cursor whose target is
         // absent from the index, which would read as session corruption.
         self.entries.lock().await.push(entry.clone());
+        self.seq_index
+            .lock()
+            .await
+            .insert(entry.id().to_string(), seq);
         // The cursor follows this entry: a `leaf` entry redirects to its
         // `targetId`, otherwise the entry becomes the cursor itself.
         *self.leaf_id.lock().await = entry.leaf_cursor_after();
+        // Ordered notification: sent under the append lock so subscribers
+        // observe strictly increasing seq. No subscribers is fine.
+        let _ = self.journal_tx.send(JournalEvent {
+            seq,
+            entry: std::sync::Arc::new(entry.clone()),
+        });
         Ok(())
     }
+
+    /// Rewrite the whole file as v4 (header + every indexed entry with its
+    /// stamped seq, optionally plus one more line) in a single write. Used by
+    /// deferred materialization and the lazy v3 migration, both under
+    /// `append_lock`.
+    async fn rewrite_file_v4_locked(&self, extra_line: Option<&str>) -> Result<(), anyhow::Error> {
+        let header = SessionHeader {
+            type_tag: "session".into(),
+            version: FORMAT_VERSION,
+            id: self.metadata.id.clone(),
+            timestamp: self.metadata.created_at,
+            cwd: self.metadata.cwd.clone(),
+            parent_session: self.metadata.parent_session_path.clone(),
+            metadata: self.metadata.metadata.clone(),
+        };
+        let mut content = serde_json::to_string(&header)? + "\n";
+        {
+            let entries = self.entries.lock().await;
+            let seq_index = self.seq_index.lock().await;
+            for entry in entries.iter() {
+                let seq = seq_index.get(entry.id()).copied().ok_or_else(|| {
+                    anyhow::anyhow!("entry {} missing from seq index", entry.id())
+                })?;
+                content.push_str(&v4_line(entry, seq)?);
+            }
+        }
+        if let Some(extra) = extra_line {
+            content.push_str(extra);
+        }
+        tokio::fs::write(&self.jsonl_path, content).await?;
+        *self.file_version.lock().await = FORMAT_VERSION;
+        Ok(())
+    }
+
+    // ── v4 journal read face (§C.3) ────────────────────────────────────────
+
+    /// Subscribe to ordered journal appends. A lagging receiver sees
+    /// [`broadcast::error::RecvError::Lagged`] and must resynchronize via a
+    /// fresh chain read (L5 companion rule).
+    pub fn subscribe_journal(&self) -> broadcast::Receiver<JournalEvent> {
+        self.journal_tx.subscribe()
+    }
+
+    /// The seq of the active leaf (chain length − 1; 0 for an empty
+    /// journal). Dense along the active chain by construction.
+    pub async fn journal_cursor(&self) -> u64 {
+        let leaf_id = self.leaf_id.lock().await.clone();
+        match leaf_id {
+            None => 0,
+            Some(id) => self.seq_index.lock().await.get(&id).copied().unwrap_or(0),
+        }
+    }
+
+    /// Read a seq range off the active chain (inclusive bounds, clamped).
+    /// The active chain is dense 0-based, so a chain position *is* its seq.
+    pub async fn journal_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Result<Vec<JournalRecord>, anyhow::Error> {
+        let entries = self.entries.lock().await;
+        let leaf_id = self.leaf_id.lock().await.clone();
+        let target_id = match &leaf_id {
+            Some(id) if entries.iter().any(|e| e.id() == id) => id.clone(),
+            // An empty journal (or a cursor pointing at a since-removed
+            // entry — corruption get_leaf_id already rejects) yields no
+            // records; `None` cursor means empty.
+            _ => return Ok(Vec::new()),
+        };
+        let mut index: std::collections::HashMap<&str, &SessionTreeEntry> =
+            entries.iter().map(|e| (e.id(), e)).collect();
+        let mut chain: Vec<&SessionTreeEntry> = Vec::new();
+        let mut current_id: Option<&str> = Some(&target_id);
+        while let Some(id) = current_id {
+            let entry = match index.remove(id) {
+                Some(e) => e,
+                None => anyhow::bail!("entry {id} not found: session chain is broken"),
+            };
+            current_id = entry.parent_id();
+            chain.push(entry);
+        }
+        chain.reverse();
+        Ok(chain
+            .into_iter()
+            .enumerate()
+            .map(|(position, entry)| JournalRecord {
+                seq: position as u64,
+                entry: entry.clone(),
+            })
+            .filter(|record| record.seq >= from_seq && record.seq <= to_seq)
+            .collect())
+    }
+}
+
+/// Serialize one entry as a v4 journal line: the entry's own fields plus the
+/// stamped `seq` (§C.1). The envelope keys are exclusive (§C.1 rule), so
+/// inserting `seq` cannot collide with a payload field.
+fn v4_line(entry: &SessionTreeEntry, seq: u64) -> Result<String, anyhow::Error> {
+    let mut value = serde_json::to_value(entry)?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("seq".into(), JsonValue::from(seq));
+    }
+    Ok(serde_json::to_string(&value)? + "\n")
 }
 
 /// Wire-level header checks on the raw JSON, mirroring the TS
@@ -323,7 +531,8 @@ impl JsonlSessionStorage {
 /// distinction serde's `Option` cannot make — a present-but-null
 /// `parentSession` or `metadata` is rejected while an absent one is fine.
 /// Shared by `load` (rejecting damaged files) and `create` (never writing a
-/// header its own `open` would reject).
+/// header its own `open` would reject). v3 headers are accepted on read
+/// (seq backfilled in memory; the file becomes v4 on first append).
 fn validate_header_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
     let obj = value
         .as_object()
@@ -331,8 +540,12 @@ fn validate_header_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
     if obj.get("type").and_then(JsonValue::as_str) != Some("session") {
         anyhow::bail!("session file first line is not a session header");
     }
-    if obj.get("version").and_then(JsonValue::as_u64) != Some(FORMAT_VERSION as u64) {
-        anyhow::bail!("unsupported session version");
+    let version = obj
+        .get("version")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| anyhow::anyhow!("session header is missing version"))?;
+    if version != FORMAT_VERSION as u64 && version != LEGACY_FORMAT_VERSION as u64 {
+        anyhow::bail!("unsupported session version {version}");
     }
     match obj.get("id") {
         Some(JsonValue::String(id)) if !id.is_empty() => {}
@@ -1066,7 +1279,7 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(header_line.contains("\"type\":\"session\""));
-        assert!(header_line.contains("\"version\":3"));
+        assert!(header_line.contains("\"version\":4"));
     }
 
     /// A header carrying `parentSession` and `metadata` must write those as
@@ -1890,8 +2103,10 @@ mod tests {
         );
     }
 
-    /// A walk that cannot complete loudly fails: an explicit leaf unknown to
-    /// storage, or a parent id with no entry, never yields a truncated path.
+    /// A walk that cannot complete loudly fails: v4 load validation rejects
+    /// a parent id with no entry at `open` time (earlier than the v3 walk,
+    /// same guarantee — never a truncated path), and an explicit leaf
+    /// unknown to storage errors at `get_path`.
     #[tokio::test]
     async fn test_broken_session_chain_errors_instead_of_truncating() {
         let dir = tempfile::tempdir().unwrap();
@@ -1905,25 +2120,15 @@ mod tests {
             "\n",
         );
         tokio::fs::write(&path, contents).await.unwrap();
-        let storage = JsonlSessionStorage::open(&path).await.unwrap();
-
-        // Unknown explicit leaf.
-        let err = storage.get_path(Some("no-such-entry")).await.unwrap_err();
-        assert!(
-            err.to_string().contains("no-such-entry"),
-            "the error names the missing leaf: {err}"
-        );
-
-        // A parent id with no entry breaks the chain mid-walk.
-        let err = storage.get_path(Some("m2")).await.unwrap_err();
+        // v4 load validation: the unknown parent surfaces at open, naming it.
+        let err = match JsonlSessionStorage::open(&path).await {
+            Err(e) => e,
+            Ok(_) => panic!("open must reject a session whose chain references an unknown parent"),
+        };
         assert!(
             err.to_string().contains("ghost"),
             "the error names the missing parent: {err}"
         );
-
-        // A well-formed chain still walks.
-        let path = storage.get_path(Some("m1")).await.unwrap();
-        assert_eq!(path.len(), 1);
     }
 
     /// Concurrent appends must chain onto each other, never fork sibling
@@ -2163,6 +2368,224 @@ mod tests {
                 .err()
                 .expect("create must fail");
             assert!(err.to_string().contains("missing"), "{field}: {err}");
+        }
+    }
+
+    // ── v4 journal semantics (§C.1, L4/L5) ────────────────────────────────
+    mod v4 {
+        use super::*;
+
+        fn user_message(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
+            SessionTreeEntry::Message {
+                id: id.into(),
+                parent_id: parent.map(str::to_string),
+                timestamp: chrono::Utc::now(),
+                message: AgentMessage::user(text),
+            }
+        }
+
+        fn turn_start(id: &str, parent: &str) -> SessionTreeEntry {
+            SessionTreeEntry::TurnStart {
+                id: id.into(),
+                parent_id: Some(parent.into()),
+                timestamp: chrono::Utc::now(),
+            }
+        }
+
+        fn tool_call(id: &str, parent: &str, call_id: &str) -> SessionTreeEntry {
+            SessionTreeEntry::ToolCall {
+                id: id.into(),
+                parent_id: Some(parent.into()),
+                timestamp: chrono::Utc::now(),
+                call_id: call_id.into(),
+                name: "Bash".into(),
+                title: "run ls".into(),
+                status: "running".into(),
+                input: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn round_trip_dense_seq_cursor_and_range() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            let mut rx = storage.subscribe_journal();
+
+            storage
+                .append_entry(&user_message("m1", None, "one"))
+                .await
+                .unwrap();
+            storage.append_entry(&turn_start("t1", "m1")).await.unwrap();
+            storage
+                .append_entry(&tool_call("c1", "t1", "call-9"))
+                .await
+                .unwrap();
+
+            // Broadcast delivered in strict seq order while appending.
+            let seqs: Vec<u64> = {
+                let mut got = Vec::new();
+                for _ in 0..3 {
+                    got.push(rx.recv().await.unwrap().seq);
+                }
+                got
+            };
+            assert_eq!(seqs, vec![0, 1, 2]);
+
+            assert_eq!(storage.journal_cursor().await, 2);
+            let range = storage.journal_range(0, u64::MAX).await.unwrap();
+            assert_eq!(range.len(), 3);
+            assert_eq!(range[0].seq, 0);
+            assert_eq!(range[2].seq, 2);
+            // Envelope-key exclusivity (§C.1): the tool handle rides as
+            // callId, never as id.
+            assert!(
+                matches!(&range[2].entry, SessionTreeEntry::ToolCall { call_id, .. } if call_id == "call-9")
+            );
+
+            // Reopen: v4 header, dense stamped lines, same chain.
+            drop(storage);
+            let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+            assert_eq!(reopened.journal_cursor().await, 2);
+            let reread = reopened.journal_range(0, u64::MAX).await.unwrap();
+            assert_eq!(reread.len(), 3);
+            assert_eq!(reread[1].entry.id(), "t1");
+        }
+
+        #[tokio::test]
+        async fn v3_backfills_on_open_and_rewrites_on_first_append() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let contents = concat!(
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+                "\n",
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
+                "\n",
+            );
+            tokio::fs::write(&path, contents).await.unwrap();
+
+            // v3 opens with backfilled seqs; nothing is rewritten yet.
+            let storage = JsonlSessionStorage::open(&path).await.unwrap();
+            assert_eq!(storage.journal_cursor().await, 1);
+            assert_eq!(storage.journal_range(0, 0).await.unwrap().len(), 1);
+            let before = tokio::fs::read_to_string(&path).await.unwrap();
+            assert!(before.contains("\"version\":3"));
+
+            // First append lazily rewrites the whole file as v4.
+            storage
+                .append_entry(&user_message("m3", Some("m2"), "three"))
+                .await
+                .unwrap();
+            let after = tokio::fs::read_to_string(&path).await.unwrap();
+            assert!(after.contains("\"version\":4"));
+            for (want, line) in after.lines().skip(1).enumerate() {
+                let value: JsonValue = serde_json::from_str(line).unwrap();
+                assert_eq!(
+                    value.get("seq").and_then(JsonValue::as_u64),
+                    Some(want as u64),
+                    "line {want} carries its dense seq: {line}"
+                );
+            }
+
+            drop(storage);
+            let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+            assert_eq!(reopened.journal_cursor().await, 2);
+        }
+
+        #[tokio::test]
+        async fn v4_stored_seq_mismatch_is_rejected() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let contents = concat!(
+                r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+                "\n",
+                r#"{"type":"message","id":"m2","parentId":"m1","seq":7,"timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
+                "\n",
+            );
+            tokio::fs::write(&path, contents).await.unwrap();
+            let err = match JsonlSessionStorage::open(&path).await {
+                Err(e) => e,
+                Ok(_) => panic!("v4 load must reject a stored seq that diverges from chain depth"),
+            };
+            assert!(
+                err.to_string().contains("chain depth"),
+                "the error explains the divergence: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn branch_shares_prefix_and_stays_dense_along_active_chain() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            storage
+                .append_entry(&user_message("m1", None, "one"))
+                .await
+                .unwrap();
+            storage
+                .append_entry(&user_message("m2", Some("m1"), "two"))
+                .await
+                .unwrap();
+
+            // Branch: cursor back to m1, then extend with m3 (parent m1).
+            storage.set_leaf_id(Some("m1")).await.unwrap();
+            storage
+                .append_entry(&user_message("m3", Some("m1"), "three"))
+                .await
+                .unwrap();
+
+            // The active chain is m1 → m3, dense 0..1; m2 keeps its own
+            // branch-local seq (1) but is off the active chain.
+            assert_eq!(storage.journal_cursor().await, 1);
+            let chain = storage.journal_range(0, u64::MAX).await.unwrap();
+            assert_eq!(
+                chain.iter().map(|r| r.entry.id()).collect::<Vec<_>>(),
+                vec!["m1", "m3"]
+            );
+            assert_eq!(chain.iter().map(|r| r.seq).collect::<Vec<_>>(), vec![0, 1]);
+        }
+
+        #[tokio::test]
+        async fn range_is_inclusive_and_clamped() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+            for i in 0..5 {
+                let parent = if i == 0 { None } else { Some(format!("m{i}")) };
+                let parent = parent.as_deref();
+                storage
+                    .append_entry(&user_message(&format!("m{}", i + 1), parent, "x"))
+                    .await
+                    .unwrap();
+            }
+            let mid = storage.journal_range(2, 3).await.unwrap();
+            assert_eq!(
+                mid.iter().map(|r| r.entry.id()).collect::<Vec<_>>(),
+                vec!["m3", "m4"]
+            );
+            // An out-of-range tail clamps to the chain end, never errors.
+            let tail = storage.journal_range(9, 99).await.unwrap();
+            assert!(tail.is_empty());
+        }
+
+        #[tokio::test]
+        async fn append_with_unknown_parent_is_refused() {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = JsonlSessionStorage::create(&dir.path().join("session.jsonl"), meta())
+                .await
+                .unwrap();
+            let err = storage
+                .append_entry(&user_message("m1", Some("ghost"), "one"))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("ghost"),
+                "the append names the unknown parent: {err}"
+            );
         }
     }
 }

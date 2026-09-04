@@ -167,58 +167,317 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         target_id: Option<String>,
     },
+    // ── v4 journal vocabulary (architecture doc §C.2) ─────────────────────
+    //
+    // Everything below extends the durable session log to the full
+    // "every observable state change is an entry" surface (L3). The envelope
+    // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
+    // fields never reuse them, so tool handles are `callId` and subagent
+    // handles `agentId` (§C.1 exclusivity rule).
+    /// A persisted UI note card (was the fire-and-forget AppendUiNote).
+    #[serde(rename = "ui_note", rename_all = "camelCase")]
+    UiNote {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        note: JsonValue,
+    },
+    /// A model turn started.
+    #[serde(rename = "turn_start", rename_all = "camelCase")]
+    TurnStart {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+    },
+    /// A model turn finished.
+    #[serde(rename = "turn_finish", rename_all = "camelCase")]
+    TurnFinish {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        cancelled: bool,
+        failed: bool,
+        stranded_steer_ids: Vec<String>,
+    },
+    /// The loop stopped advancing.
+    #[serde(rename = "stop", rename_all = "camelCase")]
+    Stop {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        reason: Option<String>,
+    },
+    /// A provider retry was scheduled.
+    #[serde(rename = "retry", rename_all = "camelCase")]
+    Retry {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        attempt: u32,
+        max_attempts: u32,
+        delay_secs: u64,
+        reason: String,
+        detail: Option<String>,
+    },
+    /// A terminal error, flattened to its message (`anyhow` is not
+    /// serializable).
+    #[serde(rename = "error", rename_all = "camelCase")]
+    ErrorEvent {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        message: String,
+    },
+    /// An assistant text delta (durable streaming chunk, dsh parity).
+    #[serde(rename = "agent_text_delta", rename_all = "camelCase")]
+    AgentTextDelta {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        delta: String,
+    },
+    /// An assistant thinking delta.
+    #[serde(rename = "agent_thinking_delta", rename_all = "camelCase")]
+    AgentThinkingDelta {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        delta: String,
+    },
+    /// A tool call announced / updated (`callId` per §C.1).
+    #[serde(rename = "tool_call", rename_all = "camelCase")]
+    ToolCall {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        call_id: String,
+        name: String,
+        title: String,
+        status: String,
+        input: Option<JsonValue>,
+    },
+    /// A tool result settled (`callId` per §C.1).
+    #[serde(rename = "tool_result", rename_all = "camelCase")]
+    ToolResult {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        call_id: String,
+        output: String,
+        is_error: bool,
+    },
+    /// A streaming chunk of a tool's output (`callId` per §C.1).
+    #[serde(rename = "tool_output_chunk", rename_all = "camelCase")]
+    ToolOutputChunk {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        call_id: String,
+        chunk: String,
+    },
+    /// An event surfaced by a subagent child session (`agentId` per §C.1).
+    #[serde(rename = "subagent_child", rename_all = "camelCase")]
+    SubagentChild {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        agent_id: String,
+        event: JsonValue,
+    },
+    /// A subagent progress tick (`agentId` per §C.1).
+    #[serde(rename = "subagent_progress", rename_all = "camelCase")]
+    SubagentProgress {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        agent_id: String,
+        agent_type: String,
+        tool_uses: u32,
+        latest_activity: Option<String>,
+        status: String,
+    },
+    /// The project binding changed (`None` unbinds).
+    #[serde(rename = "project_change", rename_all = "camelCase")]
+    ProjectChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        path: Option<String>,
+    },
+    /// The approval mode changed.
+    #[serde(rename = "permission_mode_change", rename_all = "camelCase")]
+    PermissionModeChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        mode: String,
+    },
+    /// Plan mode toggled.
+    #[serde(rename = "plan_mode_change", rename_all = "camelCase")]
+    PlanModeChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        enabled: bool,
+    },
+    /// The persisted plan snapshot changed.
+    #[serde(rename = "plan_update", rename_all = "camelCase")]
+    PlanUpdate {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        snapshot: JsonValue,
+    },
+    /// The session goal changed.
+    #[serde(rename = "goal", rename_all = "camelCase")]
+    Goal {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        goal: Option<JsonValue>,
+    },
+    /// The display title changed.
+    #[serde(rename = "title", rename_all = "camelCase")]
+    Title {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        title: String,
+    },
+    /// The browser-suite set changed.
+    #[serde(rename = "browser_suites", rename_all = "camelCase")]
+    BrowserSuites {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        suites: Vec<String>,
+    },
+    /// A background-task snapshot changed.
+    #[serde(rename = "background_task", rename_all = "camelCase")]
+    BackgroundTask {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        snapshot: JsonValue,
+    },
+    /// An approval request or decision (the `pending_auth` projection's fold
+    /// source; `kind` is `"request" | "decision"`).
+    #[serde(rename = "approval", rename_all = "camelCase")]
+    Approval {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        kind: String,
+        auth_id: String,
+        payload: JsonValue,
+    },
+    /// Pin / archive flags changed.
+    #[serde(rename = "pinned_archived", rename_all = "camelCase")]
+    PinnedArchived {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        pinned: bool,
+        archived: bool,
+    },
+    /// A compaction began (spinner state ahead of the `compaction` boundary).
+    #[serde(rename = "compaction_started", rename_all = "camelCase")]
+    CompactionStarted {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        tokens_before: u64,
+    },
+    /// A diagnostics/metrics tick (prefix stability, cache invalidation,
+    /// call metrics, token usage) — logged, low wire priority.
+    #[serde(rename = "metrics", rename_all = "camelCase")]
+    Metrics {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        metric_type: String,
+        data: JsonValue,
+    },
+}
+
+/// Borrowed envelope fields shared by every [`SessionTreeEntry`] variant.
+pub(crate) struct EntryEnvelope<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) parent_id: Option<&'a str>,
+    pub(crate) timestamp: DateTime<Utc>,
 }
 
 impl SessionTreeEntry {
-    pub fn id(&self) -> &str {
-        match self {
-            SessionTreeEntry::Message { id, .. }
-            | SessionTreeEntry::Compaction { id, .. }
-            | SessionTreeEntry::ModelChange { id, .. }
-            | SessionTreeEntry::CwdChange { id, .. }
-            | SessionTreeEntry::ThinkingLevelChange { id, .. }
-            | SessionTreeEntry::ActiveToolsChange { id, .. }
-            | SessionTreeEntry::BranchSummary { id, .. }
-            | SessionTreeEntry::CustomMessage { id, .. }
-            | SessionTreeEntry::Custom { id, .. }
-            | SessionTreeEntry::Label { id, .. }
-            | SessionTreeEntry::SessionInfo { id, .. }
-            | SessionTreeEntry::Leaf { id, .. } => id,
+    /// The envelope fields every variant carries. One macro-driven match so a
+    /// new variant only ever adds one token here (the pre-v4 accessors were
+    /// three parallel exhaustive matches).
+    fn envelope(&self) -> EntryEnvelope<'_> {
+        macro_rules! envelope_match {
+            ($($variant:ident),* $(,)?) => {
+                match self {
+                    $(
+                        SessionTreeEntry::$variant {
+                            id, parent_id, timestamp, ..
+                        } => EntryEnvelope {
+                            id,
+                            parent_id: parent_id.as_deref(),
+                            timestamp: *timestamp,
+                        },
+                    )*
+                }
+            };
         }
+        envelope_match!(
+            Message,
+            Compaction,
+            ModelChange,
+            ThinkingLevelChange,
+            CwdChange,
+            ActiveToolsChange,
+            BranchSummary,
+            Custom,
+            CustomMessage,
+            Label,
+            SessionInfo,
+            Leaf,
+            UiNote,
+            TurnStart,
+            TurnFinish,
+            Stop,
+            Retry,
+            ErrorEvent,
+            AgentTextDelta,
+            AgentThinkingDelta,
+            ToolCall,
+            ToolResult,
+            ToolOutputChunk,
+            SubagentChild,
+            SubagentProgress,
+            ProjectChange,
+            PermissionModeChange,
+            PlanModeChange,
+            PlanUpdate,
+            Goal,
+            Title,
+            BrowserSuites,
+            BackgroundTask,
+            Approval,
+            PinnedArchived,
+            CompactionStarted,
+            Metrics,
+        )
+    }
+
+    pub fn id(&self) -> &str {
+        self.envelope().id
     }
 
     pub fn parent_id(&self) -> Option<&str> {
-        match self {
-            SessionTreeEntry::Message { parent_id, .. }
-            | SessionTreeEntry::Compaction { parent_id, .. }
-            | SessionTreeEntry::ModelChange { parent_id, .. }
-            | SessionTreeEntry::CwdChange { parent_id, .. }
-            | SessionTreeEntry::ThinkingLevelChange { parent_id, .. }
-            | SessionTreeEntry::ActiveToolsChange { parent_id, .. }
-            | SessionTreeEntry::BranchSummary { parent_id, .. }
-            | SessionTreeEntry::CustomMessage { parent_id, .. }
-            | SessionTreeEntry::Custom { parent_id, .. }
-            | SessionTreeEntry::Label { parent_id, .. }
-            | SessionTreeEntry::SessionInfo { parent_id, .. }
-            | SessionTreeEntry::Leaf { parent_id, .. } => parent_id.as_deref(),
-        }
+        self.envelope().parent_id
     }
 
     pub fn timestamp(&self) -> DateTime<Utc> {
-        match self {
-            SessionTreeEntry::Message { timestamp, .. }
-            | SessionTreeEntry::Compaction { timestamp, .. }
-            | SessionTreeEntry::ModelChange { timestamp, .. }
-            | SessionTreeEntry::CwdChange { timestamp, .. }
-            | SessionTreeEntry::ThinkingLevelChange { timestamp, .. }
-            | SessionTreeEntry::ActiveToolsChange { timestamp, .. }
-            | SessionTreeEntry::BranchSummary { timestamp, .. }
-            | SessionTreeEntry::CustomMessage { timestamp, .. }
-            | SessionTreeEntry::Custom { timestamp, .. }
-            | SessionTreeEntry::Label { timestamp, .. }
-            | SessionTreeEntry::SessionInfo { timestamp, .. }
-            | SessionTreeEntry::Leaf { timestamp, .. } => *timestamp,
-        }
+        self.envelope().timestamp
     }
 
     /// The leaf cursor after appending this entry: a `leaf` entry redirects to
@@ -1334,6 +1593,32 @@ pub enum EntryType {
     Label,
     SessionInfo,
     Leaf,
+    // ── v4 journal vocabulary (§C.2) ──────────────────────────────────────
+    UiNote,
+    TurnStart,
+    TurnFinish,
+    Stop,
+    Retry,
+    ErrorEvent,
+    AgentTextDelta,
+    AgentThinkingDelta,
+    ToolCall,
+    ToolResult,
+    ToolOutputChunk,
+    SubagentChild,
+    SubagentProgress,
+    ProjectChange,
+    PermissionModeChange,
+    PlanModeChange,
+    PlanUpdate,
+    Goal,
+    Title,
+    BrowserSuites,
+    BackgroundTask,
+    Approval,
+    PinnedArchived,
+    CompactionStarted,
+    Metrics,
 }
 
 impl EntryType {
@@ -1352,6 +1637,31 @@ impl EntryType {
             EntryType::Label => "label",
             EntryType::SessionInfo => "session_info",
             EntryType::Leaf => "leaf",
+            EntryType::UiNote => "ui_note",
+            EntryType::TurnStart => "turn_start",
+            EntryType::TurnFinish => "turn_finish",
+            EntryType::Stop => "stop",
+            EntryType::Retry => "retry",
+            EntryType::ErrorEvent => "error",
+            EntryType::AgentTextDelta => "agent_text_delta",
+            EntryType::AgentThinkingDelta => "agent_thinking_delta",
+            EntryType::ToolCall => "tool_call",
+            EntryType::ToolResult => "tool_result",
+            EntryType::ToolOutputChunk => "tool_output_chunk",
+            EntryType::SubagentChild => "subagent_child",
+            EntryType::SubagentProgress => "subagent_progress",
+            EntryType::ProjectChange => "project_change",
+            EntryType::PermissionModeChange => "permission_mode_change",
+            EntryType::PlanModeChange => "plan_mode_change",
+            EntryType::PlanUpdate => "plan_update",
+            EntryType::Goal => "goal",
+            EntryType::Title => "title",
+            EntryType::BrowserSuites => "browser_suites",
+            EntryType::BackgroundTask => "background_task",
+            EntryType::Approval => "approval",
+            EntryType::PinnedArchived => "pinned_archived",
+            EntryType::CompactionStarted => "compaction_started",
+            EntryType::Metrics => "metrics",
         }
     }
 }
@@ -1527,6 +1837,31 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::Label { .. } => EntryType::Label,
         SessionTreeEntry::SessionInfo { .. } => EntryType::SessionInfo,
         SessionTreeEntry::Leaf { .. } => EntryType::Leaf,
+        SessionTreeEntry::UiNote { .. } => EntryType::UiNote,
+        SessionTreeEntry::TurnStart { .. } => EntryType::TurnStart,
+        SessionTreeEntry::TurnFinish { .. } => EntryType::TurnFinish,
+        SessionTreeEntry::Stop { .. } => EntryType::Stop,
+        SessionTreeEntry::Retry { .. } => EntryType::Retry,
+        SessionTreeEntry::ErrorEvent { .. } => EntryType::ErrorEvent,
+        SessionTreeEntry::AgentTextDelta { .. } => EntryType::AgentTextDelta,
+        SessionTreeEntry::AgentThinkingDelta { .. } => EntryType::AgentThinkingDelta,
+        SessionTreeEntry::ToolCall { .. } => EntryType::ToolCall,
+        SessionTreeEntry::ToolResult { .. } => EntryType::ToolResult,
+        SessionTreeEntry::ToolOutputChunk { .. } => EntryType::ToolOutputChunk,
+        SessionTreeEntry::SubagentChild { .. } => EntryType::SubagentChild,
+        SessionTreeEntry::SubagentProgress { .. } => EntryType::SubagentProgress,
+        SessionTreeEntry::ProjectChange { .. } => EntryType::ProjectChange,
+        SessionTreeEntry::PermissionModeChange { .. } => EntryType::PermissionModeChange,
+        SessionTreeEntry::PlanModeChange { .. } => EntryType::PlanModeChange,
+        SessionTreeEntry::PlanUpdate { .. } => EntryType::PlanUpdate,
+        SessionTreeEntry::Goal { .. } => EntryType::Goal,
+        SessionTreeEntry::Title { .. } => EntryType::Title,
+        SessionTreeEntry::BrowserSuites { .. } => EntryType::BrowserSuites,
+        SessionTreeEntry::BackgroundTask { .. } => EntryType::BackgroundTask,
+        SessionTreeEntry::Approval { .. } => EntryType::Approval,
+        SessionTreeEntry::PinnedArchived { .. } => EntryType::PinnedArchived,
+        SessionTreeEntry::CompactionStarted { .. } => EntryType::CompactionStarted,
+        SessionTreeEntry::Metrics { .. } => EntryType::Metrics,
     }
 }
 
