@@ -269,13 +269,14 @@ impl SessionMultiplexer {
         handle.update(cx, |h, cx| h.apply_from_server(msg, cx));
     }
 
-    /// Open (reopen) or create a session on the shared connection and register
-    /// a fresh leaf handle for it. `reopen = true` rebinds an existing thread
-    /// via `OpenSession` (history replays as `ServerNote`s + a follow-stream
-    /// `Snapshot`); `false` declares a fresh one via `CreateSession` (the id
-    /// comes back on the `SessionCreated` note, which opens the follow stream).
-    /// The handle is registered before the request is sent so the pump routes
-    /// the server's replies straight to it.
+    /// Open (reopen) or create a session on the shared connection and bind a
+    /// leaf handle for it — an existing leaf is REUSED (its window,
+    /// projections and in-flight fold survive; a double `StreamOpen` would
+    /// otherwise clobber the fold and double-route frames). `reopen = true`
+    /// rebinds an existing thread via `OpenSession` (history replays as
+    /// `ServerNote`s + a follow-stream `Snapshot`); `false` declares a fresh
+    /// one via the compat `CreateSession` note (the server answers
+    /// `SessionCreated`, which opens the follow stream — see `route`).
     pub fn open_or_create(
         &mut self,
         session_id: &str,
@@ -283,18 +284,17 @@ impl SessionMultiplexer {
         reopen: bool,
         cx: &mut Context<Self>,
     ) -> Entity<ClientStoreHandle> {
-        let handle = cx.new(|cx| {
-            let mut h = ClientStoreHandle::leaf(session_id, cx);
-            h.set_outbound(self.leaf_tx.clone());
-            h
-        });
-        self.sessions.insert(session_id.to_string(), handle.clone());
+        let handle = self.ensure_leaf(session_id, cx);
         if reopen {
             self.client.send_call(ClientCall::OpenSession {
                 session_id: session_id.into(),
             });
-            let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
-            self.open_follow(session_id, stream_id);
+            // A live follow (e.g. opened by the create intent) survives the
+            // re-open; only bind a new one when none is running.
+            if !self.has_follow(session_id) {
+                let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
+                self.open_follow(session_id, stream_id);
+            }
         } else {
             self.client.send_note(ClientNote::CreateSession {
                 session_id: session_id.into(),

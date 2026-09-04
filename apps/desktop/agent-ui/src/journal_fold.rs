@@ -179,7 +179,9 @@ impl JournalFold {
             self.repairing = Some(entry.last());
             let through = entry.last();
             self.queued.push_back(entry);
-            return vec![FoldOut::NeedPage(PageRequest { through_seq: through })];
+            return vec![FoldOut::NeedPage(PageRequest {
+                through_seq: through,
+            })];
         }
         self.take(|engine| engine.apply(JournalInput::Entry(entry)))
     }
