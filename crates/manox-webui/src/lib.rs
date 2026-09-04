@@ -10,6 +10,7 @@
 //! cancelling turns, so a browser refresh never kills a desktop turn.
 
 mod bridge;
+mod plugin_routes;
 mod pump;
 mod server;
 mod ws_connection;
