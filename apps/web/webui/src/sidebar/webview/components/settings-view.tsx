@@ -4,8 +4,8 @@
 
 import { useEffect, type ReactNode } from 'react';
 
-import { t } from '../../lib/i18n';
-import { Slot } from '../../slots.outlet';
+import { t } from '../lib/i18n';
+import { Slot } from '../slots.outlet';
 
 export type SettingsDialogProps = {
   onClose: () => void;

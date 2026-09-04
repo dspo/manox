@@ -12,11 +12,11 @@
 //   ├─ settings.section                  (list)  — settings overlay sections
 //   └─ shell.overlay                     (list)  — app-level modal overlays
 
-import type { ModelInfo } from '../../../protocol';
-import type { AssertSlotDefs } from './slots';
-import { declareSlot } from './slots';
+import type { ModelInfo } from '../../protocol';
+import type { AssertSlotDefs } from './state/slots';
+import { declareSlot } from './state/slots';
 
-declare module './slots' {
+declare module './state/slots' {
 	interface SlotMap {
 		/** Actions beside the "New session" button in the workspaces footer. */
 		'sidebar.workspaces.footer.action': {

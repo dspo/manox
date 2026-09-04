@@ -234,14 +234,17 @@ export function register<K extends SlotKey>(
   }
   const kind = rec.kind;
   const priority = options.priority ?? 0;
+  // `KindOptions<K>` is a deferred conditional for generic K; the runtime
+  // kind check above guarantees the cell field the kind requires is present.
+  const cells = options as { id?: string; order?: number; key?: string };
   const entry: StoredEntry = {
     component,
     priority,
     seq: ++registrationSeq,
     ...(options.registrant !== undefined ? { registrant: options.registrant } : {}),
-    ...(kind === 'list' ? { id: options.id as string } : {}),
-    ...(kind === 'list' && options.order !== undefined ? { order: options.order } : {}),
-    ...(kind === 'keyed' ? { key: options.key as string } : {}),
+    ...(kind === 'list' ? { id: cells.id as string } : {}),
+    ...(kind === 'list' && cells.order !== undefined ? { order: cells.order } : {}),
+    ...(kind === 'keyed' ? { key: cells.key as string } : {}),
   };
   if (kind === 'list' && entry.id === undefined) {
     throw new Error(`list slot "${options.name}" requires options.id`);
@@ -399,6 +402,12 @@ function flush(): void {
   for (const rec of pending) {
     for (const listener of [...rec.listeners]) listener();
   }
+}
+
+/** Synchronous declaration-lifetime notification (inject lifetimes settle
+ * before a same-tick re-registration can observe stale state). */
+function notifyDeclaration(rec: SlotRecord): void {
+  for (const listener of [...rec.declarationListeners]) listener();
 }
 
 /** Test/host seam: drop every declaration and contribution (registry state

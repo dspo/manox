@@ -17,7 +17,7 @@
 //   mirror of the threads-list row (running/errored/unread/pending_auth/
 //   pending_plan/background_work), monotonic per the mirror rules.
 
-import { useCallback, useMemo, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useRef, useSyncExternalStore } from 'react';
 
 import type {
 	GitStats,
@@ -94,6 +94,11 @@ export type ProjectionSelector<T> = (value: unknown) => T;
  */
 export function useProjection(key: string): ProjectionSnapshot | undefined;
 export function useProjection<T>(key: string, selector: (slot: ProjectionSnapshot | undefined) => T): T;
+export function useProjection<T>(
+	key: string,
+	sessionId: string | null | undefined,
+	selector: (slot: ProjectionSnapshot | undefined) => T,
+): T;
 export function useProjection<T>(
 	key: string,
 	sessionId: string | null | undefined,
@@ -207,8 +212,9 @@ export function useThreadRow(sessionId: string | null | undefined): ThreadListIt
 
 /** The reasoning-effort projection of a session. */
 export function useReasoningEffort(sessionId: string | null | undefined): ReasoningEffort | null {
-	const slot = useProjection('reasoning_effort', sessionId);
-	return useMemo(() => (typeof slot?.value === 'string' ? (slot.value as ReasoningEffort) : null), [slot]);
+	return useProjection('reasoning_effort', sessionId, (slot) =>
+		typeof slot?.value === 'string' ? (slot.value as ReasoningEffort) : null,
+	);
 }
 
 /** The git stats §E.3 fold payload (branch row of the info card). */

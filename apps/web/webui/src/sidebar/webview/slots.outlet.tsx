@@ -13,7 +13,7 @@ import {
 	type OwnerOf,
 	type SlotKey,
 	type StoredEntry,
-} from './slots';
+} from './state/slots';
 
 /** Stable list of one slot's registered entries (mutation-bumped; the
  * shadowing projection is a render-time read on top). */
