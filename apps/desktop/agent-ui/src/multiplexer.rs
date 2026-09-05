@@ -283,8 +283,17 @@ impl SessionMultiplexer {
             FromServer::Host { .. } => None,
         };
         let Some(sid) = sid else { return };
-        let Some(handle) = self.sessions.get(&sid).cloned() else {
-            return;
+        // On-demand leaf: the create path opens the follow stream the moment
+        // `SessionCreated` lands — BEFORE the workspace's attach callback
+        // (deferred a tick out of this update borrow) calls `open_or_create`.
+        // The opening Snapshot can therefore race ahead of the leaf; dropping
+        // it here dead-airs the fold forever (no frame ever reaches it, so it
+        // cannot even Resync). Creating the leaf on demand is always safe: it
+        // is a plain store, and the later `open_or_create` reuses it via
+        // `ensure_leaf`.
+        let handle = match self.sessions.get(&sid).cloned() {
+            Some(handle) => handle,
+            None => self.ensure_leaf(&sid, cx),
         };
         handle.update(cx, |h, cx| h.apply_from_server(msg, cx));
     }

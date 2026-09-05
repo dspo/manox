@@ -898,6 +898,15 @@ pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
 }
 
+/// The directory the global store scans for session transcripts.
+/// Test-support: an end-to-end test seeds transcripts here, calls
+/// [`StoreHandle::refresh`], and switches threads to assert a cold restore
+/// loads the persisted transcript (the #765 thread-switch regression lock).
+#[cfg(any(test, feature = "test-support"))]
+pub fn global_sessions_dir() -> PathBuf {
+    global().read(|s| s.sessions_dir.clone())
+}
+
 /// Serializes tests that install the process-global store override
 /// (`init_for_test` / `drop_for_test`); the override is a single slot, so
 /// store-backed tests in different modules must not interleave.

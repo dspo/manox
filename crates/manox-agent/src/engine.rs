@@ -1919,7 +1919,6 @@ async fn settle_run(
     abort_requested: bool,
     session: &AgentSession,
     state: &Arc<EngineState>,
-    repo: &manox_harness::session::repository::SessionRepository,
     sessions_dir: &Path,
     cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -1964,7 +1963,7 @@ async fn settle_run(
     }
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
-    refresh_session_list(repo, state).await;
+    spawn_session_list_refresh(sessions_dir, state);
     let (steered, stranded) = if abort_requested || failed {
         (Vec::new(), std::mem::take(run_steers))
     } else {
@@ -2034,7 +2033,6 @@ async fn chain_goal_rounds(
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     pi_model: &mut PiModel,
-    repo: &manox_harness::session::repository::SessionRepository,
     sessions_dir: &Path,
     cwd: &Path,
     session_path: &Path,
@@ -2075,7 +2073,6 @@ async fn chain_goal_rounds(
             abort_requested,
             session,
             state,
-            repo,
             sessions_dir,
             cwd,
             notice_tx,
@@ -2519,6 +2516,16 @@ async fn run_actor(
     // never inherit the previous session; startup and explicit opens do.
     let latest = if fresh {
         None
+    } else if let Some(requested) = &initial_path {
+        // An explicit open reads only the requested transcript. The
+        // store-wide `repo.list()` walk reads and parses every session
+        // file — on a daily-use store that parked every thread switch
+        // behind a full-store scan (#765 symptom: clicking a sidebar
+        // thread never loads). The host filter is fail-closed as before.
+        repo.info(requested)
+            .await
+            .ok()
+            .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()))
     } else {
         repo.list().await.ok().and_then(|list| {
             // Only this host's sessions are eligible for restore; an explicit
@@ -2526,9 +2533,6 @@ async fn run_actor(
             let mut list = list
                 .into_iter()
                 .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()));
-            if let Some(requested) = &initial_path {
-                return list.find(|info| info.path == *requested);
-            }
             list.find(|info| info.message_count > 0)
         })
     };
@@ -2641,7 +2645,7 @@ async fn run_actor(
     if let Some(project) = &project {
         write_project_sidecar(&sessions_dir, session.path(), project).await;
     }
-    refresh_session_list(&repo, &state).await;
+    spawn_session_list_refresh(&sessions_dir, &state);
 
     // Idle-wakeup channel: the harness listener signals when monitor events
     // land in the steering queue; the actor resumes an idle session below.
@@ -2840,7 +2844,6 @@ async fn run_actor(
                         abort_requested,
                         &session,
                         &state,
-                        &repo,
                         &sessions_dir,
                         &cwd,
                         &notice_tx,
@@ -2864,7 +2867,6 @@ async fn run_actor(
                         &state,
                         &notice_tx,
                         &mut pi_model,
-                        &repo,
                         &sessions_dir,
                         &cwd,
                         &active_session_path,
@@ -2925,7 +2927,6 @@ async fn run_actor(
                     abort_requested,
                     &session,
                     &state,
-                    &repo,
                     &sessions_dir,
                     &cwd,
                     &notice_tx,
@@ -2949,7 +2950,6 @@ async fn run_actor(
                     &state,
                     &notice_tx,
                     &mut pi_model,
-                    &repo,
                     &sessions_dir,
                     &cwd,
                     &active_session_path,
@@ -3119,7 +3119,6 @@ async fn run_actor(
                         &state,
                         &notice_tx,
                         &mut pi_model,
-                        &repo,
                         &sessions_dir,
                         &cwd,
                         &active_session_path,
@@ -3156,7 +3155,7 @@ async fn run_actor(
                         Ok(_) => {
                             sync_history(&session, &sessions_dir, &state).await;
                             sync_usage(&session, &state).await;
-                            refresh_session_list(&repo, &state).await;
+                            spawn_session_list_refresh(&sessions_dir, &state);
                         }
                         Err(err) => {
                             // Execute anyway — approval intent stands; the
@@ -3191,7 +3190,6 @@ async fn run_actor(
                     abort_requested,
                     &session,
                     &state,
-                    &repo,
                     &sessions_dir,
                     &cwd,
                     &notice_tx,
@@ -3216,7 +3214,7 @@ async fn run_actor(
                         clear_user_chrome(&sessions_dir, session.path()).await;
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
-                        refresh_session_list(&repo, &state).await;
+                        spawn_session_list_refresh(&sessions_dir, &state);
                     }
                     Err(err)
                         if err
@@ -3299,7 +3297,7 @@ async fn run_actor(
                 state.session_start_fired.store(true, Ordering::SeqCst);
                 sync_history(&session, &sessions_dir, &state).await;
                 sync_usage(&session, &state).await;
-                refresh_session_list(&repo, &state).await;
+                spawn_session_list_refresh(&sessions_dir, &state);
             }
             SessionCmd::SetCwd { path } => {
                 if !path.is_dir() {
@@ -3405,7 +3403,7 @@ async fn run_actor(
                         resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
-                        refresh_session_list(&repo, &state).await;
+                        spawn_session_list_refresh(&sessions_dir, &state);
                     }
                     Err(err) => {
                         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
@@ -3469,17 +3467,15 @@ async fn rebuild_session(
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) {
     // The old session is replaced (its Drop runs on the actor thread); it is
-    // already idle when a switch happens, so nothing in-flight is lost.
+    // already idle when a switch happens, so nothing in-flight is lost. The
+    // project cwd comes from the opened transcript's own header — reading the
+    // one file, never a store-wide `list` (the #765 thread-switch stall).
     let repo = manox_harness::session::repository::SessionRepository::new(sessions_dir);
     let cwd = repo
-        .list()
+        .info(path)
         .await
         .ok()
-        .and_then(|list| {
-            list.into_iter()
-                .find(|info| info.path == path)
-                .map(|info| PathBuf::from(info.cwd))
-        })
+        .map(|info| PathBuf::from(info.cwd))
         .map(|cwd| {
             if cwd.as_os_str() == "/" {
                 fallback_cwd.to_path_buf()
@@ -4382,12 +4378,29 @@ fn to_token_usage(u: &manox_harness::types::Usage) -> TokenUsage {
     }
 }
 
+/// Mirror the session list into the actor's state as a detached scan.
+///
+/// `SessionRepository::list` reads and parses every transcript in the
+/// store — an O(store) walk that takes seconds-to-minutes on a real
+/// daily-use store. Awaiting it inline (the #765 regression) parked the
+/// actor before its idle loop and at every settle point, so
+/// `JournalSnapshot` (the follow-stream snapshot that carries the
+/// projection baseline) and `SetModel` sat behind the scan and every
+/// thread looked dead. The mirror is best-effort presentation state
+/// (sidebar rows), so the walk runs on the side; the mutex swap is the
+/// handoff.
+fn spawn_session_list_refresh(sessions_dir: &Path, state: &Arc<EngineState>) {
+    let sessions_dir = sessions_dir.to_path_buf();
+    let state = Arc::clone(state);
+    crate::runtime::handle().spawn(async move {
+        refresh_session_list(&sessions_dir, &state).await;
+    });
+}
+
 /// Re-read the session directory and mirror the summary list into engine
 /// state (the sidebar's source of truth).
-async fn refresh_session_list(
-    repo: &manox_harness::session::repository::SessionRepository,
-    state: &Arc<EngineState>,
-) {
+async fn refresh_session_list(sessions_dir: &Path, state: &Arc<EngineState>) {
+    let repo = manox_harness::session::repository::SessionRepository::new(sessions_dir);
     let mut out = Vec::new();
     if let Ok(list) = repo.list().await {
         for info in list {
@@ -5693,13 +5706,11 @@ mod tests {
         // Settlement persists the parked note BEFORE the authoritative
         // sync, so the rebuilt mirror retains it — no loss window between
         // the mid-run mirror and the next reload.
-        let repo = manox_harness::session::repository::SessionRepository::new(&sessions_path);
         settle_run(
             &result,
             false,
             &session,
             &state,
-            &repo,
             &sessions_path,
             &cwd,
             &notice_tx,
