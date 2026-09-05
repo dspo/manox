@@ -3,6 +3,14 @@
 // untagged errors) to manager-level subscribers, so host surfaces like the
 // chat participant and the sidebar each own their session and never see one
 // another's turns.
+//
+// T9 (v2 frames): the manager also exposes `onFrame`, a raw relay that sees
+// every `FromServer` envelope (notification / request / response / host /
+// streamItem / streamEnd) with zero filtering — the sidebar webview renderer
+// consumes the v2 stream frames through it. `host` frames are additionally
+// folded into the legacy global-event mirror (§D.5) so the manager's own
+// awaits (`ready` / `models` / `threadsUpdated` / `commands`) keep working
+// whichever envelope the server uses.
 
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
@@ -12,8 +20,8 @@ import type {
   CommandEntry,
   FromClient,
   FromServer,
+  HostEvent,
   ModelInfo,
-  ThreadInfoSnapshot,
   ThreadListItem,
 } from '../dist/protocol';
 import { isSessionEvent, notification, request } from './protocolHelpers';
@@ -39,11 +47,22 @@ export function configuredApprovalMode(): ApprovalMode {
 
 export class SessionManager {
   private static instance: SessionManager | null = null;
+  /** Host identity pinned on the Initialize handshake (§D.2). Minted once
+   * per machine by `activate` (persisted in globalState) and replayed on
+   * every manager (re)build, so window reloads and re-inits re-seat the
+   * server-side owner instead of registering a fresh client. */
+  private static clientId = '';
 
-  /** Process-wide manager: the agent server is shared by every host surface. */
-  static shared(): SessionManager {
+  /** Process-wide manager: the agent server is shared by every host surface.
+   * `clientId` is captured on the call that creates the instance (extension
+   * activation passes the persisted identity; later calls just hand back the
+   * live manager). */
+  static shared(clientId?: string): SessionManager {
+    if (clientId) SessionManager.clientId = clientId;
     if (!SessionManager.instance) {
-      SessionManager.instance = new SessionManager(NapiTransport.load());
+      SessionManager.instance = new SessionManager(
+        NapiTransport.load(SessionManager.clientId),
+      );
     }
     return SessionManager.instance;
   }
@@ -57,6 +76,13 @@ export class SessionManager {
 
   private readonly sessions = new Map<string, EventEmitter>();
   private readonly global = new EventEmitter();
+  /** Raw `FromServer` relay (T9): every frame, unfiltered, in arrival order. */
+  private readonly frames = new EventEmitter();
+  /** §D.5 mirror of the thread registry: the latest full list seen on either
+   * envelope (legacy `threadsUpdated` note or `HostEvent::ThreadsUpdated`),
+   * with `sessionStatus` deltas merged. Seeds the `listThreads` await when
+   * the server has moved to host frames for registry pushes. */
+  private threadsSnapshot: ThreadListItem[] | null = null;
   private initPhase: 'idle' | 'starting' | 'ready' = 'idle';
   private readyPromise: Promise<void> | null = null;
   private approvalMode: ApprovalMode = configuredApprovalMode();
@@ -65,7 +91,13 @@ export class SessionManager {
 
   private constructor(private readonly transport: Transport) {
     this.global.setMaxListeners(0);
-    transport.onEvent((msg) => this.route(msg));
+    this.frames.setMaxListeners(0);
+    transport.onEvent((msg) => {
+      // Raw relay first: the webview-facing surfaces see every frame,
+      // unfiltered (T9 pass-through), before host-internal routing.
+      this.frames.emit('frame', msg);
+      this.route(msg);
+    });
   }
 
   private route(msg: FromServer): void {
@@ -91,6 +123,12 @@ export class SessionManager {
         }
         if (note.method === 'ready') {
           this.initPhase = 'ready';
+        }
+        if (note.method === 'threadsUpdated') {
+          // Keep the §D.5 mirror in sync while the dual-protocol server
+          // still pushes the legacy note.
+          this.threadsSnapshot =
+            (note.threads as ThreadListItem[] | undefined) ?? this.threadsSnapshot;
         }
         this.global.emit('event', note);
         return;
@@ -123,6 +161,96 @@ export class SessionManager {
             pending.reject(new Error(`request failed: ${msg.outcome.Err.message}`));
           }
         }
+        return;
+      }
+      case 'host': {
+        // §D.5 host vocabulary: mirror into the legacy global-event shape so
+        // the manager's own awaits keep resolving whichever envelope the
+        // server uses. The webview receives the frame verbatim via onFrame.
+        this.foldHostEvent(msg.host);
+        return;
+      }
+      case 'streamItem':
+      case 'streamEnd': {
+        // v2 journal frames target the webview renderer (the shared v2
+        // bundle routes them by streamId into its journal engine). The host
+        // never consumes or filters them; the onFrame relay forwards them.
+        return;
+      }
+    }
+  }
+
+  /** Fold a `HostEvent` into the manager's global-event mirror. Unknown
+   * future variants are dropped (the raw relay still forwards them). */
+  private foldHostEvent(host: HostEvent): void {
+    switch (host.type) {
+      case 'ready':
+        this.initPhase = 'ready';
+        this.global.emit('event', { method: 'ready' });
+        return;
+      case 'models':
+        this.global.emit('event', { method: 'models', models: host.models });
+        return;
+      case 'commands':
+        this.global.emit('event', { method: 'commands', commands: host.commands });
+        return;
+      case 'threadsUpdated':
+        this.threadsSnapshot = host.threads;
+        this.global.emit('event', { method: 'threadsUpdated', threads: host.threads });
+        return;
+      case 'sessionStatus': {
+        // Merge the per-session projection into the registry mirror. Before
+        // any full list has been seen, synthesize a partial entry so the
+        // `listThreads` await can resolve; a later `threadsUpdated` (either
+        // envelope) replaces the whole snapshot.
+        const status: Partial<ThreadListItem> = {
+          id: host.sessionId,
+          running: host.running ?? false,
+          errored: host.errored ?? false,
+          unread: host.unread ?? false,
+          pending_auth: host.pendingAuth ?? false,
+          pending_plan: host.pendingPlan ?? false,
+          background_work: host.backgroundWork ?? false,
+        };
+        if (this.threadsSnapshot) {
+          this.threadsSnapshot = this.threadsSnapshot.map((t) =>
+            t.id === host.sessionId ? { ...t, ...status } : t,
+          );
+        } else {
+          this.threadsSnapshot = [
+            {
+              id: host.sessionId,
+              title: '',
+              updated_at: 0,
+              pinned: false,
+              archived: false,
+              parent_id: null,
+              depth: 0,
+              model_id: '',
+              ...status,
+            } as ThreadListItem,
+          ];
+        }
+        this.global.emit('event', {
+          method: 'threadsUpdated',
+          threads: this.threadsSnapshot,
+        });
+        return;
+      }
+      case 'error':
+        this.global.emit('event', {
+          method: 'error',
+          sessionId: null,
+          message: host.message,
+        });
+        return;
+      case 'sessionCreated':
+      case 'sessionDisposed': {
+        const note = { method: host.type, sessionId: host.sessionId };
+        const emitter = this.sessions.get(host.sessionId);
+        if (emitter) emitter.emit('event', note);
+        else this.global.emit('event', note);
+        if (host.type === 'sessionDisposed') this.sessions.delete(host.sessionId);
         return;
       }
     }
@@ -259,6 +387,15 @@ export class SessionManager {
     return () => emitter!.off('event', handler);
   }
 
+  /** T9 raw frame relay: subscribe to every `FromServer` envelope with zero
+   * filtering (v2 `streamItem` / `streamEnd` / `host` included). The sidebar
+   * webview host forwards these verbatim to the shared v2 bundle. Returns an
+   * unsubscribe function. */
+  onFrame(handler: (msg: FromServer) => void): () => void {
+    this.frames.on('frame', handler);
+    return () => this.frames.off('frame', handler);
+  }
+
   /** Subscribe to ServerCall requests for a session (approve/askUserQuestion/planVerdict). */
   onSessionServerCall(sessionId: string, handler: (ev: { id: string; call: Record<string, unknown> }) => void): () => void {
     const emitter = this.sessions.get(sessionId);
@@ -280,10 +417,7 @@ export class SessionManager {
   }
 
   listThreads(): Promise<ThreadListItem[]> {
-    const threads = this.awaitGlobal(
-      (ev) => ev.method === 'threadsUpdated',
-      'threads_updated',
-    );
+    const threads = this.awaitNote('threadsUpdated', 'threads_updated');
     this.send(request({ method: 'listThreads' }));
     return threads.then(
       (ev) => (ev as Record<string, unknown> & { threads: ThreadListItem[] }).threads,
@@ -314,17 +448,11 @@ export class SessionManager {
     );
   }
 
-  requestThreadInfo(sessionId: string): Promise<ThreadInfoSnapshot> {
-    const info = this.awaitSession(
-      sessionId,
-      (ev) => ev.method === 'threadInfo',
-      'thread_info',
-    );
-    this.send(request({ method: 'threadInfo', sessionId }));
-    return info.then(
-      (ev) => (ev as Record<string, unknown> & { info: ThreadInfoSnapshot }).info,
-    );
-  }
+  // T10c (§D.6): the v1 `requestThreadInfo` path (awaiting the doomed
+  // `threadInfo` note) is deleted — the server's `ClientCall::ThreadInfo`
+  // arm answers a removed-surface error since T10b. Successors: the
+  // follow-stream snapshot's projection baseline (attach) and the §E.3
+  // `GetConversationInfo` fold (on-demand info card).
 
   /** Shut the transport down; `disposeShared` is the public entry point. */
   private async dispose(): Promise<void> {
@@ -333,6 +461,7 @@ export class SessionManager {
     }
     this.pendingRequests.clear();
     this.sessions.clear();
+    this.frames.removeAllListeners();
     await this.transport.dispose();
   }
 
@@ -342,6 +471,21 @@ export class SessionManager {
     timeoutMs: number = RESPONSE_TIMEOUT_MS,
   ): Promise<Record<string, unknown>> {
     return this.awaitOn(this.global, match, label, timeoutMs);
+  }
+
+  /** Await a global event by method name, short-circuiting from the §D.5
+   * host mirror when it already holds the payload (the server's registry
+   * pushes may arrive as `HostEvent` frames rather than legacy notes; the
+   * mirror is folded by both envelopes). */
+  private awaitNote(
+    method: string,
+    label: string,
+    timeoutMs: number = RESPONSE_TIMEOUT_MS,
+  ): Promise<Record<string, unknown>> {
+    if (method === 'threadsUpdated' && this.threadsSnapshot) {
+      return Promise.resolve({ method, threads: this.threadsSnapshot });
+    }
+    return this.awaitGlobal((ev) => ev.method === method, label, timeoutMs);
   }
 
   private awaitSession(

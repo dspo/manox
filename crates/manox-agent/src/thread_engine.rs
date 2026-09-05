@@ -34,6 +34,24 @@ pub trait ThreadEngine: Send + Sync {
     /// queue orders it against prompts.
     fn append_ui_note(&self, _record: crate::db::UiNoteRecord) {}
 
+    /// The thread's journal feed (§C.3): ordered appends across session
+    /// swaps; `Lagged` is the resync signal (L5). Backends without a
+    /// journal yield an immediately-closed channel.
+    fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        tokio::sync::broadcast::channel(1).0.subscribe()
+    }
+
+    /// A one-shot whole-chain journal read (§C.3). Backends without a
+    /// journal resolve the receiver with a send error.
+    fn journal_snapshot(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<crate::engine::JournalSnapshotData> {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        rx
+    }
+
     /// Token usage keyed by user-message id, as the env card renders it.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
 
@@ -153,6 +171,18 @@ pub trait ThreadEngine: Send + Sync {
         _compact_instructions: Option<String>,
         _seed_text: String,
     ) {
+    }
+
+    /// `run` with the client's origin RPC id pinned onto this turn's first
+    /// user message (§F.2). Engines without origin support ignore it.
+    fn run_with_origin(
+        &self,
+        prompt: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) {
+        let _ = origin;
+        self.run(prompt, images);
     }
 
     /// Run a manual context-compaction pass (`/compact`). Backends without

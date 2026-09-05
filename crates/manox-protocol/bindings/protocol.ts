@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Client → server queries; each expects a [`crate::FromServer::Response`].
  */
-export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, };
+export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, } | { "method": "createSession", cwd: string | null, project: string | null, initialModel: ModelRef | null, approvalMode: string | null, reasoningEffort: string | null, } | { "method": "submit", sessionId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "steer", sessionId: string, messageId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "pageHistory", sessionId: string, throughSeq: bigint, beforeSeq: bigint | null, maxMessages: number | null, } | { "method": "getConversationInfo", sessionId: string, };
 
 /**
  * Client identity + capability declaration carried on connect.
@@ -19,12 +19,12 @@ export type ClientNote = { "method": "createSession", sessionId: string, cwd: st
 /**
  * Client → server message.
  */
-export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, };
+export type FromClient = { "kind": "request", id: MsgId, call: ClientCall, } | { "kind": "notification", note: ClientNote, } | { "kind": "reply", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "streamOpen", streamId: StreamId, streamKind: StreamKind, } | { "kind": "streamCancel", streamId: StreamId, };
 
 /**
  * Server → client message.
  */
-export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, };
+export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonValue } | { Err : RpcError }, } | { "kind": "request", id: MsgId, call: ServerCall, } | { "kind": "notification", note: ServerNote, } | { "kind": "host", host: HostEvent, } | { "kind": "streamItem", streamId: StreamId, frame: StreamFrame, } | { "kind": "streamEnd", streamId: StreamId, reason: StreamEndReason, };
 
 /**
  * Capabilities a client can answer when the server issues a [`super::ServerCall`].
@@ -32,6 +32,18 @@ export type FromServer = { "kind": "response", id: MsgId, outcome: { Ok : JsonVa
  * able to fulfil it; a call with no capable owner fails closed.
  */
 export type HookKind = "approve" | "planVerdict" | "askUserQuestion" | "browserOp" | "clipboardRead" | "openExternal";
+
+/**
+ * Global host notification — the §D.5 vocabulary replacing the doomed
+ * server-side domain notes (`ServerNote::Models`/`Commands`/
+ * `ThreadsUpdated`/turn-lifecycle/`Error`/session-control, §D.6). Carried by
+ * the v2 envelope's `FromServer::Notification { host }` (T4/T5 wiring); on
+ * the v1 wire the same shapes are still delivered via `ServerNote` (L12:
+ * unknown variants are dropped + logged, never disconnecting).
+ *
+ * Declaring surface: HOST_EVENTS.
+ */
+export type HostEvent = { "type": "ready", epoch: number, } | { "type": "models", models: Array<ModelInfo>, } | { "type": "commands", commands: JsonValue, } | { "type": "threadsUpdated", threads: Array<ThreadListItem>, } | { "type": "sessionStatus", sessionId: string, running: boolean | null, errored: boolean | null, unread: boolean | null, pendingAuth: boolean | null, pendingPlan: boolean | null, backgroundWork: boolean | null, } | { "type": "sessionCreated", sessionId: string, header: ThreadHeader, } | { "type": "sessionDisposed", sessionId: string, } | { "type": "error", message: string, };
 
 /**
  * A base64-encoded image attachment (submit / steer payloads).
@@ -47,6 +59,71 @@ data: string, mimeType: string, };
  * [`HookKind`]s it can answer, and which sessions it initially owns.
  */
 export type Initialize = { clientId: string, capabilities: Array<HookKind>, sessions: Array<string>, };
+
+/**
+ * One journal entry line as it travels the wire (§C.1 entry envelope):
+ * chain-dense `seq` + identity + timestamp + the [`JournalWireEvent`].
+ * `StreamFrame::Entry { seq, event }` carries the same pair inside the
+ * frame tag (§D.1).
+ */
+export type JournalWireEntry = { 
+/**
+ * Chain depth, dense 0-based, stamped at the single append point (L4).
+ */
+seq: bigint, 
+/**
+ * Entry uuid.
+ */
+id: string, 
+/**
+ * Parent entry uuid (chain edge).
+ */
+parentId: string | null, 
+/**
+ * ISO-8601 append timestamp (journal file shape).
+ */
+timestamp: string, } & ({ "type": "message", 
+/**
+ * `"user" | "assistant" | "tool"` — the persisted role vocabulary.
+ */
+role: string, 
+/**
+ * Content blocks in the kernel's storage shape (wire-opaque).
+ */
+content: Array<JsonValue>, 
+/**
+ * Assistant per-request token usage; absent on other roles.
+ */
+usage: UsagePayload | null, 
+/**
+ * RPC id of the `Submit`/`Steer` call that created this message,
+ * when a client echo must be retired by it.
+ */
+originRpc: string | null, } | { "type": "uiNote", kind: string, data: JsonValue, } | { "type": "custom", customType: string, data: JsonValue, } | { "type": "customMessage", customType: string, content: Array<JsonValue>, display: boolean, } | { "type": "turnStart" } | { "type": "turnFinish", cancelled: boolean, failed: boolean, strandedSteerIds: Array<string>, } | { "type": "stop", reason: string | null, } | { "type": "retry", attempt: number, maxAttempts: number, delaySecs: bigint, reason: string, } | { "type": "error", message: string, } | { "type": "agentTextDelta", s: string, } | { "type": "agentThinkingDelta", s: string, } | { "type": "toolCall", callId: string, name: string, title: string, status: string, input: JsonValue, } | { "type": "toolResult", callId: string, output: string, isError: boolean, } | { "type": "toolOutputChunk", callId: string, chunk: string, } | { "type": "subagentChild", agentId: string, event: JsonValue, } | { "type": "subagentProgress", agentId: string, agentType: string, toolUses: number, latestActivity: string | null, status: string, } | { "type": "modelChange", from: ModelRef | null, to: ModelRef, } | { "type": "cwdChange", path: string, } | { "type": "projectChange", path: string | null, } | { "type": "permissionModeChange", mode: string, } | { "type": "reasoningEffortChange", effort: string, } | { "type": "planModeChange", enabled: boolean, } | { "type": "planUpdate", snapshot: JsonValue, } | { "type": "goal", goal: JsonValue | null, } | { "type": "title", title: string, } | { "type": "browserSuites", suites: Array<string>, } | { "type": "backgroundTask", snapshot: JsonValue, } | { "type": "approval", kind: string, authId: string, toolName: string | null, toolCallId: string | null, verdict: string | null, reason: string | null, } | { "type": "pinnedArchived", pinned: boolean, archived: boolean, } | { "type": "activeToolsChange", tools: Array<string>, } | { "type": "compaction", summary: string, messagesCompacted: number, tokensBefore: bigint, retainedTail: Array<JsonValue>, firstKeptEntryId: string | null, } | { "type": "compactionStarted", tokensBefore: bigint, } | { "type": "branchSummary", text: string, } | { "type": "label", label: string, } | { "type": "sessionInfo", data: JsonValue, } | { "type": "leaf", targetId: string, } | { "type": "metrics", kind: string, data: JsonValue, });
+
+/**
+ * One journal wire event: the §C.2 entry vocabulary, verbatim. Variant
+ * payload fields match the §C.2 table; the row group is in each variant's
+ * doc comment.
+ */
+export type JournalWireEvent = { "type": "message", 
+/**
+ * `"user" | "assistant" | "tool"` — the persisted role vocabulary.
+ */
+role: string, 
+/**
+ * Content blocks in the kernel's storage shape (wire-opaque).
+ */
+content: Array<JsonValue>, 
+/**
+ * Assistant per-request token usage; absent on other roles.
+ */
+usage: UsagePayload | null, 
+/**
+ * RPC id of the `Submit`/`Steer` call that created this message,
+ * when a client echo must be retired by it.
+ */
+originRpc: string | null, } | { "type": "uiNote", kind: string, data: JsonValue, } | { "type": "custom", customType: string, data: JsonValue, } | { "type": "customMessage", customType: string, content: Array<JsonValue>, display: boolean, } | { "type": "turnStart" } | { "type": "turnFinish", cancelled: boolean, failed: boolean, strandedSteerIds: Array<string>, } | { "type": "stop", reason: string | null, } | { "type": "retry", attempt: number, maxAttempts: number, delaySecs: bigint, reason: string, } | { "type": "error", message: string, } | { "type": "agentTextDelta", s: string, } | { "type": "agentThinkingDelta", s: string, } | { "type": "toolCall", callId: string, name: string, title: string, status: string, input: JsonValue, } | { "type": "toolResult", callId: string, output: string, isError: boolean, } | { "type": "toolOutputChunk", callId: string, chunk: string, } | { "type": "subagentChild", agentId: string, event: JsonValue, } | { "type": "subagentProgress", agentId: string, agentType: string, toolUses: number, latestActivity: string | null, status: string, } | { "type": "modelChange", from: ModelRef | null, to: ModelRef, } | { "type": "cwdChange", path: string, } | { "type": "projectChange", path: string | null, } | { "type": "permissionModeChange", mode: string, } | { "type": "reasoningEffortChange", effort: string, } | { "type": "planModeChange", enabled: boolean, } | { "type": "planUpdate", snapshot: JsonValue, } | { "type": "goal", goal: JsonValue | null, } | { "type": "title", title: string, } | { "type": "browserSuites", suites: Array<string>, } | { "type": "backgroundTask", snapshot: JsonValue, } | { "type": "approval", kind: string, authId: string, toolName: string | null, toolCallId: string | null, verdict: string | null, reason: string | null, } | { "type": "pinnedArchived", pinned: boolean, archived: boolean, } | { "type": "activeToolsChange", tools: Array<string>, } | { "type": "compaction", summary: string, messagesCompacted: number, tokensBefore: bigint, retainedTail: Array<JsonValue>, firstKeptEntryId: string | null, } | { "type": "compactionStarted", tokensBefore: bigint, } | { "type": "branchSummary", text: string, } | { "type": "label", label: string, } | { "type": "sessionInfo", data: JsonValue, } | { "type": "leaf", targetId: string, } | { "type": "metrics", kind: string, data: JsonValue, };
 
 /**
  * One selectable model in the models list — the wire schema for
@@ -70,10 +147,41 @@ api: string, context_window: number,
 max_tokens?: number, };
 
 /**
+ * Canonical model reference on the wire: `{provider_registration}/{model_id}`
+ * (e.g. `DeepSeek-anthropic/deepseek-chat`).
+ *
+ * Per L8 the wire type never carries a bare model id: every model field in
+ * this crate uses `ModelRef`. Resolution / compatibility for bare ids is a
+ * server-only concern, converged in the single entry point
+ * `resolve_model_ref` (`manox-harness::model_ref`); clients must never parse
+ * domain identity beyond display splitting (L6).
+ *
+ * Declaring surface: shared identity type of the JOURNAL_ENTRIES /
+ * PROJECTION_KEYS / frame payloads (§D, L8).
+ */
+export type ModelRef = string;
+
+/**
  * Correlation id for a request/response or call/reply pair. Opaque to the
  * transport; minted by the caller and echoed verbatim by the responder.
  */
 export type MsgId = string;
+
+/**
+ * Delta of changed projection keys since the previous frame (§D.1, §E.1):
+ * only changed entries are carried; clients keep higher-`as_of_seq`-wins.
+ *
+ * Declaring surface: FRAMES (payload of `StreamFrame::Projections`).
+ */
+export type ProjectionsFrame = { sessionId: string, 
+/**
+ * Triggering entry's seq (the fold point, §E.1).
+ */
+asOfSeq: bigint, 
+/**
+ * Changed keys only: key → value.
+ */
+values: { [key in string]?: JsonValue }, };
 
 /**
  * Error carried in a `Response`/`Reply` `Err` outcome.
@@ -96,31 +204,102 @@ data: JsonValue | null, };
 export type ServerCall = { "method": "approve", sessionId: string, authId: string, toolName: string, summary: string, input: JsonValue, } | { "method": "planVerdict", sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "askUserQuestion", sessionId: string, authId: string, input: JsonValue, } | { "method": "browserOp", sessionId: string, op: JsonValue, } | { "method": "clipboardRead", sessionId: string, } | { "method": "openExternal", sessionId: string, url: string, };
 
 /**
- * Server → client streaming notifications.
+ * Server → client notifications (the retained §D.6 surface — see the
+ * module docs for the per-group rationale).
  */
-export type ServerNote = { "method": "ready" } | { "method": "sessionCreated", sessionId: string, } | { "method": "sessionDisposed", sessionId: string, } | { "method": "turnStarted", sessionId: string, } | { "method": "turnFinished", sessionId: string, cancelled: boolean, failed: boolean, strandedSteerIds: Array<string>, } | { "method": "stop", sessionId: string, reason: string | null, } | { "method": "agentText", sessionId: string, text: string, } | { "method": "agentThinking", sessionId: string, text: string, } | { "method": "toolCall", sessionId: string, id: string, name: string, title: string, status: string, input: JsonValue | null, } | { "method": "toolResult", sessionId: string, id: string, output: string, isError: boolean, } | { "method": "toolOutput", sessionId: string, id: string, chunk: string, } | { "method": "threadHistory", sessionId: string, messages: Array<WireMessage>, displayHistory: JsonValue, autoApprovedTools: Array<string> | null, restored: boolean, loading: boolean, } | { "method": "threadInfo", sessionId: string, info: ThreadInfoPayload, } | { "method": "threadsUpdated", threads: Array<ThreadListItem>, } | { "method": "models", models: Array<ModelInfo>, } | { "method": "commands", commands: JsonValue, } | { "method": "usage", sessionId: string, usage: JsonValue, cost: number, } | { "method": "usageSnapshot", sessionId: string, cumulative: TokenUsageSnapshot, perModel: { [key in string]?: TokenUsageSnapshot }, cumulativeCost: number, perModelCost: { [key in string]?: number }, perRequest: { [key in string]?: TokenUsageSnapshot }, } | { "method": "currentModel", sessionId: string, id: string | null, name: string | null, } | { "method": "planReady", sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "planUpdated", sessionId: string, snapshot: JsonValue | null, } | { "method": "planModeChanged", sessionId: string, enabled: boolean, } | { "method": "goalChanged", sessionId: string, snapshot: JsonValue | null, } | { "method": "cwdChanged", sessionId: string, path: string, } | { "method": "permissionModeChanged", sessionId: string, mode: string, } | { "method": "reasoningEffortChanged", sessionId: string, effort: string, } | { "method": "browserSuitesChanged", sessionId: string, suites: Array<string>, } | { "method": "compactionStarted", sessionId: string, tokensBefore: bigint, } | { "method": "compaction", sessionId: string, summary: string, 
-/**
- * The retained tail of messages after compaction: the server folds
- * older history into the summary and keeps the most recent messages.
- * The client store replaces its transcript with `summary + retained`.
- * Always present on the wire — an empty array means nothing was
- * retained. Populate from the kernel `CompactionResult.retained_tail`
- * via `translate`; never send a synthetic empty tail for a
- * compaction that kept messages.
- */
-retained: JsonValue, } | { "method": "cacheInvalidation", sessionId: string, reprocessedTokens: bigint, } | { "method": "subagentStarted", sessionId: string, id: string, agentType: string, description: string, } | { "method": "subagentProgress", sessionId: string, id: string, agentType: string, toolUses: number, latestActivity: string | null, status: string, } | { "method": "subagentChild", sessionId: string, id: string, event: JsonValue, } | { "method": "backgroundTaskUpdated", sessionId: string, snapshot: JsonValue, } | { "method": "steerPending", sessionId: string, clientId: string, messageId: string, } | { "method": "steerInjected", sessionId: string, messageId: string, } | { "method": "approvalDecision", sessionId: string, toolCallId: string, toolName: string, toolTitle: string, verdict: string, reason: string | null, } | { "method": "branch", sessionId: string, branch: string, } | { "method": "gitStats", sessionId: string, stats: JsonValue, } | { "method": "historyProgress", sessionId: string, } | { "method": "retry", sessionId: string, attempt: number, maxAttempts: number, delaySecs: bigint, reason: string, detail: string | null, } | { "method": "peerMessage", sessionId: string, from: string, content: string, } | { "method": "modelText", requestId: string, text: string, } | { "method": "modelThinking", requestId: string, text: string, } | { "method": "modelToolCall", requestId: string, id: string, name: string, input: JsonValue, } | { "method": "modelChatDone", requestId: string, stop: string | null, error: string | null, } | { "method": "tokenUsage", sessionId: string, input: bigint, output: bigint, cacheCreation: bigint, cacheRead: bigint, } | { "method": "error", sessionId: string | null, message: string, };
+export type ServerNote = { "method": "ready" } | { "method": "sessionCreated", sessionId: string, } | { "method": "sessionDisposed", sessionId: string, } | { "method": "threadsUpdated", threads: Array<ThreadListItem>, } | { "method": "models", models: Array<ModelInfo>, } | { "method": "commands", commands: JsonValue, } | { "method": "error", sessionId: string | null, message: string, } | { "method": "modelText", requestId: string, text: string, } | { "method": "modelThinking", requestId: string, text: string, } | { "method": "modelToolCall", requestId: string, id: string, name: string, input: JsonValue, } | { "method": "modelChatDone", requestId: string, stop: string | null, error: string | null, };
 
 /**
- * Typed thread metadata — the schema for [`ServerNote::ThreadInfo`].
- * Replaces the prior opaque `info: serde_json::Value` with a fixed contract
- * so the client store can project every field without a second implicit
- * protocol.
+ * Opening snapshot of a follow stream (§D.1): window records (dense seq),
+ * the thread header, the journal cursor, and the full projection baseline.
+ *
+ * Declaring surface: FRAMES (payload of `StreamFrame::Snapshot`).
  */
-export type ThreadInfoPayload = { cwd: string, project: string | null, displayTitle: string, modelId: string | null, modelName: string | null, 
+export type SessionSnapshot = { sessionId: string, 
 /**
- * Full model descriptor serialized (provider, api, context_window, etc.).
+ * Journal header (line 0) of the thread.
  */
-model: JsonValue | null, permissionMode: string, reasoningEffort: string, pinned: boolean, archived: boolean, depth: number, agentLabel: string, selfAuthor: string, cwdPath: string | null, branch: string | null, goal: JsonValue | null, goalElapsedSeconds: bigint | null, planMode: boolean, browserSuites: Array<string>, historyPhase: string, running: boolean, hasInteracted: boolean, };
+header: ThreadHeader, 
+/**
+ * Cursor = number of active-chain entries; the snapshot window ends
+ * exactly at `cursor` (§F.1 rule 1).
+ */
+cursor: bigint, 
+/**
+ * Window records, dense seq, oldest first.
+ */
+records: Array<JournalWireEntry>, 
+/**
+ * Older records exist before the window (truncated by `max_messages`).
+ */
+hasMore: boolean, 
+/**
+ * Full projection baseline, key → value (§E.2 key table).
+ */
+projections: { [key in string]?: JsonValue }, 
+/**
+ * `seq` the baseline was folded at.
+ */
+projectionsAsOfSeq: bigint, };
+
+/**
+ * Why a stream ended (§D.1). `Resync` is the L5 overflow signal: the client
+ * must re-follow (fresh snapshot), never replay from a server buffer.
+ *
+ * Declaring surface: FRAMES (payload of `StreamEnd`).
+ */
+export type StreamEndReason = { "type": "closed" } | { "type": "cancelled" } | { "type": "resync" } | { "type": "failure", code: string, message: string, };
+
+/**
+ * One item delivered inside `FromServer::StreamItem { stream_id, frame }`
+ * (§D.1).
+ *
+ * Declaring surface: FRAMES.
+ */
+export type StreamFrame = { "type": "snapshot" } & SessionSnapshot | { "type": "entry", seq: bigint, event: JournalWireEvent, } | { "type": "projections" } & ProjectionsFrame;
+
+/**
+ * Opaque handle of one server↔client stream (`StreamOpen` / `StreamItem` /
+ * `StreamEnd` all carry it). Minted by the client; unique per connection.
+ *
+ * Declaring surface: FRAMES (§D.1).
+ */
+export type StreamId = string;
+
+/**
+ * What a client asks a stream to carry (§D.1 `StreamOpen.kind`).
+ *
+ * Declaring surface: FRAMES.
+ */
+export type StreamKind = { "type": "followSession", sessionId: string, maxMessages: number | null, };
+
+/**
+ * Thread header — the journal file's line 0 shape (§C.1), echoed into
+ * [`crate::stream::SessionSnapshot`] so a snapshot is self-describing.
+ *
+ * Declaring surface: frame payload of `StreamFrame::Snapshot` (§D.1).
+ */
+export type ThreadHeader = { 
+/**
+ * Thread / session id.
+ */
+id: string, 
+/**
+ * Working directory the thread was created in.
+ */
+cwd: string, 
+/**
+ * Leader session id for a team worker thread; absent for top-level.
+ */
+parentSession: string | null, 
+/**
+ * Free-form persisted metadata (labels, plugin blobs).
+ */
+metadata: JsonValue | null, 
+/**
+ * ISO-8601 creation timestamp (journal file shape).
+ */
+createdAt: string, };
 
 /**
  * One row in the threads list — the wire schema for
@@ -156,92 +335,7 @@ parent_id: string | null,
 depth: number, };
 
 /**
- * Typed token usage breakdown for [`ServerNote::UsageSnapshot`]. Defined in
- * the protocol crate (not re-exported from `agent`) so the client can
- * project every field without hardcoding JSON key names.
+ * Per-request token usage carried by the assistant `message` entry (§C.2
+ * transcript group). `anyhow`-style payloads are flattened to plain numbers.
  */
-export type TokenUsageSnapshot = { input: bigint, output: bigint, cacheCreation: bigint, cacheRead: bigint, };
-
-/**
- * One content block of a [`WireMessage`]. Externally tagged (serde default):
- * `{"Text": "..."}` | `{"Thinking": {"text","signature"}}` |
- * `{"Image": {"mime_type","byte_len"}}` | `{"ToolUse": {...}}` |
- * `{"ToolResult": {...}}` | `{"Compaction": "..."}`. The `Image` payload is
- * the deflated wire shape — `byte_len` replaces the base64 `data` the storage
- * type carries.
- */
-export type WireContentBlock = { "Text": string } | { "Thinking": { text: string, signature: string | null, } } | { "Image": { mime_type: string, byte_len: number, } } | { "ToolUse": WireToolUse } | { "ToolResult": WireToolResult } | { "Compaction": string };
-
-/**
- * Wire form of [`manox_agent::message::Message`]. Content blocks are
- * externally tagged; image blocks arrive deflated to `{ mime_type, byte_len }`.
- */
-export type WireMessage = { id: string, 
-/**
- * Unix seconds.
- */
-timestamp: number, parent_id: string | null, provenance: WireMessageProvenance, role: WireRole, content: Array<WireContentBlock>, ui?: WireMessageUi, };
-
-/**
- * Wire form of [`manox_agent::message::MessageAuthor`] (snake_case,
- * externally tagged: `"lead"` | `"harness"` | `{"agent": "..."}`).
- */
-export type WireMessageAuthor = "lead" | "harness" | { "agent": string };
-
-/**
- * Stable origin of a persisted message. Mirrors
- * [`manox_agent::message::MessageProvenance`] (snake_case).
- */
-export type WireMessageProvenance = "user" | "assistant" | "tool";
-
-/**
- * Wire form of [`manox_agent::message::MessageUiMetadata`]. All fields are
- * optional — omitted from the wire when absent/false so the client treats
- * every key as optional.
- */
-export type WireMessageUi = { model_id?: string, 
-/**
- * `PermissionMode::as_i64`, stored as an integer to avoid coupling the
- * message schema to enum names.
- */
-approval_mode?: number, 
-/**
- * Set when this user message was injected mid-turn via the steer queue.
- */
-steered?: boolean, 
-/**
- * Machine-generated background-task event; the UI must not attribute it to
- * the human user.
- */
-external_event?: boolean, 
-/**
- * Originating agent of a user-role message the human did not type;
- * absent = human input.
- */
-author?: WireMessageAuthor, 
-/**
- * This user message entered the session via team peer delivery.
- */
-peer?: boolean, 
-/**
- * UI-only display form (e.g. the compact `/name args` for a slash turn).
- */
-display_text?: string, };
-
-/**
- * Conversation role. Mirrors [`manox_agent::language_model::Role`]
- * (snake_case).
- */
-export type WireRole = "user" | "assistant" | "system";
-
-/**
- * Wire form of [`manox_agent::language_model::LanguageModelToolResult`].
- * `tool_name` is a plain `String` on the wire (storage uses `Arc<str>`).
- */
-export type WireToolResult = { tool_use_id: string, tool_name: string, is_error: boolean, content: string, };
-
-/**
- * Wire form of [`manox_agent::language_model::LanguageModelToolUse`]. `name`
- * is a plain `String` on the wire (storage uses `Arc<str>`).
- */
-export type WireToolUse = { id: string, name: string, raw_input: string, input: JsonValue, is_input_complete: boolean, thought_signature: string | null, };
+export type UsagePayload = { input: bigint, output: bigint, cacheRead: bigint, cacheWrite: bigint, reasoning: bigint, };

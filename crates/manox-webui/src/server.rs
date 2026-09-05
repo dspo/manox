@@ -17,7 +17,7 @@ use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{any, get};
 use include_dir::{Dir, include_dir};
 
 /// The committed `apps/web/webui/dist` build — embedded into the binary so the app
@@ -61,6 +61,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/assets/{*path}", get(assets))
+        // Plugin HTTP seam (T8 §H): `/api/plugin/<name>/*` dispatches against
+        // the declarative registry in `plugin_routes`. Dormant today (empty
+        // registry → 404); a plugin claiming a route is the only way it lights
+        // up. `any` so the seam is method-agnostic for future registrants.
+        .route(
+            "/api/plugin/{name}/{*rest}",
+            any(crate::plugin_routes::plugin_dispatch),
+        )
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }

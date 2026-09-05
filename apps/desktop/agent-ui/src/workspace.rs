@@ -317,10 +317,10 @@ struct PendingPlanReview {
 pub struct Workspace {
     pub(crate) cwd: PathBuf,
     pub(crate) thread: manox_agent::thread::ThreadHandle,
-    /// γ-2a transitional read path: the `AgentServer`-backed
-    /// `ClientStoreHandle`, mirroring kernel state via `ServerNote`s. `None`
-    /// until the workspace creates the AgentServer connection (landing
-    /// thread); views read the store mirror. Held on
+    /// The `AgentServer`-backed `ClientStoreHandle` — the v2 `SessionStore`
+    /// (journal window + projection face + echo map) fed by the multiplexer's
+    /// follow stream. `None` until the workspace creates the AgentServer
+    /// connection (landing thread); views read the store mirror. Held on
     /// the workspace for the next wiring step (re-handling the store on
     /// thread switch) — written at landing, read there.
     pub(crate) store: Option<gpui::Entity<ClientStoreHandle>>,
@@ -502,6 +502,14 @@ pub struct Workspace {
     /// Input state for the blank project folder name overlay.
     blank_project_name_input: Option<Entity<InputState>>,
     thread_sub: Option<Subscription>,
+    /// Observes the foreground leaf store itself (beyond `thread_sub`'s
+    /// events): a projection-only frame (mid-session `SetModel` →
+    /// `Projections` delta) writes the chip fields and notifies the LEAF, but
+    /// the entry event's re-render can land in an earlier tick — without this
+    /// observe the workspace never repaints and the chip stays stale (the
+    /// #765 "picks a model, nothing happens" repro: the journal had both
+    /// changes, the render never showed them).
+    store_observe: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
@@ -530,11 +538,6 @@ pub struct Workspace {
     /// Cached `items().len()`; the event handler reconciles the list count via
     /// `splice` whenever the conversation grows or shrinks.
     list_count: usize,
-    /// Messages from the thread's mirrored history already rendered into the
-    /// conversation. The streaming preview (`ThreadEvent::HistoryProgress`)
-    /// appends only `thread.messages()[history_rendered..]`; reset whenever
-    /// the conversation is rebuilt from scratch.
-    history_rendered: usize,
     /// Top-level view mode. `Settings` replaces the entire window content
     /// with the SettingsView overlay until the user requests exit.
     view_mode: ViewMode,
@@ -762,9 +765,9 @@ impl Workspace {
         if let Some(home) = manox_agent::paths::home_dir() {
             cwd = home;
         }
-        let agent_server = std::sync::Arc::new(manox_session_core::agent_server::AgentServer::new(
-            cwd.clone(),
-        ));
+        // L11: the process-global server — every window and the embedded
+        // web UI share one AgentServer (one ownership/routing table).
+        let agent_server = manox_session_core::agent_server::global(cwd.clone());
         // The landing thread id doubles as its AgentServer session id
         // (`CreateSession` uses the session id as the `ThreadId`), so the
         // thread the workspace renders and the thread the server drives are
@@ -888,6 +891,7 @@ impl Workspace {
             blank_project_parent: None,
             blank_project_name_input: None,
             thread_sub: None,
+            store_observe: None,
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
@@ -895,7 +899,6 @@ impl Workspace {
             list_state: ListState::new(0, ListAlignment::Bottom, MSG_LIST_OVERDRAW),
             message_list_width: crate::views::MessageListWidthInvalidator::default(),
             list_count: 0,
-            history_rendered: 0,
             view_mode: ViewMode::default(),
             exiting_settings: false,
             settings_transition_gen: 0,
@@ -913,7 +916,9 @@ impl Workspace {
             cli_session_claims: std::collections::HashMap::new(),
             active_external: None,
         };
-        ws.thread_sub = Some(ws.subscribe_thread(cx));
+        let (thread_events, store_changes) = ws.subscribe_thread(cx);
+        ws.thread_sub = Some(thread_events);
+        ws.store_observe = Some(store_changes);
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
@@ -1136,30 +1141,23 @@ impl Workspace {
         }));
     }
 
-    /// Rebuild the conversation view from the current thread's message
-    /// history. The harness-pi restore hook: `PiSession` rebuilds the pi
-    /// session asynchronously, then asks the workspace to re-render once the
-    /// restored history lands.
+    /// Rebuild the conversation view from the thread's v2 display fold. The
+    /// trigger is the follow stream's authoritative history boundary
+    /// (`WindowChange::Replace` → `ThreadEvent::HistoryRestored`, §D.1); the
+    /// T10c-era successor of the deleted `ThreadHistory` note replay.
     pub(crate) fn rebuild_conversation_from_thread(&mut self, cx: &mut Context<Self>) {
-        // Derive everything the rebuild needs (message count + sub-agent rows)
-        // inside one store read — cloning the full transcript here would copy
-        // the whole thread on the main thread for every rebuild.
-        let (messages_len, subagent_rows) = self
-            .store
-            .as_ref()
-            .map(|s| {
-                let msgs = &s.read(cx).store.messages;
-                (
-                    msgs.len(),
-                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
-                )
-            })
-            .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.display_entries.clone())
+            .map(|s| s.read(cx).store.display.clone())
             .expect("foreground store present");
+        let subagent_rows = manox_agent::subagent_restore::rebuild_from_messages(
+            &self
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.derived_messages())
+                .expect("foreground store present"),
+        );
         let usage = self
             .store
             .as_ref()
@@ -1210,9 +1208,6 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
-        // The authoritative list is fully rendered now; future preview
-        // batches append from here.
-        self.history_rendered = messages_len;
         // `Tail` natively pins to the end and keeps following; an upward user
         // scroll disengages it and landing back at the bottom re-arms it.
         self.list_state.set_follow_mode(FollowMode::Tail);
@@ -1223,12 +1218,17 @@ impl Workspace {
         cx.notify();
     }
 
-    fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
+    /// Wire the workspace to the foreground leaf: the `ThreadEvent` stream
+    /// drives the conversation surface, and the entity-level observe repaints
+    /// on projection-only frames (the mid-session chip updates — see the
+    /// `store_observe` field note).
+    fn subscribe_thread(&self, cx: &mut Context<Self>) -> (Subscription, Subscription) {
         let store = self
             .store
             .clone()
             .expect("subscribe_thread requires the foreground store");
-        cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
+        let observe = cx.observe(&store, |_, _, cx| cx.notify());
+        let events = cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
             match ev {
                 ThreadEvent::ToolCallAuthorization {
                     id,
@@ -1318,12 +1318,14 @@ impl Workspace {
                     this.active_browser_suites = suites.clone();
                     cx.notify();
                 }
-                // The pi actor restores session history asynchronously; the
-                // attach-time conversation rebuild saw an empty transcript,
-                // so rebuild once the authoritative history lands (sidebar
-                // open). Without this a reopened thread strands on the
-                // loading screen, and a forked session's preview is corrected
-                // to the authoritative active branch here.
+                // v2 (T10c, §D.1): the follow stream's authoritative history
+                // boundary (`WindowChange::Replace` from the opening
+                // Snapshot / a seamless re-open) re-arms the conversation
+                // rebuild — the role the deleted `ThreadHistory` note's
+                // `restored` flag used to play. Without this a reopened
+                // thread strands on the loading screen; a window change that
+                // rewrites the branch is corrected to the authoritative
+                // active branch here.
                 ThreadEvent::HistoryRestored => {
                     this.rebuild_conversation_from_thread(cx);
                     // Re-seed the rail's plan now that the authoritative
@@ -1334,7 +1336,7 @@ impl Workspace {
                     let messages = this
                         .store
                         .as_ref()
-                        .map(|s| s.read(cx).store.messages.clone())
+                        .map(|s| s.read(cx).store.derived_messages())
                         .expect("foreground store present");
                     if let Some(snapshot) = manox_agent::plan::rebuild_from_messages(&messages)
                         .or_else(|| {
@@ -1351,72 +1353,6 @@ impl Workspace {
                     {
                         this.context_rail
                             .update(cx, |r, cx| r.set_plan(snapshot, cx));
-                    }
-                }
-                // A display-only preview batch landed while the authoritative
-                // restore is still running: append the newly available
-                // messages incrementally (paint as many as are loaded),
-                // keeping the list pinned at the tail while the user waits.
-                // Input stays gated on the thread's `HistoryPhase::Loading`.
-                ThreadEvent::HistoryProgress => {
-                    if this
-                        .store
-                        .as_ref()
-                        .map(|s| s.read(cx).store.history_phase)
-                        .expect("foreground store present")
-                        .is_loading()
-                    {
-                        let messages_len = this
-                            .store
-                            .as_ref()
-                            .map(|s| s.read(cx).store.messages.len())
-                            .expect("foreground store present");
-                        if messages_len > this.history_rendered {
-                            // Clone only the not-yet-rendered tail instead of
-                            // the whole transcript on every preview batch.
-                            let from = this.history_rendered;
-                            let new_messages: Vec<manox_agent::Message> = this
-                                .store
-                                .as_ref()
-                                .map(|s| s.read(cx).store.messages[from..].to_vec())
-                                .expect("foreground store present");
-                            let usage = this
-                                .store
-                                .as_ref()
-                                .map(|s| {
-                                    s.read(cx)
-                                        .store
-                                        .per_request_usage
-                                        .iter()
-                                        .map(|(k, v)| {
-                                            (
-                                                k.clone(),
-                                                manox_agent::TokenUsage {
-                                                    input_tokens: v.input,
-                                                    output_tokens: v.output,
-                                                    cache_creation_input_tokens: v.cache_creation,
-                                                    cache_read_input_tokens: v.cache_read,
-                                                },
-                                            )
-                                        })
-                                        .collect()
-                                })
-                                .expect("foreground store present");
-                            let role = this.model_label(cx);
-                            let cwd = thread_cwd(&this.thread, &this.store, cx);
-                            let weak = cx.weak_entity();
-                            let outcome = this.conversation.update(cx, |c, cx| {
-                                c.append_history_messages(
-                                    &new_messages,
-                                    &usage,
-                                    &role,
-                                    crate::conversation::ApplyCtx { weak, cwd },
-                                    cx,
-                                )
-                            });
-                            this.history_rendered = messages_len;
-                            this.apply_list_outcome(outcome, cx);
-                        }
                     }
                 }
                 ThreadEvent::ModelChanged { from, to } => {
@@ -1826,7 +1762,8 @@ impl Workspace {
                     cx.notify();
                 }
             }
-        })
+        });
+        (events, observe)
     }
 
     /// Minimal subscription for a thread parked in `background_threads`. Unlike
@@ -2128,21 +2065,140 @@ impl Workspace {
     /// one-shot; actors await readiness themselves). A project binds at
     /// construction time — a single session creation, no orphaned session
     /// file.
+    ///
+    /// T6: the double path is deleted. The workspace no longer pre-builds a
+    /// local `Thread` and then attaches the AgentServer session to the same
+    /// id (two `Thread::new_*` calls on one id, both racing to materialize the
+    /// session file). It now sends the §D.2 `CreateSession` intent (the full
+    /// `{cwd, project?, initial_model?}` so the server owns creation) and,
+    /// when the server's `{session_id}` receipt lands, binds a detached
+    /// rendering mirror to that server-minted id and opens the follow stream.
+    /// Creation happens exactly once — on the server.
     fn start_new_thread(
         &mut self,
         project: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = ThreadId(uuid::Uuid::new_v4().to_string());
-        let new = match &project {
-            Some(dir) => Thread::new_in_project(id, dir.clone()),
-            None => Thread::new_fresh(id, self.cwd.clone()),
+        // The park/draft bookkeeping is identical to `attach_thread`'s switch
+        // arm, but there is no outgoing-thread double-bind to preserve: the
+        // outgoing thread is detached on the park, the incoming id is unknown
+        // until the receipt.
+        //
+        // Inheritance (L8/L9): the foreground session's wire identity is the
+        // projection store — `model` key carries `{provider, modelId}` and
+        // `project` the bound folder. The legacy thread mirror is only a
+        // pre-snapshot fallback (the #765 round-2 repro: reading the mirror
+        // alone lost model AND project on every new thread).
+        let inherited_project = project.or_else(|| {
+            self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .with(|st| st.project.clone())
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+            })
+        });
+        let project = inherited_project;
+        let model = self
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.with(|st| st.model.clone()))
+            .and_then(|m| {
+                let provider = m.get("provider").and_then(|v| v.as_str())?;
+                let id = m.get("modelId").and_then(|v| v.as_str())?;
+                (!provider.is_empty() && !id.is_empty()).then(|| format!("{provider}/{id}"))
+            })
+            .or_else(|| {
+                self.thread
+                    .read(|t| t.model().map(|m| format!("{}/{}", m.provider, m.id)))
+            });
+        let approval = serde_json::to_value(self.store.as_ref().map_or_else(
+            || self.thread.read(|t| t.permission_mode()),
+            |s| s.read(cx).store.with(|st| st.permission_mode),
+        ))
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string));
+        let effort = self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.with(|st| st.reasoning_effort))
+            .unwrap_or_else(|| self.thread.read(|t| t.reasoning_effort()));
+        let effort_str = match effort {
+            manox_agent::language_model::ReasoningEffort::High => Some("high".to_string()),
+            manox_agent::language_model::ReasoningEffort::Max => Some("max".to_string()),
         };
-        if let Some(dir) = &project {
-            Self::register_project_in_store(dir, cx);
-        }
-        self.attach_thread(new, false, window, cx);
+        let cwd = project
+            .as_ref()
+            .unwrap_or(&self.cwd)
+            .to_string_lossy()
+            .to_string();
+        let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
+        let ws = cx.weak_entity();
+        let dir_for_store = project.clone();
+        self.multiplexer.update(cx, |m, _| {
+            m.create_session_intent(
+                (project.is_none()).then(|| cwd.clone()),
+                project_str.clone(),
+                model,
+                approval,
+                effort_str,
+                Box::new(move |done, cx| {
+                    let sid = match done {
+                        crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
+                            session_id
+                        }
+                        crate::multiplexer::CreateSessionDone::Failed { message } => {
+                            tracing::warn!(error = %message, "CreateSession intent failed");
+                            return;
+                        }
+                    };
+                    // Defer the workspace bind out of the multiplexer's
+                    // update borrow: the intent callback runs inside the mux
+                    // pump, and `attach_created_session` re-enters the mux
+                    // (`open_or_create`), so it must land on a later tick.
+                    cx.spawn(async move |_, cx| {
+                        if let Some(dir) = &dir_for_store {
+                            let _ = ws.update(cx, |_ws, cx| {
+                                Workspace::register_project_in_store(dir, cx);
+                            });
+                        }
+                        let _ = ws.update_in(cx, |this, window, cx| {
+                            this.attach_created_session(&sid, window, cx);
+                        });
+                    })
+                    .detach();
+                }),
+            );
+        });
+        let _ = window;
+    }
+
+    /// Attach the workspace to a freshly created session (whose id the server
+    /// minted): reuse the standard switch bookkeeping (`attach_thread` parks
+    /// the outgoing thread, restores drafts/queues) against a thread handle
+    /// for the new id, then re-open — `open_or_create(reopen = true)`
+    /// idempotently re-runs `OpenSession` and binds the follow stream that
+    /// the create intent already opened. The handle is either the live
+    /// server-side thread (when present) or a detached *rendering mirror*
+    /// (a landing thread, no engine — the server owns the transcript, so no
+    /// second actor ever races the session file).
+    fn attach_created_session(
+        &mut self,
+        session_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = manox_agent::thread_store::global();
+        let thread = store
+            .with_mut(|s| {
+                s.live_thread(session_id)
+                    .or_else(|| s.load_thread(session_id))
+            })
+            .unwrap_or_else(|| {
+                Thread::landing_with_id(ThreadId(session_id.to_string()), self.cwd.clone())
+            });
+        self.attach_thread(thread, true, window, cx);
     }
 
     /// Switch into the Settings overlay. The Settings view is created lazily on
@@ -3834,9 +3890,9 @@ impl Workspace {
 
         // A brand-new foreground thread gets its own session on the shared
         // connection: `reopen` binds an existing thread via `OpenSession`
-        // (history arrives as `ServerNote`s), otherwise a fresh one via
-        // `CreateSession`. The multiplexer registers the leaf handle before
-        // sending so the server's reply routes straight to it.
+        // (history replays as the follow-stream `Snapshot`), otherwise a
+        // fresh one via `CreateSession`. The multiplexer registers the leaf
+        // handle before sending so the server's reply routes straight to it.
         if self.store.is_none() {
             let new_sid = new_id.clone();
             let cwd = thread_cwd(&new_thread, &None, cx)
@@ -3871,25 +3927,25 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.id.0.clone())
             .expect("foreground store present");
-        // Derive the message count, the transcript's plan, and the sub-agent
-        // rows inside one store read — cloning the full transcript here would
-        // copy the whole thread on the main thread on every switch.
-        let (messages_len, plan_from_messages, subagent_rows) = self
+        // Derive the transcript's plan and the sub-agent rows inside one
+        // store read — the display fold's message rows ARE the messages
+        // (L6, mechanical transcription), and cloning the whole transcript
+        // here would copy it on the main thread on every switch.
+        let (plan_from_messages, subagent_rows) = self
             .store
             .as_ref()
             .map(|s| {
-                let msgs = &s.read(cx).store.messages;
+                let msgs = s.read(cx).store.derived_messages();
                 (
-                    msgs.len(),
-                    manox_agent::plan::rebuild_from_messages(msgs),
-                    manox_agent::subagent_restore::rebuild_from_messages(msgs),
+                    manox_agent::plan::rebuild_from_messages(&msgs),
+                    manox_agent::subagent_restore::rebuild_from_messages(&msgs),
                 )
             })
             .expect("foreground store present");
         let display: Vec<manox_agent::db::HistoryEntry> = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.display_entries.clone())
+            .map(|s| s.read(cx).store.display.clone())
             .expect("foreground store present");
         let usage = self
             .store
@@ -3986,9 +4042,6 @@ impl Workspace {
         let count = self.conversation.read(cx).items().len();
         self.list_state.reset(count);
         self.list_count = count;
-        // All of the thread's current messages are rendered (a restoring
-        // thread has none yet — the preview batches append from here).
-        self.history_rendered = messages_len;
         self.list_state.set_follow_mode(FollowMode::Tail);
         self.pending_ask = None;
         self.pending_auth = None;
@@ -4007,7 +4060,9 @@ impl Workspace {
             self.sync_list_count(cx);
             self.list_state.set_follow_mode(FollowMode::Tail);
         }
-        self.thread_sub = Some(self.subscribe_thread(cx));
+        let (thread_events, store_changes) = self.subscribe_thread(cx);
+        self.thread_sub = Some(thread_events);
+        self.store_observe = Some(store_changes);
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
         // thread's running state. A parked thread resumed mid-turn keeps the
@@ -4121,7 +4176,7 @@ impl Workspace {
         let worktree_branch = self
             .store
             .as_ref()
-            .and_then(|s| s.read(cx).store.branch.clone());
+            .and_then(|s| s.read(cx).store.with(|st| st.branch.clone()));
         cx.spawn(async move |_this, cx| {
             // Debounce: coalesce a burst of tool results / a turn's worth of
             // file writes into a single git call.
@@ -4312,13 +4367,14 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.permission_mode)
             .unwrap_or_else(|| old.read(|t| t.permission_mode()));
-        let new = match &project {
-            Some(dir) => {
-                Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
-            }
-            None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
-        };
+        // T6: detached rendering mirror (see `start_new_thread`) — no
+        // pre-spawned engine; the inherited state rides the facade and the
+        // session materializes server-side on first submit.
+        let new = Thread::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd);
         new.with_mut(|t| {
+            if let Some(dir) = &project {
+                t.restore_project(dir.clone());
+            }
             if let Some(model) = model {
                 t.set_model(model.clone());
             }
@@ -4374,17 +4430,11 @@ impl Workspace {
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // History is still loading: nothing may be submitted (the composer is
-        // hidden, this guard covers keyboard paths that bypass the render).
-        if self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase)
-            .expect("foreground store present")
-            .is_loading()
-        {
-            return;
-        }
+        // T10c (§D.6): the v1 `history_phase` loading gate is gone — the
+        // follow stream's Snapshot → window Replace is the restore boundary,
+        // and HEAD already carried an unwritten (default `Ready`) phase.
+        // Successor gate (when §K.5 lands): a "no snapshot yet" flag on the
+        // v2 fold.
         let text = self.input_state.read(cx).value().to_string();
         let attachments = std::mem::take(&mut self.pending_attachments);
         if self.pending_ask.is_some() {
@@ -4578,12 +4628,7 @@ impl Workspace {
         };
         if hit {
             let submit_text = format!("/{key} {args}");
-            let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                session_id: sid.into(),
-                text: submit_text,
-                images: Vec::new(),
-                client_id: None,
-            });
+            let _ = self.send_submit_v2(submit_text, Vec::new(), cx);
         } else {
             let i18n_key = match kind {
                 RegistryTurnKind::Command => "workspace-unknown-command",
@@ -4766,12 +4811,7 @@ impl Workspace {
                 _ => None,
             })
             .collect();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: turn.text.clone(),
-            images: attachments,
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
     }
 
     /// Drain every parked `Queued` follow-up into a single new turn. Multiple
@@ -4841,13 +4881,11 @@ impl Workspace {
                     images: attachments,
                 });
             } else {
-                // Last: insert + start the turn.
-                let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-                    session_id: sid.into(),
-                    text: turn.text.clone(),
-                    images: attachments,
-                    client_id: None,
-                });
+                // Last: insert + start the turn. The v2 Submit carries the
+                // origin_rpc so the optimistic bubble retires when the durable
+                // user row lands (batched predecessors insert without a turn
+                // via the compat note and have no echo to retire).
+                let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
             }
         }
         refresh_thread_list();
@@ -5656,12 +5694,13 @@ impl Workspace {
     }
 
     /// Final answer of a finished Agent call, for panels opened after a
-    /// reload when no live transcript was accumulated.
+    /// reload when no live transcript was accumulated. T10c: reads the v2
+    /// display fold (the message rows ARE the transcript).
     fn agent_final_text(&self, id: &str, cx: &App) -> Option<String> {
         use manox_agent::language_model::MessageContent;
         self.store
             .as_ref()
-            .map(|s| s.read(cx).store.messages.clone())
+            .map(|s| s.read(cx).store.derived_messages())
             .expect("foreground store present")
             .iter()
             .flat_map(|m| m.content.iter())
@@ -5763,11 +5802,9 @@ impl Workspace {
     fn submit_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.editor_state.read(cx).value().to_string();
         if !editor_can_submit(
-            self.store
-                .as_ref()
-                .map(|s| s.read(cx).store.history_phase)
-                .expect("foreground store present")
-                .is_loading(),
+            // T10c: the v1 `history_phase` loading gate retired with the
+            // fold (the restore boundary is now the §D.1 snapshot).
+            false,
             self.store
                 .as_ref()
                 .map(|s| s.read(cx).store.running)
@@ -5784,12 +5821,7 @@ impl Workspace {
         });
         self.sync_list_count(cx);
         self.follow_message_tail();
-        let _ = self.send_note(|sid| manox_protocol::ClientNote::Submit {
-            session_id: sid.into(),
-            text: text.clone(),
-            images: Vec::new(),
-            client_id: None,
-        });
+        let _ = self.send_submit_v2(text.clone(), Vec::new(), cx);
         refresh_thread_list();
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -5844,12 +5876,23 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn model_label(&self, _cx: &mut Context<Self>) -> String {
+    pub(crate) fn model_label(&self, cx: &mut Context<Self>) -> String {
         {
-            self.thread
-                .read(|t| t.model().cloned())
-                .map(|model| manox_agent::provider_glue::display_name(&model))
-                .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+            // Selector read face (§J11): the composer model chip derives from
+            // the store's projection-materialized model, falling back to the
+            // bound thread mirror only while no projection has landed yet.
+            // T10c: the v1 `model_name` human label (CurrentModel/ThreadInfo
+            // notes) is gone — the `model` projection carries the canonical
+            // wire identity only; display names resolve via the provider glue.
+            self.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+                .unwrap_or_else(|| {
+                    self.thread
+                        .read(|t| t.model().cloned())
+                        .map(|model| manox_agent::provider_glue::display_name(&model))
+                        .unwrap_or_else(|| i18n::t("workspace-no-model").to_string())
+                })
         }
     }
 
@@ -6023,15 +6066,9 @@ impl Workspace {
     }
 
     fn composer_can_submit(&self, running: bool, cx: &App) -> bool {
-        if self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase)
-            .expect("foreground store present")
-            .is_loading()
-        {
-            return false;
-        }
+        // T10c: the v1 `history_phase` loading gate retired with the fold
+        // (the restore boundary is now the §D.1 snapshot; a pending-snapshot
+        // gate lands with the §K.5 closeout).
         if running {
             return true;
         }
@@ -6176,6 +6213,39 @@ impl Workspace {
         } else {
             false
         }
+    }
+
+    /// v2 §D.2 submit path: mint an `origin_rpc` correlation id, register the
+    /// optimistic echo in the foreground store, and send the
+    /// [`ClientCall::Submit`] (receipt-only per L7 — the durable user row
+    /// arrives through the follow stream and retires the echo by matching its
+    /// `originRpc`). The conversation's optimistic bubble was already pushed by
+    /// the caller; retirement just clears the store's echo bookkeeping so the
+    /// row is not treated as a remote (unmatched) insertion.
+    ///
+    /// Returns `true` when the submit rode the connection (session bound).
+    pub(crate) fn send_submit_v2(
+        &mut self,
+        text: String,
+        images: Vec<manox_protocol::ImageAttachment>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(sid) = self.session_id.clone() else {
+            return false;
+        };
+        let origin_rpc = uuid::Uuid::new_v4().to_string();
+        if let Some(store) = self.store.as_ref() {
+            store.update(cx, |h, _| {
+                h.store.push_echo(&origin_rpc, text.clone());
+            });
+        }
+        self.client.send_call(manox_protocol::ClientCall::Submit {
+            session_id: sid,
+            text,
+            images,
+            origin_rpc: Some(origin_rpc),
+        });
+        true
     }
 
     /// Toggle plan mode on the current thread (persisted by the engine).
@@ -6566,10 +6636,14 @@ impl Workspace {
                         .on_click(move |_, _, cx: &mut gpui::App| {
                             let model = model.clone();
                             let _ = ws.update(cx, |this, _cx| {
+                                // L8 wire identity: the registration-qualified
+                                // `{provider}/{model}` ref, so a pick pins the
+                                // exact endpoint (wire variants of one model
+                                // share the bare id).
                                 let _ =
                                     this.send_note(|sid| manox_protocol::ClientNote::SetModel {
                                         session_id: sid.into(),
-                                        id: model.id.clone(),
+                                        id: format!("{}/{}", model.provider, model.id),
                                     });
                             });
                         }),
@@ -7507,10 +7581,13 @@ impl Workspace {
     /// on the right). The popover is `w(360)` to fit the longest bilingual
     /// subtitle without wrapping.
     fn render_access_placeholder(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // Selector read face (§J11): the composer's access chip derives its
+        // permission mode through `ClientStore::with` instead of reaching the
+        // field directly.
         let mode = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.permission_mode)
+            .map(|s| s.read(cx).store.with(|st| st.permission_mode))
             .expect("foreground store present");
         let open = self.access_open;
         // Pre-extract chip visuals so the click handler closure doesn't
@@ -7954,7 +8031,7 @@ impl Workspace {
                 let can_set = this
                     .store
                     .as_ref()
-                    .map(|s| s.read(cx).store.messages.is_empty())
+                    .map(|s| s.read(cx).store.derived_messages().is_empty())
                     .expect("foreground store present");
                 if !can_set {
                     return;
@@ -8625,7 +8702,7 @@ impl Workspace {
             let s = self
                 .store
                 .as_ref()
-                .map(|s| s.read(cx).store.display_title.clone())
+                .map(|s| s.read(cx).store.with(|st| st.display_title.clone()))
                 .expect("foreground store present");
             if s.is_empty() { "manox".to_string() } else { s }
         }
@@ -8637,12 +8714,12 @@ impl Workspace {
         // immediately, while submission remains gated until the transcript is
         // authoritative.
         let first_screen = self.conversation.read(cx).is_empty(cx) && !running;
-        // Typed store: `history_phase` is `HistoryPhase`; read directly.
-        let loading = self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.history_phase.is_loading())
-            .expect("foreground store present");
+        // T10c (§D.6): the v1 `history_phase` mirror retired with the fold —
+        // at HEAD the field was unwritten (default `Ready`), so the loading
+        // branch already never fired. The §D.1 snapshot is the restore
+        // boundary; a pending-snapshot loading indicator belongs to the
+        // §K.5 closeout.
+        let loading = false;
         let composer_placement = composer_placement(editor_open && right_pane_open, first_screen);
         let main_body_w = window.bounds().size.width
             - self.sidebar_width
@@ -10513,6 +10590,745 @@ mod tests {
         assert_eq!(rebound.2, new_id, "foreground thread swapped");
         drop(ws);
         drop(visual);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// Diagnostic (PR #765 verification): the full real chain — project-intent
+    /// creation → follow stream → Snapshot projection baseline materializes
+    /// project+model in the bound store; then SetModel updates the model
+    /// projection. Each stage has its own bounded wait so a failure names
+    /// the broken link.
+    #[gpui::test]
+    fn new_thread_intent_lands_projections_and_set_model_updates(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-projdiag-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        let project = std::env::temp_dir().join(format!("manox-projdir-{}", uuid_like_id()));
+        std::fs::create_dir_all(&project).unwrap();
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // 1. Create with a project intent.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.start_new_thread(Some(project.clone()), window, cx)
+            });
+        });
+
+        // 2. Bounded wait: session bound off the landing id.
+        let mut bound = None;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if let Some(sid) = sid {
+                bound = Some(sid);
+                break;
+            }
+        }
+        let sid = bound.expect("session bound after create receipt");
+
+        // 3. Bounded wait: the follow Snapshot's projection baseline
+        //    materializes project + model_id in the bound store.
+        let mut projected = None;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let got = ws.read_with(&visual, |ws, cx| {
+                ws.store.as_ref().map(|s| {
+                    s.read(cx).store.with(|st| {
+                        (
+                            st.project.clone(),
+                            st.model_id.clone(),
+                            st.projections.len(),
+                        )
+                    })
+                })
+            });
+            match got {
+                Some((p, Some(m), _)) if p.as_deref() == Some(project.to_str().unwrap()) => {
+                    projected = Some((p, Some(m)));
+                    break;
+                }
+                Some((p, m, _)) => projected = Some((p, m)), // diagnostics
+                None => {}
+            }
+        }
+        let (p, m) = projected.expect("projection baseline lands with the project intent");
+        assert_eq!(
+            p.as_deref(),
+            Some(project.to_str().unwrap()),
+            "project chip source"
+        );
+
+        // 4. SetModel through the same note the picker sends, then bounded
+        //    wait for the model projection to update.
+        let registry = manox_agent::provider_glue::global();
+        let chosen = registry
+            .models()
+            .into_iter()
+            .next()
+            .expect("a model exists");
+        let target = chosen.id.clone();
+        // L8: the picker sends the registration-qualified `{provider}/{model}`
+        // ref, not a bare id — mirror that wire shape here so this is a real
+        // contract lock for the switch.
+        let qualified = format!("{}/{}", chosen.provider, chosen.id);
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, _| {
+                let _ = ws.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                    session_id: sid.into(),
+                    id: qualified.clone(),
+                });
+            });
+        });
+        let mut updated = false;
+        for _ in 0..400 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.as_deref() == Some(target.as_str()) {
+                updated = true;
+                break;
+            }
+        }
+        assert!(
+            updated || m.as_deref() == Some(target.as_str()),
+            "SetModel must update the model projection (was {m:?}, target {target})"
+        );
+        let _ = sid;
+    }
+
+    /// Regression lock (#765 symptom 2): clicking a sidebar thread loads the
+    /// persisted transcript. Real-shaped session files (header, a model row,
+    /// a user and an assistant turn, and — critically — the wire-opaque
+    /// `custom` / `active_tools_change` rows legacy sessions carry) are
+    /// seeded on disk, discovered by a store `refresh`, then switched to /
+    /// away / back. Each cold restore drives the real engine's
+    /// `open_existing` + follow-stream `Snapshot` on the tokio runtime; the
+    /// assertion is that the client fold ends up with the transcript, and —
+    /// critically — that it lands inside the bounded wait (the #765 bug
+    /// parked the actor behind a store-wide scan so no frame ever arrived;
+    /// the round-2 bug holed the snapshot page at the wire-less rows so the
+    /// fold looped snapshot → Resync and nothing ever rendered).
+    #[gpui::test]
+    fn sidebar_thread_switch_restores_transcript(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-switch-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+
+        // Seed two persisted transcripts in the store's scan directory.
+        let sessions = manox_agent::thread_store::global_sessions_dir();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let id_a = format!("switch-a-{}", uuid_like_id());
+        let id_b = format!("switch-b-{}", uuid_like_id());
+        let transcript = |id: &str, text: &str| {
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{{\"host\":\"manox\"}}}}\n\
+                 {{\"type\":\"model_change\",\"id\":\"{id}-m0\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00Z\",\"provider\":\"p\",\"modelId\":\"m\"}}\n\
+                 {{\"type\":\"message\",\"id\":\"{id}-u1\",\"parentId\":\"{id}-m0\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1767225601000}}}}\n\
+                 {{\"type\":\"custom\",\"id\":\"{id}-c1\",\"parentId\":\"{id}-u1\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"customType\":\"manox_ui_note\",\"data\":{{\"kind\":\"notice\",\"data\":{{\"text\":\"note\"}}}}}}\n\
+                 {{\"type\":\"active_tools_change\",\"id\":\"{id}-t1\",\"parentId\":\"{id}-c1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"activeToolNames\":[\"Bash\"]}}\n\
+                 {{\"type\":\"message\",\"id\":\"{id}-a1\",\"parentId\":\"{id}-t1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"reply\"}}],\"model\":\"m\",\"provider\":\"p\",\"api\":\"anthropic\",\"stopReason\":\"stop\",\"timestamp\":1767225602000}}}}\n"
+            )
+        };
+        std::fs::write(
+            sessions.join(format!("{id_a}.jsonl")),
+            transcript(&id_a, "alpha-turn"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions.join(format!("{id_b}.jsonl")),
+            transcript(&id_b, "beta-turn"),
+        )
+        .unwrap();
+        manox_agent::thread_store::global().refresh();
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // Both rows appear in the sidebar after the scan lands.
+        let mut ids = Vec::new();
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            ids = manox_agent::thread_store::global()
+                .read(|s| s.summaries().iter().map(|r| r.id.clone()).collect());
+            if ids.contains(&id_a) && ids.contains(&id_b) {
+                break;
+            }
+        }
+        assert!(
+            ids.contains(&id_a) && ids.contains(&id_b),
+            "both threads listed"
+        );
+
+        // The count of folded messages currently mirrored in the client store.
+        let folded = |ws: &gpui::Entity<Workspace>, visual: &mut gpui::VisualTestContext| {
+            ws.read_with(visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.with(|st| st.display.len()))
+                    .unwrap_or(0)
+            })
+        };
+
+        // Open thread A → bounded wait: A's transcript folds into the store.
+        // The bound covers the cold engine boot (provider + LSP preflight are
+        // bounded but can take several seconds) plus the follow-stream
+        // snapshot round-trip; the regression itself never loads a frame, so
+        // the wait is a true pass/fail boundary, not a tuning knob.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.open_thread(id_a.clone(), window, cx));
+        });
+        let mut a_loaded = false;
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if folded(&ws, &mut visual) >= 2 {
+                a_loaded = true;
+                break;
+            }
+        }
+        assert!(
+            a_loaded,
+            "thread A's persisted transcript restores on switch"
+        );
+
+        // Switch away to B (A parks to the background), then back to A.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.open_thread(id_b.clone(), window, cx));
+        });
+        let mut b_loaded = false;
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if folded(&ws, &mut visual) >= 2 {
+                b_loaded = true;
+                break;
+            }
+        }
+        assert!(
+            b_loaded,
+            "thread B's persisted transcript restores on switch"
+        );
+
+        // Switch back to A: the transcript is present again (non-empty).
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.open_thread(id_a.clone(), window, cx));
+        });
+        let mut a_back = false;
+        for _ in 0..1000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if folded(&ws, &mut visual) >= 2 {
+                a_back = true;
+                break;
+            }
+        }
+        assert!(a_back, "thread A's transcript is non-empty on switch-back");
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// #765 round-2 live repro harness: runs the whole open/restore/model
+    /// contract against the user's REAL sessions tree. `HOME` is redirected
+    /// for the test process (a sanitized copy — keychain sources replaced
+    /// with literals, sockets dropped), so the real store scan, the real
+    /// provider catalog, and the real v3 files all exercise the production
+    /// paths. Run in isolation:
+    /// `cargo test -p agent-ui --lib realdata --no-run`, then execute the
+    /// printed test binary with `HOME=<copy> … realdata -- --nocapture
+    /// --test-threads=1`.
+    #[gpui::test]
+    fn realdata_open_thread_restores_and_set_model_lands(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        // This test only runs in its dedicated process (HOME redirected to the
+        // sanitized copy): the shared suite would otherwise point the real
+        // `init()` store at the developer's actual `~/.manox` and write to it.
+        let Ok(home) = std::env::var("MANOX_REALDATA_HOME") else {
+            eprintln!("REALDATA: MANOX_REALDATA_HOME unset — skipping (dedicated-process test)");
+            return;
+        };
+        assert!(
+            std::env::var_os("HOME")
+                .map(|h| h.to_string_lossy() == home)
+                .unwrap_or(false),
+            "MANOX_REALDATA_HOME must equal the redirected HOME"
+        );
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            // Real init (not init_for_test): sessions_dir and threads.db come
+            // from $HOME/.manox — the redirected real-data copy. A prior
+            // test's TEST_OVERRIDE store would shadow it, so clear the slot
+            // first.
+            manox_agent::thread_store::drop_for_test();
+            manox_agent::thread_store::init();
+        });
+        cx.background_executor.allow_parking();
+
+        let target = std::env::var("MANOX_REALDATA_THREAD")
+            .unwrap_or_else(|_| "e6d4b2e5-02bb-4bac-aae1-cfa6e5f18750".to_string());
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(1200.), gpui::px(800.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // 1. The real scan must surface the user's thread (386 files; the
+        //    bound covers the multi-second full-tree pass).
+        let mut listed = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let hit = manox_agent::thread_store::global().read(|s| {
+                s.summaries().iter().any(|r| r.id == target)
+                    || s.archived_summaries().iter().any(|r| r.id == target)
+            });
+            if hit {
+                listed = true;
+                break;
+            }
+        }
+        let n_summaries = manox_agent::thread_store::global()
+            .read(|s| s.summaries().len() + s.archived_summaries().len());
+        assert!(
+            listed,
+            "real scan lists the target thread ({target}); summaries={n_summaries}"
+        );
+        eprintln!("REALDATA: scan listed {n_summaries} summaries");
+
+        let folded = |ws: &gpui::Entity<Workspace>, visual: &mut gpui::VisualTestContext| {
+            ws.read_with(visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.with(|st| st.display.len()))
+                    .unwrap_or(0)
+            })
+        };
+
+        // 2. The user's exact gesture: click the row → open_thread. The
+        //    functional assertion is the transcript fold (the reported bug:
+        //    nothing renders, not even a loading state).
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.open_thread(target.clone(), window, cx));
+        });
+        let mut restored = 0usize;
+        let mut bound_sid: Option<String> = None;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let n = folded(&ws, &mut visual);
+            if n > 0 {
+                restored = n;
+                bound_sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+                break;
+            }
+        }
+        assert!(
+            restored > 0,
+            "real thread {target} must restore its transcript (display=0, sid={bound_sid:?})"
+        );
+        eprintln!("REALDATA: restored {restored} display entries (sid={bound_sid:?})");
+
+        // 3. The model chip contract on real data: the file's persisted
+        //    model_change must be visible in the projection.
+        let model_before = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+        });
+        eprintln!("REALDATA: model projection after restore = {model_before:?}");
+
+        // 4. The picker's exact wire: a registration-qualified ref of a real
+        //    catalog model, sent through the same note path.
+        let registry = manox_agent::provider_glue::global();
+        let chosen = registry
+            .models()
+            .into_iter()
+            .find(|m| m.id.contains("qwen3.8-flash"))
+            .or_else(|| registry.models().into_iter().next())
+            .expect("a real catalog model exists");
+        let target_id = chosen.id.clone();
+        let qualified = format!("{}/{}", chosen.provider, chosen.id);
+        eprintln!("REALDATA: SetModel ref = {qualified}");
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, _| {
+                let _ = ws.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                    session_id: sid.into(),
+                    id: qualified.clone(),
+                });
+            });
+        });
+        let mut model_updated = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.as_deref() == Some(target_id.as_str()) {
+                model_updated = true;
+                break;
+            }
+        }
+        assert!(
+            model_updated,
+            "SetModel({qualified}) must move the model projection (before={model_before:?})"
+        );
+        eprintln!("REALDATA: SetModel projection update landed");
+
+        // 5. The inheritance contract: a new thread started from this state
+        //    must carry the model into the new session's store.
+        let project_before = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.project.clone()))
+        });
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.start_new_thread(None, window, cx));
+        });
+        let mut new_sid: Option<String> = None;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if sid.as_deref() != bound_sid.as_deref() {
+                new_sid = sid;
+                break;
+            }
+        }
+        assert!(new_sid.is_some(), "new thread must bind a fresh session");
+        // The create receipt binds the id, but the model/project only land
+        // with the new session's follow snapshot — bounded wait for the
+        // projection baseline.
+        let mut new_model: Option<String> = None;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.is_some() {
+                new_model = now;
+                break;
+            }
+        }
+        let new_project = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.project.clone()))
+        });
+        eprintln!(
+            "REALDATA: new thread {new_sid:?} model={new_model:?} project={new_project:?} \
+             (source project was {project_before:?})"
+        );
+        assert!(
+            new_model.is_some(),
+            "new thread must inherit a model (source model {target_id}, project {project_before:?})"
+        );
+    }
+
+    /// T6: `start_new_thread` deletes the local pre-build — the session is
+    /// created server-side via the §D.2 `CreateSession` intent, and when the
+    /// `{session_id}` receipt lands the workspace binds to that server-minted
+    /// id (store + thread + session all agree, and it is NOT the landing id).
+    #[gpui::test]
+    fn start_new_thread_creates_via_intent_and_binds_server_id(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-intent-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+        let landing_id = ws.read_with(&visual, |ws, _| ws.thread.read(|t| t.id.0.clone()));
+
+        // Fire the intent-driven new-thread creation.
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.start_new_thread(None, window, cx));
+        });
+
+        // The receipt + bind is async (server task → gpui pump); park until the
+        // session id moves off the landing id (bounded wait).
+        for i in 0..400 {
+            cx.run_until_parked();
+            if i % 40 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
+            let rebound = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if rebound.as_deref() != Some(landing_id.as_str()) && rebound.is_some() {
+                break;
+            }
+        }
+        let (session, store_id, thread_id) = ws.read_with(&visual, |ws, cx| {
+            (
+                ws.session_id.clone(),
+                ws.store.as_ref().map(|s| s.read(cx).store.id.0.clone()),
+                ws.thread.read(|t| t.id.0.clone()),
+            )
+        });
+        let new_id = session.expect("session bound after the create receipt");
+        assert_ne!(
+            new_id.as_str(),
+            landing_id.as_str(),
+            "server minted a new id"
+        );
+        assert_eq!(
+            store_id.as_deref(),
+            Some(new_id.as_str()),
+            "store follows the new id"
+        );
+        assert_eq!(
+            thread_id, new_id,
+            "foreground mirror binds to the server id"
+        );
+        drop(ws);
+        drop(visual);
+        let _ = std::fs::remove_file(&db_path);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// #765 round-3 repro (same dedicated-process regime as the sibling
+    /// realdata test): two residual live symptoms against the real sessions
+    /// tree —
+    /// (a) a model picked in the picker immediately after boot (the engine
+    ///     still materializing) must still land in the projection, and
+    /// (b) ONE `SidebarEvent::OpenThread` (the exact event a row click
+    ///     emits) must select the row and restore the transcript.
+    #[gpui::test]
+    fn realdata_boot_set_model_and_single_event_open(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let Ok(home) = std::env::var("MANOX_REALDATA_HOME") else {
+            eprintln!("REALDATA: MANOX_REALDATA_HOME unset — skipping (dedicated-process test)");
+            return;
+        };
+        assert!(
+            std::env::var_os("HOME")
+                .map(|h| h.to_string_lossy() == home)
+                .unwrap_or(false),
+            "MANOX_REALDATA_HOME must equal the redirected HOME"
+        );
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::drop_for_test();
+            manox_agent::thread_store::init();
+        });
+        cx.background_executor.allow_parking();
+
+        let target = std::env::var("MANOX_REALDATA_THREAD")
+            .unwrap_or_else(|_| "e6d4b2e5-02bb-4bac-aae1-cfa6e5f18750".to_string());
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(1200.), gpui::px(800.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // (a) The picker's exact gesture, fired IMMEDIATELY after boot with
+        // no waits — the engine is still materializing. Pick a model that
+        // differs from the boot fallback so the change is observable.
+        let registry = manox_agent::provider_glue::global();
+        let chosen = registry
+            .models()
+            .into_iter()
+            .find(|m| m.id.contains("qwen3.8-max"))
+            .or_else(|| registry.models().into_iter().next())
+            .expect("a real catalog model exists");
+        let target_id = chosen.id.clone();
+        let qualified = format!("{}/{}", chosen.provider, chosen.id);
+        eprintln!("REALDATA-BOOT: SetModel ref = {qualified} (fired with no settle wait)");
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, _| {
+                let _ = ws.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                    session_id: sid.into(),
+                    id: qualified.clone(),
+                });
+            });
+        });
+        let mut landed = false;
+        for _ in 0..900 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.as_deref() == Some(target_id.as_str()) {
+                landed = true;
+                break;
+            }
+        }
+        assert!(
+            landed,
+            "an immediate post-boot SetModel({qualified}) must land in the model projection"
+        );
+        eprintln!("REALDATA-BOOT: immediate SetModel landed");
+
+        // (b) Wait for the scan to list the target, then ONE OpenThread
+        // event — the exact payload a row click emits.
+        let mut listed = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if manox_agent::thread_store::global()
+                .read(|s| s.summaries().iter().any(|r| r.id == target))
+            {
+                listed = true;
+                break;
+            }
+        }
+        assert!(listed, "real scan lists the target thread");
+        let sidebar = ws.read_with(&visual, |ws, _| ws.sidebar.clone());
+        visual.update(|_window, cx| {
+            sidebar.update(cx, |_, cx| {
+                cx.emit(crate::views::sidebar::SidebarEvent::OpenThread(
+                    target.clone(),
+                ))
+            });
+        });
+        // The selection must move on that single event (the sidebar's
+        // selected id is set synchronously inside open_thread → attach).
+        let mut selected_now = false;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let sel = ws.read_with(&visual, |ws, cx| {
+                ws.sidebar.read(cx).selected_id().map(str::to_string)
+            });
+            if sel.as_deref() == Some(target.as_str()) {
+                selected_now = true;
+                break;
+            }
+        }
+        assert!(
+            selected_now,
+            "one OpenThread event must select the row (no second click needed)"
+        );
+        // And the transcript restores on that same single event.
+        let mut restored = 0usize;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let n = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.with(|st| st.display.len()))
+                    .unwrap_or(0)
+            });
+            if n > 0 {
+                restored = n;
+                break;
+            }
+        }
+        assert!(
+            restored > 0,
+            "one OpenThread event must restore the transcript"
+        );
+        eprintln!("REALDATA-BOOT: single OpenThread event selected + restored {restored} entries");
         manox_agent::thread_store::drop_global_for_test();
     }
 }

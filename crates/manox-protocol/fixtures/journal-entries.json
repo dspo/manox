@@ -1,0 +1,373 @@
+[
+  {
+    "seq": 0,
+    "id": "e-0",
+    "parentId": null,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "message",
+    "role": "user",
+    "content": [
+      {
+        "type": "text",
+        "text": "hello"
+      }
+    ],
+    "usage": null,
+    "originRpc": "rpc-1"
+  },
+  {
+    "seq": 1,
+    "id": "e-1",
+    "parentId": "e-0",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "uiNote",
+    "kind": "error",
+    "data": {
+      "text": "oops"
+    }
+  },
+  {
+    "seq": 2,
+    "id": "e-2",
+    "parentId": "e-1",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "custom",
+    "customType": "manox_ui_note",
+    "data": {
+      "kind": "notice"
+    }
+  },
+  {
+    "seq": 3,
+    "id": "e-3",
+    "parentId": "e-2",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "customMessage",
+    "customType": "extension",
+    "content": [
+      {
+        "type": "text",
+        "text": "payload"
+      }
+    ],
+    "display": true
+  },
+  {
+    "seq": 4,
+    "id": "e-4",
+    "parentId": "e-3",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "turnStart"
+  },
+  {
+    "seq": 5,
+    "id": "e-5",
+    "parentId": "e-4",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "turnFinish",
+    "cancelled": false,
+    "failed": true,
+    "strandedSteerIds": [
+      "st-1"
+    ]
+  },
+  {
+    "seq": 6,
+    "id": "e-6",
+    "parentId": "e-5",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "stop",
+    "reason": "user stop"
+  },
+  {
+    "seq": 7,
+    "id": "e-7",
+    "parentId": "e-6",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "retry",
+    "attempt": 2,
+    "maxAttempts": 5,
+    "delaySecs": 3,
+    "reason": "overloaded"
+  },
+  {
+    "seq": 8,
+    "id": "e-8",
+    "parentId": "e-7",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "error",
+    "message": "provider exploded"
+  },
+  {
+    "seq": 9,
+    "id": "e-9",
+    "parentId": "e-8",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "agentTextDelta",
+    "s": "to"
+  },
+  {
+    "seq": 10,
+    "id": "e-10",
+    "parentId": "e-9",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "agentThinkingDelta",
+    "s": "k"
+  },
+  {
+    "seq": 11,
+    "id": "e-11",
+    "parentId": "e-10",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "toolCall",
+    "callId": "tc-1",
+    "name": "Bash",
+    "title": "run ls",
+    "status": "running",
+    "input": {
+      "command": "ls"
+    }
+  },
+  {
+    "seq": 12,
+    "id": "e-12",
+    "parentId": "e-11",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "toolResult",
+    "callId": "tc-1",
+    "output": "a  b\n",
+    "isError": false
+  },
+  {
+    "seq": 13,
+    "id": "e-13",
+    "parentId": "e-12",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "toolOutputChunk",
+    "callId": "tc-1",
+    "chunk": "a"
+  },
+  {
+    "seq": 14,
+    "id": "e-14",
+    "parentId": "e-13",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "subagentChild",
+    "agentId": "sub-1",
+    "event": {
+      "type": "message"
+    }
+  },
+  {
+    "seq": 15,
+    "id": "e-15",
+    "parentId": "e-14",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "subagentProgress",
+    "agentId": "sub-1",
+    "agentType": "explore",
+    "toolUses": 4,
+    "latestActivity": "reading files",
+    "status": "running"
+  },
+  {
+    "seq": 16,
+    "id": "e-16",
+    "parentId": "e-15",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "modelChange",
+    "from": "anthropic-main/claude-sonnet-4",
+    "to": "DeepSeek-anthropic/deepseek-chat"
+  },
+  {
+    "seq": 17,
+    "id": "e-17",
+    "parentId": "e-16",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "cwdChange",
+    "path": "/new"
+  },
+  {
+    "seq": 18,
+    "id": "e-18",
+    "parentId": "e-17",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "projectChange",
+    "path": "/proj"
+  },
+  {
+    "seq": 19,
+    "id": "e-19",
+    "parentId": "e-18",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "permissionModeChange",
+    "mode": "accept-edit"
+  },
+  {
+    "seq": 20,
+    "id": "e-20",
+    "parentId": "e-19",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "reasoningEffortChange",
+    "effort": "high"
+  },
+  {
+    "seq": 21,
+    "id": "e-21",
+    "parentId": "e-20",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "planModeChange",
+    "enabled": true
+  },
+  {
+    "seq": 22,
+    "id": "e-22",
+    "parentId": "e-21",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "planUpdate",
+    "snapshot": {
+      "body": "# plan"
+    }
+  },
+  {
+    "seq": 23,
+    "id": "e-23",
+    "parentId": "e-22",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "goal",
+    "goal": {
+      "objective": "ship v2",
+      "budget": 10
+    }
+  },
+  {
+    "seq": 24,
+    "id": "e-24",
+    "parentId": "e-23",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "title",
+    "title": "v2 migration"
+  },
+  {
+    "seq": 25,
+    "id": "e-25",
+    "parentId": "e-24",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "browserSuites",
+    "suites": [
+      "web_explore"
+    ]
+  },
+  {
+    "seq": 26,
+    "id": "e-26",
+    "parentId": "e-25",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "backgroundTask",
+    "snapshot": {
+      "tasks": []
+    }
+  },
+  {
+    "seq": 27,
+    "id": "e-27",
+    "parentId": "e-26",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "approval",
+    "kind": "request",
+    "authId": "auth-1",
+    "toolName": "Bash",
+    "toolCallId": "tc-1",
+    "verdict": null,
+    "reason": null
+  },
+  {
+    "seq": 28,
+    "id": "e-28",
+    "parentId": "e-27",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "pinnedArchived",
+    "pinned": true,
+    "archived": false
+  },
+  {
+    "seq": 29,
+    "id": "e-29",
+    "parentId": "e-28",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "activeToolsChange",
+    "tools": [
+      "Bash",
+      "Read"
+    ]
+  },
+  {
+    "seq": 30,
+    "id": "e-30",
+    "parentId": "e-29",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "compaction",
+    "summary": "…",
+    "messagesCompacted": 12,
+    "tokensBefore": 40000,
+    "retainedTail": [
+      {
+        "role": "user"
+      }
+    ],
+    "firstKeptEntryId": "e-30"
+  },
+  {
+    "seq": 31,
+    "id": "e-31",
+    "parentId": "e-30",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "compactionStarted",
+    "tokensBefore": 40000
+  },
+  {
+    "seq": 32,
+    "id": "e-32",
+    "parentId": "e-31",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "branchSummary",
+    "text": "fork note"
+  },
+  {
+    "seq": 33,
+    "id": "e-33",
+    "parentId": "e-32",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "label",
+    "label": "checkpoint"
+  },
+  {
+    "seq": 34,
+    "id": "e-34",
+    "parentId": "e-33",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "sessionInfo",
+    "data": {
+      "k": "v"
+    }
+  },
+  {
+    "seq": 35,
+    "id": "e-35",
+    "parentId": "e-34",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "leaf",
+    "targetId": "e-12"
+  },
+  {
+    "seq": 36,
+    "id": "e-36",
+    "parentId": "e-35",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "metrics",
+    "kind": "cache_invalidation",
+    "data": {
+      "reprocessedTokens": 12345
+    }
+  }
+]

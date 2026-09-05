@@ -1,0 +1,8 @@
+{
+  "id": "conversation-info",
+  "name": "Conversation Info",
+  "version": "0.1.0",
+  "description": "Header-utility info card with an edge-triggered GetConversationInfo pull (§E.3 Q face).",
+  "entry": "client.tsx",
+  "slots": ["conversation.session.header.utilities"]
+}

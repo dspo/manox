@@ -1,0 +1,60 @@
+{
+  "type": "snapshot",
+  "sessionId": "s1",
+  "header": {
+    "id": "s1",
+    "cwd": "/proj",
+    "parentSession": null,
+    "metadata": null,
+    "createdAt": "2026-09-04T00:00:00Z"
+  },
+  "cursor": 1,
+  "records": [
+    {
+      "seq": 0,
+      "id": "e-0",
+      "parentId": null,
+      "timestamp": "2026-09-04T00:00:00Z",
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ],
+      "usage": {
+        "input": 10,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0
+      },
+      "originRpc": "rpc-echo-1"
+    }
+  ],
+  "hasMore": false,
+  "projections": {
+    "agent_label": "agent_label",
+    "archived": "archived",
+    "background_tasks": "background_tasks",
+    "branch": "branch",
+    "browser_suites": "browser_suites",
+    "cwd": "cwd",
+    "depth": "depth",
+    "goal": "goal",
+    "has_interacted": "has_interacted",
+    "model": "model",
+    "pending_auth": "pending_auth",
+    "permission_mode": "permission_mode",
+    "pinned": "pinned",
+    "plan": "plan",
+    "plan_mode": "plan_mode",
+    "project": "project",
+    "reasoning_effort": "reasoning_effort",
+    "running": "running",
+    "self_author": "self_author",
+    "title": "title"
+  },
+  "projectionsAsOfSeq": 0
+}

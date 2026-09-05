@@ -22,6 +22,7 @@ import { partitionSessions, type SessionTreeNode } from '../lib/sessions';
 import { threadRowState } from '../lib/thread-status';
 import { cn } from '../lib/utils';
 import { store } from '../state/bridge';
+import { Slot } from '../slots.outlet';
 import { ErrorBanner } from './chrome/error-banner';
 
 export const openThread = (item: ThreadListItem) => {
@@ -225,6 +226,10 @@ export const SessionList = ({ threads, activeThreadId, onOpen, error }: SessionL
         <span className="min-w-0 flex-1 text-[11px] font-bold uppercase tracking-wide">
           {t('sessions')}
         </span>
+        {/* Workspace-level actions (§G): contributed through the
+         * `sidebar.workspaces.footer.action` slot — the built-in Settings
+         * trigger registers there; the list only opens the outlet. */}
+        <Slot name="sidebar.workspaces.footer.action" owner={{}} />
       </div>
       <ErrorBanner message={error ?? null} />
       {active.length === 0 && archived.length === 0 ? (

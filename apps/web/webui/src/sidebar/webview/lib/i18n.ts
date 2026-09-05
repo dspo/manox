@@ -67,6 +67,7 @@ const DICT = {
   stop: { en: 'Stop', zh: '停止' },
   remove_attachment: { en: 'Remove attachment', zh: '移除附件' },
   context_compacted: { en: 'context compacted', zh: '上下文已压缩' },
+  load_older: { en: 'Load older messages', zh: '加载更早的消息' },
   queued: { en: 'Queued', zh: '排队中' },
   steer_now: { en: 'Steer', zh: '引导' },
   drop_queued: { en: 'Remove', zh: '删除' },
@@ -177,6 +178,17 @@ const DICT = {
   ask_note_placeholder: {
     en: 'Add optional context…',
     zh: '添加可选补充说明…',
+  },
+  settings: { en: 'Settings', zh: '设置' },
+  close: { en: 'Close', zh: '关闭' },
+  settings_general: { en: 'General', zh: '通用' },
+  settings_general_desc: {
+    en: 'Built-in webui settings.',
+    zh: '内置 webui 设置。',
+  },
+  settings_models: {
+    en: (n: number) => `${n} models registered`,
+    zh: (n: number) => `已注册 ${n} 个模型`,
   },
 } satisfies Record<string, Entry>;
 

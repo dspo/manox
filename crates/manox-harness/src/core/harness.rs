@@ -3642,7 +3642,17 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
         let control = Arc::clone(&control);
         Box::pin(async move {
             if let AgentEvent::MessageEnd { message } = event {
-                let id = session.append_message((*message).clone()).await?;
+                // The host pinned this turn's origin RPC id (echo
+                // retirement, §F.2): drain it on exactly the first user
+                // message append; every other message appends with None.
+                let origin = if matches!(&*message, crate::types::AgentMessage::User { .. }) {
+                    session.take_pending_user_origin()
+                } else {
+                    None
+                };
+                let id = session
+                    .append_message_with_origin((*message).clone(), origin)
+                    .await?;
                 control.message_entry_ids.lock().unwrap().push(Some(id));
             }
             Ok(())
@@ -7903,6 +7913,7 @@ pub(crate) mod tests {
                 parent_id: Some("mc".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hello"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -7940,6 +7951,7 @@ pub(crate) mod tests {
                 parent_id: Some("bs1".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("after"),
+                origin: None,
             })
             .await
             .unwrap();

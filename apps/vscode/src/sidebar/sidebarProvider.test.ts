@@ -1,8 +1,9 @@
-// Sidebar host: a transparent typed relay. `FromClient` from the webview
-// forwards to the manager; `ServerNote` notifications and `ServerCall`
-// requests from the manager forward to the webview verbatim (no batching,
-// no legacy `session_ready` — the store derives readiness from
-// `SessionCreated`). Host-only lifecycle verbs orchestrate the manager.
+// Sidebar host: a transparent typed relay (T9). `FromClient` from the
+// webview — including the v2 `streamOpen` / `streamCancel` frames — forwards
+// to the manager verbatim; EVERY raw `FromServer` frame (notification /
+// request / response / host / streamItem / streamEnd) forwards to the webview
+// unfiltered: the host never intercepts ServerCall requests (the shared v2
+// bundle answers them). Host-only lifecycle verbs orchestrate the manager.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as vscode from 'vscode';
@@ -12,36 +13,25 @@ import type { ToHost, ToWebview } from '../../dist/sidebar/messages';
 import { registerManoxSidebar } from './sidebarProvider';
 
 const { managerMock } = vi.hoisted(() => {
-  const handlers = new Map<string, (ev: Record<string, unknown>) => void>();
-  const callHandlers = new Map<string, (ev: { id: string; call: Record<string, unknown> }) => void>();
+  const frameHandlers = new Set<(msg: Record<string, unknown>) => void>();
   const managerMock = {
-    handlers,
-    callHandlers,
+    frameHandlers,
     sent: [] as Record<string, unknown>[],
     init: vi.fn(async () => {}),
     createSession: vi.fn(async (_cwd: string, id?: string) => id ?? 'generated'),
     openThread: vi.fn(async (id: string) => id),
-    onSessionEvent(sessionId: string, handler: (ev: Record<string, unknown>) => void): () => void {
-      handlers.set(sessionId, handler);
-      return () => handlers.delete(sessionId);
+    /** T9 raw relay: the real manager hands every `FromServer` envelope to
+     * these subscribers with zero filtering. */
+    onFrame(handler: (msg: Record<string, unknown>) => void): () => void {
+      frameHandlers.add(handler);
+      return () => frameHandlers.delete(handler);
     },
-    onSessionServerCall(
-      sessionId: string,
-      handler: (ev: { id: string; call: Record<string, unknown> }) => void,
-    ): () => void {
-      callHandlers.set(sessionId, handler);
-      return () => callHandlers.delete(sessionId);
-    },
-    onGlobalEvent: vi.fn(() => () => {}),
     send(msg: Record<string, unknown>): void {
       this.sent.push(msg);
     },
     disposeSession: vi.fn(),
-    emit(sessionId: string, ev: Record<string, unknown>): void {
-      handlers.get(sessionId)?.(ev);
-    },
-    emitCall(sessionId: string, ev: { id: string; call: Record<string, unknown> }): void {
-      callHandlers.get(sessionId)?.(ev);
+    emitFrame(msg: Record<string, unknown>): void {
+      for (const handler of frameHandlers) handler(msg);
     },
   };
   return { managerMock };
@@ -105,8 +95,7 @@ const setup = (): Harness => {
 
 beforeEach(() => {
   vi.useFakeTimers();
-  managerMock.handlers.clear();
-  managerMock.callHandlers.clear();
+  managerMock.frameHandlers.clear();
   managerMock.sent.length = 0;
   managerMock.disposeSession.mockClear();
   managerMock.createSession.mockClear();
@@ -117,39 +106,36 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-const isNote = (m: ToWebview): m is FromServer =>
+const isFrame = (m: ToWebview): m is FromServer =>
   typeof m === 'object' && m !== null && 'kind' in m && (m as FromServer).kind !== undefined;
 
-describe('transparent relay', () => {
-  it('newSession posts a synthetic SessionCreated and forwards events individually', async () => {
-    const { provider, posted } = setup();
-    await provider.newSession({ sessionId: 's1' });
-    // Synthetic readiness (the manager's await already consumed the real one).
-    expect(posted).toContainEqual({
-      kind: 'notification',
-      note: { method: 'sessionCreated', sessionId: 's1' },
-    });
-    // No batching: each ServerNote forwards as its own frame.
-    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'a' });
-    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'b' });
-    expect(posted.filter(isNote).at(-1)).toEqual({
-      kind: 'notification',
-      note: { method: 'agentText', sessionId: 's1', text: 'b' },
-    });
-  });
-
-  it('forwards ServerCall requests as FromServer::Request frames', async () => {
-    const { provider, posted } = setup();
-    await provider.newSession({ sessionId: 's1' });
-    managerMock.emitCall('s1', {
-      id: 'auth1',
-      call: { method: 'approve', sessionId: 's1', authId: 'auth1' },
-    });
-    expect(posted).toContainEqual({
-      kind: 'request',
-      id: 'auth1',
-      call: { method: 'approve', sessionId: 's1', authId: 'auth1' },
-    });
+describe('transparent relay (T9 v2 frames)', () => {
+  it('forwards every FromServer envelope verbatim, unfiltered', async () => {
+    const { posted } = setup();
+    const frames: FromServer[] = [
+      { kind: 'notification', note: { method: 'sessionCreated', sessionId: 's1' } } as FromServer,
+      {
+        kind: 'streamItem',
+        streamId: 'st-1',
+        frame: { type: 'entry', seq: 1, event: { type: 'agentTextDelta', s: 'hi' } },
+      } as unknown as FromServer,
+      { kind: 'streamEnd', streamId: 'st-1', reason: { type: 'closed' } } as FromServer,
+      {
+        kind: 'host',
+        host: { type: 'sessionStatus', sessionId: 's1', running: true },
+      } as FromServer,
+      {
+        kind: 'request',
+        id: 'auth1',
+        call: { method: 'approve', sessionId: 's1', authId: 'auth1' },
+      } as FromServer,
+      { kind: 'response', id: 'webui-1', outcome: { Ok: { accepted: true } } } as FromServer,
+    ];
+    for (const frame of frames) managerMock.emitFrame(frame);
+    // The host does not need any session registered for a frame to flow, and
+    // it does not intercept ServerCall `request` or `response` frames: the
+    // shared v2 bundle in the webview correlates and answers them.
+    expect(posted.filter(isFrame)).toEqual(frames);
   });
 
   it('forwards FromClient from the webview verbatim to the manager', async () => {
@@ -162,17 +148,29 @@ describe('transparent relay', () => {
     expect(managerMock.sent).toContainEqual(submit);
   });
 
-  it('teardown disposes every live session and unsubscribes', async () => {
+  it('forwards the v2 streamOpen / streamCancel frames to the manager', () => {
+    const { onMessage } = setup();
+    const open = {
+      kind: 'streamOpen',
+      streamId: 'webui-st',
+      streamKind: { type: 'followSession', sessionId: 's1', maxMessages: null },
+    } as FromClient;
+    const cancel = { kind: 'streamCancel', streamId: 'webui-st' } as FromClient;
+    onMessage(open as unknown as ToHost);
+    onMessage(cancel as unknown as ToHost);
+    expect(managerMock.sent).toContainEqual(open);
+    expect(managerMock.sent).toContainEqual(cancel);
+  });
+
+  it('teardown disposes every live session and detaches the relay', async () => {
     const { provider, posted, disposeView } = setup();
     await provider.newSession({ sessionId: 's1' });
     disposeView();
     expect(managerMock.disposeSession).toHaveBeenCalledWith('s1');
-    // A late event after teardown does not reach the (disposed) webview.
-    managerMock.emit('s1', { method: 'agentText', sessionId: 's1', text: 'late' });
-    expect(posted.at(-1)).not.toEqual({
-      kind: 'notification',
-      note: { method: 'agentText', sessionId: 's1', text: 'late' },
-    });
+    expect(managerMock.frameHandlers.size).toBe(0);
+    // A late frame after teardown does not reach the (disposed) webview.
+    managerMock.emitFrame({ kind: 'notification', note: { method: 'ready' } });
+    expect(posted.at(-1)).not.toEqual({ kind: 'notification', note: { method: 'ready' } });
   });
 });
 
@@ -192,7 +190,7 @@ describe('plan_execute_fresh', () => {
     await Promise.resolve();
   };
 
-  it('archives, creates, registers, and seeds the fresh session', async () => {
+  it('archives, creates, and seeds the fresh session; frames flow via the relay', async () => {
     const { posted, onMessage } = setup();
     onMessage(message);
     await settle();
@@ -208,16 +206,15 @@ describe('plan_execute_fresh', () => {
       kind: 'notification',
       note: { method: 'archiveThread', sessionId: 's1', archived: true },
     });
-    // Synthetic readiness for the fresh session reached the webview.
-    expect(posted).toContainEqual({
+    // No synthetic readiness: the server's real `sessionCreated` reaches the
+    // webview through the raw relay like any other frame.
+    managerMock.emitFrame({
       kind: 'notification',
       note: { method: 'sessionCreated', sessionId: freshId },
     });
-    // The fresh session's events forward without a manual open.
-    managerMock.emit(freshId, { method: 'agentText', sessionId: freshId, text: 'seed' });
     expect(posted.at(-1)).toEqual({
       kind: 'notification',
-      note: { method: 'agentText', sessionId: freshId, text: 'seed' },
+      note: { method: 'sessionCreated', sessionId: freshId },
     });
   });
 

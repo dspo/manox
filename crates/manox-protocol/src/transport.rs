@@ -28,22 +28,45 @@ pub const BACKPRESSURE_CAPACITY: usize = 1024;
 pub enum BackpressurePolicy {
     /// Streaming payload: drop the message (caller may coalesce and re-send
     /// with a gap marker). The connection stays up.
+    ///
+    /// Legacy (v1) class only: under protocol v2 (§D.7) the Drop class is
+    /// DOOMED — durable delta traffic moves to
+    /// [`crate::stream::StreamFrame::Entry`], which is [`Self::BoundedResync`]
+    /// (L5: snapshots never drop, overflow resyncs; silent drops of journal
+    /// entries would open gaps a client cannot close).
     Drop,
     /// Control / lifecycle message: the client is presumed dead; disconnect.
+    /// §D.7 "control frames block, never drop": Request/Response/Reply and
+    /// host traffic take this class (blocking send on the in-process pair).
     Disconnect,
+    /// §D.7: `StreamItem(Snapshot | Projections)` and `StreamEnd` — must
+    /// never be dropped; the sender blocks until capacity frees (same
+    /// mechanics as [`Self::Disconnect`] on the in-process pair).
+    NeverDrop,
+    /// §D.7: `StreamItem(Entry)` — a bounded queue
+    /// ([`crate::stream::ENTRY_BACKPRESSURE_CAPACITY`]); when full, the
+    /// stream is ended with
+    /// [`StreamEndReason::Resync`](crate::stream::StreamEndReason::Resync)
+    /// and the client re-follows from a fresh snapshot (L5 — no server-side
+    /// replay buffers).
+    BoundedResync,
 }
 
 impl ServerNote {
-    /// Streaming payloads tolerate loss; everything else is control traffic a
-    /// dead client must not silently miss.
+    /// Legacy (v1) streaming classification — kept verbatim because live
+    /// consumers (webui ws pump, session-core pumps) compare against
+    /// `Drop`/`Disconnect`. The §D.7 successor strategy is expressed over
+    /// the v2 vocabulary: [`crate::stream::StreamFrame::backpressure_policy`]
+    /// (Snapshot/Projections/StreamEnd never drop; Entry bounded ⇒ resync)
+    /// and [`crate::stream::v2_backpressure_policy`] for the host/legacy
+    /// notification stream. Wiring those into the transports (and deleting
+    /// the `Drop` class with the doomed notes) is the T4/T5 envelope
+    /// migration.
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         match self {
-            ServerNote::AgentText { .. }
-            | ServerNote::AgentThinking { .. }
-            | ServerNote::ToolOutput { .. }
-            | ServerNote::ThreadHistory { .. }
-            | ServerNote::ModelText { .. }
-            | ServerNote::ModelThinking { .. } => BackpressurePolicy::Drop,
+            ServerNote::ModelText { .. } | ServerNote::ModelThinking { .. } => {
+                BackpressurePolicy::Drop
+            }
             _ => BackpressurePolicy::Disconnect,
         }
     }
@@ -58,45 +81,9 @@ impl ServerNote {
     pub fn session_id(&self) -> Option<&str> {
         use ServerNote::*;
         match self {
-            SessionCreated { session_id, .. }
-            | SessionDisposed { session_id, .. }
-            | TurnStarted { session_id, .. }
-            | TurnFinished { session_id, .. }
-            | Stop { session_id, .. }
-            | AgentText { session_id, .. }
-            | AgentThinking { session_id, .. }
-            | ToolCall { session_id, .. }
-            | ToolResult { session_id, .. }
-            | ToolOutput { session_id, .. }
-            | ThreadHistory { session_id, .. }
-            | ThreadInfo { session_id, .. }
-            | Usage { session_id, .. }
-            | UsageSnapshot { session_id, .. }
-            | CurrentModel { session_id, .. }
-            | PlanReady { session_id, .. }
-            | PlanUpdated { session_id, .. }
-            | PlanModeChanged { session_id, .. }
-            | GoalChanged { session_id, .. }
-            | CwdChanged { session_id, .. }
-            | PermissionModeChanged { session_id, .. }
-            | ReasoningEffortChanged { session_id, .. }
-            | BrowserSuitesChanged { session_id, .. }
-            | CompactionStarted { session_id, .. }
-            | Compaction { session_id, .. }
-            | CacheInvalidation { session_id, .. }
-            | SubagentStarted { session_id, .. }
-            | SubagentProgress { session_id, .. }
-            | SubagentChild { session_id, .. }
-            | BackgroundTaskUpdated { session_id, .. }
-            | SteerPending { session_id, .. }
-            | SteerInjected { session_id, .. }
-            | ApprovalDecision { session_id, .. }
-            | Branch { session_id, .. }
-            | GitStats { session_id, .. }
-            | HistoryProgress { session_id, .. }
-            | Retry { session_id, .. }
-            | PeerMessage { session_id, .. }
-            | TokenUsage { session_id, .. } => Some(session_id),
+            SessionCreated { session_id, .. } | SessionDisposed { session_id, .. } => {
+                Some(session_id)
+            }
             Error { session_id, .. } => session_id.as_deref(),
             Ready
             | Models { .. }
@@ -263,11 +250,11 @@ mod tests {
         // Fill the single buffer slot with a Disconnect-policy note —
         // send_blocking succeeds immediately while space exists.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnStarted {
+            note: ServerNote::SessionCreated {
                 session_id: "s1".into(),
             },
         });
-        // The buffer is full: a streaming note is dropped by policy, not
+        // The buffer is full: a streaming side-note is dropped by policy, not
         // queued — the connection stays up.
         server.send_to_client(FromServer::Notification {
             note: ServerNote::ModelThinking {
@@ -279,7 +266,7 @@ mod tests {
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnStarted { .. }
+                note: ServerNote::SessionCreated { .. }
             }
         ));
         // The dropped note never occupied a slot: the next receive is empty
@@ -287,17 +274,17 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Space freed: a further control note is delivered in order.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnFinished {
-                session_id: "s1".into(),
-                cancelled: false,
-                failed: false,
-                stranded_steer_ids: Vec::new(),
+            note: ServerNote::ModelToolCall {
+                request_id: "r1".into(),
+                id: "tc1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
             },
         });
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnFinished { .. }
+                note: ServerNote::ModelToolCall { .. }
             }
         ));
     }
@@ -327,15 +314,15 @@ mod tests {
     #[test]
     fn streaming_note_drops_when_full_control_disconnects() {
         assert_eq!(
-            ServerNote::AgentText {
-                session_id: "t".into(),
+            ServerNote::ModelText {
+                request_id: "r".into(),
                 text: "x".into()
             }
             .backpressure_policy(),
             BackpressurePolicy::Drop
         );
         assert_eq!(
-            ServerNote::TurnStarted {
+            ServerNote::SessionCreated {
                 session_id: "t".into()
             }
             .backpressure_policy(),

@@ -1,222 +1,35 @@
 //! Reverse translation: `ServerNote` / `ServerCall` → `ThreadEvent`.
 //!
-//! The desktop's conversation layer (`ConversationState::apply`) consumes
-//! `ThreadEvent`, while the AgentServer spine delivers `FromServer`. This
-//! module mirrors `manox-session-core::translate` (the forward direction) so
-//! the pump can re-emit protocol messages as the events the workspace already
-//! handles — zero change to the workspace's 601-line handler.
-//!
-//! Both directions are covered: `FromServer::Notification` maps via
-//! [`server_note_to_thread_event`], `FromServer::Request` (adjudication
-//! `ServerCall`s) via [`server_call_to_thread_event`].
+//! Post-T10c (§D.6) only the retained `ServerNote` surface reaches this
+//! module: the session-domain note arms are gone, and the v2 successor for
+//! their events is [`crate::journal_translate`] (journal rows → the same
+//! `ThreadEvent` vocabulary). `server_call_to_thread_event` stays: the
+//! adjudication waterfall (Approve / AskUserQuestion / PlanVerdict) still
+//! rides `ServerCall`.
 
 use manox_agent::ThreadEvent;
-use manox_agent::thread::{HistoryPhase, PermissionMode};
 use manox_protocol::{ServerCall, ServerNote};
 
-/// Project a `ServerNote` onto the `ThreadEvent` the desktop conversation
-/// renders. `None` for notes with no `ThreadEvent` counterpart (session
-/// lifecycle, snapshots, model-chat streams — the store mirrors those).
+/// Project a retained `ServerNote` onto the `ThreadEvent` the desktop
+/// conversation renders. `None` for everything else (session lifecycle, the
+/// transitional registry-push list channel, model-chat side stream — the
+/// store / sidebar / model-chat paths mirror those).
 pub fn server_note_to_thread_event(note: &ServerNote) -> Option<ThreadEvent> {
     use ServerNote::*;
     Some(match note {
-        AgentText { text, .. } => ThreadEvent::AgentText(text.clone()),
-        AgentThinking { text, .. } => ThreadEvent::AgentThinking(text.clone()),
-        ToolCall {
-            id,
-            name,
-            title,
-            status,
-            input,
-            ..
-        } => ThreadEvent::ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            title: title.clone(),
-            status: parse_status(status),
-            input: input.clone(),
-        },
-        ToolResult {
-            id,
-            output,
-            is_error,
-            ..
-        } => ThreadEvent::ToolResult {
-            id: id.clone(),
-            output: output.clone(),
-            is_error: *is_error,
-        },
-        ToolOutput { id, chunk, .. } => ThreadEvent::ToolOutput {
-            id: id.clone(),
-            chunk: chunk.clone(),
-        },
-        TurnStarted { .. } => ThreadEvent::TurnStarted,
-        Stop { reason, .. } => ThreadEvent::Stop(
-            serde_json::from_value(serde_json::Value::String(
-                reason.clone().unwrap_or_default(),
-            ))
-            .unwrap_or(manox_agent::language_model::StopReason::EndTurn),
-        ),
-        TurnFinished {
-            cancelled,
-            failed,
-            stranded_steer_ids,
-            ..
-        } => ThreadEvent::TurnFinished {
-            cancelled: *cancelled,
-            failed: *failed,
-            stranded_steer_ids: stranded_steer_ids.clone(),
-        },
-        Retry {
-            attempt,
-            max_attempts,
-            delay_secs,
-            reason,
-            detail,
-            ..
-        } => ThreadEvent::Retry {
-            attempt: *attempt,
-            max_attempts: *max_attempts,
-            delay_secs: *delay_secs,
-            reason: reason.clone(),
-            detail: detail.clone(),
-        },
         Error { message, .. } => ThreadEvent::Error(anyhow::anyhow!("{}", message)),
-        CurrentModel { name, .. } => ThreadEvent::ModelChanged {
-            from: None,
-            to: name.clone().unwrap_or_default(),
-        },
-        TokenUsage {
-            input,
-            output,
-            cache_creation,
-            cache_read,
-            ..
-        } => ThreadEvent::TokenUsageUpdated(manox_agent::language_model::TokenUsage {
-            input_tokens: *input,
-            output_tokens: *output,
-            cache_creation_input_tokens: *cache_creation,
-            cache_read_input_tokens: *cache_read,
-        }),
-        PermissionModeChanged { mode, .. } => ThreadEvent::PermissionModeChanged {
-            mode: parse_permission_mode(mode),
-        },
-        ReasoningEffortChanged { effort, .. } => ThreadEvent::ReasoningEffortChanged {
-            effort: parse_reasoning_effort(effort),
-        },
-        BrowserSuitesChanged { suites, .. } => ThreadEvent::BrowserSuitesChanged {
-            suites: suites
-                .iter()
-                .filter_map(|s| {
-                    serde_json::from_value(serde_json::Value::String(s.clone()))
-                        .ok()
-                        .or_else(|| {
-                            serde_json::from_value::<manox_agent::engine::BrowserSuite>(
-                                serde_json::Value::String(s.clone()),
-                            )
-                            .ok()
-                        })
-                })
-                .collect(),
-        },
-        PlanReady {
-            plan_file, title, ..
-        } => ThreadEvent::PlanReady {
-            plan_file: plan_file.clone(),
-            title: title.clone(),
-        },
-        PlanUpdated { snapshot, .. } => ThreadEvent::PlanUpdated {
-            snapshot: serde_json::from_value(snapshot.clone()?).ok()?,
-        },
-        PlanModeChanged { enabled, .. } => ThreadEvent::PlanModeChanged { enabled: *enabled },
-        GoalChanged { snapshot, .. } => ThreadEvent::GoalChanged {
-            goal: snapshot
-                .as_ref()
-                .and_then(|s| serde_json::from_value(s.clone()).ok()),
-        },
-        CwdChanged { path, .. } => ThreadEvent::CwdChanged { path: path.clone() },
-        CompactionStarted { tokens_before, .. } => ThreadEvent::CompactionStarted {
-            tokens_before: *tokens_before,
-        },
-        Compaction {
-            summary, retained, ..
-        } => ThreadEvent::Compaction {
-            summary: summary.clone(),
-            messages_compacted: 0,
-            tokens_before: 0,
-            retained_tail: serde_json::from_value(retained.clone()).unwrap_or_default(),
-        },
-        CacheInvalidation {
-            reprocessed_tokens, ..
-        } => ThreadEvent::CacheInvalidation {
-            reprocessed_tokens: *reprocessed_tokens,
-        },
-        SubagentStarted {
-            id,
-            agent_type,
-            description,
-            ..
-        } => ThreadEvent::SubagentStarted {
-            id: id.clone(),
-            subagent_type: agent_type.clone(),
-            description: description.clone(),
-            child: manox_agent::ThreadId::default(),
-        },
-        SubagentProgress {
-            id,
-            agent_type,
-            tool_uses,
-            latest_activity,
-            status,
-            ..
-        } => ThreadEvent::SubagentProgress {
-            id: id.clone(),
-            subagent_type: agent_type.clone(),
-            tool_uses: *tool_uses,
-            token_usage: manox_agent::language_model::TokenUsage::default(),
-            latest_activity: latest_activity.clone(),
-            status: parse_status(status),
-            health: None,
-        },
-        SubagentChild { id, event, .. } => ThreadEvent::SubagentChild {
-            id: id.clone(),
-            child: serde_json::from_value(event.clone()).ok()?,
-        },
-        BackgroundTaskUpdated { snapshot, .. } => ThreadEvent::BackgroundTaskUpdated {
-            snapshot: serde_json::from_value(snapshot.clone()).ok()?,
-        },
-        SteerInjected { message_id, .. } => ThreadEvent::SteerInjected {
-            message_id: message_id.clone(),
-        },
-        PeerMessage { from, content, .. } => ThreadEvent::PeerMessage {
-            from: from.clone(),
-            content: content.clone(),
-        },
-        HistoryProgress { .. } => ThreadEvent::HistoryProgress,
-        // Every authoritative history boundary re-arms the conversation
-        // rebuild; a mid-session restore (`restored: false`) and an
-        // attach replay (`restored: true`) are both safe — the rebuild is
-        // idempotent.
-        ThreadHistory { .. } => ThreadEvent::HistoryRestored,
-        // No ThreadEvent counterpart: session lifecycle, snapshots, model
-        // chat, per-session streams the store mirrors instead.
+        // No ThreadEvent counterpart: owner control, the list channel, the
+        // model-chat side stream.
         Ready
         | SessionCreated { .. }
         | SessionDisposed { .. }
-        | ThreadInfo { .. }
         | ThreadsUpdated { .. }
         | Models { .. }
-        | Usage { .. }
-        | UsageSnapshot { .. }
-        | SteerPending { .. }
-        | ApprovalDecision { .. }
-        | Branch { .. }
-        | GitStats { .. }
+        | Commands { .. }
         | ModelText { .. }
         | ModelThinking { .. }
         | ModelToolCall { .. }
-        | ModelChatDone { .. }
-        | Commands { .. } => return None,
+        | ModelChatDone { .. } => return None,
     })
 }
 
@@ -254,62 +67,9 @@ pub fn server_call_to_thread_event(call: &ServerCall) -> Option<ThreadEvent> {
     }
 }
 
-/// Reverse of `translate`'s ToolCallStatus projection (kebab-case string).
-fn parse_status(status: &str) -> manox_agent::thread::ToolCallStatus {
-    serde_json::from_value(serde_json::Value::String(status.to_string()))
-        .unwrap_or(manox_agent::thread::ToolCallStatus::PendingApproval)
-}
-
-/// Reverse of `translate`'s PermissionMode projection (kebab-case string).
-fn parse_permission_mode(mode: &str) -> PermissionMode {
-    serde_json::from_value(serde_json::Value::String(mode.to_string()))
-        .unwrap_or(PermissionMode::WorkspaceWrite)
-}
-
-/// Reverse of `translate`'s ReasoningEffort projection (snake-case string).
-fn parse_reasoning_effort(effort: &str) -> manox_agent::language_model::ReasoningEffort {
-    serde_json::from_value(serde_json::Value::String(effort.to_string())).unwrap_or_default()
-}
-
-// Unused helper kept for the store mirror; `HistoryPhase` travels as a
-// wire string through the store, never through `ThreadEvent`.
-#[allow(dead_code)]
-fn _history_phase(_: &str) -> HistoryPhase {
-    HistoryPhase::Ready
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_text_maps() {
-        let note = ServerNote::AgentText {
-            session_id: "s1".into(),
-            text: "hi".into(),
-        };
-        assert!(matches!(
-            server_note_to_thread_event(&note),
-            Some(ThreadEvent::AgentText(t)) if t == "hi"
-        ));
-    }
-
-    #[test]
-    fn tool_call_maps_status() {
-        let note = ServerNote::ToolCall {
-            session_id: "s1".into(),
-            id: "tc-1".into(),
-            name: "Bash".into(),
-            title: "run".into(),
-            status: "pending-approval".into(),
-            input: Some(serde_json::json!({})),
-        };
-        assert!(matches!(
-            server_note_to_thread_event(&note),
-            Some(ThreadEvent::ToolCall { status, .. })
-                if matches!(status, manox_agent::thread::ToolCallStatus::PendingApproval)
-        ));
-    }
 
     #[test]
     fn error_maps_to_anyhow() {
@@ -324,33 +84,36 @@ mod tests {
     }
 
     #[test]
-    fn history_restored_derives_from_thread_history() {
-        let note = ServerNote::ThreadHistory {
-            session_id: "s1".into(),
-            messages: vec![],
-            display_history: serde_json::json!([]),
-            auto_approved_tools: None,
-            restored: false,
-            loading: false,
-        };
-        assert!(matches!(
-            server_note_to_thread_event(&note),
-            Some(ThreadEvent::HistoryRestored)
-        ));
-    }
-
-    #[test]
-    fn cache_invalidation_maps() {
-        let note = ServerNote::CacheInvalidation {
-            session_id: "s1".into(),
-            reprocessed_tokens: 42,
-        };
-        assert!(matches!(
-            server_note_to_thread_event(&note),
-            Some(ThreadEvent::CacheInvalidation {
-                reprocessed_tokens: 42
-            })
-        ));
+    fn retained_global_notes_have_no_event() {
+        let notes = [
+            ServerNote::Ready,
+            ServerNote::SessionCreated {
+                session_id: "s1".into(),
+            },
+            ServerNote::SessionDisposed {
+                session_id: "s1".into(),
+            },
+            ServerNote::ThreadsUpdated { threads: vec![] },
+            ServerNote::Models { models: vec![] },
+            ServerNote::Commands {
+                commands: serde_json::json!([]),
+            },
+            ServerNote::ModelText {
+                request_id: "r".into(),
+                text: "t".into(),
+            },
+            ServerNote::ModelChatDone {
+                request_id: "r".into(),
+                stop: None,
+                error: None,
+            },
+        ];
+        assert!(
+            notes
+                .iter()
+                .all(|n| server_note_to_thread_event(n).is_none()),
+            "retained non-domain notes must not emit ThreadEvents"
+        );
     }
 
     #[test]
@@ -395,38 +158,6 @@ mod tests {
             server_call_to_thread_event(&call),
             Some(ThreadEvent::PlanReady { plan_file, .. }) if plan_file == "/plan.md"
         ));
-    }
-
-    #[test]
-    fn no_thread_event_for_snapshots() {
-        let note = ServerNote::ThreadInfo {
-            session_id: "s1".into(),
-            info: Box::new(manox_protocol::server::ThreadInfoPayload {
-                cwd: String::new(),
-                project: None,
-                display_title: String::new(),
-                model_id: None,
-                model_name: None,
-                model: None,
-                permission_mode: String::new(),
-                reasoning_effort: String::new(),
-                pinned: false,
-                archived: false,
-                depth: 0,
-                agent_label: String::new(),
-                self_author: String::new(),
-                cwd_path: None,
-                branch: None,
-                goal: None,
-                goal_elapsed_seconds: None,
-                plan_mode: false,
-                browser_suites: Vec::new(),
-                history_phase: String::new(),
-                running: false,
-                has_interacted: false,
-            }),
-        };
-        assert!(server_note_to_thread_event(&note).is_none());
     }
 
     #[test]

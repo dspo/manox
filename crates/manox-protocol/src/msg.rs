@@ -6,6 +6,16 @@
 //! [`crate::ServerNote`] are themselves internally tagged by `method`, nested
 //! under the `call` / `note` field, so every wire message is fully
 //! self-describing.
+//!
+//! Protocol v2 (§D.1) adds the stream classes — `FromClient::StreamOpen /
+//! StreamCancel` and `FromServer::StreamItem / StreamEnd` — over the payload
+//! vocabulary in [`crate::stream`] ([`StreamKind`](crate::stream::StreamKind),
+//! [`StreamFrame`](crate::stream::StreamFrame),
+//! [`StreamEndReason`](crate::stream::StreamEndReason),
+//! [`HostEvent`](crate::stream::HostEvent)). The variants landed with the T4
+//! stream services; v1 consumers tolerate them per L12 (unknown variants are
+//! dropped + logged, never fatal), and the §D.5 `HostEvent` re-type of
+//! `FromServer::Notification` still waits on the T5 consumer migration.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -51,10 +61,54 @@ impl std::fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
+/// Stable application error codes for v2 failures (§D.7). The numeric `code`
+/// stays an `i32` for wire-compat with v1 consumers; v2 servers carry one of
+/// these strings in [`RpcError::data`] under the key `"code"` (e.g.
+/// `RpcError::new(-1, msg).with_code(CODE_MODEL_UNRESOLVABLE)`).
+pub const RPC_ERROR_CODES: &[&str] = &[
+    "session/not-found",
+    "session/busy",
+    "gateway/bad-request",
+    "gateway/internal",
+    "resync-required",
+    "model/unresolvable",
+];
+
+/// `session/not-found` (§D.7).
+pub const CODE_SESSION_NOT_FOUND: &str = "session/not-found";
+/// `session/busy` (§D.7).
+pub const CODE_SESSION_BUSY: &str = "session/busy";
+/// `gateway/bad-request` (§D.7).
+pub const CODE_GATEWAY_BAD_REQUEST: &str = "gateway/bad-request";
+/// `gateway/internal` (§D.7).
+pub const CODE_GATEWAY_INTERNAL: &str = "gateway/internal";
+/// `resync-required` (§D.7): follow stream must be re-opened from a fresh
+/// snapshot (L5 companion of `StreamEndReason::Resync`).
+pub const CODE_RESYNC_REQUIRED: &str = "resync-required";
+/// `model/unresolvable` (§D.7): a [`ModelRef`](crate::journal::ModelRef) did
+/// not resolve server-side (the single convergence point is
+/// `resolve_model_ref`, L8).
+pub const CODE_MODEL_UNRESOLVABLE: &str = "model/unresolvable";
+
+impl RpcError {
+    /// Builder: tag this error with a §D.7 stable code (stored in
+    /// `data.code`).
+    pub fn with_code(self, code: &'static str) -> Self {
+        Self {
+            data: Some(serde_json::json!({ "code": code })),
+            ..self
+        }
+    }
+}
+
 /// Client → server message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum FromClient {
     /// A query needing a [`FromServer::Response`].
     Request {
@@ -68,12 +122,29 @@ pub enum FromClient {
         id: MsgId,
         outcome: Result<serde_json::Value, RpcError>,
     },
+    /// Open a server→client stream (§D.1): the server answers with
+    /// [`FromServer::StreamItem`] frames and exactly one terminal
+    /// [`FromServer::StreamEnd`]. `stream_id` is client-minted, unique per
+    /// connection. The kind field is `streamKind` on the wire — the §D.1
+    /// field name `kind` would collide with this enum's internal `kind` tag
+    /// (same envelope-key exclusivity rule as §C.1).
+    StreamOpen {
+        stream_id: crate::journal::StreamId,
+        stream_kind: crate::stream::StreamKind,
+    },
+    /// Cancel a live stream (§D.1); the server closes it with
+    /// `StreamEnd { reason: Cancelled }`.
+    StreamCancel { stream_id: crate::journal::StreamId },
 }
 
 /// Server → client message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum FromServer {
     /// The server's answer to a [`FromClient::Request`] (`ClientCall`).
     Response {
@@ -85,8 +156,28 @@ pub enum FromServer {
         id: MsgId,
         call: crate::server::ServerCall,
     },
-    /// Streaming update.
+    /// Streaming update. v2 (§D.5) re-types this payload as
+    /// [`HostEvent`](crate::stream::HostEvent) — the global host vocabulary
+    /// that replaces the doomed `ServerNote` domain arms; the swap waits on
+    /// the consumer migration (see module docs).
     Notification { note: crate::server::ServerNote },
+    /// v2 host event (§D.5): global, change-driven broadcasts
+    /// (`SessionStatus` deltas, `Models`/`Commands` refresh pushes, …)
+    /// addressed to every connected client, not to a session's owners.
+    Host { host: crate::stream::HostEvent },
+    /// One frame of a live stream (§D.1). `Snapshot` / `Projections` and the
+    /// terminal `StreamEnd` never drop under backpressure (L5 / §D.7);
+    /// `Entry` frames ride a bounded queue that resyncs on overflow.
+    StreamItem {
+        stream_id: crate::journal::StreamId,
+        frame: crate::stream::StreamFrame,
+    },
+    /// The terminal frame of a stream (§D.1): exactly one per opened stream,
+    /// never dropped (§D.7). After it the `stream_id` may be reopened.
+    StreamEnd {
+        stream_id: crate::journal::StreamId,
+        reason: crate::stream::StreamEndReason,
+    },
 }
 
 #[cfg(test)]
@@ -232,6 +323,16 @@ mod tests {
                 id: MsgId::new("rep-2"),
                 outcome: Err(RpcError::new(-1, "denied")),
             },
+            FromClient::StreamOpen {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                stream_kind: crate::stream::StreamKind::FollowSession {
+                    session_id: "s1".into(),
+                    max_messages: Some(64),
+                },
+            },
+            FromClient::StreamCancel {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();
@@ -288,38 +389,59 @@ mod tests {
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::TurnStarted {
-                    session_id: "s1".into(),
+                note: crate::server::ServerNote::ThreadsUpdated { threads: vec![] },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::Models {
+                    models: vec![crate::wire::ModelInfo {
+                        id: "deepseek-chat".into(),
+                        name: "DeepSeek Chat".into(),
+                        provider: "DeepSeek-anthropic".into(),
+                        provider_name: None,
+                        api: "anthropic".into(),
+                        context_window: 131_072,
+                        max_tokens: None,
+                    }],
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::CacheInvalidation {
-                    session_id: "s1".into(),
-                    reprocessed_tokens: 12345,
+                note: crate::server::ServerNote::Commands {
+                    commands: serde_json::json!([]),
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::TurnFinished {
-                    cancelled: false,
-                    failed: false,
-                    stranded_steer_ids: vec![],
-                    session_id: "s1".into(),
+                note: crate::server::ServerNote::Error {
+                    session_id: Some("s1".into()),
+                    message: "boom".into(),
                 },
             },
             FromServer::Notification {
-                note: crate::server::ServerNote::UsageSnapshot {
-                    session_id: "s1".into(),
-                    cumulative: crate::server::TokenUsageSnapshot {
-                        input: 100,
-                        output: 50,
-                        cache_creation: 0,
-                        cache_read: 0,
-                    },
-                    per_model: std::collections::HashMap::new(),
-                    cumulative_cost: 0.01,
-                    per_model_cost: std::collections::HashMap::new(),
-                    per_request: std::collections::HashMap::new(),
+                note: crate::server::ServerNote::ModelText {
+                    request_id: "r1".into(),
+                    text: "delta".into(),
                 },
+            },
+            FromServer::Notification {
+                note: crate::server::ServerNote::ModelChatDone {
+                    request_id: "r1".into(),
+                    stop: Some("end_turn".into()),
+                    error: None,
+                },
+            },
+            FromServer::StreamItem {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                frame: crate::stream::StreamFrame::Entry {
+                    seq: 3,
+                    event: crate::journal::JournalWireEvent::AgentTextDelta { s: "tok".into() },
+                },
+            },
+            FromServer::StreamItem {
+                stream_id: crate::journal::StreamId::new("stream-2"),
+                frame: crate::stream::StreamFrame::Snapshot(crate::surface::snapshot_sample()),
+            },
+            FromServer::StreamEnd {
+                stream_id: crate::journal::StreamId::new("stream-1"),
+                reason: crate::stream::StreamEndReason::Resync,
             },
         ];
         for msg in &msgs {
@@ -327,5 +449,48 @@ mod tests {
             let back: FromServer = serde_json::from_str(&json).unwrap();
             assert_eq!(msg, &back, "FromServer serde round-trip failed: {json}");
         }
+    }
+
+    /// L12 / §D.8: an unknown journal entry tag must be *tolerable* on the
+    /// read side — clients probe the `type` against
+    /// [`crate::surface::JOURNAL_ENTRIES`] and drop + log the frame without
+    /// erroring the connection (the strict parse is `is_err`, the tolerant
+    /// path never panics).
+    #[test]
+    fn unknown_journal_entry_tag_is_tolerated_not_fatal() {
+        let unknown = serde_json::json!({
+            "seq": 5,
+            "id": "x-1",
+            "parentId": null,
+            "timestamp": "2026-09-04T00:00:00Z",
+            "type": "someFutureEntry"
+        });
+        // Strict typed parse fails cleanly (an error value, not a panic)…
+        assert!(
+            serde_json::from_value::<crate::journal::JournalWireEntry>(unknown.clone()).is_err()
+        );
+        // …and the tolerant client path: the tag is absent from the declared
+        // surface, so the frame is dropped + logged; the connection stays up.
+        let tag = unknown["type"].as_str().unwrap();
+        assert!(!crate::surface::JOURNAL_ENTRIES.contains(&tag));
+        // A declared tag, by contrast, parses.
+        let known = serde_json::json!({
+            "seq": 6,
+            "id": "x-2",
+            "parentId": null,
+            "timestamp": "2026-09-04T00:00:00Z",
+            "type": "turnStart"
+        });
+        assert!(crate::surface::JOURNAL_ENTRIES.contains(&"turnStart"));
+        assert!(serde_json::from_value::<crate::journal::JournalWireEntry>(known).is_ok());
+    }
+
+    /// §D.7: the v2 stable error-code set.
+    #[test]
+    fn rpc_error_code_set_is_wired_into_data() {
+        let err = RpcError::new(1, "gone").with_code(CODE_SESSION_NOT_FOUND);
+        assert_eq!(err.data.as_ref().unwrap()["code"], "session/not-found");
+        assert!(RPC_ERROR_CODES.contains(&"resync-required"));
+        assert!(RPC_ERROR_CODES.contains(&CODE_MODEL_UNRESOLVABLE));
     }
 }

@@ -6,12 +6,13 @@ import { ArrowUp, Check, ChevronDown, Lock, Pause, ShieldCheck, TriangleAlert, X
 import type { ClipboardEvent, KeyboardEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import type { ApprovalMode, CommandEntry, ModelInfo, ReasoningEffort } from '../../../../protocol';
-import { ThreadApi } from '../../api/client';
+import type { ApprovalMode, CommandEntry, ImageAttachment, ModelInfo, ReasoningEffort } from '../../../../protocol';
+import { mintRpcId, ThreadApi } from '../../api/client';
 import { hasCommandKey, t, type I18nKey } from '../../lib/i18n';
 import { enterAction } from '../../lib/ime';
 import { recallStep } from '../../lib/turn-recall';
 import { cn } from '../../lib/utils';
+import { Slot } from '../../slots.outlet';
 import { store } from '../../state/bridge';
 import {
   DropdownMenu,
@@ -21,7 +22,6 @@ import {
   DropdownMenuTrigger,
 } from '../ui/dropdown-menu';
 import { Textarea } from '../ui/textarea';
-import { ModelPicker } from './model-picker';
 const MAX_IMAGE_EDGE_PX = 1568;
 // Trailing-key window after `compositionend`: only an Enter landing this
 // fast is the engine's post-composition echo, never a deliberate send.
@@ -174,7 +174,8 @@ export type ComposerProps = {
   sessionId: string | null;
   turnActive: boolean;
   models: ModelInfo[];
-  currentModelId: string | null;
+  /** Canonical model display ref of the owning thread / draft. */
+  currentModelRef: string | null;
   approvalMode: ApprovalMode;
   reasoningEffort: ReasoningEffort;
   planMode: boolean;
@@ -197,7 +198,7 @@ export const Composer = ({
   sessionId,
   turnActive,
   models,
-  currentModelId,
+  currentModelRef,
   approvalMode,
   reasoningEffort,
   planMode,
@@ -264,9 +265,10 @@ export const Composer = ({
     // immediately. Attached images fall through — the actor only routes
     // slashes on text-only submissions.
     if (sessionId && !creating && images.length === 0 && NAV_BUILTIN.test(trimmed)) {
-      store.echoUser(sessionId, trimmed);
+      const originRpc = mintRpcId();
+      store.echoUser(sessionId, trimmed, undefined, { originRpc });
       store.backToList();
-      new ThreadApi(sessionId).submit(trimmed);
+      void new ThreadApi(sessionId).submit(trimmed, undefined, originRpc);
       setText('');
       setImages([]);
       return;
@@ -274,23 +276,26 @@ export const Composer = ({
     if ((!trimmed && images.length === 0) || creating) {
       return;
     }
-    const wireImages = images.length
-      ? images.map((img) => ({ data: img.data, mimeType: img.mimeType }))
-      : undefined;
+    const wireImages: ImageAttachment[] = images.map((img) => ({
+      data: img.data,
+      mimeType: img.mimeType,
+    }));
     if (sessionId) {
       const api = new ThreadApi(sessionId);
-      // A submit while a turn runs parks the message on the actor; the
-      // bubble renders queued until the drain or a steer/drop action.
-      const clientId = crypto.randomUUID();
+      // §T7.3: submit is a Request carrying the echo's `originRpc`; the
+      // durable user entry retires the bubble when it lands (§F.2). A
+      // submit while a turn runs parks on the actor; the bubble renders
+      // queued until the drain or a steer action.
+      const originRpc = mintRpcId();
       store.echoUser(
         sessionId,
         trimmed,
         images.map((img) => ({ mimeType: img.mimeType, data: img.dataUrl, byteLen: null })),
-        { queued: turnActive, clientId },
+        { queued: turnActive, originRpc },
       );
-      api.submit(trimmed, wireImages, clientId);
+      void api.submit(trimmed, wireImages.length ? wireImages : undefined, originRpc);
     } else if (onCreateSession) {
-      onCreateSession(trimmed, wireImages ?? []);
+      onCreateSession(trimmed, wireImages);
     } else {
       return;
     }
@@ -479,13 +484,19 @@ export const Composer = ({
           </div>
         )}
         <div className="flex items-center gap-2">
-          <ModelPicker
-            currentModelId={currentModelId}
-            disabled={!ready || creating}
-            models={models}
-            onSelect={draft ? onModelChange : undefined}
-            reasoningEffort={reasoningEffort}
-            sessionId={sessionId}
+          {/* The model picker is contributed through the `conversation.
+           * composer.dock` slot (§G): the composer only opens the outlet and
+           * passes its owner props (session/display-ref/disabled/draft
+           * select); the picker component and its shared-data reads live in
+           * the slot defaults registration, not imported here. */}
+          <Slot
+            name="conversation.composer.dock"
+            owner={{
+              sessionId,
+              currentModelRef,
+              disabled: !ready || creating,
+              ...(draft ? { onModelChange } : {}),
+            }}
           />
           {turnActive && sessionId ? (
             <button

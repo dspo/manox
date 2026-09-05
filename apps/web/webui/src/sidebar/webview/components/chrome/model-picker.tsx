@@ -24,7 +24,8 @@ const REASONING_EFFORTS: ReasoningEffort[] = ['high', 'max'];
 
 export type ModelPickerProps = {
   models: ModelInfo[];
-  currentModelId: string | null;
+  /** Canonical `{provider}/{modelId}` display ref (L8). */
+  currentModelRef: string | null;
   disabled: boolean;
   sessionId: string | null;
   reasoningEffort: ReasoningEffort;
@@ -35,14 +36,14 @@ export type ModelPickerProps = {
 
 export const ModelPicker = ({
   models,
-  currentModelId,
+  currentModelRef,
   disabled,
   sessionId,
   reasoningEffort,
   onSelect,
 }: ModelPickerProps) => {
   const [open, setOpen] = useState(false);
-  const current = findCurrentModel(models, currentModelId);
+  const current = findCurrentModel(models, currentModelRef);
   // Group by provider DISPLAY name with same-name registrations merged into
   // one submenu, mirroring the host's popup grouping.
   const groups: { name: string; models: ModelInfo[] }[] = [];

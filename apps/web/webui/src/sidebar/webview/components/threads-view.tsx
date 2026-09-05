@@ -6,7 +6,7 @@
 import { useCallback, useState } from 'react';
 
 import type { CommandEntry, ModelInfo, ThreadListItem } from '../../../protocol';
-import { api } from '../api/client';
+import { api, mintRpcId } from '../api/client';
 import { useContainerWidth } from '../lib/use-container-width';
 import { store } from '../state/bridge';
 import { Composer } from './chrome/composer';
@@ -43,21 +43,27 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
 
   const createSession = useCallback(
     (text: string, images: { data: string; mimeType: string }[]) => {
-      const id = crypto.randomUUID();
+      // §T7.3: the draft echoes the first message under a fresh `originRpc`
+      // (the durable user entry retires it once the server journals it), and
+      // the create rides the full `CreateSession` intent (model included).
+      const localId = crypto.randomUUID();
+      const originRpc = mintRpcId();
       store.draftThread(
-        id,
+        localId,
         text,
         images.map((img) => ({
           mimeType: img.mimeType,
           data: `data:${img.mimeType};base64,${img.data}`,
           byteLen: null,
         })),
+        { originRpc },
       );
-      api.newSession({
-        sessionId: id,
+      void api.newSession({
+        localId,
         text,
         images: images.length ? images : undefined,
-        modelId: draftModelId ?? undefined,
+        modelRef: draftModelId,
+        originRpc,
       });
     },
     [draftModelId],
@@ -67,7 +73,7 @@ export const ThreadsView = ({ threads, error, models, commands }: ThreadsViewPro
     <Composer
       approvalMode="workspace-write"
       commands={commands}
-      currentModelId={draftModelId}
+      currentModelRef={draftModelId}
       models={models}
       onCreateSession={createSession}
       onModelChange={pickDraftModel}

@@ -87,6 +87,13 @@ impl SessionRepository {
             .await
             .map_err(|e| anyhow::anyhow!("failed to delete session {}: {e}", path.display()))
     }
+
+    /// The [`SessionInfo`] for one transcript, without scanning the
+    /// directory. An explicit open only ever needs this — a store-wide
+    /// [`Self::list`] is O(every file) and must never gate it.
+    pub async fn info(&self, path: &Path) -> Result<SessionInfo, anyhow::Error> {
+        build_session_info(path).await
+    }
 }
 
 fn session_file_name(id: &str) -> String {

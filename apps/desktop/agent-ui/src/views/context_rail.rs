@@ -277,10 +277,11 @@ impl ContextRail {
     /// `Render` impl positions this as an absolute overlay over the
     /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = self
-            .store
-            .as_ref()
-            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()));
+        let project = self.store.as_ref().map(|s| {
+            s.read(cx)
+                .store
+                .with(|st| std::path::PathBuf::from(st.cwd.clone()))
+        });
         let agents_section = self.render_agents_section(theme, cx);
 
         v_flex()
@@ -356,7 +357,7 @@ impl ContextRail {
         let cumulative_cost = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.cumulative_cost)
+            .map(|s| s.read(cx).store.with(|st| st.cumulative_cost))
             .unwrap_or(0.0);
         let total = if cumulative_cost > 0.0 {
             SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
@@ -607,11 +608,18 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The store mirrors the session's effective cwd as a string.
-        let cwd_path = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read(cx).store.cwd_path.clone());
+        // The store mirrors the session's effective cwd as a string (the v2
+        // `cwd` projection; T10c retired the separate `cwd_path` note field —
+        // it was the same directory path).
+        let cwd_path = self.store.as_ref().and_then(|s| {
+            s.read(cx).store.with(|st| {
+                if st.cwd.is_empty() {
+                    None
+                } else {
+                    Some(st.cwd.clone())
+                }
+            })
+        });
         let display = self.git_branch_display.clone();
 
         // Branch label: branch / detached sha + (detached).
@@ -760,7 +768,7 @@ impl ContextRail {
         let running = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.running)
+            .map(|s| s.read(cx).store.with(|st| st.running))
             .unwrap_or(false);
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
             manox_agent::ToolCallStatus::Error

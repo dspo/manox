@@ -352,6 +352,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             timestamp: chrono::Utc::now(),
             message,
+            origin: None,
         }
     }
 

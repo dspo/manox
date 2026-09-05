@@ -3,18 +3,17 @@
 // which view is shown, so switching never interrupts or loses a running
 // turn.
 
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 
-import { api, ThreadApi } from './api/client';
+import { api } from './api/client';
 import { ConversationView } from './components/conversation-view';
 import { ThreadsView } from './components/threads-view';
 import { useChatState } from './state/bridge';
+import { Slot } from './slots.outlet';
 
 export const App = () => {
   const state = useChatState();
   const thread = state.activeThreadId ? (state.perThread[state.activeThreadId] ?? null) : null;
-  const turnActive = thread?.turnActive ?? false;
-  const prevTurnActive = useRef(false);
 
   // Global registries (models, threads, slash entries) load once on mount;
   // the host pushes updates afterwards.
@@ -24,19 +23,13 @@ export const App = () => {
     api.listCommands();
   }, []);
 
-  // The active turn flag's falling edge refreshes usage and the info
-  // snapshot (spend tree, git stats) for the finished turn.
-  useEffect(() => {
-    if (prevTurnActive.current && !turnActive && thread) {
-      const threadApi = new ThreadApi(thread.sessionId);
-      threadApi.requestUsage();
-      threadApi.requestThreadInfo();
-    }
-    prevTurnActive.current = turnActive;
-  }, [turnActive, thread]);
+  // Spend/context (§E.3) is no longer store-driven: the conversation-info
+  // plugin (T8 §H) watches the `committed` edge and pulls `GetConversationInfo`
+  // through its own seam. App keeps no request effects (the old turn-falling-
+  // edge usage refresh was a §D.6 dead path and is gone).
 
-  if (state.view === 'conversation' && thread) {
-    return (
+  const body =
+    state.view === 'conversation' && thread ? (
       <ConversationView
         commands={state.commands}
         error={thread.error ?? state.error}
@@ -44,14 +37,21 @@ export const App = () => {
         thread={thread}
         threads={state.threads}
       />
+    ) : (
+      <ThreadsView
+        commands={state.commands}
+        error={state.error}
+        models={state.models}
+        threads={state.threads}
+      />
     );
-  }
+
   return (
-    <ThreadsView
-      commands={state.commands}
-      error={state.error}
-      models={state.models}
-      threads={state.threads}
-    />
+    <>
+      {body}
+      {/* App-level modal overlays (§G): the settings sheet and any plugin
+       * overlay render here through the `shell.overlay` outlet. */}
+      <Slot name="shell.overlay" owner={{ sessionId: state.activeThreadId }} />
+    </>
   );
 };

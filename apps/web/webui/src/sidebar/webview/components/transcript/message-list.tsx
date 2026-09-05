@@ -66,8 +66,11 @@ function groupIntoTurns(items: TranscriptItem[]): TurnGroup[] {
   return groups;
 }
 
-const modelName = (models: ModelInfo[], id?: string | null): string | null =>
-  id ? (models.find((m) => m.id === id)?.name ?? id) : null;
+/** Turn-header model label. `ref` is the canonical `{provider}/{modelId}`
+ * stamped by the entry fold; exact canonical match only (L8 — no bare-id
+ * first-match); unmatched refs display the ref itself. */
+const modelName = (models: ModelInfo[], ref?: string | null): string | null =>
+  ref ? (models.find((m) => `${m.provider}/${m.id}` === ref)?.name ?? ref) : null;
 
 export const MessageList = ({
   items,
