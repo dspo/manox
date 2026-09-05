@@ -98,20 +98,23 @@ pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Tra
 // ── v4 journal → wire mapping (§C.2 / §D.1, T4) ─────────────────────────────
 //
 // The kernel `SessionTreeEntry` vocabulary (37 variants, journal v4) projects
-// onto the wire [`manox_protocol::JournalWireEvent`] (34 variants). Three
-// kernel variants have no §C.2 wire row — `ActiveToolsChange`, `Custom`,
-// `CustomMessage` — and map to `None` (the follow stream skips them without
-// opening a §F.1 gap: an unclaimed seq is sealed by the next Entry). The
-// two new wire fields carried by every entry (`id`/`parentId`) and the
-// `seq` stamp ride [`wire_entry`]; `id → callId` / `agentId` renames follow
-// the §C.1 envelope-key exclusivity rule.
+// onto the wire [`manox_protocol::JournalWireEvent`] (37 variants). The
+// projection is TOTAL: every kernel variant has a §C.2 wire row — including
+// the wire-opaque extension kinds (`ActiveToolsChange`, `Custom`,
+// `CustomMessage`), which ride verbatim. Totality is a hard §F.1 requirement:
+// the client fold's `assertPage` adjacency demands a seq-dense wire page, so a
+// wire-less kind would punch a hole in the follow snapshot and loop the client
+// on snapshot → Resync. The two new wire fields carried by every entry
+// (`id`/`parentId`) and the `seq` stamp ride [`wire_entry`]; `id → callId` /
+// `agentId` renames follow the §C.1 envelope-key exclusivity rule.
 
 use manox_harness::session::SessionTreeEntry;
 use manox_harness::types::AgentMessage;
 use manox_protocol::journal::{JournalWireEntry, JournalWireEvent, ModelRef, UsagePayload};
 
-/// One journal record as the wire carries it (§C.1 entry envelope). `None`
-/// when the kernel variant has no §C.2 wire row.
+/// One journal record as the wire carries it (§C.1 entry envelope). The
+/// projection is total — `None` is unreachable and kept only for signature
+/// stability across the T-wave.
 pub fn wire_entry(seq: u64, entry: &SessionTreeEntry) -> Option<JournalWireEntry> {
     Some(JournalWireEntry {
         seq,
@@ -124,8 +127,8 @@ pub fn wire_entry(seq: u64, entry: &SessionTreeEntry) -> Option<JournalWireEntry
     })
 }
 
-/// The §C.2 event projection of one kernel entry. `None` = no wire row
-/// (see the module comment above).
+/// The §C.2 event projection of one kernel entry — total (see the module
+/// comment); the `Option` is signature stability, never a skip.
 pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
     use JournalWireEvent as W;
     Some(match entry {
@@ -377,9 +380,30 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
             data: data.clone(),
         },
         // ── kernel rows with no §C.2 wire vocabulary ────────────────────
-        SessionTreeEntry::ActiveToolsChange { .. }
-        | SessionTreeEntry::Custom { .. }
-        | SessionTreeEntry::CustomMessage { .. } => return None,
+        SessionTreeEntry::ActiveToolsChange {
+            active_tool_names, ..
+        } => W::ActiveToolsChange {
+            tools: active_tool_names.clone(),
+        },
+        // Wire-opaque extension rows (§C.2): carried verbatim so the journal's
+        // wire page stays seq-dense (a wire-less kind would break the client
+        // fold's `assertPage` adjacency and loop snapshot → Resync).
+        SessionTreeEntry::Custom {
+            custom_type, data, ..
+        } => W::Custom {
+            custom_type: custom_type.clone(),
+            data: data.clone().unwrap_or(serde_json::Value::Null),
+        },
+        SessionTreeEntry::CustomMessage {
+            custom_type,
+            content,
+            display,
+            ..
+        } => W::CustomMessage {
+            custom_type: custom_type.clone(),
+            content: content_blocks(content),
+            display: *display,
+        },
     })
 }
 
@@ -488,14 +512,13 @@ mod tests {
     }
 
     /// §J.4 (d) coverage: the kernel `SessionTreeEntry` vocabulary has 37
-    /// variants; `wire_event` maps every one of them — the 34 §C.2 wire rows
-    /// are produced, and the 3 kernel-only rows (`ActiveToolsChange`,
-    /// `Custom`, `CustomMessage`) are the documented `None` drops. If a new
-    /// kernel variant is added, the exhaustive `match` in `wire_event` stops
-    /// compiling, so this test is the behavioral pin, not a completeness
-    /// check — it asserts the drop-set is exactly the three named rows.
+    /// variants and `wire_event` maps every one of them — the projection is
+    /// TOTAL (§F.1 density: the follow snapshot page must be seq-dense, so no
+    /// kernel kind may be wire-less). If a new kernel variant is added, the
+    /// exhaustive `match` in `wire_event` stops compiling; this test is the
+    /// behavioral pin that the None-set stays empty.
     #[test]
-    fn wire_projection_covers_every_kernel_variant_and_drops_exactly_three() {
+    fn wire_projection_covers_every_kernel_variant_totally() {
         use manox_harness::session::SessionTreeEntry as E;
         let now = chrono::Utc::now();
         let id = || "e".to_string();
@@ -766,6 +789,11 @@ mod tests {
             },
         ];
         assert_eq!(all.len(), 37, "kernel vocabulary is 37 variants");
+        // The projection is TOTAL (§F.1 density): no kernel kind may be
+        // wire-less — a hole in the follow snapshot page violates the client
+        // fold's `assertPage` adjacency and loops snapshot → Resync (the
+        // #765 real-data regression: legacy `custom` / `active_tools_change`
+        // rows in the user's sessions).
         let dropped: Vec<&str> = all
             .iter()
             .filter(|e| wire_event(e).is_none())
@@ -774,14 +802,12 @@ mod tests {
                 manox_harness::session::entry_kind(e).as_str()
             })
             .collect();
-        let mut dropped = dropped;
-        dropped.sort_unstable();
         assert_eq!(
             dropped,
-            vec!["active_tools_change", "custom", "custom_message"],
-            "the drop-set is exactly the three kernel-only rows"
+            Vec::<&str>::new(),
+            "no kernel variant may lack a wire row"
         );
-        // The other 34 all project (and round-trip through the wire enum).
+        // All 37 project (and round-trip through the wire enum).
         for e in &all {
             if wire_event(e).is_none() {
                 continue;
@@ -796,5 +822,22 @@ mod tests {
                 manox_harness::session::entry_kind(e).as_str()
             );
         }
+        // The legacy extension kinds land on their dedicated wire rows.
+        let custom = all
+            .iter()
+            .find(|e| matches!(e, E::Custom { .. }))
+            .expect("custom sample present");
+        assert!(matches!(
+            wire_event(custom),
+            Some(JournalWireEvent::Custom { .. })
+        ));
+        let tools = all
+            .iter()
+            .find(|e| matches!(e, E::ActiveToolsChange { .. }))
+            .expect("active-tools sample present");
+        assert!(matches!(
+            wire_event(tools),
+            Some(JournalWireEvent::ActiveToolsChange { .. })
+        ));
     }
 }

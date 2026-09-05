@@ -33,14 +33,14 @@ export function exactKeys(v: unknown, keys: readonly string[]): boolean {
 
 /** §C.2 journal entry tags (JOURNAL_ENTRIES in src/surface.rs). */
 export const JOURNAL_ENTRY_TAGS: readonly string[] = [
-  'message', 'uiNote', 'turnStart', 'turnFinish', 'stop', 'retry', 'error',
+  'message', 'uiNote', 'custom', 'customMessage', 'turnStart', 'turnFinish', 'stop', 'retry', 'error',
   'agentTextDelta', 'agentThinkingDelta', 'toolCall', 'toolResult',
   'toolOutputChunk', 'subagentChild', 'subagentProgress', 'modelChange',
   'cwdChange', 'projectChange', 'permissionModeChange',
   'reasoningEffortChange', 'planModeChange', 'planUpdate', 'goal', 'title',
   'browserSuites', 'backgroundTask', 'approval', 'pinnedArchived',
-  'compaction', 'compactionStarted', 'branchSummary', 'label', 'sessionInfo',
-  'leaf', 'metrics',
+  'activeToolsChange', 'compaction', 'compactionStarted', 'branchSummary',
+  'label', 'sessionInfo', 'leaf', 'metrics',
 ];
 
 /** §D.5 host event tags (HOST_EVENTS in src/surface.rs). */

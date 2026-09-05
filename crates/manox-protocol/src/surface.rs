@@ -38,6 +38,8 @@ pub const JOURNAL_ENTRIES: &[&str] = &[
     // transcript
     "message",
     "uiNote",
+    "custom",
+    "customMessage",
     // lifecycle
     "turnStart",
     "turnFinish",
@@ -66,6 +68,7 @@ pub const JOURNAL_ENTRIES: &[&str] = &[
     "backgroundTask",
     "approval",
     "pinnedArchived",
+    "activeToolsChange",
     // compaction / tree
     "compaction",
     "compactionStarted",
@@ -234,6 +237,15 @@ pub fn journal_samples() -> Vec<JournalWireEvent> {
             kind: "error".into(),
             data: serde_json::json!({"text": "oops"}),
         },
+        Custom {
+            custom_type: "manox_ui_note".into(),
+            data: serde_json::json!({"kind": "notice"}),
+        },
+        CustomMessage {
+            custom_type: "extension".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "payload"})],
+            display: true,
+        },
         // lifecycle
         TurnStart,
         TurnFinish {
@@ -329,6 +341,9 @@ pub fn journal_samples() -> Vec<JournalWireEvent> {
         PinnedArchived {
             pinned: true,
             archived: false,
+        },
+        ActiveToolsChange {
+            tools: vec!["Bash".into(), "Read".into()],
         },
         // compaction / tree
         Compaction {

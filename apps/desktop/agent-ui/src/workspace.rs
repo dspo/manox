@@ -2067,9 +2067,35 @@ impl Workspace {
         // arm, but there is no outgoing-thread double-bind to preserve: the
         // outgoing thread is detached on the park, the incoming id is unknown
         // until the receipt.
+        //
+        // Inheritance (L8/L9): the foreground session's wire identity is the
+        // projection store — `model` key carries `{provider, modelId}` and
+        // `project` the bound folder. The legacy thread mirror is only a
+        // pre-snapshot fallback (the #765 round-2 repro: reading the mirror
+        // alone lost model AND project on every new thread).
+        let inherited_project = project.or_else(|| {
+            self.store.as_ref().and_then(|s| {
+                s.read(cx)
+                    .store
+                    .with(|st| st.project.clone())
+                    .filter(|p| !p.is_empty())
+                    .map(PathBuf::from)
+            })
+        });
+        let project = inherited_project;
         let model = self
-            .thread
-            .read(|t| t.model().map(|m| format!("{}/{}", m.provider, m.id)));
+            .store
+            .as_ref()
+            .and_then(|s| s.read(cx).store.with(|st| st.model.clone()))
+            .and_then(|m| {
+                let provider = m.get("provider").and_then(|v| v.as_str())?;
+                let id = m.get("modelId").and_then(|v| v.as_str())?;
+                (!provider.is_empty() && !id.is_empty()).then(|| format!("{provider}/{id}"))
+            })
+            .or_else(|| {
+                self.thread
+                    .read(|t| t.model().map(|m| format!("{}/{}", m.provider, m.id)))
+            });
         let approval = serde_json::to_value(self.store.as_ref().map_or_else(
             || self.thread.read(|t| t.permission_mode()),
             |s| s.read(cx).store.with(|st| st.permission_mode),
@@ -10682,14 +10708,17 @@ mod tests {
     }
 
     /// Regression lock (#765 symptom 2): clicking a sidebar thread loads the
-    /// persisted transcript. Two real session files (header + a user and an
-    /// assistant turn) are seeded on disk, discovered by a store `refresh`,
-    /// then switched to / away / back. Each cold restore drives the real
-    /// engine's `open_existing` + follow-stream `Snapshot` on the tokio
-    /// runtime; the assertion is that the client fold ends up with the
-    /// transcript, and — critically — that it lands inside the bounded wait
-    /// (the #765 bug parked the actor behind a store-wide scan so no frame
-    /// ever arrived).
+    /// persisted transcript. Real-shaped session files (header, a model row,
+    /// a user and an assistant turn, and — critically — the wire-opaque
+    /// `custom` / `active_tools_change` rows legacy sessions carry) are
+    /// seeded on disk, discovered by a store `refresh`, then switched to /
+    /// away / back. Each cold restore drives the real engine's
+    /// `open_existing` + follow-stream `Snapshot` on the tokio runtime; the
+    /// assertion is that the client fold ends up with the transcript, and —
+    /// critically — that it lands inside the bounded wait (the #765 bug
+    /// parked the actor behind a store-wide scan so no frame ever arrived;
+    /// the round-2 bug holed the snapshot page at the wire-less rows so the
+    /// fold looped snapshot → Resync and nothing ever rendered).
     #[gpui::test]
     fn sidebar_thread_switch_restores_transcript(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
@@ -10715,8 +10744,11 @@ mod tests {
         let transcript = |id: &str, text: &str| {
             format!(
                 "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{{\"host\":\"manox\"}}}}\n\
-                 {{\"type\":\"message\",\"id\":\"{id}-u1\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1767225601000}}}}\n\
-                 {{\"type\":\"message\",\"id\":\"{id}-a1\",\"parentId\":\"{id}-u1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"reply\"}}],\"model\":\"m\",\"provider\":\"p\",\"api\":\"anthropic\",\"stopReason\":\"stop\",\"timestamp\":1767225602000}}}}\n"
+                 {{\"type\":\"model_change\",\"id\":\"{id}-m0\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:00Z\",\"provider\":\"p\",\"modelId\":\"m\"}}\n\
+                 {{\"type\":\"message\",\"id\":\"{id}-u1\",\"parentId\":\"{id}-m0\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"timestamp\":1767225601000}}}}\n\
+                 {{\"type\":\"custom\",\"id\":\"{id}-c1\",\"parentId\":\"{id}-u1\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"customType\":\"manox_ui_note\",\"data\":{{\"kind\":\"notice\",\"data\":{{\"text\":\"note\"}}}}}}\n\
+                 {{\"type\":\"active_tools_change\",\"id\":\"{id}-t1\",\"parentId\":\"{id}-c1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"activeToolNames\":[\"Bash\"]}}\n\
+                 {{\"type\":\"message\",\"id\":\"{id}-a1\",\"parentId\":\"{id}-t1\",\"timestamp\":\"2026-01-01T00:00:02Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"reply\"}}],\"model\":\"m\",\"provider\":\"p\",\"api\":\"anthropic\",\"stopReason\":\"stop\",\"timestamp\":1767225602000}}}}\n"
             )
         };
         std::fs::write(
@@ -10828,6 +10860,222 @@ mod tests {
         assert!(a_back, "thread A's transcript is non-empty on switch-back");
 
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// #765 round-2 live repro harness: runs the whole open/restore/model
+    /// contract against the user's REAL sessions tree. `HOME` is redirected
+    /// for the test process (a sanitized copy — keychain sources replaced
+    /// with literals, sockets dropped), so the real store scan, the real
+    /// provider catalog, and the real v3 files all exercise the production
+    /// paths. Run in isolation:
+    /// `cargo test -p agent-ui --lib realdata --no-run`, then execute the
+    /// printed test binary with `HOME=<copy> … realdata -- --nocapture
+    /// --test-threads=1`.
+    #[gpui::test]
+    fn realdata_open_thread_restores_and_set_model_lands(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        // This test only runs in its dedicated process (HOME redirected to the
+        // sanitized copy): the shared suite would otherwise point the real
+        // `init()` store at the developer's actual `~/.manox` and write to it.
+        let Ok(home) = std::env::var("MANOX_REALDATA_HOME") else {
+            eprintln!("REALDATA: MANOX_REALDATA_HOME unset — skipping (dedicated-process test)");
+            return;
+        };
+        assert!(
+            std::env::var_os("HOME")
+                .map(|h| h.to_string_lossy() == home)
+                .unwrap_or(false),
+            "MANOX_REALDATA_HOME must equal the redirected HOME"
+        );
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            // Real init (not init_for_test): sessions_dir and threads.db come
+            // from $HOME/.manox — the redirected real-data copy. A prior
+            // test's TEST_OVERRIDE store would shadow it, so clear the slot
+            // first.
+            manox_agent::thread_store::drop_for_test();
+            manox_agent::thread_store::init();
+        });
+        cx.background_executor.allow_parking();
+
+        let target = std::env::var("MANOX_REALDATA_THREAD")
+            .unwrap_or_else(|_| "e6d4b2e5-02bb-4bac-aae1-cfa6e5f18750".to_string());
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(1200.), gpui::px(800.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // 1. The real scan must surface the user's thread (386 files; the
+        //    bound covers the multi-second full-tree pass).
+        let mut listed = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let hit = manox_agent::thread_store::global().read(|s| {
+                s.summaries().iter().any(|r| r.id == target)
+                    || s.archived_summaries().iter().any(|r| r.id == target)
+            });
+            if hit {
+                listed = true;
+                break;
+            }
+        }
+        let n_summaries = manox_agent::thread_store::global()
+            .read(|s| s.summaries().len() + s.archived_summaries().len());
+        assert!(
+            listed,
+            "real scan lists the target thread ({target}); summaries={n_summaries}"
+        );
+        eprintln!("REALDATA: scan listed {n_summaries} summaries");
+
+        let folded = |ws: &gpui::Entity<Workspace>, visual: &mut gpui::VisualTestContext| {
+            ws.read_with(visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.with(|st| st.display.len()))
+                    .unwrap_or(0)
+            })
+        };
+
+        // 2. The user's exact gesture: click the row → open_thread. The
+        //    functional assertion is the transcript fold (the reported bug:
+        //    nothing renders, not even a loading state).
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.open_thread(target.clone(), window, cx));
+        });
+        let mut restored = 0usize;
+        let mut bound_sid: Option<String> = None;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let n = folded(&ws, &mut visual);
+            if n > 0 {
+                restored = n;
+                bound_sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+                break;
+            }
+        }
+        assert!(
+            restored > 0,
+            "real thread {target} must restore its transcript (display=0, sid={bound_sid:?})"
+        );
+        eprintln!("REALDATA: restored {restored} display entries (sid={bound_sid:?})");
+
+        // 3. The model chip contract on real data: the file's persisted
+        //    model_change must be visible in the projection.
+        let model_before = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+        });
+        eprintln!("REALDATA: model projection after restore = {model_before:?}");
+
+        // 4. The picker's exact wire: a registration-qualified ref of a real
+        //    catalog model, sent through the same note path.
+        let registry = manox_agent::provider_glue::global();
+        let chosen = registry
+            .models()
+            .into_iter()
+            .find(|m| m.id.contains("qwen3.8-flash"))
+            .or_else(|| registry.models().into_iter().next())
+            .expect("a real catalog model exists");
+        let target_id = chosen.id.clone();
+        let qualified = format!("{}/{}", chosen.provider, chosen.id);
+        eprintln!("REALDATA: SetModel ref = {qualified}");
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, _| {
+                let _ = ws.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                    session_id: sid.into(),
+                    id: qualified.clone(),
+                });
+            });
+        });
+        let mut model_updated = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.as_deref() == Some(target_id.as_str()) {
+                model_updated = true;
+                break;
+            }
+        }
+        assert!(
+            model_updated,
+            "SetModel({qualified}) must move the model projection (before={model_before:?})"
+        );
+        eprintln!("REALDATA: SetModel projection update landed");
+
+        // 5. The inheritance contract: a new thread started from this state
+        //    must carry the model into the new session's store.
+        let project_before = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.project.clone()))
+        });
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.start_new_thread(None, window, cx));
+        });
+        let mut new_sid: Option<String> = None;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if sid.as_deref() != bound_sid.as_deref() {
+                new_sid = sid;
+                break;
+            }
+        }
+        assert!(new_sid.is_some(), "new thread must bind a fresh session");
+        // The create receipt binds the id, but the model/project only land
+        // with the new session's follow snapshot — bounded wait for the
+        // projection baseline.
+        let mut new_model: Option<String> = None;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.is_some() {
+                new_model = now;
+                break;
+            }
+        }
+        let new_project = ws.read_with(&visual, |ws, cx| {
+            ws.store
+                .as_ref()
+                .and_then(|s| s.read(cx).store.with(|st| st.project.clone()))
+        });
+        eprintln!(
+            "REALDATA: new thread {new_sid:?} model={new_model:?} project={new_project:?} \
+             (source project was {project_before:?})"
+        );
+        assert!(
+            new_model.is_some(),
+            "new thread must inherit a model (source model {target_id}, project {project_before:?})"
+        );
     }
 
     /// T6: `start_new_thread` deletes the local pre-build — the session is

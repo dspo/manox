@@ -151,12 +151,11 @@ async fn run_follow_stream(
             let mut projections = crate::projections::ProjectionSet::seed(&thread);
             for record in &data.records {
                 projections.apply_event(record.seq, &record.entry);
-                match wire_entry(record.seq, &record.entry) {
-                    Some(entry) => records.push(entry),
-                    None => tracing::trace!(
-                        seq = record.seq,
-                        "follow stream: kernel entry has no wire projection (L12)"
-                    ),
+                // The §C.2 projection is total (no wire-less kinds), so the
+                // page is seq-dense end-to-end — the fold's `assertPage`
+                // adjacency holds.
+                if let Some(entry) = wire_entry(record.seq, &record.entry) {
+                    records.push(entry);
                 }
             }
             // Header `createdAt` fallback: the oldest wire-mapped record
@@ -261,6 +260,9 @@ async fn forward_entries(
             }
             received = feed.recv() => match received {
                 Ok(JournalFeed::Event(event)) => {
+                    // §C.2 totality: every journal entry has a wire row, so
+                    // every feed event forwards as an Entry frame — the seq
+                    // stream stays dense (§F.1 rule 2 is vacuous now).
                     if let Some(frame_event) = crate::translate::wire_event(&event.entry) {
                         conn.send_to_client(FromServer::StreamItem {
                             stream_id: stream_id.clone(),
@@ -270,11 +272,7 @@ async fn forward_entries(
                             },
                         });
                     }
-                    // Wire-projection-less entries do not open a gap on the
-                    // client (§F.1 rule 2): the seq stays unclaimed and the
-                    // next Entry seals the window.
-                    // P face: fold server-side regardless of wire
-                    // projection, then publish changed keys (§E.1).
+                    // P face: fold server-side, then publish changed keys (§E.1).
                     projections.apply_event(event.seq, &event.entry);
                     if let Some((as_of_seq, values)) = projections.drain_changed() {
                         conn.send_to_client(FromServer::StreamItem {

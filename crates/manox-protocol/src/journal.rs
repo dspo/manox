@@ -116,6 +116,23 @@ pub enum JournalWireEvent {
         kind: String,
         data: serde_json::Value,
     },
+    /// A kernel extension entry carried verbatim (wire-opaque, §C.2). Every
+    /// journal entry has a wire row — completeness is what keeps the follow
+    /// snapshot page seq-dense for the client fold's adjacency assertion
+    /// (§F.1 `assertPage`); a wire-less kind would punch a hole and loop the
+    /// client on snapshot → Resync. `customType: "manox_ui_note"` is the
+    /// pre-`UiNote` durable form of a UI annotation (legacy files).
+    Custom {
+        custom_type: String,
+        data: serde_json::Value,
+    },
+    /// An extension message whose payload the harness does not interpret
+    /// (kernel `custom_message`); wire-opaque like [`JournalWireEvent::Custom`].
+    CustomMessage {
+        custom_type: String,
+        content: Vec<serde_json::Value>,
+        display: bool,
+    },
     // ── lifecycle ───────────────────────────────────────────────────
     /// A model turn started (drives the `running` projection's true edge).
     TurnStart,
@@ -213,6 +230,9 @@ pub enum JournalWireEvent {
     },
     /// Pinned / archived flags changed.
     PinnedArchived { pinned: bool, archived: bool },
+    /// The engine's active tool-set changed (kernel diagnostic state,
+    /// wire-opaque). Completes the §C.2 set: no journal kind is wire-less.
+    ActiveToolsChange { tools: Vec<String> },
     /// Compaction of older history completed (spinner state is carried by
     /// the independent `CompactionStarted` entry, §C.2 note).
     Compaction {

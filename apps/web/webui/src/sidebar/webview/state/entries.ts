@@ -213,6 +213,20 @@ export class TranscriptFold {
 			case 'uiNote':
 				this.onUiNote(r);
 				return;
+			case 'custom':
+				// Legacy durable UI annotation (pre-`uiNote` files wrote
+				// `custom{customType: "manox_ui_note"}`): the payload shape is
+				// the uiNote row verbatim — fold it the same way.
+				if (asString(r.customType) === 'manox_ui_note') {
+					const payload = asRecord(r.data);
+					this.onUiNote({
+						...r,
+						type: 'uiNote',
+						kind: payload ? (asString(payload.kind) ?? 'notice') : 'notice',
+						data: payload ? payload.data : undefined,
+					});
+				}
+				return;
 			case 'turnStart':
 				this.side.turnStarted = true;
 				return;
@@ -574,9 +588,10 @@ const emptySide = (): FoldSideEffects => ({
 
 /** Normalize raw `PageHistory` rows / snapshot `records` JSON into the
  * flattened §C.1 envelope shape the fold consumes. Rows whose `type` is not
- * in the declared vocabulary, or whose seq is not a finite number, are
- * dropped (guards enforce tag membership at the boundary; this is the last
- * tolerant filter — L12). */
+ * in the declared vocabulary are KEPT opaquely — they occupy their seq for
+ * the engine's §F.1 adjacency algebra (a dropped row would punch a hole in
+ * the page and loop snapshot → resync) and simply render nothing. Only rows
+ * without a finite seq are dropped (malformed). */
 export const normalizeWireRecords = (raw: unknown): WireRecord[] => {
 	if (!Array.isArray(raw)) return [];
 	const out: WireRecord[] = [];
@@ -585,9 +600,12 @@ export const normalizeWireRecords = (raw: unknown): WireRecord[] => {
 		const row = value as Record<string, unknown>;
 		const seq = asNumber(row.seq);
 		const type = asString(row.type);
-		if (seq === null || type === null || !isKnownJournalTag(type)) {
-			console.warn('[webui] journal record dropped', type);
+		if (seq === null || type === null) {
+			console.warn('[webui] journal record dropped (no seq/type)', type);
 			continue;
+		}
+		if (!isKnownJournalTag(type)) {
+			console.debug('[webui] journal record carried opaquely', type);
 		}
 		out.push({
 			...row,

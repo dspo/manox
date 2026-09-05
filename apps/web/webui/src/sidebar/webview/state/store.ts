@@ -636,22 +636,26 @@ export class Store {
 			console.warn('[webui] malformed entry frame dropped', frame);
 			return;
 		}
-		if (!isKnownJournalTag(event.type)) {
-			// L12 tolerance: drop + log, never disconnect.
-			console.warn('[webui] unknown journal entry tag dropped', event.type);
-			return;
-		}
 		const record: WireRecord = {
 			...event,
 			seq,
-			type: event.type,
+			type: asString(event.type) ?? 'unknown',
 			id: `e-${seq}`,
 			timestamp: new Date().toISOString(),
 		};
+		// Feed the engine FIRST, before any tag filtering: every wire entry
+		// occupies its seq (§F.1 density). Dropping an unknown-tag entry
+		// before the engine would punch a hole and loop snapshot → resync.
 		const violation = runtime.engine.entry({ first: seq, last: seq });
 		if (violation) return; // engine violation → `failed` → resync
 		const tail = runtime.engine.cursors().last;
 		if (tail === undefined || tail < seq) return; // not applied (gap)
+		if (!isKnownJournalTag(record.type)) {
+			// L12 tolerance: the seq is claimed (density holds) but the row
+			// renders nothing — log and carry on, never disconnect.
+			console.debug('[webui] unknown journal entry tag carried opaquely', record.type);
+			return;
+		}
 		insertRow(runtime.rows, {
 			record,
 			originRpc: originOf(record),

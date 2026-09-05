@@ -142,6 +142,27 @@ pub fn history_entries_of(entry: &JournalWireEntry) -> Vec<HistoryEntry> {
             }
             out
         }
+        // Legacy durable UI annotation (pre-`uiNote` files wrote
+        // `custom{customType: "manox_ui_note"}`): the payload is the
+        // `UiNoteRecord` verbatim — render exactly like the `uiNote` row so
+        // old sessions keep their notice cards.
+        JournalWireEvent::Custom { custom_type, data } if custom_type == "manox_ui_note" => {
+            match serde_json::from_value::<UiNoteRecord>(data.clone()) {
+                Ok(record) => vec![HistoryEntry::Note(record)],
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "journal display fold: unparseable legacy manox_ui_note skipped"
+                    );
+                    Vec::new()
+                }
+            }
+        }
+        // Wire-opaque extension rows (§C.2 totality): they occupy their seq
+        // for the fold's density algebra but render nothing.
+        JournalWireEvent::Custom { .. }
+        | JournalWireEvent::CustomMessage { .. }
+        | JournalWireEvent::ActiveToolsChange { .. } => Vec::new(),
         _ => Vec::new(),
     }
 }
