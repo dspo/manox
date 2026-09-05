@@ -819,6 +819,11 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// The currently selected thread id (the highlight source).
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
     /// Order threads as a team forest: top-level rows (threads + externals)
     /// merged by recency, each leader followed by its indented member
     /// subtree. Orphans and cycles stay top-level (`depth` is zeroed for

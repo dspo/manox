@@ -502,6 +502,14 @@ pub struct Workspace {
     /// Input state for the blank project folder name overlay.
     blank_project_name_input: Option<Entity<InputState>>,
     thread_sub: Option<Subscription>,
+    /// Observes the foreground leaf store itself (beyond `thread_sub`'s
+    /// events): a projection-only frame (mid-session `SetModel` →
+    /// `Projections` delta) writes the chip fields and notifies the LEAF, but
+    /// the entry event's re-render can land in an earlier tick — without this
+    /// observe the workspace never repaints and the chip stays stale (the
+    /// #765 "picks a model, nothing happens" repro: the journal had both
+    /// changes, the render never showed them).
+    store_observe: Option<Subscription>,
     sidebar_sub: Option<Subscription>,
     input_sub: Option<Subscription>,
     editor_sub: Option<Subscription>,
@@ -883,6 +891,7 @@ impl Workspace {
             blank_project_parent: None,
             blank_project_name_input: None,
             thread_sub: None,
+            store_observe: None,
             sidebar_sub: None,
             input_sub: None,
             editor_sub: None,
@@ -907,7 +916,9 @@ impl Workspace {
             cli_session_claims: std::collections::HashMap::new(),
             active_external: None,
         };
-        ws.thread_sub = Some(ws.subscribe_thread(cx));
+        let (thread_events, store_changes) = ws.subscribe_thread(cx);
+        ws.thread_sub = Some(thread_events);
+        ws.store_observe = Some(store_changes);
         ws.sidebar_sub = Some(ws.subscribe_sidebar(window, cx));
         ws.input_sub = Some(ws.subscribe_input(window, cx));
         ws.editor_sub = Some(ws.subscribe_editor(window, cx));
@@ -1207,12 +1218,17 @@ impl Workspace {
         cx.notify();
     }
 
-    fn subscribe_thread(&self, cx: &mut Context<Self>) -> Subscription {
+    /// Wire the workspace to the foreground leaf: the `ThreadEvent` stream
+    /// drives the conversation surface, and the entity-level observe repaints
+    /// on projection-only frames (the mid-session chip updates — see the
+    /// `store_observe` field note).
+    fn subscribe_thread(&self, cx: &mut Context<Self>) -> (Subscription, Subscription) {
         let store = self
             .store
             .clone()
             .expect("subscribe_thread requires the foreground store");
-        cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
+        let observe = cx.observe(&store, |_, _, cx| cx.notify());
+        let events = cx.subscribe(&store, |this, _store, ev: &ThreadEvent, cx| {
             match ev {
                 ThreadEvent::ToolCallAuthorization {
                     id,
@@ -1746,7 +1762,8 @@ impl Workspace {
                     cx.notify();
                 }
             }
-        })
+        });
+        (events, observe)
     }
 
     /// Minimal subscription for a thread parked in `background_threads`. Unlike
@@ -4043,7 +4060,9 @@ impl Workspace {
             self.sync_list_count(cx);
             self.list_state.set_follow_mode(FollowMode::Tail);
         }
-        self.thread_sub = Some(self.subscribe_thread(cx));
+        let (thread_events, store_changes) = self.subscribe_thread(cx);
+        self.thread_sub = Some(thread_events);
+        self.store_observe = Some(store_changes);
         // The thinking ticker belongs to the outgoing thread: bump its
         // generation so the old ticker self-terminates, then mirror the incoming
         // thread's running state. A parked thread resumed mid-turn keeps the
@@ -11156,6 +11175,160 @@ mod tests {
         drop(ws);
         drop(visual);
         let _ = std::fs::remove_file(&db_path);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// #765 round-3 repro (same dedicated-process regime as the sibling
+    /// realdata test): two residual live symptoms against the real sessions
+    /// tree —
+    /// (a) a model picked in the picker immediately after boot (the engine
+    ///     still materializing) must still land in the projection, and
+    /// (b) ONE `SidebarEvent::OpenThread` (the exact event a row click
+    ///     emits) must select the row and restore the transcript.
+    #[gpui::test]
+    fn realdata_boot_set_model_and_single_event_open(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let Ok(home) = std::env::var("MANOX_REALDATA_HOME") else {
+            eprintln!("REALDATA: MANOX_REALDATA_HOME unset — skipping (dedicated-process test)");
+            return;
+        };
+        assert!(
+            std::env::var_os("HOME")
+                .map(|h| h.to_string_lossy() == home)
+                .unwrap_or(false),
+            "MANOX_REALDATA_HOME must equal the redirected HOME"
+        );
+        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::drop_for_test();
+            manox_agent::thread_store::init();
+        });
+        cx.background_executor.allow_parking();
+
+        let target = std::env::var("MANOX_REALDATA_THREAD")
+            .unwrap_or_else(|_| "e6d4b2e5-02bb-4bac-aae1-cfa6e5f18750".to_string());
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(1200.), gpui::px(800.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // (a) The picker's exact gesture, fired IMMEDIATELY after boot with
+        // no waits — the engine is still materializing. Pick a model that
+        // differs from the boot fallback so the change is observable.
+        let registry = manox_agent::provider_glue::global();
+        let chosen = registry
+            .models()
+            .into_iter()
+            .find(|m| m.id.contains("qwen3.8-max"))
+            .or_else(|| registry.models().into_iter().next())
+            .expect("a real catalog model exists");
+        let target_id = chosen.id.clone();
+        let qualified = format!("{}/{}", chosen.provider, chosen.id);
+        eprintln!("REALDATA-BOOT: SetModel ref = {qualified} (fired with no settle wait)");
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, _| {
+                let _ = ws.send_note(|sid| manox_protocol::ClientNote::SetModel {
+                    session_id: sid.into(),
+                    id: qualified.clone(),
+                });
+            });
+        });
+        let mut landed = false;
+        for _ in 0..900 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let now = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .and_then(|s| s.read(cx).store.with(|st| st.model_id.clone()))
+            });
+            if now.as_deref() == Some(target_id.as_str()) {
+                landed = true;
+                break;
+            }
+        }
+        assert!(
+            landed,
+            "an immediate post-boot SetModel({qualified}) must land in the model projection"
+        );
+        eprintln!("REALDATA-BOOT: immediate SetModel landed");
+
+        // (b) Wait for the scan to list the target, then ONE OpenThread
+        // event — the exact payload a row click emits.
+        let mut listed = false;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if manox_agent::thread_store::global()
+                .read(|s| s.summaries().iter().any(|r| r.id == target))
+            {
+                listed = true;
+                break;
+            }
+        }
+        assert!(listed, "real scan lists the target thread");
+        let sidebar = ws.read_with(&visual, |ws, _| ws.sidebar.clone());
+        visual.update(|_window, cx| {
+            sidebar.update(cx, |_, cx| {
+                cx.emit(crate::views::sidebar::SidebarEvent::OpenThread(
+                    target.clone(),
+                ))
+            });
+        });
+        // The selection must move on that single event (the sidebar's
+        // selected id is set synchronously inside open_thread → attach).
+        let mut selected_now = false;
+        for _ in 0..50 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let sel = ws.read_with(&visual, |ws, cx| {
+                ws.sidebar.read(cx).selected_id().map(str::to_string)
+            });
+            if sel.as_deref() == Some(target.as_str()) {
+                selected_now = true;
+                break;
+            }
+        }
+        assert!(
+            selected_now,
+            "one OpenThread event must select the row (no second click needed)"
+        );
+        // And the transcript restores on that same single event.
+        let mut restored = 0usize;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let n = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| s.read(cx).store.with(|st| st.display.len()))
+                    .unwrap_or(0)
+            });
+            if n > 0 {
+                restored = n;
+                break;
+            }
+        }
+        assert!(
+            restored > 0,
+            "one OpenThread event must restore the transcript"
+        );
+        eprintln!("REALDATA-BOOT: single OpenThread event selected + restored {restored} entries");
         manox_agent::thread_store::drop_global_for_test();
     }
 }

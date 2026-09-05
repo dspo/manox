@@ -65,7 +65,15 @@ impl ClientStoreHandle {
     /// `SessionCreated` note (routed by the multiplexer) lands.
     pub fn leaf(session_id: &str, _cx: &mut Context<Self>) -> Self {
         Self {
-            store: ClientStore::default(),
+            // The leaf exists for exactly this session (L11: the thread id IS
+            // the session id), so the mirror carries it from construction —
+            // binding only on the v1 `SessionCreated` note left opened
+            // sessions with an empty `store.id`, and every same-frame
+            // read-back (attach's sidebar selection) saw "".
+            store: ClientStore {
+                id: manox_agent::ThreadId(session_id.to_string()),
+                ..ClientStore::default()
+            },
             fold: JournalFold::new(),
             session_id: session_id.to_string(),
             outbound: None,
