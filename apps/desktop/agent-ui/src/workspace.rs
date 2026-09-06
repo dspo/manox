@@ -11344,14 +11344,24 @@ mod tests {
 
         // (a) The picker's exact gesture, fired IMMEDIATELY after boot with
         // no waits — the engine is still materializing. Pick a model that
-        // differs from the boot fallback so the change is observable.
-        let registry = manox_agent::provider_glue::global();
-        let chosen = registry
-            .models()
-            .into_iter()
-            .find(|m| m.id.contains("qwen3.8-max"))
-            .or_else(|| registry.models().into_iter().next())
-            .expect("a real catalog model exists");
+        // differs from the boot fallback so the change is observable. (The
+        // registry builds on a background thread — with a real HOME the
+        // keychain reads take a beat, so wait for the first registration.)
+        let mut chosen = None;
+        for _ in 0..300 {
+            let registry = manox_agent::provider_glue::global();
+            if let Some(m) = registry
+                .models()
+                .into_iter()
+                .find(|m| m.id.contains("qwen3.8-max"))
+                .or_else(|| registry.models().into_iter().next())
+            {
+                chosen = Some(m);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let chosen = chosen.expect("a real catalog model exists (registry built within 30s)");
         let target_id = chosen.id.clone();
         let qualified = format!("{}/{}", chosen.provider, chosen.id);
         eprintln!("REALDATA-BOOT: SetModel ref = {qualified} (fired with no settle wait)");
@@ -11459,6 +11469,117 @@ mod tests {
             "one OpenThread event must restore the transcript"
         );
         eprintln!("REALDATA-BOOT: single OpenThread event selected + restored {restored} entries");
+
+        // 7. A NEW thread via the §D.2 intent must have a LIVE transcript:
+        //    the real submit path's durable user row arrives through the
+        //    follow stream (the round-5 repro: an intent-created session's
+        //    transcript stayed dead after submit while the journal recorded
+        //    everything — the user message landed in the new session but the
+        //    window never showed it).
+        visual.update(|window, cx| {
+            ws.update(cx, |ws, cx| ws.start_new_thread(None, window, cx));
+        });
+        let mut new_bound: Option<String> = None;
+        for _ in 0..3000 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
+            if let Some(sid) = sid
+                && sid != target
+            {
+                new_bound = Some(sid);
+                break;
+            }
+        }
+        assert!(
+            new_bound.is_some(),
+            "the intent thread must bind a fresh session"
+        );
+        let probe_text = "realdata round-5 transcript probe".to_string();
+        let probe = probe_text.clone();
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.send_user_turn(probe.clone(), Vec::new(), cx)
+            });
+        });
+        let mut user_row = false;
+        for _ in 0..900 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let hit = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| {
+                        s.read(cx).store.with(|st| {
+                            st.display.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    manox_agent::db::HistoryEntry::Message(m)
+                                        if m.content
+                                            .iter()
+                                            .any(|c| c.to_str() == Some(probe.as_str()))
+                                )
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if hit {
+                user_row = true;
+                break;
+            }
+        }
+        assert!(
+            user_row,
+            "the submitted user turn must appear in the intent thread's transcript"
+        );
+        eprintln!("REALDATA-BOOT: submitted user turn is live in the intent thread's transcript");
+
+        // 8. Turn-outcome probe (diagnostic, env-dependent — never asserts):
+        // the engine's turn must reach a terminal state. Against the
+        // sanitized copy the provider rejects the dummy key quickly; against
+        // a real HOME this is the transport-failure reproducer — the
+        // journaled error now carries the full reqwest source chain.
+        let journal_sid = new_bound.clone().unwrap_or_default();
+        let journal_path =
+            manox_agent::thread_store::global_sessions_dir().join(format!("{journal_sid}.jsonl"));
+        let mut outcome = String::new();
+        for _ in 0..1500 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Ok(text) = std::fs::read_to_string(&journal_path) {
+                for line in text.lines().rev() {
+                    let Ok(d) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    match d.get("type").and_then(|t| t.as_str()) {
+                        Some("error") => {
+                            outcome = format!(
+                                "ERROR: {}",
+                                d.get("message").and_then(|m| m.as_str()).unwrap_or("")
+                            );
+                            break;
+                        }
+                        Some("turn_finish") => {
+                            outcome = "TURN_FINISHED".to_string();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                if !outcome.is_empty() {
+                    break;
+                }
+            }
+        }
+        eprintln!(
+            "REALDATA-BOOT: turn outcome for {journal_sid} = {}",
+            if outcome.is_empty() {
+                "(no terminal entry within 150s)"
+            } else {
+                &outcome
+            }
+        );
         manox_agent::thread_store::drop_global_for_test();
     }
 }

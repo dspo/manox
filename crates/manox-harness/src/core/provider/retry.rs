@@ -55,6 +55,21 @@ fn is_retryable_send_error(err: &reqwest::Error) -> bool {
     !err.is_status() && !err.is_redirect() && !err.is_builder()
 }
 
+/// The full reqwest error chain (`Display` of every source, ` <- `-joined).
+/// reqwest's own Display stops at "error sending request for url (…)" — the
+/// actual cause (DNS resolution, connection refused, TLS, closed connection)
+/// lives in the source chain and is the only thing that distinguishes them.
+fn error_chain(err: &reqwest::Error) -> String {
+    use std::error::Error as _;
+    let mut parts = vec![err.to_string()];
+    let mut source: Option<&dyn std::error::Error> = err.source();
+    while let Some(e) = source {
+        parts.push(e.to_string());
+        source = e.source();
+    }
+    parts.join(" <- ")
+}
+
 /// Short, user-facing label for a retryable reqwest send error. Mirrors the
 /// retry-decision logic of `is_retryable_send_error` but only classifies — it
 /// never gates a retry. Kept terse so the retry event reads as one line.
@@ -235,13 +250,13 @@ where
             }
             Err(err) => {
                 if !is_retryable_send_error(&err) || attempt >= MAX_ATTEMPTS {
-                    return Err(ProviderError::Transport(err.to_string()).into());
+                    return Err(ProviderError::Transport(error_chain(&err)).into());
                 }
                 let delay = backoff(attempt);
                 tracing::warn!(
                     attempt,
                     max_attempts = MAX_ATTEMPTS,
-                    error = %err,
+                    error = %error_chain(&err),
                     delay_secs = delay.as_secs(),
                     "send error, retrying"
                 );

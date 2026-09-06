@@ -216,13 +216,19 @@ impl SessionMultiplexer {
                 // v1 compat: a `SessionCreated` note re-seats the handle and
                 // triggers the first follow-stream open (the create path —
                 // `open_or_create(reopen=false)` has no client-chosen id, so
-                // the id only lands here).
+                // the id only lands here). The leaf must exist BEFORE the
+                // follow opens: the note races ahead of the create receipt,
+                // and the intent path deliberately pre-creates nothing — so
+                // the on-demand leaf lands here, not after the open (the
+                // round-5 warn: `open_follow: no leaf registered` bailed and
+                // the stream only survived via the receipt arm's re-open).
                 let sid = note.session_id().map(str::to_string);
                 if let Some(sid) = sid.as_ref()
                     && matches!(note, manox_protocol::ServerNote::SessionCreated { .. })
                     && !self.has_follow(sid)
                 {
                     let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
+                    self.ensure_leaf(sid, cx);
                     self.open_follow(sid, stream_id);
                 }
                 sid
