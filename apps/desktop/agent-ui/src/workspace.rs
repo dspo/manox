@@ -6338,13 +6338,9 @@ impl Workspace {
                     .clone()
                     .map(std::path::PathBuf::from)
             });
-            let model = self.store.as_ref().and_then(|s| {
-                s.read(cx)
-                    .store
-                    .model
-                    .clone()
-                    .and_then(|v| serde_json::from_value::<manox_harness::types::Model>(v).ok())
-            });
+            let model = self
+                .foreground_model_identity(cx)
+                .and_then(|(provider, id)| Self::resolve_model_identity(&provider, &id));
             let effort = self
                 .store
                 .as_ref()
@@ -6439,19 +6435,57 @@ impl Workspace {
         }
     }
 
+    /// The foreground session's model identity from the `model` projection:
+    /// the canonical `{provider, modelId}` wire identity (L8) — never a full
+    /// `Model` blob. Deserializing the projection into `Model` (an earlier
+    /// iteration) always failed on the missing display fields, so the chip
+    /// rendered "no model" no matter what the journal said.
+    pub(crate) fn foreground_model_identity(&self, cx: &App) -> Option<(String, String)> {
+        self.store.as_ref().and_then(|s| {
+            s.read(cx).store.with(|st| {
+                let v = st.model.clone()?;
+                let provider = v.get("provider")?.as_str()?.to_string();
+                let id = v.get("modelId")?.as_str()?.to_string();
+                (!provider.is_empty() && !id.is_empty()).then_some((provider, id))
+            })
+        })
+    }
+
+    /// Exact registration match of a canonical model identity — display
+    /// metadata (name, wire api) resolves against the live registry at render
+    /// time; a stale id resolves to `None` and the caller renders the raw
+    /// identity, never a fuzzy look-alike.
+    pub(crate) fn resolve_model_identity(
+        provider: &str,
+        id: &str,
+    ) -> Option<manox_harness::types::Model> {
+        Self::resolve_model_identity_in(&manox_agent::provider_glue::global(), provider, id)
+    }
+
+    /// The pure core of [`Self::resolve_model_identity`] against an explicit
+    /// registry (tests construct one synchronously — the global builds on a
+    /// background thread).
+    pub(crate) fn resolve_model_identity_in(
+        registry: &manox_harness::core::ProviderRegistry,
+        provider: &str,
+        id: &str,
+    ) -> Option<manox_harness::types::Model> {
+        registry
+            .models()
+            .into_iter()
+            .find(|m| m.provider == provider && m.id == id)
+    }
+
     /// The pi-harness model selector. Reads the shared pi provider registry
     /// (the streaming source of truth): closed, a ghost button showing
     /// `provider · model · effort` with the model name tinted by wire api;
     /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let open = self.model_open;
-        let model = self.store.as_ref().and_then(|s| {
-            s.read(cx)
-                .store
-                .model
-                .clone()
-                .and_then(|v| serde_json::from_value::<manox_harness::types::Model>(v).ok())
-        });
+        let model_identity = self.foreground_model_identity(cx);
+        let model = model_identity
+            .as_ref()
+            .and_then(|(provider, id)| Self::resolve_model_identity(provider, id));
         let effort = self
             .store
             .as_ref()
@@ -6488,6 +6522,37 @@ impl Workspace {
                         .child(manox_agent::provider_glue::display_name(m))
                         .into_any_element(),
                     dot().into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(effort.wire_value().to_string())
+                        .into_any_element(),
+                ]
+            } else if let Some((ref provider, ref id)) = model_identity {
+                // The journal identity no longer resolves against the live
+                // registry (provider/model deregistered) — render it raw so
+                // the chip still tells the truth instead of "no model".
+                vec![
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.foreground)
+                        .child(provider.clone())
+                        .into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("·")
+                        .into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(id.clone())
+                        .into_any_element(),
+                    gpui::div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("·")
+                        .into_any_element(),
                     gpui::div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
@@ -10378,6 +10443,56 @@ mod tests {
         STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The chip's display resolution is an EXACT registration match — a stale
+    /// identity (provider/model the current catalog no longer registers)
+    /// resolves to `None` and renders raw, never a fuzzy look-alike. The
+    /// registry is constructed inline (the global builds on a background
+    /// thread, too racy for a sync test, and this must not contend the
+    /// process-wide runtime.lock either).
+    #[test]
+    fn resolve_model_identity_exact_match_only() {
+        use manox_harness::core::{
+            Api, Cost, InputModality, ProviderConfig, ProviderModelConfig, ProviderRegistry,
+        };
+        let model_cfg = |id: &str| ProviderModelConfig {
+            id: id.into(),
+            name: id.into(),
+            reasoning: false,
+            input: vec![InputModality::Text],
+            context_window: 131_072,
+            max_tokens: 8_192,
+            cost: Cost::default(),
+            api: None,
+            base_url: None,
+            metadata: std::collections::HashMap::new(),
+        };
+        let registry = ProviderRegistry::new();
+        registry
+            .register_provider(
+                "Test-anthropic",
+                ProviderConfig {
+                    name: Some("Test".into()),
+                    base_url: Some("https://test.example".into()),
+                    api_key: Some("sk-literal".into()),
+                    api: Some(Api::AnthropicMessages),
+                    headers: None,
+                    auth_header: true,
+                    models: vec![model_cfg("m-1")],
+                },
+            )
+            .unwrap();
+        assert!(Workspace::resolve_model_identity_in(&registry, "Test-anthropic", "m-1").is_some());
+        assert!(
+            Workspace::resolve_model_identity_in(&registry, "Test-anthropic", "no-such-model-id")
+                .is_none(),
+            "a stale id must not fuzzy-resolve to a look-alike"
+        );
+        assert!(
+            Workspace::resolve_model_identity_in(&registry, "Other-anthropic", "m-1").is_none(),
+            "the provider registration must match exactly too"
+        );
+    }
+
     /// Unique-ish id for temp files without pulling in a uuid dependency.
     fn uuid_like_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -11267,6 +11382,21 @@ mod tests {
             "an immediate post-boot SetModel({qualified}) must land in the model projection"
         );
         eprintln!("REALDATA-BOOT: immediate SetModel landed");
+        // The chip's render inputs (the #765 "pick a model, nothing happens"
+        // repro: the journal had the change but the chip deserialized the
+        // identity projection into a full Model blob and always failed).
+        let (chip_provider, chip_id) = ws
+            .read_with(&visual, |ws, cx| ws.foreground_model_identity(cx))
+            .expect("model identity present after SetModel");
+        assert_eq!(
+            (chip_provider.as_str(), chip_id.as_str()),
+            (chosen.provider.as_str(), target_id.as_str()),
+            "the chip identity equals the picked model"
+        );
+        assert!(
+            Workspace::resolve_model_identity(&chip_provider, &chip_id).is_some(),
+            "the chip display resolves against the live registry"
+        );
 
         // (b) Wait for the scan to list the target, then ONE OpenThread
         // event — the exact payload a row click emits.
