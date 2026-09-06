@@ -50,7 +50,11 @@ pub struct ResponsesStreamFn {
 impl ResponsesStreamFn {
     pub fn new(api_key: impl Into<String>) -> Self {
         ResponsesStreamFn {
-            client: reqwest::Client::new(),
+            // Direct LLM traffic — see the anthropic provider's note.
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("provider http client"),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             options: StreamOptions::default(),

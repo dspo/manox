@@ -11580,6 +11580,9 @@ mod tests {
                 &outcome
             }
         );
-        manox_agent::thread_store::drop_global_for_test();
+        // No `drop_global_for_test` here: this test runs in a dedicated
+        // process (the MANOX_REALDATA_HOME gate) and the agent-runtime
+        // background tasks (session-list refresh) outlive the test — dropping
+        // the slot makes their `global()` panic after the asserts.
     }
 }

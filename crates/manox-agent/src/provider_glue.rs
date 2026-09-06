@@ -43,6 +43,26 @@ fn build() -> Arc<ProviderRegistry> {
 pub fn init() {
     let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
     let notify = READY.get_or_init(tokio::sync::Notify::new);
+    // Routing note: provider HTTP clients are DIRECT (no_proxy). A shell
+    // proxy env var (`HTTP(S)_PROXY` / `ALL_PROXY`) silently rerouting LLM
+    // traffic turns every request into a tunnel failure when that proxy is
+    // down; tools that want a proxy (web_fetch) opt in themselves.
+    let proxy_env = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    if let Some(var) = proxy_env {
+        tracing::info!(
+            var,
+            "proxy environment detected — provider (LLM) traffic connects directly and ignores it"
+        );
+    }
     std::thread::spawn(move || {
         let fresh = build();
         if let Some(lock) = REGISTRY.get() {

@@ -38,7 +38,17 @@ pub struct AnthropicStreamFn {
 impl AnthropicStreamFn {
     pub fn new(api_key: impl Into<String>) -> Self {
         AnthropicStreamFn {
-            client: reqwest::Client::new(),
+            // LLM traffic is DIRECT: endpoints and keys are explicit
+            // provider config, and an incidental shell/system proxy
+            // (`HTTP(S)_PROXY` env) silently rerouting them turns every
+            // request into a tunnel failure when that proxy dies — the
+            // round-6 repro (`tunnel error ... Connection refused` while the
+            // endpoint itself was directly reachable). Tools that want a
+            // proxy (web_fetch) opt in themselves.
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("provider http client"),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             options: StreamOptions::default(),
