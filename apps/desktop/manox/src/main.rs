@@ -399,6 +399,14 @@ fn main() {
                         "system tray unavailable: {e:#}; closing the last window quits"
                     ),
                 }
+                // `--webui` forces the WebUI server on regardless of the tray
+                // outcome (the listener otherwise starts only from the tray /
+                // menu entry — unreachable when the tray cannot install, e.g.
+                // window-server resource exhaustion).
+                if std::env::args().any(|a| a == "--webui") {
+                    manox_webui::spawn_server();
+                    manox_webui::start_server();
+                }
             });
 
             // Wire the process-wide browser host: bind it to the main

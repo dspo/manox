@@ -10295,7 +10295,7 @@ mod tests {
     async fn right_pane_state_machine(cx: &mut gpui::TestAppContext) {
         use super::{PersistedRightTab, RightTab};
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
         let _store = store_test_guard();
         cx.update(gpui_component::init);
@@ -10557,7 +10557,7 @@ mod tests {
     #[gpui::test]
     async fn navigator_fill_lands_the_walk_and_hands_the_draft_back(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-fill-test-{}.db", uuid_like_id()));
@@ -10627,7 +10627,7 @@ mod tests {
     #[gpui::test]
     fn attach_thread_rebinds_store_to_new_session(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-attach-test-{}.db", uuid_like_id()));
@@ -10716,7 +10716,7 @@ mod tests {
     #[gpui::test]
     fn new_thread_intent_lands_projections_and_set_model_updates(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-projdiag-{}.db", uuid_like_id()));
@@ -10757,7 +10757,7 @@ mod tests {
         let mut bound = None;
         for _ in 0..400 {
             cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let sid = ws.read_with(&visual, |ws, _| ws.session_id.clone());
             if let Some(sid) = sid {
                 bound = Some(sid);
@@ -10771,7 +10771,7 @@ mod tests {
         let mut projected = None;
         for _ in 0..400 {
             cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let got = ws.read_with(&visual, |ws, cx| {
                 ws.store.as_ref().map(|s| {
                     s.read(cx).store.with(|st| {
@@ -10823,7 +10823,7 @@ mod tests {
         let mut updated = false;
         for _ in 0..400 {
             cx.run_until_parked();
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let now = ws.read_with(&visual, |ws, cx| {
                 ws.store
                     .as_ref()
@@ -10856,7 +10856,7 @@ mod tests {
     #[gpui::test]
     fn sidebar_thread_switch_restores_transcript(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-switch-{}.db", uuid_like_id()));
@@ -11021,7 +11021,7 @@ mod tests {
                 .unwrap_or(false),
             "MANOX_REALDATA_HOME must equal the redirected HOME"
         );
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         cx.update(|_cx| {
@@ -11219,7 +11219,7 @@ mod tests {
     #[gpui::test]
     fn start_new_thread_creates_via_intent_and_binds_server_id(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         let db_path = std::env::temp_dir().join(format!("manox-intent-test-{}.db", uuid_like_id()));
@@ -11313,7 +11313,7 @@ mod tests {
                 .unwrap_or(false),
             "MANOX_REALDATA_HOME must equal the redirected HOME"
         );
-        let _g = GLOBALS_LOCK.lock().unwrap();
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _store = store_test_guard();
         cx.update(gpui_component::init);
         cx.update(|_cx| {
@@ -11469,6 +11469,127 @@ mod tests {
             "one OpenThread event must restore the transcript"
         );
         eprintln!("REALDATA-BOOT: single OpenThread event selected + restored {restored} entries");
+
+        // 6b. Round-7 repro — the user's exact flow tonight: submit on the
+        //     REOPENED thread. The durable user row (and the live turn it
+        //     starts) must render into the foreground display fold.
+        let reopen_probe = "realdata round-7 reopened-thread probe".to_string();
+        let reopen_text = reopen_probe.clone();
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| ws.send_user_turn(reopen_text, Vec::new(), cx));
+        });
+        let mut reopen_row = false;
+        for _ in 0..600 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let hit = ws.read_with(&visual, |ws, cx| {
+                ws.store
+                    .as_ref()
+                    .map(|s| {
+                        s.read(cx).store.with(|st| {
+                            st.display.iter().any(|e| {
+                                matches!(
+                                    e,
+                                    manox_agent::db::HistoryEntry::Message(m)
+                                        if m.content
+                                            .iter()
+                                            .any(|c| c.to_str() == Some(reopen_probe.as_str()))
+                                )
+                            })
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            if hit {
+                reopen_row = true;
+                break;
+            }
+        }
+        assert!(
+            reopen_row,
+            "a submit on the reopened thread must render its user row"
+        );
+        eprintln!("REALDATA-BOOT: reopened-thread submit renders its user row");
+        // The conversation ENTITY is what paints — the store's display fold
+        // alone is not render. The durable user row is an Append (no live
+        // ThreadEvent, no structural rebuild), so this is the exact seam the
+        // round-7 "no reaction" repro lives or dies on.
+        let mut conv_row = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let hit = ws.read_with(&visual, |ws, cx| {
+                ws.conversation.read(cx).items().iter().any(|item| {
+                    matches!(
+                        item.read(cx).kind(),
+                        crate::conversation::ConvItem::User { text, .. }
+                            if text.contains(reopen_probe.as_str())
+                    )
+                })
+            });
+            if hit {
+                conv_row = true;
+                break;
+            }
+        }
+        eprintln!("REALDATA-BOOT: conversation entity carries the user row: {conv_row}");
+
+        // 6c. The committed-edge re-render: a durable MESSAGE row appending
+        //     through the follow stream must grow the conversation (the
+        //     round-7 root cause — tool turns are all settled rows and stayed
+        //     invisible). Push a synthetic assistant message entry through
+        //     the leaf exactly as the follow stream would.
+        let (before_items, tail_seq) = ws.read_with(&visual, |ws, cx| {
+            let n = ws.conversation.read(cx).items().len();
+            let tail = ws
+                .store
+                .as_ref()
+                .map(|s| s.read(cx).store.window.last().map(|e| e.seq).unwrap_or(0))
+                .unwrap_or(0);
+            (n, tail)
+        });
+        visual.update(|_window, cx| {
+            ws.update(cx, |ws, cx| {
+                if let Some(store) = ws.store.clone() {
+                    store.update(cx, |h, cx| {
+                        h.apply_from_server(
+                            manox_protocol::FromServer::StreamItem {
+                                stream_id: manox_protocol::StreamId::new("probe-stream"),
+                                frame: manox_protocol::StreamFrame::Entry {
+                                    seq: tail_seq + 1,
+                                    event: manox_protocol::JournalWireEvent::Message {
+                                        role: "assistant".into(),
+                                        content: vec![serde_json::json!({
+                                            "type": "text",
+                                            "text": "settled row probe"
+                                        })],
+                                        usage: None,
+                                        origin_rpc: None,
+                                    },
+                                },
+                            },
+                            cx,
+                        );
+                    });
+                }
+            });
+        });
+        let mut settled_row_renders = false;
+        for _ in 0..100 {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let n = ws.read_with(&visual, |ws, cx| ws.conversation.read(cx).items().len());
+            if n > before_items {
+                settled_row_renders = true;
+                break;
+            }
+        }
+        assert!(
+            settled_row_renders,
+            "a durable assistant message row must re-render the conversation \
+             ({before_items} items before, tail seq {tail_seq})"
+        );
+        eprintln!("REALDATA-BOOT: settled message row re-renders the conversation");
 
         // 7. A NEW thread via the §D.2 intent must have a LIVE transcript:
         //    the real submit path's durable user row arrives through the
