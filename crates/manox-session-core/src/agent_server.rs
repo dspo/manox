@@ -326,7 +326,8 @@ impl AgentServerInner {
                 if client_id.is_empty() {
                     conn.send_to_client(FromServer::Response {
                         id,
-                        outcome: Err(RpcError::new(-1, "empty client_id")),
+                        outcome: Err(RpcError::new(-1, "empty client_id")
+                            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
                     });
                     return;
                 }
@@ -358,7 +359,10 @@ impl AgentServerInner {
                 // its serve_connection loop exits promptly, then re-seat the
                 // entry with a fresh generation.
                 if let Some(old) = self.clients.lock().get(&client_id) {
-                    old.peer.cancel_all(RpcError::new(-1, "client reconnected"));
+                    old.peer.cancel_all(
+                        RpcError::new(-1, "client reconnected")
+                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+                    );
                     old.conn.disconnect();
                     // §D.1: the replaced connection's streams die with it
                     // (`Closed`). Safe here — the new connection cannot have
@@ -424,7 +428,8 @@ impl AgentServerInner {
                 };
                 conn.send_to_client(FromServer::Response {
                     id,
-                    outcome: Err(RpcError::new(-1, "expected Initialize first")),
+                    outcome: Err(RpcError::new(-1, "expected Initialize first")
+                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
                 });
                 return;
             }
@@ -881,7 +886,8 @@ async fn handle_call(
     call: ClientCall,
 ) -> Result<Value, RpcError> {
     match call {
-        ClientCall::Initialize(_) => Err(RpcError::new(-1, "already initialized")),
+        ClientCall::Initialize(_) => Err(RpcError::new(-1, "already initialized")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
         // ── v2 write calls (§D.2: receipts only, L7). ───────────────────────
         ClientCall::CreateSession {
             cwd,
@@ -973,10 +979,14 @@ async fn handle_call(
                 .await
         }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
-        ClientCall::ListThreads => serde_json::to_value(inner.threads_snapshot())
-            .map_err(|_| RpcError::new(-1, "threads serialization failed")),
-        ClientCall::ListModels => serde_json::to_value(inner.models_snapshot())
-            .map_err(|_| RpcError::new(-1, "models serialization failed")),
+        ClientCall::ListThreads => serde_json::to_value(inner.threads_snapshot()).map_err(|_| {
+            RpcError::new(-1, "threads serialization failed")
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        }),
+        ClientCall::ListModels => serde_json::to_value(inner.models_snapshot()).map_err(|_| {
+            RpcError::new(-1, "models serialization failed")
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        }),
         ClientCall::ListCommands => Ok(inner.commands_snapshot()),
         // T10 (§D.6): the v1 query surface is retired — usage rides the
         // journal (Q face `GetConversationInfo`), the model and every header
@@ -1063,7 +1073,10 @@ async fn open_session(
     // upgrade), and only phase 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
         .with_mut(|s| s.load_thread(session_id))
-        .ok_or_else(|| RpcError::new(-1, "thread not found"))?;
+        .ok_or_else(|| {
+            RpcError::new(-1, "thread not found")
+                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
+        })?;
     // Phase 3: recheck–spawn–insert under ONE lock hold. The pump is
     // spawned HERE, not in phase 2, so a race still yields exactly one
     // entry and one pump: the loser finds the winner's entry and re-owns
@@ -2123,7 +2136,8 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     conn.send_to_client(FromServer::Request { id, call });
     let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
         Ok(Ok(o)) => o,
-        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")),
+        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
     };
     if outcome.is_err() {
         // Plan §5.2: a timed-out / errored call must surface the reason,
@@ -2269,11 +2283,11 @@ async fn route_waterfall(
             let (expired, outcome) = tokio::select! {
                 _ = token.cancelled() => (
                     true,
-                    Err(RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)")),
+                    Err(RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
                 ),
                 replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
                     Ok(Ok(o)) => (false, o),
-                    _ => (true, Err(RpcError::new(-1, "adjudication reply timed out"))),
+                    _ => (true, Err(RpcError::new(-1, "adjudication reply timed out").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL))),
                 },
             };
             let _ = tx.send((cid, expired, outcome));
@@ -2578,15 +2592,16 @@ async fn route_capability_call(
             })
     };
     let Some((conn, rx)) = target else {
-        return Err(RpcError::new(
-            -1,
-            "no client can answer this capability call",
-        ));
+        return Err(
+            RpcError::new(-1, "no client can answer this capability call")
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+        );
     };
     conn.send_to_client(FromServer::Request { id, call });
     match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
         Ok(Ok(o)) => o,
-        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")),
+        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
     }
 }
 
@@ -8437,5 +8452,66 @@ mod tests {
         drop(b);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// C2 gate: every gateway error carries a §D.7 stable code. Scans this
+    /// crate's production sources for `RpcError::new(` constructor calls
+    /// whose matching close paren is not immediately followed by
+    /// `.with_code(` — an uncoded error is a contract hole (clients switch
+    /// on `data.code`; L11). Paren matching is string-aware enough for this
+    /// codebase (message literals keep their parens balanced); a site that
+    /// trips the gate falsely should still be restructured to chain
+    /// `.with_code` directly.
+    #[test]
+    fn every_production_rpc_error_carries_a_stable_code() {
+        const FILES: &[&str] = &[
+            "src/agent_server.rs",
+            "src/journal_query.rs",
+            "src/follow.rs",
+            "src/translate.rs",
+            "src/agent_client.rs",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut uncoded: Vec<String> = Vec::new();
+        for file in FILES {
+            let path = root.join(file);
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let prod = match source.find("\nmod tests {") {
+                Some(idx) => &source[..idx],
+                None => source.as_str(),
+            };
+            let mut from = 0;
+            while let Some(rel) = prod[from..].find("RpcError::new(") {
+                let start = from + rel;
+                // Walk to the matching close paren of `new(`.
+                let mut depth = 0usize;
+                let mut end = prod.len();
+                for (i, ch) in prod[start..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = start + i + 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let after = prod[end..].trim_start();
+                if !after.starts_with(".with_code(") {
+                    let line = prod[..start].matches('\n').count() + 1;
+                    uncoded.push(format!("{file}:{line}"));
+                }
+                from = start + "RpcError::new(".len();
+            }
+        }
+        assert!(
+            uncoded.is_empty(),
+            "C2: uncoded RpcError sites — every gateway error must carry a §D.7 stable code via `.with_code(...)`: {uncoded:?}"
+        );
     }
 }

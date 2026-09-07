@@ -121,7 +121,7 @@ enum StreamEndReason { Closed, Cancelled, Resync, Failure { code: String, messag
 - 策略表：`StreamItem(Snapshot|Projections)` 与 `StreamEnd` → 永不 Drop；`Entry` → 有界（4096，单源常量 `ENTRY_BACKPRESSURE_CAPACITY`）满即发 `StreamEnd{Resync}`；控制帧（Request/Response/Reply/Host）→ 阻塞不丢。
 - 载体分界（C6 决断，round-10 死锁教训）：**网络载体**（WS，有界 1024）执行上表——有界、阻塞、满即 Resync；**进程内载体**（GPUI/napi 的 in-proc pair）按设计无界：两端同进程，有界对在双向同时填满时只会让双方 park 在 `send_blocking` 上互等而死锁（round-10 的 GPUI 主线程冻结即此），L5 的有界-重同步语义只适用网络载体，慢客户端在进程内的代价是内存而非丢帧；任何发送方不得在 GPUI 主线程上同步阻塞。ModelChat 侧流 note（modelText/modelThinking）为 §B L6 域旁路，明文声明为可损（Drop 类保留）。
 - 服务端广播纪律（GW4）：`broadcast_host`/`note_to_client` 一律锁内 clone 连接列表、锁外发送——单个停滞的网络客户端不得持 `clients` 锁冻结全网关（克隆后发送，照 `route_note` 范本）。
-- `RpcError{code, message}`，code 集：`session/not-found, session/busy, gateway/bad-request, gateway/internal, resync-required, model/unresolvable, feature/unavailable, protocol/unsupported-epoch`（C1：epoch ∉ {0, PROTOCOL_EPOCH}）（GW7 增补：协议已声明但尚未实现的能力臂以此作答，客户端可区分「功能未建」与一般失败；Terminal 死桩为首个使用者）。
+- `RpcError{code, message}`，code 集：`session/not-found, session/busy, gateway/bad-request, gateway/internal, resync-required, model/unresolvable, feature/unavailable, protocol/unsupported-epoch`（C1：epoch ∉ {0, PROTOCOL_EPOCH}）（GW7 增补：协议已声明但尚未实现的能力臂以此作答，客户端可区分「功能未建」与一般失败；Terminal 死桩为首个使用者）。**C2 错误码纪律**：离开网关的每个 `RpcError` 都携稳定码（生产区零无码——结构门禁 `every_production_rpc_error_carries_a_stable_code` 扫描构造点，构造必须立即链 `.with_code`）；成功载荷的类型化 RpcOutcome 为 Wave 2 项（波及全客户端 Response 消费面，与 C4 wire 工作同批）。
 
 ### D.8 TS 侧
 ts-rs 绑定再生成；帧层手写 exact-key 守卫（dsh stream-protocol.ts:270-291 同款）；cargo 测试导出真实帧 JSON fixture（`crates/manox-protocol/fixtures/`）→ vitest 断言守卫解析（双路径一致性的 TS 侧，M0 围栏）。
