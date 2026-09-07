@@ -344,7 +344,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 **客户端前置（note 臂删除前必须完成）**：
 - 桌面：`SessionCreated/Disposed/Error` 权威迁移——U2 `apply_host` 现仅对账这三类（v1 note 路径权威，has_follow 守卫钉住 follow 单开）→ C4a 先反转权威再删 note 臂。
 - 桌面：`model_cascade` provider_glue 直读 → ModelInfo 扩展（跨域#4）；`refresh_thread_list` 7 处+store 事件桥 → 服务端 rescan 自持（跨域#5）；ThreadRowMeta 装饰推送 → ThreadListItem 扩列+known_projects 通道（跨域#1）。
-- webui：T7 已迁 v2-first——删臂前确认无 v1 note 消费残余。
+- webui：T7 v2-first✓；**消费残余已审计定界**（`apps/web/webui/src/sidebar/webview/state/store.ts`）：`notification` 路由 1 处（~325）+ `onServerNote` 纯 v1 臂 7 个——注册表 4 臂（models/commands/threadsUpdated/ready，~893-902，Host 直折已覆盖）+ 裁决 note 3 臂（approve/askUserQuestion/planVerdict，~917-939，Request 路径已覆盖，GW1 双发幂等折叠）；sessionCreated/sessionDisposed/error 3 臂被 Host 转换器内部复用（规范化入口，非 wire 残余）。C4b 删臂 = 删路由+7 臂，零行为变化（各臂的 Host/Request 等价路径已逐一核对存在）。
 - napi：适配面同步（vscode 徽章已列 follow-up）。
 
 **顺序**：C4a 桌面权威迁移+compat 退休（依赖 U1-flush/GW8 与跨域#1/#4/#5）→ C4b 协议删除批（单 commit：类型+宏表+穷举 match+ts-rs 再生+fixtures；J1 三面门禁对死面残留自动红）→ C4c §J.6「零残留」声明真实化收尾。
