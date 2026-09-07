@@ -794,7 +794,12 @@ impl AgentServerInner {
                 .map(|t| ThreadListItem {
                     id: t.id.clone(),
                     title: t.display_title().to_string(),
-                    updated_at: t.updated_at as i32,
+                    // U2-cross-domain #3: the wire column is documented as
+                    // the LAST INTERACTION — interacted_at advances on real
+                    // activity only, while updated_at advances on every
+                    // metadata save and would float stale threads in the
+                    // clients' recency ordering.
+                    updated_at: t.interacted_at as i32,
                     running: s.is_running(&t.id),
                     // GW5: unread is client-owned — the server keeps no
                     // focus mirror, so the deprecated list field is always
@@ -9321,6 +9326,57 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_file(&plan_file);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U2-cross-domain #3: the wire ThreadListItem.updated_at column is
+    /// documented as the last INTERACTION — the mapping must take the
+    /// summary's interacted_at (real activity only), not updated_at
+    /// (every metadata save advances it, floating stale threads in the
+    /// clients' recency ordering — the pre-migration sidebar sorted by
+    /// interacted_at).
+    #[test]
+    fn list_threads_maps_the_wire_recency_column_from_interacted_at() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_with_times_for_test("t-old", None, 500, 9000);
+            s.insert_summary_with_times_for_test("t-new", None, 800, 850);
+        });
+        client.send(FromClient::Request {
+            id: MsgId::new("list"),
+            call: ClientCall::ListThreads,
+        });
+        let items = loop {
+            match client.recv() {
+                FromServer::Response {
+                    id,
+                    outcome: Ok(payload),
+                } if id.0 == "list" => {
+                    break serde_json::from_value::<Vec<manox_protocol::ThreadListItem>>(payload)
+                        .unwrap();
+                }
+                FromServer::Response {
+                    id,
+                    outcome: Err(e),
+                } if id.0 == "list" => panic!("ListThreads failed: {e:?}"),
+                _ => {}
+            }
+        };
+        let old = items.iter().find(|i| i.id == "t-old").expect("t-old listed");
+        let new = items.iter().find(|i| i.id == "t-new").expect("t-new listed");
+        assert_eq!(
+            old.updated_at, 500,
+            "the wire recency column is interacted_at, not the metadata updated_at (9000)"
+        );
+        assert_eq!(
+            new.updated_at, 800,
+            "the wire recency column is interacted_at, not updated_at (850)"
+        );
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();

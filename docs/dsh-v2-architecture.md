@@ -314,7 +314,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | harness:冷读全文件解析(长链尾屏代价)——请求有界尾部读 API(`journal_tail`) | 优化 | K8 |
 | U2-跨域#1:wire `ThreadListItem` 缺 project/tag/approval_mode 列,`known_projects` 无 wire 通道——sidebar 装饰靠 workspace 进程内推送(双轨债,sidebar 已被门禁钉 0) | 协议扩列+快照携项目注册表(或新 HostEvent) | C4/Wave 2 |
 | U2-跨域#2:§D.5「Models(provider reload 即推)」未实现——唯一发射点=ListModels 请求方定向镜像(桌面已用空快照有界重试 10×500ms+开菜单重拉缓解) | provider 注册/reload 落定后 broadcast Models | Wave 2 |
-| U2-跨域#3:`ThreadListItem.updated_at` 映射 `t.updated_at`(每保存即进)而文档语义="last interaction"——recency 排序细微差 | 改映射 `interacted_at` 或增列 | Wave 2(小改) |
 | U2-跨域#4:wire `ModelInfo` 缺 config_id+metadata.agents——`views/model_cascade.rs`(外部 CLI 启动级联,发 raw cx config key)无法迁移,保留 provider_glue 直读(未入门禁针面) | ModelInfo 扩展 | Wave 2 |
 | U2-跨域#5:服务端 rescan 自持缺失——桌面 `refresh_thread_list()` 7 处仍为进程内 rescan 触发器+store 事件桥(双轨) | 服务端在生命周期边界/ListThreads 内自持 rescan,桌面退休桥 | Wave 2 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |

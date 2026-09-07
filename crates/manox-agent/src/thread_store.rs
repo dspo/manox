@@ -496,6 +496,24 @@ impl ThreadStore {
         });
     }
 
+    /// Like `insert_summary_for_test`, with explicit recency columns —
+    /// interacted_at (advanced by real activity only) and updated_at
+    /// (advanced by every metadata save) diverge in production, and
+    /// consumers pin the wire mapping between them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_summary_with_times_for_test(
+        &mut self,
+        id: &str,
+        parent: Option<&str>,
+        interacted_at: i64,
+        updated_at: i64,
+    ) {
+        self.insert_summary_for_test(id, parent);
+        let summary = self.summaries.last_mut().expect("just inserted");
+        summary.interacted_at = interacted_at;
+        summary.updated_at = updated_at;
+    }
+
     /// Archive (or unarchive) a session. The row moves between the active
     /// and archived partitions immediately; the post-write refresh in
     /// `write_meta` re-syncs both partitions from disk. Archiving cascades
