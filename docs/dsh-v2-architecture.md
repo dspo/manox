@@ -294,3 +294,27 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | GW3 | 裁决投递无 delivery_id、不可取消 | `adjudication_requests_carry_stable_delivery_id`、`cancel_delivery_converges_pending_adjudication`(session-core) |
 | GW6 | 冷读缺位 → 无 engine 会话 PageHistory 30s 挂起 | `page_history_cold_reads_disk_for_opened_session_without_engine`、`page_history_reads_disk_without_live_session`、`page_history_unknown_session_still_answers_not_found`、`concurrent_create_and_open_same_cold_id_singleflight`(session-core) |
 | 测试隔离 | 触达 plugin_hooks::fire 的测试单独跑 panic(runtime 未初始化) | `mid_run_append_ui_note_mirrors_now_and_parks_persist`(agent;自持 runtime::init) |
+
+
+### K.7.2 余债账本(整改波内的认可债务,单一事实源;清偿归 Wave 2/C4)
+
+| 债务 | 现状 | 归属 |
+| --- | --- | --- |
+| U3b:泵 Error 臂不 `mark_idle`(前台/parked 错误臂的桌面镜像写因此保留) | 服务端一行修 | Wave 2 |
+| U3b:裁决时刻服务端不清 pending 旗(approve 路径 pending_plan、verdict 后 pending_auth 靠桌面启发式清零) | 服务端小修 + 删桌面启发式 | Wave 2 |
+| U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
+| U1-flush:parked follow-up 直写 facade(insert_user_message+run_turn 绕过网关 Submit) | 改道网关 Submit(服务端队列/drain/K5 持久已就绪) | Wave 2 |
+| U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
+| GW3-client:三端裁决卡存 deliveryId + dismiss/dispose 时发 cancelDelivery(webui 无触发面,桌面有) | 桌面+webui 单批 | Wave 2 |
+| vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
+| harness:冷读全文件解析(长链尾屏代价)——请求有界尾部读 API(`journal_tail`) | 优化 | K8 |
+| GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
+| K4 对称性:persist_ui_note 静默丢、middleware message-append 无有界重试 | 对称化 | Wave 2 |
+| K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
+| C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
+| J1:真实组合发射覆盖门禁(37 条目 × 8 HostEvent × 帧/调用面在真实网关发过) | 复用 K1 全类型会话设施 | J1 |
+| U7b:Q 面 visibility 门控(rail 可见性状态归属) | U9 拆分后做 | U9 |
+| U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
+| C5:字段漂移(信封折叠/CwdChange 形状/D.3 文本) | — | C5 |
+| K6:跨面定序契约测试(serializer 后残余:tap 滞后粒度) | — | K6 |
+| K9:ui_note 决断、死 schema 删除、cursor 语义注 | — | K9 |
