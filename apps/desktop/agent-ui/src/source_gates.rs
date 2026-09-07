@@ -11,7 +11,10 @@
 //!   gateway (`ClientCall::Submit` etc.); rendering state comes from the
 //!   client store, not a locally driven kernel facade.
 //! - store reads (`thread_store::global()` / `thread_store_global()`) — U2:
-//!   lists and summaries come from `ListThreads` + host events.
+//!   lists and summaries come from `ListThreads` + host events. Landed for
+//!   the list/registry surface (the sidebar reads the multiplexer's wire
+//!   rows; its budget is 0); the workspace residue is itemized in the
+//!   budget table below.
 //! - protocol sends outside the gateway client — U9 layering: views talk to
 //!   the multiplexer, never to the wire directly.
 //!
@@ -56,7 +59,16 @@ mod tests {
             // user-action writes awaiting gateway calls (U3b).
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 18),
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 8),
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 30),
+            // U2: the list/registry reads are retired — the sidebar renders
+            // the multiplexer's wire rows and the chip menu reads the pushed
+            // decoration cache. The residual 21 are sanctioned debt: the 16
+            // write-site acquisitions above (U3b), the attach-surface thread
+            // load (U6), the three right-pane threads.db persistence reads
+            // (desktop-local UI state), and the one dual-track bridge
+            // acquisition whose rescan pump pushes the decoration columns the
+            // wire list does not carry yet and re-pulls the list through the
+            // gateway.
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 21),
             ("workspace.rs", "protocol sends (U9)", SENDS, 18),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
@@ -65,7 +77,10 @@ mod tests {
             // sanctioned wire surface and stay unbudgeted here, but they
             // must never spread to other files (checked below).
             ("slash_command.rs", "protocol sends (controller)", SENDS, 9),
-            ("views/sidebar.rs", "store reads (U2)", STORE_GLOBAL, 1),
+            // U2: retired — the sidebar's rows come from the multiplexer's
+            // wire list and its decoration from the workspace push; the
+            // store acquisition and event pump are gone.
+            ("views/sidebar.rs", "store reads (U2)", STORE_GLOBAL, 0),
         ];
         for (file, family, needles, max) in budget {
             let got = prod_count(&src, file, needles);
@@ -90,7 +105,6 @@ mod tests {
             "workspace.rs",
             "multiplexer.rs",
             "slash_command.rs",
-            "views/sidebar.rs",
             "source_gates.rs",
             // The gateway client half legitimately constructs wire frames.
             "client_store_handle.rs",

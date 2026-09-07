@@ -118,7 +118,7 @@ enum StreamEndReason { Closed, Cancelled, Resync, Failure { code: String, messag
 ### D.6 死亡清单（迁移完成后删除）
 `ServerNote::{AgentText, AgentThinking, ToolCall, ToolResult, ToolOutput, TurnStarted, TurnFinished, Stop, Retry, Compaction*, Subagent*, ModelText/Thinking/ToolCall/ModelChatDone, ThreadInfo, ThreadHistory, ThreadsUpdated, Models, Commands, Usage, UsageSnapshot, TokenUsage, CurrentModel, PlanReady?, PlanUpdated, PlanModeChanged, GoalChanged, CwdChanged, PermissionModeChanged, ReasoningEffortChanged, BrowserSuitesChanged, BackgroundTaskUpdated, SteerPending/Injected, ApprovalDecision, Branch, GitStats, HistoryProgress, PeerMessage?, CacheInvalidation, Error}`——分别由 Entry 条目 / 投影 / HostEvent / Snapshot 边界取代。`translate.rs` 的镜像臂全灭，ServerCall 生成臂保留迁入新泵。
 
-**as-built（arch 审计修订）**：拆除实际删 37 留 11（保留集＝owner 控制 `ready/sessionCreated/sessionDisposed`、过渡列表通道 `threadsUpdated/models/commands`、服务端 `error`、ModelChat 侧流 ×4——以 surface.rs 的 `SERVER_NOTES` 宏生成清单为准）。§J.6 的「零残留」声明不实：另有 compat `ClientNote::{CreateSession,Submit,Steer}`（桌面 landing 创建主路径即 compat CreateSession）与错误桩 `ClientCall::{GetUsage,GetCurrentModel,ThreadInfo}` 存活。C4 关闭双协议窗口时经 surface 宏清单一次删除（穷举 tag match 使表/样本/类型同步收敛，编译期门禁）。GW1 已落地：8 个 HostEvent 变体全部有生产发射点（与 v1 note 同受众双发），客户端迁移（桌面 multiplexer 现丢弃非 SessionStatus Host 帧、webui store 折叠 Host 镜像）与 C4 删臂为后续项。
+**as-built（arch 审计修订）**：拆除实际删 37 留 11（保留集＝owner 控制 `ready/sessionCreated/sessionDisposed`、过渡列表通道 `threadsUpdated/models/commands`、服务端 `error`、ModelChat 侧流 ×4——以 surface.rs 的 `SERVER_NOTES` 宏生成清单为准）。§J.6 的「零残留」声明不实：另有 compat `ClientNote::{CreateSession,Submit,Steer}`（桌面 landing 创建主路径即 compat CreateSession）与错误桩 `ClientCall::{GetUsage,GetCurrentModel,ThreadInfo}` 存活。C4 关闭双协议窗口时经 surface 宏清单一次删除（穷举 tag match 使表/样本/类型同步收敛，编译期门禁）。GW1 已落地：8 个 HostEvent 变体全部有生产发射点（与 v1 note 同受众双发）。客户端迁移：webui store 折叠 Host 镜像✓；**桌面 U2 已落地**——multiplexer `apply_host` 全量镜像（Ready{epoch} 校验 PROTOCOL_EPOCH+触发 ListThreads/ListModels/ListCommands 首拉、Models/Commands/ThreadsUpdated 替换、SessionStatus 按 §D.5 客户端单调规则逐条对齐 webui、SessionCreated/Disposed/Error 仅对账——v1 note 路径保持权威，follow 只开一次有守卫钉住），sidebar/列表面零内核读✓；C4 删臂为后续项。
 
 ### D.7 背压与错误
 - 策略表：`StreamItem(Snapshot|Projections)` 与 `StreamEnd` → 永不 Drop；`Entry` → 有界（4096，单源常量 `ENTRY_BACKPRESSURE_CAPACITY`）满即发 `StreamEnd{Resync}`；控制帧（Request/Response/Reply/Host）→ 阻塞不丢。
@@ -312,6 +312,11 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | GW3-client:三端裁决卡存 deliveryId + dismiss/dispose 时发 cancelDelivery(webui 无触发面,桌面有) | 桌面+webui 单批 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
 | harness:冷读全文件解析(长链尾屏代价)——请求有界尾部读 API(`journal_tail`) | 优化 | K8 |
+| U2-跨域#1:wire `ThreadListItem` 缺 project/tag/approval_mode 列,`known_projects` 无 wire 通道——sidebar 装饰靠 workspace 进程内推送(双轨债,sidebar 已被门禁钉 0) | 协议扩列+快照携项目注册表(或新 HostEvent) | C4/Wave 2 |
+| U2-跨域#2:§D.5「Models(provider reload 即推)」未实现——唯一发射点=ListModels 请求方定向镜像(桌面已用空快照有界重试 10×500ms+开菜单重拉缓解) | provider 注册/reload 落定后 broadcast Models | Wave 2 |
+| U2-跨域#3:`ThreadListItem.updated_at` 映射 `t.updated_at`(每保存即进)而文档语义="last interaction"——recency 排序细微差 | 改映射 `interacted_at` 或增列 | Wave 2(小改) |
+| U2-跨域#4:wire `ModelInfo` 缺 config_id+metadata.agents——`views/model_cascade.rs`(外部 CLI 启动级联,发 raw cx config key)无法迁移,保留 provider_glue 直读(未入门禁针面) | ModelInfo 扩展 | Wave 2 |
+| U2-跨域#5:服务端 rescan 自持缺失——桌面 `refresh_thread_list()` 7 处仍为进程内 rescan 触发器+store 事件桥(双轨) | 服务端在生命周期边界/ListThreads 内自持 rescan,桌面退休桥 | Wave 2 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |

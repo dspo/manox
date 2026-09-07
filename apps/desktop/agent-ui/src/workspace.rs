@@ -78,7 +78,7 @@ use crate::views::composer_menu::{
 use crate::views::message::MessageItem;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
-use crate::views::sidebar::{Sidebar, SidebarEvent};
+use crate::views::sidebar::{Sidebar, SidebarEvent, ThreadRowMeta};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
@@ -346,6 +346,26 @@ pub struct Workspace {
     /// result back via `async_channel`, the same bridge the worktree tool uses.
     git_status_gen: u64,
     pub(crate) sidebar: Entity<Sidebar>,
+    /// The in-process thread store handle (U2 dual-track residue). The list
+    /// itself lives on the multiplexer (the gateway client); this handle
+    /// serves the surfaces the wire does not carry yet:
+    /// - the rescan-event pump that pushes the sidebar's decoration columns
+    ///   (project/tag/approval wash) and re-pulls the list through the
+    ///   gateway,
+    /// - `open_thread`'s kernel thread-handle load (U6/attach surface).
+    ///
+    /// The right-pane `threads.db` persistence keeps its own ad-hoc reads
+    /// (desktop-local UI state; a migration item of its own).
+    thread_store: manox_agent::thread_store::StoreHandle,
+    /// Distinct bound-project paths of the active summaries, in list order
+    /// (the project chip's "recent, unregistered" section; U2 push cache).
+    thread_projects: Vec<String>,
+    /// Registered project folders (chip menu + the sidebar grouping push).
+    known_projects: Vec<String>,
+    _store_pump: gpui::Task<()>,
+    /// Repaint observer on the multiplexer's list/registry state (U2): its
+    /// notify drives the sidebar rows and the workspace's model surfaces.
+    _mux_lists: gpui::Subscription,
     pub(crate) conversation: Entity<ConversationState>,
     pub(crate) input_state: Entity<InputState>,
     /// Per-thread unsent composer text, keyed by thread id. Saved when
@@ -819,9 +839,31 @@ impl Workspace {
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
-        // GW5 badge source: rows read the leaves' client-owned unread
-        // mirrors through the multiplexer.
+        // U2 list source + GW5 badge source: rows are the multiplexer's wire
+        // list, and badges prefer the leaves' client-owned unread mirrors.
         sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
+        // U2 dual-track bridge: the in-process store stays the rescan source
+        // the server's snapshot reads, so its event channel drives (a) the
+        // sidebar decoration push (the columns the wire list does not carry
+        // yet) and (b) the gateway list refetch. When the server owns the
+        // rescan itself, this bridge retires (cross-domain ask).
+        let thread_store = manox_agent::thread_store_global();
+        let (thread_meta, thread_projects, known_projects) = read_thread_decor(&thread_store);
+        sidebar.update(cx, |s, cx| {
+            s.set_thread_meta(thread_meta, known_projects.clone(), cx)
+        });
+        let store_rx = thread_store.subscribe();
+        let _store_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+            while let Ok(_ev) = store_rx.recv().await {
+                let _ = this.update(cx, |ws, cx| ws.on_thread_store_changed(cx));
+            }
+        });
+        // The multiplexer's notify (its list/registry state changed)
+        // repaints the sidebar rows and the workspace's model surfaces.
+        let _mux_lists = cx.observe(&multiplexer, |this, _, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        });
         let recipient = thread.read(|t| t.self_author());
         let conversation = cx.new(|_| ConversationState::new(recipient));
         let context_rail = {
@@ -842,6 +884,11 @@ impl Workspace {
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
+            thread_store,
+            thread_projects,
+            known_projects,
+            _store_pump,
+            _mux_lists,
             conversation: conversation.clone(),
             input_state,
             drafts: HashMap::new(),
@@ -3399,7 +3446,8 @@ impl Workspace {
             None => None,
             Some(det) => {
                 let items = if det.trigger == '/' {
-                    slash_source(&det.query)
+                    // U2: the popover lists the gateway's command snapshot.
+                    slash_source(&det.query, self.multiplexer.read(cx).commands())
                 } else {
                     mention_source(&det.query)
                 };
@@ -4400,11 +4448,26 @@ impl Workspace {
             self.attach_thread(bg.entity, true, window, cx);
             return;
         }
-        let store = self.sidebar.read(cx).store();
-        let Some(loaded) = store.with_mut(|s| s.load_thread(&id)) else {
+        // U6/attach surface: the kernel thread-handle load stays a store
+        // read until the attach path migrates (the LIST itself is already
+        // gateway-owned — the row this click came from is a wire item).
+        let Some(loaded) = self.thread_store.with_mut(|s| s.load_thread(&id)) else {
             return;
         };
         self.attach_thread(loaded, true, window, cx);
+    }
+
+    /// One in-process store-change tick (U2 dual-track bridge): push the
+    /// fresh decoration columns to the sidebar and re-pull the authoritative
+    /// list through the gateway. The list itself is never read off the store
+    /// — the multiplexer's wire rows are the sidebar's source.
+    fn on_thread_store_changed(&mut self, cx: &mut Context<Self>) {
+        let (meta, projects, known) = read_thread_decor(&self.thread_store);
+        self.thread_projects = projects;
+        self.known_projects = known.clone();
+        self.sidebar
+            .update(cx, |s, cx| s.set_thread_meta(meta, known, cx));
+        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4601,13 +4664,14 @@ impl Workspace {
         self.sync_list_count(cx);
         // Re-engage tail-follow so the streaming reply stays in view.
         self.follow_message_tail();
+        // U2: the registry hit check reads the gateway's command snapshot —
+        // the server projects the same command/skill registries the macro
+        // and skill adapters dispatch against, so a remote server's
+        // registry decides the hit.
+        let commands = self.multiplexer.read(cx).commands().clone();
         let hit = match kind {
-            RegistryTurnKind::Command => {
-                manox_agent::command::try_global().is_some_and(|r| r.get(key).is_some())
-            }
-            RegistryTurnKind::Skill => {
-                manox_agent::skill::try_global().is_some_and(|r| r.get(key).is_some())
-            }
+            RegistryTurnKind::Command => wire_commands_has(&commands, key, "command"),
+            RegistryTurnKind::Skill => wire_commands_has(&commands, key, "skill"),
         };
         if hit {
             let submit_text = format!("/{key} {args}");
@@ -6436,10 +6500,13 @@ impl Workspace {
         })
     }
 
-    /// Exact registration match of a canonical model identity — display
-    /// metadata (name, wire api) resolves against the live registry at render
-    /// time; a stale id resolves to `None` and the caller renders the raw
-    /// identity, never a fuzzy look-alike.
+    /// Exact registration match of a canonical model identity against the
+    /// kernel provider registry, returning the kernel `Model`. U2 retired
+    /// this from the DISPLAY surfaces (the chip and the menu resolve against
+    /// the gateway's wire snapshot — [`Self::resolve_model_display`]); what
+    /// remains is the `ExecuteFresh` facade seeding, which constructs a
+    /// kernel `Thread` and needs a kernel `Model` (U6/attach surface). A
+    /// stale id resolves to `None`, never a fuzzy look-alike.
     pub(crate) fn resolve_model_identity(
         provider: &str,
         id: &str,
@@ -6461,8 +6528,37 @@ impl Workspace {
             .find(|m| m.provider == provider && m.id == id)
     }
 
-    /// The pi-harness model selector. Reads the shared pi provider registry
-    /// (the streaming source of truth): closed, a ghost button showing
+    /// Exact registration match of a canonical model identity against the
+    /// gateway's model-registry snapshot (U2 display resolution): the chip
+    /// and the picker menu read the wire `ModelInfo` the server projects, so
+    /// a remote server's registry drives the desktop display. A stale id
+    /// resolves to `None` and the caller renders the raw identity, never a
+    /// fuzzy look-alike.
+    pub(crate) fn resolve_model_display(
+        &self,
+        provider: &str,
+        id: &str,
+        cx: &App,
+    ) -> Option<manox_protocol::ModelInfo> {
+        Self::resolve_model_display_in(self.multiplexer.read(cx).models(), provider, id)
+    }
+
+    /// The pure core of [`Self::resolve_model_display`] against an explicit
+    /// wire snapshot.
+    pub(crate) fn resolve_model_display_in(
+        models: &[manox_protocol::ModelInfo],
+        provider: &str,
+        id: &str,
+    ) -> Option<manox_protocol::ModelInfo> {
+        models
+            .iter()
+            .find(|m| m.provider == provider && m.id == id)
+            .cloned()
+    }
+
+    /// The pi-harness model selector. Reads the gateway's model-registry
+    /// snapshot (U2 — the server projects the pi registry the streaming side
+    /// resolves against): closed, a ghost button showing
     /// `provider · model · effort` with the model name tinted by wire api;
     /// open, a PopupMenu of provider submenus.
     fn render_model_selector_pi(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -6470,7 +6566,7 @@ impl Workspace {
         let model_identity = self.foreground_model_identity(cx);
         let model = model_identity
             .as_ref()
-            .and_then(|(provider, id)| Self::resolve_model_identity(provider, id));
+            .and_then(|(provider, id)| self.resolve_model_display(provider, id, cx));
         let effort = self
             .store
             .as_ref()
@@ -6498,13 +6594,17 @@ impl Workspace {
                     gpui::div()
                         .text_xs()
                         .text_color(theme.foreground)
-                        .child(manox_agent::provider_glue::display_provider_name(m))
+                        .child(
+                            m.provider_name
+                                .clone()
+                                .unwrap_or_else(|| m.provider.clone()),
+                        )
                         .into_any_element(),
                     dot().into_any_element(),
                     gpui::div()
                         .text_xs()
                         .text_color(model_color)
-                        .child(manox_agent::provider_glue::display_name(m))
+                        .child(m.name.clone())
                         .into_any_element(),
                     dot().into_any_element(),
                     gpui::div()
@@ -6514,9 +6614,10 @@ impl Workspace {
                         .into_any_element(),
                 ]
             } else if let Some((ref provider, ref id)) = model_identity {
-                // The journal identity no longer resolves against the live
-                // registry (provider/model deregistered) — render it raw so
-                // the chip still tells the truth instead of "no model".
+                // The journal identity no longer resolves against the
+                // gateway's model snapshot (provider/model deregistered) —
+                // render it raw so the chip still tells the truth instead
+                // of "no model".
                 vec![
                     gpui::div()
                         .text_xs()
@@ -6575,8 +6676,23 @@ impl Workspace {
                         .map(|s| s.read(cx).store.reasoning_effort)
                         .expect("foreground store present");
                     let workspace = cx.entity().downgrade();
+                    // U2: the menu lists the gateway's model-registry
+                    // snapshot (the server projects the same pi registry the
+                    // streaming side resolves against). The open also
+                    // re-pulls, so a settings-side provider reload (no
+                    // server push yet — §D.5 cross-domain ask) converges by
+                    // the next open at the latest.
+                    this.multiplexer.update(cx, |m, _| m.fetch_models());
+                    let models = this.multiplexer.read(cx).models().to_vec();
                     let menu = PopupMenu::build(window, cx, |menu, window, cx| {
-                        Self::build_model_popup_menu_pi(menu, workspace, current_effort, window, cx)
+                        Self::build_model_popup_menu_pi(
+                            menu,
+                            workspace,
+                            models,
+                            current_effort,
+                            window,
+                            cx,
+                        )
                     });
                     let sub = cx.subscribe(
                         &menu,
@@ -6624,31 +6740,35 @@ impl Workspace {
     }
 
     /// Model menu for the pi harness: grouped by provider display name;
-    /// each row shows a wire-api Tag and selects through the registry.
-    /// A config model registered through several wire apis appears once per
-    /// wire endpoint (exact duplicates collapse), so the responses and
-    /// completions variants stay selectable alongside the anthropic one.
+    /// each row shows a wire-api Tag and selects through the gateway. U2:
+    /// the rows are the server's wire `ModelInfo` snapshot (already deduped
+    /// per registration at the source); a config model registered through
+    /// several wire apis appears once per wire endpoint (registration names
+    /// differ), so the responses and completions variants stay selectable
+    /// alongside the anthropic one.
     fn build_model_popup_menu_pi(
         menu: PopupMenu,
         workspace: WeakEntity<Workspace>,
+        models: Vec<manox_protocol::ModelInfo>,
         current_effort: manox_agent::language_model::ReasoningEffort,
         window: &mut Window,
         cx: &mut Context<PopupMenu>,
     ) -> PopupMenu {
-        // Group by DISPLAY name via lookup (not adjacency): models() is
+        // Group by DISPLAY name via lookup (not adjacency): the snapshot is
         // sorted by registration name, so same-display-name providers with
         // different registrations must still merge into one submenu.
-        let mut providers: Vec<(String, Vec<manox_harness::types::Model>)> = Vec::new();
+        let mut providers: Vec<(String, Vec<manox_protocol::ModelInfo>)> = Vec::new();
         let mut seen: HashSet<(String, String)> = HashSet::new();
-        for m in manox_agent::provider_glue::global().models() {
-            let prov = manox_agent::provider_glue::display_provider_name(&m);
-            // Identity is the registration name (unique per wire endpoint), so
-            // wire variants of one provider stay separate; only exact
-            // duplicates collapse.
-            if !seen.insert((
-                m.provider.clone(),
-                manox_agent::provider_glue::config_id(&m),
-            )) {
+        for m in models {
+            let prov = m
+                .provider_name
+                .clone()
+                .unwrap_or_else(|| m.provider.clone());
+            // Identity is the registration name (unique per wire endpoint),
+            // so wire variants of one provider stay separate; only exact
+            // duplicates collapse (the server already dedupes — this is the
+            // defensive client-side parity).
+            if !seen.insert((m.provider.clone(), m.id.clone())) {
                 continue;
             }
             match providers.iter_mut().find(|(name, _)| *name == prov) {
@@ -6666,7 +6786,7 @@ impl Workspace {
                 let mut submenu = submenu;
                 for m in &models {
                     let model = m.clone();
-                    let model_name = manox_agent::provider_glue::display_name(&model);
+                    let model_name = model.name.clone();
                     let (variant, label) = Self::pi_wire_tag_variant(&model.api);
                     let ws = ws.clone();
                     submenu = submenu.item(
@@ -8092,6 +8212,11 @@ impl Workspace {
                 let theme = cx.theme().clone();
                 let ws_blank = ws.clone();
                 let ws_folder = ws.clone();
+                // U2: the chip's recency source is the pushed decoration
+                // cache (the same snapshot the sidebar groups by), never a
+                // kernel store read.
+                let known = this.known_projects.clone();
+                let bound = this.thread_projects.clone();
 
                 let menu = PopupMenu::build(window, cx, move |menu, _window, _cx| {
                     let mut menu = menu.max_w(gpui::px(320.)).scrollable(true);
@@ -8099,30 +8224,27 @@ impl Workspace {
 
                     // Recent projects: registered folders first (newest
                     // first), then session cwds not yet registered.
-                    let store = manox_agent::thread_store_global();
                     let mut recent_projects: Vec<String> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
-                    store.read(|store| {
-                        for path in store.known_projects().iter().rev() {
-                            if seen.insert(path.clone()) {
-                                recent_projects.push(path.clone());
+                    for path in known.iter().rev() {
+                        if seen.insert(path.clone()) {
+                            recent_projects.push(path.clone());
+                        }
+                        if recent_projects.len() >= 20 {
+                            break;
+                        }
+                    }
+                    if recent_projects.len() < 20 {
+                        for path in &bound {
+                            if path.is_empty() || !seen.insert(path.clone()) {
+                                continue;
                             }
+                            recent_projects.push(path.clone());
                             if recent_projects.len() >= 20 {
                                 break;
                             }
                         }
-                        if recent_projects.len() < 20 {
-                            for sum in store.summaries() {
-                                if sum.project.is_empty() || !seen.insert(sum.project.clone()) {
-                                    continue;
-                                }
-                                recent_projects.push(sum.project.clone());
-                                if recent_projects.len() >= 20 {
-                                    break;
-                                }
-                            }
-                        }
-                    });
+                    }
 
                     let ws_recent = ws.clone();
                     let theme_recent = theme.clone();
@@ -9989,6 +10111,66 @@ fn truncate_follow_up(s: &str) -> String {
     t
 }
 
+/// Whether the gateway's command snapshot (§D.5 `Commands` / `ListCommands`)
+/// registers `name` under `kind` (`"command"` for macros, `"skill"` for
+/// skills). U2: the slash-dispatch hit check reads the wire projection of the
+/// server's command/skill registries instead of the in-process kernel
+/// registries, so a remote server's registry decides the hit. Builtins share
+/// the `"command"` kind but never reach this check (they dispatch through
+/// their own `SlashCommand::execute`, and the registry adapters skip
+/// builtin-named keys at init).
+fn wire_commands_has(commands: &serde_json::Value, name: &str, kind: &str) -> bool {
+    commands.as_array().is_some_and(|entries| {
+        entries.iter().any(|e| {
+            e.get("name").and_then(|v| v.as_str()) == Some(name)
+                && e.get("kind").and_then(|v| v.as_str()) == Some(kind)
+        })
+    })
+}
+
+/// Read the sidebar decoration columns the wire `ThreadListItem` does not
+/// carry yet (U2 dual-track): per-thread project/tag/approval-mode plus the
+/// registered-project folder list. Returns `(meta by id, distinct active
+/// project paths in list order, known projects)`. The meta map spans both
+/// store partitions (active rows win) so a tag lookup addresses archived
+/// rows too; the project-path list drives the chip's "recent, unregistered"
+/// section. This is the last kernel read feeding the sidebar — the cross-
+/// domain ask is to extend §D.5 `ThreadsUpdated` with these columns so it
+/// retires.
+fn read_thread_decor(
+    store: &manox_agent::thread_store::StoreHandle,
+) -> (HashMap<String, ThreadRowMeta>, Vec<String>, Vec<String>) {
+    store.read(|s| {
+        let mut meta: HashMap<String, ThreadRowMeta> = HashMap::new();
+        // Archived first so an active row with the same id overwrites it.
+        for sum in s.archived_summaries() {
+            meta.insert(
+                sum.id.clone(),
+                ThreadRowMeta {
+                    project: sum.project.clone(),
+                    tag: sum.tag.clone(),
+                    approval_mode: sum.approval_mode,
+                },
+            );
+        }
+        let mut projects: Vec<String> = Vec::new();
+        for sum in s.summaries() {
+            meta.insert(
+                sum.id.clone(),
+                ThreadRowMeta {
+                    project: sum.project.clone(),
+                    tag: sum.tag.clone(),
+                    approval_mode: sum.approval_mode,
+                },
+            );
+            if !sum.project.is_empty() && !projects.contains(&sum.project) {
+                projects.push(sum.project.clone());
+            }
+        }
+        (meta, projects, s.known_projects().to_vec())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     /// Serializes tests that init/replace the process-wide `thread_store`
@@ -10692,6 +10874,135 @@ mod tests {
         assert_eq!(rebound.2, new_id, "foreground thread swapped");
         drop(ws);
         drop(visual);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U2 end-to-end through the real in-process gateway: the C1 handshake
+    /// `Ready` lands on the multiplexer and fires the first list pull (the
+    /// server's command snapshot always carries the built-ins, so a
+    /// non-empty commands array proves the round trip); then an in-process
+    /// store change rides the dual-track bridge — the store event drives the
+    /// workspace pump, which pushes the decoration columns to the sidebar
+    /// and re-pulls `ListThreads`, so the sidebar's rows arrive as the
+    /// server's wire projection instead of a kernel read.
+    #[gpui::test]
+    fn u2_thread_list_flows_through_the_gateway(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path =
+            std::env::temp_dir().join(format!("manox-u2-list-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        // The AgentServer answers across threads (real tokio runtime); see
+        // the sibling test's parking note.
+        cx.background_executor.allow_parking();
+
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // (a) Ready(epoch) + the first pull: the commands snapshot is never
+        // empty (the server always projects the built-in commands).
+        let mut pulled = false;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let (epoch, commands) = ws.read_with(&visual, |ws, cx| {
+                let m = ws.multiplexer.read(cx);
+                (
+                    m.ready_epoch(),
+                    m.commands().as_array().map(|a| a.len()).unwrap_or(0),
+                )
+            });
+            if epoch == Some(manox_protocol::PROTOCOL_EPOCH) && commands > 0 {
+                pulled = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            pulled,
+            "the handshake Ready + first ListCommands pull must land on the multiplexer"
+        );
+
+        // (b) A store change: seed a summary row with a pending-auth badge
+        // and register a project folder. `with_mut` fires SummariesUpdated;
+        // the pump pushes the decoration and re-pulls the list.
+        cx.update(|_cx| {
+            manox_agent::thread_store_global().with_mut(|s| {
+                s.register_project("/p/u2".to_string());
+                s.insert_summary_for_test("t-u2-row", None);
+                s.mark_pending_auth("t-u2-row", true);
+            });
+        });
+        let mut row = None;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let found = ws.read_with(&visual, |ws, cx| {
+                ws.multiplexer
+                    .read(cx)
+                    .thread_list()
+                    .iter()
+                    .find(|r| r.id == "t-u2-row")
+                    .cloned()
+            });
+            if found.is_some() {
+                row = found;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let row = row.expect("the store event must re-pull the list through the gateway");
+        assert!(
+            row.pending_auth,
+            "the wire row carries the server's projection of the store flag"
+        );
+
+        // (c) The decoration push reached both caches: the workspace's chip
+        // menu source and the sidebar's grouping registry (neither reads the
+        // kernel at render time any more).
+        let (ws_known, sb_known, sb_meta) = ws.read_with(&visual, |ws, cx| {
+            let sb = ws.sidebar.read(cx);
+            (
+                ws.known_projects.clone(),
+                sb.known_projects_for_test().to_vec(),
+                sb.thread_meta_for_test("t-u2-row").cloned(),
+            )
+        });
+        assert!(
+            ws_known.iter().any(|p| p == "/p/u2"),
+            "the chip menu's project cache rides the pump push"
+        );
+        assert!(
+            sb_known.iter().any(|p| p == "/p/u2"),
+            "the sidebar's grouping registry rides the pump push"
+        );
+        assert!(
+            sb_meta.is_some(),
+            "every listed row gets its decoration entry"
+        );
+
+        drop(ws);
+        drop(visual);
+        let _ = std::fs::remove_file(&db_path);
         manox_agent::thread_store::drop_global_for_test();
     }
 
