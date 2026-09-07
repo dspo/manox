@@ -304,8 +304,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 | 债务 | 现状 | 归属 |
 | --- | --- | --- |
-| U3b:泵 Error 臂不 `mark_idle`(前台/parked 错误臂的桌面镜像写因此保留) | 服务端一行修 | Wave 2 |
-| U3b:裁决时刻服务端不清 pending 旗(approve 路径 pending_plan、verdict 后 pending_auth 靠桌面启发式清零) | 服务端小修 + 删桌面启发式 | Wave 2 |
+| U3b-桌面侧:workspace 前台泵/parked 启发式/裁决本地清等冗余写删除(服务端清零已落地 1a4d26cc,Error 臂单帧 delta 携全套) | GW3-client 同批(agent-ui)进行中 | Wave 1 |
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
 | U1-flush:parked follow-up 直写 facade(insert_user_message+run_turn 绕过网关 Submit) | 改道网关 Submit(服务端队列/drain/K5 持久已就绪) | Wave 2 |
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
@@ -318,7 +317,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
-| J1:真实组合发射覆盖门禁(37 条目 × 8 HostEvent × 帧/调用面在真实网关发过) | 复用 K1 全类型会话设施 | J1 |
 | U7b:Q 面 visibility 门控(rail 可见性状态归属) | U9 拆分后做 | U9 |
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
 | C5:字段漂移——文档面已对齐（D.3 清单 25 项/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
@@ -327,3 +325,27 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
 | goal 权威在 threads.db（GoalBridge；`goal` 条目已在词汇但未迁移） | — | Wave 2 |
 | Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |
+
+### K.7.3 C4 收口准备清单（prep 盘点，非实施——执行顺序与前置以本表为准）
+
+**协议删除面（L12 破坏性变更，单批收敛）**：
+1. 错误桩 ClientCall 三件：`GetUsage`/`GetCurrentModel`/`ThreadInfo`（§J.6 as-built 注记的存活桩）。
+2. compat ClientNote 三件：`CreateSession`/`Submit`/`Steer`——**前置：桌面 landing/旧写路径先迁移**（Submit→U1-flush/GW8 批；CreateSession landing 与 Steer 的 v2 等价路线在 U1 批内定稿）。
+3. `FocusThread` 变体（GW5 起 handler no-op）。
+4. `ThreadListItem.unread` 弃用列（GW5 起恒 false，两端均已 delta+本地清零）。
+5. T2 死亡清单 `#[deprecated]` 类型（ServerNote 死亡清单=37 减 11 保留集的差集；保留集以 `SERVER_NOTES` 宏清单为单源）。
+6. `UiNote` 内核变体 + `uiNote` wire 标签（K9 决断：无生产发射——回收与否在 C4 定稿）。
+7. `SetModel.id:String` → 类型化 `ModelRef` 字段（C5 wire 收敛）。
+8. plan-verdict 专用条目词汇增补（38+，pending_plan 投影获得折叠源，refine/reject 清理去 sidecar 化）。
+9. vscode：focusThread 死帧+徽章迁移（vscode 域，GPUI 范围外——已记 C4 follow-up）。
+
+**服务端删除面**：GW1 双发的 v1 note 臂全删（8 个 HostEvent 发射点保留 Host 帧；C3 宏表 SERVER_NOTES 37→11 收敛，穷举 tag match 使类型/表/样本同步）。
+
+**客户端前置（note 臂删除前必须完成）**：
+- 桌面：`SessionCreated/Disposed/Error` 权威迁移——U2 `apply_host` 现仅对账这三类（v1 note 路径权威，has_follow 守卫钉住 follow 单开）→ C4a 先反转权威再删 note 臂。
+- 桌面：`model_cascade` provider_glue 直读 → ModelInfo 扩展（跨域#4）；`refresh_thread_list` 7 处+store 事件桥 → 服务端 rescan 自持（跨域#5）；ThreadRowMeta 装饰推送 → ThreadListItem 扩列+known_projects 通道（跨域#1）。
+- webui：T7 已迁 v2-first——删臂前确认无 v1 note 消费残余。
+- napi：适配面同步（vscode 徽章已列 follow-up）。
+
+**顺序**：C4a 桌面权威迁移+compat 退休（依赖 U1-flush/GW8 与跨域#1/#4/#5）→ C4b 协议删除批（单 commit：类型+宏表+穷举 match+ts-rs 再生+fixtures；J1 三面门禁对死面残留自动红）→ C4c §J.6「零残留」声明真实化收尾。
+**门禁证据**：C3 `wire_surface!` 宏单源（表/match/样本同收敛）；J1 host+call+journal 三面门禁；ts-rs exact-key 守卫+fixtures 导出；桌面棘轮针面（source_gates）。
