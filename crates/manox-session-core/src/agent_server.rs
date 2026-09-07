@@ -1052,52 +1052,33 @@ async fn open_session(
     owner: &str,
     session_id: &str,
 ) -> Result<Value, RpcError> {
-    // Idempotent reopen: a live session is re-owned instead of loading a
-    // second copy. T10 (§D.6): no v1 snapshot replay here — the client's
-    // history comes from the §D.1 follow stream's `Snapshot` frame. Use
-    // directed `SessionCreated` (not broadcast) to avoid disturbing owners.
-    //
-    // GW2: the check, the load, and the insert happen under ONE `sessions`
-    // lock hold. Pre-fix the check (`session_thread(..).is_some()`) and the
-    // insert were separated by the unlocked `load_thread` IO, so two
-    // concurrent `OpenSession`s both passed the check, both loaded (the
-    // store's weak upgrade hands out the SAME `ThreadHandle`), and the
-    // second insert spawned a duplicate pump beside the first — the GW2
-    // double-route/auto-deny chain.
+    // Phase 1 (fast path): a live session is re-owned without any IO.
+    if inner.sessions.lock().contains_key(session_id) {
+        return reown_existing(inner, owner, session_id);
+    }
+    // Phase 2 (U8): the journal-file IO runs OUTSIDE the `sessions` lock —
+    // a slow disk must not stall the whole gateway table (pre-fix this ran
+    // under the single hold, recorded as known debt in the GW2 batch).
+    // Concurrent racers load the SAME `ThreadHandle` (the store's weak
+    // upgrade), and only phase 3 decides who inserts.
+    let thread = manox_agent::thread_store::global()
+        .with_mut(|s| s.load_thread(session_id))
+        .ok_or_else(|| RpcError::new(-1, "thread not found"))?;
+    // Phase 3: recheck–spawn–insert under ONE lock hold. The pump is
+    // spawned HERE, not in phase 2, so a race still yields exactly one
+    // entry and one pump: the loser finds the winner's entry and re-owns
+    // it, discarding its own load (the same handle via the weak upgrade —
+    // nothing leaks). GW2's structural invariant and GW6's resume
+    // singleflight both ride this hold.
     {
         let mut sessions = inner.sessions.lock();
-        if let Some(existing) = sessions.get(session_id) {
-            // Idempotent re-own. Clone the thread under the lock — the
-            // GW1 Host mirror below projects its header from it.
-            let thread = existing.thread.clone();
+        if sessions.contains_key(session_id) {
             drop(sessions);
-            inner.add_owner(session_id, owner);
-            inner.note_to_client(
-                owner,
-                ServerNote::SessionCreated {
-                    session_id: session_id.into(),
-                },
-            );
-            // GW1 dual emit: the §D.5 Host mirror, DIRECTED to the new owner
-            // (SessionCreated is owner-set control, never a broadcast). The
-            // header projects from the live thread (the authoritative header
-            // rides the follow stream's Snapshot frame).
-            inner.host_to_client(owner, session_created_event(session_id, &thread));
-            return Ok(json!({ "restored": true }));
+            return reown_existing(inner, owner, session_id);
         }
-        // U8 (known debt): `load_thread` does journal-file IO while the
-        // `sessions` lock is held. Correctness first — the atomic
-        // check-load-insert is what makes a duplicate pump structurally
-        // impossible; narrowing the lock around the IO re-opens the TOCTOU.
-        // GW6 singleflight rides exactly this: concurrent open/create races
-        // serialize on this one hold (the losers take the idempotent branch
-        // above on their turn).
-        let thread = manox_agent::thread_store::global()
-            .with_mut(|s| s.load_thread(session_id))
-            .ok_or_else(|| RpcError::new(-1, "thread not found"))?;
         // GW5: the open-time `set_unread(session_id, false)` store mirror
-        // write is gone — unread is client-owned (clients clear their badge
-        // locally on focus); the server keeps no read-state.
+        // write is gone — unread is client-owned (clients clear their
+        // badge locally on focus); the server keeps no read-state.
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(StdMutex::new(Vec::new()));
         let pump_cancel = tokio_util::sync::CancellationToken::new();
@@ -1109,9 +1090,6 @@ async fn open_session(
             pending_submits.clone(),
             pump_cancel.clone(),
         );
-        // No entry existed under this same lock hold, so the insert replaces
-        // nothing; the plain insert is exact here (the belt-and-braces
-        // `insert_session` covers the create path's check-insert gap).
         sessions.insert(
             session_id.into(),
             ServerSession {
@@ -1130,13 +1108,43 @@ async fn open_session(
                 session_id: session_id.into(),
             },
         );
-        // GW1 dual emit: the Host mirror to the owner set (after `add_owner`
-        // so the opening client is in the audience).
+        // GW1 dual emit: the Host mirror to the owner set (after
+        // `add_owner` so the opening client is in the audience).
         inner.route_host(session_id, session_created_event(session_id, &thread));
         Ok(json!({ "restored": true }))
     }
 }
 
+/// The idempotent re-own of a live session: the owner joins and the
+/// directed `SessionCreated` note + GW1 Host mirror reach ONLY the new
+/// owner (owner-set control, never a broadcast — the existing owners are
+/// not disturbed). T10 (§D.6): no v1 snapshot replay here; the client's
+/// history comes from the §D.1 follow stream's `Snapshot` frame.
+fn reown_existing(
+    inner: &Arc<AgentServerInner>,
+    owner: &str,
+    session_id: &str,
+) -> Result<Value, RpcError> {
+    let thread = {
+        let sessions = inner.sessions.lock();
+        let Some(existing) = sessions.get(session_id) else {
+            // Gone between a check and this re-own (a concurrent dispose):
+            // answer not-found; the caller's retry re-enters the open path.
+            return Err(RpcError::new(-1, "thread not found")
+                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+        };
+        existing.thread.clone()
+    };
+    inner.add_owner(session_id, owner);
+    inner.note_to_client(
+        owner,
+        ServerNote::SessionCreated {
+            session_id: session_id.into(),
+        },
+    );
+    inner.host_to_client(owner, session_created_event(session_id, &thread));
+    Ok(json!({ "restored": true }))
+}
 /// GW1 (§D.5): build the `SessionCreated` Host mirror — the wire note
 /// carries only the id, the Host event carries the header. Projected from
 /// the live thread exactly like the follow stream's snapshot header
