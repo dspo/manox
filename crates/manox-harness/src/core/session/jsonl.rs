@@ -390,18 +390,15 @@ impl JsonlSessionStorage {
                 ..
             }
         );
-        let mut materialized = false;
         if *self.deferred.lock().await {
             if is_assistant {
                 self.rewrite_file_v4_locked(Some(&line)).await?;
                 *self.deferred.lock().await = false;
-                materialized = true;
             }
         } else if *self.file_version.lock().await < FORMAT_VERSION {
             // Lazy v3 → v4 migration: rewrite the whole file with stamped
             // lines, appending the new one in the same write.
             self.rewrite_file_v4_locked(Some(&line)).await?;
-            materialized = true;
         } else {
             self.append_line(&line).await?;
         }
@@ -455,7 +452,30 @@ impl JsonlSessionStorage {
         if let Some(extra) = extra_line {
             content.push_str(extra);
         }
-        tokio::fs::write(&self.jsonl_path, content).await?;
+        // K7 (§C durability): the whole-file rewrite is an atomic replace —
+        // write a sibling temp, fsync it, then rename over the target. The
+        // former truncate+write left a crash (or any concurrent reader, e.g.
+        // the sidebar scan or an ecosystem tool reading the journal) staring
+        // at a half-written or empty session file; with rename, readers see
+        // either the complete old file or the complete new one, never a
+        // truncation in between. The temp name is per-session and the rewrite
+        // runs under `append_lock`, so two rewrites can never race on it, and
+        // the `.tmp` suffix keeps session-directory scans off the artifact.
+        let tmp = self.jsonl_path.with_extension("jsonl.tmp");
+        let mut file = File::create(&tmp).await?;
+        file.write_all(content.as_bytes()).await?;
+        file.sync_all().await?;
+        tokio::fs::rename(&tmp, &self.jsonl_path).await?;
+        // Best-effort: fsync the containing directory so the rename itself
+        // survives a crash. The data is already consistent without it (the
+        // rename happened); a directory that cannot be opened or synced only
+        // loses that metadata-flush guarantee, never file contents.
+        #[cfg(unix)]
+        if let Some(dir) = self.jsonl_path.parent()
+            && let Ok(dir_file) = std::fs::File::open(dir)
+        {
+            let _ = dir_file.sync_all();
+        }
         *self.file_version.lock().await = FORMAT_VERSION;
         Ok(())
     }
@@ -2519,6 +2539,198 @@ mod tests {
             drop(storage);
             let reopened = JsonlSessionStorage::open(&path).await.unwrap();
             assert_eq!(reopened.journal_cursor().await, 2);
+        }
+
+        /// K7 regression: a whole-file rewrite (here the lazy v3→v4
+        /// migration) must be an atomic replace. A concurrent reader — the
+        /// sidebar scan, an ecosystem tool reading the journal, a follow
+        /// cold read — samples the path in a tight loop across the rewrite
+        /// and must only ever observe a complete file: intact v3 before,
+        /// dense v4 after. The reader samples `stat` lengths in a tight
+        /// loop — a microsecond period, far below any plausible write
+        /// window — so the former truncate+write is caught exposing every
+        /// intermediate length (starting at 0), while an atomic rename
+        /// only ever exposes the two legal ones.
+        #[tokio::test]
+        async fn concurrent_reader_never_observes_a_torn_rewrite() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::{Arc, Mutex as StdMutex};
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+
+            // A v3 chain big enough that the rewrite's write phase is a
+            // window a tight reader loop reliably samples.
+            const CHAIN: u32 = 20000;
+            let mut contents = String::from(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"s1\",\"timestamp\":\"2026-05-28T07:13:46.608Z\",\"cwd\":\"/proj\"}\n",
+            );
+            for i in 1..=CHAIN {
+                let parent = if i == 1 {
+                    "null".to_string()
+                } else {
+                    format!("\"m{}\"", i - 1)
+                };
+                contents.push_str(&format!(
+                    "{{\"type\":\"message\",\"id\":\"m{i}\",\"parentId\":{parent},\"timestamp\":\"2026-05-28T07:14:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"msg {i}\"}}],\"timestamp\":1779952440000}}}}\n"
+                ));
+            }
+            tokio::fs::write(&path, &contents).await.unwrap();
+            let storage = JsonlSessionStorage::open(&path).await.unwrap();
+
+            // High-frequency integrity sampling: the reader thread stats
+            // the path in a tight loop and records every distinct observed
+            // file length. A complete file is exactly `len_v3` before the
+            // rewrite and `len_v4` after it; truncate+write transiently
+            // exposes every intermediate length (starting at 0), while an
+            // atomic rename exposes only the two valid ones.
+            let len_v3 = contents.len() as u64;
+            let stop = Arc::new(AtomicBool::new(false));
+            let observed = Arc::new(StdMutex::new(Vec::<u64>::new()));
+            let reader = {
+                let (path, stop, observed) = (path.clone(), stop.clone(), observed.clone());
+                std::thread::spawn(move || {
+                    let mut last = u64::MAX;
+                    while !stop.load(Ordering::Relaxed) {
+                        match std::fs::metadata(&path) {
+                            Ok(md) => {
+                                let len = md.len();
+                                if len != last {
+                                    observed.lock().unwrap().push(len);
+                                    last = len;
+                                }
+                            }
+                            // A missing path mid-existence is also a torn
+                            // observation (rename replaces the target, it
+                            // never removes it).
+                            Err(_) => {
+                                observed.lock().unwrap().push(u64::MAX);
+                                break;
+                            }
+                        }
+                    }
+                })
+            };
+
+            // The first append on a v3 file rewrites the whole chain as v4.
+            storage
+                .append_entry(&user_message(
+                    &format!("m{}", CHAIN + 1),
+                    Some(&format!("m{CHAIN}")),
+                    "final",
+                ))
+                .await
+                .unwrap();
+
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap();
+
+            // Judge every observed length against the two legal file
+            // states; anything else is a torn observation.
+            let after = tokio::fs::read_to_string(&path).await.unwrap();
+            let len_v4 = after.len() as u64;
+            let torn: Vec<u64> = observed
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|len| *len != len_v3 && *len != len_v4)
+                .collect();
+            assert!(
+                torn.is_empty(),
+                "torn rewrite observed: intermediate lengths {torn:?} (v3={len_v3}, v4={len_v4})"
+            );
+
+            // Post-conditions: the migrated file is complete v4 with dense
+            // seqs, and the atomic replace left no temp residue.
+            assert!(after.contains("\"version\":4"));
+            assert_eq!(after.lines().count(), CHAIN as usize + 2);
+            let residue: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                residue.is_empty(),
+                "temp residue after rewrite: {residue:?}"
+            );
+        }
+
+        /// K7 companion: when the atomic replace cannot even create its
+        /// sibling temp (read-only directory), the append must fail loud
+        /// with the on-disk original byte-identical, and the same append
+        /// must complete the migration once the directory is writable
+        /// again — a failed rewrite is a no-op, never a corruption.
+        #[tokio::test]
+        #[cfg(unix)]
+        async fn failed_rewrite_leaves_the_original_file_intact() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session.jsonl");
+            let contents = concat!(
+                r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+                "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+                "\n",
+            );
+            tokio::fs::write(&path, contents).await.unwrap();
+            let storage = JsonlSessionStorage::open(&path).await.unwrap();
+
+            // Restore the directory mode even on a panicking assertion.
+            struct PermGuard(std::path::PathBuf, u32);
+            impl Drop for PermGuard {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+                }
+            }
+            let original = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            let guard = PermGuard(dir.path().to_path_buf(), original);
+
+            // Root ignores directory permissions; the fence would be inert,
+            // so skip rather than assert on a false setup.
+            if std::fs::File::create(dir.path().join("probe")).is_ok() {
+                let _ = std::fs::remove_file(dir.path().join("probe"));
+                eprintln!("skipping: running with write access despite 0o500 (root?)");
+                return;
+            }
+
+            let err = storage
+                .append_entry(&user_message("m2", Some("m1"), "two"))
+                .await
+                .expect_err("rewrite into a read-only directory must fail");
+            assert!(
+                err.to_string().contains("jsonl.tmp")
+                    || std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("\"version\":3"),
+                "failure names the temp write or the original survives: {err}"
+            );
+            drop(guard);
+
+            // The v3 original is byte-identical, and recovery is a plain
+            // retry: the same append now completes the migration with no
+            // temp residue.
+            assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), contents);
+            storage
+                .append_entry(&user_message("m2", Some("m1"), "two"))
+                .await
+                .unwrap();
+            let migrated = tokio::fs::read_to_string(&path).await.unwrap();
+            assert!(migrated.contains("\"version\":4"));
+            let residue: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(
+                residue.is_empty(),
+                "temp residue after recovery: {residue:?}"
+            );
         }
 
         #[tokio::test]
