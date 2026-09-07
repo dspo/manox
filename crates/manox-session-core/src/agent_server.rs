@@ -3323,6 +3323,248 @@ mod tests {
         Arc::new(entry(id.into(), parent.map(str::to_string)))
     }
 
+    // ── J1 journal-face builders: the remaining §C.2 vocabulary (the
+    // twelve dual-path builders above + these twenty-five = the full 37,
+    // 1:1 with the kernel's SessionTreeEntry variants). ──
+    fn ent_message(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            message: manox_harness::types::AgentMessage::User {
+                content: vec![manox_harness::types::ContentBlock::Text {
+                    text: "j1 message".into(),
+                    signature: None,
+                }],
+                timestamp: fixed_ts(),
+            },
+            origin: Some("j1-origin".into()),
+        }
+    }
+    fn ent_custom(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Custom {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            custom_type: "j1-custom".into(),
+            data: Some(json!({"k": 1})),
+        }
+    }
+    fn ent_custom_message(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::CustomMessage {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            custom_type: "j1-custom-msg".into(),
+            content: vec![manox_harness::types::ContentBlock::Text {
+                text: "j1".into(),
+                signature: None,
+            }],
+            details: None,
+            display: true,
+        }
+    }
+    fn ent_retry(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Retry {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            attempt: 1,
+            max_attempts: 3,
+            delay_secs: 2,
+            reason: "j1 retry".into(),
+            detail: None,
+        }
+    }
+    fn ent_agent_thinking_delta(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::AgentThinkingDelta {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            delta: "thought".into(),
+        }
+    }
+    fn ent_tool_output_chunk(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ToolOutputChunk {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            call_id: "tc-1".into(),
+            chunk: "out".into(),
+        }
+    }
+    fn ent_subagent_child(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::SubagentChild {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            agent_id: "a-1".into(),
+            event: json!({"kind": "spawn"}),
+        }
+    }
+    fn ent_subagent_progress(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::SubagentProgress {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            agent_id: "a-1".into(),
+            agent_type: "explore".into(),
+            tool_uses: 2,
+            latest_activity: Some("reading".into()),
+            status: "running".into(),
+        }
+    }
+    fn ent_cwd_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::CwdChange {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            cwd: "/j1".into(),
+        }
+    }
+    fn ent_project_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ProjectChange {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            path: Some("/j1/proj".into()),
+        }
+    }
+    fn ent_thinking_level_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ThinkingLevelChange {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            thinking_level: "high".into(),
+        }
+    }
+    fn ent_plan_mode_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::PlanModeChange {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            enabled: true,
+        }
+    }
+    fn ent_plan_update(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::PlanUpdate {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            snapshot: json!([{"step": "s1"}]),
+        }
+    }
+    fn ent_browser_suites(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::BrowserSuites {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            suites: vec!["j1-suite".into()],
+        }
+    }
+    fn ent_background_task(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::BackgroundTask {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            snapshot: json!({"tasks": []}),
+        }
+    }
+    fn ent_approval(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Approval {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            kind: "decision".into(),
+            auth_id: "auth-j1".into(),
+            payload: json!({"toolName": "Bash", "verdict": "allow_once"}),
+        }
+    }
+    fn ent_pinned_archived(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::PinnedArchived {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            pinned: true,
+            archived: false,
+        }
+    }
+    fn ent_active_tools_change(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::ActiveToolsChange {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            active_tool_names: vec!["Bash".into()],
+        }
+    }
+    fn ent_compaction(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Compaction {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            summary: "j1 summary".into(),
+            first_kept_entry_id: None,
+            tokens_before: 10,
+            retained_tail: None,
+            usage: None,
+            details: None,
+            from_hook: None,
+        }
+    }
+    fn ent_compaction_started(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::CompactionStarted {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            tokens_before: 10,
+        }
+    }
+    fn ent_branch_summary(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::BranchSummary {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            from_id: "j1-from".into(),
+            summary: "j1 branch".into(),
+            details: None,
+            usage: None,
+            from_hook: None,
+        }
+    }
+    fn ent_label(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Label {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            target_id: "j1-target".into(),
+            label: Some("L".into()),
+        }
+    }
+    fn ent_session_info(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::SessionInfo {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            name: Some("j1 name".into()),
+        }
+    }
+    fn ent_leaf(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Leaf {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            target_id: Some("j1-target".into()),
+        }
+    }
+    fn ent_metrics(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::Metrics {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            metric_type: "usage".into(),
+            data: json!({"n": 1}),
+        }
+    }
     fn ent_turn_start(id: String, parent_id: Option<String>) -> SessionTreeEntry {
         SessionTreeEntry::TurnStart {
             id,
@@ -8730,6 +8972,131 @@ mod tests {
         assert!(
             missing_hosts.is_empty(),
             "J1: declared HostEvents the real composition never emitted: {missing_hosts:?}"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// J1's journal face (§J.4): every declared `JournalWireEvent` tag
+    /// must stream through the REAL gateway follow lane — kernel entries
+    /// ride the live feed, the follow forwarding converts them through the
+    /// §C.2 total mapping and the U5 envelope. A vocabulary member the
+    /// real pipeline cannot carry (a translate gap, a tag drift, a frame
+    /// regression) fails here. Companion to the host+call gate above;
+    /// together they walk every C3 declaration table against the live
+    /// composition.
+    #[test]
+    fn real_composition_streams_every_journal_entry_tag() {
+        use manox_protocol::surface::{JOURNAL_ENTRIES, journal_wire_tag};
+        use std::collections::HashSet;
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "j1-j");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("j1-j", engine.clone(), events);
+        client.send(FromClient::StreamOpen {
+            stream_id: StreamId::new("j1-stream"),
+            stream_kind: StreamKind::FollowSession {
+                session_id: "j1-j".into(),
+                max_messages: None,
+            },
+        });
+        loop {
+            if let FromServer::StreamItem {
+                stream_id,
+                frame: manox_protocol::StreamFrame::Snapshot(snap),
+            } = client.recv()
+            {
+                assert_eq!(stream_id.0, "j1-stream");
+                assert_eq!(snap.session_id, "j1-j");
+                break;
+            }
+        }
+        // The full vocabulary, 1:1 with the kernel's 37 SessionTreeEntry
+        // variants, chained (each entry's parent is its predecessor).
+        let builders: Vec<fn(String, Option<String>) -> SessionTreeEntry> = vec![
+            ent_message,
+            ent_ui_note,
+            ent_custom,
+            ent_custom_message,
+            ent_turn_start,
+            ent_turn_finish,
+            ent_stop,
+            ent_retry,
+            ent_error_event,
+            ent_agent_text_delta,
+            ent_agent_thinking_delta,
+            ent_tool_call,
+            ent_tool_result,
+            ent_tool_output_chunk,
+            ent_subagent_child,
+            ent_subagent_progress,
+            ent_model_change,
+            ent_cwd_change,
+            ent_project_change,
+            ent_permission_mode_change,
+            ent_thinking_level_change,
+            ent_plan_mode_change,
+            ent_plan_update,
+            ent_goal,
+            ent_title,
+            ent_browser_suites,
+            ent_background_task,
+            ent_approval,
+            ent_pinned_archived,
+            ent_active_tools_change,
+            ent_compaction,
+            ent_compaction_started,
+            ent_branch_summary,
+            ent_label,
+            ent_session_info,
+            ent_leaf,
+            ent_metrics,
+        ];
+        assert_eq!(
+            builders.len(),
+            JOURNAL_ENTRIES.len(),
+            "J1: the builder list must stay 1:1 with the declared vocabulary \
+             (both sides are exhaustive over the same 37)"
+        );
+        let mut prev: Option<String> = None;
+        for (seq, build) in builders.into_iter().enumerate() {
+            let id = format!("j1-{seq}");
+            let entry = build(id.clone(), prev.clone());
+            engine.push_journal(seq as u64, Arc::new(entry));
+            prev = Some(id);
+        }
+        // Collect Entry frames until every declared tag has crossed the
+        // stream (recv carries its own timeout; the deadline names gaps).
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while seen.len() < JOURNAL_ENTRIES.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "J1: journal tags that never streamed: {:?}",
+                JOURNAL_ENTRIES
+                    .iter()
+                    .filter(|t| !seen.contains(*t))
+                    .collect::<Vec<_>>()
+            );
+            if let FromServer::StreamItem {
+                frame: manox_protocol::StreamFrame::Entry { event, .. },
+                ..
+            } = client.recv()
+            {
+                seen.insert(journal_wire_tag(&event));
+            }
+        }
+        let missing: Vec<&&str> = JOURNAL_ENTRIES
+            .iter()
+            .filter(|t| !seen.contains(*t))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "J1: declared journal tags never streamed: {missing:?}"
         );
         drop(client);
         drop(server);
