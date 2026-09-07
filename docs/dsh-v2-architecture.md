@@ -69,7 +69,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 - 读 API：`journal.cursor() -> u64`、`journal.slice(from..to) -> Vec<JournalEvent>`、`journal.replay() -> Thread`（L10 门禁）。compaction 后 `slice` 的 records 视图从 `firstKeptEntryId` 起（seq 连续性不变）。
 - 写放大对策：组提交（批量 flush，默认不逐条 fsync）；页读 chunk-run 打包。唯一允许的回退是 `subagent_progress` 降频，不得回退「条目皆可重放」。
 - 整文件重写原子性（K7）：懒 v3→v4 迁移与 deferred 物化一律经 sibling `.jsonl.tmp` 原子替换（write→fsync→rename→best-effort 目录 fsync）：崩溃或并发读者（侧栏扫描、生态工具、follow 冷读）只见完整旧文件或完整新文件，永不见截断中间态；`.tmp` 后缀不入会话目录扫描。
-- **durable append 面（K5/K4 as-built）**：storage trait 增 `append_entry_durable`（Jsonl 实现强制 deferred 物化：header 重写 + 已缓冲行 + 本行原子落盘），Session 增 `append_message_durable`；deferred 物化触发 = 首条 assistant 消息（TS parity 不变）**或任一 durable 标记的 append**；受理过 Submit 的 session 视为已交互、非 zombie。typed-append 写面统一 fail-loud（K4）：有界重试（3 次 × 50ms×attempt 退避）→ 永久失败 = durable `error` 条目记录丢失 kind 与原因（storage 自身 down 时 park 进 pending_journal，settle/idle drain 重试，恢复后可见；`error`-kind 行永不自补偿——断 tap 反馈环）+ facade `ThreadEvent::Error` 通知 + mid-run fail-closed（serializer abort 折进 abort_requested，settle 报 cancelled）。对照面：middleware 的 message-append 失败即 abort run（无重试，Wave 2 对称化候选）；`persist_ui_note` 已对称化（K9：有界重试+损失记录+facade Error 通知；无取消腿——UI note 非转录，丢失不作废 turn）。
+- **durable append 面（K5/K4 as-built）**：storage trait 增 `append_entry_durable`（Jsonl 实现强制 deferred 物化：header 重写 + 已缓冲行 + 本行原子落盘），Session 增 `append_message_durable`；deferred 物化触发 = 首条 assistant 消息（TS parity 不变）**或任一 durable 标记的 append**；受理过 Submit 的 session 视为已交互、非 zombie。typed-append 写面统一 fail-loud（K4）：有界重试（3 次 × 50ms×attempt 退避）→ 永久失败 = durable `error` 条目记录丢失 kind 与原因（storage 自身 down 时 park 进 pending_journal，settle/idle drain 重试，恢复后可见；`error`-kind 行永不自补偿——断 tap 反馈环）+ facade `ThreadEvent::Error` 通知 + mid-run fail-closed（serializer abort 折进 abort_requested，settle 报 cancelled）。对照面（K9 已全部对称化）：middleware 的 message-append 有界重试（3×50ms×attempt）后仍失败才 abort run（消息还原为未发送）；`persist_ui_note` 同款重试+损失记录+facade Error 通知（无取消腿——UI note 非转录，丢失不作废 turn）。
 - **K2 as-built（权威迁移）**：`title/pinned/archived/project/permission_mode/reasoning_effort/plan_mode/plan_snapshot/goal/cwd` 的重建权威 = journal（`replay_thread_state` 对 37 变体**穷举 match** 折叠，新词汇必须分类才能编译；last-wins，不可解析词汇 fail-soft 不清旧值）+ `merge_restored_state`（sidecar 只补链上从未出现的字段=懒迁移窗口）+ 背离时缓存收敛修复。三个 restore 面（startup/Open 交换/NewSession）同一实现。title 的缓存修复在**桌面改名接入日志面之前停用**（改名直写 sidecar，修复会回滚用户决策）。goal 权威暂留 threads.db（GoalBridge）；plan_file/plan_review_pending 无条目词汇、留 sidecar。K3 行路由：活引擎行经 ENGINE_ROUTES 入 actor serializer；退役/无路由经有界等待后冷追加（仅当 journal 文件存在）；actor 出口在同锁内 claim 队列——不丢行、不双写为结构性保证。
 
 ## D. 协议 v2 完备规格（manox-protocol）
@@ -312,7 +312,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
 | harness:冷读全文件解析(长链尾屏代价)——请求有界尾部读 API(`journal_tail`) | 优化 | K8 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
-| K4 对称性:persist_ui_note 已对称化(K9,有界重试+损失记录+facade 通知;无 mid-run 取消腿——UI note 非转录) | 残余:middleware message-append 无有界重试 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
 | J1:真实组合发射覆盖门禁(37 条目 × 8 HostEvent × 帧/调用面在真实网关发过) | 复用 K1 全类型会话设施 | J1 |

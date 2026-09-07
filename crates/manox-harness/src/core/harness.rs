@@ -3643,6 +3643,38 @@ pub struct PromptTemplate {
 /// to the session immediately — before any listener observes it — and
 /// records the entry id for the harness's transcript alignment. An append
 /// failure aborts the run, keeping the persisted prefix as the truth.
+/// K9: the append-attempt budget and backoff for the persistence
+/// middleware — the K4 typed-append discipline (3 attempts, 50ms×attempt)
+/// mirrored on the harness side (the engine's constants live in the agent
+/// crate; the dependency direction forbids sharing them).
+const APPEND_ATTEMPTS: u32 = 3;
+const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run one journal append under the bounded-retry discipline: a transient
+/// storage hiccup must not void the turn; after the budget the error
+/// propagates unchanged (the caller's fail-fast semantics — for the
+/// middleware, aborting the run with the message restored as unsent).
+async fn with_append_retries<F, Fut, T>(face: &'static str, mut op: F) -> Result<T, anyhow::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    let mut attempt = 1u32;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= APPEND_ATTEMPTS {
+                    return Err(err);
+                }
+                tracing::warn!(%err, face, attempt, "journal append failed; retrying");
+                tokio::time::sleep(APPEND_RETRY_DELAY * attempt).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn build_persistence_middleware<S: SessionStorage + 'static>(
     control: Arc<HarnessControl>,
     session: Arc<Session<S>>,
@@ -3680,9 +3712,16 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
                 } else {
                     None
                 };
-                let id = session
-                    .append_message_with_origin((*message).clone(), origin)
-                    .await?;
+                // K9: bounded retries before the fail-fast propagation (K4
+                // symmetry) — each attempt re-clones the message/origin so a
+                // partial previous attempt can never alias into the next.
+                let id = with_append_retries("message", || {
+                    let session = Arc::clone(&session);
+                    let message = (*message).clone();
+                    let origin = origin.clone();
+                    async move { session.append_message_with_origin(message, origin).await }
+                })
+                .await?;
                 control.message_entry_ids.lock().unwrap().push(Some(id));
             }
             Ok(())
@@ -4068,7 +4107,10 @@ pub(crate) mod tests {
         leaf_id: std::sync::Mutex<Option<String>>,
         /// Number of `append_entry` calls so far.
         append_calls: std::sync::Mutex<u64>,
-        /// Call number at which `append_entry` fails; `u64::MAX` means never.
+        /// Call number FROM WHICH `append_entry` fails, persistently (K9:
+        /// the middleware's bounded retries must not bridge an injected
+        /// failure — an abort test needs a failure that stays failed);
+        /// `u64::MAX` means never. Reset to `u64::MAX` to lift.
         fail_at_call: std::sync::Mutex<u64>,
         /// When set, a `model_change` append for this model id fails — the
         /// durability hook for flush tests.
@@ -4114,7 +4156,7 @@ pub(crate) mod tests {
             }
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
-            if *calls == *self.fail_at_call.lock().unwrap() {
+            if *calls >= *self.fail_at_call.lock().unwrap() {
                 anyhow::bail!("injected append failure");
             }
             drop(calls);
@@ -8297,8 +8339,10 @@ pub(crate) mod tests {
             1
         );
 
-        // With the failure spent, continuing answers the pending user
+        // Lift the injected failure (K9 made it persistent — the retries
+        // must not bridge it); continuing then answers the pending user
         // message — the conversation continues coherently, not forked.
+        *harness.session().storage().fail_at_call.lock().unwrap() = u64::MAX;
         let produced = harness.continue_().await.unwrap();
         assert!(
             produced
@@ -10369,5 +10413,49 @@ pub(crate) mod tests {
         let messages = harness.prompt("Hello").await.unwrap();
         assert_eq!(messages.len(), 2, "user message plus the response");
         assert_eq!(seen.lock().unwrap().as_slice(), ["base prompt"]);
+    }
+
+    /// K9: the append retry discipline bridges transient failures and caps
+    /// at the attempt budget, propagating the permanent error unchanged —
+    /// the middleware's fail-fast abort semantics downstream are unchanged.
+    #[tokio::test]
+    async fn append_retries_bridge_transient_failures_then_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let landed = super::with_append_retries("test", move || {
+            let c = Arc::clone(&c);
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(anyhow::anyhow!("transient failure {n}"))
+                } else {
+                    Ok("landed")
+                }
+            }
+        })
+        .await;
+        assert_eq!(landed.unwrap(), "landed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two transient failures then the success"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let down = super::with_append_retries::<_, _, ()>("test", move || {
+            let c = Arc::clone(&c);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("storage down"))
+            }
+        })
+        .await;
+        assert!(down.is_err(), "the permanent failure propagates");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "exactly the attempt budget, then the error"
+        );
     }
 }
