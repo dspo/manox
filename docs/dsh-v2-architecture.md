@@ -64,7 +64,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 ### C.3 内核改造
 - `ThreadCore { state: Thread, journal: SessionLog, subscribers: Vec<Sender<Arc<JournalEvent>>> }`；`JournalEvent{seq, entry}`。
-- **as-built 出口拓扑**（修订原文的「出口三段/泵唯一订阅者」）：`with_mut` 出口为锁内收集 `pending_events` → 解锁广播 `ThreadEvent`（内部面，unbounded）；durable 面经 notice tap 汇入 engine actor 队列。**seq 唯一盖章点在 storage 的 append 锁**（jsonl.rs `append_entry_locked`：父必先入索引否则拒绝、重复 id 拒绝、锁内按序广播 `JournalEvent`），facade 状态变更与日志条目为最终一致（tap 滞后 run 调度粒度，K6 跟踪跨面定序）。journal feed 为 bounded broadcast（4096，单源化到 `ENTRY_BACKPRESSURE_CAPACITY` 属 C6 代码项），慢订阅者收 `Lagged` → follow 流以 `StreamEnd{Resync}` 收口（L5，永不静默丢）。订阅者非唯一：每条 follow 流直接订阅 feed，网关泵另订 ThreadEvent 面做裁决路由与簿记。
+- **as-built 出口拓扑**（修订原文的「出口三段/泵唯一订阅者」）：`with_mut` 出口为锁内收集 `pending_events` → 解锁广播 `ThreadEvent`（内部面，unbounded）；durable 面经 notice tap 汇入 engine actor 队列。**seq 唯一盖章点在 storage 的 append 锁**（jsonl.rs `append_entry_locked`：父必先入索引否则拒绝、重复 id 拒绝、锁内按序广播 `JournalEvent`），facade 状态变更与日志条目为最终一致（tap 滞后 run 调度粒度）。**K6 关闭论证**：跨面定序的四个保证面各有归属——seq 定序=append 锁内单点盖章（结构）；`(cursor, records)` 不撕裂=`reply_journal_snapshot` 单次锁读派生（结构，stall 修复的一部分）；settle 排空=drive_run 返回前排空 serializer（`parallel_tool_rounds_land_every_result` 钉）；退役排空=`retire_and_claim_journal_rows` 同锁 claim（`store_journal_rows_route_to_the_actor_and_shutdown_claim_lands_them` 钉）。tap 滞后窗口本身=最终一致设计，非逐事件定序契约。journal feed 为 bounded broadcast（4096，单源化到 `ENTRY_BACKPRESSURE_CAPACITY` 属 C6 代码项），慢订阅者收 `Lagged` → follow 流以 `StreamEnd{Resync}` 收口（L5，永不静默丢）。订阅者非唯一：每条 follow 流直接订阅 feed，网关泵另订 ThreadEvent 面做裁决路由与簿记。
 - `ThreadEvent`（30 变体）保留为内核内部事件面；新增 `ThreadEvent → JournalEntry` 的序列化映射与 `JournalEntry → ThreadEvent` 反投影（桌面视图复用）。新 durable 事件（ui_note/approval/project_change/pinned_archived/title...）直接产生条目。
 - 读 API：`journal.cursor() -> u64`、`journal.slice(from..to) -> Vec<JournalEvent>`、`journal.replay() -> Thread`（L10 门禁）。compaction 后 `slice` 的 records 视图从 `firstKeptEntryId` 起（seq 连续性不变）。
 - 写放大对策：组提交（批量 flush，默认不逐条 fsync）；页读 chunk-run 打包。唯一允许的回退是 `subagent_progress` 降频，不得回退「条目皆可重放」。
@@ -318,7 +318,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U7b:Q 面 visibility 门控(rail 可见性状态归属) | U9 拆分后做 | U9 |
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
 | C5:字段漂移——文档面已对齐（D.3 清单 25 项/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
-| K6:跨面定序契约测试(serializer 后残余:tap 滞后粒度) | — | K6 |
 | K9:ui_note 决断✓、cursor 语义注✓（均已入 §C.2/§F.1 as-built）；persist_ui_note 对称化✓（K9 提交）；死 schema 回收（无发射的 `UiNote` 变体/`uiNote` 标签） | C4 表面决断 | C4 |
 | 桌面改名直写 sidecar（workspace.rs:3143）→ K2 title 缓存修复停用中 | thread_store 增 `rename_thread`（journal `title` 条目+sidecar，与 pin_thread 同构）或 gateway rename note；接线后启用修复（engine.rs 有注释锚点） | Wave 2（E 批次后） |
 | plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
