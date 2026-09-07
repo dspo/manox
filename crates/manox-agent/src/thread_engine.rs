@@ -256,14 +256,27 @@ pub struct ReadyInfo {
     /// A plan review card was pending when the session last settled;
     /// the facade re-emits `PlanReady` so the card re-surfaces.
     pub plan_review_pending: bool,
-    /// Last `UpdatePlan` snapshot persisted in the sidecar; the facade
-    /// mirrors it as the rebuild fallback after compaction summarized
-    /// the transcript's plan tool calls away.
+    /// Last `UpdatePlan` snapshot rebuilt journal-first (K2: the
+    /// `plan_update` entries are the authority, the sidecar the derived
+    /// cache); the facade mirrors it as the rebuild fallback after
+    /// compaction summarized the transcript's plan tool calls away.
     pub plan_snapshot: Option<serde_json::Value>,
-    /// Display title persisted in the session sidecar; the facade mirrors
-    /// it so the title bar matches the sidebar's
+    /// Display title rebuilt journal-first from the session's active
+    /// chain (the sidecar fills a chain that never saw a `title` entry);
+    /// the facade mirrors it so the title bar matches the sidebar's
     /// [`crate::db::ThreadSummary::display_title`] source of truth.
     pub title: Option<String>,
+    /// Pin flag rebuilt journal-first (K2: the `pinned_archived` entries
+    /// are the authority, the sidecar the derived cache); the facade
+    /// mirrors it so the projection baseline seeds from journal-backed
+    /// state.
+    pub pinned: bool,
+    /// Archive flag rebuilt journal-first (K2), mirrored like `pinned`.
+    pub archived: bool,
+    /// The bound project rebuilt journal-first (K2: the `project_change`
+    /// entries are the authority); `None` leaves the facade's binding
+    /// untouched (an unbound chain with no sidecar binding).
+    pub project: Option<std::path::PathBuf>,
 }
 
 /// Notices the backend sends back to the facade's gpui drainer.

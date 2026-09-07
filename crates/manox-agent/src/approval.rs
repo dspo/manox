@@ -64,6 +64,13 @@ pub struct ApprovalGate {
     pending: Mutex<HashMap<String, PendingAuth>>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     model: Arc<Mutex<Option<PiModel>>>,
+    /// K3 (L3): the engine actor's command sender, wired at spawn. The
+    /// user's verdict on a parked card is an observable state change — it
+    /// journals as an `approval` decision entry through the actor's
+    /// serializer queue (the request entry rides the notice tap; the
+    /// decision has no notice vocabulary of its own). `None` on a
+    /// standalone gate (tests): verdicts simply do not journal.
+    journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
 }
 
 impl ApprovalGate {
@@ -76,7 +83,15 @@ impl ApprovalGate {
             pending: Mutex::new(HashMap::new()),
             notice_tx,
             model: model_slot,
+            journal_sink: Mutex::new(None),
         }
+    }
+
+    /// Wire the actor command sender that carries verdict journaling (K3).
+    /// Set once by `spawn_engine`; the gate is constructed before the
+    /// sender exists, hence the setter.
+    pub(crate) fn set_journal_sink(&self, tx: mpsc::UnboundedSender<crate::engine::SessionCmd>) {
+        *self.journal_sink.lock().unwrap() = Some(tx);
     }
 
     pub fn mode(&self) -> PermissionMode {
@@ -118,14 +133,46 @@ impl ApprovalGate {
 
     /// Drop a pending interaction without answering (turn cancelled).
     fn discard(&self, id: &str) {
-        self.pending.lock().unwrap().remove(id);
+        // K3 (L3): a cancelled card journals its decision too — the
+        // `pending_auth` fold would otherwise keep a card alive that no
+        // client can ever answer (§C.2: the decision closes the fold).
+        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            self.journal_decision(id, &pending.meta.tool_name, "cancelled");
+        }
     }
 
     /// Deliver the user's answer. Unknown ids are ignored (already settled).
     pub fn respond(&self, id: &str, response: ToolAuthorizationResponse) {
         if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            // K3 (L3): the verdict is an observable state change — it
+            // journals as the `approval` decision entry (§C.2 dual state)
+            // through the actor's serializer queue.
+            let verdict = match &response {
+                ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => "allow_once",
+                ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => "deny",
+                ToolAuthorizationResponse::AskUserQuestion { .. } => "answered",
+            };
+            self.journal_decision(id, &pending.meta.tool_name, verdict);
             let _ = pending.tx.send(response);
         }
+    }
+
+    /// Queue the `approval` decision entry onto the engine actor (K3).
+    /// Without a sink (a standalone gate) or with the actor already gone
+    /// the decision does not journal: a gate with no engine has no session
+    /// to append to and no facade left to hear about it.
+    fn journal_decision(&self, id: &str, tool_name: &str, verdict: &str) {
+        let Some(tx) = self.journal_sink.lock().unwrap().clone() else {
+            return;
+        };
+        let _ = tx.send(crate::engine::SessionCmd::AppendJournal {
+            kind: "approval".into(),
+            payload: serde_json::json!({
+                "kind": "decision",
+                "authId": id,
+                "payload": { "toolName": tool_name, "verdict": verdict },
+            }),
+        });
     }
 
     /// Snapshot of pending interactions for card re-surfacing.
@@ -1552,5 +1599,80 @@ mod tests {
             .as_object()
             .expect("bare schema has properties");
         assert!(!bare_props.contains_key("sandbox_permissions"));
+    }
+
+    /// K3 (L3): the user's verdict on a parked card journals as an
+    /// `approval` decision entry through the actor's command queue —
+    /// `respond` carries the verdict vocabulary (`allow_once` / `deny` /
+    /// `answered`), and `discard` (a cancelled turn) closes the card with
+    /// a `cancelled` decision so the `pending_auth` fold never keeps a
+    /// dead card alive. A settled card never journals twice.
+    #[test]
+    fn respond_and_discard_journal_approval_decisions() {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<crate::engine::SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let gate = ApprovalGate::new(notice_tx, Arc::new(Mutex::new(None)));
+        gate.set_journal_sink(cmd_tx);
+        let meta = || PendingAuthMeta {
+            tool_name: "Bash".into(),
+            summary: "s".into(),
+            input: serde_json::json!({}),
+        };
+        let next_decision = |cmd_rx: &mut mpsc::UnboundedReceiver<crate::engine::SessionCmd>,
+                             auth_id: &str,
+                             verdict: &str| {
+            match cmd_rx.try_recv().expect("the verdict must journal") {
+                crate::engine::SessionCmd::AppendJournal { kind, payload } => {
+                    assert_eq!(kind, "approval");
+                    assert_eq!(payload["kind"], serde_json::json!("decision"));
+                    assert_eq!(payload["authId"], serde_json::json!(auth_id));
+                    assert_eq!(payload["payload"]["toolName"], serde_json::json!("Bash"));
+                    assert_eq!(payload["payload"]["verdict"], serde_json::json!(verdict));
+                }
+                _ => panic!("expected an AppendJournal row for {auth_id}"),
+            }
+        };
+
+        let mut rx = gate.register("call-1", meta());
+        gate.respond(
+            "call-1",
+            ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce),
+        );
+        next_decision(&mut cmd_rx, "call-1", "allow_once");
+        // The responder still receives the answer (journaling never eats it).
+        assert!(rx.try_recv().is_ok());
+
+        let _rx = gate.register("call-2", meta());
+        gate.respond(
+            "call-2",
+            ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        );
+        next_decision(&mut cmd_rx, "call-2", "deny");
+
+        let _rx = gate.register("call-3", meta());
+        gate.respond(
+            "call-3",
+            ToolAuthorizationResponse::AskUserQuestion {
+                answers: vec![("q".into(), "yes".into())],
+                response: None,
+            },
+        );
+        next_decision(&mut cmd_rx, "call-3", "answered");
+
+        let _rx = gate.register("call-4", meta());
+        gate.discard("call-4");
+        next_decision(&mut cmd_rx, "call-4", "cancelled");
+
+        // A settled card is gone from `pending`: neither a second respond
+        // nor a second discard journals again.
+        gate.discard("call-4");
+        gate.respond(
+            "call-4",
+            ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        );
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a settled card must not journal a second decision"
+        );
     }
 }

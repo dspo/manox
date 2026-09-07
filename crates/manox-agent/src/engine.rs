@@ -462,7 +462,10 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
         //    journal entry is the future single truth, L10) ───────────────
         ThreadEvent::PermissionModeChanged { mode } => (
             "permission_mode_change".into(),
-            json!({ "mode": format!("{mode:?}") }),
+            // The closed kebab wire vocabulary (§C.2 `mode`), never the
+            // Debug name: the replay fold, the sidecar cache, and the wire
+            // projection all parse `from_wire`.
+            json!({ "mode": mode.wire() }),
         ),
         ThreadEvent::PlanModeChanged { enabled } => {
             ("plan_mode_change".into(), json!({ "enabled": enabled }))
@@ -554,6 +557,238 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
     })
 }
 
+// ── Thread → engine journal routing (K3) ───────────────────────────────────
+//
+// Kernel-level decision points that live outside the engine actor (the
+// thread store's pin/archive writes) must still journal through the actor's
+// serializer queue (`SessionCmd::AppendJournal` → the K4 fail-loud typed
+// append face), so their entries are linearized against every other writer
+// of the same session. When no live engine holds the thread, the row
+// cold-appends through a freshly opened storage — which is only safe while
+// no live storage writes the same file. The retirement protocol below makes
+// the handoff structural:
+//
+// - A dispatch under the registry lock either SENDS into a non-retired
+//   route (the row is then guaranteed to be appended by the actor: its
+//   shutdown claim drains every queued row under the same lock), or sees a
+//   retired/absent route and takes the cold path.
+// - The actor retires its route and claims the queue in one lock hold at
+//   shutdown, appends the claimed rows, closes the session, and only then
+//   (on exit) removes the route — so a waiting cold append starts strictly
+//   after the live storage stopped writing. One writer at a time, no lost
+//   row.
+struct EngineRoute {
+    tx: mpsc::UnboundedSender<SessionCmd>,
+    /// Set (under the registry lock, together with the shutdown claim) when
+    /// the actor broke its command loop. From then on dispatches never send
+    /// into this route — they wait for its removal and cold-append.
+    retired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static ENGINE_ROUTES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, EngineRoute>>> =
+    std::sync::OnceLock::new();
+
+fn engine_routes() -> &'static std::sync::Mutex<HashMap<String, EngineRoute>> {
+    ENGINE_ROUTES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn register_engine_route(thread_id: &str, tx: &mpsc::UnboundedSender<SessionCmd>) {
+    engine_routes().lock().unwrap().insert(
+        thread_id.to_string(),
+        EngineRoute {
+            tx: tx.clone(),
+            retired: Arc::new(AtomicBool::new(false)),
+        },
+    );
+}
+
+fn unregister_engine_route(thread_id: &str, tx: &mpsc::UnboundedSender<SessionCmd>) {
+    let mut routes = engine_routes().lock().unwrap();
+    if routes
+        .get(thread_id)
+        .is_some_and(|route| route.tx.same_channel(tx))
+    {
+        routes.remove(thread_id);
+    }
+}
+
+/// K3 shutdown protocol, step 1: retire this thread's registry route and
+/// claim every `AppendJournal` row already queued. Runs under the registry
+/// lock, so a concurrent [`dispatch_store_journal_row`] either sent before
+/// this point (its row is claimed here and appended before close) or sees
+/// the retirement (it waits for the route's removal, then cold-appends
+/// after this actor's storage stopped writing). Non-journal rows queued at
+/// shutdown are dropped: the actor has broken its command loop.
+fn retire_and_claim_journal_rows(
+    thread_id: &str,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+) -> Vec<(String, serde_json::Value)> {
+    let routes = engine_routes().lock().unwrap();
+    if let Some(route) = routes.get(thread_id) {
+        route.retired.store(true, Ordering::Relaxed);
+    }
+    let mut rows = Vec::new();
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        if let SessionCmd::AppendJournal { kind, payload } = cmd {
+            rows.push((kind, payload));
+        }
+    }
+    rows
+}
+
+/// Land one journal row outside the actor (shutdown claim or cold append);
+/// the K4 fail-loud discipline applies. A permanent loss records its
+/// durable `error` entry where the storage allows and logs loudly
+/// otherwise — no facade is left to notify on these paths.
+async fn append_row_fail_loud(
+    appender: &JournalAppender,
+    kind: String,
+    payload: serde_json::Value,
+) {
+    if let Err(err) = append_typed_resilient(appender, &kind, payload).await {
+        let _ = record_journal_loss(appender, &kind, &err).await;
+        tracing::error!(%err, kind, "journal row could not land outside the actor loop");
+    }
+}
+
+/// Route one store-level journal row (K3: pin/archive and any future
+/// store-owned decision) to the thread's journal. Sends into the live
+/// actor's serializer queue when one is registered; otherwise cold-appends
+/// through a freshly opened storage once the file has no live writer.
+/// Called synchronously by the store's dispatch; the waiting/cold paths run
+/// on the agent runtime.
+///
+/// `session_path` is the store's cached journal-file path, needed for the
+/// cold path; `None` with no live route logs and drops the row (a thread
+/// that never materialized has no journal — its sidecar carries the flag
+/// until the journal exists, the K2 fallback).
+pub(crate) fn dispatch_store_journal_row(
+    thread_id: String,
+    session_path: Option<PathBuf>,
+    kind: String,
+    payload: serde_json::Value,
+) {
+    enum Fate {
+        Queued,
+        Wait,
+        Cold,
+    }
+    let fate = {
+        let routes = engine_routes().lock().unwrap();
+        match routes.get(&thread_id) {
+            Some(route) if !route.retired.load(Ordering::Relaxed) => {
+                match route.tx.send(SessionCmd::AppendJournal {
+                    kind: kind.clone(),
+                    payload: payload.clone(),
+                }) {
+                    // The actor's shutdown claim covers this row: it drains
+                    // every queued AppendJournal under the same lock that
+                    // sets `retired`.
+                    Ok(()) => Fate::Queued,
+                    // Actor died without retiring (a Fatal early return):
+                    // the route's removal is imminent — wait, then re-check.
+                    Err(_) => Fate::Wait,
+                }
+            }
+            // Retiring: the actor is appending its claimed rows / closing.
+            Some(_) => Fate::Wait,
+            None => Fate::Cold,
+        }
+    };
+    match fate {
+        Fate::Queued => {}
+        Fate::Wait => {
+            crate::runtime::handle().spawn(wait_then_cold_journal_append(
+                thread_id,
+                session_path,
+                kind,
+                payload,
+            ));
+        }
+        Fate::Cold => {
+            crate::runtime::handle().spawn(cold_journal_append(session_path, kind, payload));
+        }
+    }
+}
+
+/// Wait for a retiring route's removal (a successor engine re-registering
+/// is re-checked and offered the row), then cold-append. Bounded: a hung
+/// actor shutdown must not strand the decision forever — after the window
+/// the row cold-appends best-effort with a loud log.
+async fn wait_then_cold_journal_append(
+    thread_id: String,
+    session_path: Option<PathBuf>,
+    kind: String,
+    payload: serde_json::Value,
+) {
+    for _ in 0..200u32 {
+        enum Step {
+            Done,
+            KeepWaiting,
+            Cold,
+        }
+        let step = {
+            let routes = engine_routes().lock().unwrap();
+            match routes.get(&thread_id) {
+                Some(route) if !route.retired.load(Ordering::Relaxed) => {
+                    // A successor engine took over the thread: its actor
+                    // serializes the row against the same session file.
+                    match route.tx.send(SessionCmd::AppendJournal {
+                        kind: kind.clone(),
+                        payload: payload.clone(),
+                    }) {
+                        Ok(()) => Step::Done,
+                        Err(_) => Step::KeepWaiting,
+                    }
+                }
+                Some(_) => Step::KeepWaiting,
+                None => Step::Cold,
+            }
+        };
+        match step {
+            Step::Done => return,
+            Step::Cold => break,
+            Step::KeepWaiting => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+        }
+    }
+    cold_journal_append(session_path, kind, payload).await;
+}
+
+/// Cold journal append for a decision whose thread has no live engine (K3):
+/// open the session file and land the typed row through the same storage
+/// face a live actor uses (`append_typed`: parent selection + append lock +
+/// seq stamp + journal broadcast). Safe because the registry protocol
+/// guarantees no live storage writes this file while the route is absent.
+/// A thread whose journal never materialized has no file: the row is
+/// skipped loudly at debug — the sidecar carries the flag until the journal
+/// exists (the K2 fallback).
+async fn cold_journal_append(
+    session_path: Option<PathBuf>,
+    kind: String,
+    payload: serde_json::Value,
+) {
+    let Some(path) = session_path else {
+        tracing::debug!(
+            kind,
+            "no session file to cold-append to; the sidecar carries the flag"
+        );
+        return;
+    };
+    if !path.exists() {
+        tracing::debug!(kind, path = %path.display(), "session file does not exist; the sidecar carries the flag");
+        return;
+    }
+    let storage = match manox_harness::session::jsonl::JsonlSessionStorage::open(&path).await {
+        Ok(storage) => storage,
+        Err(err) => {
+            tracing::error!(%err, kind, path = %path.display(), "cold journal append could not open the session file");
+            return;
+        }
+    };
+    let session = manox_harness::session::Session::new(storage);
+    append_row_fail_loud(&session, kind, payload).await;
+}
+
 /// Spawn the pi actor and return the engine handle plus its notice receiver.
 /// The facade drains the receiver on the gpui thread. `initial_path`, when
 /// given, opens that session file instead of restoring the newest one.
@@ -570,6 +805,9 @@ pub fn spawn_engine(
     parent_session: Option<String>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    // K3: expose this engine's actor queue to the store-level decision
+    // points (pin/archive) so their typed appends ride the same serializer.
+    register_engine_route(&thread_id, &cmd_tx);
     // The journal tap (architecture §C, L3/L4): every BackendNotice funnels
     // through `notice_tx`; the tap forwards each one to the facade FIRST (UI
     // latency unchanged) and, for durable events, queues a typed journal
@@ -598,6 +836,10 @@ pub fn spawn_engine(
         notice_tx.clone(),
         Arc::clone(&model_slot),
     ));
+    // K3: the user's verdict on a parked card is an observable state
+    // change — the gate journals it as an `approval` decision entry through
+    // the actor queue (the request entry rides the notice tap).
+    gate.set_journal_sink(cmd_tx.clone());
     // The thread-scoped journal feed; session relays publish into it as
     // sessions come and go (capacity matches the storage broadcast, L5).
     let (journal_feed_handle, _) = tokio::sync::broadcast::channel::<JournalFeed>(4096);
@@ -630,21 +872,35 @@ pub fn spawn_engine(
         granted_roots: crate::granted_roots::GrantedRoots::new(cwd.clone()),
         last_cwd_note: Mutex::new(None),
     });
-    crate::runtime::handle().spawn(run_actor(
-        cwd,
-        model,
-        sessions_dir,
-        initial_path.clone(),
-        fresh,
-        project,
-        cmd_tx.clone(),
-        cmd_rx,
-        notice_tx.clone(),
-        Arc::clone(&state),
-        thread_id,
-        parent_session,
-        Arc::clone(&bus),
-    ));
+    // The registry entry lives exactly as long as the actor: its exit
+    // unregisters under a channel-identity guard (K3), so a store-level
+    // decision after this point takes the cold-append path instead of
+    // sending into a dead queue.
+    let actor_cmd_tx = cmd_tx.clone();
+    let registry_thread_id = thread_id.clone();
+    let actor_notice_tx = notice_tx.clone();
+    let actor_state = Arc::clone(&state);
+    let actor_bus = Arc::clone(&bus);
+    let actor_initial_path = initial_path.clone();
+    crate::runtime::handle().spawn(async move {
+        run_actor(
+            cwd,
+            model,
+            sessions_dir,
+            actor_initial_path,
+            fresh,
+            project,
+            actor_cmd_tx.clone(),
+            cmd_rx,
+            actor_notice_tx,
+            actor_state,
+            thread_id,
+            parent_session,
+            actor_bus,
+        )
+        .await;
+        unregister_engine_route(&registry_thread_id, &actor_cmd_tx);
+    });
     // Display-only streaming preview: while the actor's eager restore reads
     // the whole session file, stream its transcript into the mirrored history
     // in batches so the workspace paints the first messages early. The
@@ -2945,7 +3201,7 @@ async fn run_actor(
     *state.current_appender.lock().unwrap() = Some(session.journal_appender());
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
     if let Some(project) = &project {
-        write_project_sidecar(&sessions_dir, session.path(), project).await;
+        bind_project(&sessions_dir, &session, project, &state, &notice_tx).await;
     }
     spawn_session_list_refresh(&sessions_dir, &state);
 
@@ -2960,6 +3216,11 @@ async fn run_actor(
     // reads; shared so mid-run history refreshes never borrow the session.
     let live_mirror: Arc<Mutex<LiveTranscript>> = Arc::new(Mutex::new(LiveTranscript::default()));
     let restored_provider_responses = successful_provider_responses(session.harness_messages());
+    // K2: the journal-first restore rebuild — the active chain is the
+    // authority for every field §C.2 entries carry, the sidecar fills the
+    // fields the chain has never seen, and a diverging cache is repaired
+    // toward the journal.
+    let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
     let title_scheduler = TitleScheduler::new(
         runtime.clone(),
         Arc::clone(&state.model),
@@ -2969,7 +3230,13 @@ async fn run_actor(
         session.path().to_path_buf(),
         cwd.clone(),
         cmd_tx.clone(),
-        load_title_scheduler(&sessions_dir, session.path(), restored_provider_responses).await,
+        load_title_scheduler(
+            &sessions_dir,
+            session.path(),
+            restored_provider_responses,
+            restored_state.title.clone(),
+        )
+        .await,
     );
     let mut _subscription = subscribe_session(
         &session,
@@ -2985,14 +3252,14 @@ async fn run_actor(
         &wakeup_tx,
     );
 
-    // The permission mode rides the session sidecar: restore it so a
-    // reopened session keeps its mode.
-    let permission_mode = load_approval_mode(&sessions_dir, session.path()).await;
+    // The permission mode rebuilds from the journal (the sidecar fills the
+    // legacy gap): restore it so a reopened session keeps its mode.
+    let permission_mode = restored_state.permission_mode;
     state.gate.set_mode(permission_mode);
-    // The reasoning effort rides the same sidecar: restore it so a reopened
-    // Max session keeps its effort. The engine clamps against the current
-    // model and persists the change in the transcript (TS `setThinkingLevel`).
-    let reasoning_effort = load_reasoning_effort(&sessions_dir, session.path()).await;
+    // The reasoning effort rebuilds the same way: a reopened Max session
+    // keeps its effort. The engine clamps against the current model and
+    // persists the change in the transcript (TS `setThinkingLevel`).
+    let reasoning_effort = restored_state.reasoning_effort;
     if reasoning_effort != ReasoningEffort::default()
         && let Err(err) = session
             .set_thinking_level(Some(reasoning_effort.wire_value().to_string()))
@@ -3000,25 +3267,20 @@ async fn run_actor(
     {
         tracing::warn!(error = %err, "failed to restore reasoning effort");
     }
-    // Plan mode rides the same sidecar: restore the flag so a reopened
-    // planning session keeps its read-only gate; the facade re-renders and
-    // re-sends the instructions once it sees `Ready`.
-    let (plan_mode_restored, plan_file_restored) =
-        load_plan_state(&sessions_dir, session.path()).await;
+    // Plan mode rebuilds the same way: a reopened planning session keeps
+    // its read-only gate; the facade re-renders and re-sends the
+    // instructions once it sees `Ready`.
     state
         .plan
-        .set(plan_mode_restored, plan_file_restored.clone());
-    if plan_mode_restored {
+        .set(restored_state.plan_mode, restored_state.plan_file.clone());
+    if restored_state.plan_mode {
         state
             .plan
             .set_active_instructions(render_plan_instructions());
     }
-    let plan_review_pending = load_plan_review_pending(&sessions_dir, session.path()).await;
-    let plan_snapshot = load_plan_snapshot(&sessions_dir, session.path()).await;
-    let restored_title = manox_harness::session_meta::load(&sessions_dir, session.path())
-        .await
-        .ok()
-        .and_then(|meta| meta.title);
+    let plan_review_pending = restored_state.plan_review_pending;
+    let plan_snapshot = restored_state.plan_snapshot.clone();
+    let restored_title = restored_state.title.clone();
 
     // Mirror the authoritative transcript BEFORE `Ready` is sent: the
     // facade's Ready handler reads `history()` immediately, and a drainer
@@ -3043,11 +3305,14 @@ async fn run_actor(
         permission_mode,
         reasoning_effort,
         browser_suites,
-        plan_mode: plan_mode_restored,
-        plan_file: plan_file_restored,
+        plan_mode: restored_state.plan_mode,
+        plan_file: restored_state.plan_file.clone(),
         plan_review_pending,
         plan_snapshot,
         title: restored_title,
+        pinned: restored_state.pinned,
+        archived: restored_state.archived,
+        project: restored_state.project.clone(),
     })));
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
@@ -3335,12 +3600,8 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetPermissionMode(mode) => {
-                state.gate.set_mode(mode);
-                if let Err(err) =
-                    write_approval_mode_sidecar(&sessions_dir, session.path(), mode).await
-                {
-                    tracing::warn!(error = %err, "failed to persist approval mode");
-                }
+                apply_permission_mode(&state, &sessions_dir, session.path(), mode, &notice_tx)
+                    .await;
             }
             SessionCmd::SetBrowserSuite { suite, enable } => {
                 apply_browser_suite(&mut session, suite, enable).await;
@@ -3404,11 +3665,7 @@ async fn run_actor(
                     }
                 };
                 if should_write {
-                    if let Err(error) = persist_title(&sessions_dir, session.path(), title).await {
-                        tracing::warn!(%error, "failed to persist initial title");
-                    } else {
-                        let _ = notice_tx.send(BackendNotice::SessionListDirty);
-                    }
+                    persist_initial_title(&sessions_dir, session.path(), title, &notice_tx).await;
                 }
             }
             SessionCmd::PersistGeneratedTitle {
@@ -3603,6 +3860,10 @@ async fn run_actor(
                     &bus,
                 )
                 .await;
+                // K2: the journal-first rebuild resolves the swapped-in
+                // session's observable state (authority: its active chain;
+                // gap-fill: its sidecar).
+                let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
                 title_scheduler.retarget(
                     path.clone(),
                     cwd.clone(),
@@ -3610,6 +3871,7 @@ async fn run_actor(
                         &sessions_dir,
                         &path,
                         successful_provider_responses(session.harness_messages()),
+                        restored_state.title.clone(),
                     )
                     .await,
                 );
@@ -3626,7 +3888,7 @@ async fn run_actor(
                     &notice_tx,
                     &wakeup_tx,
                 );
-                resync_plan_state(&sessions_dir, &path, &state.plan, &notice_tx).await;
+                resync_plan_state(&restored_state, &state.plan, &notice_tx);
                 // The opened file becomes the thread's active session.
                 let opened_id = path
                     .file_stem()
@@ -3634,7 +3896,7 @@ async fn run_actor(
                     .unwrap_or_default();
                 crate::thread_registry::set_active(&thread_id, opened_id).await;
                 *state.active_path.lock().unwrap() = Some(path);
-                resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                resync_approval_mode(&restored_state, &state, &notice_tx);
                 // Opened sessions are resumed conversations: SessionStart
                 // already happened in a prior lifetime.
                 state.session_start_fired.store(true, Ordering::SeqCst);
@@ -3719,6 +3981,10 @@ async fn run_actor(
                         // The fresh session is pinned to the facade thread's id.
                         crate::thread_registry::set_active(&thread_id, &thread_id).await;
                         let new_path = session.path().to_path_buf();
+                        // K2: a fresh chain folds empty — the rebuild
+                        // resolves entirely to sidecar defaults, keeping
+                        // one restore face for every session establishment.
+                        let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
                         title_scheduler.retarget(
                             new_path.clone(),
                             cwd.clone(),
@@ -3726,6 +3992,7 @@ async fn run_actor(
                                 &sessions_dir,
                                 &new_path,
                                 successful_provider_responses(session.harness_messages()),
+                                restored_state.title.clone(),
                             )
                             .await,
                         );
@@ -3744,9 +4011,10 @@ async fn run_actor(
                         );
                         *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
                         if let Some(project) = &project {
-                            write_project_sidecar(&sessions_dir, session.path(), project).await;
+                            bind_project(&sessions_dir, &session, project, &state, &notice_tx)
+                                .await;
                         }
-                        resync_approval_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                        resync_approval_mode(&restored_state, &state, &notice_tx);
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
                         spawn_session_list_refresh(&sessions_dir, &state);
@@ -3796,6 +4064,20 @@ async fn run_actor(
         }
     }
 
+    // K3 shutdown protocol: retire this thread's registry route and claim
+    // every journal row still queued — a store-level pin/archive decision
+    // races disposal (the gateway archives right after the last owner
+    // detaches), and L3 leaves no observable state change without an
+    // entry. Claimed rows append before close; the route itself is removed
+    // only when this actor exits (the spawn wrapper), so a waiting store
+    // dispatch cold-appends strictly after this storage stops writing.
+    let claimed_rows = retire_and_claim_journal_rows(&thread_id, &mut cmd_rx);
+    if !claimed_rows.is_empty() {
+        let shutdown_appender = session.journal_appender();
+        for (kind, payload) in claimed_rows {
+            append_row_fail_loud(&shutdown_appender, kind, payload).await;
+        }
+    }
     let _ = session.close().await;
     // Thread-lifetime cleanup: cancel (SessionEnded) every task this thread
     // owns — including in-flight asynchronously-dispatched Sailors — then
@@ -4179,15 +4461,19 @@ async fn load_title_scheduler(
     sessions_dir: &Path,
     session_path: &Path,
     provider_responses: usize,
+    journal_title: Option<String>,
 ) -> PersistedTitleScheduler {
-    manox_harness::session_meta::load(sessions_dir, session_path)
+    // K2: the journal chain's title is the authority; the sidecar fills a
+    // chain that never saw a `title` entry.
+    let sidecar = manox_harness::session_meta::load(sessions_dir, session_path)
         .await
         .ok()
-        .map(|meta| PersistedTitleScheduler {
-            title: meta.title.filter(|title| !title.trim().is_empty()),
-            provider_responses,
-        })
-        .unwrap_or_default()
+        .and_then(|meta| meta.title)
+        .filter(|title| !title.trim().is_empty());
+    PersistedTitleScheduler {
+        title: journal_title.or(sidecar),
+        provider_responses,
+    }
 }
 
 fn successful_provider_responses(messages: &[AgentMessage]) -> usize {
@@ -4231,7 +4517,9 @@ async fn persist_title(
 
 /// The permission mode persisted in a session's sidecar (wire field
 /// `approval_mode`); fresh sessions (missing sidecar or field) and unknown
-/// values land on the bounded default.
+/// values land on the bounded default. Test face of the sidecar cache —
+/// production restores go through [`rebuild_restored_state`] (K2).
+#[cfg(test)]
 async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> PermissionMode {
     match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => meta
@@ -4260,13 +4548,6 @@ fn render_plan_instructions() -> Option<String> {
     }
 }
 
-async fn load_plan_state(sessions_dir: &Path, session_path: &Path) -> (bool, Option<String>) {
-    match manox_harness::session_meta::load(sessions_dir, session_path).await {
-        Ok(meta) => (meta.plan_mode.unwrap_or(false), meta.plan_file),
-        Err(_) => (false, None),
-    }
-}
-
 /// Persist plan mode + last plan file from the shared state into the session
 /// sidecar (`plan_mode` stored only while on; `plan_file` kept across exits
 /// for the execution handoff).
@@ -4280,23 +4561,6 @@ async fn write_plan_sidecar(
         meta.plan_file = plan.plan_file();
     })
     .await
-}
-
-async fn load_plan_review_pending(sessions_dir: &Path, session_path: &Path) -> bool {
-    match manox_harness::session_meta::load(sessions_dir, session_path).await {
-        Ok(meta) => meta.plan_review_pending.unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
-/// The last `UpdatePlan` snapshot persisted in the sidecar (compaction
-/// survival: the transcript's plan tool calls are summarized away, but the
-/// rail's plan restores from here).
-async fn load_plan_snapshot(sessions_dir: &Path, session_path: &Path) -> Option<serde_json::Value> {
-    match manox_harness::session_meta::load(sessions_dir, session_path).await {
-        Ok(meta) => meta.plan_snapshot,
-        Err(_) => None,
-    }
 }
 
 async fn write_plan_review_pending_sidecar(
@@ -4321,21 +4585,21 @@ async fn write_plan_snapshot_sidecar(
     .await
 }
 
-/// Re-sync plan mode after a session switch: the flag follows the opened
-/// session's sidecar. Emits `PlanModeChanged` so the facade chip tracks the
-/// session it now mirrors; instructions re-render when the target session
-/// plans.
-async fn resync_plan_state(
-    sessions_dir: &Path,
-    session_path: &Path,
+/// Re-sync plan mode after a session switch (K2): the flag comes from the
+/// journal-first restore rebuild. Emits `PlanModeChanged` so the facade
+/// chip tracks the session it now mirrors; instructions re-render when the
+/// target session plans.
+fn resync_plan_state(
+    restored: &RestoredThreadState,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
-    let (enabled, plan_file) = load_plan_state(sessions_dir, session_path).await;
-    plan.set(enabled, plan_file);
-    plan.set_active_instructions(enabled.then(render_plan_instructions).flatten());
+    plan.set(restored.plan_mode, restored.plan_file.clone());
+    plan.set_active_instructions(restored.plan_mode.then(render_plan_instructions).flatten());
     let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PlanModeChanged { enabled },
+        ThreadEvent::PlanModeChanged {
+            enabled: restored.plan_mode,
+        },
     )));
 }
 
@@ -4358,7 +4622,9 @@ async fn write_approval_mode_sidecar(
 }
 
 /// The reasoning effort persisted in a session's sidecar; fresh sessions
-/// (missing sidecar or field) default to High.
+/// (missing sidecar or field) default to High. Test face of the sidecar
+/// cache — production restores go through [`rebuild_restored_state`] (K2).
+#[cfg(test)]
 async fn load_reasoning_effort(sessions_dir: &Path, session_path: &Path) -> ReasoningEffort {
     match manox_harness::session_meta::load(sessions_dir, session_path).await {
         Ok(meta) => match meta.reasoning_effort.as_deref() {
@@ -4384,8 +4650,10 @@ async fn write_reasoning_effort_sidecar(
 }
 
 /// Parse the facade's effort knob wire value; other levels (e.g. "off")
-/// are not user-facing and yield `None`.
-fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
+/// are not user-facing and yield `None`. Shared with the journal replay
+/// fold (K2), which reads the same vocabulary off `thinking_level_change`
+/// entries.
+pub(crate) fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     match raw {
         "high" => Some(ReasoningEffort::High),
         "max" => Some(ReasoningEffort::Max),
@@ -4393,19 +4661,187 @@ fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     }
 }
 
-/// Re-read the session's persisted permission mode after a session switch
-/// and align the gate + the facade's chip with it.
-async fn resync_approval_mode(
-    session: &AgentSession,
-    sessions_dir: &Path,
+/// Re-apply the persisted permission mode after a session switch (K2): the
+/// mode comes from the journal-first restore rebuild; align the gate and
+/// the facade's chip with it.
+fn resync_approval_mode(
+    restored: &RestoredThreadState,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
-    let mode = load_approval_mode(sessions_dir, session.path()).await;
-    state.gate.set_mode(mode);
+    state.gate.set_mode(restored.permission_mode);
     let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PermissionModeChanged { mode },
+        ThreadEvent::PermissionModeChanged {
+            mode: restored.permission_mode,
+        },
     )));
+}
+
+/// The observable state of a restored thread (K2), resolved journal-first:
+/// every field a §C.2 state-change entry carries rebuilds from the active
+/// chain ([`crate::replay::replay_thread_state`]); the session sidecar is
+/// the derived cache that fills fields the chain has never seen (legacy
+/// journals predate the decision-point entries) and is repaired whenever
+/// it diverges from a journal-backed field (conflicts resolve toward the
+/// journal, never the reverse).
+#[derive(Debug, Clone, PartialEq)]
+struct RestoredThreadState {
+    permission_mode: PermissionMode,
+    reasoning_effort: ReasoningEffort,
+    plan_mode: bool,
+    /// Sidecar-only: the plan file has no journal vocabulary (the plan's
+    /// content rides its own file; the entries carry mode + snapshot).
+    plan_file: Option<String>,
+    /// Sidecar-only: the pending-review flag is a restart re-surface hint,
+    /// not a journaled state change.
+    plan_review_pending: bool,
+    plan_snapshot: Option<serde_json::Value>,
+    title: Option<String>,
+    pinned: bool,
+    archived: bool,
+    project: Option<PathBuf>,
+}
+
+/// The replayed plan snapshot, with the model's cleared plan (an empty
+/// array entry) normalized to the sidecar's absence semantics.
+fn journal_plan_snapshot(
+    replayed: &crate::replay::ReplayedThreadState,
+) -> Option<serde_json::Value> {
+    replayed
+        .plan_snapshot
+        .clone()
+        .filter(|value| !value.as_array().is_some_and(|plan| plan.is_empty()))
+}
+
+/// Resolve the journal replay against the sidecar cache (the K2 merge):
+/// journal-backed fields win wherever the chain carries them; the sidecar
+/// fills exactly the fields the chain has never seen (legacy journals
+/// predate the decision-point entries). Pure and total — every restore
+/// face applies this resolution verbatim, and the replay-consistency
+/// regression asserts it across a disk round trip.
+fn merge_restored_state(
+    replayed: &crate::replay::ReplayedThreadState,
+    meta: &manox_harness::session_meta::SessionMeta,
+) -> RestoredThreadState {
+    let permission_mode = replayed.permission_mode.unwrap_or_else(|| {
+        meta.approval_mode
+            .as_deref()
+            .and_then(PermissionMode::from_wire)
+            .unwrap_or_default()
+    });
+    let reasoning_effort =
+        replayed
+            .reasoning_effort
+            .unwrap_or_else(|| match meta.reasoning_effort.as_deref() {
+                Some("max") => ReasoningEffort::Max,
+                _ => ReasoningEffort::default(),
+            });
+    RestoredThreadState {
+        permission_mode,
+        reasoning_effort,
+        plan_mode: replayed
+            .plan_mode
+            .unwrap_or(meta.plan_mode.unwrap_or(false)),
+        plan_file: meta.plan_file.clone(),
+        plan_review_pending: meta.plan_review_pending.unwrap_or(false),
+        plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
+        title: replayed
+            .title
+            .clone()
+            .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty())),
+        pinned: replayed.pinned.unwrap_or(meta.pinned),
+        archived: replayed.archived.unwrap_or(meta.archived),
+        project: match &replayed.project {
+            Some(Some(path)) => Some(PathBuf::from(path)),
+            Some(None) => None,
+            None => meta.project.clone().map(PathBuf::from),
+        },
+    }
+}
+
+/// Fold one session's active chain and resolve it against the sidecar
+/// cache (K2). Runs on every restore face: startup, `Open`, and
+/// `NewSession` (a fresh chain resolves entirely to sidecar defaults).
+async fn rebuild_restored_state(
+    session: &AgentSession,
+    sessions_dir: &Path,
+) -> RestoredThreadState {
+    let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
+    let replayed = crate::replay::replay_thread_state(&records);
+    let meta = manox_harness::session_meta::load(sessions_dir, session.path())
+        .await
+        .unwrap_or_default();
+    let merged = merge_restored_state(&replayed, &meta);
+
+    // Cache repair: re-stamp every journal-backed field whose sidecar copy
+    // diverges from the authority, in one write. Fields the journal has
+    // never seen keep their sidecar value untouched.
+    let repair_mode = replayed
+        .permission_mode
+        .filter(|mode| meta.approval_mode.as_deref() != Some(mode.wire()));
+    let repair_effort = replayed
+        .reasoning_effort
+        .filter(|effort| meta.reasoning_effort.as_deref() != Some(effort.wire_value()));
+    let repair_plan_mode = replayed
+        .plan_mode
+        .filter(|enabled| meta.plan_mode.unwrap_or(false) != *enabled);
+    let repair_snapshot =
+        journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
+    // The TITLE is deliberately not repaired: the desktop rename writes
+    // the sidecar directly (no gateway rename note exists yet), so a
+    // sidecar title diverging from the chain may be a NEWER decision the
+    // journal never saw — repairing would silently revert the user's
+    // rename on the next open. The rebuild itself stays journal-first
+    // (the authority face); the cache converges once the rename decision
+    // point is routed through a journaled face (cross-domain request in
+    // the K3 report).
+    let repair_flags = replayed
+        .pinned
+        .zip(replayed.archived)
+        .filter(|(pin, arc)| meta.pinned != *pin || meta.archived != *arc);
+    let repair_project = match &replayed.project {
+        Some(Some(path)) if meta.project.as_deref() != Some(path.as_str()) => {
+            Some(Some(path.clone()))
+        }
+        Some(None) if meta.project.is_some() => Some(None),
+        _ => None,
+    };
+    if repair_mode.is_some()
+        || repair_effort.is_some()
+        || repair_plan_mode.is_some()
+        || repair_snapshot.is_some()
+        || repair_flags.is_some()
+        || repair_project.is_some()
+    {
+        let result =
+            manox_harness::session_meta::update(sessions_dir, session.path(), move |meta| {
+                if let Some(mode) = repair_mode {
+                    meta.approval_mode = Some(mode.wire().to_string());
+                }
+                if let Some(effort) = repair_effort {
+                    meta.reasoning_effort = Some(effort.wire_value().to_string());
+                }
+                if let Some(enabled) = repair_plan_mode {
+                    meta.plan_mode = enabled.then_some(true);
+                }
+                if let Some(snapshot) = repair_snapshot {
+                    meta.plan_snapshot = Some(snapshot);
+                }
+                if let Some((pin, arc)) = repair_flags {
+                    meta.pinned = pin;
+                    meta.archived = arc;
+                }
+                if let Some(project) = repair_project {
+                    meta.project = project;
+                }
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::warn!(error = %err, "failed to repair the session sidecar from the journal authority");
+        }
+    }
+
+    merged
 }
 
 /// Mirror the session's authoritative entry list (compaction-aware, every
@@ -4564,6 +5000,74 @@ async fn write_project_sidecar(sessions_dir: &Path, session_path: &Path, project
     .await
     {
         tracing::warn!(error = %err, "failed to persist session project");
+    }
+}
+
+/// Bind a session to its project (K3): the sidecar cache write plus the
+/// `project_change` journal entry — the entry is the authority (K2), the
+/// sidecar stays the derived fast-list cache. The append runs the shared
+/// fail-loud discipline; a still-down storage parks the loss record for
+/// the next drain and the facade hears one `Error` notice.
+async fn bind_project(
+    sessions_dir: &Path,
+    session: &AgentSession,
+    project: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    write_project_sidecar(sessions_dir, session.path(), project).await;
+    let appender = session.journal_appender();
+    let payload = serde_json::json!({ "path": project.to_string_lossy() });
+    if let Err(err) = append_typed_resilient(&appender, "project_change", payload).await {
+        if let Some(row) = record_journal_loss(&appender, "project_change", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+            ThreadEvent::Error(anyhow::anyhow!(
+                "journal append permanently failed for `project_change`: {err:#}; the entry was dropped"
+            )),
+        )));
+    }
+}
+
+/// Apply the user's permission-mode decision (K3): gate + sidecar cache +
+/// the notice whose tap emission journals the `permission_mode_change`
+/// entry (L3 — the decision never lives in the cache alone). The facade
+/// already broadcast its own synchronous copy of this event; the echo is
+/// idempotent.
+async fn apply_permission_mode(
+    state: &Arc<EngineState>,
+    sessions_dir: &Path,
+    session_path: &Path,
+    mode: PermissionMode,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    state.gate.set_mode(mode);
+    if let Err(err) = write_approval_mode_sidecar(sessions_dir, session_path, mode).await {
+        tracing::warn!(error = %err, "failed to persist approval mode");
+    }
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::PermissionModeChanged { mode },
+    )));
+}
+
+/// Persist the initial-title decision (K3): the sidecar cache write, the
+/// sidebar refresh, and the `TitleChanged` notice whose tap emission
+/// journals the `title` entry (L3) — the same face the generated title
+/// rides — while the facade mirror tracks the title bar without a reload.
+async fn persist_initial_title(
+    sessions_dir: &Path,
+    session_path: &Path,
+    title: String,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    if let Err(error) = persist_title(sessions_dir, session_path, title.clone()).await {
+        tracing::warn!(%error, "failed to persist initial title");
+    } else {
+        let _ = notice_tx.send(BackendNotice::SessionListDirty);
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
+            title,
+        })));
     }
 }
 
@@ -7876,5 +8380,841 @@ mod tests {
             .await
             .unwrap();
         assert!(guard.is_some(), "uninjected spawn keeps the tempdir guard");
+    }
+
+    // ── K3/K2/K1: decision-point entries, journal authority, replay gate ──
+
+    /// One entry per replay-supported journal kind, in the payload shapes
+    /// the production write faces emit (`durable_journal_payload` and the
+    /// typed-append call sites). The K1 regression drives these through the
+    /// real append face and asserts the coverage list below against the
+    /// resulting chain.
+    fn scripted_state_rows() -> Vec<(&'static str, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            ("turn_start", json!({})),
+            ("agent_text_delta", json!({ "delta": "hel" })),
+            ("agent_thinking_delta", json!({ "delta": "thinking..." })),
+            (
+                "tool_call",
+                json!({ "callId": "call-1", "name": "Read", "title": "Read a file", "status": "pending_approval", "input": { "path": "/tmp/x" } }),
+            ),
+            (
+                "approval",
+                json!({ "kind": "request", "authId": "call-1", "payload": { "toolName": "Read", "summary": "s", "input": {} } }),
+            ),
+            (
+                "approval",
+                json!({ "kind": "decision", "authId": "call-1", "payload": { "toolName": "Read", "verdict": "allow_once" } }),
+            ),
+            (
+                "tool_result",
+                json!({ "callId": "call-1", "output": "ok", "isError": false }),
+            ),
+            (
+                "tool_output_chunk",
+                json!({ "callId": "call-1", "chunk": "stream" }),
+            ),
+            (
+                "subagent_child",
+                json!({ "agentId": "agent-1", "event": { "type": "started", "subagentType": "Sailor", "description": "d", "childId": "c-1" } }),
+            ),
+            (
+                "subagent_progress",
+                json!({ "agentId": "agent-1", "agentType": "Sailor", "toolUses": 2, "tokenUsage": null, "latestActivity": "working", "status": "running" }),
+            ),
+            (
+                "retry",
+                json!({ "attempt": 1, "maxAttempts": 3, "delaySecs": 2, "reason": "overloaded", "detail": null }),
+            ),
+            (
+                "model_change",
+                json!({ "provider": "test", "modelId": "replay-model" }),
+            ),
+            ("cwd_change", json!({ "cwd": "/replay/work" })),
+            ("project_change", json!({ "path": "/replay/proj" })),
+            (
+                "permission_mode_change",
+                json!({ "mode": "danger-full-access" }),
+            ),
+            ("plan_mode_change", json!({ "enabled": true })),
+            (
+                "plan_update",
+                json!({ "snapshot": [{ "content": "step one", "status": "pending", "activeForm": "stepping" }] }),
+            ),
+            ("goal", json!({ "goal": { "objective": "replay" } })),
+            ("title", json!({ "title": "replayed title" })),
+            ("browser_suites", json!({ "suites": ["chrome_use"] })),
+            (
+                "background_task",
+                json!({ "snapshot": { "taskId": "task-1", "status": "running" } }),
+            ),
+            (
+                "pinned_archived",
+                json!({ "pinned": true, "archived": false }),
+            ),
+            (
+                "pinned_archived",
+                json!({ "pinned": false, "archived": true }),
+            ),
+            ("compaction_started", json!({ "tokensBefore": 1234 })),
+            (
+                "metrics",
+                json!({ "metricType": "prefix_stability", "data": { "stabilityPct": 99, "systemChanged": false, "toolsChanged": false } }),
+            ),
+            ("stop", json!({ "reason": "end_turn" })),
+            (
+                "turn_finish",
+                json!({ "cancelled": false, "failed": false, "strandedSteerIds": [] }),
+            ),
+            ("error", json!({ "message": "scripted error row" })),
+        ]
+    }
+
+    /// Every on-disk `type` tag the replay-consistency regression must
+    /// cover: the full state-change vocabulary the fold and restore
+    /// rebuild consume, the transcript + lifecycle + delta kinds the
+    /// display projection consumes, and the two kernel-written faces
+    /// (`thinking_level_change`, `active_tools_change`). Tree-management
+    /// kinds (`leaf`, `label`, `session_info`, `branch_summary`,
+    /// `custom_message`) and the dedicated-path kinds (`message` is
+    /// covered by the real turn; `compaction` owns a richer append path
+    /// the typed face refuses by design) are out of the scripted set.
+    const REPLAY_COVERAGE_KINDS: &[&str] = &[
+        "message",
+        "turn_start",
+        "turn_finish",
+        "stop",
+        "retry",
+        "error",
+        "agent_text_delta",
+        "agent_thinking_delta",
+        "tool_call",
+        "tool_result",
+        "tool_output_chunk",
+        "subagent_child",
+        "subagent_progress",
+        "model_change",
+        "cwd_change",
+        "project_change",
+        "permission_mode_change",
+        "thinking_level_change",
+        "plan_mode_change",
+        "plan_update",
+        "goal",
+        "title",
+        "browser_suites",
+        "background_task",
+        "approval",
+        "pinned_archived",
+        "compaction_started",
+        "metrics",
+        "custom",
+        "active_tools_change",
+    ];
+
+    fn entry_type_tag(entry: &manox_harness::session::SessionTreeEntry) -> String {
+        serde_json::to_value(entry)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|tag| tag.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default()
+    }
+
+    /// K1 (L10) replay-consistency gate: a scripted session covering every
+    /// replay-supported journal kind — the live state (replay fold, restore
+    /// rebuild, display projection, cursor, transcript) must equal, field
+    /// by field, the state rebuilt from the on-disk file through the
+    /// production reload path (`builder.open`, the same seam `run_actor`'s
+    /// restore uses). Timestamps inside message payloads are the one
+    /// as-built exception (K5): the journal is the authority and they are
+    /// not a byte-for-byte assertion face, so the transcript comparison
+    /// strips them.
+    #[tokio::test]
+    async fn journal_replay_is_consistent_across_disk_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let sessions = dir.path().join("sessions");
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0, // first call answers "done": the turn completes
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let resolver_for = |stream: Arc<ToolRoundsStream>| {
+            let resolver: manox_harness::agent_loop::StreamResolver =
+                Arc::new(move |_m: &PiModel| {
+                    Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+                });
+            resolver
+        };
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(sessions.clone())
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver_for(Arc::clone(&stream))))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // A real turn: the user + assistant `message` entries land through
+        // the persistence middleware (the deferred session materializes).
+        session.prompt("replay consistency turn").await.unwrap();
+
+        // One entry per supported kind through the production typed-append
+        // face — the same `append_typed` the serializer runs.
+        let appender = session.journal_appender();
+        for (kind, payload) in scripted_state_rows() {
+            appender
+                .append_typed(kind, payload)
+                .await
+                .unwrap_or_else(|err| panic!("typed append `{kind}` must land: {err:#}"));
+        }
+        // The kernel-written faces: the reasoning-effort entry in its
+        // on-disk vocabulary (the `set_thinking_level` clamp against a
+        // non-thinking test model would record "off", which is not an
+        // effort — the clamp is kernel-owned and harness-tested) and the
+        // active-tool set through the production kernel face.
+        appender
+            .append_typed(
+                "thinking_level_change",
+                serde_json::json!({ "thinkingLevel": "max" }),
+            )
+            .await
+            .unwrap();
+        session
+            .set_active_tools(vec!["Read".into(), "Grep".into()])
+            .await
+            .unwrap();
+        // A UI annotation card (the display projection's `custom` face).
+        assert!(
+            persist_ui_note(
+                &session,
+                &UiNoteRecord {
+                    kind: crate::db::UiNoteKind::Notice,
+                    data: serde_json::json!({ "text": "scripted note" }),
+                },
+            )
+            .await
+        );
+
+        // ── Live-state capture. ──────────────────────────────────────────
+        let live_records = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        let live_replay = crate::replay::replay_thread_state(&live_records);
+        let live_rebuilt = rebuild_restored_state(&session, &sessions).await;
+        let live_entries = session.context_entries().await.unwrap();
+        let (live_display, live_notes) = adapt::entries_to_display(&live_entries);
+        let live_cursor = appender.storage().journal_cursor().await;
+        let strip_timestamps = |messages: &[AgentMessage]| -> Vec<serde_json::Value> {
+            messages
+                .iter()
+                .map(|message| {
+                    let mut value = serde_json::to_value(message).unwrap();
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("timestamp");
+                    }
+                    value
+                })
+                .collect()
+        };
+        let live_transcript = strip_timestamps(session.harness_messages());
+        let live_path = session.path().to_path_buf();
+
+        // The fold reflects the scripted decisions (the entries are the
+        // authority — not empty defaults), last-wins per field.
+        assert_eq!(live_replay.title.as_deref(), Some("replayed title"));
+        assert_eq!(live_replay.pinned, Some(false));
+        assert_eq!(live_replay.archived, Some(true));
+        assert_eq!(live_replay.project, Some(Some("/replay/proj".into())));
+        assert_eq!(
+            live_replay.permission_mode,
+            Some(PermissionMode::DangerFullAccess)
+        );
+        assert_eq!(live_replay.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(live_replay.plan_mode, Some(true));
+        assert_eq!(live_replay.cwd.as_deref(), Some("/replay/work"));
+        assert_eq!(
+            live_replay.goal,
+            Some(serde_json::json!({ "objective": "replay" }))
+        );
+        assert_eq!(
+            live_rebuilt.title.as_deref(),
+            Some("replayed title"),
+            "restore rebuild must read the journal title"
+        );
+        assert!(!live_rebuilt.pinned && live_rebuilt.archived);
+        assert_eq!(live_rebuilt.project, Some(PathBuf::from("/replay/proj")));
+        assert_eq!(
+            live_rebuilt.permission_mode,
+            PermissionMode::DangerFullAccess
+        );
+        assert_eq!(live_rebuilt.reasoning_effort, ReasoningEffort::Max);
+        assert!(live_rebuilt.plan_mode);
+
+        // K2 cache repair: the diverging (here: empty) sidecar converges
+        // toward the journal authority — EXCEPT the title, which is never
+        // repaired over: a diverging sidecar title may be a newer desktop
+        // rename the journal never saw (the rename's journaled routing is
+        // the open cross-domain K3 request), so the cache keeps it.
+        let repaired = manox_harness::session_meta::load(&sessions, &live_path)
+            .await
+            .unwrap();
+        assert_eq!(repaired.title, None);
+        assert!(!repaired.pinned && repaired.archived);
+        assert_eq!(repaired.project.as_deref(), Some("/replay/proj"));
+        assert_eq!(
+            repaired.approval_mode.as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(repaired.reasoning_effort.as_deref(), Some("max"));
+        assert_eq!(repaired.plan_mode, Some(true));
+
+        // Coverage guard: every supported kind is actually on the chain —
+        // a silently skipped kind would make the round-trip assertions
+        // vacuous.
+        let live_tags: std::collections::HashSet<String> = live_records
+            .iter()
+            .map(|record| entry_type_tag(&record.entry))
+            .collect();
+        for kind in REPLAY_COVERAGE_KINDS {
+            assert!(
+                live_tags.contains(*kind),
+                "the scripted session must cover `{kind}`; on chain: {live_tags:?}"
+            );
+        }
+
+        // ── Reload through the production path and re-capture. ──────────
+        session.close().await.unwrap();
+        let reloaded = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(sessions.clone())
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver_for(Arc::clone(&stream))))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .open(live_path)
+            .await
+            .unwrap();
+        let reloaded_records = reloaded.journal_range(0, u64::MAX).await.unwrap();
+        let reloaded_replay = crate::replay::replay_thread_state(&reloaded_records);
+        let reloaded_rebuilt = rebuild_restored_state(&reloaded, &sessions).await;
+        let reloaded_entries = reloaded.context_entries().await.unwrap();
+        let (reloaded_display, reloaded_notes) = adapt::entries_to_display(&reloaded_entries);
+        let reloaded_cursor = reloaded.journal_cursor().await;
+        let reloaded_transcript = strip_timestamps(reloaded.harness_messages());
+
+        // ── Disk reload == live memory, field by field (§J.2). ──────────
+        assert_eq!(
+            live_replay, reloaded_replay,
+            "the replay fold diverged across the disk round trip"
+        );
+        assert_eq!(
+            live_rebuilt, reloaded_rebuilt,
+            "the restore rebuild diverged across the disk round trip"
+        );
+        assert_eq!(
+            live_records.len(),
+            reloaded_records.len(),
+            "the reloaded chain lost or gained entries"
+        );
+        for (live, reloaded) in live_records.iter().zip(&reloaded_records) {
+            assert_eq!(live.seq, reloaded.seq, "seq diverged on the round trip");
+            assert_eq!(
+                serde_json::to_value(&live.entry).unwrap(),
+                serde_json::to_value(&reloaded.entry).unwrap(),
+                "entry `{}` diverged on the round trip",
+                entry_type_tag(&live.entry)
+            );
+        }
+        // The display comparison strips the per-message `id`: the mapping
+        // mints a fresh UUID on every rebuild (it is not journal-derived),
+        // so like message-payload timestamps (the K5 as-built note) it is
+        // not a byte-for-byte assertion face. Everything else — roles,
+        // content, note cards, ordering — must round-trip exactly.
+        let display_shape = |display: &[HistoryEntry]| -> Vec<serde_json::Value> {
+            display
+                .iter()
+                .map(|entry| {
+                    let mut value = serde_json::to_value(entry).unwrap();
+                    if let Some(message) = value.get_mut("Message").and_then(|m| m.as_object_mut())
+                    {
+                        message.remove("id");
+                    }
+                    value
+                })
+                .collect()
+        };
+        assert_eq!(
+            display_shape(&live_display),
+            display_shape(&reloaded_display),
+            "the display projection diverged across the disk round trip"
+        );
+        let note_shape = |notes: &[crate::db::PositionedNote]| -> Vec<serde_json::Value> {
+            notes
+                .iter()
+                .map(|note| {
+                    serde_json::json!({
+                        "afterMessage": note.after_message,
+                        "note": serde_json::to_value(&note.note).unwrap(),
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(
+            note_shape(&live_notes),
+            note_shape(&reloaded_notes),
+            "the UI-note positions diverged across the disk round trip"
+        );
+        assert_eq!(
+            live_cursor, reloaded_cursor,
+            "the journal cursor diverged across the disk round trip"
+        );
+        assert_eq!(
+            live_transcript, reloaded_transcript,
+            "the transcript diverged across the disk round trip"
+        );
+        // The reloaded chain stays dense (L4): contiguous seq from 0 and
+        // the cursor sits on the last record.
+        for (index, record) in reloaded_records.iter().enumerate() {
+            assert_eq!(record.seq, index as u64, "the reloaded chain is not dense");
+        }
+        assert_eq!(
+            reloaded_cursor,
+            reloaded_records
+                .last()
+                .map(|record| record.seq)
+                .unwrap_or(0)
+        );
+    }
+
+    /// K2 authority: the journal rebuild WINS over a diverging sidecar, and
+    /// the sidecar cache is repaired toward the journal.
+    #[tokio::test]
+    async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let sessions = dir.path().join("sessions");
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(sessions.clone())
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // A stale sidecar: the cache says one thing …
+        manox_harness::session_meta::update(&sessions, session.path(), |meta| {
+            meta.title = Some("stale sidecar title".into());
+            meta.pinned = true;
+            meta.archived = false;
+            meta.approval_mode = Some("read-only".into());
+            meta.project = Some("/stale/project".into());
+        })
+        .await
+        .unwrap();
+        // … the journal says another (K3's decision-point entries).
+        let appender = session.journal_appender();
+        appender
+            .append_typed("title", serde_json::json!({ "title": "journal title" }))
+            .await
+            .unwrap();
+        appender
+            .append_typed(
+                "pinned_archived",
+                serde_json::json!({ "pinned": false, "archived": true }),
+            )
+            .await
+            .unwrap();
+        appender
+            .append_typed(
+                "permission_mode_change",
+                serde_json::json!({ "mode": "workspace-write" }),
+            )
+            .await
+            .unwrap();
+        appender
+            .append_typed(
+                "project_change",
+                serde_json::json!({ "path": "/journal/project" }),
+            )
+            .await
+            .unwrap();
+
+        let rebuilt = rebuild_restored_state(&session, &sessions).await;
+        assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
+        assert!(!rebuilt.pinned);
+        assert!(rebuilt.archived);
+        assert_eq!(rebuilt.permission_mode, PermissionMode::WorkspaceWrite);
+        assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
+
+        // The cache converged toward the authority in the same pass —
+        // except the title: a diverging sidecar title may be a newer
+        // desktop rename the journal never saw, so repairing over it
+        // would silently revert the user's rename. The rebuild itself
+        // stays journal-first (the `rebuilt.title` assert above).
+        let repaired = manox_harness::session_meta::load(&sessions, session.path())
+            .await
+            .unwrap();
+        assert_eq!(repaired.title.as_deref(), Some("stale sidecar title"));
+        assert!(!repaired.pinned && repaired.archived);
+        assert_eq!(repaired.approval_mode.as_deref(), Some("workspace-write"));
+        assert_eq!(repaired.project.as_deref(), Some("/journal/project"));
+        session.close().await.unwrap();
+    }
+
+    /// K2 migration window: a legacy chain without decision-point entries
+    /// resolves entirely from the sidecar — the rebuild never overwrites
+    /// cached state with defaults.
+    #[tokio::test]
+    async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
+        let replayed = crate::replay::ReplayedThreadState::default();
+        let meta = manox_harness::session_meta::SessionMeta {
+            title: Some("sidecar title".into()),
+            project: Some("/sidecar/project".into()),
+            approval_mode: Some("read-only".into()),
+            plan_mode: Some(true),
+            reasoning_effort: Some("max".into()),
+            plan_file: Some("/plans/x-plan.md".into()),
+            plan_review_pending: Some(true),
+            plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
+            pinned: true,
+            archived: true,
+            ..Default::default()
+        };
+        let merged = merge_restored_state(&replayed, &meta);
+        assert_eq!(merged.title.as_deref(), Some("sidecar title"));
+        assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
+        assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
+        assert!(merged.plan_mode);
+        assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
+        assert_eq!(merged.plan_file.as_deref(), Some("/plans/x-plan.md"));
+        assert!(merged.plan_review_pending);
+        assert_eq!(
+            merged.plan_snapshot,
+            Some(serde_json::json!([{ "content": "step" }]))
+        );
+        assert!(merged.pinned && merged.archived);
+    }
+
+    /// A cleared plan (the empty `plan_update` snapshot the facade
+    /// persists on clear) normalizes to the sidecar's absence semantics —
+    /// the rebuild must not resurrect an empty plan rail.
+    #[test]
+    fn cleared_plan_snapshot_normalizes_to_absence() {
+        let replayed = crate::replay::ReplayedThreadState {
+            plan_snapshot: Some(serde_json::json!([])),
+            ..Default::default()
+        };
+        let meta = manox_harness::session_meta::SessionMeta::default();
+        let merged = merge_restored_state(&replayed, &meta);
+        assert_eq!(merged.plan_snapshot, None);
+    }
+
+    /// K3 routing: a store-level decision row reaches the live actor's
+    /// command queue through the registry route, and the shutdown claim
+    /// lands queued rows in the journal even when they arrive behind the
+    /// actor's `Shutdown` break (the gateway archives right after dispose).
+    #[tokio::test]
+    async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let thread_id = format!("route-test-{}", uuid::Uuid::new_v4());
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        register_engine_route(&thread_id, &cmd_tx);
+
+        // Live route: the dispatch lands on the actor queue (send order =
+        // persist order, §C.3).
+        dispatch_store_journal_row(
+            thread_id.clone(),
+            None,
+            "pinned_archived".into(),
+            serde_json::json!({ "pinned": true, "archived": false }),
+        );
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("the routed row must reach the actor queue")
+            .expect("the channel stays open");
+        match queued {
+            SessionCmd::AppendJournal { kind, payload } => {
+                assert_eq!(kind, "pinned_archived");
+                assert_eq!(payload["pinned"], serde_json::json!(true));
+            }
+            _other => panic!("expected an AppendJournal row, got a different SessionCmd variant"),
+        }
+
+        // Shutdown claim: a row queued while the actor is exiting is
+        // claimed under the registry lock and appended before close.
+        let appender = session.journal_appender();
+        dispatch_store_journal_row(
+            thread_id.clone(),
+            None,
+            "pinned_archived".into(),
+            serde_json::json!({ "pinned": false, "archived": true }),
+        );
+        let claimed = retire_and_claim_journal_rows(&thread_id, &mut cmd_rx);
+        assert_eq!(claimed.len(), 1, "the queued row must be claimed");
+        for (kind, payload) in claimed {
+            append_row_fail_loud(&appender, kind, payload).await;
+        }
+        let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        assert!(
+            rows.iter().any(|record| matches!(
+                &record.entry,
+                manox_harness::session::SessionTreeEntry::PinnedArchived { pinned, archived, .. }
+                    if !*pinned && *archived
+            )),
+            "the claimed row must land in the journal"
+        );
+
+        // A retired route never accepts new rows: the dispatch waits for
+        // the route's removal, then takes the cold path (no file here —
+        // the row is skipped, which the wait+removal must not hang on).
+        unregister_engine_route(&thread_id, &cmd_tx);
+        dispatch_store_journal_row(
+            thread_id.clone(),
+            None,
+            "pinned_archived".into(),
+            serde_json::json!({ "pinned": true, "archived": true }),
+        );
+        // Give the spawned waiter a beat; the assertion is that the route
+        // table stays clean (the test's global-state hygiene) and nothing
+        // panics or hangs.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            engine_routes().lock().unwrap().get(&thread_id).is_none(),
+            "the test must leave the engine-route registry clean"
+        );
+        session.close().await.unwrap();
+    }
+
+    /// A minimal session for the K3 decision-point tests: a real jsonl
+    /// storage (deferred until first write), a scripted stream that is
+    /// never exercised, and the production builder path.
+    async fn decision_rig_session(dir: &tempfile::TempDir) -> AgentSession {
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// K3 (L3) regression: the project-binding decision journals a
+    /// `project_change` entry alongside the sidecar cache write — pre-fix
+    /// the binding was written to the sidecar only, leaving the chain
+    /// without the authority K2 rebuilds from.
+    #[tokio::test]
+    async fn project_binding_journals_project_change_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = decision_rig_session(&dir).await;
+        let state = test_engine_state();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        bind_project(
+            &sessions,
+            &session,
+            Path::new("/bound/project"),
+            &state,
+            &notice_tx,
+        )
+        .await;
+
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        assert!(
+            rows.iter().any(|record| matches!(
+                &record.entry,
+                manox_harness::session::SessionTreeEntry::ProjectChange { path, .. }
+                    if path.as_deref() == Some("/bound/project")
+            )),
+            "the binding must journal a project_change entry; chain kinds: {:?}",
+            rows.iter()
+                .map(|record| entry_type_tag(&record.entry))
+                .collect::<Vec<_>>()
+        );
+        // The sidecar cache follows (fast-list mirror, K2).
+        let meta = manox_harness::session_meta::load(&sessions, session.path())
+            .await
+            .unwrap();
+        assert_eq!(meta.project.as_deref(), Some("/bound/project"));
+        session.close().await.unwrap();
+    }
+
+    /// K3 (L3) regression: the permission-mode decision emits the notice
+    /// whose tap mapping journals `permission_mode_change` — pre-fix the
+    /// choice landed in the gate and the sidecar only, so the chain never
+    /// carried the user's mode toggle.
+    #[tokio::test]
+    async fn permission_mode_decision_journals_through_the_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = decision_rig_session(&dir).await;
+        let state = test_engine_state();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        apply_permission_mode(
+            &state,
+            &sessions,
+            session.path(),
+            PermissionMode::ReadOnly,
+            &notice_tx,
+        )
+        .await;
+
+        assert_eq!(state.gate.mode(), PermissionMode::ReadOnly);
+        let meta = manox_harness::session_meta::load(&sessions, session.path())
+            .await
+            .unwrap();
+        assert_eq!(meta.approval_mode.as_deref(), Some("read-only"));
+
+        // The decision notifies, and the tap's mapping of that notice is
+        // the journal row (the same `durable_journal_payload` face the
+        // spawn_engine tap runs). Bounded: a missing emission must fail
+        // the test, not hang it.
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the mode decision must reach the notice face"))
+            .expect("the notice channel must stay open");
+        let BackendNotice::Event(event) = notice else {
+            panic!("the mode decision must ride a ThreadEvent notice");
+        };
+        let ThreadEvent::PermissionModeChanged { mode } = *event else {
+            panic!("expected PermissionModeChanged");
+        };
+        assert_eq!(mode, PermissionMode::ReadOnly);
+        let (kind, payload) = durable_journal_payload(&ThreadEvent::PermissionModeChanged { mode })
+            .expect("the tap maps the decision to a typed row");
+        assert_eq!(kind, "permission_mode_change");
+        session
+            .journal_appender()
+            .append_typed(&kind, payload)
+            .await
+            .unwrap();
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        assert!(
+            rows.iter().any(|record| matches!(
+                &record.entry,
+                manox_harness::session::SessionTreeEntry::PermissionModeChange { mode, .. }
+                    if mode == "read-only"
+            )),
+            "the decision must land a permission_mode_change entry"
+        );
+        session.close().await.unwrap();
+    }
+
+    /// K3 (L3) regression: the initial-title decision rides the same
+    /// notice tap as the generated title — pre-fix only
+    /// `SessionListDirty` fired, so the chain never carried a `title`
+    /// entry for the initial title and the K2 rebuild stayed blind to it.
+    #[tokio::test]
+    async fn initial_title_decision_journals_through_the_tap() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = decision_rig_session(&dir).await;
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        persist_initial_title(
+            &sessions,
+            session.path(),
+            "initial title".to_string(),
+            &notice_tx,
+        )
+        .await;
+
+        let meta = manox_harness::session_meta::load(&sessions, session.path())
+            .await
+            .unwrap();
+        assert_eq!(meta.title.as_deref(), Some("initial title"));
+
+        // First the sidebar refresh, then the TitleChanged notice whose
+        // tap mapping is the `title` row. Bounded: a missing emission must
+        // fail the test, not hang it.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the sidebar must refresh"))
+            .expect("the notice channel must stay open");
+        assert!(
+            matches!(first, BackendNotice::SessionListDirty),
+            "the refresh notice comes first"
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the title decision must reach the notice face"))
+            .expect("the notice channel must stay open");
+        let BackendNotice::Event(event) = second else {
+            panic!("the title decision must ride a ThreadEvent notice");
+        };
+        let ThreadEvent::TitleChanged { title } = *event else {
+            panic!("expected TitleChanged");
+        };
+        assert_eq!(title, "initial title");
+        let (kind, payload) = durable_journal_payload(&ThreadEvent::TitleChanged { title })
+            .expect("the tap maps the decision to a typed row");
+        assert_eq!(kind, "title");
+        session
+            .journal_appender()
+            .append_typed(&kind, payload)
+            .await
+            .unwrap();
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        assert!(
+            rows.iter().any(|record| matches!(
+                &record.entry,
+                manox_harness::session::SessionTreeEntry::Title { title, .. }
+                    if title == "initial title"
+            )),
+            "the decision must land a title entry"
+        );
+        session.close().await.unwrap();
     }
 }

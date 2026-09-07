@@ -536,6 +536,12 @@ impl ThreadStore {
                 summary.archived = false;
                 self.summaries.push(summary);
             }
+            // K3 (L3): every cascaded row's flag decision journals its own
+            // `pinned_archived` entry (the entry is the authority, K2); a
+            // skipped row already carries the target state and stays
+            // silent, matching the no-op discipline of this method.
+            let pinned = self.summary_by_id(&tid).is_some_and(|s| s.pinned);
+            self.journal_pinned_archived(&tid, pinned, archived);
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
@@ -568,10 +574,31 @@ impl ThreadStore {
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
     pub fn pin_thread(&mut self, id: &str, pinned: bool) {
+        let archived = self.summary_by_id(id).is_some_and(|s| s.archived);
         if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
+        // K3 (L3): the flag decision journals a `pinned_archived` entry —
+        // the entry is the authority (K2) and the sidecar write below is
+        // the derived fast-list cache. The entry carries BOTH flags, so
+        // one entry fully re-establishes the pair on rebuild.
+        self.journal_pinned_archived(id, pinned, archived);
         self.write_meta(id, move |meta| meta.pinned = pinned);
+    }
+
+    /// Route a `pinned_archived` decision into the thread's journal (K3):
+    /// the live engine actor serializes it against every other writer of
+    /// the session; a thread without an engine cold-appends on the session
+    /// file. The flag pair is the post-decision full state, sourced from
+    /// the summary mirror (a thread whose summary never loaded carries the
+    /// decided flag alone — every later decision re-carries the pair).
+    fn journal_pinned_archived(&self, id: &str, pinned: bool, archived: bool) {
+        crate::engine::dispatch_store_journal_row(
+            id.to_string(),
+            self.session_paths.get(id).cloned(),
+            "pinned_archived".into(),
+            serde_json::json!({ "pinned": pinned, "archived": archived }),
+        );
     }
 
     /// Set the user tag on a session (persisted in its sidecar); `None`
@@ -1555,6 +1582,117 @@ mod tests {
                     .any(|s| s.id == "member" && s.archived)
             );
         });
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// K3 (L3) regression: a pin / archive decision on a thread with no
+    /// live engine journals its `pinned_archived` entry through the cold
+    /// storage append — the decision-point entry lands on the session's
+    /// chain (authority for the K2 rebuild), not only in the sidecar
+    /// cache. Covers the cascade too: archiving a lead journals an entry
+    /// for every descendant row that actually moves.
+    #[test]
+    fn pin_and_archive_decisions_cold_append_pinned_archived_entries() {
+        let (db, db_path) = temp_db();
+        crate::runtime::init();
+        let dir = tempfile::tempdir().unwrap();
+        // Real session files (v3 headers: the cold append rides the lazy
+        // v3→v4 migration like any other writer). The child carries its
+        // team edge in the header so the post-write rescans (which rebuild
+        // the summaries from disk) keep the cascade link.
+        let write_session = |id: &str, metadata: &str| {
+            let path = dir.path().join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"),
+            )
+            .unwrap();
+            path
+        };
+        let lead = write_session("k3-lead", "{\"host\":\"manox\"}");
+        let child = write_session(
+            "k3-child",
+            "{\"host\":\"manox\",\"team\":{\"parent\":\"k3-lead\"}}",
+        );
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.sessions_dir = dir.path().to_path_buf();
+            s.session_paths.insert("k3-lead".to_string(), lead.clone());
+            s.session_paths
+                .insert("k3-child".to_string(), child.clone());
+            s.insert_summary_for_test("k3-lead", None);
+            s.insert_summary_for_test("k3-child", Some("k3-lead"));
+        });
+
+        // The pinned_archived entries each decision must land, in order.
+        let entries_for = |path: &std::path::Path| -> Vec<(bool, bool)> {
+            crate::runtime::handle()
+                .block_on(async {
+                    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+                        .await
+                        .unwrap();
+                    storage.journal_range(0, u64::MAX).await.unwrap()
+                })
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::PinnedArchived {
+                        pinned,
+                        archived,
+                        ..
+                    } => Some((pinned, archived)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_for_entries = |path: &std::path::Path, count: usize| {
+            for _ in 0..1500 {
+                let entries = entries_for(path);
+                if entries.len() >= count {
+                    return entries;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "the decision-point entry never landed in {}: {:?}",
+                path.display(),
+                entries_for(path)
+            );
+        };
+
+        // Pin: one entry carrying BOTH flags (the pair fully re-establishes
+        // the state on rebuild), appended while the sidecar cache follows.
+        store.with_mut(|s| s.pin_thread("k3-lead", true));
+        let pinned = wait_for_entries(&lead, 1);
+        assert_eq!(
+            pinned,
+            vec![(true, false)],
+            "pin journals {{pinned:true, archived:false}}"
+        );
+
+        // Archive cascades: the lead AND the child each journal their own
+        // entry, carrying the pinned flag the summary mirror holds.
+        store.with_mut(|s| s.archive_thread("k3-lead", true));
+        let lead_entries = wait_for_entries(&lead, 2);
+        assert_eq!(
+            lead_entries[1],
+            (true, true),
+            "the cascade entry carries the full post-decision flag pair"
+        );
+        let child_entries = wait_for_entries(&child, 1);
+        assert_eq!(
+            child_entries[0],
+            (false, true),
+            "the child journals its own entry"
+        );
+
+        // Re-asserting the current state is a no-op: no duplicate entry.
+        store.with_mut(|s| s.archive_thread("k3-lead", true));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            entries_for(&lead).len(),
+            2,
+            "a no-op decision must not journal"
+        );
         std::fs::remove_file(db_path).ok();
     }
 }

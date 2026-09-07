@@ -39,6 +39,7 @@ pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
 pub mod provider_glue;
+pub mod replay;
 pub mod runtime;
 pub mod sandbox;
 pub mod settings;

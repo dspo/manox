@@ -915,12 +915,25 @@ impl Thread {
                     plan_review_pending,
                     plan_snapshot,
                     title,
+                    pinned,
+                    archived,
+                    project,
                 } = *notice;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot.and_then(|v| serde_json::from_value(v).ok());
                 self.restored = restored;
                 self.title = title;
+                // K2: the flags and the project binding rebuild from the
+                // journal chain (the sidecar filled whatever the chain
+                // never saw) — the facade mirrors the authority so the
+                // projection baseline seeds from journal-backed state.
+                // A `None` project leaves an existing binding untouched.
+                self.pinned = pinned;
+                self.archived = archived;
+                if let Some(dir) = project {
+                    self.project = Some(dir);
+                }
                 // The restored session's model is authoritative only until the
                 // user names one: a pick made while the engine assembled is
                 // already queued to the actor, and this boot-time snapshot
@@ -2962,6 +2975,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         let (phase, texts) = thread.read(|t| {
             let texts: Vec<String> = t
@@ -3038,6 +3054,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(
             thread.read(|t| t.permission_mode()),
@@ -3135,6 +3154,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: Some(value),
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(t.persisted_plan(), Some(&snapshot));
@@ -3170,6 +3192,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
     }
@@ -3200,6 +3225,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
     }
@@ -3238,6 +3266,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(
@@ -3267,6 +3298,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(
@@ -3316,6 +3350,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: Some("终端标题修复".into()),
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| assert_eq!(t.display_title(), "终端标题修复"));
         thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
@@ -3349,6 +3386,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         }))
     }
 
@@ -3381,5 +3421,62 @@ pub(crate) mod tests {
             thread.read(|t| t.model().cloned()),
             Some(facade_model("restored"))
         );
+    }
+
+    /// K2: the `Ready` projection carries the journal-rebuilt flags and
+    /// project binding — the facade mirrors them so the gateway's
+    /// projection baseline seeds from journal-backed state instead of the
+    /// construction defaults (a restored pin/archive/binding must be
+    /// visible without touching the sidecar cache).
+    #[test]
+    fn ready_projection_mirrors_journal_rebuilt_flags_and_project() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: Some("journal title".into()),
+            pinned: true,
+            archived: true,
+            project: Some(PathBuf::from("/journal/project")),
+        })));
+        thread.read(|t| {
+            assert!(t.is_pinned(), "the journal-rebuilt pin must mirror");
+            assert!(t.archived(), "the journal-rebuilt archive must mirror");
+            assert_eq!(t.project(), Some(&PathBuf::from("/journal/project")));
+            assert_eq!(t.display_title(), "journal title");
+        });
+
+        // A `None` project leaves an existing binding untouched (an
+        // unbound chain with no sidecar binding never clobbers a
+        // binding the store already restored).
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| t.restore_project(PathBuf::from("/store/project")));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+            pinned: false,
+            archived: false,
+            project: None,
+        })));
+        thread.read(|t| {
+            assert_eq!(t.project(), Some(&PathBuf::from("/store/project")));
+        });
     }
 }
