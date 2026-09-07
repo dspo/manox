@@ -337,6 +337,46 @@ describe('Host SessionStatus mirror', () => {
 
 	const row = (store: Store) => store.get().threads.find((r) => r.id === SESSION);
 
+	it('GW5: a list refresh preserves the client-owned unread; focus clears it', () => {
+		// A plain store keeps SESSION unfocused (openStore activates it, and
+		// the active gate must keep that row dark — pinned by the test above).
+		const store = new Store();
+		const effects = spyEffects();
+		store.attachEffects(effects);
+		// Seed the row, then the settle delta lights it (session not active).
+		store.dispatch(rowOf());
+		store.dispatch(status({ unread: true }));
+		expect(row(store)?.unread).toBe(true);
+		// Server rows carry a constant unread:false since the GW5 mirror
+		// retirement — folding a refresh must NOT wipe the client flag.
+		store.dispatch(rowOf());
+		expect(row(store)?.unread).toBe(true);
+		// Local focus clears it (client-owned, §F.2)...
+		store.openLocal(SESSION);
+		expect(row(store)?.unread).toBe(false);
+		// ...and the active session's mirror gate keeps it dark.
+		store.dispatch(status({ unread: true }));
+		expect(row(store)?.unread).toBe(false);
+		// A refresh after the clear stays cleared.
+		store.dispatch(rowOf());
+		expect(row(store)?.unread).toBe(false);
+	});
+
+	it('GW5: backToList is the local blur — the settle after it lights the row', () => {
+		const { store } = openStore();
+		// openStore activated SESSION (the row is the focused one).
+		store.dispatch(rowOf());
+		store.dispatch(status({ unread: true }));
+		expect(row(store)?.unread).toBe(false); // active gate holds it dark
+		// Leaving the conversation view clears activeThreadId — the blur the
+		// retired focusThread note used to carry server-side.
+		store.backToList();
+		expect(store.get().activeThreadId).toBe(null);
+		// A turn settling after the blur now lights the badge.
+		store.dispatch(status({ unread: true }));
+		expect(row(store)?.unread).toBe(true);
+	});
+
 	it('mirrors running / pendingAuth / backgroundWork latest-wins', () => {
 		const { store } = openStore();
 		store.dispatch(rowOf());

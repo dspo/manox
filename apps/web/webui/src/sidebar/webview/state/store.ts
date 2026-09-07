@@ -494,7 +494,11 @@ export class Store {
 	}
 
 	backToList(): void {
-		this.patch({ ...this.state, view: 'threads' });
+		// GW5: this IS the blur — the active gate keys off activeThreadId,
+		// so leaving it set would suppress the settle-unread of the thread
+		// the user just left (the former server-side focus mirror owned
+		// this; unread is client-owned now).
+		this.patch({ ...this.state, view: 'threads', activeThreadId: null });
 	}
 
 	/** Session ids with live local state (the api re-follows these on a
@@ -1328,7 +1332,16 @@ function foldThreads(state: ChatState, threads: ThreadListItem[]): ChatState {
 			perThread = { ...perThread, [item.id]: { ...t, title: item.title } };
 		}
 	}
-	return { ...state, threads, perThread };
+	// GW5 (§F.2): `unread` is client-owned — wire rows carry a constant
+	// false since the server-side mirror retirement, so a list refresh
+	// must preserve the mirror's flag for rows that persist across the
+	// fold (monotonic until the local focus clear).
+	const byId = new Map(state.threads.map((row) => [row.id, row]));
+	const merged = threads.map((item) => {
+		const prev = byId.get(item.id);
+		return prev?.unread ? { ...item, unread: true } : item;
+	});
+	return { ...state, threads: merged, perThread };
 }
 
 function updateThread(

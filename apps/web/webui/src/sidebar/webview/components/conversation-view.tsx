@@ -96,8 +96,9 @@ export const ConversationView = memo(({
   };
 
   const backToList = () => {
+    // GW5: store.backToList() clears activeThreadId — the local blur that
+    // re-arms the settle-unread gate (the focusThread note is retired).
     store.backToList();
-    api.blurThread();
   };
 
   return (

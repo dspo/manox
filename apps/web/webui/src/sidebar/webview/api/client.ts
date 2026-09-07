@@ -328,9 +328,6 @@ export class ThreadApi {
 		postNote({ method: 'stopBackgroundTask', sessionId: this.sessionId, taskId });
 	}
 
-	focus(): void {
-		postNote({ method: 'focusThread', sessionId: this.sessionId });
-	}
 }
 
 /** Global command surface (thread registry, models, slash entries). */
@@ -406,11 +403,10 @@ export const api = {
 		// confirms it); the `OpenSession` receipt is just ownership (§D.2).
 		storeSink?.openRemote(sessionId);
 	},
-	/** Clear the focused thread (leaving the conversation view) so turns that
-	 * finish afterwards mark it unread. */
-	blurThread(): void {
-		postNote({ method: 'focusThread', sessionId: null });
-	},
+	// GW5: the former `blurThread()` posted a `focusThread` note — the
+	// server-side focus mirror is retired (the handler is a no-op, the
+	// variant dies at C4). The blur is local state: `store.backToList()`
+	// clears `activeThreadId`, which re-arms the settle-unread gate.
 };
 
 /** Re-export for component ergonomics (the host capability set the webview

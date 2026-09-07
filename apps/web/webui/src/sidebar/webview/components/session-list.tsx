@@ -16,7 +16,7 @@ import {
 import { Fragment, useEffect, useState } from 'react';
 
 import type { ThreadListItem } from '../../../protocol';
-import { api, ThreadApi } from '../api/client';
+import { api } from '../api/client';
 import { formatRelativeTime, t } from '../lib/i18n';
 import { partitionSessions, type SessionTreeNode } from '../lib/sessions';
 import { threadRowState } from '../lib/thread-status';
@@ -29,8 +29,9 @@ export const openThread = (item: ThreadListItem) => {
   // Threads with live local state switch instantly and only refocus the
   // actor; the rest go through the host's open handshake.
   if (store.get().perThread[item.id]) {
+    // GW5: openLocal sets activeThreadId and clears the unread mirror —
+    // the focus is client-owned state, the focusThread note is retired.
     store.openLocal(item.id);
-    new ThreadApi(item.id).focus();
   } else {
     api.openThread(item.id);
   }
