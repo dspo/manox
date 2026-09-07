@@ -47,11 +47,13 @@ pub(crate) enum SessionCmd {
         /// The RPC id the client submitted this turn under (dsh `source.rpcId`,
         /// §C.2 `originRpc`). The server pins it on the prompt's user-message
         /// journal entry so the client can retire its optimistic echo (§F.2).
-        /// `None` for internally-driven turns (goal rounds, plan seeds). The
-        /// actor currently threads the prompt through the shared persistence
-        /// middleware, which does not yet carry the origin to the user-message
-        /// append; the field is retained here for the follow-up wiring.
+        /// `None` for internally-driven turns (goal rounds, plan seeds).
         origin_rpc: Option<String>,
+        /// K5: the journal entry id of the user message already persisted at
+        /// Submit acceptance (`ThreadEngine::persist_user_submission`). The
+        /// actor pins the middleware skip from it instead of appending its
+        /// own entry; `None` persists the entry at drain, before the run.
+        accepted_entry: Option<String>,
     },
     /// Inject a steer into the running turn.
     Steer {
@@ -200,8 +202,14 @@ async fn reply_journal_snapshot(
     reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,
 ) {
     let storage = appender.storage();
-    let cursor = storage.journal_cursor().await;
+    // One locked read: the cursor is derived from the records themselves so
+    // a concurrent append (the live serializer, the persistence middleware)
+    // can never tear the pair — a records tail past the reported cursor
+    // would fail the clients' snapshot validation (page tail == cursor,
+    // §F.1 rule 1). `journal_range`'s last record IS the active leaf, so
+    // this equals `journal_cursor` by construction (0 for an empty chain).
     let records = storage.journal_range(0, u64::MAX).await.unwrap_or_default();
+    let cursor = records.last().map(|r| r.seq).unwrap_or(0);
     let _ = reply.send(JournalSnapshotData { cursor, records });
 }
 
@@ -219,8 +227,11 @@ struct EngineState {
     /// Mid-run `AppendUiNote`s park here (the run owns the session); the
     /// idle loop drains and persists them.
     pending_ui_notes: Mutex<Vec<UiNoteRecord>>,
-    /// Mid-run journal appends park here (same run-owns-the-session rule as
-    /// `pending_ui_notes`); the idle loop drains them in arrival order.
+    /// Rows the mid-run serializer could not land (K4): after a fail-loud
+    /// abort, later rows park here whole, and a permanent loss parks its
+    /// durable `error` compensation record here when the storage itself is
+    /// down. The settle and idle drains retry them in arrival order, so a
+    /// record lands once the storage recovers.
     pending_journal: Mutex<Vec<(String, serde_json::Value)>>,
     /// The thread-scoped journal feed (storage broadcasts relayed into it,
     /// one relay per live session). Session-core follow streams subscribe.
@@ -250,6 +261,13 @@ struct EngineState {
     /// parks them here instead of dropping; the idle loop drains and
     /// re-queues them so the post-settle cmd dispatch runs the handler.
     pending_session_cmds: Mutex<Vec<SessionCmd>>,
+    /// The active session's shared journal appender, published on every
+    /// session build/swap (K5): the Submit-acceptance path
+    /// (`persist_user_submission`) appends the user entry durably through
+    /// it from OUTSIDE the actor task, before the run exists. `None` only
+    /// before the first session assembles — the actor's drain-time
+    /// persistence covers a Submit accepted in that window.
+    current_appender: Mutex<Option<Arc<JournalAppender>>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -602,6 +620,7 @@ pub fn spawn_engine(
         active_path: Mutex::new(initial_path.clone()),
         pending_browser_suite: Mutex::new(None),
         pending_session_cmds: Mutex::new(Vec::new()),
+        current_appender: Mutex::new(None),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
@@ -702,12 +721,40 @@ impl ThreadEngine for PiEngine {
         prompt: String,
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
+        accepted_entry: Option<String>,
     ) {
         let _ = self.cmd_tx.send(SessionCmd::Prompt {
             text: prompt,
             images,
             origin_rpc: origin,
+            accepted_entry,
         });
+    }
+    fn persist_user_submission(
+        &self,
+        text: &str,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, anyhow::Error>> + Send>,
+    > {
+        let state = Arc::clone(&self.state);
+        let text = text.to_string();
+        Box::pin(async move {
+            // The actor publishes the active session's appender on every
+            // build/swap; `None` means the session is not assembled yet —
+            // the actor's drain-time persistence covers the Submit when its
+            // Prompt cmd is processed (still before model-visible).
+            let Some(appender) = state.current_appender.lock().unwrap().clone() else {
+                return Ok(None);
+            };
+            let message = prompt_user_message(&text, &images);
+            // Durable: a still-deferred session (no file yet) materializes
+            // here — the accepted text is on disk before the caller's
+            // receipt returns.
+            let id = appender.append_message_durable(message, origin).await?;
+            Ok(Some(id))
+        })
     }
     fn is_running(&self) -> bool {
         self.state.running.load(Ordering::Relaxed)
@@ -767,6 +814,7 @@ impl ThreadEngine for PiEngine {
             text: prompt,
             images,
             origin_rpc: None,
+            accepted_entry: None,
         });
     }
 
@@ -1772,6 +1820,133 @@ fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
 type JournalAppender =
     manox_harness::session::Session<manox_harness::session::jsonl::JsonlSessionStorage>;
 
+/// The user message a prompt's text and images construct — the same shape
+/// `prompt_input`'s batch entry carries (`[Text, images...]`), so the
+/// middleware's content-match skip recognizes the run's announced message
+/// as the already-persisted one.
+fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentMessage {
+    let mut content = Vec::with_capacity(images.len() + 1);
+    content.push(ContentBlock::Text {
+        text: text.to_string(),
+        signature: None,
+    });
+    content.extend(images.iter().cloned());
+    AgentMessage::User {
+        content,
+        timestamp: chrono::Utc::now(),
+    }
+}
+
+/// K5: resolve the prompt's user-entry persistence BEFORE the run starts.
+///
+/// A Submit accepted at the gateway arrives already persisted
+/// (`accepted_entry` = the journal entry id appended at acceptance, origin
+/// pinned on it); a queued Submit persists here, at drain — still ahead of
+/// the run, so ahead of model-visible ("model-visible ⟺ logged"). Both arm
+/// the middleware skip (entry id + accepted content) so the run's own user
+/// `MessageEnd` records the existing entry instead of appending a
+/// duplicate; jsonl's duplicate-entry-id refusal stays the backstop, never
+/// the normal path. An origin-less prompt (an internally-driven `run()`
+/// turn, a goal/monitor seed) keeps the legacy flow: the middleware
+/// persists its user message at announce time.
+async fn persist_prompt_user_entry(
+    session: &AgentSession,
+    text: &str,
+    images: &[ContentBlock],
+    origin_rpc: Option<String>,
+    accepted_entry: Option<String>,
+) -> Result<Option<String>, anyhow::Error> {
+    let appender = session.journal_appender();
+    // A stale pin no run consumed (one died before announcing its user
+    // message) must not leak the middleware skip into this turn.
+    appender.clear_accepted_user_entry();
+    if accepted_entry.is_none() && origin_rpc.is_none() {
+        return Ok(None);
+    }
+    let message = prompt_user_message(text, images);
+    let content = match &message {
+        AgentMessage::User { content, .. } => {
+            serde_json::to_value(content).unwrap_or(serde_json::Value::Null)
+        }
+        _ => unreachable!("prompt_user_message builds a user message"),
+    };
+    let entry_id = match accepted_entry {
+        Some(id) => id,
+        None => {
+            // Durable: a still-deferred session (no file yet) puts the
+            // accepted text on disk here, not at the first assistant
+            // message.
+            appender.append_message_durable(message, origin_rpc).await?
+        }
+    };
+    appender.pin_accepted_user_entry(entry_id.clone(), content);
+    Ok(Some(entry_id))
+}
+
+/// K4 (§C.3, L3): the typed-append discipline shared by every journal write
+/// face. A transient failure retries a bounded number of times with a short
+/// backoff; a permanent failure must never drop the row silently — callers
+/// run the fail-loud tail ([`record_journal_loss`], a facade notice, and,
+/// mid-run, turn cancellation), mirroring the persistence middleware's
+/// message-append rule where a failure aborts the whole run.
+const TYPED_APPEND_ATTEMPTS: u32 = 3;
+const TYPED_APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+async fn append_typed_resilient(
+    appender: &JournalAppender,
+    kind: &str,
+    payload: serde_json::Value,
+) -> Result<String, anyhow::Error> {
+    let mut last_err = None;
+    for attempt in 1..=TYPED_APPEND_ATTEMPTS {
+        match appender.append_typed(kind, payload.clone()).await {
+            Ok(id) => return Ok(id),
+            Err(err) => {
+                tracing::warn!(%err, kind, attempt, "typed journal append failed");
+                last_err = Some(err);
+                if attempt < TYPED_APPEND_ATTEMPTS {
+                    tokio::time::sleep(TYPED_APPEND_RETRY_DELAY * attempt).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("the attempt loop ran at least once"))
+}
+
+/// The K4 loss record for a permanently failed typed append: a durable
+/// `error` entry naming the dropped kind and reason. Best-effort — when the
+/// storage itself is down the record cannot land either, so it is handed
+/// back for the caller to park (`pending_journal`) and the settle/idle drain
+/// persists it once the storage recovers. `error` rows never spawn a
+/// compensation of their own: that breaks the tap feedback loop
+/// (`ThreadEvent::Error` → tap → `AppendJournal("error")` → loss → …) and
+/// keeps a dead storage from amplifying one failure into a notice storm.
+async fn record_journal_loss(
+    appender: &JournalAppender,
+    kind: &str,
+    err: &anyhow::Error,
+) -> Option<(String, serde_json::Value)> {
+    if kind == "error" {
+        tracing::error!(%err, "journal append failed for an error record; dropping it");
+        return None;
+    }
+    let compensation = (
+        "error".to_string(),
+        serde_json::json!({
+            "message": format!(
+                "journal append permanently failed for `{kind}`: {err:#} — the entry was dropped"
+            ),
+        }),
+    );
+    match appender
+        .append_typed(&compensation.0, compensation.1.clone())
+        .await
+    {
+        Ok(_) => None,
+        Err(_) => Some(compensation),
+    }
+}
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
@@ -1793,12 +1968,67 @@ async fn drive_run<F>(
     pi_model: &mut PiModel,
     sessions_dir: &Path,
     session_path: &Path,
-    appender: &JournalAppender,
+    appender: &Arc<JournalAppender>,
 ) -> (anyhow::Result<Vec<AgentMessage>>, bool)
 where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
     tokio::pin!(run);
+    // Live journal appends run on a dedicated serializer task, never inline
+    // in this select. The `run` branch below shares THIS task, and its
+    // persistence middleware holds the session's append lock across file-I/O
+    // await points (`append_message_with_origin` → `append_line`); a select
+    // handler that awaits the same lock suspends the whole task, so the
+    // select can never poll the run branch again to release it — a same-task
+    // self-deadlock that froze the turn forever with the journal tail stuck
+    // mid-round (the round-11 stall). The serializer keeps facade rows
+    // ordered (FIFO channel, sequential appends) and stays linearized
+    // against middleware appends by the same session append lock.
+    let (live_row_tx, mut live_row_rx) = mpsc::unbounded_channel::<(String, serde_json::Value)>();
+    let live_appender = Arc::clone(appender);
+    let live_state = Arc::clone(state);
+    let live_notice = notice_tx.clone();
+    let live_handle = handle.clone();
+    // K4 fail-closed flag: a permanent mid-run append loss cancels the turn;
+    // drive_run folds this into `abort_requested` so settle reports it.
+    let live_abort = Arc::new(AtomicBool::new(false));
+    let live_abort_flag = Arc::clone(&live_abort);
+    let live_appends = tokio::spawn(async move {
+        let mut loss_signaled = false;
+        while let Some((kind, payload)) = live_row_rx.recv().await {
+            let Err(err) = append_typed_resilient(&live_appender, &kind, payload.clone()).await
+            else {
+                continue;
+            };
+            // Permanent loss (K4, L3): the state this row describes already
+            // took effect, so the run must not silently continue without it.
+            // The first loss records itself durably, notifies the facade,
+            // and cancels the turn; later rows of the same dead-storage run
+            // park for the settle/idle drain without re-signaling (one
+            // notice, one abort — the turn is already converging).
+            if loss_signaled {
+                live_state
+                    .pending_journal
+                    .lock()
+                    .unwrap()
+                    .push((kind, payload));
+                continue;
+            }
+            if let Some(row) = record_journal_loss(&live_appender, &kind, &err).await {
+                live_state.pending_journal.lock().unwrap().push(row);
+            }
+            if kind != "error" {
+                loss_signaled = true;
+                let _ = live_notice.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                    anyhow::anyhow!(
+                        "journal append permanently failed for `{kind}`: {err:#}; cancelling the turn"
+                    ),
+                ))));
+                live_abort_flag.store(true, Ordering::SeqCst);
+                live_handle.abort();
+            }
+        }
+    });
     let mut abort_requested = false;
     let mut channel_open = true;
     let mut live_ticker = tokio::time::interval(LIVE_HISTORY_TICK);
@@ -1904,25 +2134,18 @@ where
                     state.pending_ui_notes.lock().unwrap().push(record);
                 }
                 Some(SessionCmd::AppendJournal { kind, payload }) => {
-                    // Append LIVE through the shared session handle (the
-                    // persistence middleware's own Arc): the session's
-                    // append lock linearizes parent-selection + append, and
-                    // the storage broadcast feeds followers immediately.
-                    // Parking for settle hid subagent/retry/background rows
-                    // for the whole run (L5 — the round-8 repro: a
-                    // dispatched Sailor's failure never reached the journal
-                    // while the captain kept working).
-                    if let Err(err) = appender.append_typed(&kind, payload.clone()).await {
-                        tracing::warn!(
-                            %err, kind,
-                            "mid-run journal append failed; parking for settle"
-                        );
-                        state
-                            .pending_journal
-                            .lock()
-                            .unwrap()
-                            .push((kind, payload));
-                    }
+                    // Forwarded to the serializer task spawned above — this
+                    // arm must NEVER await the session's append lock inline:
+                    // the run branch of this same select suspends holding it
+                    // (the persistence middleware's file I/O), and a handler
+                    // await would deadlock the task against itself (the
+                    // round-11 stall). Rows still append LIVE through the
+                    // shared session handle in emission order; parking for
+                    // settle hid subagent/retry/background rows for the whole
+                    // run (L5 — the round-8 repro: a dispatched Sailor's
+                    // failure never reached the journal while the captain
+                    // kept working).
+                    let _ = live_row_tx.send((kind, payload));
                 }
                 Some(SessionCmd::JournalSnapshot { reply }) => {
                     // Answer live off the storage (same read face as the
@@ -1953,6 +2176,17 @@ where
             result = &mut run => break result,
         }
     };
+    // Drain the serializer before returning: every AppendJournal received
+    // mid-run has landed (or parked for settle) before settle_run reads the
+    // journal. The run future has finished, so the append lock is free and
+    // the drain is bounded by the queued rows.
+    drop(live_row_tx);
+    let _ = live_appends.await;
+    // A K4 fail-closed cancel (permanent journal loss) counts as the abort
+    // it was: settle reports `cancelled` and strands the run's steers.
+    if live_abort.load(Ordering::SeqCst) {
+        abort_requested = true;
+    }
     (result, abort_requested)
 }
 
@@ -1971,6 +2205,9 @@ async fn settle_run(
     run_steers: &mut Vec<String>,
 ) {
     let failed = result.is_err();
+    // K5: a pin no run consumed (one died before announcing its user
+    // message) must not leak the middleware skip into the next turn.
+    session.journal_appender().clear_accepted_user_entry();
     if let Err(err) = result {
         let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
             anyhow::anyhow!("{err:#}"),
@@ -1998,9 +2235,28 @@ async fn settle_run(
         let _ = persist_ui_note(session, &record).await;
     }
     let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
-    for (kind, payload) in parked_journal {
-        if let Err(err) = session.append_typed(&kind, payload).await {
-            tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
+    if !parked_journal.is_empty() {
+        // K4: the settle drain runs the same fail-loud discipline as every
+        // typed-append face — bounded retries, then a durable loss record
+        // and one facade notice. The turn has already converged here, so
+        // there is nothing left to cancel; the record parks for the idle
+        // drain when the storage is still down (it lands after recovery).
+        let appender = session.journal_appender();
+        let mut loss_notified = false;
+        for (kind, payload) in parked_journal {
+            if let Err(err) = append_typed_resilient(&appender, &kind, payload).await {
+                if let Some(row) = record_journal_loss(&appender, &kind, &err).await {
+                    state.pending_journal.lock().unwrap().push(row);
+                }
+                if kind != "error" && !loss_notified {
+                    loss_notified = true;
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!(
+                            "journal append permanently failed for `{kind}` at settle: {err:#}; the entry was dropped"
+                        ),
+                    ))));
+                }
+            }
         }
     }
     sync_history(session, sessions_dir, state).await;
@@ -2685,6 +2941,8 @@ async fn run_actor(
     // The journal relay for this session (exits by itself when a swap drops
     // the storage; the next establishment spawns its own relay).
     spawn_journal_relay(&session, &state.journal_tx);
+    // K5: publish the acceptance-time writer for this session.
+    *state.current_appender.lock().unwrap() = Some(session.journal_appender());
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
     if let Some(project) = &project {
         write_project_sidecar(&sessions_dir, session.path(), project).await;
@@ -2818,9 +3076,27 @@ async fn run_actor(
             let _ = persist_ui_note(&session, &record).await;
         }
         let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
-        for (kind, payload) in parked_journal {
-            if let Err(err) = session.append_typed(&kind, payload).await {
-                tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
+        if !parked_journal.is_empty() {
+            // K4: same fail-loud discipline as the settle drain — bounded
+            // retries, then a durable loss record and one facade notice. No
+            // turn is in flight while idle, so there is nothing to cancel; a
+            // still-down storage re-parks the record for the next drain.
+            let appender = session.journal_appender();
+            let mut loss_notified = false;
+            for (kind, payload) in parked_journal {
+                if let Err(err) = append_typed_resilient(&appender, &kind, payload).await {
+                    if let Some(row) = record_journal_loss(&appender, &kind, &err).await {
+                        state.pending_journal.lock().unwrap().push(row);
+                    }
+                    if kind != "error" && !loss_notified {
+                        loss_notified = true;
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::Error(anyhow::anyhow!(
+                                "journal append permanently failed for `{kind}`: {err:#}; the entry was dropped"
+                            )),
+                        )));
+                    }
+                }
             }
         }
         // A mid-run browser-suite toggle parked itself for the same reason;
@@ -2927,12 +3203,33 @@ async fn run_actor(
                 text,
                 images,
                 origin_rpc,
+                accepted_entry,
             } => {
-                // Echo retirement (§F.2): pin the client's RPC id onto this
-                // turn's first user message; the persistence middleware
-                // drains it on exactly that append.
-                if origin_rpc.is_some() {
-                    session.set_pending_user_origin(origin_rpc.clone());
+                // K5: the prompt's user entry is on disk before the run
+                // starts — persisted at Submit acceptance (the gateway
+                // awaited the append before its receipt and passes the
+                // entry id) or here, at drain, for a queued Submit. The
+                // middleware skips its own append through the pinned id.
+                if let Err(err) =
+                    persist_prompt_user_entry(&session, &text, &images, origin_rpc, accepted_entry)
+                        .await
+                {
+                    // Fail loud (the K4/K5 discipline): text that could not
+                    // be persisted must not run — accepted-without-logged
+                    // breaks the journal contract. The facade converges the
+                    // turn it optimistically started.
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!(
+                            "submit persistence failed: {err:#}; the turn was not started"
+                        ),
+                    ))));
+                    let _ = notice_tx.send(BackendNotice::Settled {
+                        cancelled: false,
+                        failed: true,
+                        steered: Vec::new(),
+                        stranded: Vec::new(),
+                    });
+                    continue;
                 }
                 // Plugin lifecycle: `SessionStart` fires once per session,
                 // before the first user turn (fail-open, detached).
@@ -3416,6 +3713,9 @@ async fn run_actor(
                         state.session_start_fired.store(false, Ordering::SeqCst);
                         session = s;
                         spawn_journal_relay(&session, &state.journal_tx);
+                        // K5: the swapped session is the acceptance-time
+                        // writer from here on.
+                        *state.current_appender.lock().unwrap() = Some(session.journal_appender());
                         // The fresh session is pinned to the facade thread's id.
                         crate::thread_registry::set_active(&thread_id, &thread_id).await;
                         let new_path = session.path().to_path_buf();
@@ -3469,9 +3769,24 @@ async fn run_actor(
             }
             SessionCmd::AppendJournal { kind, payload } => {
                 // Typed v4 journal entry from the notice tap: one durable
-                // append per durable notice, in actor-queue order.
-                if let Err(err) = session.append_typed(&kind, payload).await {
-                    tracing::warn!(kind = %kind, error = %err, "journal append failed");
+                // append per durable notice, in actor-queue order. K4: the
+                // idle append runs the same fail-loud discipline — bounded
+                // retries, then a durable loss record and a facade notice.
+                // No turn is in flight while idle, so there is nothing to
+                // cancel; a still-down storage parks the record for the next
+                // drain.
+                let appender = session.journal_appender();
+                if let Err(err) = append_typed_resilient(&appender, &kind, payload).await {
+                    if let Some(row) = record_journal_loss(&appender, &kind, &err).await {
+                        state.pending_journal.lock().unwrap().push(row);
+                    }
+                    if kind != "error" {
+                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                            ThreadEvent::Error(anyhow::anyhow!(
+                                "journal append permanently failed for `{kind}`: {err:#}; the entry was dropped"
+                            )),
+                        )));
+                    }
                 }
             }
             SessionCmd::JournalSnapshot { reply } => {
@@ -3566,6 +3881,8 @@ async fn rebuild_session(
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.
             spawn_journal_relay(session, &state.journal_tx);
+            // K5: the rebuilt session is the acceptance-time writer.
+            *state.current_appender.lock().unwrap() = Some(session.journal_appender());
         }
         Err(err) => {
             let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
@@ -5329,6 +5646,7 @@ mod tests {
             active_path: Mutex::new(None),
             pending_browser_suite: Mutex::new(None),
             pending_session_cmds: Mutex::new(Vec::new()),
+            current_appender: Mutex::new(None),
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
@@ -6118,6 +6436,761 @@ mod tests {
         assert!(
             foreign_ix < done_ix,
             "the mid-run row precedes the run's settled tail (linear chain)"
+        );
+    }
+
+    /// K4 probe stream: the first call answers with a parallel tool round
+    /// (its assistant message materializes the deferred journal file), the
+    /// next call parks until the test releases it — ignoring the
+    /// cancellation signal like a provider stuck on the network.
+    struct StallAfterFirstStream {
+        call: std::sync::atomic::AtomicUsize,
+        parked: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl manox_harness::agent_loop::StreamFn for StallAfterFirstStream {
+        async fn stream(
+            &self,
+            context: &manox_harness::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let n = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                return Ok(tool_rounds_assistant(context, 0));
+            }
+            self.parked.notify_waiters();
+            self.release.notified().await;
+            Ok(text_assistant(context, "done"))
+        }
+    }
+
+    /// K4 (P0) regression: a mid-run typed journal append that PERMANENTLY
+    /// fails must not drop its row with a warn — the audited asymmetry let
+    /// the state stand in effect while the journal silently lost its entry
+    /// (L3); the control group (a message append failure) aborts the whole
+    /// run. The fail-loud tail this pins: bounded retries, a durable `error`
+    /// record of the loss (parked while the storage is down, landed after
+    /// recovery), exactly ONE ThreadEvent::Error notice to the facade (the
+    /// tap re-queues the notice itself as an `error` row — the kind guard
+    /// must break that feedback loop, not storm), and a fail-closed turn
+    /// cancel reported through drive_run's abort flag.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // settle_run fires the (detached) plugin `Stop` hook through the
+        // global runtime handle.
+        crate::runtime::init();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(StallAfterFirstStream {
+            call: std::sync::atomic::AtomicUsize::new(0),
+            parked: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // Production notice wiring, replicated: every notice rides the tap,
+        // which forwards to the facade FIRST and queues durable
+        // AppendJournal cmds — including the `error` row for the serializer's
+        // own fail-loud notice (the feedback loop the kind guard breaks).
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, tap_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let (tap_tx, mut facade_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let tap_cmd_tx = cmd_tx.clone();
+        let _tap = tokio::spawn(async move {
+            let mut tap_rx = tap_rx;
+            while let Some(notice) = tap_rx.recv().await {
+                if let BackendNotice::Event(event) = &notice
+                    && let Some((kind, payload)) = durable_journal_payload(event)
+                {
+                    let _ = tap_cmd_tx.send(SessionCmd::AppendJournal { kind, payload });
+                }
+                let _ = tap_tx.send(notice);
+            }
+        });
+        let listener_tx = notice_tx.clone();
+        let _listener_sub = session.subscribe(Arc::new(move |event, _cancel| {
+            let tx = listener_tx.clone();
+            Box::pin(async move {
+                for te in crate::engine::adapt::agent_event_to_thread_events(&event) {
+                    let _ = tx.send(BackendNotice::Event(Box::new(te)));
+                }
+            })
+        }));
+
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+        let journal_path = session.path().to_path_buf();
+
+        let run = drive_run(
+            session.prompt("k4 fail-loud probe"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+            &journal_appender,
+        );
+
+        let skipped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ((result, aborted), ()) = tokio::join!(run, async {
+            // Turn 2 is parked in the provider stream; turn 1's assistant
+            // message materialized the journal file on disk.
+            stream.parked.notified().await;
+            // Let the serializer drain turn 1's tap rows (quiesce) so the
+            // probe row is the only append in flight when the fence rises.
+            let mut last = usize::MAX;
+            for _ in 0..1000 {
+                let rows = journal_appender
+                    .storage()
+                    .journal_range(0, u64::MAX)
+                    .await
+                    .unwrap_or_default()
+                    .len();
+                if rows == last {
+                    break;
+                }
+                last = rows;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // Fence the journal file: appends (open O_APPEND) now fail with
+            // EACCES while reads and the in-memory index keep working.
+            let original = std::fs::metadata(&journal_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o400))
+                .unwrap();
+            // Restore the mode even on a panicking assert.
+            struct PermGuard(std::path::PathBuf, u32);
+            impl Drop for PermGuard {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+                }
+            }
+            let guard = PermGuard(journal_path.clone(), original);
+            // Root ignores the file mode; the fence would be inert, so skip
+            // rather than assert on a false setup.
+            if std::fs::OpenOptions::new()
+                .append(true)
+                .open(&journal_path)
+                .is_ok()
+            {
+                skipped.store(true, Ordering::SeqCst);
+                drop(guard);
+                stream.release.notify_waiters();
+                return;
+            }
+            cmd_tx
+                .send(SessionCmd::AppendJournal {
+                    kind: "subagent_progress".into(),
+                    payload: serde_json::json!({
+                        "agentId": "k4-loss-probe",
+                        "agentType": "Sailor",
+                        "toolUses": 0,
+                        "tokenUsage": null,
+                        "latestActivity": "working",
+                        "status": "running",
+                    }),
+                })
+                .unwrap();
+            // The fail-loud notice must reach the facade WHILE the run is
+            // still parked (bounded retries: 3 attempts, ~150ms of backoff).
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut saw_loss_notice = false;
+            while tokio::time::Instant::now() < deadline && !saw_loss_notice {
+                match tokio::time::timeout(std::time::Duration::from_millis(500), facade_rx.recv())
+                    .await
+                {
+                    Ok(Some(BackendNotice::Event(ev))) => {
+                        if let crate::thread::ThreadEvent::Error(err) = &*ev
+                            && err.to_string().contains("subagent_progress")
+                        {
+                            saw_loss_notice = true;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    // The facade channel closed: no notice can still arrive.
+                    Ok(None) => break,
+                    // A quiet 500ms window is not the deadline; keep waiting
+                    // (the serializer's bounded retries plus scheduler load
+                    // can stretch the notice past one window).
+                    Err(_) => continue,
+                }
+            }
+            assert!(
+                saw_loss_notice,
+                "a permanent mid-run append loss must notify the facade (K4 fail-loud)"
+            );
+            // Release the parked provider; the run converges (the serializer
+            // already cancelled it fail-closed). The fence comes down right
+            // after the release — on this runtime the woken stream cannot run
+            // until this block yields — so the settle-side drains see a
+            // healthy storage.
+            stream.release.notify_waiters();
+            drop(guard);
+        });
+        if skipped.load(Ordering::SeqCst) {
+            eprintln!("skipping: running with write access despite 0o400 (root?)");
+            return;
+        }
+        // (c) fail-closed convergence: the cancel reports through drive_run's
+        // abort flag, so settle surfaces TurnFinished{cancelled}.
+        assert!(
+            aborted,
+            "a permanent journal loss must cancel the turn fail-closed (K4)"
+        );
+
+        // Post-run: settle drains the parked loss record (the storage is
+        // healthy again) — the durable `error` entry lands now, the
+        // "visible after recovery" half of the K4 contract.
+        settle_run(
+            &result,
+            aborted,
+            &session,
+            &state,
+            &sessions_path,
+            &cwd,
+            &notice_tx,
+            &mut run_steers,
+        )
+        .await;
+        // Idle-arm replication for cmds that raced past the run (the tap's
+        // `error` mirror of the fail-loud notice, late convergence rows).
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let SessionCmd::AppendJournal { kind, payload } = cmd
+                && let Err(err) = append_typed_resilient(&journal_appender, &kind, payload).await
+                && let Some(row) = record_journal_loss(&journal_appender, &kind, &err).await
+            {
+                state.pending_journal.lock().unwrap().push(row);
+            }
+        }
+
+        // (a) the loss is recorded durably: an `error` entry on disk names
+        // the dropped kind, and the dropped row itself never appears — the
+        // journal never pretends the state change did not happen.
+        let text = tokio::fs::read_to_string(&journal_path).await.unwrap();
+        assert!(
+            text.contains("journal append permanently failed for `subagent_progress`"),
+            "the durable loss record must be on disk after recovery: {text}"
+        );
+        let rows = journal_appender
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        assert!(
+            !rows.iter().any(|r| matches!(
+                &r.entry,
+                manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+                    if agent_id == "k4-loss-probe"
+            )),
+            "the permanently lost row must not appear in the journal"
+        );
+
+        // (b) exactly one fail-loud notice: the tap re-queued the notice as
+        // an `error` AppendJournal whose own fenced append must NOT notify
+        // again (kind guard) — no feedback storm.
+        let mut loss_notices = 1; // the one observed inside the probe block
+        while let Ok(notice) = facade_rx.try_recv() {
+            if let BackendNotice::Event(ev) = notice
+                && let crate::thread::ThreadEvent::Error(err) = &*ev
+                && err
+                    .to_string()
+                    .contains("journal append permanently failed")
+            {
+                loss_notices += 1;
+            }
+        }
+        assert_eq!(
+            loss_notices, 1,
+            "the fail-loud notice fires once per run; the error-kind guard breaks the tap loop"
+        );
+    }
+
+    /// The user-message rows of a journal read: `(joined text blocks,
+    /// origin)` per entry — the K5 assertions' lens.
+    fn k5_user_entries(
+        rows: &[manox_harness::session::jsonl::JournalRecord],
+    ) -> Vec<(String, Option<String>)> {
+        rows.iter()
+            .filter_map(|r| match &r.entry {
+                manox_harness::session::SessionTreeEntry::Message {
+                    message: AgentMessage::User { content, .. },
+                    origin,
+                    ..
+                } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text, .. } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    Some((text, origin.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Minimal drive_run wiring for the K5 tests: no tap (the assertions
+    /// look at message entries only), a kept-alive cmd sender so the select
+    /// never sees a closed channel, and a shared appender for the
+    /// acceptance-side writes.
+    struct K5Rig {
+        cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
+        _cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+        notice_tx: mpsc::UnboundedSender<BackendNotice>,
+        state: Arc<EngineState>,
+        live: Arc<Mutex<LiveTranscript>>,
+        run_steers: Vec<String>,
+        shutdown_after_run: bool,
+        pi_model: PiModel,
+        handle: manox_harness::harness::HarnessHandle,
+        sessions_path: PathBuf,
+        active_session_path: PathBuf,
+        journal_appender: Arc<JournalAppender>,
+    }
+
+    impl K5Rig {
+        fn new(dir: &tempfile::TempDir, session: &AgentSession) -> Self {
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+            let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+            K5Rig {
+                cmd_rx,
+                _cmd_tx: cmd_tx,
+                notice_tx,
+                state: test_engine_state(),
+                live: Arc::new(Mutex::new(LiveTranscript::default())),
+                run_steers: Vec::new(),
+                shutdown_after_run: false,
+                pi_model: test_model(),
+                handle: session.handle(),
+                sessions_path: dir.path().join("sessions"),
+                active_session_path: session.path().clone(),
+                journal_appender: session.journal_appender(),
+            }
+        }
+    }
+
+    /// K5 (P0) regression, direct-submit path: a user entry persisted at
+    /// Submit acceptance (durable — a deferred session materializes on it)
+    /// is on disk BEFORE the run exists, the run's own user `MessageEnd`
+    /// records the accepted entry instead of appending a duplicate, and the
+    /// origin rides the accepted entry (echo retirement, §F.2).
+    #[tokio::test]
+    async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_the_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0, // first call answers "done": the run completes
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // Submit acceptance (the gateway side, replicated): the durable
+        // append materializes the still-deferred session — the accepted
+        // text is on disk before any run exists.
+        let appender = session.journal_appender();
+        let accepted_id = appender
+            .append_message_durable(
+                prompt_user_message("k5 accepted text", &[]),
+                Some("rpc-k5".into()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            session.path().exists(),
+            "acceptance must put the entry on disk (a deferred session materializes)"
+        );
+
+        // The actor's Prompt-cmd resolution for an accepted Submit: arm the
+        // middleware skip from the accepted entry id.
+        let pinned = persist_prompt_user_entry(
+            &session,
+            "k5 accepted text",
+            &[],
+            Some("rpc-k5".into()),
+            Some(accepted_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pinned.as_deref(), Some(accepted_id.as_str()));
+
+        let mut rig = K5Rig::new(&dir, &session);
+        let (result, _aborted) = drive_run(
+            session.prompt("k5 accepted text"),
+            &rig.handle,
+            &mut rig.cmd_rx,
+            &mut rig.run_steers,
+            &mut rig.shutdown_after_run,
+            Arc::clone(&rig.live),
+            &rig.state,
+            &rig.notice_tx,
+            &mut rig.pi_model,
+            &rig.sessions_path,
+            &rig.active_session_path,
+            &rig.journal_appender,
+        )
+        .await;
+        result.unwrap();
+
+        let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        let users = k5_user_entries(&rows);
+        assert_eq!(
+            users.len(),
+            1,
+            "the accepted entry is the ONLY user row (the middleware skipped its duplicate): {users:?}"
+        );
+        assert_eq!(users[0].0, "k5 accepted text");
+        assert_eq!(
+            users[0].1.as_deref(),
+            Some("rpc-k5"),
+            "the origin rides the accepted entry (echo retirement)"
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::Message {
+                        message: AgentMessage::Assistant { .. },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "the run completed and appended its assistant message"
+        );
+    }
+
+    /// K5 regression, kill-after-receipt: while a turn is parked at a
+    /// barrier, an accepted Submit's user entry is ALREADY in the journal
+    /// (before the run continues); dropping everything right after the
+    /// acceptance — the crash window the receipt opened — leaves the entry
+    /// and its pinned origin on disk when the file is reopened.
+    #[tokio::test]
+    async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ParkOnceStream {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // Acceptance: durable append + armed skip, exactly the direct-submit
+        // mechanism.
+        let appender = session.journal_appender();
+        let accepted_id = appender
+            .append_message_durable(prompt_user_message("k5b text", &[]), Some("rpc-k5b".into()))
+            .await
+            .unwrap();
+        persist_prompt_user_entry(
+            &session,
+            "k5b text",
+            &[],
+            Some("rpc-k5b".into()),
+            Some(accepted_id),
+        )
+        .await
+        .unwrap();
+
+        let journal_path = session.path().clone();
+        let mut rig = K5Rig::new(&dir, &session);
+        // The probe wins the select and the drive_run future is dropped
+        // WITHOUT releasing the park: everything after the receipt dies
+        // mid-turn (the crash the receipt's window invited).
+        tokio::select! {
+            _ = drive_run(
+                session.prompt("k5b text"),
+                &rig.handle,
+                &mut rig.cmd_rx,
+                &mut rig.run_steers,
+                &mut rig.shutdown_after_run,
+                Arc::clone(&rig.live),
+                &rig.state,
+                &rig.notice_tx,
+                &mut rig.pi_model,
+                &rig.sessions_path,
+                &rig.active_session_path,
+                &rig.journal_appender,
+            ) => panic!("the parked run must not finish before the probe"),
+            _ = async {
+                stream.started.notified().await;
+                // The turn is parked; the run never reached completion —
+                // yet the accepted entry is already durable.
+                let text = tokio::fs::read_to_string(&journal_path).await.unwrap();
+                assert!(
+                    text.contains("k5b text") && text.contains(r#""origin":"rpc-k5b""#),
+                    "the accepted entry with its origin must be in the journal before the run continues: {text}"
+                );
+                assert_eq!(
+                    text.matches("k5b text").count(),
+                    1,
+                    "the middleware skip kept the announced message from duplicating the entry: {text}"
+                );
+            } => {}
+        }
+
+        // Kill-after-receipt: everything is dropped (the select consumed the
+        // run future); reopen the file — the entry and origin survived.
+        let text = tokio::fs::read_to_string(&journal_path).await.unwrap();
+        assert!(
+            text.contains("k5b text") && text.contains(r#""origin":"rpc-k5b""#),
+            "the accepted entry must survive the killed run: {text}"
+        );
+        let reopened = manox_harness::session::jsonl::JsonlSessionStorage::open(&journal_path)
+            .await
+            .unwrap();
+        let rows = reopened.journal_range(0, u64::MAX).await.unwrap();
+        let users = k5_user_entries(&rows);
+        assert_eq!(users.len(), 1, "reopened journal: {users:?}");
+        assert_eq!(users[0].0, "k5b text");
+        assert_eq!(users[0].1.as_deref(), Some("rpc-k5b"));
+    }
+
+    /// K5 regression, queued-submit path: a Submit whose acceptance did not
+    /// persist (the engine was running; the gateway queued it) persists at
+    /// drain — in the actor's Prompt handler, BEFORE the run starts, so
+    /// before model-visible — and the run's middleware skips the duplicate.
+    #[tokio::test]
+    async fn queued_submit_persists_at_drain_before_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // The actor's drain of a queued Submit: no accepted_entry, an
+        // origin → persist NOW (durable), before drive_run exists.
+        let drained_id =
+            persist_prompt_user_entry(&session, "drained text", &[], Some("rpc-q".into()), None)
+                .await
+                .unwrap()
+                .expect("an origin-carrying prompt persists at drain");
+
+        let appender = session.journal_appender();
+        let rows_before = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        let users_before = k5_user_entries(&rows_before);
+        assert_eq!(
+            users_before,
+            vec![("drained text".to_string(), Some("rpc-q".into()))],
+            "the drained Submit must be in the journal BEFORE the run starts"
+        );
+
+        let mut rig = K5Rig::new(&dir, &session);
+        let (result, _aborted) = drive_run(
+            session.prompt("drained text"),
+            &rig.handle,
+            &mut rig.cmd_rx,
+            &mut rig.run_steers,
+            &mut rig.shutdown_after_run,
+            Arc::clone(&rig.live),
+            &rig.state,
+            &rig.notice_tx,
+            &mut rig.pi_model,
+            &rig.sessions_path,
+            &rig.active_session_path,
+            &rig.journal_appender,
+        )
+        .await;
+        result.unwrap();
+
+        let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        let users = k5_user_entries(&rows);
+        assert_eq!(users.len(), 1, "no duplicate user row: {users:?}");
+        assert_eq!(users[0].1.as_deref(), Some("rpc-q"));
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::Message {
+                        message: AgentMessage::User { .. },
+                        ..
+                    }
+                )
+            })
+            .map(|r| r.entry.id())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![drained_id.as_str()],
+            "the surviving user row IS the drain-time entry (the middleware recorded it, never re-appended)"
+        );
+    }
+
+    /// K5 guard: a pin no run consumed (its run died before announcing the
+    /// user message) must never leak the middleware skip into a later turn —
+    /// even when the later turn's user content matches the stale pin
+    /// exactly. The drain-time resolution clears the pin before arming (or
+    /// declining to arm) its own.
+    #[tokio::test]
+    async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // A stale pin whose content MATCHES the next turn's user message
+        // (the worst case for a leaked skip): a dead run left it armed.
+        let appender = session.journal_appender();
+        let stale_content = match prompt_user_message("fresh text", &[]) {
+            AgentMessage::User { content, .. } => serde_json::to_value(content).unwrap(),
+            _ => unreachable!("prompt_user_message builds a user message"),
+        };
+        appender.pin_accepted_user_entry("stale-entry-id".into(), stale_content);
+
+        // A legacy (origin-less) prompt: the drain-time resolution declines
+        // to persist — and clears the stale pin on its way through.
+        let pinned = persist_prompt_user_entry(&session, "fresh text", &[], None, None)
+            .await
+            .unwrap();
+        assert!(
+            pinned.is_none(),
+            "a legacy prompt keeps the middleware path"
+        );
+
+        let mut rig = K5Rig::new(&dir, &session);
+        let (result, _aborted) = drive_run(
+            session.prompt("fresh text"),
+            &rig.handle,
+            &mut rig.cmd_rx,
+            &mut rig.run_steers,
+            &mut rig.shutdown_after_run,
+            Arc::clone(&rig.live),
+            &rig.state,
+            &rig.notice_tx,
+            &mut rig.pi_model,
+            &rig.sessions_path,
+            &rig.active_session_path,
+            &rig.journal_appender,
+        )
+        .await;
+        result.unwrap();
+
+        let rows = appender.storage().journal_range(0, u64::MAX).await.unwrap();
+        let users = k5_user_entries(&rows);
+        assert_eq!(users.len(), 1, "the legacy turn appended its own user row");
+        assert_eq!(users[0].0, "fresh text");
+        assert_eq!(users[0].1, None);
+        let id = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::Message {
+                        message: AgentMessage::User { .. },
+                        ..
+                    }
+                )
+            })
+            .map(|r| r.entry.id().to_string())
+            .unwrap();
+        assert_ne!(
+            id, "stale-entry-id",
+            "the surviving row is the middleware's fresh append, not the stale pin's id"
         );
     }
 

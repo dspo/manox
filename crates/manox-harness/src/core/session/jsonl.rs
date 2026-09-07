@@ -347,7 +347,16 @@ impl JsonlSessionStorage {
     /// Appending to a file still on v3 rewrites it in full as v4 first (the
     /// lazy migration; the rewrite reuses the buffered-seq values computed
     /// at load).
-    async fn append_entry_locked(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+    ///
+    /// `force_materialize` writes the entry — and every buffered row before
+    /// it — to disk even while the session is still deferred (the K5
+    /// acceptance-time append: a persisted Submit must survive a crash that
+    /// happens before any assistant message materializes the file).
+    async fn append_entry_locked(
+        &self,
+        entry: &SessionTreeEntry,
+        force_materialize: bool,
+    ) -> Result<(), anyhow::Error> {
         if entry.id().is_empty() {
             anyhow::bail!("refusing entry with empty id");
         }
@@ -391,7 +400,12 @@ impl JsonlSessionStorage {
             }
         );
         if *self.deferred.lock().await {
-            if is_assistant {
+            // A deferred session materializes on the first assistant message
+            // (TS `_persist`) — or on ANY entry the caller marks durable (K5:
+            // a session carrying an accepted Submit has interacted, so it is
+            // no zombie; the accepted text must be on disk before the
+            // receipt's crash window opens).
+            if is_assistant || force_materialize {
                 self.rewrite_file_v4_locked(Some(&line)).await?;
                 *self.deferred.lock().await = false;
             }
@@ -629,7 +643,12 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
         let _guard = self.append_lock.lock().await;
-        self.append_entry_locked(entry).await
+        self.append_entry_locked(entry, false).await
+    }
+
+    async fn append_entry_durable(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        self.append_entry_locked(entry, true).await
     }
 
     async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error> {
@@ -670,7 +689,7 @@ impl SessionStorage for JsonlSessionStorage {
         // Reuse the shared append path so the leaf entry lands on disk, in the
         // in-memory index, and as the cursor through one code path — the
         // cursor becomes the leaf's `targetId` via `leaf_cursor_after`.
-        self.append_entry_locked(&entry).await
+        self.append_entry_locked(&entry, false).await
     }
 
     async fn get_entries(

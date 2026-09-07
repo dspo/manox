@@ -560,6 +560,16 @@ pub trait SessionStorage: Send + Sync {
     /// `append_entry` with a separate `set_leaf_id` for the same cursor move.
     async fn append_entry(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error>;
 
+    /// Append an entry that MUST be on durable storage when this call
+    /// returns (K5 Submit acceptance: the entry survives a crash that
+    /// happens before any later write). A storage with a deferred
+    /// write-behind materializes the file here instead of waiting for its
+    /// usual trigger; the default has no deferral to force, so it delegates
+    /// to [`Self::append_entry`].
+    async fn append_entry_durable(&self, entry: &SessionTreeEntry) -> Result<(), anyhow::Error> {
+        self.append_entry(entry).await
+    }
+
     /// Get an entry by ID.
     async fn get_entry(&self, id: &str) -> Result<Option<SessionTreeEntry>, anyhow::Error>;
 
@@ -616,6 +626,16 @@ pub struct Session<S: SessionStorage> {
     /// `origin_rpc`; the persistence middleware drains it on exactly that
     /// append. One-shot by construction.
     pending_user_origin: std::sync::Mutex<Option<String>>,
+    /// K5 one-shot skip: the entry id and serialized content of the user
+    /// message already persisted before the run (at Submit acceptance, or at
+    /// drain for a queued submit). The persistence middleware consumes the
+    /// pin on the user `MessageEnd` whose content matches, recording the id
+    /// for transcript alignment instead of appending a duplicate — jsonl's
+    /// duplicate-entry-id refusal stays the backstop, never the normal path.
+    /// Content matching confines the skip to exactly the accepted message: a
+    /// `next_turn`-queued user message announced ahead of it, or a steer,
+    /// appends its own entry as usual.
+    accepted_user_entry: std::sync::Mutex<Option<(String, JsonValue)>>,
 }
 
 /// Authorship of a persisted compaction: whether a before-compact hook
@@ -634,12 +654,39 @@ impl<S: SessionStorage> Session<S> {
             storage,
             append_lock: tokio::sync::Mutex::new(()),
             pending_user_origin: std::sync::Mutex::new(None),
+            accepted_user_entry: std::sync::Mutex::new(None),
         }
     }
 
     /// Pin the origin RPC id for this turn's first user message (§F.2).
     pub fn set_pending_user_origin(&self, origin: Option<String>) {
         *self.pending_user_origin.lock().unwrap() = origin;
+    }
+
+    /// K5: pin the journal entry of the user message already persisted
+    /// before this run (at Submit acceptance or at drain). `content` is the
+    /// serialized content-block vector of the accepted message; the
+    /// middleware's skip fires only on an exact match.
+    pub fn pin_accepted_user_entry(&self, entry_id: String, content: JsonValue) {
+        *self.accepted_user_entry.lock().unwrap() = Some((entry_id, content));
+    }
+
+    /// Consume the accepted-user pin when `content` matches the pinned
+    /// message; returns its entry id for transcript alignment. `None` means
+    /// no skip — the caller appends the message normally.
+    pub fn take_accepted_user_entry(&self, content: &JsonValue) -> Option<String> {
+        let mut slot = self.accepted_user_entry.lock().unwrap();
+        if slot.as_ref().is_some_and(|(_, pinned)| pinned == content) {
+            slot.take().map(|(id, _)| id)
+        } else {
+            None
+        }
+    }
+
+    /// Drop a stale accepted-user pin: a run that died before announcing its
+    /// user message must not leak the skip into the next turn.
+    pub fn clear_accepted_user_entry(&self) {
+        *self.accepted_user_entry.lock().unwrap() = None;
     }
 
     /// Drain the pending origin (the persistence middleware's one-shot take
@@ -680,6 +727,32 @@ impl<S: SessionStorage> Session<S> {
             origin,
         };
         self.storage.append_entry(&entry).await?;
+        Ok(id)
+    }
+
+    /// Append a message entry that MUST be on disk when this call returns
+    /// (K5 Submit acceptance: `accepted` ⟹ logged, so a crash after the
+    /// receipt can never lose the text). A deferred session materializes
+    /// here — header plus every buffered row plus this entry — instead of
+    /// waiting for the first assistant message. Carries the optional
+    /// `origin` exactly like [`Self::append_message_with_origin`].
+    pub async fn append_message_durable(
+        &self,
+        message: AgentMessage,
+        origin: Option<String>,
+    ) -> Result<String, anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        let id = self.storage.create_entry_id().await?;
+        let parent_id = self.storage.get_leaf_id().await?;
+
+        let entry = SessionTreeEntry::Message {
+            id: id.clone(),
+            parent_id,
+            timestamp: Utc::now(),
+            message,
+            origin,
+        };
+        self.storage.append_entry_durable(&entry).await?;
         Ok(id)
     }
 

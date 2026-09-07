@@ -3652,6 +3652,26 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
         let control = Arc::clone(&control);
         Box::pin(async move {
             if let AgentEvent::MessageEnd { message } = event {
+                // K5: a user message persisted before the run (at Submit
+                // acceptance, or at drain for a queued submit) already owns
+                // its journal entry — the engine pinned the entry id with
+                // the accepted content. Consume the pin on the content
+                // match and record the id for transcript alignment instead
+                // of appending a duplicate; the content gate keeps a
+                // `next_turn`-queued user message announced ahead of the
+                // accepted one (and every steer) on the normal append path.
+                if let crate::types::AgentMessage::User { content, .. } = &*message {
+                    let content_value =
+                        serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+                    if let Some(entry_id) = session.take_accepted_user_entry(&content_value) {
+                        control
+                            .message_entry_ids
+                            .lock()
+                            .unwrap()
+                            .push(Some(entry_id));
+                        return Ok(());
+                    }
+                }
                 // The host pinned this turn's origin RPC id (echo
                 // retirement, §F.2): drain it on exactly the first user
                 // message append; every other message appends with None.

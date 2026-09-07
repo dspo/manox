@@ -174,15 +174,41 @@ pub trait ThreadEngine: Send + Sync {
     }
 
     /// `run` with the client's origin RPC id pinned onto this turn's first
-    /// user message (§F.2). Engines without origin support ignore it.
+    /// user message (§F.2) and — K5 — the journal entry id the Submit was
+    /// accepted under ([`Self::persist_user_submission`] persisted it before
+    /// the receipt): the engine arms the middleware skip from it instead of
+    /// appending its own user entry. Engines without origin support ignore
+    /// both.
     fn run_with_origin(
         &self,
         prompt: String,
         images: Vec<manox_harness::types::ContentBlock>,
         origin: Option<String>,
+        accepted_entry: Option<String>,
     ) {
-        let _ = origin;
+        let _ = (origin, accepted_entry);
         self.run(prompt, images);
+    }
+
+    /// K5: persist the user message entry (with its origin) DURABLY at
+    /// Submit acceptance — on disk before the caller receipts the Submit,
+    /// so a crash after `accepted` can never lose the text and the echo can
+    /// retire — and return the journal entry id for
+    /// [`Self::run_with_origin`]. `Ok(None)`: the backend has no journal
+    /// session yet; the entry persists at drain instead, still before
+    /// model-visible. `Err`: the entry could not be persisted — the caller
+    /// must NOT receipt the Submit as accepted (fail loud: accepted ⟹
+    /// logged). Backends without a journal resolve `Ok(None)`.
+    fn persist_user_submission(
+        &self,
+        text: &str,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, anyhow::Error>> + Send>,
+    > {
+        let _ = (text, images, origin);
+        Box::pin(async { Ok(None) })
     }
 
     /// Run a manual context-compaction pass (`/compact`). Backends without

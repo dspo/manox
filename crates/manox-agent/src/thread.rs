@@ -335,6 +335,15 @@ pub struct Thread {
     /// single turn, so the last non-None origin wins (documented; receipts
     /// keep per-call correlation).
     pending_turn_origin: Option<String>,
+    /// K5: the journal entry id persisted at Submit acceptance
+    /// (`ThreadEngine::persist_user_submission`) for the turn's user
+    /// message. Set by the host right before `run_turn` (a direct submit —
+    /// one Submit, one prompt, one entry); consumed by `run_turn`, which
+    /// hands it to the engine so the persistence middleware records the
+    /// accepted entry instead of appending a duplicate. A merged queued
+    /// batch carries no accepted entry — the engine persists the merged
+    /// prompt at drain instead.
+    pending_turn_accepted_entry: Option<String>,
     /// Image blocks attached to the pending prompts, drained by `run_turn`
     /// onto the engine (kernel `ContentBlock::Image`).
     pending_images: Vec<manox_harness::types::ContentBlock>,
@@ -679,6 +688,7 @@ impl Thread {
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -765,6 +775,7 @@ impl Thread {
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -1189,6 +1200,15 @@ impl Thread {
         self.pending_turn_origin = origin;
     }
 
+    /// K5: pin the journal entry id persisted at Submit acceptance
+    /// (`ThreadEngine::persist_user_submission`) for the next turn's user
+    /// message. Must be set before `run_turn`; cleared by it. The engine
+    /// arms the middleware skip from it, so the accepted entry is never
+    /// appended twice.
+    pub fn set_pending_turn_accepted_entry(&mut self, entry_id: Option<String>) {
+        self.pending_turn_accepted_entry = entry_id;
+    }
+
     pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
@@ -1197,12 +1217,13 @@ impl Thread {
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
         let origin = self.pending_turn_origin.take();
+        let accepted_entry = self.pending_turn_accepted_entry.take();
         self.running = true;
         self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
-            .run_with_origin(prompt, images, origin);
+            .run_with_origin(prompt, images, origin, accepted_entry);
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -1644,6 +1665,7 @@ impl Thread {
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -2500,6 +2522,7 @@ pub(crate) mod tests {
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
             pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
