@@ -40,11 +40,11 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 ### C.1 文件与信封
 - 路径 `~/.manox/sessions/<thread_id>.jsonl`。第 0 行 header：`{"type":"session","version":4,"id","timestamp","cwd","parentSession"?,"metadata"?}`。
-- 条目行：`{"seq":u64,"id":uuid,"parentId":uuid,"timestamp":iso,"type":camelCase,...payload}`。**信封键独占规则**：`seq/id/parentId/timestamp/type` 为信封保留键，事件载荷不得使用同名键（`#[serde(flatten)]` 下同名会互抢/产生重复键）——tool 事件的句柄叫 `callId`，subagent 事件的句柄叫 `agentId`。
+- 条目行：`{"seq":u64,"id":uuid,"parentId":uuid,"timestamp":iso,"type":snake_case,...payload}`（as-built 修订：on-disk `type` 标签是 snake_case——`turn_start` 等，随 TS Pi v3 schema；**wire** `JournalWireEvent` 的标签是 camelCase——`turnStart` 等，由 translate 层重命名；载荷字段名两侧均 camelCase）。**信封键独占规则**：`seq/id/parentId/timestamp/type` 为信封保留键，事件载荷不得使用同名键（`#[serde(flatten)]` 下同名会互抢/产生重复键）——tool 事件的句柄叫 `callId`，subagent 事件的句柄叫 `agentId`。
 - **seq = 活动链深度**：链上稠密 0-based。分叉共享前缀 seq、新后缀续编号；中插（merged follow-up）= 新链 + `leaf` 重定向（现状语义 + seq）。加载时沿 leaf 链校验稠密，违例报错。
 - **v3 兼容**：旧文件（version:3、无 seq）读入时按链深回填 seq，内存使用；下次 append 时以 v4 写出（懒迁移）。`leaf.targetId` 游标重定向语义不变。
 
-### C.2 条目词汇表（kernel `JournalEntry` enum，serde tag="type" camelCase；即 wire `JournalWireEvent`）
+### C.2 条目词汇表（kernel `JournalEntry` enum，serde tag="type"、tag 值 snake_case；wire `JournalWireEvent` 同名条目、tag 值 camelCase，translate 层一一映射且全射）
 
 | 组 | 条目 | 载荷要点 |
 |---|---|---|
@@ -62,7 +62,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 ### C.3 内核改造
 - `ThreadCore { state: Thread, journal: SessionLog, subscribers: Vec<Sender<Arc<JournalEvent>>> }`；`JournalEvent{seq, entry}`。
-- `with_mut` 出口三段（现 thread.rs:490-503）：锁内收集 `pending_events` → **单点赋 seq 并 append 日志（内存+文件）** → 广播 `JournalEvent`。泵是唯一订阅者，通道满即 await（消灭现 try_send 满丢，thread.rs:505-522）。
+- **as-built 出口拓扑**（修订原文的「出口三段/泵唯一订阅者」）：`with_mut` 出口为锁内收集 `pending_events` → 解锁广播 `ThreadEvent`（内部面，unbounded）；durable 面经 notice tap 汇入 engine actor 队列。**seq 唯一盖章点在 storage 的 append 锁**（jsonl.rs `append_entry_locked`：父必先入索引否则拒绝、重复 id 拒绝、锁内按序广播 `JournalEvent`），facade 状态变更与日志条目为最终一致（tap 滞后 run 调度粒度，K6 跟踪跨面定序）。journal feed 为 bounded broadcast（4096，单源化到 `ENTRY_BACKPRESSURE_CAPACITY` 属 C6 代码项），慢订阅者收 `Lagged` → follow 流以 `StreamEnd{Resync}` 收口（L5，永不静默丢）。订阅者非唯一：每条 follow 流直接订阅 feed，网关泵另订 ThreadEvent 面做裁决路由与簿记。
 - `ThreadEvent`（30 变体）保留为内核内部事件面；新增 `ThreadEvent → JournalEntry` 的序列化映射与 `JournalEntry → ThreadEvent` 反投影（桌面视图复用）。新 durable 事件（ui_note/approval/project_change/pinned_archived/title...）直接产生条目。
 - 读 API：`journal.cursor() -> u64`、`journal.slice(from..to) -> Vec<JournalEvent>`、`journal.replay() -> Thread`（L10 门禁）。compaction 后 `slice` 的 records 视图从 `firstKeptEntryId` 起（seq 连续性不变）。
 - 写放大对策：组提交（批量 flush，默认不逐条 fsync）；页读 chunk-run 打包。唯一允许的回退是 `subagent_progress` 降频，不得回退「条目皆可重放」。
@@ -114,9 +114,13 @@ enum StreamEndReason { Closed, Cancelled, Resync, Failure { code: String, messag
 ### D.6 死亡清单（迁移完成后删除）
 `ServerNote::{AgentText, AgentThinking, ToolCall, ToolResult, ToolOutput, TurnStarted, TurnFinished, Stop, Retry, Compaction*, Subagent*, ModelText/Thinking/ToolCall/ModelChatDone, ThreadInfo, ThreadHistory, ThreadsUpdated, Models, Commands, Usage, UsageSnapshot, TokenUsage, CurrentModel, PlanReady?, PlanUpdated, PlanModeChanged, GoalChanged, CwdChanged, PermissionModeChanged, ReasoningEffortChanged, BrowserSuitesChanged, BackgroundTaskUpdated, SteerPending/Injected, ApprovalDecision, Branch, GitStats, HistoryProgress, PeerMessage?, CacheInvalidation, Error}`——分别由 Entry 条目 / 投影 / HostEvent / Snapshot 边界取代。`translate.rs` 的镜像臂全灭，ServerCall 生成臂保留迁入新泵。
 
+**as-built（arch 审计修订）**：拆除实际删 37 留 11（保留集＝owner 控制 `ready/sessionCreated/sessionDisposed`、过渡列表通道 `threadsUpdated/models/commands`、服务端 `error`、ModelChat 侧流 ×4——以 surface.rs 的 `SERVER_NOTES` 宏生成清单为准）。§J.6 的「零残留」声明不实：另有 compat `ClientNote::{CreateSession,Submit,Steer}`（桌面 landing 创建主路径即 compat CreateSession）与错误桩 `ClientCall::{GetUsage,GetCurrentModel,ThreadInfo}` 存活。C4 关闭双协议窗口时经 surface 宏清单一次删除（穷举 tag match 使表/样本/类型同步收敛，编译期门禁）。
+
 ### D.7 背压与错误
-- 策略表（取代 transport.rs:36-49）：`StreamItem(Snapshot|Projections)` 与 `StreamEnd` → 永不 Drop；`Entry` → 有界（4096）满即发 `StreamEnd{Resync}`；控制帧（Request/Response/Notification）→ 阻塞不丢。
-- `RpcError{code, message}`，code 集：`session/not-found, session/busy, gateway/bad-request, gateway/internal, resync-required, model/unresolvable`。
+- 策略表：`StreamItem(Snapshot|Projections)` 与 `StreamEnd` → 永不 Drop；`Entry` → 有界（4096，单源常量 `ENTRY_BACKPRESSURE_CAPACITY`）满即发 `StreamEnd{Resync}`；控制帧（Request/Response/Reply/Host）→ 阻塞不丢。
+- 载体分界（C6 决断，round-10 死锁教训）：**网络载体**（WS，有界 1024）执行上表——有界、阻塞、满即 Resync；**进程内载体**（GPUI/napi 的 in-proc pair）按设计无界：两端同进程，有界对在双向同时填满时只会让双方 park 在 `send_blocking` 上互等而死锁（round-10 的 GPUI 主线程冻结即此），L5 的有界-重同步语义只适用网络载体，慢客户端在进程内的代价是内存而非丢帧；任何发送方不得在 GPUI 主线程上同步阻塞。ModelChat 侧流 note（modelText/modelThinking）为 §B L6 域旁路，明文声明为可损（Drop 类保留）。
+- 服务端广播纪律（GW4）：`broadcast_host`/`note_to_client` 一律锁内 clone 连接列表、锁外发送——单个停滞的网络客户端不得持 `clients` 锁冻结全网关（克隆后发送，照 `route_note` 范本）。
+- `RpcError{code, message}`，code 集：`session/not-found, session/busy, gateway/bad-request, gateway/internal, resync-required, model/unresolvable, feature/unavailable`（GW7 增补：协议已声明但尚未实现的能力臂以此作答，客户端可区分「功能未建」与一般失败；Terminal 死桩为首个使用者）。
 
 ### D.8 TS 侧
 ts-rs 绑定再生成；帧层手写 exact-key 守卫（dsh stream-protocol.ts:270-291 同款）；cargo 测试导出真实帧 JSON fixture（`crates/manox-protocol/fixtures/`）→ vitest 断言守卫解析（双路径一致性的 TS 侧，M0 围栏）。
@@ -176,7 +180,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 3. JournalStream 属性测试（F.1.5）。
 4. 声明面覆盖（L12）：journal 条目/投影 key/host 事件/协议帧四张表，emit 点 100%（coverage 测试：脚本化会话驱动后断言每个声明面出现在 FromServer 流；扩展 `dual_path_transport_consistency`）。
 5. 双路径一致性：in-proc ≡ serde ≡ TS 守卫（fixtures）。
-6. grep 门禁（终局）：视图/组件层不得 import 协议发送面；`ServerNote::ThreadInfo|UsageSnapshot` 等死亡清单零残留。
+6. grep 门禁（终局）：视图/组件层不得 import 协议发送面；死亡清单残留以 §D.6 as-built 保留集为准（原「零残留」声明经审计证伪），并按 U9 扩展到内核对象面（views 不得持 ThreadHandle）。
 7. 病灶回归：has_interacted 首交互即显（投影）；消费统计实时+历史（Q 面折叠）；项目/模型继承（CreateSession 意图）；选中一次生效（client-owned）；模型不串号（canonical+零解析）。
 
 ---
@@ -235,13 +239,13 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 ### K.5.1 T10 拆除与集成清单（**已完成**，2026-09-05 终局门禁全绿）
 
-**终局状态**：translate 只余裁决路由；桌面渲染与 restore 全走 v2 流（含重开回归锁 `reopen_snapshot_restores_transcript_and_rearms_rebuild`）；v1 快照发射面（ThreadHistory/ThreadInfo/GetUsage/GetCurrentModel/残余 PermissionModeChanged/SteerPending）删除；37 个 DOOMED ServerNote 变体删除（保留 11 个：owner 控制 ×3、过渡列表通道 ×3、服务端 Error、ModelChat 侧流 ×4）；双端 v1 fold 清除；绑定/守卫/fixtures 再生成；桌面 usage 面板接 Q 面（committed 边沿，含回归测试）；全仓门禁 2285 Rust 测试 + webui 152 vitest + vscode tsc + grep 零残留。
+**终局状态**：translate 只余裁决路由；桌面渲染与 restore 全走 v2 流（含重开回归锁 `reopen_snapshot_restores_transcript_and_rearms_rebuild`）；v1 快照发射面（ThreadHistory/ThreadInfo/GetUsage/GetCurrentModel/残余 PermissionModeChanged/SteerPending）删除；37 个 DOOMED ServerNote 变体删除（保留 11 个：owner 控制 ×3、过渡列表通道 ×3、服务端 Error、ModelChat 侧流 ×4）；双端 v1 fold 清除；绑定/守卫/fixtures 再生成；桌面 usage 面板接 Q 面（committed 边沿，含回归测试）；全仓门禁 2285 Rust 测试 + webui 152 vitest + vscode tsc（「grep 零残留」声明经 arch 审计证伪——真实保留集见 §D.6 as-built 注记；且 §J.4 发射覆盖门禁当时为自指样本，C3 已改为宏单源+穷举 match，真实组合发射覆盖属 J1b）。
 
-以下为 **PR 后润色项**（不阻塞）：
-1. Models/ThreadsUpdated/Commands 列表通道 v1 note → Host 帧迁移；
-2. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，客户端合成 key 的抖动根因）；
-3. steer→parked-submit 的 message_id 关联语义与内核对齐一次；
-4. `GetConversationInfo` 的 git 字段（host git 查询）。
+以下为 **PR 后润色项**（arch 审计后更新状态与范围）：
+1. HostEvent 总线迁移（GW1，open）——审计修正范围：8 个 HostEvent 变体中仅 `SessionStatus` 有生产发射点，`Ready/Models/Commands/ThreadsUpdated/SessionCreated/SessionDisposed/Error` 全由 v1 ServerNote 承载；`pending_plan`/`background_work` 的 SessionStatus delta（含 true 边沿）已补齐；
+2. `StreamFrame::Entry` 信封补齐（U5，open）——id/parentId/timestamp；桌面同款根因：live 帧合成 id `e-{seq}` 在快照 Replace 后漂移（usage key/气泡身份）；
+3. steer→parked-submit 的 message_id 关联语义与内核对齐（GW8，open）；
+4. `GetConversationInfo` 的 git 字段（open）。
 
 原盘点（历史）：
 
@@ -250,8 +254,13 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 **集成复核（T6/T7 交付时上报的事项）**：
 1. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，T7 报的 React key 抖动根因）——协议+follow.rs+两端解析器一次改齐；
 2. steer→parked-submit 的 message_id 关联语义（§D.2 vs 无 DropQueued）与 `turnFinish.strandedSteerIds` 的客户端匹配——与 server 对一次；
-3. 重连 `StreamEnd{Closed}` 旧代竞态——T7 已用每代轮换 streamId 缓解，T9 同方案，或服务端 re-seat 不重放旧 Closed；
+3. 重连 `StreamEnd{Closed}` 旧代竞态——**已关闭（arch 审计验证）**：服务端 re-seat 先 `disconnect()` 旧连接再 end 旧流（旧 Closed 只发往死通道），`remove_client` 有代际栅栏、follow untrack 有身份栅栏；客户端每代轮换 streamId 为双保险；
 4. `GetConversationInfo` 的 git 字段仍为 null（host git 查询，可选补）。
 
 ### K.6 显式不做（本迭代范围外，架构已预留钩子）
 动态 host 插件（WASM/JS eval 沙箱）、插件市场与分发、皮肤 token 体系完整化、桌面动态 slot、terminal/ModelChat 域并入 journal。
+
+
+### K.7 arch 审计整改波（arch/dsh-v2 第二波，进行中）
+
+四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。

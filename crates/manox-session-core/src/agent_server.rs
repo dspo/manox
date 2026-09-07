@@ -590,14 +590,21 @@ impl AgentServerInner {
         drop(owners);
         let mut sessions = self.sessions.lock();
         for sid in orphaned {
-            // GW2: an orphaned session's pump must not outlive the entry —
-            // stop it explicitly (removal alone only detached the task).
-            if let Some(session) = sessions.remove(&sid) {
-                session.stop_pump();
-            }
             // Ownership lost ⇒ every live stream of the session closes
             // (§D.1 `Closed`).
             self.end_streams_for_session(&sid, StreamEndReason::Closed);
+            // GW2: an orphaned session's pump must not outlive the entry —
+            // stop it explicitly (removal alone only detached the task).
+            // Deferred reap (GW2 follow-up): an orphan whose turn is still
+            // in flight keeps its entry and pump until the TurnFinished arm
+            // settles it — stopping here would strand the store's `running`
+            // flag and swallow the settle-time SessionStatus edges.
+            let running = sessions
+                .get(&sid)
+                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+            if !running && let Some(session) = sessions.remove(&sid) {
+                session.stop_pump();
+            }
         }
     }
 
@@ -834,13 +841,11 @@ async fn handle_call(
         .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
         // GW7: an explicit stable code, not a bare -1 — clients that
         // declared terminal support must be able to distinguish "feature
-        // not built yet" from a generic failure. The code is a §D.7 set
-        // addition candidate (spec revision proposed in the delivery
-        // report; the msg.rs constant table lives outside this change's
-        // file domain, so the literal is used here).
+        // not built yet" from a generic failure (§D.7 code set, ratified
+        // with the msg.rs constant + spec revision).
         ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
             Err(RpcError::new(-1, "terminal support lands in β-3b")
-                .with_code("feature/unavailable"))
+                .with_code(manox_protocol::msg::CODE_FEATURE_UNAVAILABLE))
         }
         ClientCall::ModelChat {
             request_id,
@@ -1316,14 +1321,25 @@ impl AgentServerInner {
         }
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty() {
-            // GW2: the last owner detached — terminate the pump before the
-            // entry leaves the table (a dropped JoinHandle only detaches).
-            let removed = { self.sessions.lock().remove(session_id) };
-            if let Some(session) = removed {
-                session.stop_pump();
-            }
             // Ownership lost ⇒ live streams close (§D.1 `Closed`).
             self.end_streams_for_session(session_id, StreamEndReason::Closed);
+            // GW2 follow-up (deferred reap): a detach while the turn still
+            // runs keeps the entry and its pump — the settle bookkeeping
+            // (store running/unread/pending flags and the SessionStatus
+            // edges) belongs to the pump, and stopping it here would strand
+            // the store's `running` flag true with nobody left to clear it.
+            // The TurnFinished arm reaps the orphan once it settles.
+            let running = self
+                .sessions
+                .lock()
+                .get(session_id)
+                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+            if !running {
+                let removed = { self.sessions.lock().remove(session_id) };
+                if let Some(session) = removed {
+                    session.stop_pump();
+                }
+            }
         }
     }
 
@@ -2353,6 +2369,19 @@ fn spawn_pump(
                             }
                         });
                     }
+                    // Deferred reap (GW2 follow-up): an orphaned session
+                    // (last owner detached or disconnected mid-turn) kept
+                    // its entry and pump through this settle so the
+                    // bookkeeping above could converge the store flags;
+                    // reap it now unless the drain just started a follow-up
+                    // turn (`is_running` is the facade's synchronous truth —
+                    // run_turn sets it, the settle path cleared it before
+                    // this event was pushed). Dropping the entry runs
+                    // ServerSession::Drop → stop_pump; this loop exits on
+                    // the cancelled token at its next select.
+                    if inner.owners(&session_id).is_empty() && !thread.read(|t| t.is_running()) {
+                        inner.sessions.lock().remove(&session_id);
+                    }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
                     let id = session_id.clone();
@@ -2379,6 +2408,13 @@ fn spawn_pump(
                     manox_agent::thread_store::global()
                         .with_mut(|s| s.mark_pending_plan(&id, true));
                     thread.with_mut(|t| t.set_plan_review_pending(true));
+                    // §D.5: the pending_plan TRUE edge broadcasts like the
+                    // pending_auth one — without it client mirrors only ever
+                    // see the false edge (GW1 delivery finding) and a list
+                    // badge cannot rise until the next explicit ListThreads.
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.pending_plan = Some(true);
+                    }));
                     // β-3b: initiate PlanVerdict (carries the plan body) and
                     // skip translate's bare PlanReady note — the call is the
                     // actionable review card; the bare note would duplicate.
@@ -2397,12 +2433,18 @@ fn spawn_pump(
                 }
                 ThreadEvent::BackgroundTaskUpdated { .. } => {
                     let id = session_id.clone();
-                    manox_agent::thread_store::global().with_mut(|s| {
-                        s.mark_background_work(
-                            &id,
-                            manox_agent::background_task::thread_has_running_tasks(&id),
-                        )
-                    });
+                    // Computed OUTSIDE the store write lock (it takes the
+                    // background-task registry lock — nesting it inside was a
+                    // U8-class lock-order hazard) and broadcast: §D.5 lists
+                    // background work as a SessionStatus delta, and client
+                    // mirrors previously only learned it at the next
+                    // ListThreads.
+                    let active = manox_agent::background_task::thread_has_running_tasks(&id);
+                    manox_agent::thread_store::global()
+                        .with_mut(|s| s.mark_background_work(&id, active));
+                    inner.broadcast_host(host_status(&session_id, |f| {
+                        f.background_work = Some(active);
+                    }));
                 }
                 _ => {}
             }
@@ -4945,6 +4987,76 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// GW2 follow-up regression: detaching the last owner WHILE a turn runs
+    /// defers the pump stop — the settle bookkeeping (store flags + the
+    /// SessionStatus edges) belongs to the pump, and killing it at detach
+    /// stranded the store's `running` flag with nobody left to clear it.
+    /// The TurnFinished arm reaps the orphan: the entry leaves the table,
+    /// the pump terminates, and the settle edge still broadcasts.
+    #[test]
+    fn detach_while_running_defers_reap_until_settle() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        // The turn starts: the pump marks it active and broadcasts.
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
+            .unwrap();
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(true));
+
+        // The last owner detaches mid-turn.
+        client.send(FromClient::Notification {
+            note: ClientNote::DetachSession {
+                session_id: "s1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionDisposed { session_id } } if session_id == "s1"),
+        );
+        assert!(
+            server.0.owners("s1").is_empty(),
+            "DetachSession must release the owner"
+        );
+        // Deferred: the entry and its pump survive the detach while the
+        // turn is in flight.
+        assert!(
+            server.0.session_thread("s1").is_some(),
+            "a detached-but-running session keeps its entry until settle"
+        );
+        expect_live_pumps(&server, 1, "detach mid-turn defers the pump stop");
+
+        // Settle: the pump runs the bookkeeping, broadcasts the edge, and
+        // reaps the orphan.
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
+        expect_live_pumps(&server, 0, "the orphan is reaped at settle");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.0.session_thread("s1").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the settled orphan's entry never left the table"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
     /// Reopening a detached session is idempotent: the persisted thread
     /// survives detach (only the in-memory owner is dropped), so a later
     /// `OpenSession` re-adds the owner and the v2 replay lane — the follow
@@ -6216,15 +6328,32 @@ mod tests {
                 title: "GW9 plan".into(),
             })))
             .unwrap();
+        let mut saw_pending_true = false;
         let call_id = loop {
-            if let FromServer::Request {
-                id,
-                call: ServerCall::PlanVerdict { .. },
-            } = client.recv()
-            {
-                break id;
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::PlanVerdict { .. },
+                } => break id,
+                // §D.5: the pending_plan TRUE edge must broadcast on the
+                // way in (GW1 delivery finding) — the pump emits it before
+                // routing the verdict call, so it arrives first on this
+                // FIFO connection.
+                FromServer::Host {
+                    host:
+                        HostEvent::SessionStatus {
+                            session_id,
+                            pending_plan: Some(true),
+                            ..
+                        },
+                } if session_id == "gw9-s1" => saw_pending_true = true,
+                _ => {}
             }
         };
+        assert!(
+            saw_pending_true,
+            "the pending_plan TRUE edge must broadcast (§D.5)"
+        );
         // The pending-review planes are set while the verdict is in flight.
         expect_store_pending_plan("gw9-s1", true, "while the verdict is pending");
 

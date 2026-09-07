@@ -72,6 +72,7 @@ pub const RPC_ERROR_CODES: &[&str] = &[
     "gateway/internal",
     "resync-required",
     "model/unresolvable",
+    "feature/unavailable",
 ];
 
 /// `session/not-found` (§D.7).
@@ -89,6 +90,11 @@ pub const CODE_RESYNC_REQUIRED: &str = "resync-required";
 /// not resolve server-side (the single convergence point is
 /// `resolve_model_ref`, L8).
 pub const CODE_MODEL_UNRESOLVABLE: &str = "model/unresolvable";
+/// `feature/unavailable` (§D.7): the protocol declares the entry but the
+/// capability is not implemented yet — a programmable answer for declared
+/// dead faces (GW7's terminal stubs), so a client can distinguish "not
+/// built" from a generic failure instead of losing the request silently.
+pub const CODE_FEATURE_UNAVAILABLE: &str = "feature/unavailable";
 
 impl RpcError {
     /// Builder: tag this error with a §D.7 stable code (stored in
@@ -506,5 +512,6 @@ mod tests {
         assert_eq!(err.data.as_ref().unwrap()["code"], "session/not-found");
         assert!(RPC_ERROR_CODES.contains(&"resync-required"));
         assert!(RPC_ERROR_CODES.contains(&CODE_MODEL_UNRESOLVABLE));
+        assert!(RPC_ERROR_CODES.contains(&CODE_FEATURE_UNAVAILABLE));
     }
 }
