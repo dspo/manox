@@ -438,6 +438,9 @@ mod tests {
                 stream_id: crate::journal::StreamId::new("stream-1"),
                 frame: crate::stream::StreamFrame::Entry {
                     seq: 3,
+                    id: "e-3".into(),
+                    parent_id: Some("e-2".into()),
+                    timestamp: "2026-09-04T00:00:00Z".into(),
                     event: crate::journal::JournalWireEvent::AgentTextDelta { s: "tok".into() },
                 },
             },

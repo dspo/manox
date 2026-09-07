@@ -5240,7 +5240,7 @@ mod tests {
             let (got, event) = loop {
                 match client.recv() {
                     FromServer::StreamItem {
-                        frame: manox_protocol::StreamFrame::Entry { seq, event },
+                        frame: manox_protocol::StreamFrame::Entry { seq, event, .. },
                         ..
                     } => break (seq, event),
                     // The P face interleaves changed-key frames after the

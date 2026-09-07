@@ -640,8 +640,17 @@ export class Store {
 			...event,
 			seq,
 			type: asString(event.type) ?? 'unknown',
-			id: `e-${seq}`,
-			timestamp: new Date().toISOString(),
+			// U5: the frame carries the durable §C.1 envelope — the
+			// synthesized `e-${seq}` id and wall-clock timestamp used to
+			// drift from the snapshot records' real uuids at every Replace
+			// (React keys, usage keys, echo matching). The fallbacks keep
+			// the store lenient for hand-built frames; the wire boundary
+			// (guards.parseStreamFrame) requires the full envelope.
+			id: asString(frame.id) ?? `e-${seq}`,
+			...(frame.parentId === null || typeof frame.parentId === 'string'
+				? { parentId: frame.parentId }
+				: {}),
+			timestamp: asString(frame.timestamp) ?? new Date().toISOString(),
 		};
 		// Feed the engine FIRST, before any tag filtering: every wire entry
 		// occupies its seq (§F.1 density). Dropping an unknown-tag entry

@@ -243,7 +243,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 以下为 **PR 后润色项**（arch 审计后更新状态与范围）：
 1. HostEvent 总线迁移（GW1，open）——审计修正范围：8 个 HostEvent 变体中仅 `SessionStatus` 有生产发射点，`Ready/Models/Commands/ThreadsUpdated/SessionCreated/SessionDisposed/Error` 全由 v1 ServerNote 承载；`pending_plan`/`background_work` 的 SessionStatus delta（含 true 边沿）已补齐；
-2. `StreamFrame::Entry` 信封补齐（U5，open）——id/parentId/timestamp；桌面同款根因：live 帧合成 id `e-{seq}` 在快照 Replace 后漂移（usage key/气泡身份）；
+2. `StreamFrame::Entry` 信封补齐——**已关闭（U5）**：帧携完整 §C.1 信封（seq/id/parentId/timestamp/event），follow.rs 与快照 records 走同一 `wire_entry` 变换（live 帧与其快照孪生同形），桌面 fold 与 webui store 双双退休合成 `e-{seq}` id，TS 边界（guards.parseStreamFrame）以 exactKeys 钉住信封；
 3. steer→parked-submit 的 message_id 关联语义与内核对齐（GW8，open）；
 4. `GetConversationInfo` 的 git 字段（open）。
 
@@ -252,7 +252,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 **拆除**：translate.rs 的 4 处 DOOMED note 发射臂；agent_server.rs 的 13 处 DOOMED 引用（含 `republish_if_first_interaction` ×5 与 GetUsage/GetCurrentModel 的 dispatch 臂）；client_store.rs 的 v1 `apply_server_note`（先翻 `stream_drives_render=true` 验证渲染，再删 v1 fold 与 `server_note_translate`）；protocol 的 DOOMED ServerNote 变体 + 守卫/绑定/fixtures 再生成；grep 门禁（§J.6）终检。
 
 **集成复核（T6/T7 交付时上报的事项）**：
-1. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，T7 报的 React key 抖动根因）——协议+follow.rs+两端解析器一次改齐；
+1. `StreamFrame::Entry` 信封补齐（id/parentId/timestamp，T7 报的 React key 抖动根因）——**已关闭（U5）**：协议+follow.rs+两端解析器一次改齐；
 2. steer→parked-submit 的 message_id 关联语义（§D.2 vs 无 DropQueued）与 `turnFinish.strandedSteerIds` 的客户端匹配——与 server 对一次；
 3. 重连 `StreamEnd{Closed}` 旧代竞态——**已关闭（arch 审计验证）**：服务端 re-seat 先 `disconnect()` 旧连接再 end 旧流（旧 Closed 只发往死通道），`remove_client` 有代际栅栏、follow untrack 有身份栅栏；客户端每代轮换 streamId 为双保险；
 4. `GetConversationInfo` 的 git 字段仍为 null（host git 查询，可选补）。
@@ -263,4 +263,4 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 ### K.7 arch 审计整改波（arch/dsh-v2 第二波，进行中）
 
-四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。
+四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）、§D.5 双边沿+detach 延迟回收+规格真实化（037d5d2e）、U5 Entry 帧信封补齐（两端退休合成 id）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。

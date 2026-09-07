@@ -6,7 +6,8 @@
 //! carried by one of these entries (L3), stamped with a chain-dense `seq` at
 //! the single append point (L4). The frames [`crate::stream`] carry are
 //! `JournalWireEntry` = `{seq, id, parentId, timestamp, event}` (§C.1);
-//! `StreamFrame::Entry` transports the `seq` + `event` pair.
+//! `StreamFrame::Entry` transports the full entry envelope (`seq`, `id`,
+//! `parentId`, `timestamp`, `event`) — identical to a snapshot record.
 //!
 //! serde shape: internally tagged by `type` (camelCase), struct variants with
 //! camelCase payload fields. `unknown-variant-tolerant` on the read side is a
@@ -266,7 +267,7 @@ pub enum JournalWireEvent {
 
 /// One journal entry line as it travels the wire (§C.1 entry envelope):
 /// chain-dense `seq` + identity + timestamp + the [`JournalWireEvent`].
-/// `StreamFrame::Entry { seq, event }` carries the same pair inside the
+/// `StreamFrame::Entry { seq, id, parent_id, timestamp, event }` carries the same envelope inside the
 /// frame tag (§D.1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "protocol.ts")]

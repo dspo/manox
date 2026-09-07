@@ -134,7 +134,7 @@ describe('request/receipt correlation (§T7.1)', () => {
 		const frame = {
 			kind: 'streamItem',
 			streamId: 's',
-			frame: { type: 'entry', seq: 1, event: { type: 'turnStart' } },
+			frame: { type: 'entry', seq: 1, id: 'e-1', parentId: null, timestamp: '2026-09-04T00:00:00Z', event: { type: 'turnStart' } },
 		};
 		ws.receive(frame);
 		expect(store.dispatch).toHaveBeenCalledWith(expect.objectContaining({ kind: 'streamItem' }));

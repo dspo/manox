@@ -3,6 +3,9 @@
     "s": "hi",
     "type": "agentTextDelta"
   },
+  "id": "e-2",
+  "parentId": "e-1",
   "seq": 2,
+  "timestamp": "2026-09-04T00:00:00Z",
   "type": "entry"
 }

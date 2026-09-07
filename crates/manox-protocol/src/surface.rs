@@ -346,6 +346,9 @@ wire_surface! {
         StreamFrame::Snapshot(_) => "snapshot" ~ StreamFrame::Snapshot(snapshot_sample()),
         StreamFrame::Entry { .. } => "entry" ~ StreamFrame::Entry {
             seq: 2,
+            id: "e-2".into(),
+            parent_id: Some("e-1".into()),
+            timestamp: "2026-09-04T00:00:00Z".into(),
             event: JournalWireEvent::AgentTextDelta { s: "hi".into() },
         },
         StreamFrame::Projections(_) => "projections" ~ StreamFrame::Projections(ProjectionsFrame {
@@ -793,6 +796,9 @@ pub fn scripted_session() -> Vec<FromServer> {
             stream_id: stream_1.clone(),
             frame: StreamFrame::Entry {
                 seq: (10 + i) as u64,
+                id: format!("e-{}", 10 + i),
+                parent_id: Some(format!("e-{}", 9 + i)),
+                timestamp: "2026-09-04T00:00:00Z".into(),
                 event,
             },
         });

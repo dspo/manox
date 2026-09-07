@@ -161,7 +161,7 @@ describe('createWebBridge (v2 frame routing)', () => {
 		MockWebSocket.instances[0].receive({
 			kind: 'streamItem',
 			streamId: 's',
-			frame: { type: 'entry', seq: 1, event: { type: 'turnStart' }, extraKey: true },
+			frame: { type: 'entry', seq: 1, id: 'e-1', parentId: null, timestamp: '2026-09-04T00:00:00Z', event: { type: 'turnStart' }, extraKey: true },
 		});
 		MockWebSocket.instances[0].receive({ kind: 'host', host: { type: 'notAHostTag' } });
 		expect(listener).not.toHaveBeenCalled();
@@ -175,7 +175,7 @@ describe('createWebBridge (v2 frame routing)', () => {
 		MockWebSocket.instances[0].receive({
 			kind: 'streamItem',
 			streamId: 's1',
-			frame: { type: 'entry', seq: 1, event: { type: 'turnStart' } },
+			frame: { type: 'entry', seq: 1, id: 'e-1', parentId: null, timestamp: '2026-09-04T00:00:00Z', event: { type: 'turnStart' } },
 		});
 		MockWebSocket.instances[0].receive({
 			kind: 'host',

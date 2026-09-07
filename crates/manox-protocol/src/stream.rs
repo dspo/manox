@@ -64,10 +64,17 @@ pub enum StreamFrame {
     /// Authoritative window opening a stream (L5: never dropped; the
     /// client's journal engine requires it as frame #1, §F.1).
     Snapshot(SessionSnapshot),
-    /// One durable journal entry appended at `seq` (L3/L4). Bounded queue:
+    /// One durable journal entry appended at `seq` (L3/L4). Carries the
+    /// full §C.1 envelope (id/parentId/timestamp) — the former seq+event
+    /// shape forced clients to synthesize `e-{seq}` ids that drifted from
+    /// the durable uuids at every snapshot Replace (usage keys, bubble
+    /// identity, list keys — U5 / K.5.1 polish item 2). Bounded queue:
     /// overflow resyncs instead of dropping (L5).
     Entry {
         seq: u64,
+        id: String,
+        parent_id: Option<String>,
+        timestamp: String,
         event: crate::journal::JournalWireEvent,
     },
     /// Changed projection values since the previous frame (P face, §E.1);
@@ -270,11 +277,18 @@ mod tests {
     fn entry_and_projection_frames_round_trip() {
         let frame = StreamFrame::Entry {
             seq: 3,
+            id: "e-3".into(),
+            parent_id: Some("e-2".into()),
+            timestamp: "2026-09-04T00:00:00Z".into(),
             event: JournalWireEvent::AgentTextDelta { s: "tok".into() },
         };
         let json = serde_json::to_value(&frame).unwrap();
         assert_eq!(json["type"], "entry");
         assert_eq!(json["seq"], 3);
+        // U5: the frame carries the §C.1 envelope on the wire, camelCase.
+        assert_eq!(json["id"], "e-3");
+        assert_eq!(json["parentId"], "e-2");
+        assert_eq!(json["timestamp"], "2026-09-04T00:00:00Z");
         assert_eq!(json["event"]["type"], "agentTextDelta");
         let back: StreamFrame = serde_json::from_value(json).unwrap();
         assert_eq!(frame, back);
@@ -312,6 +326,9 @@ mod tests {
         assert_eq!(
             StreamFrame::Entry {
                 seq: 1,
+                id: "e-1".into(),
+                parent_id: None,
+                timestamp: String::new(),
                 event: JournalWireEvent::Stop { reason: None },
             }
             .backpressure_policy(),

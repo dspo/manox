@@ -11578,6 +11578,9 @@ mod tests {
                                 stream_id: manox_protocol::StreamId::new("probe-stream"),
                                 frame: manox_protocol::StreamFrame::Entry {
                                     seq: tail_seq + 1,
+                                    id: format!("w{}", tail_seq + 1),
+                                    parent_id: None,
+                                    timestamp: String::new(),
                                     event: manox_protocol::JournalWireEvent::TurnStart,
                                 },
                             },
@@ -11588,6 +11591,9 @@ mod tests {
                                 stream_id: manox_protocol::StreamId::new("probe-stream"),
                                 frame: manox_protocol::StreamFrame::Entry {
                                     seq: tail_seq + 2,
+                                    id: format!("w{}", tail_seq + 2),
+                                    parent_id: None,
+                                    timestamp: String::new(),
                                     event: manox_protocol::JournalWireEvent::AgentTextDelta {
                                         s: "settled row probe".into(),
                                     },

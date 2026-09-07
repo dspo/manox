@@ -67,7 +67,15 @@ export type FrameSnapshot = {
   projections: Record<string, unknown>;
   projectionsAsOfSeq: number;
 };
-export type FrameEntry = { type: 'entry'; seq: number; event: Record<string, unknown> };
+export type FrameEntry = {
+  type: 'entry';
+  seq: number;
+  /** Durable entry uuid (§C.1 envelope, U5) — never synthesized. */
+  id: string;
+  parentId: string | null;
+  timestamp: string;
+  event: Record<string, unknown>;
+};
 export type FrameProjections = {
   type: 'projections';
   sessionId: string;
@@ -98,11 +106,13 @@ export function parseStreamFrame(v: unknown): Guard<StreamFrameShape> {
         value: v as unknown as FrameSnapshot,
       };
     case 'entry':
-      if (!exactKeys(v, ['type', 'seq', 'event'])) {
+      if (!exactKeys(v, ['type', 'seq', 'id', 'parentId', 'timestamp', 'event'])) {
         return { ok: false, reason: 'entry: exact-keys check failed' };
       }
       if (
         !typeofOr(v.seq, 'number') || !isRecord(v.event)
+        || !typeofOr(v.id, 'string') || !typeofOr(v.timestamp, 'string')
+        || !(v.parentId === null || typeofOr(v.parentId, 'string'))
       ) return { ok: false, reason: 'entry: field types' };
       return { ok: true, value: v as unknown as FrameEntry };
     case 'projections':

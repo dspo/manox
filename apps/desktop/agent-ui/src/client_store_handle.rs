@@ -173,7 +173,19 @@ impl ClientStoreHandle {
                     .merge_projection_baseline(&snap.projections, snap.projections_as_of_seq);
                 outs
             }
-            StreamFrame::Entry { seq, event } => self.fold.entry(seq, event),
+            StreamFrame::Entry {
+                seq,
+                id,
+                parent_id,
+                timestamp,
+                event,
+            } => self.fold.entry(manox_protocol::JournalWireEntry {
+                seq,
+                id,
+                parent_id,
+                timestamp,
+                event,
+            }),
             StreamFrame::Projections(frame) => {
                 if frame.session_id != self.session_id {
                     return;
@@ -643,6 +655,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 3,
+                        id: "w3".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: JournalWireEvent::AgentTextDelta { s: "a".into() },
                     },
                 ),
@@ -655,6 +670,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 4,
+                        id: "w4".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: JournalWireEvent::ToolCall {
                             call_id: "c1".into(),
                             name: "Bash".into(),
@@ -680,6 +698,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 5,
+                        id: "w5".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: msg_ev("user"),
                     },
                 ),
@@ -692,6 +713,20 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(drain_info(&rx), vec!["info-s1-3".to_string()]);
 
+        // U5: the live frame's durable envelope flows through verbatim —
+        // the fold no longer synthesizes `e-{seq}` ids, which drifted from
+        // the snapshot records' real uuids at every Replace (usage keys,
+        // bubble identity, list keys).
+        handle.update(cx, |h, _| {
+            let row = h
+                .store
+                .window
+                .iter()
+                .find(|e| e.seq == 5)
+                .expect("seq 5 lands in the window");
+            assert_eq!(row.id, "w5", "the frame's durable id flows through");
+        });
+
         // Structural boundary: a gap (seq 7 after tail 5) buffers the entry
         // and requests the missing page; answering it merges into a Replace
         // whose recount must be exact (messages 0, 2, 5, 6, 7 → 5).
@@ -701,6 +736,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 7,
+                        id: "w7".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: msg_ev("assistant"),
                     },
                 ),
@@ -768,6 +806,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 8,
+                        id: "w8".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: msg_ev("user"),
                     },
                 ),
@@ -784,6 +825,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 9,
+                        id: "w9".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: msg_ev("user"),
                     },
                 ),
@@ -993,6 +1037,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 1,
+                        id: "w1".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: JournalWireEvent::AgentTextDelta { s: "yo".into() },
                     },
                 ),
@@ -1122,6 +1169,9 @@ mod tests {
                     "s1",
                     StreamFrame::Entry {
                         seq: 1,
+                        id: "w1".to_string(),
+                        parent_id: None,
+                        timestamp: String::new(),
                         event: JournalWireEvent::Message {
                             role: "user".into(),
                             content: vec![serde_json::json!({"type": "text", "text": "hello"})],

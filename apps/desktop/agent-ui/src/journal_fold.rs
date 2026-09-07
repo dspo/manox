@@ -28,7 +28,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use manox_protocol::journal::{JournalWireEntry, JournalWireEvent};
+use manox_protocol::journal::JournalWireEntry;
 use manox_protocol::journal_stream::{
     JournalChange, JournalEntry, JournalInput, JournalSource, JournalStream,
 };
@@ -146,15 +146,11 @@ impl JournalFold {
         self.take(|engine| engine.apply(JournalInput::Opened { cursor, page }))
     }
 
-    /// Feed one live `Entry` frame.
-    pub fn entry(&mut self, seq: u64, event: JournalWireEvent) -> Vec<FoldOut> {
-        let entry = FoldEntry(JournalWireEntry {
-            seq,
-            id: format!("e-{seq}"),
-            parent_id: None,
-            timestamp: String::new(),
-            event,
-        });
+    /// Feed one live `Entry` frame. U5: the frame carries the full §C.1
+    /// envelope, so the fold never synthesizes ids — a live entry and its
+    /// snapshot-record twin keep one durable identity across a Replace.
+    pub fn entry(&mut self, entry: JournalWireEntry) -> Vec<FoldOut> {
+        let entry = FoldEntry(entry);
         // While repairing, everything queues; the repair flush feeds them in
         // arrival order (engine merges by seq).
         if self.repairing.is_some() {
@@ -321,6 +317,16 @@ mod tests {
     use super::*;
     use manox_protocol::journal::JournalWireEvent as E;
 
+    fn wire(seq: u64, event: E) -> JournalWireEntry {
+        JournalWireEntry {
+            seq,
+            id: format!("e-{seq}"),
+            parent_id: None,
+            timestamp: String::new(),
+            event,
+        }
+    }
+
     fn entry(seq: u64) -> E {
         E::AgentTextDelta {
             s: format!("tok-{seq}"),
@@ -344,7 +350,7 @@ mod tests {
             snap.as_slice(),
             [FoldOut::Change(WindowChange::Replace { entries, .. })] if entries.len() == 1
         ));
-        let outs = fold.entry(1, entry(1));
+        let outs = fold.entry(wire(1, entry(1)));
         assert!(matches!(
             outs.as_slice(),
             [FoldOut::Change(WindowChange::Append(_))]
@@ -365,7 +371,7 @@ mod tests {
                 event: entry(0),
             }],
         );
-        let outs = fold.entry(0, entry(0));
+        let outs = fold.entry(wire(0, entry(0)));
         assert!(outs.is_empty(), "stale replay must not emit a change");
     }
 
@@ -383,14 +389,14 @@ mod tests {
             }],
         );
         // seq 2 skips 1 → gap, repair page must end at through=2.
-        let outs = fold.entry(2, entry(2));
+        let outs = fold.entry(wire(2, entry(2)));
         assert!(matches!(
             outs.as_slice(),
             [FoldOut::NeedPage(PageRequest { through_seq: 2 })]
         ));
         assert!(fold.repairing());
         // seq 3 arrives during repair: it queues (fed after the page).
-        let outs2 = fold.entry(3, entry(3));
+        let outs2 = fold.entry(wire(3, entry(3)));
         assert!(outs2.is_empty());
         // Deliver the repair page ending at seq 2; the engine merges the
         // queued entry (seq 2 already inside the page) and publishes a
@@ -425,7 +431,7 @@ mod tests {
     #[test]
     fn resync_requested_when_entry_precedes_snapshot() {
         let mut fold = JournalFold::new();
-        let outs = fold.entry(0, entry(0));
+        let outs = fold.entry(wire(0, entry(0)));
         assert!(matches!(outs.as_slice(), [FoldOut::Resync]));
     }
 }

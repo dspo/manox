@@ -263,12 +263,19 @@ async fn forward_entries(
                     // §C.2 totality: every journal entry has a wire row, so
                     // every feed event forwards as an Entry frame — the seq
                     // stream stays dense (§F.1 rule 2 is vacuous now).
-                    if let Some(frame_event) = crate::translate::wire_event(&event.entry) {
+                    // U5: the frame carries the full §C.1 envelope through
+                    // the same conversion the snapshot records use, so a
+                    // live entry and its snapshot-record twin are the same
+                    // wire shape (no client-side id synthesis to drift).
+                    if let Some(wire) = crate::translate::wire_entry(event.seq, &event.entry) {
                         conn.send_to_client(FromServer::StreamItem {
                             stream_id: stream_id.clone(),
                             frame: StreamFrame::Entry {
-                                seq: event.seq,
-                                event: frame_event,
+                                seq: wire.seq,
+                                id: wire.id,
+                                parent_id: wire.parent_id,
+                                timestamp: wire.timestamp,
+                                event: wire.event,
                             },
                         });
                     }

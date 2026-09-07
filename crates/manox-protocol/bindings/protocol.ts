@@ -63,7 +63,7 @@ export type Initialize = { clientId: string, capabilities: Array<HookKind>, sess
 /**
  * One journal entry line as it travels the wire (§C.1 entry envelope):
  * chain-dense `seq` + identity + timestamp + the [`JournalWireEvent`].
- * `StreamFrame::Entry { seq, event }` carries the same pair inside the
+ * `StreamFrame::Entry { seq, id, parent_id, timestamp, event }` carries the same envelope inside the
  * frame tag (§D.1).
  */
 export type JournalWireEntry = { 
@@ -256,7 +256,7 @@ export type StreamEndReason = { "type": "closed" } | { "type": "cancelled" } | {
  *
  * Declaring surface: FRAMES.
  */
-export type StreamFrame = { "type": "snapshot" } & SessionSnapshot | { "type": "entry", seq: bigint, event: JournalWireEvent, } | { "type": "projections" } & ProjectionsFrame;
+export type StreamFrame = { "type": "snapshot" } & SessionSnapshot | { "type": "entry", seq: bigint, id: string, parentId: string | null, timestamp: string, event: JournalWireEvent, } | { "type": "projections" } & ProjectionsFrame;
 
 /**
  * Opaque handle of one server↔client stream (`StreamOpen` / `StreamItem` /
