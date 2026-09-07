@@ -2003,7 +2003,12 @@ fn mirror_ui_note(state: &Arc<EngineState>, record: UiNoteRecord) {
 }
 
 /// Serialize and append one UI note as a `custom` entry at the session leaf.
-async fn persist_ui_note(session: &AgentSession, record: &UiNoteRecord) -> bool {
+async fn persist_ui_note(
+    session: &AgentSession,
+    state: &EngineState,
+    notice_tx: &tokio::sync::mpsc::UnboundedSender<BackendNotice>,
+    record: &UiNoteRecord,
+) -> bool {
     let data = match serde_json::to_value(record) {
         Ok(value) => Some(value),
         Err(err) => {
@@ -2013,12 +2018,40 @@ async fn persist_ui_note(session: &AgentSession, record: &UiNoteRecord) -> bool 
             None
         }
     };
-    if let Err(err) = session.append_custom(UI_NOTE_CUSTOM_TYPE, data).await {
-        tracing::warn!(error = %err, "failed to persist UI note");
-        false
-    } else {
-        true
+    // K9/K4 symmetry: the UI-note append is a typed-append face like any
+    // other (plan/approval cards ride it) — bounded retries, then the
+    // durable loss record (parked for the settle/idle drains when the
+    // storage itself is down) and one facade notice. The former warn-only
+    // path swallowed permanent losses: the card vanished on reload with no
+    // journal trace. No mid-run cancel leg — a UI note is not transcript,
+    // so its loss never voids the turn.
+    let mut last_err = None;
+    for attempt in 1..=TYPED_APPEND_ATTEMPTS {
+        match session
+            .append_custom(UI_NOTE_CUSTOM_TYPE, data.clone())
+            .await
+        {
+            Ok(_) => return true,
+            Err(err) => {
+                tracing::warn!(%err, attempt, "UI note journal append failed");
+                last_err = Some(err);
+                if attempt < TYPED_APPEND_ATTEMPTS {
+                    tokio::time::sleep(TYPED_APPEND_RETRY_DELAY * attempt).await;
+                }
+            }
+        }
     }
+    let err = last_err.expect("the attempt loop ran at least once");
+    let appender = session.journal_appender();
+    if let Some(row) = record_journal_loss(&appender, "ui_note", &err).await {
+        state.pending_journal.lock().unwrap().push(row);
+    }
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+        anyhow::anyhow!(
+            "journal append permanently failed for `ui_note`: {err:#}; the entry was dropped"
+        ),
+    ))));
+    false
 }
 
 /// Merge or strip a browser suite's tool names into an active-tool set.
@@ -2488,7 +2521,7 @@ async fn settle_run(
     // persist before the authoritative sync so the rebuilt mirror keeps them.
     let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
     for record in parked {
-        let _ = persist_ui_note(session, &record).await;
+        let _ = persist_ui_note(session, state, notice_tx, &record).await;
     }
     let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
     if !parked_journal.is_empty() {
@@ -3338,7 +3371,7 @@ async fn run_actor(
         // session); drain before blocking on the next command.
         let parked = std::mem::take(&mut *state.pending_ui_notes.lock().unwrap());
         for record in parked {
-            let _ = persist_ui_note(&session, &record).await;
+            let _ = persist_ui_note(&session, &state, &notice_tx, &record).await;
         }
         let parked_journal = std::mem::take(&mut *state.pending_journal.lock().unwrap());
         if !parked_journal.is_empty() {
@@ -4031,7 +4064,7 @@ async fn run_actor(
                 // Persist at the leaf through the append queue and refresh
                 // the mirror so an idle switch-away sees the note before the
                 // next authoritative sync.
-                if persist_ui_note(&session, &record).await {
+                if persist_ui_note(&session, &state, &notice_tx, &record).await {
                     mirror_ui_note(&state, record);
                 }
             }
@@ -6980,6 +7013,130 @@ mod tests {
     /// recovery), exactly ONE ThreadEvent::Error notice to the facade (the
     /// tap re-queues the notice itself as an `error` row — the kind guard
     /// must break that feedback loop, not storm), and a fail-closed turn
+    /// K9 regression: a permanently failing UI-note append must fail LOUD
+    /// like every typed-append face (K4 symmetry) — the durable loss record
+    /// (parked for the settle/idle drains while the storage is down) and
+    /// exactly one facade Error notice. Pre-fix a `tracing::warn` swallowed
+    /// the loss: the plan/approval card vanished on reload with no journal
+    /// trace.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn ui_note_permanent_append_failure_fails_loud() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        // build() resolves the model stream eagerly; this probe never runs a
+        // turn, so the stream fn itself is never called.
+        struct K9IdleStream;
+        #[async_trait::async_trait]
+        impl manox_harness::agent_loop::StreamFn for K9IdleStream {
+            async fn stream(
+                &self,
+                _context: &manox_harness::types::AgentContext,
+                _signal: tokio_util::sync::CancellationToken,
+                _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+            ) -> Result<manox_harness::types::AgentMessage, anyhow::Error> {
+                Err(anyhow::anyhow!("the k9 probe never streams"))
+            }
+        }
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(K9IdleStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+        // Materialize the journal file (deferred until now): the durable
+        // user append forces the header + row to disk.
+        session
+            .journal_appender()
+            .append_message_durable(
+                manox_harness::types::AgentMessage::User {
+                    content: vec![manox_harness::types::ContentBlock::Text {
+                        text: "k9 probe".into(),
+                        signature: None,
+                    }],
+                    timestamp: chrono::Utc::now(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let journal_path = session.path().to_path_buf();
+        // Fence the journal file: appends (open O_APPEND) fail with EACCES
+        // while reads keep working.
+        let original = std::fs::metadata(&journal_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        struct PermGuard(std::path::PathBuf, u32);
+        impl Drop for PermGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+        let guard = PermGuard(journal_path.clone(), original);
+        if std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .is_ok()
+        {
+            // Root ignores the file mode — the fence is inert; skip rather
+            // than assert on a false setup.
+            return;
+        }
+        let state = test_engine_state();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let landed = persist_ui_note(
+            &session,
+            &state,
+            &notice_tx,
+            &UiNoteRecord {
+                kind: crate::db::UiNoteKind::Notice,
+                data: serde_json::json!({ "text": "doomed card" }),
+            },
+        )
+        .await;
+        assert!(!landed, "the fenced append must not report success");
+        // The loss record parks for the drains (storage down ⇒
+        // record_journal_loss cannot land it either).
+        let parked = state.pending_journal.lock().unwrap().clone();
+        assert_eq!(parked.len(), 1, "exactly one parked loss record");
+        assert_eq!(parked[0].0, "error");
+        let message = parked[0].1["message"].as_str().unwrap();
+        assert!(
+            message.contains("journal append permanently failed for `ui_note`"),
+            "the loss record names the dropped face: {message}"
+        );
+        // Exactly one facade notice.
+        match notice_rx.recv().await {
+            Some(BackendNotice::Event(event)) => match *event {
+                ThreadEvent::Error(err) => assert!(
+                    err.to_string().contains("ui_note"),
+                    "the facade notice names the face: {err}"
+                ),
+                _ => panic!("expected the Error notice, got a different event"),
+            },
+            None => panic!("expected the facade Error notice, got a channel close"),
+            Some(_) => panic!("expected an Event notice, got a Settled/other notice"),
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), notice_rx.recv())
+                .await
+                .is_err(),
+            "the loss notice fires exactly once"
+        );
+        drop(guard);
+    }
+
     /// cancel reported through drive_run's abort flag.
     #[tokio::test]
     #[cfg(unix)]
@@ -8592,17 +8749,18 @@ mod tests {
             .set_active_tools(vec!["Read".into(), "Grep".into()])
             .await
             .unwrap();
-        // A UI annotation card (the display projection's `custom` face).
-        assert!(
-            persist_ui_note(
-                &session,
-                &UiNoteRecord {
-                    kind: crate::db::UiNoteKind::Notice,
-                    data: serde_json::json!({ "text": "scripted note" }),
-                },
-            )
+        // A UI annotation card (the display projection's `custom` face) —
+        // appended through the same storage face persist_ui_note uses (the
+        // resilient wrapper needs the actor's state/notice sink, which this
+        // storage-level replay test does not run).
+        let note_record = UiNoteRecord {
+            kind: crate::db::UiNoteKind::Notice,
+            data: serde_json::json!({ "text": "scripted note" }),
+        };
+        session
+            .append_custom(UI_NOTE_CUSTOM_TYPE, serde_json::to_value(&note_record).ok())
             .await
-        );
+            .unwrap();
 
         // ── Live-state capture. ──────────────────────────────────────────
         let live_records = appender.storage().journal_range(0, u64::MAX).await.unwrap();

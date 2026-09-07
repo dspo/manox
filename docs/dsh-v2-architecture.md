@@ -312,7 +312,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
 | harness:冷读全文件解析(长链尾屏代价)——请求有界尾部读 API(`journal_tail`) | 优化 | K8 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
-| K4 对称性:persist_ui_note 静默丢、middleware message-append 无有界重试 | 对称化 | Wave 2 |
+| K4 对称性:persist_ui_note 已对称化(K9,有界重试+损失记录+facade 通知;无 mid-run 取消腿——UI note 非转录) | 残余:middleware message-append 无有界重试 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
 | J1:真实组合发射覆盖门禁(37 条目 × 8 HostEvent × 帧/调用面在真实网关发过) | 复用 K1 全类型会话设施 | J1 |
