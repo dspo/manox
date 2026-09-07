@@ -1983,8 +1983,15 @@ impl AgentServerInner {
 
     fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
         if archived {
-            self.dispose_session(owner, session_id);
+            // K3 (delivery request): journal the archive decision BEFORE
+            // the dispose — while the engine route is still alive the
+            // pinned_archived row rides the actor's serializer (K4
+            // fail-loud) instead of racing the retire protocol's
+            // cold-append fallback. The pump is also still alive, so
+            // follow streams deliver the entry before the dispose closes
+            // them.
             manox_agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, true));
+            self.dispose_session(owner, session_id);
         } else {
             manox_agent::thread_store::global().with_mut(|s| s.archive_thread(session_id, false));
         }

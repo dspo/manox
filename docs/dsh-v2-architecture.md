@@ -50,6 +50,8 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 |---|---|---|
 | transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；条目携带 `origin?`（乐观回显退休；**as-built**：Submit 的 origin_rpc 经 `SessionCmd::Prompt` → `Session::set_pending_user_origin` → 持久化中间件在本 turn 首个 user 消息落盘时一次性消费，`append_message_with_origin` 钉入条目；**K5 as-built**：user 条目两个持久时机——direct Submit 在网关受理时 durable 落盘（`persist_user_submission`，accepted⟹logged：receipt 跟条目落地走，持久失败拒绝 receipt；网关跳过条件=残留 pending 会使合并 prompt 偏离本文本），或 queued Submit 在 actor drain 先于 run 持久（合并单条目）；middleware 经 `Session.accepted_user_entry`（entry id+序列化 content 精确匹配）one-shot 跳过重复 append（内容匹配防 next_turn/steer 的 user 行被误跳），jsonl duplicate-id 拒绝仅为结构防线。原设计「消息 id 作条目 id」修订为 pinned(entry_id, content) 槽——AgentMessage::User 无 id 字段，加字段会穿透 provider 序列化与 C.1 信封键独占） |
 | transcript | `ui_note` | 现 AppendUiNote 改 durable |
+
+> **K3 as-built 词汇注**：`permission_mode_change` 的 mode 值为 kebab wire 词汇（`PermissionMode::wire`）；早期 tap 映射曾写 Debug 名（如 `"ReadOnly"`），已修——存量 Debug 名条目重放 fail-soft 跳过（保留前值/sidecar 回退），不改写历史行。`approval{kind:"decision"}` 的 verdict 封闭词汇：`allow_once | deny | answered | cancelled`（pending_auth 投影 decision→remove 折叠的真实源）。`pinned_archived` 条目双旗成对（一条即完整重建旗对）；no-op 决策不落条目。
 | lifecycle | `turn_start` / `turn_finish{cancelled,failed,strandedSteerIds}` / `stop{reason}` / `retry{attempt,maxAttempts,delaySecs,reason}` / `error{message}` | `anyhow::Error` 过线/落盘转 `{message}` |
 | 流式 delta | `agent_text_delta{delta}` / `agent_thinking_delta{delta}` / `tool_call{callId,name,title,status,input}` / `tool_result{callId,output,isError}` / `tool_output_chunk{callId,chunk}` / `subagent_child{agentId,event}` / `subagent_progress{agentId,...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义）；`callId`/`agentId` 遵守 §C.1 信封键独占规则（**as-built**：kernel 侧字段名为 `delta`，wire 映射在 translate 层改名 `s`→`delta` 或直接沿用，见 T4 报告） |
 | 状态变更 | `model_change{from?,to}`（to=canonical）/ `cwd_change{cwd}`（**as-built**：沿用 v3 字段名 `cwd`）/ `project_change{path?}` / `permission_mode_change{mode}` / `reasoning_effort_change{effort}`（**as-built**：复用既有 `thinking_level_change` 条目，字段 `thinking_level`）/ `plan_mode_change{enabled}` / `plan_update{snapshot}` / `goal{goal?}` / `title{title}` / `browser_suites{suites}` / `background_task{snapshot}` / `approval{kind:request|decision, authId, payload}` / `pinned_archived{pinned,archived}` | approval request+decision 双态入日志，投影 `pending_auth` 的 fold 源 |
@@ -68,6 +70,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 - 写放大对策：组提交（批量 flush，默认不逐条 fsync）；页读 chunk-run 打包。唯一允许的回退是 `subagent_progress` 降频，不得回退「条目皆可重放」。
 - 整文件重写原子性（K7）：懒 v3→v4 迁移与 deferred 物化一律经 sibling `.jsonl.tmp` 原子替换（write→fsync→rename→best-effort 目录 fsync）：崩溃或并发读者（侧栏扫描、生态工具、follow 冷读）只见完整旧文件或完整新文件，永不见截断中间态；`.tmp` 后缀不入会话目录扫描。
 - **durable append 面（K5/K4 as-built）**：storage trait 增 `append_entry_durable`（Jsonl 实现强制 deferred 物化：header 重写 + 已缓冲行 + 本行原子落盘），Session 增 `append_message_durable`；deferred 物化触发 = 首条 assistant 消息（TS parity 不变）**或任一 durable 标记的 append**；受理过 Submit 的 session 视为已交互、非 zombie。typed-append 写面统一 fail-loud（K4）：有界重试（3 次 × 50ms×attempt 退避）→ 永久失败 = durable `error` 条目记录丢失 kind 与原因（storage 自身 down 时 park 进 pending_journal，settle/idle drain 重试，恢复后可见；`error`-kind 行永不自补偿——断 tap 反馈环）+ facade `ThreadEvent::Error` 通知 + mid-run fail-closed（serializer abort 折进 abort_requested，settle 报 cancelled）。对照面：middleware 的 message-append 失败即 abort run（无重试，Wave 2 对称化候选）；`persist_ui_note` 仍静默（同列）。
+- **K2 as-built（权威迁移）**：`title/pinned/archived/project/permission_mode/reasoning_effort/plan_mode/plan_snapshot/goal/cwd` 的重建权威 = journal（`replay_thread_state` 对 37 变体**穷举 match** 折叠，新词汇必须分类才能编译；last-wins，不可解析词汇 fail-soft 不清旧值）+ `merge_restored_state`（sidecar 只补链上从未出现的字段=懒迁移窗口）+ 背离时缓存收敛修复。三个 restore 面（startup/Open 交换/NewSession）同一实现。title 的缓存修复在**桌面改名接入日志面之前停用**（改名直写 sidecar，修复会回滚用户决策）。goal 权威暂留 threads.db（GoalBridge）；plan_file/plan_review_pending 无条目词汇、留 sidecar。K3 行路由：活引擎行经 ENGINE_ROUTES 入 actor serializer；退役/无路由经有界等待后冷追加（仅当 journal 文件存在）；actor 出口在同锁内 claim 队列——不丢行、不双写为结构性保证。
 
 ## D. 协议 v2 完备规格（manox-protocol）
 
@@ -177,7 +180,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 ## J. 测试与门禁体系（每任务验收 = 门禁绿 + 专项）
 1. 全仓门禁：`cargo fmt`、`cargo clippy --workspace --all-targets -- D warnings`、`cargo test --workspace`、webui `npm run typecheck && npm run test`。
-2. 回放一致性（L10）：落盘重载 == 内存（display/投影/游标）。
+2. 回放一致性（L10）：落盘重载 == 内存（display/投影/游标）。**K1 as-built**：门禁 `journal_replay_is_consistent_across_disk_reload` 覆盖 30 种 on-disk kind（REPLAY_COVERAGE_KINDS 对链断言防空转），经生产 `builder.open` 重载路径逐面相等。两个 as-built 非逐字节面（测试内注明）：消息载荷 timestamp（K5 受理/运行毫秒差）与 **display message id**（`entries_to_display` 每次重建新铸 UUID、非 journal 派生——候选后续：display id 改由条目 id 派生以获得 UI key 稳定性，T6/T7 关联）。
 3. JournalStream 属性测试（F.1.5）。
 4. 声明面覆盖（L12）：journal 条目/投影 key/host 事件/协议帧四张表，emit 点 100%（coverage 测试：脚本化会话驱动后断言每个声明面出现在 FromServer 流；扩展 `dual_path_transport_consistency`）。
 5. 双路径一致性：in-proc ≡ serde ≡ TS 守卫（fixtures）。
@@ -264,7 +267,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 ### K.7 arch 审计整改波（arch/dsh-v2 第二波，进行中）
 
-四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）、§D.5 双边沿+detach 延迟回收+规格真实化（037d5d2e）、U5 Entry 帧信封补齐（93876496）、round-11 turn-stall 根因修复+K4 typed-append fail-loud+K5 受理即持久机制面（4ac63866）、K5 网关接线（c7cea383）、GW5 客户端半边：unread 客户端拥有+侧栏徽章读 leaf 镜像（768fc7ec）、U3a 九处冗余 store 镜像写删除+棘轮 27→18（2c6ad9d4）、C1/GW1/GW3/GW5-服务端/GW6 网关批次（本提交）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。
+四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）、§D.5 双边沿+detach 延迟回收+规格真实化（037d5d2e）、U5 Entry 帧信封补齐（93876496）、round-11 turn-stall 根因修复+K4 typed-append fail-loud+K5 受理即持久机制面（4ac63866）、K5 网关接线（c7cea383）、GW5 客户端半边：unread 客户端拥有+侧栏徽章读 leaf 镜像（768fc7ec）、U3a 九处冗余 store 镜像写删除+棘轮 27→18（2c6ad9d4）、C1/GW1/GW3/GW5-服务端/GW6 网关批次（c12309e8）、webui unread 客户端拥有收尾（49cfaae4）、C2 错误码纪律+结构门禁（aed45a57）、J1 真实组合发射门禁·host+call 面（898b9ee3）、K3 决策点入日志+K2 journal 重建权威+K1 L10 重放门禁（f51dee3f，approval 裁决词汇 allow_once|deny|answered|cancelled、ENGINE_ROUTES 冷追加/退役 claim 协议）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。
 
 
 ### K.7.1 事故 ↔ 回归对照表(J1 门禁的可审计面)
@@ -318,3 +321,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | C5:字段漂移(信封折叠/CwdChange 形状/D.3 文本) | — | C5 |
 | K6:跨面定序契约测试(serializer 后残余:tap 滞后粒度) | — | K6 |
 | K9:ui_note 决断、死 schema 删除、cursor 语义注 | — | K9 |
+| 桌面改名直写 sidecar（workspace.rs:3143）→ K2 title 缓存修复停用中 | thread_store 增 `rename_thread`（journal `title` 条目+sidecar，与 pin_thread 同构）或 gateway rename note；接线后启用修复（engine.rs 有注释锚点） | Wave 2（E 批次后） |
+| plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
+| goal 权威在 threads.db（GoalBridge；`goal` 条目已在词汇但未迁移） | — | Wave 2 |
+| Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |
