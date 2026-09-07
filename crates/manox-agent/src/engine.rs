@@ -1763,6 +1763,13 @@ fn project_browser_suites(active: &[String]) -> Vec<BrowserSuite> {
         .collect()
 }
 
+/// The shared mid-run journal writer (`AgentSession::journal_appender`): the
+/// same session `Arc` the persistence middleware holds, so a mid-run append
+/// is linearized by the session's append lock and broadcasts to followers
+/// like any other append.
+type JournalAppender =
+    manox_harness::session::Session<manox_harness::session::jsonl::JsonlSessionStorage>;
+
 /// Drive one session run to completion while still servicing mid-run
 /// commands (abort/steer/cancel/shutdown) through the session handle.
 /// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
@@ -1784,6 +1791,7 @@ async fn drive_run<F>(
     pi_model: &mut PiModel,
     sessions_dir: &Path,
     session_path: &Path,
+    appender: &JournalAppender,
 ) -> (anyhow::Result<Vec<AgentMessage>>, bool)
 where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
@@ -1872,13 +1880,25 @@ where
                     state.pending_ui_notes.lock().unwrap().push(record);
                 }
                 Some(SessionCmd::AppendJournal { kind, payload }) => {
-                    // Same run-owns-the-session rule: park in arrival order;
-                    // the idle loop (or the post-settle sync) persists them.
-                    state
-                        .pending_journal
-                        .lock()
-                        .unwrap()
-                        .push((kind, payload));
+                    // Append LIVE through the shared session handle (the
+                    // persistence middleware's own Arc): the session's
+                    // append lock linearizes parent-selection + append, and
+                    // the storage broadcast feeds followers immediately.
+                    // Parking for settle hid subagent/retry/background rows
+                    // for the whole run (L5 — the round-8 repro: a
+                    // dispatched Sailor's failure never reached the journal
+                    // while the captain kept working).
+                    if let Err(err) = appender.append_typed(&kind, payload.clone()).await {
+                        tracing::warn!(
+                            %err, kind,
+                            "mid-run journal append failed; parking for settle"
+                        );
+                        state
+                            .pending_journal
+                            .lock()
+                            .unwrap()
+                            .push((kind, payload));
+                    }
                 }
                 Some(SessionCmd::JournalSnapshot { reply }) => {
                     // Read parked with the appends; drained post-settle in
@@ -2054,6 +2074,7 @@ async fn chain_goal_rounds(
         if !queued {
             return;
         }
+        let journal_appender = session.journal_appender();
         let (result, abort_requested) = drive_run(
             session.continue_(),
             handle,
@@ -2066,6 +2087,7 @@ async fn chain_goal_rounds(
             pi_model,
             sessions_dir,
             session_path,
+            &journal_appender,
         )
         .await;
         settle_run(
@@ -2822,6 +2844,7 @@ async fn run_actor(
                     )));
                     let handle = session.handle();
                     let active_session_path = session.path().clone();
+                    let journal_appender = session.journal_appender();
                     // One resume run for the steered events, then chain
                     // automatic goal rounds until the goal stops or the user
                     // interrupts (the gate re-checks after every settle).
@@ -2837,6 +2860,7 @@ async fn run_actor(
                         &mut pi_model,
                         &sessions_dir,
                         &active_session_path,
+                        &journal_appender,
                     )
                     .await;
                     settle_run(
@@ -2904,6 +2928,7 @@ async fn run_actor(
                 state.running.store(true, Ordering::Relaxed);
                 let handle = session.handle();
                 let active_session_path = session.path().clone();
+                let journal_appender = session.journal_appender();
                 // Drive the run while still servicing mid-run commands
                 // (abort/steer) through the session handle, then chain
                 // automatic goal rounds until the goal stops or the user
@@ -2920,6 +2945,7 @@ async fn run_actor(
                     &mut pi_model,
                     &sessions_dir,
                     &active_session_path,
+                    &journal_appender,
                 )
                 .await;
                 settle_run(
@@ -3171,6 +3197,7 @@ async fn run_actor(
                 let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
                 let handle = session.handle();
                 let active_session_path = session.path().clone();
+                let journal_appender = session.journal_appender();
                 let (result, abort_requested) = drive_run(
                     session.prompt(&seed_text),
                     &handle,
@@ -3183,6 +3210,7 @@ async fn run_actor(
                     &mut pi_model,
                     &sessions_dir,
                     &active_session_path,
+                    &journal_appender,
                 )
                 .await;
                 settle_run(
@@ -5535,6 +5563,7 @@ mod tests {
         let handle = session.handle();
         let sessions_path = dir.path().join("sessions");
         let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
         let run = drive_run(
             session.prompt("first turn"),
             &handle,
@@ -5547,6 +5576,7 @@ mod tests {
             &mut pi_model,
             &sessions_path,
             &active_session_path,
+            &journal_appender,
         );
         let new_model = test_model_switched();
 
@@ -5609,6 +5639,191 @@ mod tests {
         );
     }
 
+    /// A stream that parks once mid-run (barrier), then answers with text —
+    /// lets a test interleave a mid-run journal append while the turn is
+    /// provably in flight.
+    struct ParkOnceStream {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl manox_harness::agent_loop::StreamFn for ParkOnceStream {
+        async fn stream(
+            &self,
+            context: &manox_harness::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<manox_harness::types::AgentMessage, anyhow::Error> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(AgentMessage::Assistant {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                    signature: None,
+                }],
+                model: context.model.id.clone(),
+                provider: context.model.provider.clone(),
+                api: context.model.api.clone(),
+                response_model: None,
+                response_id: None,
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: Some(manox_harness::types::StopReason::Stop),
+                usage: Box::new(manox_harness::types::Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                }),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// A facade-level journal append (the notice tap: subagent progress,
+    /// retries, background tasks) arriving while a turn is in flight must
+    /// land in the journal IMMEDIATELY — not park for settle. The round-8
+    /// repro: five dispatched Sailors failed fast and their rows sat in
+    /// `pending_journal` while the Captain worked for 20+ minutes, so
+    /// followers (follow streams, webui) saw nothing live.
+    #[tokio::test]
+    async fn mid_run_journal_append_lands_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ParkOnceStream {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+        let run = drive_run(
+            session.prompt("first turn"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+            &journal_appender,
+        );
+
+        let appender_for_probe = std::sync::Arc::clone(&journal_appender);
+        let ((result, _aborted), ()) = tokio::join!(run, async {
+            // The turn is parked in flight; append a facade-level row.
+            stream.started.notified().await;
+            cmd_tx
+                .send(SessionCmd::AppendJournal {
+                    kind: "subagent_progress".into(),
+                    payload: serde_json::json!({
+                        "agentId": "review-kernel",
+                        "agentType": "Sailor",
+                        "toolUses": 0,
+                        "tokenUsage": null,
+                        "latestActivity": "failed: http 402",
+                        "status": "error",
+                    }),
+                })
+                .unwrap();
+            // Bounded wait: the row must be readable from the shared journal
+            // handle WHILE the run is still parked (nothing has settled).
+            for _ in 0..10_000 {
+                let rows = appender_for_probe
+                    .storage()
+                    .journal_range(0, u64::MAX)
+                    .await
+                    .unwrap_or_default();
+                let found = rows.iter().any(|r| {
+                    matches!(
+                        &r.entry,
+                        manox_harness::session::SessionTreeEntry::SubagentProgress {
+                            agent_id, status, ..
+                        }
+                            if agent_id == "review-kernel"
+                                && status.eq_ignore_ascii_case("error")
+                    )
+                });
+                if found {
+                    // Release the parked run from INSIDE the probe: the join
+                    // below waits for the run too, so an outside release
+                    // would deadlock.
+                    stream.release.notify_waiters();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("the mid-run AppendJournal must land in the journal before settle");
+        });
+        result.unwrap();
+
+        // Post-settle: the chain stays linear — the foreign row is part of
+        // the active chain and the run's own rows append after it.
+        let rows = session
+            .journal_appender()
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        let foreign_ix = rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::SubagentProgress { agent_id, .. }
+                        if agent_id == "review-kernel"
+                )
+            })
+            .expect("foreign row present after settle");
+        // The run's own settled tail (an assistant Message row) appends
+        // AFTER the foreign row: the chain stayed linear through the
+        // mid-run interleaving.
+        let done_ix = rows
+            .iter()
+            .rposition(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::Message { .. }
+                )
+            })
+            .expect("the run's settled message rows present");
+        assert!(
+            foreign_ix < done_ix,
+            "the mid-run row precedes the run's settled tail (linear chain)"
+        );
+    }
+
     /// `AppendUiNote` arriving while a turn is in flight must not be dropped
     /// like the other unserviceable mid-run commands: the card merges into
     /// the mirror immediately (a mid-run switch-back renders it) and parks
@@ -5659,6 +5874,7 @@ mod tests {
         let handle = session.handle();
         let sessions_path = dir.path().join("sessions");
         let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
         let run = drive_run(
             session.prompt("first turn"),
             &handle,
@@ -5671,6 +5887,7 @@ mod tests {
             &mut pi_model,
             &sessions_path,
             &active_session_path,
+            &journal_appender,
         );
         let record = UiNoteRecord {
             kind: crate::db::UiNoteKind::Notice,

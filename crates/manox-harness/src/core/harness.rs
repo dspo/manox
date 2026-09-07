@@ -1315,6 +1315,16 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.session.as_ref()
     }
 
+    /// The shared session handle — the same `Arc` the persistence
+    /// middleware holds. A mid-run writer through this handle is safe by
+    /// construction: the session's append lock linearizes
+    /// parent-selection + append, so a concurrent appender can never fork
+    /// the chain (the storage broadcast fires for every append regardless
+    /// of caller, so followers see the row live).
+    pub fn session_arc(&self) -> Arc<Session<S>> {
+        Arc::clone(&self.session)
+    }
+
     /// Access the agent.
     pub fn agent(&self) -> &Agent {
         &self.agent

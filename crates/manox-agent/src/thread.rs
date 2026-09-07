@@ -1020,10 +1020,29 @@ impl Thread {
                     manox_harness::steer_bus::AgentId::Captain => "captain".to_string(),
                     manox_harness::steer_bus::AgentId::User => "user".to_string(),
                 };
-                self.deliver_peer_messages(vec![crate::team::PeerMessage {
-                    from: sender,
-                    content: payload.text,
-                }]);
+                if self.running {
+                    // Mid-run: a peer message would strand the report in
+                    // pending_prompts until the turn settles (the round-8
+                    // repro: five Sailor failure reports sat unseen while
+                    // the Captain kept working for 20+ minutes). Inject as a
+                    // steer instead — the running turn absorbs it at its
+                    // next safe join point (the engine re-queues it as a
+                    // follow-up if the run has already ended by then).
+                    let report = format!("[{sender}] {}", payload.text);
+                    if let Some(engine) = &self.engine {
+                        engine.steer(report, Vec::new());
+                    } else {
+                        self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                            from: sender,
+                            content: payload.text,
+                        }]);
+                    }
+                } else {
+                    self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                        from: sender,
+                        content: payload.text,
+                    }]);
+                }
             }
             // Bus / browser / session-list arms are dispatched at the handle
             // level (`ThreadHandle::handle_notice`); they never reach here.
@@ -2368,6 +2387,8 @@ pub(crate) mod tests {
         runs: Mutex<Vec<(String, Vec<manox_harness::types::ContentBlock>)>>,
         /// Recorded `persist_plan_snapshot` calls (serialized snapshots).
         plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
+        /// Recorded `steer` calls (the mid-run injection texts).
+        steers: Mutex<Vec<String>>,
     }
 
     impl FakeEngine {
@@ -2381,6 +2402,7 @@ pub(crate) mod tests {
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
+                steers: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2413,7 +2435,8 @@ pub(crate) mod tests {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, _text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+        fn steer(&self, text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+            self.steers.lock().unwrap().push(text);
             String::new()
         }
 
@@ -2571,6 +2594,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         // Mid-run mirror refresh: the live partial lands in `messages`.
@@ -2610,6 +2634,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         // The prompt form enters plan mode and runs the turn with the
@@ -2672,6 +2697,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| {
@@ -2732,6 +2758,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2784,6 +2811,49 @@ pub(crate) mod tests {
         assert!(has_user, "a user message was injected for the completion");
     }
 
+    /// Round-8 regression: a Sailor report arriving while the Captain's turn
+    /// is RUNNING must inject as a steer (absorbed at the run's next safe
+    /// join point) — NOT queue as a peer message, which strands the report
+    /// until the turn settles (five Sailor failures sat unseen for 20+
+    /// minutes while the Captain kept working).
+    #[tokio::test]
+    async fn sailor_report_mid_run_injects_as_steer_not_peer_turn() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        // The Captain's turn is in flight.
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        thread.handle_notice(BackendNotice::SteerDelivered {
+            from: manox_harness::steer_bus::AgentId::Subagent("review-kernel".into()),
+            reason: manox_harness::steer_bus::SteerReason::Complete,
+            payload: manox_harness::steer_bus::SteerPayload {
+                text: "SUBAGENT FAILED: http 402 Insufficient Balance".into(),
+            },
+        });
+        {
+            let steers = engine.steers.lock().unwrap();
+            assert_eq!(
+                steers.len(),
+                1,
+                "the mid-run report must inject exactly one steer"
+            );
+            assert!(
+                steers[0].contains("[review-kernel]"),
+                "the steer identifies its sender: {:?}",
+                steers[0]
+            );
+            assert!(
+                steers[0].contains("http 402"),
+                "the steer carries the report body: {:?}",
+                steers[0]
+            );
+        }
+        let runs = engine.runs.lock().unwrap();
+        assert!(
+            runs.is_empty(),
+            "no peer-message turn may fire while the Captain is running"
+        );
+    }
+
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
     /// the image (kernel pushes the empty text block, TS parity).
@@ -2797,6 +2867,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2821,6 +2892,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.run_turn());
@@ -2841,6 +2913,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
@@ -2892,6 +2965,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.with_mut(|t| {
@@ -2916,6 +2990,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
@@ -2951,6 +3026,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let engine_ref = Arc::clone(&engine);
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -3006,6 +3082,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         let snapshot = crate::plan::PlanSnapshot {
@@ -3045,6 +3122,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_reasoning_effort(ReasoningEffort::Max));
@@ -3077,6 +3155,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
@@ -3178,6 +3257,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.cancel());

@@ -849,6 +849,19 @@ impl AgentSession {
         self.harness.session().set_pending_user_origin(origin);
     }
 
+    /// The shared mid-run journal writer: the same `Arc<Session>` the
+    /// persistence middleware holds. Appends through it are linearized by
+    /// the session's append lock (parent-selection + append never fork the
+    /// chain) and broadcast to journal subscribers like any other append —
+    /// a host can persist facade-level rows (subagent progress, retries)
+    /// WHILE a run holds the session, instead of parking them for
+    /// turn-settle.
+    pub fn journal_appender(
+        &self,
+    ) -> std::sync::Arc<crate::session::Session<crate::session::jsonl::JsonlSessionStorage>> {
+        self.harness.session_arc()
+    }
+
     /// Subscribe to this session's ordered journal appends (the §C.3 read
     /// face; the host relays this to session-core's follow streams).
     pub fn subscribe_journal(
