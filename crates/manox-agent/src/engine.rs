@@ -7201,6 +7201,12 @@ mod tests {
     /// at the leaf once the run owns no borrow of the session.
     #[tokio::test]
     async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
+        // The settle path fires plugin hooks, and Registry::fire takes the
+        // global runtime handle unconditionally — without this the test
+        // only passes when an earlier test in the binary happened to init
+        // the runtime (pre-existing isolation fragility, HEAD-verified:
+        // alone it panics "tokio runtime not initialized").
+        crate::runtime::init();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
