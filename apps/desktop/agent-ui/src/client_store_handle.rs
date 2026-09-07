@@ -11,7 +11,7 @@
 //! channel and their `Response`s are correlated by MsgId through
 //! [`Self::apply_page_response`].
 
-use gpui::{Context, EventEmitter};
+use gpui::{Context, EventEmitter, Task};
 use manox_agent::ThreadEvent;
 use manox_protocol::{FromServer, MsgId, RpcError, StreamFrame, StreamId};
 
@@ -19,6 +19,11 @@ use crate::client_store::ClientStore;
 use crate::journal_fold::{FoldOut, JournalFold, WindowChange};
 use crate::journal_translate;
 use crate::server_note_translate::{server_call_to_thread_event, server_note_to_thread_event};
+
+/// §E.3: Q-face fetches are debounced — a dense committed burst (an
+/// assistant message plus its tool rows settling within milliseconds)
+/// fires one trailing fetch instead of one `GetConversationInfo` per row.
+const INFO_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// A signal the leaf asks the multiplexer to carry on the shared connection.
 #[derive(Debug, Clone)]
@@ -59,6 +64,9 @@ pub struct ClientStoreHandle {
     /// The materialization edge fired once (sidebar refresh, see
     /// [`Self::apply_change`]).
     materialized_notified: bool,
+    /// The pending debounced Q-face fetch (§E.3); replacing it cancels the
+    /// previous one, coalescing a committed burst into a trailing request.
+    info_debounce: Option<Task<()>>,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
@@ -84,6 +92,7 @@ impl ClientStoreHandle {
             pending_info: None,
             info_committed: 0,
             materialized_notified: false,
+            info_debounce: None,
         }
     }
 
@@ -259,24 +268,31 @@ impl ClientStoreHandle {
             manox_agent::thread_store::refresh_thread_list();
         }
         // §E.3 Q face: a message row landing in the window is the committed
-        // edge — refresh the usage panel (per-turn frequency, no debounce
-        // needed; the wire usage rows themselves ride the transcript).
-        let committed = self
-            .store
-            .window
-            .iter()
-            .filter(|e| matches!(&e.event, manox_protocol::JournalWireEvent::Message { .. }))
-            .count();
+        // edge — refresh the usage panel (per-turn frequency; the wire usage
+        // rows themselves ride the transcript). The counter is maintained
+        // incrementally (U7): an Append contributes exactly its own row, so
+        // the streaming hot path is O(1) per frame; only structural window
+        // changes (snapshot Replace, gap-repair merge, Prepend) recount the
+        // fresh window. The former full-window scan ran on every delta
+        // frame — O(window) per frame, O(n²) across a session.
+        let committed = if structural {
+            self.store
+                .window
+                .iter()
+                .filter(|e| matches!(&e.event, manox_protocol::JournalWireEvent::Message { .. }))
+                .count()
+        } else {
+            self.info_committed
+                + live_events
+                    .iter()
+                    .filter(|e| {
+                        matches!(&e.event, manox_protocol::JournalWireEvent::Message { .. })
+                    })
+                    .count()
+        };
         if committed != self.info_committed {
             self.info_committed = committed;
-            if let Some(outbound) = self.outbound.clone() {
-                let id = MsgId::new(format!("info-{}-{}", self.session_id, committed));
-                self.pending_info = Some(id.clone());
-                let _ = outbound.try_send(LeafRequest::ConversationInfo {
-                    id,
-                    session_id: self.session_id.clone(),
-                });
-            }
+            self.schedule_info_fetch(cx);
         }
         if self.store.stream_drives_render {
             if structural {
@@ -289,6 +305,32 @@ impl ClientStoreHandle {
             }
         }
         cx.notify();
+    }
+
+    /// §E.3 debounce: schedule (or replace) the trailing Q-face fetch.
+    /// Dropping the previous `Task` cancels it, so a burst of committed
+    /// edges coalesces into one request keyed by the latest count. The
+    /// timer rides the gpui background executor — never tokio time on the
+    /// gpui thread.
+    fn schedule_info_fetch(&mut self, cx: &mut Context<Self>) {
+        self.info_debounce = Some(cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
+            cx.background_executor().timer(INFO_DEBOUNCE).await;
+            let _ = this.update(cx, |h, _| h.fire_info_fetch());
+        }));
+    }
+
+    /// Send the Q-face request for the current committed count (the
+    /// debounce trailing edge).
+    fn fire_info_fetch(&mut self) {
+        let Some(outbound) = self.outbound.clone() else {
+            return;
+        };
+        let id = MsgId::new(format!("info-{}-{}", self.session_id, self.info_committed));
+        self.pending_info = Some(id.clone());
+        let _ = outbound.try_send(LeafRequest::ConversationInfo {
+            id,
+            session_id: self.session_id.clone(),
+        });
     }
 
     /// Deliver a `PageHistory` response the leaf requested. Correlated by
@@ -487,6 +529,10 @@ mod tests {
             )
         });
         cx.run_until_parked();
+        // §E.3 debounce: the fetch fires at the trailing edge of the window.
+        cx.executor()
+            .advance_clock(INFO_DEBOUNCE + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
 
         // The committed edge fired: the server side of the pair must have
         // received a GetConversationInfo Request for s1.
@@ -526,6 +572,248 @@ mod tests {
             assert_eq!(st.per_model_usage.len(), 1);
             assert!((st.cumulative_cost - 0.42).abs() < 1e-9);
             assert_eq!(st.per_model_cost.get("P/m"), Some(&0.42));
+        });
+    }
+
+    /// U7 (§E.3): the committed-message counter is maintained
+    /// incrementally — an Append contributes exactly its own row, and only
+    /// structural window changes (snapshot Replace, gap-repair merge)
+    /// recount. Behavior is identical to the former full-window scan:
+    /// requests fire only on committed edges with `info-<session>-<count>`
+    /// ids, non-message appends fire nothing, and the counter equals a
+    /// full recount at every boundary.
+    #[gpui::test]
+    async fn q_face_committed_counter_is_incremental_and_exact(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
+        cx.run_until_parked();
+        let rx = server_conn.client_rx();
+        // Drain GetConversationInfo request ids; other frames (the follow
+        // StreamOpen) are discarded — the raw pair's server side answers
+        // nothing in this test.
+        let drain_info = |rx: &async_channel::Receiver<manox_protocol::FromClient>| -> Vec<String> {
+            let mut ids = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                if let manox_protocol::FromClient::Request { id, call } = m
+                    && matches!(call, manox_protocol::ClientCall::GetConversationInfo { .. })
+                {
+                    ids.push(id.0.clone());
+                }
+            }
+            ids
+        };
+        let msg_ev = |role: &str| JournalWireEvent::Message {
+            role: role.into(),
+            content: vec![serde_json::json!({"type": "text", "text": "x"})],
+            usage: None,
+            origin_rpc: None,
+        };
+
+        // Snapshot: two message rows plus one delta → Replace → committed
+        // recounts to 2 and fires one request.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    snapshot(
+                        "s1",
+                        2,
+                        vec![
+                            wire(0, msg_ev("user")),
+                            wire(1, JournalWireEvent::AgentTextDelta { s: "d".into() }),
+                            wire(2, msg_ev("assistant")),
+                        ],
+                    ),
+                ),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(INFO_DEBOUNCE + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        assert_eq!(drain_info(&rx), vec!["info-s1-2".to_string()]);
+
+        // Delta and tool appends: window rows land but the committed edge
+        // does not move — no request (the hot path the former code rescanned
+        // in full on every frame).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 3,
+                        event: JournalWireEvent::AgentTextDelta { s: "a".into() },
+                    },
+                ),
+                cx,
+            )
+        });
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 4,
+                        event: JournalWireEvent::ToolCall {
+                            call_id: "c1".into(),
+                            name: "Bash".into(),
+                            title: "t".into(),
+                            status: "running".into(),
+                            input: serde_json::json!({}),
+                        },
+                    },
+                ),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(
+            drain_info(&rx).is_empty(),
+            "non-message appends must not fire the Q face"
+        );
+
+        // A message append moves the edge to 3 — exactly one request.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 5,
+                        event: msg_ev("user"),
+                    },
+                ),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(INFO_DEBOUNCE + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        assert_eq!(drain_info(&rx), vec!["info-s1-3".to_string()]);
+
+        // Structural boundary: a gap (seq 7 after tail 5) buffers the entry
+        // and requests the missing page; answering it merges into a Replace
+        // whose recount must be exact (messages 0, 2, 5, 6, 7 → 5).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 7,
+                        event: msg_ev("assistant"),
+                    },
+                ),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let mut page_id: Option<MsgId> = None;
+        while let Ok(m) = rx.try_recv() {
+            if let manox_protocol::FromClient::Request { id, call } = m
+                && matches!(call, manox_protocol::ClientCall::PageHistory { .. })
+            {
+                page_id = Some(id);
+            }
+        }
+        let page_id = page_id.expect("the gap must request a page");
+        // The repair page follows the production PageHistory contract: an
+        // unbounded read from the chain start through `through_seq` (the
+        // offending entry's own seq) — the engine publishes the repair page
+        // AS the whole window ("exactly the repair page plus the queued
+        // entries", journal_stream replaceThrough), so a bounded page would
+        // truncate the transcript. The queued seq-7 entry merges as a stale
+        // duplicate (the page already contains it).
+        let full_chain: Vec<serde_json::Value> = vec![
+            serde_json::to_value(wire(0, msg_ev("user"))).unwrap(),
+            serde_json::to_value(wire(1, JournalWireEvent::AgentTextDelta { s: "d".into() }))
+                .unwrap(),
+            serde_json::to_value(wire(2, msg_ev("assistant"))).unwrap(),
+            serde_json::to_value(wire(3, JournalWireEvent::AgentTextDelta { s: "a".into() }))
+                .unwrap(),
+            serde_json::to_value(wire(
+                4,
+                JournalWireEvent::ToolCall {
+                    call_id: "c1".into(),
+                    name: "Bash".into(),
+                    title: "t".into(),
+                    status: "running".into(),
+                    input: serde_json::json!({}),
+                },
+            ))
+            .unwrap(),
+            serde_json::to_value(wire(5, msg_ev("user"))).unwrap(),
+            serde_json::to_value(wire(6, msg_ev("user"))).unwrap(),
+            serde_json::to_value(wire(7, msg_ev("assistant"))).unwrap(),
+        ];
+        handle.update(cx, |h, cx| {
+            h.apply_page_response(
+                page_id,
+                Ok(serde_json::json!({ "records": full_chain })),
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(INFO_DEBOUNCE + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        assert_eq!(drain_info(&rx), vec!["info-s1-5".to_string()]);
+
+        // §E.3 debounce: two committed rows inside one window coalesce into
+        // a single trailing fetch keyed by the latest count (messages are
+        // now {0,2,5,6,7,8,9} = 7).
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 8,
+                        event: msg_ev("user"),
+                    },
+                ),
+                cx,
+            )
+        });
+        // NB: a "user" row, not "assistant" — an appended assistant row
+        // fires the materialization edge (sidebar refresh through the
+        // process-global ThreadStore), which this hermetic leaf test must
+        // not touch; the Q-face count is role-independent.
+        handle.update(cx, |h, cx| {
+            h.apply_from_server(
+                item(
+                    "s1",
+                    StreamFrame::Entry {
+                        seq: 9,
+                        event: msg_ev("user"),
+                    },
+                ),
+                cx,
+            )
+        });
+        // Inside the debounce window nothing has been sent yet — the
+        // trailing-edge fetch is the only request the burst produces.
+        cx.run_until_parked();
+        assert!(
+            drain_info(&rx).is_empty(),
+            "the debounce window must hold the trailing fetch"
+        );
+        cx.executor()
+            .advance_clock(INFO_DEBOUNCE + std::time::Duration::from_millis(10));
+        cx.run_until_parked();
+        assert_eq!(drain_info(&rx), vec!["info-s1-7".to_string()]);
+
+        handle.update(cx, |h, _| {
+            let exact = h
+                .store
+                .window
+                .iter()
+                .filter(|e| matches!(&e.event, JournalWireEvent::Message { .. }))
+                .count();
+            assert_eq!(
+                h.info_committed, exact,
+                "the incremental counter equals the full recount"
+            );
+            assert_eq!(exact, 7);
         });
     }
 
