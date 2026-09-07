@@ -378,7 +378,11 @@ impl JsonlSessionStorage {
         let line = v4_line(entry, seq)?;
         // A deferred session materializes on the first assistant message: the
         // header plus every buffered entry are written in one shot, so the
-        // on-disk order matches the in-memory index (TS `_persist`).
+        // on-disk order matches the in-memory index (TS `_persist`). Before
+        // that boundary the row lives ONLY in memory — writing it straight to
+        // disk (the pre-fix bug) produced headerless zombie files on every
+        // boot / new-session click (two default rows, no `session` header),
+        // invisible to the scan forever.
         let is_assistant = matches!(
             entry,
             SessionTreeEntry::Message {
@@ -398,10 +402,11 @@ impl JsonlSessionStorage {
             // lines, appending the new one in the same write.
             self.rewrite_file_v4_locked(Some(&line)).await?;
             materialized = true;
-        }
-        if !materialized {
+        } else {
             self.append_line(&line).await?;
         }
+        // A buffered (pre-materialization) row needs no disk write: the index
+        // below carries it until the flush rewrites the file wholesale.
         // Index the entry before moving the cursor, mirroring TS Pi's order:
         // a concurrent `get_leaf_id` must never see a cursor whose target is
         // absent from the index, which would read as session corruption.
@@ -2767,5 +2772,42 @@ mod tests {
                 "{name} message lines without an origin key must read None: {origins:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod deferred_probe_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deferred_session_never_touches_disk_before_assistant_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let storage = JsonlSessionStorage::create_deferred(
+            &path,
+            JsonlSessionMetadata {
+                id: "s1".into(),
+                cwd: "/t".into(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .append_entry(&SessionTreeEntry::ModelChange {
+                id: "m0".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                provider: "p".into(),
+                model_id: "m".into(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !path.exists(),
+            "a deferred session with only non-assistant rows must not materialize"
+        );
     }
 }

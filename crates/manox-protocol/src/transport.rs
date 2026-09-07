@@ -122,14 +122,35 @@ pub struct InProcessConnection {
     s2c_rx: Receiver<FromServer>,
 }
 
-/// Two [`InProcessConnection`] ends sharing one pair of bounded channels.
+/// Two [`InProcessConnection`] ends sharing one pair of channels.
+///
+/// Unbounded by design: both ends live in one process, so the only cost of
+/// queue depth is memory — while a bounded pair deadlocks the moment both
+/// directions fill at once (each side parked in `send_blocking` waiting for
+/// the other to consume; the gpui main thread frozen mid-submit is the
+/// round-10 "UI shows no reaction" repro). Flooding policies still apply per
+/// message via [`BackpressurePolicy`] on the bounded test pair.
 pub fn in_process_pair() -> (InProcessConnection, InProcessConnection) {
-    in_process_pair_with_capacity(BACKPRESSURE_CAPACITY)
+    let (c2s_tx, c2s_rx) = async_channel::unbounded();
+    let (s2c_tx, s2c_rx) = async_channel::unbounded();
+    let client = InProcessConnection {
+        c2s_tx: c2s_tx.clone(),
+        c2s_rx: c2s_rx.clone(),
+        s2c_tx: s2c_tx.clone(),
+        s2c_rx: s2c_rx.clone(),
+    };
+    let server = InProcessConnection {
+        c2s_tx,
+        c2s_rx,
+        s2c_tx,
+        s2c_rx,
+    };
+    (client, server)
 }
 
 /// Capacity-injectable variant for backpressure tests: a small buffer makes
-/// overflow reachable without flooding. Production callers use
-/// [`in_process_pair`] (the standing [`BACKPRESSURE_CAPACITY`]).
+/// overflow reachable without flooding. Production callers use the unbounded
+/// [`in_process_pair`].
 pub fn in_process_pair_with_capacity(cap: usize) -> (InProcessConnection, InProcessConnection) {
     let (c2s_tx, c2s_rx) = async_channel::bounded(cap);
     let (s2c_tx, s2c_rx) = async_channel::bounded(cap);
@@ -309,6 +330,46 @@ mod tests {
                 note: ServerNote::Ready
             }
         ));
+    }
+
+    /// Round-10 regression: the production pair is unbounded, so a burst on
+    /// one (or both) directions never parks a sender — the historical bounded
+    /// pair deadlocked the gpui main thread mid-submit once both directions
+    /// filled (each side parked in `send_blocking` waiting for the other's
+    /// consumer). Flood far past the old [`BACKPRESSURE_CAPACITY`] with NO
+    /// consumer attached, then drain and count.
+    #[test]
+    fn in_process_pair_never_blocks_on_bidirectional_flood() {
+        let (client, server) = in_process_pair();
+        let n = BACKPRESSURE_CAPACITY * 3;
+        // Both directions flood with no consumer: every send must return
+        // immediately (a bounded pair would park here and the test would
+        // hang, failing by timeout).
+        for i in 0..n {
+            client.send_to_server(FromClient::Reply {
+                id: MsgId::new(format!("c-{i}")),
+                outcome: Ok(serde_json::json!(null)),
+            });
+            server.send_to_client(FromServer::Notification {
+                note: ServerNote::SessionCreated {
+                    session_id: format!("s-{i}"),
+                },
+            });
+        }
+        let c2s = server.client_rx();
+        let s2c = client.server_rx();
+        for i in 0..n {
+            assert!(matches!(
+                c2s.recv_blocking().unwrap(),
+                FromClient::Reply { id, .. } if id.0 == format!("c-{i}")
+            ));
+            assert!(matches!(
+                s2c.recv_blocking().unwrap(),
+                FromServer::Notification {
+                    note: ServerNote::SessionCreated { session_id }
+                } if session_id == format!("s-{i}")
+            ));
+        }
     }
 
     #[test]

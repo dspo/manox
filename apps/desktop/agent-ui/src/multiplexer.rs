@@ -99,8 +99,11 @@ impl SessionMultiplexer {
         let rx = client.conn().server_rx();
         let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
             while let Ok(msg) = rx.recv().await {
-                let _ = this.update(cx, |m, cx| m.route(msg, cx));
+                if let Err(err) = this.update(cx, |m, cx| m.route(msg, cx)) {
+                    tracing::warn!(error = %err, "mux pump route update failed");
+                }
             }
+            tracing::error!("mux pump exited (channel closed)");
         });
         let (leaf_tx, leaf_rx) = async_channel::unbounded::<LeafRequest>();
         let _leaf_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {

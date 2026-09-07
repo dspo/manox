@@ -2146,6 +2146,7 @@ impl Workspace {
                 Box::new(move |done, cx| {
                     let sid = match done {
                         crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
+                            tracing::info!(session_id = %session_id, "new-thread intent created");
                             session_id
                         }
                         crate::multiplexer::CreateSessionDone::Failed { message } => {
@@ -2163,9 +2164,16 @@ impl Workspace {
                                 Workspace::register_project_in_store(dir, cx);
                             });
                         }
-                        let _ = ws.update_in(cx, |this, window, cx| {
+                        match ws.update_in(cx, |this, window, cx| {
                             this.attach_created_session(&sid, window, cx);
-                        });
+                        }) {
+                            Ok(()) => {
+                                tracing::info!(session_id = %sid, "new-thread attach landed")
+                            }
+                            Err(err) => {
+                                tracing::warn!(session_id = %sid, error = %err, "new-thread attach FAILED")
+                            }
+                        }
                     })
                     .detach();
                 }),
@@ -4430,6 +4438,7 @@ impl Workspace {
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        tracing::info!("composer submit fired");
         // T10c (§D.6): the v1 `history_phase` loading gate is gone — the
         // follow stream's Snapshot → window Replace is the restore boundary,
         // and HEAD already carried an unwritten (default `Ready`) phase.
@@ -4456,6 +4465,10 @@ impl Workspace {
         // here — it is routed through `send_user_turn`, which enqueues it as a
         // follow-up instead of interrupting the running turn.
         if (text.trim().is_empty() && attachments.is_empty()) || self.project_picker_pending {
+            tracing::info!(
+                pending_picker = self.project_picker_pending,
+                "submit swallowed by composer guard"
+            );
             self.pending_attachments = attachments;
             return;
         }
@@ -6231,8 +6244,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(sid) = self.session_id.clone() else {
+            tracing::warn!("submit dropped: no session bound to the workspace");
             return false;
         };
+        tracing::info!(session_id = %sid, "submit v2 sent");
         let origin_rpc = uuid::Uuid::new_v4().to_string();
         if let Some(store) = self.store.as_ref() {
             store.update(cx, |h, _| {
@@ -8391,14 +8406,16 @@ impl Workspace {
         cx.spawn(async move |this, cx| {
             let result = dir.await;
             this.update(cx, |this, cx| {
+                tracing::info!(?result, "project picker completed");
                 this.project_picker_pending = false;
                 if let Ok(Ok(Some(paths))) = result
                     && let Some(path) = paths.into_iter().next()
                 {
-                    let _ = this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
+                    let sent = this.send_note(|sid| manox_protocol::ClientNote::SetCwd {
                         session_id: sid.into(),
                         cwd: path.to_str().unwrap_or_default().into(),
                     });
+                    tracing::info!(sent, path = %path.display(), "project pick SetCwd note");
                     Self::register_project_in_store(&path, cx);
                 }
                 cx.notify();
