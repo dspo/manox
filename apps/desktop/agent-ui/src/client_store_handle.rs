@@ -56,6 +56,9 @@ pub struct ClientStoreHandle {
     pending_info: Option<MsgId>,
     /// Message-row count at the last info fetch (the committed edge).
     info_committed: usize,
+    /// The materialization edge fired once (sidebar refresh, see
+    /// [`Self::apply_change`]).
+    materialized_notified: bool,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
@@ -80,6 +83,7 @@ impl ClientStoreHandle {
             pending_page: None,
             pending_info: None,
             info_committed: 0,
+            materialized_notified: false,
         }
     }
 
@@ -236,6 +240,24 @@ impl ClientStoreHandle {
             _ => Vec::new(),
         };
         self.store.apply_window_change(change);
+        // The session file materializes on the FIRST assistant message (the
+        // deferred-first-assistant contract) — before that boundary a fresh
+        // thread has no file for the sidebar scan to list, so the submit-time
+        // refresh misses it and the running conversation is invisible (the
+        // round-11 "this thread never appeared in the list" repro). The first
+        // assistant row landing in the window IS the materialization edge:
+        // refresh the thread list exactly once per session.
+        if !self.materialized_notified
+            && live_events.iter().any(|e| {
+                matches!(
+                    &e.event,
+                    manox_protocol::JournalWireEvent::Message { role, .. } if role == "assistant"
+                )
+            })
+        {
+            self.materialized_notified = true;
+            manox_agent::thread_store::refresh_thread_list();
+        }
         // §E.3 Q face: a message row landing in the window is the committed
         // edge — refresh the usage panel (per-turn frequency, no debounce
         // needed; the wire usage rows themselves ride the transcript).

@@ -1806,6 +1806,13 @@ where
     // The first tick completes immediately; consume it so the mirror is not
     // re-synced at run start (the settle/ready path already mirrored).
     live_ticker.tick().await;
+    // Stall watchdog: a turn whose journal tail stops moving while the run
+    // future stays pending is the round-11 stall shape (tools finished, no
+    // durable rows, no settle). The warn carries the frozen cursor so the
+    // log bracket around the stall is unmissable; it repeats every 2 minutes.
+    let mut watchdog_cursor: Option<u64> = None;
+    let mut watchdog_last_move = std::time::Instant::now();
+    let appender_for_watchdog = appender;
     let result = loop {
         if !channel_open {
             break run.await;
@@ -1814,6 +1821,21 @@ where
             _ = live_ticker.tick() => {
                 if sync_live_history(&live, state) {
                     let _ = notice_tx.send(BackendNotice::LiveHistory);
+                }
+                let cursor = appender_for_watchdog.storage().journal_cursor().await;
+                if watchdog_cursor != Some(cursor) {
+                    watchdog_cursor = Some(cursor);
+                    watchdog_last_move = std::time::Instant::now();
+                } else if watchdog_last_move.elapsed()
+                    > std::time::Duration::from_secs(120)
+                {
+                    tracing::warn!(
+                        session = ?session_path,
+                        cursor,
+                        elapsed_secs = watchdog_last_move.elapsed().as_secs(),
+                        "turn stall watchdog: the journal tail has not moved while the run stays pending"
+                    );
+                    watchdog_last_move = std::time::Instant::now();
                 }
             }
             maybe_cmd = cmd_rx.recv() => match maybe_cmd {
@@ -5674,6 +5696,291 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             })
         }
+    }
+
+    /// A scripted provider that walks `rounds` rounds of TWO PARALLEL
+    /// read-only tool calls before answering with plain text — the user's
+    /// round-11 stall shape (three completed Grep rounds, then the fourth
+    /// round's toolResult rows never landed and the turn spun forever).
+    struct ToolRoundsStream {
+        rounds: usize,
+        call: std::sync::atomic::AtomicUsize,
+    }
+
+    fn tool_rounds_assistant(
+        context: &manox_harness::types::AgentContext,
+        round: usize,
+    ) -> AgentMessage {
+        let tool_use = |suffix: char| ContentBlock::ToolUse {
+            id: format!("r{round}-{suffix}"),
+            name: "Grep".into(),
+            input: serde_json::json!({ "pattern": format!("needle{round}{suffix}") }),
+            thought_signature: None,
+        };
+        AgentMessage::Assistant {
+            content: vec![tool_use('a'), tool_use('b')],
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(manox_harness::types::StopReason::ToolUse),
+            usage: Box::new(manox_harness::types::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn text_assistant(context: &manox_harness::types::AgentContext, text: &str) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(manox_harness::types::StopReason::Stop),
+            usage: Box::new(manox_harness::types::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl manox_harness::agent_loop::StreamFn for ToolRoundsStream {
+        async fn stream(
+            &self,
+            context: &manox_harness::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let n = self.call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.rounds {
+                Ok(tool_rounds_assistant(context, n))
+            } else {
+                Ok(text_assistant(context, "done"))
+            }
+        }
+    }
+
+    /// Round-11 regression: a multi-round turn of PARALLEL read-only tool
+    /// calls must land EVERY round's durable rows — each round's two
+    /// `tool_call` completions, their `tool_result` tap rows, AND the
+    /// persisted `ToolResult` messages (the persistence middleware). The
+    /// user's live stall: round 3's second Grep appended its success
+    /// `tool_call` row and then nothing — no `tool_result` row, no ToolResult
+    /// messages, turn frozen mid-flight forever. This test drives the real
+    /// three-writer stack (persistence middleware + notice tap → live
+    /// AppendJournal through drive_run's select) under a bounded timeout: a
+    /// stall fails the timeout with a journal dump instead of hanging.
+    #[tokio::test]
+    async fn parallel_tool_rounds_land_every_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 4,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        // The engine's notice wiring, replicated: session events → ThreadEvent
+        // notices → the tap queues durable AppendJournal cmds onto the actor
+        // channel; drive_run services them live (mid-run arm).
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (tap_notice_tx, tap_notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let (facade_tx, _facade_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let _listener_sub = session.subscribe(Arc::new(move |event, _cancel| {
+            let tx = tap_notice_tx.clone();
+            Box::pin(async move {
+                for te in crate::engine::adapt::agent_event_to_thread_events(&event) {
+                    let _ = tx.send(BackendNotice::Event(Box::new(te)));
+                }
+            })
+        }));
+        let tap_cmd_tx = cmd_tx.clone();
+        let _tap = tokio::spawn(async move {
+            let mut rx = tap_notice_rx;
+            while let Some(notice) = rx.recv().await {
+                if let BackendNotice::Event(event) = &notice
+                    && let Some((kind, payload)) = durable_journal_payload(event)
+                {
+                    let _ = tap_cmd_tx.send(SessionCmd::AppendJournal { kind, payload });
+                }
+            }
+        });
+
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+
+        let driven = drive_run(
+            session.prompt("four rounds of parallel greps"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &facade_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+            &journal_appender,
+        );
+        let appender_for_dump = std::sync::Arc::clone(&journal_appender);
+        // Production pressure the basic flow lacks: the foreground leaf fires
+        // GetConversationInfo on every committed-message change, and each one
+        // routes through SessionCmd::JournalSnapshot into drive_run's LIVE
+        // arm (round-9). A concurrent snapshot storm rides the whole turn.
+        let snapshot_cmd_tx = cmd_tx.clone();
+        let snapshot_storm = tokio::spawn(async move {
+            for _ in 0..2000u32 {
+                let (tx, rx) = tokio::sync::oneshot::channel::<JournalSnapshotData>();
+                if snapshot_cmd_tx
+                    .send(SessionCmd::JournalSnapshot { reply: tx })
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = rx.await;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+        let (result, _aborted) =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), driven).await {
+                Ok(pair) => pair,
+                Err(_) => {
+                    let rows = appender_for_dump
+                        .storage()
+                        .journal_range(0, u64::MAX)
+                        .await
+                        .unwrap_or_default();
+                    let kinds: Vec<String> = rows
+                        .iter()
+                        .map(|r| match &r.entry {
+                            manox_harness::session::SessionTreeEntry::ToolCall {
+                                name,
+                                status,
+                                ..
+                            } => {
+                                format!("tool_call:{name}:{status}")
+                            }
+                            manox_harness::session::SessionTreeEntry::ToolResult { .. } => {
+                                "tool_result".into()
+                            }
+                            manox_harness::session::SessionTreeEntry::Message { .. } => {
+                                "message".into()
+                            }
+                            other => format!("{:?}", std::mem::discriminant(other)),
+                        })
+                        .collect();
+                    panic!("drive_run stalled mid-turn; journal tail: {kinds:?}");
+                }
+            };
+        result.unwrap();
+        snapshot_storm.abort();
+
+        // Post-run: the idle arm of the actor loop services any AppendJournal
+        // cmds that raced past the run's completion (the tap task lags the
+        // run by scheduler granularity).
+        let appender_for_drain = std::sync::Arc::clone(&journal_appender);
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                SessionCmd::AppendJournal { kind, payload } => {
+                    if let Err(err) = appender_for_drain.append_typed(&kind, payload).await {
+                        tracing::warn!(%err, kind, "post-run journal append failed");
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let rows = journal_appender
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        // Every round's two tool calls must have BOTH their tap rows and their
+        // persisted ToolResult messages.
+        let tool_results = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::ToolResult { .. }
+                )
+            })
+            .count();
+        let result_messages = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    &r.entry,
+                    manox_harness::session::SessionTreeEntry::Message {
+                        message: AgentMessage::ToolResult { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|r| match &r.entry {
+                manox_harness::session::SessionTreeEntry::ToolCall { name, status, .. } => {
+                    format!("tool_call:{name}:{status:?}")
+                }
+                manox_harness::session::SessionTreeEntry::ToolResult { .. } => "tool_result".into(),
+                manox_harness::session::SessionTreeEntry::Message { .. } => {
+                    "message".to_string()
+                }
+                other => format!("{:?}", std::mem::discriminant(other)),
+            })
+            .collect();
+        assert_eq!(
+            tool_results, 8,
+            "every parallel Grep must land a durable tool_result row; journal: {kinds:?}"
+        );
+        assert_eq!(
+            result_messages, 8,
+            "every parallel Grep must land its persisted ToolResult message; journal: {kinds:?}"
+        );
     }
 
     /// A facade-level journal append (the notice tap: subagent progress,

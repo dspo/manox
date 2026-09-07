@@ -1,8 +1,8 @@
 {
-  "event": {
-    "s": "hi",
-    "type": "agentTextDelta"
-  },
+  "type": "entry",
   "seq": 2,
-  "type": "entry"
+  "event": {
+    "type": "agentTextDelta",
+    "s": "hi"
+  }
 }
