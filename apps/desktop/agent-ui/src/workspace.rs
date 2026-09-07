@@ -11534,11 +11534,15 @@ mod tests {
         }
         eprintln!("REALDATA-BOOT: conversation entity carries the user row: {conv_row}");
 
-        // 6c. The committed-edge re-render: a durable MESSAGE row appending
-        //     through the follow stream must grow the conversation (the
-        //     round-7 root cause — tool turns are all settled rows and stayed
-        //     invisible). Push a synthetic assistant message entry through
-        //     the leaf exactly as the follow stream would.
+        // 6c. The streaming contract (round-9): assistant text reaches the
+        //     conversation through its DELTA rows — the durable settled
+        //     message that follows only finalizes what already rendered.
+        //     Round-7 fired a full conversation rebuild on every settled
+        //     row; with live journaling (round-8) the typed rows land live,
+        //     and the rebuild became a main-thread rebuild storm that
+        //     destroyed streaming state on long tool turns. Push the real
+        //     sequence through the leaf exactly as the follow stream would:
+        //     turn boundary + one text delta must grow the conversation.
         let (before_items, tail_seq) = ws.read_with(&visual, |ws, cx| {
             let n = ws.conversation.read(cx).items().len();
             let tail = ws
@@ -11557,14 +11561,18 @@ mod tests {
                                 stream_id: manox_protocol::StreamId::new("probe-stream"),
                                 frame: manox_protocol::StreamFrame::Entry {
                                     seq: tail_seq + 1,
-                                    event: manox_protocol::JournalWireEvent::Message {
-                                        role: "assistant".into(),
-                                        content: vec![serde_json::json!({
-                                            "type": "text",
-                                            "text": "settled row probe"
-                                        })],
-                                        usage: None,
-                                        origin_rpc: None,
+                                    event: manox_protocol::JournalWireEvent::TurnStart,
+                                },
+                            },
+                            cx,
+                        );
+                        h.apply_from_server(
+                            manox_protocol::FromServer::StreamItem {
+                                stream_id: manox_protocol::StreamId::new("probe-stream"),
+                                frame: manox_protocol::StreamFrame::Entry {
+                                    seq: tail_seq + 2,
+                                    event: manox_protocol::JournalWireEvent::AgentTextDelta {
+                                        s: "settled row probe".into(),
                                     },
                                 },
                             },
@@ -11586,10 +11594,10 @@ mod tests {
         }
         assert!(
             settled_row_renders,
-            "a durable assistant message row must re-render the conversation \
+            "a streamed text delta must grow the conversation \
              ({before_items} items before, tail seq {tail_seq})"
         );
-        eprintln!("REALDATA-BOOT: settled message row re-renders the conversation");
+        eprintln!("REALDATA-BOOT: text delta streams into the conversation");
 
         // 7. A NEW thread via the §D.2 intent must have a LIVE transcript:
         //    the real submit path's durable user row arrives through the

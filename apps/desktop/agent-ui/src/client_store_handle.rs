@@ -235,15 +235,6 @@ impl ClientStoreHandle {
             WindowChange::Append(entry) => vec![entry.clone()],
             _ => Vec::new(),
         };
-        // A durable MESSAGE row append is a committed transcript edge: the
-        // conversation re-renders from the authoritative fold. Durable rows
-        // carry no streaming ThreadEvent (only deltas do), and a tool turn
-        // is ALL settled rows — without this re-render the entire turn stays
-        // invisible until the next thread switch (the round-7 "submit and
-        // see nothing" repro: 37 journal rows, not one pixel).
-        let committed_message = live_events
-            .iter()
-            .any(|e| matches!(&e.event, manox_protocol::JournalWireEvent::Message { .. }));
         self.store.apply_window_change(change);
         // §E.3 Q face: a message row landing in the window is the committed
         // edge — refresh the usage panel (per-turn frequency, no debounce
@@ -266,7 +257,7 @@ impl ClientStoreHandle {
             }
         }
         if self.store.stream_drives_render {
-            if structural || committed_message {
+            if structural {
                 cx.emit(ThreadEvent::HistoryRestored);
             }
             for entry in live_events {

@@ -190,12 +190,18 @@ fn spawn_journal_relay_rx(
 }
 
 /// Answer a snapshot request from the session's journal read face.
+///
+/// Reads the storage directly through the shared appender (the same `Arc`
+/// the persistence middleware holds), so the answer is current at any await
+/// point — including mid-run, where live appends already land on the storage
+/// under the append lock (L5 read face: reads never park behind the run).
 async fn reply_journal_snapshot(
-    session: &AgentSession,
+    appender: &JournalAppender,
     reply: tokio::sync::oneshot::Sender<JournalSnapshotData>,
 ) {
-    let cursor = session.journal_cursor().await;
-    let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
+    let storage = appender.storage();
+    let cursor = storage.journal_cursor().await;
+    let records = storage.journal_range(0, u64::MAX).await.unwrap_or_default();
     let _ = reply.send(JournalSnapshotData { cursor, records });
 }
 
@@ -216,9 +222,6 @@ struct EngineState {
     /// Mid-run journal appends park here (same run-owns-the-session rule as
     /// `pending_ui_notes`); the idle loop drains them in arrival order.
     pending_journal: Mutex<Vec<(String, serde_json::Value)>>,
-    /// Mid-run snapshot requests park here (run owns the session); drained
-    /// with `pending_journal` so replies stay in request order.
-    pending_snapshots: Mutex<Vec<tokio::sync::oneshot::Sender<JournalSnapshotData>>>,
     /// The thread-scoped journal feed (storage broadcasts relayed into it,
     /// one relay per live session). Session-core follow streams subscribe.
     journal_tx: tokio::sync::broadcast::Sender<JournalFeed>,
@@ -587,7 +590,6 @@ pub fn spawn_engine(
         notes_gen: AtomicU64::new(0),
         pending_ui_notes: Mutex::new(Vec::new()),
         pending_journal: Mutex::new(Vec::new()),
-        pending_snapshots: Mutex::new(Vec::new()),
         journal_tx: journal_feed_handle.clone(),
         request_usage: Mutex::new(HashMap::new()),
         per_model_last_usage: Mutex::new(HashMap::new()),
@@ -1901,9 +1903,11 @@ where
                     }
                 }
                 Some(SessionCmd::JournalSnapshot { reply }) => {
-                    // Read parked with the appends; drained post-settle in
-                    // request order.
-                    state.pending_snapshots.lock().unwrap().push(reply);
+                    // Answer live off the storage (same read face as the
+                    // idle loop): parking froze GetConversationInfo and
+                    // PageHistory — the Q face AND the follow streams' gap
+                    // repair — for the entire duration of a running turn.
+                    reply_journal_snapshot(appender, reply).await;
                 }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
@@ -1976,10 +1980,6 @@ async fn settle_run(
         if let Err(err) = session.append_typed(&kind, payload).await {
             tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
         }
-    }
-    let parked_snapshots = std::mem::take(&mut *state.pending_snapshots.lock().unwrap());
-    for reply in parked_snapshots {
-        reply_journal_snapshot(session, reply).await;
     }
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
@@ -2801,10 +2801,6 @@ async fn run_actor(
                 tracing::warn!(kind = %kind, error = %err, "parked journal append failed");
             }
         }
-        let parked_snapshots = std::mem::take(&mut *state.pending_snapshots.lock().unwrap());
-        for reply in parked_snapshots {
-            reply_journal_snapshot(&session, reply).await;
-        }
         // A mid-run browser-suite toggle parked itself for the same reason;
         // apply it now that the session is idle again. The guard is dropped
         // before the await so the future stays `Send`.
@@ -3457,7 +3453,7 @@ async fn run_actor(
                 }
             }
             SessionCmd::JournalSnapshot { reply } => {
-                reply_journal_snapshot(&session, reply).await;
+                reply_journal_snapshot(&session.journal_appender(), reply).await;
             }
             SessionCmd::Shutdown => break,
         }
@@ -5299,7 +5295,6 @@ mod tests {
             notes_gen: AtomicU64::new(0),
             pending_ui_notes: Mutex::new(Vec::new()),
             pending_journal: Mutex::new(Vec::new()),
-            pending_snapshots: Mutex::new(Vec::new()),
             journal_tx: tokio::sync::broadcast::channel(4096).0,
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
