@@ -225,10 +225,23 @@ impl RpcPeer {
     }
 
     /// Register a waiter for `id`; returns the receiver it resolves on.
-    pub fn register(&self, id: MsgId) -> Receiver<Result<serde_json::Value, RpcError>> {
+    ///
+    /// A duplicate registration of the same id is refused: `None` answers
+    /// and the FIRST waiter stays registered (GW2 — the pre-fix map insert
+    /// clobbered the earlier sender, dropping it, which closed the first
+    /// waiter's receiver immediately; callers fold a closed receiver into a
+    /// fail-closed rejection, so a double-routed `ServerCall` auto-denied
+    /// the approval before the user could answer). Callers must treat
+    /// `None` as a routing bug and skip the delivery fail-closed.
+    pub fn register(&self, id: MsgId) -> Option<Receiver<Result<serde_json::Value, RpcError>>> {
         let (tx, rx) = async_channel::bounded(1);
-        self.pending.lock().insert(id, tx);
-        rx
+        match self.pending.lock().entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(tx);
+                Some(rx)
+            }
+        }
     }
 
     /// Resolve the waiter for `id`. Returns `false` when no waiter exists
@@ -402,7 +415,9 @@ mod tests {
     #[test]
     fn rpc_peer_register_complete_resolves() {
         let peer = RpcPeer::new();
-        let rx = peer.register(MsgId::new("c-1"));
+        let rx = peer
+            .register(MsgId::new("c-1"))
+            .expect("fresh id registers");
         assert!(peer.complete(&MsgId::new("c-1"), Ok(serde_json::json!({"ok": true}))));
         let outcome = rx.recv_blocking().unwrap();
         assert_eq!(outcome.unwrap(), serde_json::json!({"ok": true}));
@@ -410,10 +425,42 @@ mod tests {
         assert!(!peer.complete(&MsgId::new("c-1"), Ok(serde_json::json!(null))));
     }
 
+    /// GW2 regression: a duplicate `register` of the same MsgId must NOT
+    /// clobber the first waiter. Pre-fix the map insert dropped the earlier
+    /// sender, closing its receiver immediately — a double-routed
+    /// ServerCall then read the closed receiver as a fail-closed rejection
+    /// and auto-denied before the user answered. The refused second
+    /// registration answers `None` and the first waiter still resolves on
+    /// `complete`.
+    #[test]
+    fn rpc_peer_duplicate_register_keeps_the_first_waiter_alive() {
+        let peer = RpcPeer::new();
+        let first = peer
+            .register(MsgId::new("dup"))
+            .expect("fresh id registers");
+        assert!(
+            peer.register(MsgId::new("dup")).is_none(),
+            "a duplicate MsgId registration must be refused, not clobber"
+        );
+        // The first waiter survives the refused duplicate: it is still open
+        // (pre-fix its sender was dropped here, so recv failed closed).
+        assert!(
+            first.is_empty() && !first.is_closed(),
+            "the first waiter's receiver must stay open after a refused duplicate"
+        );
+        assert!(peer.complete(&MsgId::new("dup"), Ok(serde_json::json!({"ok": 1}))));
+        assert_eq!(
+            first.recv_blocking().unwrap().unwrap(),
+            serde_json::json!({"ok": 1})
+        );
+    }
+
     #[test]
     fn rpc_peer_cancel_resolves_with_error() {
         let peer = RpcPeer::new();
-        let rx = peer.register(MsgId::new("c-2"));
+        let rx = peer
+            .register(MsgId::new("c-2"))
+            .expect("fresh id registers");
         assert!(peer.cancel(&MsgId::new("c-2"), RpcError::new(-1, "gone")));
         let outcome = rx.recv_blocking().unwrap();
         assert_eq!(outcome.unwrap_err().message, "gone");
@@ -422,8 +469,8 @@ mod tests {
     #[test]
     fn rpc_peer_cancel_all_resolves_every_waiter() {
         let peer = RpcPeer::new();
-        let r1 = peer.register(MsgId::new("a"));
-        let r2 = peer.register(MsgId::new("b"));
+        let r1 = peer.register(MsgId::new("a")).expect("fresh id registers");
+        let r2 = peer.register(MsgId::new("b")).expect("fresh id registers");
         peer.cancel_all(RpcError::new(-2, "disconnect"));
         assert_eq!(r1.recv_blocking().unwrap().unwrap_err().code, -2);
         assert_eq!(r2.recv_blocking().unwrap().unwrap_err().code, -2);

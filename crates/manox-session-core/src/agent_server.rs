@@ -48,12 +48,60 @@ use crate::translate::{Translated, translate};
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// One live session: the strong `ThreadHandle` (the retention owner) and its
-/// event pump. The pump is aborted when the session is dropped.
+/// event pump. Dropping the `JoinHandle` alone only DETACHES the pump — it
+/// keeps running (its own `ThreadHandle` clone keeps the subscription alive),
+/// so every removal path must call [`ServerSession::stop_pump`] before the
+/// entry leaves the table; the `Drop` impl is the safety net that makes the
+/// guarantee structural (GW2).
 struct ServerSession {
     thread: ThreadHandle,
-    _pump: tokio::task::JoinHandle<()>,
+    /// Cancellation token for the pump loop's `tokio::select!` (the
+    /// [`crate::follow::StreamHandle`] pattern): cancel wakes a pump parked
+    /// in `rx.recv()`.
+    pump_cancel: tokio_util::sync::CancellationToken,
+    /// The pump task. Aborted alongside the token in [`Self::stop_pump`] —
+    /// the abort covers a pump parked inside a long `route_call` await that
+    /// never re-enters the select.
+    pump: tokio::task::JoinHandle<()>,
     turn_active: Arc<AtomicBool>,
     pending_submits: Arc<StdMutex<Vec<QueuedSubmit>>>,
+}
+
+impl ServerSession {
+    /// Terminate this session's pump (GW2): cancel the token and abort the
+    /// task (double insurance — either alone leaves a window). Idempotent;
+    /// runs before the entry is dropped so a concurrent reopen can never
+    /// observe a live session with a dead table entry, and a replaced entry
+    /// can never leave a second pump subscribed to the same thread.
+    fn stop_pump(&self) {
+        self.pump_cancel.cancel();
+        self.pump.abort();
+    }
+}
+
+impl Drop for ServerSession {
+    /// Safety net: a session entry leaving the table by ANY path (explicit
+    /// removal, map replacement, whole-server drop) takes its pump with it.
+    /// Without this, `JoinHandle` drop merely detached the pump: its
+    /// `ThreadHandle` clone kept `thread.subscribe()`'s unbounded channel
+    /// open, so `rx.recv()` never closed and the pump plus the engine actor
+    /// leaked process-wide (GW2).
+    fn drop(&mut self) {
+        self.stop_pump();
+    }
+}
+
+/// Bumps the server's finished-pump counter when the pump task exits — by
+/// token cancellation, subscription close, or `JoinHandle::abort` (the abort
+/// drops the task future, running this guard's `Drop`). Paired with the
+/// spawn counter it makes the live pump count observable for the GW2
+/// double-pump regressions.
+struct PumpExitGuard(Arc<AgentServerInner>);
+
+impl Drop for PumpExitGuard {
+    fn drop(&mut self) {
+        self.0.pumps_finished.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// A submission parked while a turn runs; drained into one follow-up turn when
@@ -102,9 +150,36 @@ struct AgentServerInner {
     /// §E.3 Q-face cache: `(thread_id, cursor)` → the folded conversation
     /// info payload (recomputed only when the cursor advances).
     conversation_info_cache: Arc<StdMutex<journal_query::ConversationInfoCache>>,
+    /// GW2 pump observability: every `spawn_pump` bumps `pumps_spawned`;
+    /// every pump exit — token cancel, subscription close, or task abort
+    /// (the [`PumpExitGuard`]'s Drop runs in all three) — bumps
+    /// `pumps_finished`. Their difference is the live pump count the
+    /// double-pump regressions assert on.
+    pumps_spawned: AtomicU64,
+    pumps_finished: AtomicU64,
 }
 
 impl AgentServerInner {
+    /// Live pump count (GW2 observability): spawned minus finished. A
+    /// session's pump counts as finished once its task exits by token
+    /// cancel, subscription close, or abort — the double-pump regressions
+    /// poll this to a deadline instead of racing the runtime.
+    #[cfg(test)]
+    fn live_pumps(&self) -> u64 {
+        self.pumps_spawned.load(Ordering::SeqCst) - self.pumps_finished.load(Ordering::SeqCst)
+    }
+
+    /// Install a session entry, terminating the pump of any entry it
+    /// replaces (GW2: a replaced `ServerSession` must never leave its pump
+    /// subscribed to the same thread beside the replacement's).
+    fn insert_session(&self, session_id: String, session: ServerSession) {
+        let replaced = { self.sessions.lock().insert(session_id, session) };
+        if let Some(old) = replaced {
+            tracing::warn!("replaced a live session entry; terminating the superseded pump");
+            old.stop_pump();
+        }
+    }
+
     /// Register a live stream and return its control handle.
     fn track_stream(&self, client_id: &str, stream_id: &StreamId, handle: StreamHandle) {
         self.streams
@@ -189,6 +264,8 @@ impl AgentServer {
             conversation_info_cache: Arc::new(StdMutex::new(
                 journal_query::ConversationInfoCache::default(),
             )),
+            pumps_spawned: AtomicU64::new(0),
+            pumps_finished: AtomicU64::new(0),
         }))
     }
 
@@ -267,12 +344,22 @@ impl AgentServerInner {
                         generation,
                     },
                 );
+                // GW10: a handshake REPLACES the ownership this client_id
+                // holds. `remove_client`'s generation guard intentionally
+                // skips a re-seated entry, so the old generation's owner
+                // rows would otherwise survive and the pre-fix bare `push`
+                // below duplicated them on every reconnect that re-declared
+                // sessions — duplicated `owner_conns` frames and duplicate
+                // `RpcPeer::register` of the same ServerCall MsgId (the GW2
+                // auto-deny chain). Clear first, then re-add through the
+                // deduping `add_owner`: the fresh hello's `sessions` list is
+                // the authoritative ownership set.
+                self.session_owners.lock().retain(|_, list| {
+                    list.retain(|c| c != &client_id);
+                    !list.is_empty()
+                });
                 for s in &hello.sessions {
-                    self.session_owners
-                        .lock()
-                        .entry(s.clone())
-                        .or_default()
-                        .push(client_id.clone());
+                    self.add_owner(s, &client_id);
                 }
                 conn.send_to_client(FromServer::Response {
                     id,
@@ -503,7 +590,11 @@ impl AgentServerInner {
         drop(owners);
         let mut sessions = self.sessions.lock();
         for sid in orphaned {
-            sessions.remove(&sid);
+            // GW2: an orphaned session's pump must not outlive the entry —
+            // stop it explicitly (removal alone only detached the task).
+            if let Some(session) = sessions.remove(&sid) {
+                session.stop_pump();
+            }
             // Ownership lost ⇒ every live stream of the session closes
             // (§D.1 `Closed`).
             self.end_streams_for_session(&sid, StreamEndReason::Closed);
@@ -741,8 +832,15 @@ async fn handle_call(
                  follow stream, projections, and GetConversationInfo",
         )
         .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
+        // GW7: an explicit stable code, not a bare -1 — clients that
+        // declared terminal support must be able to distinguish "feature
+        // not built yet" from a generic failure. The code is a §D.7 set
+        // addition candidate (spec revision proposed in the delivery
+        // report; the msg.rs constant table lives outside this change's
+        // file domain, so the literal is used here).
         ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
-            Err(RpcError::new(-1, "terminal support lands in β-3b"))
+            Err(RpcError::new(-1, "terminal support lands in β-3b")
+                .with_code("feature/unavailable"))
         }
         ClientCall::ModelChat {
             request_id,
@@ -801,38 +899,61 @@ async fn open_session(
     // second copy. T10 (§D.6): no v1 snapshot replay here — the client's
     // history comes from the §D.1 follow stream's `Snapshot` frame. Use
     // directed `SessionCreated` (not broadcast) to avoid disturbing owners.
-    if inner.session_thread(session_id).is_some() {
-        inner.add_owner(session_id, owner);
-        inner.note_to_client(
-            owner,
-            ServerNote::SessionCreated {
-                session_id: session_id.into(),
+    //
+    // GW2: the check, the load, and the insert happen under ONE `sessions`
+    // lock hold. Pre-fix the check (`session_thread(..).is_some()`) and the
+    // insert were separated by the unlocked `load_thread` IO, so two
+    // concurrent `OpenSession`s both passed the check, both loaded (the
+    // store's weak upgrade hands out the SAME `ThreadHandle`), and the
+    // second insert spawned a duplicate pump beside the first — the GW2
+    // double-route/auto-deny chain.
+    {
+        let mut sessions = inner.sessions.lock();
+        if sessions.contains_key(session_id) {
+            drop(sessions);
+            inner.add_owner(session_id, owner);
+            inner.note_to_client(
+                owner,
+                ServerNote::SessionCreated {
+                    session_id: session_id.into(),
+                },
+            );
+            return Ok(json!({ "restored": true }));
+        }
+        // U8 (known debt): `load_thread` does journal-file IO while the
+        // `sessions` lock is held. Correctness first — the atomic
+        // check-load-insert is what makes a duplicate pump structurally
+        // impossible; narrowing the lock around the IO re-opens the TOCTOU.
+        let thread = manox_agent::thread_store::global()
+            .with_mut(|s| s.load_thread(session_id))
+            .ok_or_else(|| RpcError::new(-1, "thread not found"))?;
+        manox_agent::thread_store::global().with_mut(|s| s.set_unread(session_id, false));
+        let turn_active = Arc::new(AtomicBool::new(false));
+        let pending_submits = Arc::new(StdMutex::new(Vec::new()));
+        let pump_cancel = tokio_util::sync::CancellationToken::new();
+        let pump = spawn_pump(
+            Arc::clone(inner),
+            session_id.into(),
+            thread.clone(),
+            turn_active.clone(),
+            pending_submits.clone(),
+            inner.focused.clone(),
+            pump_cancel.clone(),
+        );
+        // No entry existed under this same lock hold, so the insert replaces
+        // nothing; the plain insert is exact here (the belt-and-braces
+        // `insert_session` covers the create path's check-insert gap).
+        sessions.insert(
+            session_id.into(),
+            ServerSession {
+                thread,
+                pump_cancel,
+                pump,
+                turn_active,
+                pending_submits,
             },
         );
-        return Ok(json!({ "restored": true }));
     }
-    let thread = manox_agent::thread_store::global().with_mut(|s| s.load_thread(session_id));
-    let thread = thread.ok_or_else(|| RpcError::new(-1, "thread not found"))?;
-    manox_agent::thread_store::global().with_mut(|s| s.set_unread(session_id, false));
-    let turn_active = Arc::new(AtomicBool::new(false));
-    let pending_submits = Arc::new(StdMutex::new(Vec::new()));
-    let pump = spawn_pump(
-        Arc::clone(inner),
-        session_id.into(),
-        thread.clone(),
-        turn_active.clone(),
-        pending_submits.clone(),
-        inner.focused.clone(),
-    );
-    inner.sessions.lock().insert(
-        session_id.into(),
-        ServerSession {
-            thread: thread.clone(),
-            _pump: pump,
-            turn_active,
-            pending_submits,
-        },
-    );
     inner.add_owner(session_id, owner);
     inner.route_note(
         session_id,
@@ -940,7 +1061,18 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         }
         ClientNote::FocusThread { session_id } => inner.focus_thread(session_id),
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
-            // β-3b: route to TerminalHandle.
+            // β-3b: route to TerminalHandle. GW7: until then, an explicit
+            // Error note to the SENDING client — pre-fix the note was
+            // silently swallowed, which is data loss for a client that
+            // declared terminal support (session_id None: the drop is
+            // connection-scoped, not a session fact).
+            inner.note_to_client(
+                owner,
+                ServerNote::Error {
+                    session_id: None,
+                    message: "terminal input dropped: terminal support lands in β-3b".into(),
+                },
+            );
         }
         ClientNote::AppendUserMessage {
             session_id,
@@ -1100,6 +1232,7 @@ impl AgentServerInner {
         });
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(StdMutex::new(Vec::new()));
+        let pump_cancel = tokio_util::sync::CancellationToken::new();
         let pump = spawn_pump(
             Arc::clone(inner),
             session_id.clone(),
@@ -1107,12 +1240,18 @@ impl AgentServerInner {
             turn_active.clone(),
             pending_submits.clone(),
             inner.focused.clone(),
+            pump_cancel.clone(),
         );
-        inner.sessions.lock().insert(
+        // GW2: `insert_session` terminates the pump of any entry this
+        // replaces — the live-session check above and this insert are not
+        // one atomic step, so a racing create/open must not leave two pumps
+        // subscribed to the same thread.
+        inner.insert_session(
             session_id.clone(),
             ServerSession {
                 thread: thread.clone(),
-                _pump: pump,
+                pump_cancel,
+                pump,
                 turn_active,
                 pending_submits,
             },
@@ -1144,15 +1283,21 @@ impl AgentServerInner {
             });
         }
         self.remove_owner(owner, session_id);
-        if self.owners(session_id).is_empty()
-            && let Some(session) = self.sessions.lock().remove(session_id)
-        {
-            // Disposal closes every live stream of the session (§D.1
-            // `Closed`).
-            self.end_streams_for_session(session_id, StreamEndReason::Closed);
-            if session.turn_active.load(Ordering::SeqCst) {
-                session.thread.with_mut(|t| t.cancel());
-                manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
+        if self.owners(session_id).is_empty() {
+            let removed = { self.sessions.lock().remove(session_id) };
+            if let Some(session) = removed {
+                // GW2: terminate the pump BEFORE the entry goes away — the
+                // pre-fix removal only dropped the JoinHandle, which detaches
+                // (the pump kept its ThreadHandle and ran forever), so a
+                // reopen of the same id spawned a second pump.
+                session.stop_pump();
+                // Disposal closes every live stream of the session (§D.1
+                // `Closed`).
+                self.end_streams_for_session(session_id, StreamEndReason::Closed);
+                if session.turn_active.load(Ordering::SeqCst) {
+                    session.thread.with_mut(|t| t.cancel());
+                    manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
+                }
             }
         }
     }
@@ -1171,7 +1316,12 @@ impl AgentServerInner {
         }
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty() {
-            self.sessions.lock().remove(session_id);
+            // GW2: the last owner detached — terminate the pump before the
+            // entry leaves the table (a dropped JoinHandle only detaches).
+            let removed = { self.sessions.lock().remove(session_id) };
+            if let Some(session) = removed {
+                session.stop_pump();
+            }
             // Ownership lost ⇒ live streams close (§D.1 `Closed`).
             self.end_streams_for_session(session_id, StreamEndReason::Closed);
         }
@@ -1572,7 +1722,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         owners
             .iter()
             .filter(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
-            .map(|cid| {
+            .filter_map(|cid| {
                 let entry = clients.get(cid).expect("just checked");
                 // Deterministic MsgId per kind so a client without bridge
                 // state can correlate its Reply: Approve/AskUser echo the
@@ -1586,8 +1736,25 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                     ReplyCtx::PlanVerdict { .. } => MsgId::new(session_id.to_string()),
                     ReplyCtx::Other => inner.next_call_id(),
                 };
-                let rx = entry.peer.register(id.clone());
-                (cid.clone(), entry.conn.clone(), rx, id)
+                // GW2: `register` refuses a duplicate MsgId (the first
+                // waiter stays live). A duplicate here means the same
+                // adjudication is being routed twice to one peer — a routing
+                // bug (double pump / duplicated owner row). Fail closed for
+                // this target: skip it; if every target is skipped the
+                // empty-targets path below denies/expires the call.
+                match entry.peer.register(id.clone()) {
+                    Some(rx) => Some((cid.clone(), entry.conn.clone(), rx, id)),
+                    None => {
+                        tracing::error!(
+                            session = %session_id,
+                            client = %cid,
+                            msg_id = %id.0,
+                            "duplicate ServerCall registration for the same MsgId \
+                             (double-routed adjudication); skipping target fail-closed"
+                        );
+                        None
+                    }
+                }
             })
             .collect::<Vec<_>>()
     };
@@ -1621,7 +1788,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
             },
         );
     }
-    apply_reply(inner, session_id, ctx, outcome);
+    apply_reply(inner, session_id, ctx, outcome, None);
 }
 
 /// §D.4 fan-out/fan-in: deliver the adjudication Request to every target,
@@ -1646,8 +1813,11 @@ async fn route_waterfall(
     call: ServerCall,
     targets: Vec<AdjudicationTarget>,
 ) {
+    // (client id, delivery expired, reply outcome): `expired` separates a
+    // delivery that timed out / closed from an explicit client rejection so
+    // the GW9 PlanVerdict convergence can name the cause.
     let (funnel_tx, mut funnel_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, Result<Value, RpcError>)>();
+        tokio::sync::mpsc::unbounded_channel::<(String, bool, Result<Value, RpcError>)>();
     let mut waterfall = crate::waterfall::Waterfall::new(session_id.to_string(), {
         let mut ids = targets
             .iter()
@@ -1663,19 +1833,25 @@ async fn route_waterfall(
         });
         let tx = funnel_tx.clone();
         manox_agent::runtime::handle().spawn(async move {
-            let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-                Ok(Ok(o)) => o,
-                _ => Err(RpcError::new(-1, "adjudication reply timed out")),
+            let (expired, outcome) = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
+                Ok(Ok(o)) => (false, o),
+                _ => (true, Err(RpcError::new(-1, "adjudication reply timed out"))),
             };
-            let _ = tx.send((cid, outcome));
+            let _ = tx.send((cid, expired, outcome));
         });
     }
     drop(funnel_tx);
     let mut settled: Option<Result<Value, RpcError>> = None;
-    while let Some((cid, outcome)) = funnel_rx.recv().await {
+    // The settling delivery when it settled the waterfall AGAINST the call:
+    // (client id, expired).
+    let mut settled_by: Option<(String, bool)> = None;
+    while let Some((cid, expired, outcome)) = funnel_rx.recv().await {
         let next = outcome.is_ok();
-        if let Some(outcome_of_settler) = waterfall.reply(&cid, next).map(|_why| outcome) {
-            settled = Some(outcome_of_settler);
+        if waterfall.reply(&cid, next).is_some() {
+            if !next {
+                settled_by = Some((cid, expired));
+            }
+            settled = Some(outcome);
             break;
         }
     }
@@ -1685,7 +1861,18 @@ async fn route_waterfall(
                 .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
         )
     });
-    if outcome.is_err() {
+    // GW9: a PlanVerdict that settles against the call converges through
+    // `apply_plan_verdict`'s fail-closed arm, which sends the kind-specific
+    // Error note (naming who rejected / expired) — the generic note below is
+    // skipped for it to keep exactly one Error per rejection.
+    let verdict_failure = (outcome.is_err() && matches!(ctx, ReplyCtx::PlanVerdict { .. })).then(
+        || match &settled_by {
+            Some((cid, true)) => format!("plan verdict expired: no reply from {cid}"),
+            Some((cid, false)) => format!("plan verdict rejected by {cid}"),
+            None => "plan verdict unsettled: every delivery expired".to_string(),
+        },
+    );
+    if outcome.is_err() && verdict_failure.is_none() {
         inner.route_note(
             session_id,
             ServerNote::Error {
@@ -1694,7 +1881,7 @@ async fn route_waterfall(
             },
         );
     }
-    apply_reply(inner, session_id, ctx, outcome);
+    apply_reply(inner, session_id, ctx, outcome, verdict_failure);
 }
 
 /// Per-`ServerCall` context carried out of the lock to apply the reply.
@@ -1713,12 +1900,14 @@ fn fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, ctx: &ReplyCtx) 
         ReplyCtx::AskUser { auth_id } => {
             respond_ask_fail_closed(inner, session_id, auth_id.clone())
         }
-        ReplyCtx::PlanVerdict { .. } => inner.route_note(
+        // GW9: an unreviewable plan is a fail-closed rejection like any
+        // other — converge the pending-review state instead of leaving the
+        // session parked forever (the bare Error note was the pre-fix
+        // behavior; it cleared nothing).
+        ReplyCtx::PlanVerdict { .. } => converge_plan_rejected(
+            inner,
             session_id,
-            ServerNote::Error {
-                session_id: Some(session_id.into()),
-                message: "no client can review this plan".into(),
-            },
+            "no client can review this plan".to_string(),
         ),
         ReplyCtx::Other => {}
     }
@@ -1729,12 +1918,13 @@ fn apply_reply(
     session_id: &str,
     ctx: ReplyCtx,
     outcome: Result<Value, RpcError>,
+    verdict_failure: Option<String>,
 ) {
     match ctx {
         ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::PlanVerdict { plan_file } => {
-            apply_plan_verdict(inner, session_id, plan_file, outcome)
+            apply_plan_verdict(inner, session_id, plan_file, outcome, verdict_failure)
         }
         ReplyCtx::Other => {}
     }
@@ -1843,6 +2033,7 @@ fn apply_plan_verdict(
     session_id: &str,
     plan_file: String,
     outcome: Result<Value, RpcError>,
+    verdict_failure: Option<String>,
 ) {
     let choice = match outcome {
         Ok(v) => v
@@ -1850,7 +2041,20 @@ fn apply_plan_verdict(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        Err(_) => return, // fail-closed: leave plan mode; the engine stays parked.
+        // GW9: a rejected / expired verdict CONVERGES — the pre-fix early
+        // return cleared nothing, so `plan_review_pending` (kernel) and
+        // `pending_plan` (store) stayed set forever, the engine stayed
+        // parked, and the session was permanently "plan pending review"
+        // (late replies had nowhere to land). Fail-closed semantics are
+        // kept: the plan does NOT execute.
+        Err(_) => {
+            converge_plan_rejected(
+                inner,
+                session_id,
+                verdict_failure.unwrap_or_else(|| "plan verdict rejected or expired".to_string()),
+            );
+            return;
+        }
     };
     let Some(thread) = inner.session_thread(session_id) else {
         return;
@@ -1885,6 +2089,41 @@ fn apply_plan_verdict(
     });
 }
 
+/// Converge a PlanVerdict that will never be answered — rejected, expired,
+/// or unreviewable (GW9). Fail-closed: the plan does NOT execute; every
+/// pending-review plane is cleared so the session stays operable instead of
+/// parking forever, and the parked turn is cancelled so its `TurnFinished`
+/// settles normally through the pump. `message` names the cause (who
+/// rejected / which delivery expired) and rides an Error note to the owners.
+///
+/// Extracted as a free function so the timeout path (a 300s `CALL_TIMEOUT`
+/// wait, unreachable inside a unit test) is testable by direct call.
+fn converge_plan_rejected(inner: &Arc<AgentServerInner>, session_id: &str, message: String) {
+    if let Some(thread) = inner.session_thread(session_id) {
+        thread.with_mut(|t| {
+            // Kernel flag: no stale review card re-surfaces on restart.
+            t.set_plan_review_pending(false);
+            // Cancel the parked turn so TurnFinished arrives and the pump's
+            // settlement path runs (running=false, queued-submit drain).
+            t.cancel();
+        });
+    }
+    // Store flag: the sidebar badge / ListThreads snapshot clears.
+    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(session_id, false));
+    // §D.5 status delta: every connection's pending_plan mirror clears.
+    inner.broadcast_host(host_status(session_id, |f| {
+        f.pending_plan = Some(false);
+    }));
+    // K3: the decision entry lands with the journal work.
+    inner.route_note(
+        session_id,
+        ServerNote::Error {
+            session_id: Some(session_id.into()),
+            message,
+        },
+    );
+}
+
 /// Route a capability `ServerCall` (BrowserOp/ClipboardRead/OpenExternal) to the
 /// owning ∩ capable client and return its Reply outcome. Unlike `route_call`,
 /// the reply is returned to the kernel (the engine's capability call awaits
@@ -1903,11 +2142,24 @@ async fn route_capability_call(
         owners
             .iter()
             .find(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
-            .map(|cid| {
+            .and_then(|cid| {
                 let entry = clients.get(cid).expect("just checked");
-                let rx = entry.peer.register(id.clone());
-                let conn = entry.conn.clone();
-                (conn, rx)
+                // GW2: a fresh `call-N` id cannot collide unless a previous
+                // waiter for it is still registered; refuse the delivery
+                // fail-closed rather than clobbering the earlier waiter.
+                match entry.peer.register(id.clone()) {
+                    Some(rx) => Some((entry.conn.clone(), rx)),
+                    None => {
+                        tracing::error!(
+                            session = %session_id,
+                            client = %cid,
+                            msg_id = %id.0,
+                            "duplicate capability-call registration for the same MsgId; \
+                             failing closed"
+                        );
+                        None
+                    }
+                }
             })
     };
     let Some((conn, rx)) = target else {
@@ -1999,13 +2251,38 @@ fn spawn_pump(
     turn_active: Arc<AtomicBool>,
     pending_submits: Arc<StdMutex<Vec<QueuedSubmit>>>,
     focused: Arc<StdMutex<Option<String>>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     // Subscribe synchronously so the receiver is registered before any
     // broadcast (a subscribe inside the task can lose events fired before
     // the task is first polled).
     let rx = thread.subscribe();
+    // GW2 observability: the live pump count is spawned minus finished; the
+    // exit guard bumps `finished` even when the task is aborted (the abort
+    // drops the future, running the guard's Drop).
+    inner.pumps_spawned.fetch_add(1, Ordering::SeqCst);
     manox_agent::runtime::handle().spawn(async move {
-        while let Ok(ev) = rx.recv().await {
+        let _exit_guard = PumpExitGuard(Arc::clone(&inner));
+        loop {
+            // GW2: the pump is terminable — `ServerSession::stop_pump`
+            // cancels this token (waking a pump parked in `recv`) and the
+            // callers additionally abort the JoinHandle (covering a pump
+            // parked inside a long `route_call` await below, which never
+            // re-enters this select). Pre-fix the loop was a bare
+            // `while let Ok(ev) = rx.recv().await`: the pump's own
+            // `ThreadHandle` clone kept the unbounded subscription open
+            // forever, so a "disposed" session's pump leaked process-wide
+            // and a reopen spawned a SECOND pump on the same thread — every
+            // `ToolCallAuthorization` was then routed twice, and the
+            // duplicate `RpcPeer::register` auto-denied the approval (GW2).
+            let ev = tokio::select! {
+                _ = cancel.cancelled() => break,
+                received = rx.recv() => match received {
+                    Ok(ev) => ev,
+                    // Every sender dropped: the thread is gone.
+                    Err(_) => break,
+                },
+            };
             // Bookkeeping that mirrors the legacy host pump: thread-store list
             // flags and the queued-follow-up drain. T10 (§D.6): no v1 notes
             // are emitted here — translate only carries adjudication calls.
@@ -2219,6 +2496,15 @@ mod tests {
         notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
         auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
         pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
+        /// GW9 probe: every `set_plan_review_pending` the facade forwards,
+        /// in order. The trait default is a silent no-op, so without this
+        /// recorder the kernel-side pending-review flag is unobservable in
+        /// gateway tests (the real engine persists it to a sidecar).
+        plan_review_flags: StdMutex<Vec<bool>>,
+        /// GW9 probe: every `approve_plan` seed text — a rejected/expired
+        /// verdict must never execute the plan, and this is the execution
+        /// observable (the trait default is a silent no-op).
+        plan_approvals: StdMutex<Vec<String>>,
         /// Journal read-seam override (§C.3): tests append `JournalEvent`s
         /// through this sender and seed the snapshot read directly, so
         /// follow streams / PageHistory / the fold are exercised without a
@@ -2242,6 +2528,8 @@ mod tests {
                     notices,
                     auth_responses: StdMutex::new(Vec::new()),
                     pending_auth: StdMutex::new(Vec::new()),
+                    plan_review_flags: StdMutex::new(Vec::new()),
+                    plan_approvals: StdMutex::new(Vec::new()),
                     journal_tx: tokio::sync::broadcast::channel(64).0,
                     journal_data: StdMutex::new(manox_agent::engine::JournalSnapshotData {
                         cursor: 0,
@@ -2298,6 +2586,12 @@ mod tests {
             self.model_switches.lock().unwrap().push(model.id);
         }
         fn set_thinking_level(&self, _: Option<String>) {}
+        fn set_plan_review_pending(&self, pending: bool) {
+            self.plan_review_flags.lock().unwrap().push(pending);
+        }
+        fn approve_plan(&self, _compact: bool, _instructions: Option<String>, seed_text: String) {
+            self.plan_approvals.lock().unwrap().push(seed_text);
+        }
         fn open_session(&self, _: PathBuf) {}
         fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}
         fn set_cwd(&self, path: std::path::PathBuf) {
@@ -5471,6 +5765,829 @@ mod tests {
         });
         drop(client);
         drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── GW2: pump lifetime / double-pump regressions. ─────────────────────
+
+    /// Handshake a fresh connection with an explicit `sessions` ownership
+    /// declaration (the `harness` helper always sends `sessions: []`).
+    fn connect_sessions(
+        server: &AgentServer,
+        client_id: &str,
+        caps: Vec<HookKind>,
+        sessions: Vec<String>,
+    ) -> Client {
+        let (client_conn, server_conn) = in_process_pair();
+        server.accept(Arc::new(server_conn));
+        let client = Client { conn: client_conn };
+        client.send(FromClient::Request {
+            id: MsgId::new(format!("init-{client_id}")),
+            call: ClientCall::Initialize(Initialize {
+                client_id: client_id.into(),
+                capabilities: caps,
+                sessions,
+            }),
+        });
+        let resp = client.recv();
+        assert!(
+            matches!(resp, FromServer::Response { outcome: Ok(_), .. }),
+            "expected ack, got {resp:?}"
+        );
+        let ready = client.recv();
+        assert!(
+            matches!(
+                ready,
+                FromServer::Notification {
+                    note: ServerNote::Ready
+                }
+            ),
+            "expected Ready, got {ready:?}"
+        );
+        client
+    }
+
+    /// Poll `server.0.live_pumps()` to `want` within a deadline (pump exit
+    /// runs on the runtime; the abort's future-drop is asynchronous).
+    fn expect_live_pumps(server: &AgentServer, want: u64, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if server.0.live_pumps() == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: live pump count is {}, expected {want}",
+                server.0.live_pumps()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Drain this connection for a settle window, counting `ServerCall`
+    /// Request frames — the "exactly one delivery" pin for the GW2
+    /// double-pump chain (one kernel event must produce one frame).
+    fn count_requests_in_settle_window(client: &Client, window: Duration) -> usize {
+        let settle = std::time::Instant::now() + window;
+        let mut count = 0usize;
+        loop {
+            match client.conn.server_rx().try_recv() {
+                Ok(FromServer::Request { .. }) => count += 1,
+                Ok(_) => {}
+                Err(_) if std::time::Instant::now() < settle => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return count,
+            }
+        }
+    }
+
+    /// GW2 regression: dispose terminates the pump (pre-fix the JoinHandle
+    /// drop only DETACHED it — the pump's own ThreadHandle kept the
+    /// unbounded subscription open, so `rx.recv()` never closed and the pump
+    /// plus engine actor leaked process-wide). A reopen of the same id must
+    /// then run EXACTLY ONE pump: one ToolCallAuthorization produces one
+    /// Approve frame, and no fail-closed Deny lands before the user replies
+    /// (the double-pump chain routed the same auth twice; the duplicate
+    /// MsgId registration killed the first waiter and the waterfall read
+    /// that as a rejection — an auto-deny before any answer).
+    #[test]
+    fn dispose_then_reopen_keeps_exactly_one_pump() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // GW11 hygiene: a seeded file makes every later create() of this id
+        // restore — unique id, removed in teardown.
+        seed_session_file(&sessions, "gw2-reopen-1", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![HookKind::Approve]);
+
+        // First open: one pump.
+        client.send(FromClient::Request {
+            id: MsgId::new("open-1"),
+            call: ClientCall::OpenSession {
+                session_id: "gw2-reopen-1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "gw2-reopen-1"),
+        );
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "open-1"),
+        );
+        expect_live_pumps(&server, 1, "after the first open");
+
+        // Dispose: the pump must terminate (pre-fix it ran forever).
+        client.send(FromClient::Notification {
+            note: ClientNote::DisposeSession {
+                session_id: "gw2-reopen-1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionDisposed { session_id } } if session_id == "gw2-reopen-1"),
+        );
+        expect_live_pumps(&server, 0, "after dispose (GW2: the pump must terminate)");
+
+        // Reopen the same id: exactly one pump again — not one leaked plus
+        // one fresh.
+        client.send(FromClient::Request {
+            id: MsgId::new("open-2"),
+            call: ClientCall::OpenSession {
+                session_id: "gw2-reopen-1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "gw2-reopen-1"),
+        );
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "open-2"),
+        );
+        expect_live_pumps(&server, 1, "after the reopen");
+
+        // Behavioral pin: one authorization → one Approve frame, one Reply
+        // settles it, and nothing auto-denies before the answer.
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw2-reopen-1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "gw2-reopen-1".into(),
+                text: "probe".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect_host_status(&client, "gw2-reopen-1", |running, _, _, _| {
+            running == Some(true)
+        });
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "gw2-a1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "run ls".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::Approve { auth_id, .. },
+                } if auth_id == "gw2-a1" => break id,
+                _ => {}
+            }
+        };
+        // A second (leaked) pump would deliver a duplicate Approve frame
+        // here — or, with the duplicate-registration refusal, auto-deny the
+        // authorization fail-closed. Neither may happen.
+        assert_eq!(
+            count_requests_in_settle_window(&client, Duration::from_millis(400)),
+            0,
+            "one ToolCallAuthorization must produce exactly one Approve frame (GW2 double pump)"
+        );
+        assert!(
+            engine.auth_responses.lock().unwrap().is_empty(),
+            "no decision may land before the user replies (GW2 auto-deny chain)"
+        );
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(json!({"allow": true})),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let responses = engine.auth_responses.lock().unwrap();
+            if responses.len() == 1
+                && matches!(
+                    responses[0].1,
+                    manox_agent::permission::ToolAuthorizationResponse::Decision(
+                        manox_agent::permission::PermissionDecision::AllowOnce
+                    )
+                )
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the single Reply never settled the approval as exactly one AllowOnce: {responses:?}"
+            );
+            drop(responses);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        expect_host_status(&client, "gw2-reopen-1", |running, _, _, _| {
+            running == Some(false)
+        });
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("gw2-reopen-1.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW2 regression: two connections racing `OpenSession` for the same
+    /// cold id must converge on ONE sessions entry and ONE pump — pre-fix
+    /// the check and the insert were separated by unlocked `load_thread` IO
+    /// (TOCTOU), both opens passed the check, and the weak upgrade handed
+    /// both the SAME `ThreadHandle`, spawning a second pump.
+    #[test]
+    fn concurrent_open_session_yields_one_entry_one_pump() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // GW11 hygiene: unique id, seed removed in teardown.
+        seed_session_file(&sessions, "gw2-conc-1", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let client_a = connect_sessions(&server, "racer-a", vec![HookKind::Approve], vec![]);
+        let client_b = connect_sessions(&server, "racer-b", vec![HookKind::Approve], vec![]);
+
+        // Fire both opens back-to-back, then read both answers: the
+        // check-load-insert window (if any) is where the race lives.
+        for (client, id) in [(&client_a, "race-a"), (&client_b, "race-b")] {
+            client.send(FromClient::Request {
+                id: MsgId::new(id),
+                call: ClientCall::OpenSession {
+                    session_id: "gw2-conc-1".into(),
+                },
+            });
+        }
+        for (client, id) in [(&client_a, "race-a"), (&client_b, "race-b")] {
+            expect(
+                client,
+                |m| matches!(m, FromServer::Response { id: rid, outcome: Ok(_), .. } if rid.0 == id),
+            );
+        }
+
+        // One table entry, one live pump, both racers owners.
+        assert_eq!(
+            server.0.sessions.lock().len(),
+            1,
+            "the sessions table must hold exactly one entry for the raced id"
+        );
+        expect_live_pumps(&server, 1, "after the concurrent opens");
+        let mut owners = server.0.owners("gw2-conc-1");
+        owners.sort();
+        assert_eq!(owners, vec!["racer-a".to_string(), "racer-b".to_string()]);
+
+        // No double ServerCall: one authorization fans out to exactly one
+        // frame per owner (§D.4), never one per pump.
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw2-conc-1", engine.clone(), events);
+        client_a.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "gw2-conc-1".into(),
+                text: "probe".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect_host_status(&client_a, "gw2-conc-1", |running, _, _, _| {
+            running == Some(true)
+        });
+        expect_host_status(&client_b, "gw2-conc-1", |running, _, _, _| {
+            running == Some(true)
+        });
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "gw2c-a1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "run ls".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        for client in [&client_a, &client_b] {
+            let _call_id = loop {
+                match client.recv() {
+                    FromServer::Request {
+                        id,
+                        call: ServerCall::Approve { auth_id, .. },
+                    } if auth_id == "gw2c-a1" => break id,
+                    _ => {}
+                }
+            };
+        }
+        // A second pump would duplicate the per-owner delivery (or, with the
+        // duplicate-registration refusal, auto-deny fail-closed).
+        assert_eq!(
+            count_requests_in_settle_window(&client_a, Duration::from_millis(400)),
+            0,
+            "owner A saw a duplicate Approve frame (GW2 double pump)"
+        );
+        assert_eq!(
+            count_requests_in_settle_window(&client_b, Duration::from_millis(400)),
+            0,
+            "owner B saw a duplicate Approve frame (GW2 double pump)"
+        );
+        assert!(
+            engine.auth_responses.lock().unwrap().is_empty(),
+            "no decision may land before the owners reply (GW2 auto-deny chain)"
+        );
+        // Both owners answer next on their OWN connections (the deterministic
+        // MsgId is the auth_id on every delivery) → Allowed → exactly one
+        // AllowOnce lands on the engine.
+        for client in [&client_a, &client_b] {
+            client.send(FromClient::Reply {
+                id: MsgId::new("gw2c-a1"),
+                outcome: Ok(json!({"allow": true})),
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let responses = engine.auth_responses.lock().unwrap();
+            if responses.len() == 1
+                && matches!(
+                    responses[0].1,
+                    manox_agent::permission::ToolAuthorizationResponse::Decision(
+                        manox_agent::permission::PermissionDecision::AllowOnce
+                    )
+                )
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the two-owner waterfall never settled as exactly one AllowOnce: {responses:?}"
+            );
+            drop(responses);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client_a);
+        drop(client_b);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("gw2-conc-1.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── GW9: rejected/expired PlanVerdict convergence. ────────────────────
+
+    /// Drain until a `SessionStatus` delta for `session_id` clears
+    /// `pending_plan` (§D.5 — `expect_host_status` pins the other fields).
+    fn expect_pending_plan_cleared(client: &Client, session_id: &str) {
+        expect(client, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id: sid,
+                        pending_plan: Some(false),
+                        ..
+                    }
+                } if sid == session_id
+            )
+        });
+    }
+
+    /// Poll the store-side `pending_plan` flag to `want` (convergence runs
+    /// on the pump task).
+    fn expect_store_pending_plan(session_id: &str, want: bool, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got =
+                manox_agent::thread_store::global().read(|s| s.pending_plan_contains(session_id));
+            if got == want {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: store pending_plan is {got}, expected {want}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// GW9 regression: a REJECTED PlanVerdict must converge — pre-fix the
+    /// fail-closed arm was a bare `return` that cleared nothing: the kernel
+    /// `plan_review_pending` flag and the store `pending_plan` flag stayed
+    /// set forever, no `pending_plan=false` delta was broadcast, and the
+    /// session was permanently "plan pending review". The convergence
+    /// clears every plane, cancels the parked turn, and names the rejecter
+    /// in an Error note. Fail-closed semantics hold: the plan never
+    /// executes (no `approve_plan` on the engine).
+    #[test]
+    fn plan_verdict_rejection_converges_pending_state() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::PlanVerdict]);
+        create(&server, &client, "gw9-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw9-s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "gw9-s1".into(),
+                enabled: true,
+            },
+        });
+        client.settle();
+        assert!(plan_mode_of(&server, "gw9-s1"));
+
+        let plan_file =
+            std::env::temp_dir().join(format!("manox-gw9-reject-{}.md", std::process::id()));
+        std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: plan_file.to_string_lossy().into_owned(),
+                title: "GW9 plan".into(),
+            })))
+            .unwrap();
+        let call_id = loop {
+            if let FromServer::Request {
+                id,
+                call: ServerCall::PlanVerdict { .. },
+            } = client.recv()
+            {
+                break id;
+            }
+        };
+        // The pending-review planes are set while the verdict is in flight.
+        expect_store_pending_plan("gw9-s1", true, "while the verdict is pending");
+
+        // The reviewer rejects.
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Err(RpcError::new(-1, "user rejected the plan")),
+        });
+
+        // Convergence, plane by plane:
+        // 1. §D.5 delta: pending_plan clears for every connection.
+        expect_pending_plan_cleared(&client, "gw9-s1");
+        // 2. Store flag clears (sidebar badge / ListThreads snapshot).
+        expect_store_pending_plan("gw9-s1", false, "after the rejection");
+        // 3. Kernel facade flag clears (no stale review card on restart).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let flags = engine.plan_review_flags.lock().unwrap().clone();
+            if flags == vec![true, false] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the facade pending-review flag never cleared: {flags:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 4. The Error note names the rejecter.
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { session_id: Some(sid), message }
+                } if sid == "gw9-s1" && message.contains("rejected by test")
+            )
+        });
+        // 5. Fail-closed: the plan never executes and plan mode stays on
+        //    (the user can re-edit; convergence touches no plan_mode).
+        assert!(
+            engine.plan_approvals.lock().unwrap().is_empty(),
+            "a rejected plan must not seed execution"
+        );
+        assert!(
+            plan_mode_of(&server, "gw9-s1"),
+            "convergence leaves plan mode on (fail-closed, re-editable)"
+        );
+        // 6. The session stays operable: a §D.2 read answers normally.
+        let v = response_outcome(request(
+            &client,
+            "gw9-ph",
+            ClientCall::PageHistory {
+                session_id: "gw9-s1".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+        ));
+        assert_eq!(v["cursor"], 0, "PageHistory answers after convergence");
+
+        let _ = std::fs::remove_file(&plan_file);
+        let _ = std::fs::remove_file(
+            manox_agent::paths::sessions_dir()
+                .unwrap()
+                .join("gw9-s1.jsonl"),
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW9 regression: an UNREVIEWABLE plan (no owner declared the
+    /// PlanVerdict capability) is the fail_closed arm of the same deadlock —
+    /// pre-fix it noted an Error and left every pending-review plane set.
+    #[test]
+    fn plan_verdict_without_reviewer_converges() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        // No PlanVerdict capability: route_call finds no target.
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "gw9-s2");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw9-s2", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "gw9-s2".into(),
+                enabled: true,
+            },
+        });
+        client.settle();
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: "/nonexistent/gw9-plan.md".into(),
+                title: "GW9 orphan plan".into(),
+            })))
+            .unwrap();
+        // Convergence order inside `converge_plan_rejected` is wire-ordered:
+        // the §D.5 broadcast is sent BEFORE the fail-closed Error note, so
+        // expect the Host frame first (an expect drains and discards
+        // non-matching frames).
+        expect_pending_plan_cleared(&client, "gw9-s2");
+        // The fail-closed Error note arrives...
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { session_id: Some(sid), message }
+                } if sid == "gw9-s2" && message.contains("no client can review this plan")
+            )
+        });
+        // ...and the pending-review planes converge exactly like a
+        // rejection: store flag and facade flag clear.
+        expect_store_pending_plan("gw9-s2", false, "after the unreviewable plan");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let flags = engine.plan_review_flags.lock().unwrap().clone();
+            if flags == vec![true, false] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the facade pending-review flag never cleared: {flags:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Still operable.
+        let v = response_outcome(request(
+            &client,
+            "gw9-ph2",
+            ClientCall::PageHistory {
+                session_id: "gw9-s2".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+        ));
+        assert_eq!(v["cursor"], 0);
+        let _ = std::fs::remove_file(
+            manox_agent::paths::sessions_dir()
+                .unwrap()
+                .join("gw9-s2.jsonl"),
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW9 timeout path: `CALL_TIMEOUT` is 300s — unreachable inside a unit
+    /// test — so the convergence itself is pinned by direct call with the
+    /// expired-delivery message route_waterfall builds for a timed-out
+    /// reviewer.
+    #[test]
+    fn converge_plan_rejected_clears_every_plane_directly() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::PlanVerdict]);
+        create(&server, &client, "gw9-s3");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw9-s3", engine.clone(), events);
+
+        // Set both pending planes as PlanReady would.
+        manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan("gw9-s3", true));
+        server
+            .0
+            .session_thread("gw9-s3")
+            .expect("live session")
+            .with_mut(|t| t.set_plan_review_pending(true));
+
+        // The expiry convergence, exactly as the timed-out waterfall arm
+        // calls it.
+        converge_plan_rejected(
+            &server.0,
+            "gw9-s3",
+            "plan verdict expired: no reply from test".to_string(),
+        );
+
+        assert_eq!(
+            engine.plan_review_flags.lock().unwrap().clone(),
+            vec![true, false]
+        );
+        expect_store_pending_plan("gw9-s3", false, "after the direct convergence");
+        expect_pending_plan_cleared(&client, "gw9-s3");
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { session_id: Some(sid), message }
+                } if sid == "gw9-s3" && message.contains("expired")
+            )
+        });
+        let _ = std::fs::remove_file(
+            manox_agent::paths::sessions_dir()
+                .unwrap()
+                .join("gw9-s3.jsonl"),
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── GW10: handshake owner registration. ───────────────────────────────
+
+    /// GW10 regression: a re-seat handshake (same client_id reconnecting)
+    /// that re-declares a non-empty `sessions` list must not duplicate the
+    /// owner rows — pre-fix the handshake pushed unconditionally (no
+    /// `add_owner` dedup) and `remove_client`'s generation guard early-
+    /// returned without clearing the old rows, so every reconnect copied
+    /// the ownership: `owner_conns` fanned every note out twice and
+    /// `route_call` registered the same MsgId twice (the GW2 auto-deny
+    /// chain). The fix clears the client's rows on handshake and re-adds
+    /// through the deduping `add_owner`: the fresh hello is authoritative.
+    #[test]
+    fn rehandshake_same_client_id_keeps_one_owner_row_per_session() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+
+        let _first = connect_sessions(&server, "gw10", vec![], vec!["gw10-s1".into()]);
+        assert_eq!(server.0.owners("gw10-s1"), vec!["gw10".to_string()]);
+
+        // Re-seat: the same client_id on a fresh connection, re-declaring
+        // the session. The old connection is disconnected by the handshake.
+        let second = connect_sessions(&server, "gw10", vec![], vec!["gw10-s1".into()]);
+        // The handshake completed synchronously before Ready — no polling.
+        assert_eq!(
+            server.0.owners("gw10-s1"),
+            vec!["gw10".to_string()],
+            "a re-seat handshake must keep exactly one owner row (GW10)"
+        );
+
+        // One owner row ⇒ one frame per note (pre-fix: the duplicated row
+        // delivered every owner-scoped note twice to the same connection).
+        server.0.route_note(
+            "gw10-s1",
+            ServerNote::Error {
+                session_id: Some("gw10-s1".into()),
+                message: "gw10-probe".into(),
+            },
+        );
+        expect(&second, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { message, .. }
+                } if message == "gw10-probe"
+            )
+        });
+        // Settle window: a duplicated owner row would deliver the SAME probe
+        // note to this connection a second time.
+        let settle = std::time::Instant::now() + Duration::from_millis(300);
+        let mut duplicates = 0usize;
+        loop {
+            match second.conn.server_rx().try_recv() {
+                Ok(FromServer::Notification {
+                    note: ServerNote::Error { message, .. },
+                }) if message == "gw10-probe" => duplicates += 1,
+                Ok(_) => {}
+                Err(_) if std::time::Instant::now() < settle => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(
+            duplicates, 0,
+            "duplicate owner row delivered the probe note twice (GW10)"
+        );
+        drop(_first);
+        drop(second);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── GW7: terminal stubs answer explicitly. ────────────────────────────
+
+    /// GW7 regression: the terminal calls answer with the stable
+    /// `feature/unavailable` code (pre-fix a bare -1 with no data.code —
+    /// indistinguishable from a generic failure for clients that declared
+    /// terminal support). The code is a §D.7 addition candidate; the spec
+    /// revision is proposed in the delivery report.
+    #[test]
+    fn terminal_calls_answer_feature_unavailable() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (_server, client) = harness(vec![]);
+        let m = request(
+            &client,
+            "term-attach",
+            ClientCall::TerminalAttach {
+                session: "s1".into(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        match m {
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => {
+                assert_eq!(
+                    e.data.as_ref().expect("GW7: the error carries data.code")["code"],
+                    "feature/unavailable"
+                );
+                assert!(e.message.contains("β-3b"));
+            }
+            other => panic!("expected the terminal error, got {other:?}"),
+        }
+        let m = request(
+            &client,
+            "term-snapshot",
+            ClientCall::TerminalSnapshot {
+                terminal: "t1".into(),
+            },
+        );
+        match m {
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => {
+                assert_eq!(e.data.unwrap()["code"], "feature/unavailable");
+            }
+            other => panic!("expected the terminal error, got {other:?}"),
+        }
+        drop(client);
+        drop(_server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW7 regression: terminal NOTES are no longer silently swallowed —
+    /// the sending client gets an explicit `ServerNote::Error` (silent data
+    /// loss for a client that declared terminal support).
+    #[test]
+    fn terminal_notes_answer_with_an_error_note() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (_server, client) = harness(vec![]);
+        for note in [
+            ClientNote::TerminalInput {
+                terminal: "t1".into(),
+                bytes: b"ls\n".to_vec(),
+            },
+            ClientNote::TerminalResize {
+                terminal: "t1".into(),
+                cols: 100,
+                rows: 40,
+            },
+        ] {
+            client.send(FromClient::Notification { note });
+            expect(&client, |m| {
+                matches!(
+                    m,
+                    FromServer::Notification {
+                        note: ServerNote::Error { session_id: None, message }
+                    } if message == "terminal input dropped: terminal support lands in β-3b"
+                )
+            });
+        }
+        drop(client);
+        drop(_server);
         manox_agent::thread_store::drop_global_for_test();
     }
 }
