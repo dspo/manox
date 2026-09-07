@@ -265,3 +265,32 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 ### K.7 arch 审计整改波（arch/dsh-v2 第二波，进行中）
 
 四路只读审计（协议/网关/内核/桌面）+ 主线交叉验证产出 spec 级问题清单（编号 K*/C*/GW*/U*/J*），按 Wave 0（止血：数据丢失/瘫痪/冻结）→ Wave 1（架构承诺收口）→ Wave 2（契约完成与债务）实施；纪律：每项 = 规格修订 + 实现 + 回归测试 + 红前绿后证明（对旧实现临时回退必须报红）。已提交：GW4 广播锁外发送（cc813c42）、K7 整文件重写原子替换（2ffaed80）、GW11 冷 id CreateSession 恢复而非重铸+套件卫生（56a27ae1）、C3 声明面宏单源+编译期穷举门禁+TS 同步断言（82eeeba2）、U7 Q 面增量计数+120ms 去抖（63a58396）、GW2/GW9/GW10/GW7 网关生命周期批次（b3409d18）、§D.5 双边沿+detach 延迟回收+规格真实化（037d5d2e）、U5 Entry 帧信封补齐（93876496）、round-11 turn-stall 根因修复+K4 typed-append fail-loud+K5 受理即持久机制面（4ac63866）、K5 网关接线（c7cea383）、GW5 客户端半边：unread 客户端拥有+侧栏徽章读 leaf 镜像（768fc7ec）、U3a 九处冗余 store 镜像写删除+棘轮 27→18（2c6ad9d4）、C1/GW1/GW3/GW5-服务端/GW6 网关批次（本提交）。round-11 turn-stall 已根因定位（drive_run 的 select 同任务自死锁：AppendJournal 臂内联等 append_lock，同 select 的 run 分支持锁挂在文件 IO；修复=AppendJournal 转发专用 serializer 任务+快照读同锁派生 cursor），验收提交中。
+
+
+### K.7.1 事故 ↔ 回归对照表(J1 门禁的可审计面)
+
+整改波每个事故类必须有一个具名回归测试钉住;本表是对照单一事实源。门禁语义:表中测试名必须全部存在于套件(grep 可验),且各自附带红前绿后证据(对旧实现临时回退报红)。**新增事故类必须新增一行**——没有回归测试的事故修复不算完成。J1 的"真实组合发射覆盖门禁"(§J.4)在此之上再加一层:声明面每个条目/事件/帧必须在真实网关组合中被发射过一次(而非自指样本)。
+
+| 项 | 事故类 | 回归测试(crate) |
+| --- | --- | --- |
+| GW4 | 单个停滞客户端持 `clients` 锁 → 全网关冻结 | `stalled_host_broadcast_never_holds_the_clients_lock`(session-core) |
+| K7 | 整文件重写非原子 → 并发读者见截断中间态 | `concurrent_reader_never_observes_a_torn_rewrite`、`failed_rewrite_leaves_the_original_file_intact`(harness) |
+| GW11 | 冷 id CreateSession 重铸而非恢复 → 历史丢失 | `create_session_with_a_cold_persisted_id_restores_history`(session-core) |
+| C3 | 声明面表/样本/tag 三处手维护漂移(FRAMES 缺 followSession、假 Response 信封) | `tag_functions_agree_with_tables`、`frames_is_the_mechanical_concatenation`、`export_surface_tags`(protocol)+ webui `guards-surface.test.ts` |
+| U7 | Q 面每帧 O(window) 全扫 + 无去抖 | `q_face_committed_counter_is_incremental_and_exact`(agent-ui) |
+| GW2 | 泵永生 → dispose 后重开双泵 → 审批被自动拒绝 | `dispose_then_reopen_keeps_exactly_one_pump`、`concurrent_open_session_yields_one_entry_one_pump`、`rpc_peer_duplicate_register_keeps_the_first_waiter_alive`(session-core/protocol) |
+| GW9 | PlanVerdict 被拒/超时 → pending_plan 永久卡死 | `plan_verdict_rejection_converges_pending_state`、`plan_verdict_without_reviewer_converges`、`converge_plan_rejected_clears_every_plane_directly`(session-core) |
+| GW10 | 重握手 owner 注册非幂等 → 重复帧 + MsgId 自撞 | `rehandshake_same_client_id_keeps_one_owner_row_per_session`(session-core) |
+| GW7 | Terminal 死桩静默吞字节 / 无稳定码 | `terminal_calls_answer_feature_unavailable`、`terminal_notes_answer_with_an_error_note`(session-core) |
+| D.5 | pending_plan/background_work 边沿不广播;detach 停泵后 running 旗滞留 | `submit_receipt_waits_for_accept_time_persistence`(true 边沿)、`detach_while_running_defers_reap_until_settle`(session-core) |
+| K4 | typed-append 永久失败静默丢行 | `mid_run_typed_append_permanent_failure_fails_loud_and_cancels`(agent) |
+| K5 | receipt 先于持久 → 受理后崩溃丢文本;queued 双写 | `accepted_user_entry_persists_before_the_run_and_the_middleware_skips_the_duplicate`、`kill_after_receipt_keeps_the_accepted_entry_and_origin`、`queued_submit_persists_at_drain_before_the_run`、`stale_accepted_pin_never_leaks_into_the_next_turn`(agent)+ `submit_receipt_waits_for_accept_time_persistence`、`submit_persistence_failure_refuses_the_receipt`(session-core 网关接线) |
+| STALL | round-11 turn 停滞:drive_run select 同任务自死锁 | `parallel_tool_rounds_land_every_result`(agent;曾 ~2/3 红,现 10/10 稳绿) |
+| U5 | Entry 帧无信封 → 两端合成 `e-{seq}` id 在 Replace 后漂移 | `entry_and_projection_frames_round_trip`(protocol)+ q_face durable-id 断言(agent-ui)+ webui entry 守卫/桥接测试 |
+| U3a | 桌面九处 store 镜像写与泵竞态(单写者违背) | `desktop_bypass_surface_never_grows`、`no_new_files_touch_wire_or_store`(agent-ui 棘轮门禁) |
+| GW5 | unread 服务端单槽 focus 镜像无法表达每客户端;正看着的会话也点亮;blur 后徽标永不亮 | `active_leaf_suppresses_unread_and_focus_clears`、`multiplexer_focus_transitions_gate_the_leaf_mirrors`(agent-ui)、`turn_settle_raises_unread_even_after_focus_report`、`list_threads_unread_is_always_false_and_focus_is_noop`(session-core)、`GW5: a list refresh preserves the client-owned unread`、`GW5: backToList is the local blur`(webui) |
+| C1 | 握手无版本协商 | `handshake_rejects_unknown_protocol_epoch`、`handshake_accepts_v1_client_without_protocol_epoch`、`handshake_ready_double_emits_host_epoch_echo`、`initialize_protocol_epoch_defaults_to_zero`(protocol/session-core) |
+| GW1 | HostEvent 总线 7/8 变体无生产发射点 | `list_pushes_double_emit_host_frames`、`session_created_double_emits_directed_host_frame`、`session_disposed_and_detached_double_emit_host_frames`、`error_notes_double_emit_host_error`(session-core) |
+| GW3 | 裁决投递无 delivery_id、不可取消 | `adjudication_requests_carry_stable_delivery_id`、`cancel_delivery_converges_pending_adjudication`(session-core) |
+| GW6 | 冷读缺位 → 无 engine 会话 PageHistory 30s 挂起 | `page_history_cold_reads_disk_for_opened_session_without_engine`、`page_history_reads_disk_without_live_session`、`page_history_unknown_session_still_answers_not_found`、`concurrent_create_and_open_same_cold_id_singleflight`(session-core) |
+| 测试隔离 | 触达 plugin_hooks::fire 的测试单独跑 panic(runtime 未初始化) | `mid_run_append_ui_note_mirrors_now_and_parks_persist`(agent;自持 runtime::init) |
