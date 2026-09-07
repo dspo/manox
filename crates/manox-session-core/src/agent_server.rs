@@ -264,7 +264,7 @@ pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
 
 impl AgentServer {
     pub fn new(cwd: PathBuf) -> Self {
-        Self(Arc::new(AgentServerInner {
+        let inner = Arc::new(AgentServerInner {
             cwd,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -280,7 +280,20 @@ impl AgentServer {
             )),
             pumps_spawned: AtomicU64::new(0),
             pumps_finished: AtomicU64::new(0),
-        }))
+        });
+        // U2 cross-domain #2 (§D.5 "Models(provider reload 即推)"): a
+        // provider reload broadcasts the fresh snapshot to every
+        // connection. Weak, so a dropped server leaves an inert listener;
+        // a newer server re-registers (last one wins).
+        manox_agent::provider_glue::set_reload_listener(Some(Box::new({
+            let weak = Arc::downgrade(&inner);
+            move || {
+                if let Some(inner) = weak.upgrade() {
+                    inner.broadcast_models_after_reload();
+                }
+            }
+        })));
+        Self(inner)
     }
 
     /// Accept a connection: spawn the handshake + dispatch task. The
@@ -720,6 +733,15 @@ impl AgentServerInner {
     // ── Note routing. ──────────────────────────────────────────────────────
     /// §D.5: broadcast a host event to EVERY connected client (global,
     /// change-driven — not owner-scoped like `route_note`).
+    /// §D.5 as-built (U2 cross-domain #2): the provider-reload broadcast —
+    /// Host frame only, to every connection. An unsolicited Models push has
+    /// no v1 note consumer (both migrated clients fold HostEvent::Models);
+    /// the ListModels RESPONSE side keeps its GW1 dual-emit.
+    fn broadcast_models_after_reload(&self) {
+        let models = self.models_snapshot();
+        self.broadcast_host(HostEvent::Models { models });
+    }
+
     fn broadcast_host(&self, host: manox_protocol::stream::HostEvent) {
         let frame = FromServer::Host { host };
         // Clone the connection list under the lock, then send outside it: a
@@ -9367,8 +9389,14 @@ mod tests {
                 _ => {}
             }
         };
-        let old = items.iter().find(|i| i.id == "t-old").expect("t-old listed");
-        let new = items.iter().find(|i| i.id == "t-new").expect("t-new listed");
+        let old = items
+            .iter()
+            .find(|i| i.id == "t-old")
+            .expect("t-old listed");
+        let new = items
+            .iter()
+            .find(|i| i.id == "t-new")
+            .expect("t-new listed");
         assert_eq!(
             old.updated_at, 500,
             "the wire recency column is interacted_at, not the metadata updated_at (9000)"
@@ -9377,6 +9405,66 @@ mod tests {
             new.updated_at, 800,
             "the wire recency column is interacted_at, not updated_at (850)"
         );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U2 cross-domain #2: a provider reload broadcasts a fresh Models
+    /// snapshot to EVERY connection — §D.5's "Models(provider reload 即推)"
+    /// promise, previously unimplemented (the only emission was the
+    /// requester-directed ListModels response mirror). The desktop's
+    /// menu-open refetch stays for the startup-registration race; the
+    /// reload-driven staleness retires against this.
+    #[test]
+    fn provider_reload_broadcasts_models_to_all_clients() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        // Second connection: the audience is every client, and there is no
+        // requester at all (the reload is process-local).
+        let (conn2_client, conn2_server) = in_process_pair();
+        server.accept(Arc::new(conn2_server));
+        let client2 = Client { conn: conn2_client };
+        let init_id = MsgId::new("init2");
+        client2.send(FromClient::Request {
+            id: init_id.clone(),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "test2".into(),
+                capabilities: vec![],
+                sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
+            }),
+        });
+        // Drain the handshake frames (ack, Ready note, Host Ready).
+        let mut acked = false;
+        let mut host_ready = false;
+        while !(acked && host_ready) {
+            match client2.recv() {
+                FromServer::Response { id, .. } if id == init_id => acked = true,
+                FromServer::Host {
+                    host: HostEvent::Ready { .. },
+                } => host_ready = true,
+                _ => {}
+            }
+        }
+        // The hermetic HOME has no provider config: the fresh snapshot is
+        // empty — the frame itself is the contract, not its contents.
+        manox_agent::provider_glue::reload().unwrap();
+        for (who, c) in [("client1", &client), ("client2", &client2)] {
+            let mut saw = false;
+            while !saw {
+                if let FromServer::Host {
+                    host: HostEvent::Models { .. },
+                } = c.recv()
+                {
+                    saw = true;
+                }
+            }
+            assert!(saw, "{who} never received the Models broadcast");
+        }
+        drop(client2);
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();

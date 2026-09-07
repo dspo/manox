@@ -113,6 +113,19 @@ pub fn global() -> Arc<ProviderRegistry> {
         .clone()
 }
 
+/// Post-swap reload listener (single slot, last registration wins): the
+/// gateway registers here so a provider reload broadcasts a fresh Models
+/// snapshot to every connection (§D.5 "Models(provider reload 即推)"
+/// as-built — U2 cross-domain #2). Fires on `reload()`'s background
+/// thread after the snapshot swap; implementations must not block.
+static RELOAD_LISTENER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Register (or clear, with `None`) the post-swap reload listener.
+pub fn set_reload_listener(listener: Option<Box<dyn Fn() + Send + Sync>>) {
+    *RELOAD_LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = listener;
+}
+
 /// Rebuild from the config file and atomically swap the snapshot. The
 /// previous snapshot is kept on failure. Blocking (keychain / shell
 /// commands) — call from a background thread.
@@ -127,6 +140,15 @@ pub fn reload() -> anyhow::Result<()> {
         .get()
         .expect("pi_providers not initialized; call manox_agent::init first");
     *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+    // Fire the listener OUTSIDE the registry write lock: the broadcast
+    // re-reads the fresh snapshot through global().
+    if let Some(listener) = RELOAD_LISTENER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        listener();
+    }
     Ok(())
 }
 
