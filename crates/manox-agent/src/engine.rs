@@ -5922,13 +5922,10 @@ mod tests {
         // run by scheduler granularity).
         let appender_for_drain = std::sync::Arc::clone(&journal_appender);
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                SessionCmd::AppendJournal { kind, payload } => {
-                    if let Err(err) = appender_for_drain.append_typed(&kind, payload).await {
-                        tracing::warn!(%err, kind, "post-run journal append failed");
-                    }
-                }
-                _ => {}
+            if let SessionCmd::AppendJournal { kind, payload } = cmd
+                && let Err(err) = appender_for_drain.append_typed(&kind, payload).await
+            {
+                tracing::warn!(%err, kind, "post-run journal append failed");
             }
         }
 
@@ -5967,9 +5964,7 @@ mod tests {
                     format!("tool_call:{name}:{status:?}")
                 }
                 manox_harness::session::SessionTreeEntry::ToolResult { .. } => "tool_result".into(),
-                manox_harness::session::SessionTreeEntry::Message { .. } => {
-                    "message".to_string()
-                }
+                manox_harness::session::SessionTreeEntry::Message { .. } => "message".to_string(),
                 other => format!("{:?}", std::mem::discriminant(other)),
             })
             .collect();
