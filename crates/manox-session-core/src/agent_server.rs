@@ -420,10 +420,20 @@ impl AgentServerInner {
 
     /// Deliver a note to one connected client (request-scoped traffic such
     /// as bare-model stream deltas, which have no session ownership).
+    ///
+    /// The connection is cloned under the `clients` lock and the send runs
+    /// outside it: a bounded network carrier can block inside
+    /// `send_to_client`, and sending under the lock would stall every other
+    /// client's routing, reply dispatch, and call registration while one
+    /// peer is slow (same clone-then-send discipline as `route_note`).
     fn note_to_client(&self, client_id: &str, note: manox_protocol::ServerNote) {
-        let clients = self.clients.lock();
-        if let Some(entry) = clients.get(client_id) {
-            entry.conn.send_to_client(FromServer::Notification { note });
+        let conn = self
+            .clients
+            .lock()
+            .get(client_id)
+            .map(|entry| entry.conn.clone());
+        if let Some(conn) = conn {
+            conn.send_to_client(FromServer::Notification { note });
         }
     }
 
@@ -517,8 +527,20 @@ impl AgentServerInner {
     /// change-driven — not owner-scoped like `route_note`).
     fn broadcast_host(&self, host: manox_protocol::stream::HostEvent) {
         let frame = FromServer::Host { host };
-        for entry in self.clients.lock().values() {
-            entry.conn.send_to_client(frame.clone());
+        // Clone the connection list under the lock, then send outside it: a
+        // stalled client on a bounded carrier must not freeze the gateway's
+        // shared `clients` lock for every other path (pumps, reply dispatch,
+        // call registration). Per-client non-blocking delivery is the
+        // transport-policy question (§D.7); this keeps the blast radius of a
+        // slow peer to the broadcasting task alone.
+        let conns: Vec<Arc<dyn RpcConnection>> = self
+            .clients
+            .lock()
+            .values()
+            .map(|entry| entry.conn.clone())
+            .collect();
+        for conn in conns {
+            conn.send_to_client(frame.clone());
         }
     }
 
@@ -2697,6 +2719,206 @@ mod tests {
         hermetic_home();
         init_globals();
         let (_server, _client) = harness(vec![]);
+    }
+
+    /// A connection whose `send_to_client` parks on the first Host frame
+    /// (signalling entry, then waiting for a test-controlled release) and
+    /// delegates everything else to an ordinary in-process pair. It stands
+    /// in for a stalled WS peer whose bounded carrier blocks in
+    /// `send_blocking`.
+    struct GatedConn {
+        inner: manox_protocol::InProcessConnection,
+        /// Signalled when a Host frame enters `send_to_client` and parks.
+        entered: StdMutex<std::sync::mpsc::Sender<()>>,
+        /// The parked send waits here until the test flips it.
+        release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl RpcConnection for GatedConn {
+        fn send_to_client(&self, msg: FromServer) {
+            if matches!(msg, FromServer::Host { .. }) {
+                let _ = self.entered.lock().unwrap().send(());
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+            }
+            self.inner.send_to_client(msg);
+        }
+        fn send_to_server(&self, msg: FromClient) {
+            self.inner.send_to_server(msg);
+        }
+        fn client_rx(&self) -> async_channel::Receiver<FromClient> {
+            self.inner.client_rx()
+        }
+        fn server_rx(&self) -> async_channel::Receiver<FromServer> {
+            self.inner.server_rx()
+        }
+        fn disconnect(&self) {
+            self.inner.disconnect();
+        }
+    }
+
+    /// GW4 regression: a server→client send may block on a bounded carrier
+    /// (a stalled WS peer), and it must never do so while holding the shared
+    /// `clients` lock — otherwise one slow client freezes every pump's host
+    /// broadcast, Reply dispatch, and route_call registration gateway-wide.
+    /// The gated connection parks deterministically inside `send_to_client`;
+    /// the test asserts the lock stays acquirable and a healthy client's
+    /// targeted traffic keeps flowing while the broadcast thread is parked.
+    #[test]
+    fn stalled_host_broadcast_never_holds_the_clients_lock() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+
+        // Client "gated": the handshake passes (non-Host frames delegate),
+        // then the first Host frame parks inside send_to_client.
+        let (gated_client_conn, gated_server_conn) = in_process_pair();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        server.accept(Arc::new(GatedConn {
+            inner: gated_server_conn,
+            entered: StdMutex::new(entered_tx),
+            release: release.clone(),
+        }));
+        let gated = Client {
+            conn: gated_client_conn,
+        };
+        gated.send(FromClient::Request {
+            id: MsgId::new("init-gated"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "gated".into(),
+                capabilities: vec![],
+                sessions: vec![],
+            }),
+        });
+        assert!(matches!(gated.recv(), FromServer::Response { .. }));
+        assert!(matches!(
+            gated.recv(),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+
+        // Client "healthy": an ordinary in-process pair on the same server.
+        let (healthy_client_conn, healthy_server_conn) = in_process_pair();
+        server.accept(Arc::new(healthy_server_conn));
+        let healthy = Client {
+            conn: healthy_client_conn,
+        };
+        healthy.send(FromClient::Request {
+            id: MsgId::new("init-healthy"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "healthy".into(),
+                capabilities: vec![],
+                sessions: vec![],
+            }),
+        });
+        assert!(matches!(healthy.recv(), FromServer::Response { .. }));
+        assert!(matches!(
+            healthy.recv(),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+
+        // Broadcast from a side thread; it parks inside the gated client's
+        // send. The clients-map iteration order decides whether the healthy
+        // client is served before or after the park — both are legal, and
+        // both clients must hold the frame once the gate releases.
+        let inner = server.0.clone();
+        let broadcaster = std::thread::spawn(move || {
+            inner.broadcast_host(HostEvent::SessionStatus {
+                session_id: "gw4".into(),
+                running: Some(true),
+                errored: None,
+                unread: None,
+                pending_auth: None,
+                pending_plan: None,
+                background_work: None,
+            });
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("gated send never entered");
+
+        // The regression assertion: while a send is parked, the shared lock
+        // must stay acquirable. Before the fix, broadcast_host held
+        // `clients` across send_to_client, so this timed out — and every
+        // pump, Reply dispatch, and route_call froze with it.
+        assert!(
+            server
+                .0
+                .clients
+                .try_lock_for(Duration::from_millis(500))
+                .is_some(),
+            "clients lock held across a stalled send_to_client (GW4)"
+        );
+
+        // Targeted traffic to the healthy client is dispatched (and lands in
+        // its carrier) while the gated one is still parked — reaching the
+        // release below at all proves note_to_client did not block on the
+        // contended lock.
+        server.0.note_to_client(
+            "healthy",
+            ServerNote::Error {
+                session_id: None,
+                message: "gw4-ping".into(),
+            },
+        );
+
+        // Release the gate; the broadcast completes for every client.
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+        broadcaster.join().expect("broadcaster panicked");
+
+        // The gated client sees the Host frame after the release.
+        expect_host_status(&gated, "gw4", |running, _, _, _| running == Some(true));
+
+        // The healthy client holds both the targeted ping and the broadcast
+        // frame; arrival order depends on the map iteration and the park
+        // point, so collect until both are seen.
+        let mut saw_ping = false;
+        let mut saw_host = false;
+        let rx = healthy.conn.server_rx();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !(saw_ping && saw_host) {
+            match rx.try_recv() {
+                Ok(FromServer::Notification {
+                    note: ServerNote::Error { message, .. },
+                }) if message == "gw4-ping" => saw_ping = true,
+                Ok(FromServer::Host {
+                    host:
+                        HostEvent::SessionStatus {
+                            session_id,
+                            running,
+                            ..
+                        },
+                }) if session_id == "gw4" && running == Some(true) => saw_host = true,
+                Ok(_) => {}
+                Err(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "healthy client never saw ping+host: ping={saw_ping} host={saw_host}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+
+        gated.conn.disconnect();
+        healthy.conn.disconnect();
+        drop(gated);
+        drop(healthy);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
     }
 
     #[test]
