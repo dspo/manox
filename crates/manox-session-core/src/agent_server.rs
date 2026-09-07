@@ -2396,6 +2396,7 @@ fn respond_auth_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, aut
         });
     }
     inner.note_error(session_id, "no client can answer this approval");
+    clear_pending_auth_if_settled(inner, session_id);
 }
 
 fn apply_approve_reply(
@@ -2420,6 +2421,7 @@ fn apply_approve_reply(
     if let Some(thread) = inner.session_thread(session_id) {
         thread.with_mut(|t| t.respond_authorization(&auth_id, response));
     }
+    clear_pending_auth_if_settled(inner, session_id);
 }
 
 fn apply_ask_reply(
@@ -2453,6 +2455,7 @@ fn apply_ask_reply(
     if let Some(thread) = inner.session_thread(session_id) {
         thread.with_mut(|t| t.respond_authorization(&auth_id, response));
     }
+    clear_pending_auth_if_settled(inner, session_id);
 }
 
 fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth_id: String) {
@@ -2468,6 +2471,38 @@ fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth
         });
     }
     inner.note_error(session_id, "no client can answer this question");
+    clear_pending_auth_if_settled(inner, session_id);
+}
+
+/// U3b: the verdict-time pending-auth clear. The store flag drops when the
+/// LAST authorization settles (the facade's pending set is the truth — a
+/// concurrent second authorization keeps the badge up) and the §D.5 delta
+/// tells the mirrors. This replaces the desktop's heuristic clears (tool
+/// traffic past a parked authorization), which only ever ran in-proc and
+/// only for one client.
+fn clear_pending_auth_if_settled(inner: &Arc<AgentServerInner>, session_id: &str) {
+    let settled = inner
+        .session_thread(session_id)
+        .is_none_or(|t| t.read(|t| t.pending_auth_entries().is_empty()));
+    if !settled {
+        return;
+    }
+    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_auth(session_id, false));
+    inner.broadcast_host(host_status(session_id, |f| {
+        f.pending_auth = Some(false);
+    }));
+}
+
+/// U3b: the verdict-time pending-plan clear — the kernel flag is consumed
+/// by the verdict arms themselves; this drops the store mirror and tells
+/// the §D.5 delta (formerly a desktop-local write, which left every other
+/// client's badge stale). The reject/expire path has its own convergence
+/// (`converge_plan_rejected`, GW9).
+fn clear_pending_plan_flags(inner: &Arc<AgentServerInner>, session_id: &str) {
+    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(session_id, false));
+    inner.broadcast_host(host_status(session_id, |f| {
+        f.pending_plan = Some(false);
+    }));
 }
 
 fn apply_plan_verdict(
@@ -2505,6 +2540,7 @@ fn apply_plan_verdict(
     // mode on (the user can re-edit) without seeding execution.
     if choice == "refine" {
         thread.with_mut(|t| t.set_plan_review_pending(false));
+        clear_pending_plan_flags(inner, session_id);
         return;
     }
     let compact = choice == "execute_compact";
@@ -2529,6 +2565,7 @@ fn apply_plan_verdict(
         };
         t.approve_plan(compact, compact_instructions, seed_text, Some(ui));
     });
+    clear_pending_plan_flags(inner, session_id);
 }
 
 /// Converge a PlanVerdict that will never be answered — rejected, expired,
@@ -2817,14 +2854,24 @@ fn spawn_pump(
                 }
                 ThreadEvent::Error(_) => {
                     let id = session_id.clone();
+                    // U3b: the Error edge idles the store and clears the
+                    // adjudication badges server-side — the desktop mirror
+                    // blocks that covered these gaps (mark_idle,
+                    // pending_auth) are redundant now and retire after the
+                    // desktop list migration.
                     manox_agent::thread_store::global().with_mut(|s| {
+                        s.mark_idle(&id);
                         s.set_errored(&id, true);
                         s.mark_pending_plan(&id, false);
+                        s.mark_pending_auth(&id, false);
                         s.mark_background_work(&id, false);
                     });
                     inner.broadcast_host(host_status(&session_id, |f| {
                         f.errored = Some(true);
                         f.running = Some(false);
+                        f.pending_plan = Some(false);
+                        f.pending_auth = Some(false);
+                        f.background_work = Some(false);
                     }));
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
@@ -9101,5 +9148,197 @@ mod tests {
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U3b: the Error edge idles the store and clears the adjudication
+    /// badges server-side — one delta carries the whole clear set (the
+    /// desktop mirror blocks that papered over these gaps retire against
+    /// this). The running flag rises through the real pump chain; the
+    /// badge flags are raised test-side as setup — the verdict-time clear
+    /// through the live adjudication flow is pinned by
+    /// approve_verdict_clears_the_pending_auth_badge_server_side, and this
+    /// test pins the Error arm's store+delta clears.
+    #[test]
+    fn error_edge_idles_store_and_clears_adjudication_flags() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "u3b-err");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("u3b-err", engine.clone(), events);
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
+            .unwrap();
+        expect_host_status(&client, "u3b-err", |running, _, _, _| running == Some(true));
+        poll_store("running raised", |s| s.is_running("u3b-err"));
+        // Raise the badges test-side (see the doc comment).
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.mark_pending_auth("u3b-err", true);
+            s.mark_pending_plan("u3b-err", true);
+        });
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                anyhow::anyhow!("killed"),
+            ))))
+            .unwrap();
+        // ONE delta carries the full clear set (the U3b Error broadcast).
+        expect_host_status(&client, "u3b-err", |running, errored, _, pending_auth| {
+            running == Some(false) && errored == Some(true) && pending_auth == Some(false)
+        });
+        poll_store("cleared", |s| {
+            !s.is_running("u3b-err")
+                && !s.pending_auth_contains("u3b-err")
+                && !s.pending_plan_contains("u3b-err")
+        });
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U3b: settling the LAST authorization drops the pending-auth badge
+    /// server-side (store + §D.5 delta) — the verdict-time clear replacing
+    /// the desktop's in-proc-only tool-traffic heuristic.
+    #[test]
+    fn approve_verdict_clears_the_pending_auth_badge_server_side() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::Approve]);
+        create(&server, &client, "u3b-auth");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("u3b-auth", engine.clone(), events);
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "auth-v".into(),
+                    tool_name: "Bash".into(),
+                    summary: "run ls".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        let call_id = loop {
+            if let FromServer::Request {
+                id,
+                call: ServerCall::Approve { auth_id, .. },
+            } = client.recv()
+            {
+                assert_eq!(auth_id, "auth-v");
+                break id;
+            }
+        };
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(json!({ "allow": true })),
+        });
+        expect_host_status(&client, "u3b-auth", |_, _, _, pending_auth| {
+            pending_auth == Some(false)
+        });
+        poll_store("auth badge cleared", |s| {
+            !s.pending_auth_contains("u3b-auth")
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let responded = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+                id == "auth-v"
+                    && matches!(
+                        r,
+                        manox_agent::permission::ToolAuthorizationResponse::Decision(
+                            manox_agent::permission::PermissionDecision::AllowOnce
+                        )
+                    )
+            });
+            if responded {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the verdict never reached the kernel"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U3b: an EXECUTED plan verdict clears the pending-plan badge
+    /// server-side (store + delta) — bookkeeping, not a skip: the plan
+    /// still executes. (Reject/expire is GW9's convergence, pinned there.)
+    #[test]
+    fn plan_verdict_execution_clears_the_pending_plan_badge() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::PlanVerdict]);
+        create(&server, &client, "u3b-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("u3b-s1", engine.clone(), events);
+        let plan_file =
+            std::env::temp_dir().join(format!("manox-u3b-plan-{}.md", std::process::id()));
+        std::fs::write(&plan_file, "# Plan").unwrap();
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: plan_file.to_string_lossy().into_owned(),
+                title: "U3b plan".into(),
+            })))
+            .unwrap();
+        let call_id = loop {
+            if let FromServer::Request {
+                id,
+                call: ServerCall::PlanVerdict { .. },
+            } = client.recv()
+            {
+                break id;
+            }
+        };
+        expect_store_pending_plan("u3b-s1", true, "while the verdict is pending");
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(json!({ "choice": "execute_keep" })),
+        });
+        expect_pending_plan_cleared(&client, "u3b-s1");
+        expect_store_pending_plan("u3b-s1", false, "after the execution verdict");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let (flags, approvals) = {
+                let f = engine.plan_review_flags.lock().unwrap().clone();
+                let a = engine.plan_approvals.lock().unwrap().clone();
+                (f, a)
+            };
+            if flags == vec![true, false] && approvals.len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the approve verdict must consume the review flag and seed execution"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(&plan_file);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// Poll a thread-store predicate to true (10s deadline) — the U3b
+    /// store-flag assertions run against pump-task timing.
+    fn poll_store(what: &str, pred: impl Fn(&manox_agent::thread_store::ThreadStore) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if manox_agent::thread_store::global().read(|s| pred(s)) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store never reached the expected state: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
