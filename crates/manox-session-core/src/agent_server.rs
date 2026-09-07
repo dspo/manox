@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use manox_protocol::base64_bytes;
 use manox_protocol::client::ImageAttachment;
-use manox_protocol::handshake::{ClientHello, HookKind, Initialize};
+use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
 use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
 use manox_protocol::{
@@ -139,8 +139,21 @@ struct AgentServerInner {
     /// Live §D.1 streams: `(client_id, stream_id)` → control handle. The
     /// key pair mirrors the stream id's per-connection uniqueness (§D.1).
     streams: Mutex<HashMap<(String, StreamId), StreamHandle>>,
-    focused: Arc<StdMutex<Option<String>>>,
     call_seq: AtomicU64,
+    /// GW3 (§D.4): per-session adjudication delivery counter — the `dlv-`
+    /// id's monotonic suffix. Per-session (not per-server) so the two
+    /// transports of `dual_path_transport_consistency` mint identical ids
+    /// for identical scripts after session-id normalization.
+    delivery_seq: Mutex<HashMap<String, u64>>,
+    /// GW3 (§D.4): in-flight waterfall deliveries — `delivery_id` →
+    /// (recipient client_id → cancel token). A `CancelDelivery` call flips
+    /// the sender's token; the delivery's reply waiter folds that into the
+    /// funnel as an expired reply, converging the waterfall fail-closed
+    /// through the existing expire path. Registered for the fan-out window
+    /// only (the [`DeliveryGuard`] removes the entry at settlement — Drop
+    /// covers a pump abort too).
+    pending_deliveries:
+        Mutex<HashMap<String, HashMap<String, tokio_util::sync::CancellationToken>>>,
     /// In-flight bare-model completions by request id (the LanguageModelChat
     /// provider path); cancellation tokens shared with the spawned streams.
     model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
@@ -257,8 +270,9 @@ impl AgentServer {
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
-            focused: Arc::new(StdMutex::new(None)),
             call_seq: AtomicU64::new(0),
+            delivery_seq: Mutex::new(HashMap::new()),
+            pending_deliveries: Mutex::new(HashMap::new()),
             model_chats: Arc::new(StdMutex::new(HashMap::new())),
             next_generation: AtomicU64::new(1),
             conversation_info_cache: Arc::new(StdMutex::new(
@@ -306,12 +320,34 @@ impl AgentServerInner {
                         client_id,
                         capabilities,
                         sessions,
+                        protocol_epoch,
                     }),
             }) => {
                 if client_id.is_empty() {
                     conn.send_to_client(FromServer::Response {
                         id,
                         outcome: Err(RpcError::new(-1, "empty client_id")),
+                    });
+                    return;
+                }
+                // C1 (L12 epoch negotiation): 0 is the pre-epoch v1
+                // generation (the serde default of a missing field) and
+                // stays accepted through the dual-protocol window;
+                // PROTOCOL_EPOCH is the generation this server speaks. Any
+                // other value is a generation whose frames this server would
+                // misread — refuse at the handshake with the stable §D.7
+                // code instead of interpreting future frames as current ones.
+                if protocol_epoch != 0 && protocol_epoch != PROTOCOL_EPOCH {
+                    conn.send_to_client(FromServer::Response {
+                        id,
+                        outcome: Err(RpcError::new(
+                            -1,
+                            format!(
+                                "unsupported protocol epoch {protocol_epoch} \
+                                 (server speaks {PROTOCOL_EPOCH}; v1 clients omit the field)"
+                            ),
+                        )
+                        .with_code(manox_protocol::msg::CODE_PROTOCOL_UNSUPPORTED_EPOCH)),
                     });
                     return;
                 }
@@ -368,6 +404,17 @@ impl AgentServerInner {
                 conn.send_to_client(FromServer::Notification {
                     note: ServerNote::Ready,
                 });
+                // GW1 dual emit + C1 epoch echo: the §D.5 Host mirror of the
+                // handshake ack, directed to THIS connection (a handshake is
+                // per-connection, never a broadcast). `Ready{epoch}` echoes
+                // the epoch the connection operates under — PROTOCOL_EPOCH
+                // for both accepted generations (a v1 client does not read
+                // Host frames; the C4 close-out retires the note arm).
+                conn.send_to_client(FromServer::Host {
+                    host: HostEvent::Ready {
+                        epoch: PROTOCOL_EPOCH,
+                    },
+                });
                 (client_id, generation)
             }
             other => {
@@ -391,7 +438,12 @@ impl AgentServerInner {
                     // the requesting client — the VS Code TS client reads
                     // results from notifications (push delivery), not from
                     // Response bodies (request-response). Both are sent for
-                    // protocol completeness.
+                    // protocol completeness. GW1 dual emit: the §D.5
+                    // HostEvent mirror rides along, directed to the
+                    // requester exactly like the v1 note (same audience,
+                    // same snapshot value; the C4 close-out retires the note
+                    // arm). Note first, then the Host mirror, then the
+                    // Response: v1 consumers see their familiar prefix.
                     let push_after = match &call {
                         ClientCall::ListModels => Some(ListPush::Models),
                         ClientCall::ListThreads => Some(ListPush::Threads),
@@ -400,18 +452,41 @@ impl AgentServerInner {
                     };
                     let outcome = handle_call(&self, &client_id, call).await;
                     if let Some(push) = push_after {
-                        let note = match push {
-                            ListPush::Models => ServerNote::Models {
-                                models: self.models_snapshot(),
-                            },
-                            ListPush::Threads => ServerNote::ThreadsUpdated {
-                                threads: self.threads_snapshot(),
-                            },
-                            ListPush::Commands => ServerNote::Commands {
-                                commands: self.commands_snapshot(),
-                            },
-                        };
-                        conn.send_to_client(FromServer::Notification { note });
+                        match push {
+                            ListPush::Models => {
+                                let models = self.models_snapshot();
+                                conn.send_to_client(FromServer::Notification {
+                                    note: ServerNote::Models {
+                                        models: models.clone(),
+                                    },
+                                });
+                                conn.send_to_client(FromServer::Host {
+                                    host: HostEvent::Models { models },
+                                });
+                            }
+                            ListPush::Threads => {
+                                let threads = self.threads_snapshot();
+                                conn.send_to_client(FromServer::Notification {
+                                    note: ServerNote::ThreadsUpdated {
+                                        threads: threads.clone(),
+                                    },
+                                });
+                                conn.send_to_client(FromServer::Host {
+                                    host: HostEvent::ThreadsUpdated { threads },
+                                });
+                            }
+                            ListPush::Commands => {
+                                let commands = self.commands_snapshot();
+                                conn.send_to_client(FromServer::Notification {
+                                    note: ServerNote::Commands {
+                                        commands: commands.clone(),
+                                    },
+                                });
+                                conn.send_to_client(FromServer::Host {
+                                    host: HostEvent::Commands { commands },
+                                });
+                            }
+                        }
                     }
                     conn.send_to_client(FromServer::Response { id, outcome });
                 }
@@ -521,6 +596,23 @@ impl AgentServerInner {
             .map(|entry| entry.conn.clone());
         if let Some(conn) = conn {
             conn.send_to_client(FromServer::Notification { note });
+        }
+    }
+
+    /// GW1 (§D.5 dual emit): deliver a Host event to ONE connected client —
+    /// the Host twin of [`Self::note_to_client`] for the directed host
+    /// events (handshake `Ready`, the owner-controlled
+    /// `SessionCreated`/`SessionDisposed`, requester-scoped list mirrors).
+    /// Same clone-then-send discipline (GW4): the connection is cloned under
+    /// the `clients` lock and the send runs outside it.
+    fn host_to_client(&self, client_id: &str, host: manox_protocol::stream::HostEvent) {
+        let conn = self
+            .clients
+            .lock()
+            .get(client_id)
+            .map(|entry| entry.conn.clone());
+        if let Some(conn) = conn {
+            conn.send_to_client(FromServer::Host { host });
         }
     }
 
@@ -652,11 +744,32 @@ impl AgentServerInner {
         }
     }
 
+    /// GW1 (§D.5 dual emit): route a Host event to a session's owner set —
+    /// the Host twin of [`Self::route_note`] (same audience, same
+    /// clone-conns-then-send-outside-the-lock discipline; `owner_conns`
+    /// already clones under the locks and returns).
+    fn route_host(&self, session_id: &str, host: manox_protocol::stream::HostEvent) {
+        let conns = self.owner_conns(session_id);
+        for conn in conns {
+            conn.send_to_client(FromServer::Host { host: host.clone() });
+        }
+    }
+
     fn note_error(&self, session_id: &str, message: &str) {
+        // GW1 dual emit: the §D.5 `HostEvent::Error` mirror rides to the
+        // SAME owner audience as the v1 note (a session-scoped error is not
+        // broadcast to non-owners; the HostEvent vocabulary carries no
+        // session id, the audience carries the scope).
         self.route_note(
             session_id,
             ServerNote::Error {
                 session_id: Some(session_id.into()),
+                message: message.into(),
+            },
+        );
+        self.route_host(
+            session_id,
+            HostEvent::Error {
                 message: message.into(),
             },
         );
@@ -678,7 +791,12 @@ impl AgentServerInner {
                     title: t.display_title().to_string(),
                     updated_at: t.updated_at as i32,
                     running: s.is_running(&t.id),
-                    unread: t.has_unread,
+                    // GW5: unread is client-owned — the server keeps no
+                    // focus mirror, so the deprecated list field is always
+                    // false (clients derive unread from the
+                    // `SessionStatus.unread` settle deltas and clear it
+                    // locally on focus). C4 removes the field.
+                    unread: false,
                     errored: t.errored,
                     pending_auth: s.pending_auth_contains(&t.id),
                     pending_plan: s.pending_plan_contains(&t.id),
@@ -810,12 +928,42 @@ async fn handle_call(
             before_seq,
             max_messages,
         } => {
-            let thread = inner.session_thread(&session_id).ok_or_else(|| {
-                RpcError::new(-1, "unknown session")
-                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
-            })?;
-            journal_query::page_history(&thread, through_seq, before_seq, max_messages).await
+            // §D.2: "冷读不激活 engine，jsonl 直读" (GW6). The live engine
+            // seam answers when it is materialized; otherwise the persisted
+            // journal is read straight off disk — a cold session must never
+            // answer "journal engine is not materialized" (pre-fix the
+            // client's gap-repair and backwards paging both dead-ended on
+            // it). A live session with neither an answering engine nor a
+            // persisted file (a fresh deferred thread) has an EMPTY journal,
+            // not a missing one; a session that is neither live nor
+            // persisted stays `session/not-found`.
+            let thread = inner.session_thread(&session_id);
+            let snapshot = match &thread {
+                Some(t) => t.journal_snapshot().await,
+                None => None,
+            };
+            let snapshot = match snapshot {
+                Some(data) => data,
+                None => match journal_query::cold_snapshot(&session_id).await {
+                    Some(data) => data,
+                    None if thread.is_some() => manox_agent::engine::JournalSnapshotData {
+                        cursor: 0,
+                        records: Vec::new(),
+                    },
+                    None => {
+                        return Err(RpcError::new(-1, "unknown session")
+                            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+                    }
+                },
+            };
+            journal_query::page_history(snapshot, through_seq, before_seq, max_messages)
         }
+        // GW3 (§D.4): withdraw a pending adjudication delivery — the server
+        // converges it through the existing expire path (fail-closed), never
+        // waiting out the 300s call timeout for a client that navigated away.
+        ClientCall::CancelDelivery { delivery_id } => Ok(json!({
+            "cancelled": inner.cancel_delivery(client_id, &delivery_id),
+        })),
         ClientCall::GetConversationInfo { session_id } => {
             let thread = inner.session_thread(&session_id).ok_or_else(|| {
                 RpcError::new(-1, "unknown session")
@@ -918,7 +1066,10 @@ async fn open_session(
     // double-route/auto-deny chain.
     {
         let mut sessions = inner.sessions.lock();
-        if sessions.contains_key(session_id) {
+        if let Some(existing) = sessions.get(session_id) {
+            // Idempotent re-own. Clone the thread under the lock — the
+            // GW1 Host mirror below projects its header from it.
+            let thread = existing.thread.clone();
             drop(sessions);
             inner.add_owner(session_id, owner);
             inner.note_to_client(
@@ -927,16 +1078,26 @@ async fn open_session(
                     session_id: session_id.into(),
                 },
             );
+            // GW1 dual emit: the §D.5 Host mirror, DIRECTED to the new owner
+            // (SessionCreated is owner-set control, never a broadcast). The
+            // header projects from the live thread (the authoritative header
+            // rides the follow stream's Snapshot frame).
+            inner.host_to_client(owner, session_created_event(session_id, &thread));
             return Ok(json!({ "restored": true }));
         }
         // U8 (known debt): `load_thread` does journal-file IO while the
         // `sessions` lock is held. Correctness first — the atomic
         // check-load-insert is what makes a duplicate pump structurally
         // impossible; narrowing the lock around the IO re-opens the TOCTOU.
+        // GW6 singleflight rides exactly this: concurrent open/create races
+        // serialize on this one hold (the losers take the idempotent branch
+        // above on their turn).
         let thread = manox_agent::thread_store::global()
             .with_mut(|s| s.load_thread(session_id))
             .ok_or_else(|| RpcError::new(-1, "thread not found"))?;
-        manox_agent::thread_store::global().with_mut(|s| s.set_unread(session_id, false));
+        // GW5: the open-time `set_unread(session_id, false)` store mirror
+        // write is gone — unread is client-owned (clients clear their badge
+        // locally on focus); the server keeps no read-state.
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(StdMutex::new(Vec::new()));
         let pump_cancel = tokio_util::sync::CancellationToken::new();
@@ -946,7 +1107,6 @@ async fn open_session(
             thread.clone(),
             turn_active.clone(),
             pending_submits.clone(),
-            inner.focused.clone(),
             pump_cancel.clone(),
         );
         // No entry existed under this same lock hold, so the insert replaces
@@ -955,22 +1115,49 @@ async fn open_session(
         sessions.insert(
             session_id.into(),
             ServerSession {
-                thread,
+                thread: thread.clone(),
                 pump_cancel,
                 pump,
                 turn_active,
                 pending_submits,
             },
         );
+        drop(sessions);
+        inner.add_owner(session_id, owner);
+        inner.route_note(
+            session_id,
+            ServerNote::SessionCreated {
+                session_id: session_id.into(),
+            },
+        );
+        // GW1 dual emit: the Host mirror to the owner set (after `add_owner`
+        // so the opening client is in the audience).
+        inner.route_host(session_id, session_created_event(session_id, &thread));
+        Ok(json!({ "restored": true }))
     }
-    inner.add_owner(session_id, owner);
-    inner.route_note(
-        session_id,
-        ServerNote::SessionCreated {
-            session_id: session_id.into(),
+}
+
+/// GW1 (§D.5): build the `SessionCreated` Host mirror — the wire note
+/// carries only the id, the Host event carries the header. Projected from
+/// the live thread exactly like the follow stream's snapshot header
+/// (`cwd` from the thread, `createdAt` the projection moment — the
+/// authoritative header rides the follow Snapshot; this mirror is
+/// transitional until C4).
+fn session_created_event(
+    session_id: &str,
+    thread: &ThreadHandle,
+) -> manox_protocol::stream::HostEvent {
+    let cwd = thread.read(|t| t.cwd().to_string_lossy().into_owned());
+    HostEvent::SessionCreated {
+        session_id: session_id.to_string(),
+        header: manox_protocol::journal::ThreadHeader {
+            id: session_id.to_string(),
+            cwd,
+            parent_session: None,
+            metadata: None,
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         },
-    );
-    Ok(json!({ "restored": true }))
+    }
 }
 
 // ── ClientNote dispatch (fire-and-forget). ───────────────────────────────────
@@ -1070,18 +1257,33 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::PinThread { session_id, pinned } => {
             manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
         }
-        ClientNote::FocusThread { session_id } => inner.focus_thread(session_id),
+        // GW5: unread is client-owned — the server's single-slot `focused`
+        // mirror is removed (it could not express multi-client focus, and
+        // the desktop never sent FocusThread, so the session the user was
+        // WATCHING still lit unread). The note variant survives the
+        // dual-protocol window as a no-op; C4 removes it. Clients clear
+        // their own unread badge on focus.
+        ClientNote::FocusThread { .. } => {}
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
             // β-3b: route to TerminalHandle. GW7: until then, an explicit
             // Error note to the SENDING client — pre-fix the note was
             // silently swallowed, which is data loss for a client that
             // declared terminal support (session_id None: the drop is
             // connection-scoped, not a session fact).
+            let message = "terminal input dropped: terminal support lands in β-3b";
             inner.note_to_client(
                 owner,
                 ServerNote::Error {
                     session_id: None,
-                    message: "terminal input dropped: terminal support lands in β-3b".into(),
+                    message: message.into(),
+                },
+            );
+            // GW1 dual emit: the §D.5 Host mirror, directed to the sending
+            // connection (the note's audience).
+            inner.host_to_client(
+                owner,
+                HostEvent::Error {
+                    message: message.into(),
                 },
             );
         }
@@ -1109,9 +1311,9 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
 
 /// The canonical on-disk journal path for a session id
 /// (`<config>/sessions/<id>.jsonl`) — the same name creation and the
-/// repository scan use, so the GW11 identity probe and the eventual
-/// materialization can never disagree about the file.
-fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
+/// repository scan use, so the GW11 identity probe, the GW6 cold read, and
+/// the eventual materialization can never disagree about the file.
+pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
     manox_agent::paths::sessions_dir().ok().map(|dir| {
         dir.join(manox_harness::session::repository::session_file_name(
             session_id,
@@ -1250,7 +1452,6 @@ impl AgentServerInner {
             thread.clone(),
             turn_active.clone(),
             pending_submits.clone(),
-            inner.focused.clone(),
             pump_cancel.clone(),
         );
         // GW2: `insert_session` terminates the pump of any entry this
@@ -1274,6 +1475,9 @@ impl AgentServerInner {
                 session_id: session_id.clone(),
             },
         );
+        // GW1 dual emit: the §D.5 Host mirror to the owner set (after
+        // `add_owner` so the creating client is in the audience).
+        inner.route_host(&session_id, session_created_event(&session_id, &thread));
         // T10 (§D.6): the create-time `PermissionModeChanged` mirror is gone —
         // the mode rides the follow-stream snapshot's `permission_mode`
         // projection (seeded from the live thread) and the
@@ -1289,6 +1493,13 @@ impl AgentServerInner {
         if let Some(conn) = self.clients.lock().get(owner).map(|e| e.conn.clone()) {
             conn.send_to_client(FromServer::Notification {
                 note: ServerNote::SessionDisposed {
+                    session_id: session_id.into(),
+                },
+            });
+            // GW1 dual emit: the §D.5 Host mirror, directed to the same
+            // single connection (owner-set control, never a broadcast).
+            conn.send_to_client(FromServer::Host {
+                host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
                 },
             });
@@ -1321,6 +1532,13 @@ impl AgentServerInner {
         if let Some(conn) = self.clients.lock().get(owner).map(|e| e.conn.clone()) {
             conn.send_to_client(FromServer::Notification {
                 note: ServerNote::SessionDisposed {
+                    session_id: session_id.into(),
+                },
+            });
+            // GW1 dual emit: the §D.5 Host mirror, directed to the detaching
+            // connection only.
+            conn.send_to_client(FromServer::Host {
+                host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
                 },
             });
@@ -1751,10 +1969,38 @@ impl AgentServerInner {
         }
     }
 
-    fn focus_thread(&self, session_id: Option<String>) {
-        *self.focused.lock().unwrap() = session_id.clone();
-        if let Some(id) = session_id {
-            manox_agent::thread_store::global().with_mut(|s| s.set_unread(&id, false));
+    /// GW3 (§D.4): mint the stable delivery identity for one adjudication —
+    /// `dlv-{session}-{n}`, n counting the session's deliveries. Per-session
+    /// (not per-server) so identical scripts on the two
+    /// `dual_path_transport_consistency` transports mint identical ids after
+    /// session-id normalization; the session prefix keeps the id unique
+    /// gateway-wide (the `pending_deliveries` registry key).
+    fn next_delivery_id(&self, session_id: &str) -> String {
+        let n = {
+            let mut seq = self.delivery_seq.lock();
+            let entry = seq.entry(session_id.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        format!("dlv-{session_id}-{n}")
+    }
+
+    /// GW3 (§D.4): withdraw `client_id`'s pending delivery — flips its
+    /// cancel token, which the delivery's reply waiter folds into the
+    /// funnel as an expired reply (the waterfall then converges fail-closed
+    /// through the existing expire path). `false` when the delivery already
+    /// settled, never existed, or targeted other clients only.
+    fn cancel_delivery(&self, client_id: &str, delivery_id: &str) -> bool {
+        let deliveries = self.pending_deliveries.lock();
+        match deliveries
+            .get(delivery_id)
+            .and_then(|tokens| tokens.get(client_id))
+        {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
         }
     }
 }
@@ -1762,6 +2008,20 @@ impl AgentServerInner {
 // ── ServerCall routing (β-3b: Approve / AskUserQuestion / PlanVerdict). ─────
 async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: ServerCall) {
     let kind = hook_kind_for(&call);
+    // GW3 (§D.4): the gateway is the SINGLE stamping point for delivery
+    // identity — translate/pump construct the trio with an empty
+    // `delivery_id` (they are pure), and every adjudication passes through
+    // here before hitting the wire. Directed capability calls carry none.
+    let delivery_id = match &call {
+        ServerCall::Approve { .. }
+        | ServerCall::PlanVerdict { .. }
+        | ServerCall::AskUserQuestion { .. } => Some(inner.next_delivery_id(session_id)),
+        _ => None,
+    };
+    let call = match &delivery_id {
+        Some(d) => with_delivery_id(call, d),
+        None => call,
+    };
     // Per-kind context needed to apply the reply, extracted before `call`
     // moves into the Request envelope.
     let ctx = match &call {
@@ -1836,7 +2096,15 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     }
 
     if adjudication {
-        route_waterfall(inner, session_id, ctx, call, targets).await;
+        route_waterfall(
+            inner,
+            session_id,
+            ctx,
+            call,
+            targets,
+            delivery_id.expect("stamped above for exactly the adjudication kinds"),
+        )
+        .await;
         return;
     }
 
@@ -1852,13 +2120,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     if outcome.is_err() {
         // Plan §5.2: a timed-out / errored call must surface the reason,
         // mirroring the no-owner fail-closed path.
-        inner.route_note(
-            session_id,
-            ServerNote::Error {
-                session_id: Some(session_id.into()),
-                message: "capability call timed out or cancelled".into(),
-            },
-        );
+        inner.note_error(session_id, "capability call timed out or cancelled");
     }
     apply_reply(inner, session_id, ctx, outcome, None);
 }
@@ -1878,16 +2140,86 @@ type AdjudicationTarget = (
     MsgId,
 );
 
+/// GW3: unregister a delivery when its waterfall settles — and cancel the
+/// tokens of any recipient that never answered, so their reply-waiter tasks
+/// exit promptly instead of parking on the 300s timeout. Drop-based (the
+/// [`PumpExitGuard`] pattern): a pump aborted mid-waterfall still unregisters.
+struct DeliveryGuard<'a> {
+    inner: &'a AgentServerInner,
+    delivery_id: String,
+}
+
+impl Drop for DeliveryGuard<'_> {
+    fn drop(&mut self) {
+        let mut deliveries = self.inner.pending_deliveries.lock();
+        if let Some(tokens) = deliveries.remove(&self.delivery_id) {
+            for token in tokens.values() {
+                token.cancel();
+            }
+        }
+    }
+}
+
+/// GW3: rebuild one of the three adjudication variants with the gateway-
+/// minted `delivery_id` (the single stamping point — see `route_call`);
+/// capability calls pass through untouched (they carry no delivery identity).
+fn with_delivery_id(call: ServerCall, delivery_id: &str) -> ServerCall {
+    match call {
+        ServerCall::Approve {
+            session_id,
+            auth_id,
+            tool_name,
+            summary,
+            input,
+            ..
+        } => ServerCall::Approve {
+            delivery_id: delivery_id.to_string(),
+            session_id,
+            auth_id,
+            tool_name,
+            summary,
+            input,
+        },
+        ServerCall::PlanVerdict {
+            session_id,
+            plan_file,
+            title,
+            content,
+            ..
+        } => ServerCall::PlanVerdict {
+            delivery_id: delivery_id.to_string(),
+            session_id,
+            plan_file,
+            title,
+            content,
+        },
+        ServerCall::AskUserQuestion {
+            session_id,
+            auth_id,
+            input,
+            ..
+        } => ServerCall::AskUserQuestion {
+            delivery_id: delivery_id.to_string(),
+            session_id,
+            auth_id,
+            input,
+        },
+        other => other,
+    }
+}
+
 async fn route_waterfall(
     inner: &Arc<AgentServerInner>,
     session_id: &str,
     ctx: ReplyCtx,
     call: ServerCall,
     targets: Vec<AdjudicationTarget>,
+    delivery_id: String,
 ) {
     // (client id, delivery expired, reply outcome): `expired` separates a
-    // delivery that timed out / closed from an explicit client rejection so
-    // the GW9 PlanVerdict convergence can name the cause.
+    // delivery that timed out / closed / was WITHDRAWN (GW3
+    // `CancelDelivery`) from an explicit client rejection so the GW9
+    // PlanVerdict convergence can name the cause.
     let (funnel_tx, mut funnel_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, bool, Result<Value, RpcError>)>();
     let mut waterfall = crate::waterfall::Waterfall::new(session_id.to_string(), {
@@ -1898,16 +2230,43 @@ async fn route_waterfall(
         ids.sort();
         ids
     });
+    // GW3: one cancel token per recipient, registered under the delivery id
+    // for the fan-out window. A `CancelDelivery` from a recipient flips its
+    // token; the waiter below folds that into the funnel as an expired
+    // reply, converging the waterfall fail-closed through the SAME path a
+    // timeout takes (no parallel cancellation semantics).
+    let tokens: HashMap<String, tokio_util::sync::CancellationToken> = targets
+        .iter()
+        .map(|(cid, ..)| (cid.clone(), tokio_util::sync::CancellationToken::new()))
+        .collect();
+    inner
+        .pending_deliveries
+        .lock()
+        .insert(delivery_id.clone(), tokens.clone());
+    let _delivery_guard = DeliveryGuard {
+        inner,
+        delivery_id: delivery_id.clone(),
+    };
     for (cid, conn, rx, id) in targets {
         conn.send_to_client(FromServer::Request {
             id,
             call: call.clone(),
         });
         let tx = funnel_tx.clone();
+        let token = tokens
+            .get(&cid)
+            .expect("every target registered a token")
+            .clone();
         manox_agent::runtime::handle().spawn(async move {
-            let (expired, outcome) = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-                Ok(Ok(o)) => (false, o),
-                _ => (true, Err(RpcError::new(-1, "adjudication reply timed out"))),
+            let (expired, outcome) = tokio::select! {
+                _ = token.cancelled() => (
+                    true,
+                    Err(RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)")),
+                ),
+                replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
+                    Ok(Ok(o)) => (false, o),
+                    _ => (true, Err(RpcError::new(-1, "adjudication reply timed out"))),
+                },
             };
             let _ = tx.send((cid, expired, outcome));
         });
@@ -1945,13 +2304,7 @@ async fn route_waterfall(
         },
     );
     if outcome.is_err() && verdict_failure.is_none() {
-        inner.route_note(
-            session_id,
-            ServerNote::Error {
-                session_id: Some(session_id.into()),
-                message: "adjudication rejected or timed out".into(),
-            },
-        );
+        inner.note_error(session_id, "adjudication rejected or timed out");
     }
     apply_reply(inner, session_id, ctx, outcome, verdict_failure);
 }
@@ -2013,13 +2366,7 @@ fn respond_auth_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, aut
             )
         });
     }
-    inner.route_note(
-        session_id,
-        ServerNote::Error {
-            session_id: Some(session_id.into()),
-            message: "no client can answer this approval".into(),
-        },
-    );
+    inner.note_error(session_id, "no client can answer this approval");
 }
 
 fn apply_approve_reply(
@@ -2091,13 +2438,7 @@ fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth
             )
         });
     }
-    inner.route_note(
-        session_id,
-        ServerNote::Error {
-            session_id: Some(session_id.into()),
-            message: "no client can answer this question".into(),
-        },
-    );
+    inner.note_error(session_id, "no client can answer this question");
 }
 
 fn apply_plan_verdict(
@@ -2187,13 +2528,7 @@ fn converge_plan_rejected(inner: &Arc<AgentServerInner>, session_id: &str, messa
         f.pending_plan = Some(false);
     }));
     // K3: the decision entry lands with the journal work.
-    inner.route_note(
-        session_id,
-        ServerNote::Error {
-            session_id: Some(session_id.into()),
-            message,
-        },
-    );
+    inner.note_error(session_id, &message);
 }
 
 /// Route a capability `ServerCall` (BrowserOp/ClipboardRead/OpenExternal) to the
@@ -2322,7 +2657,6 @@ fn spawn_pump(
     thread: ThreadHandle,
     turn_active: Arc<AtomicBool>,
     pending_submits: Arc<StdMutex<Vec<QueuedSubmit>>>,
-    focused: Arc<StdMutex<Option<String>>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     // Subscribe synchronously so the receiver is registered before any
@@ -2375,8 +2709,12 @@ fn spawn_pump(
                     cancelled, failed, ..
                 } => {
                     turn_active.store(false, Ordering::SeqCst);
-                    let unread = focused.lock().unwrap().as_deref() != Some(session_id.as_str());
                     let id = session_id.clone();
+                    // GW5: no store-side unread mirror write — unread is
+                    // client-owned. (Pre-fix this arm wrote
+                    // `set_unread(id, true)` when the server's single-slot
+                    // `focused` mirror named another session; the slot is
+                    // gone and clients derive unread from the delta below.)
                     manox_agent::thread_store::global().with_mut(|s| {
                         s.mark_idle(&id);
                         s.mark_pending_auth(&id, false);
@@ -2384,17 +2722,17 @@ fn spawn_pump(
                         if !*failed {
                             s.set_errored(&id, false);
                         }
-                        if unread {
-                            s.set_unread(&id, true);
-                        }
                     });
                     inner.broadcast_host(host_status(&session_id, |f| {
                         f.running = Some(false);
                         f.pending_auth = Some(false);
                         f.pending_plan = Some(false);
-                        if unread {
-                            f.unread = Some(true);
-                        }
+                        // GW5: the settle edge ALWAYS raises unread — the
+                        // server cannot know which of N clients is looking
+                        // (the single-slot focus mirror pretended it could,
+                        // and the desktop never even sent FocusThread).
+                        // Clients clear their own badge locally on focus.
+                        f.unread = Some(true);
                     }));
                     if !*cancelled {
                         let drained = pending_submits
@@ -2474,10 +2812,13 @@ fn spawn_pump(
                     // β-3b: initiate PlanVerdict (carries the plan body) and
                     // skip translate's bare PlanReady note — the call is the
                     // actionable review card; the bare note would duplicate.
+                    // GW3: `delivery_id` is stamped at the single routing
+                    // point (`route_call`), never at construction.
                     route_call(
                         &inner,
                         &session_id,
                         ServerCall::PlanVerdict {
+                            delivery_id: String::new(),
                             session_id: session_id.clone(),
                             plan_file: plan_file.clone(),
                             title: title.clone(),
@@ -2623,6 +2964,12 @@ mod tests {
         /// K5 probe: run_with_origin records — (prompt, origin, accepted
         /// entry) — the pin-arming observable.
         origin_runs: StdMutex<Vec<OriginRun>>,
+        /// GW6: when false, `journal_snapshot` answers with a oneshot whose
+        /// sender is dropped without a reply — the seam's "engine not
+        /// materialized" state (`ThreadHandle::journal_snapshot` folds the
+        /// dropped reply to `None`) that the PageHistory cold-disk path must
+        /// survive.
+        journal_available: AtomicBool,
     }
 
     impl FakeEngine {
@@ -2650,9 +2997,17 @@ mod tests {
                     persist_calls: StdMutex::new(Vec::new()),
                     persist_reply: StdMutex::new(None),
                     origin_runs: StdMutex::new(Vec::new()),
+                    journal_available: AtomicBool::new(true),
                 }),
                 events,
             )
+        }
+
+        /// GW6: flip the §C.3 read seam to "engine not materialized" — the
+        /// oneshot's sender drops without answering, exactly like an engine
+        /// actor that never assembled.
+        fn set_journal_unavailable(&self) {
+            self.journal_available.store(false, Ordering::SeqCst);
         }
 
         /// Script the accept-time persistence reply (K5 gateway tests).
@@ -2764,7 +3119,11 @@ mod tests {
             &self,
         ) -> tokio::sync::oneshot::Receiver<manox_agent::engine::JournalSnapshotData> {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let _ = tx.send(self.journal_data.lock().unwrap().clone());
+            if self.journal_available.load(Ordering::SeqCst) {
+                let _ = tx.send(self.journal_data.lock().unwrap().clone());
+            }
+            // GW6 unavailable: `tx` drops without a reply — the seam answers
+            // `Err`, which `ThreadHandle::journal_snapshot` folds to `None`.
             rx
         }
         fn session_list(&self) -> Vec<manox_agent::ThreadSummary> {
@@ -2855,6 +3214,7 @@ mod tests {
                 client_id: "test".into(),
                 capabilities: caps,
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         let resp = client.recv();
@@ -2866,6 +3226,21 @@ mod tests {
                 note: ServerNote::Ready
             }
         ));
+        // GW1/C1 dual emit: the handshake also carries the §D.5 Host mirror
+        // with the accepted protocol epoch — every test through this harness
+        // pins it, and the queue stays clean for the drain loops downstream.
+        let host_ready = client.recv();
+        assert!(
+            matches!(
+                host_ready,
+                FromServer::Host {
+                    host: HostEvent::Ready {
+                        epoch: PROTOCOL_EPOCH
+                    }
+                }
+            ),
+            "expected the Host Ready epoch echo (GW1/C1), got {host_ready:?}"
+        );
         (server, client)
     }
 
@@ -3101,6 +3476,9 @@ mod tests {
                 // A cancelled probe stream's terminal frame is noise.
                 FromServer::StreamEnd { .. } => continue,
                 FromServer::Notification { .. } => continue,
+                // GW1 dual-emit mirrors (Host SessionCreated etc.) are noise
+                // for the stream-shape pins.
+                FromServer::Host { .. } => continue,
                 other => panic!("expected {stream_id} Snapshot, got {other:?}"),
             }
         }
@@ -3125,6 +3503,8 @@ mod tests {
                 FromServer::StreamItem { .. } => continue,
                 FromServer::StreamEnd { .. } => continue,
                 FromServer::Notification { .. } => continue,
+                // GW1 dual-emit mirrors are noise for the P-face pin.
+                FromServer::Host { .. } => continue,
                 other => panic!("expected Projections frame, got {other:?}"),
             }
         }
@@ -3283,6 +3663,7 @@ mod tests {
                 client_id: "gated".into(),
                 capabilities: vec![],
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         assert!(matches!(gated.recv(), FromServer::Response { .. }));
@@ -3305,6 +3686,7 @@ mod tests {
                 client_id: "healthy".into(),
                 capabilities: vec![],
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         assert!(matches!(healthy.recv(), FromServer::Response { .. }));
@@ -3562,13 +3944,12 @@ mod tests {
             &client,
             |m| matches!(m, FromServer::Notification { note: ServerNote::SessionCreated { session_id } } if session_id == "s1"),
         );
-        match client.recv() {
-            FromServer::Response { id, outcome: Ok(v) } => {
-                assert_eq!(id.0, "open");
-                assert_eq!(v["restored"], true);
-            }
-            other => panic!("expected the open ack, got {other:?}"),
-        }
+        // GW1: the Host SessionCreated mirror rides between the note and the
+        // Response — drain to the ack instead of a bare recv.
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(v) } if id.0 == "open" && v["restored"] == true),
+        );
         // The v2 replay: attach the scripted read seam and open the stream.
         let (engine, events) = FakeEngine::new();
         engine.set_journal(
@@ -4382,6 +4763,7 @@ mod tests {
                 client_id: "serde-test".into(),
                 capabilities: vec![HookKind::Approve],
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         assert!(matches!(
@@ -4392,6 +4774,18 @@ mod tests {
             client_sl.recv_timeout(Duration::from_secs(10)),
             FromServer::Notification {
                 note: ServerNote::Ready
+            }
+        ));
+        // GW1/C1: the Host Ready epoch echo is part of the handshake on both
+        // paths — drain it here exactly like `harness()` does for the
+        // in-process path, so the multiset comparison below sees the same
+        // handshake prefix on both.
+        assert!(matches!(
+            client_sl.recv_timeout(Duration::from_secs(10)),
+            FromServer::Host {
+                host: HostEvent::Ready {
+                    epoch: PROTOCOL_EPOCH
+                }
             }
         ));
         let (engine_sl, events_sl) = FakeEngine::new();
@@ -4771,6 +5165,7 @@ mod tests {
                 client_id: "test-b".into(),
                 capabilities: vec![],
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         assert!(matches!(client_b.recv(), FromServer::Response { .. }));
@@ -4922,6 +5317,7 @@ mod tests {
                 client_id: "test".into(),
                 capabilities: vec![],
                 sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         // Must NOT be rejected — must get ack + Ready.
@@ -4939,6 +5335,19 @@ mod tests {
                 }
             ),
             "reconnect must receive Ready: {ready:?}"
+        );
+        // C1/GW1: a re-seat handshake echoes the epoch on the Host lane too.
+        let host_ready = client_reconn.recv();
+        assert!(
+            matches!(
+                host_ready,
+                FromServer::Host {
+                    host: HostEvent::Ready {
+                        epoch: PROTOCOL_EPOCH
+                    }
+                }
+            ),
+            "reconnect must receive the Host Ready epoch echo: {host_ready:?}"
         );
         // Reopen s1 on the new connection: must load the session again —
         // directed ack, and the v2 replay lane (follow stream) answers the
@@ -5297,6 +5706,8 @@ mod tests {
                 // its notes in the dual-protocol window) is skipped; the
                 // FIRST STREAM frame must be the snapshot (§F.1 rule 1).
                 FromServer::Notification { .. } => continue,
+                // GW1 dual-emit Host mirrors are skipped likewise.
+                FromServer::Host { .. } => continue,
                 other => {
                     panic!("first stream frame must be the Snapshot, got {other:?}");
                 }
@@ -5371,6 +5782,8 @@ mod tests {
                     }
                     // Compat-window v1 push may interleave; skip it.
                     FromServer::Notification { .. } => continue,
+                    // GW1 dual-emit Host mirrors may interleave; skip them.
+                    FromServer::Host { .. } => continue,
                     other => panic!("expected Entry frames, got {other:?}"),
                 }
             };
@@ -5504,6 +5917,8 @@ mod tests {
                 // Compat-window v1 notes are drained; any other frame on
                 // an unopened stream would be cross-talk.
                 FromServer::Notification { .. } => continue,
+                // GW1 dual-emit Host mirrors are drained likewise.
+                FromServer::Host { .. } => continue,
                 other => panic!("expected snapshots on both streams, got {other:?}"),
             }
         }
@@ -5513,6 +5928,7 @@ mod tests {
             match client.recv() {
                 FromServer::StreamItem { stream_id, frame } => break (stream_id, frame),
                 FromServer::Notification { .. } => continue,
+                FromServer::Host { .. } => continue,
                 other => panic!("expected a live entry, got {other:?}"),
             }
         };
@@ -6011,6 +6427,7 @@ mod tests {
                 client_id: client_id.into(),
                 capabilities: caps,
                 sessions,
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         let resp = client.recv();
@@ -6027,6 +6444,20 @@ mod tests {
                 }
             ),
             "expected Ready, got {ready:?}"
+        );
+        // GW1/C1 dual emit: drain the Host Ready epoch echo so the queue is
+        // clean for the caller's assertions.
+        let host_ready = client.recv();
+        assert!(
+            matches!(
+                host_ready,
+                FromServer::Host {
+                    host: HostEvent::Ready {
+                        epoch: PROTOCOL_EPOCH
+                    }
+                }
+            ),
+            "expected the Host Ready epoch echo (GW1/C1), got {host_ready:?}"
         );
         client
     }
@@ -6938,6 +7369,1064 @@ mod tests {
         );
         assert!(engine.origin_runs.lock().unwrap().is_empty());
         drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    // ── K.7 remediation wave: C1 / GW1 / GW3 / GW5 / GW6 regressions. ─────
+
+    /// Seed a dense two-entry v4 chain (two user messages) under the hermetic
+    /// sessions dir — the on-disk shape the GW6 cold reads answer from.
+    /// Returns the file path (callers remove it in teardown, GW11 hygiene).
+    fn seed_v4_chain(dir: &std::path::Path, id: &str) -> PathBuf {
+        let cwd = dir.parent().unwrap().to_string_lossy().into_owned();
+        let path = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"type":"session","version":4,"id":"{id}","timestamp":"2026-05-28T07:13:46.608Z","cwd":"{cwd}"}}
+{{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"one"}}],"timestamp":1779952440000}}}}
+{{"type":"message","id":"m2","parentId":"m1","seq":1,"timestamp":"2026-05-28T07:14:10.000Z","message":{{"role":"user","content":[{{"type":"text","text":"two"}}],"timestamp":1779952450000}}}}
+"#
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// C1 regression: a handshake declaring a protocol epoch the server does
+    /// not speak must be refused with the stable `protocol/unsupported-epoch`
+    /// code (§D.7) — pre-fix the server accepted ANY `Initialize` (the epoch
+    /// field did not exist), so future frame generations could not be
+    /// distinguished (L12). The frame rides raw JSON: a pre-epoch server
+    /// parses it by ignoring the unknown field, which is exactly the defect.
+    #[test]
+    fn handshake_rejects_unknown_protocol_epoch() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let (client_conn, server_conn) = serde_pair();
+        server.accept(Arc::new(server_conn));
+        let client = SerdeClient { conn: client_conn };
+        let init: FromClient = serde_json::from_value(json!({
+            "kind": "request",
+            "id": "init-epoch",
+            "call": {
+                "method": "initialize",
+                "clientId": "epoch-probe",
+                "capabilities": [],
+                "sessions": [],
+                "protocolEpoch": 7,
+            }
+        }))
+        .expect("the epoch-bearing Initialize frame parses");
+        client.send(init);
+        match client.recv_timeout(Duration::from_secs(10)) {
+            FromServer::Response {
+                id,
+                outcome: Err(e),
+            } if id.0 == "init-epoch" => {
+                assert_eq!(
+                    e.data
+                        .as_ref()
+                        .expect("C1: the epoch rejection carries data.code")["code"],
+                    "protocol/unsupported-epoch"
+                );
+                assert!(
+                    e.message.contains('7'),
+                    "the rejection names the offending epoch: {}",
+                    e.message
+                );
+            }
+            other => panic!("expected a coded epoch rejection, got {other:?}"),
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// C1 compat pin: a v1 client whose `Initialize` carries no
+    /// `protocolEpoch` at all (the serde-default-0 generation) is still
+    /// accepted — the epoch gate must not sever the dual-protocol window.
+    #[test]
+    fn handshake_accepts_v1_client_without_protocol_epoch() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let (client_conn, server_conn) = serde_pair();
+        server.accept(Arc::new(server_conn));
+        let client = SerdeClient { conn: client_conn };
+        let init: FromClient = serde_json::from_value(json!({
+            "kind": "request",
+            "id": "init-v1",
+            "call": {
+                "method": "initialize",
+                "clientId": "v1-probe",
+                "capabilities": [],
+                "sessions": [],
+            }
+        }))
+        .expect("the v1 Initialize frame parses");
+        client.send(init);
+        match client.recv_timeout(Duration::from_secs(10)) {
+            FromServer::Response { id, outcome: Ok(_) } if id.0 == "init-v1" => {}
+            other => panic!("a v1 handshake (no protocolEpoch) must be accepted, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                client.recv_timeout(Duration::from_secs(10)),
+                FromServer::Notification {
+                    note: ServerNote::Ready
+                }
+            ),
+            "the v1 handshake still yields the Ready note"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// C1+GW1 regression: the handshake dual-emits — the v1
+    /// `ServerNote::Ready` is followed by the §D.5 `HostEvent::Ready` echo
+    /// carrying the server's protocol epoch. Pre-fix no Host frame ever
+    /// arrived (the third `recv` below timed out).
+    #[test]
+    fn handshake_ready_double_emits_host_epoch_echo() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let (client_conn, server_conn) = in_process_pair();
+        server.accept(Arc::new(server_conn));
+        let client = Client { conn: client_conn };
+        client.send(FromClient::Request {
+            id: MsgId::new("init-echo"),
+            call: ClientCall::Initialize(Initialize {
+                client_id: "echo-probe".into(),
+                capabilities: vec![],
+                sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
+            }),
+        });
+        assert!(matches!(client.recv(), FromServer::Response { .. }));
+        assert!(matches!(
+            client.recv(),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+        // The §D.5 Host mirror with the accepted epoch (C1: `Ready{epoch}`
+        // echoes PROTOCOL_EPOCH = 1; pre-fix this recv timed out).
+        match client.recv() {
+            FromServer::Host {
+                host: HostEvent::Ready { epoch },
+            } => assert_eq!(epoch, 1, "the Ready host event echoes the epoch"),
+            other => panic!("expected the Host Ready epoch echo (C1/GW1), got {other:?}"),
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW1 regression: the list-push channel dual-emits — each of
+    /// Models/ThreadsUpdated/Commands arrives BOTH as the v1 note and as its
+    /// §D.5 `HostEvent` mirror on the requesting connection (the C4
+    /// close-out retires the note arm; until then clients fold both).
+    /// Pre-fix no Host mirror was ever produced (`saw_host` stayed false).
+    #[test]
+    fn list_pushes_double_emit_host_frames() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+
+        client.send(FromClient::Request {
+            id: MsgId::new("lm"),
+            call: ClientCall::ListModels,
+        });
+        let (mut saw_note, mut saw_host) = (false, false);
+        loop {
+            match client.recv() {
+                FromServer::Response { id, .. } if id.0 == "lm" => break,
+                FromServer::Notification {
+                    note: ServerNote::Models { .. },
+                } => saw_note = true,
+                FromServer::Host {
+                    host: HostEvent::Models { .. },
+                } => saw_host = true,
+                _ => {}
+            }
+        }
+        assert!(saw_note, "the v1 Models note still emits (dual window)");
+        assert!(saw_host, "GW1: ListModels must dual-emit HostEvent::Models");
+
+        client.send(FromClient::Request {
+            id: MsgId::new("lt"),
+            call: ClientCall::ListThreads,
+        });
+        let (mut saw_note, mut saw_host) = (false, false);
+        loop {
+            match client.recv() {
+                FromServer::Response { id, .. } if id.0 == "lt" => break,
+                FromServer::Notification {
+                    note: ServerNote::ThreadsUpdated { .. },
+                } => saw_note = true,
+                FromServer::Host {
+                    host: HostEvent::ThreadsUpdated { .. },
+                } => saw_host = true,
+                _ => {}
+            }
+        }
+        assert!(saw_note, "the v1 ThreadsUpdated note still emits");
+        assert!(
+            saw_host,
+            "GW1: ListThreads must dual-emit HostEvent::ThreadsUpdated"
+        );
+
+        client.send(FromClient::Request {
+            id: MsgId::new("lc"),
+            call: ClientCall::ListCommands,
+        });
+        let (mut saw_note, mut saw_host) = (false, false);
+        loop {
+            match client.recv() {
+                FromServer::Response { id, .. } if id.0 == "lc" => break,
+                FromServer::Notification {
+                    note: ServerNote::Commands { .. },
+                } => saw_note = true,
+                FromServer::Host {
+                    host: HostEvent::Commands { .. },
+                } => saw_host = true,
+                _ => {}
+            }
+        }
+        assert!(saw_note, "the v1 Commands note still emits");
+        assert!(
+            saw_host,
+            "GW1: ListCommands must dual-emit HostEvent::Commands"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW1 regression: `SessionCreated` dual-emits DIRECTED — the Host mirror
+    /// reaches the owner connection (with the session header, §D.5) and never
+    /// a non-owner (it is owner-set control, not a broadcast; pre-fix the
+    /// owner's `expect` below timed out).
+    #[test]
+    fn session_created_double_emits_directed_host_frame() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let owner = connect_sessions(&server, "gw1-owner", vec![], vec![]);
+        let bystander = connect_sessions(&server, "gw1-bystander", vec![], vec![]);
+
+        create(&server, &owner, "gw1-s1");
+        // create() drained the v1 note; the Host mirror follows it on the
+        // same connection, carrying the header (§D.5 SessionCreated).
+        expect(&owner, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionCreated { session_id, header }
+                } if session_id == "gw1-s1" && header.id == "gw1-s1"
+            )
+        });
+        // Directed, not broadcast: the bystander's settle window stays free
+        // of the owner's SessionCreated mirror.
+        let settle = std::time::Instant::now() + Duration::from_millis(300);
+        while std::time::Instant::now() < settle {
+            if let Ok(m) = bystander.conn.server_rx().try_recv() {
+                assert!(
+                    !matches!(
+                        m,
+                        FromServer::Host {
+                            host: HostEvent::SessionCreated { .. }
+                        }
+                    ),
+                    "GW1: SessionCreated is owner-directed, never broadcast: {m:?}"
+                );
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        drop(owner);
+        drop(bystander);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW1 regression: `SessionDisposed` dual-emits on both directed paths —
+    /// dispose (requester only, §D.5) and detach (the detaching client).
+    /// Pre-fix the Host mirror `expect`s timed out.
+    #[test]
+    fn session_disposed_and_detached_double_emit_host_frames() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+
+        create(&server, &client, "gw1-d1");
+        client.send(FromClient::Notification {
+            note: ClientNote::DisposeSession {
+                session_id: "gw1-d1".into(),
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::SessionDisposed { session_id }
+                } if session_id == "gw1-d1"
+            )
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionDisposed { session_id }
+                } if session_id == "gw1-d1"
+            )
+        });
+
+        create(&server, &client, "gw1-d2");
+        client.send(FromClient::Notification {
+            note: ClientNote::DetachSession {
+                session_id: "gw1-d2".into(),
+            },
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::SessionDisposed { session_id }
+                } if session_id == "gw1-d2"
+            )
+        });
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionDisposed { session_id }
+                } if session_id == "gw1-d2"
+            )
+        });
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW1 regression: a session-scoped `Error` note dual-emits its §D.5
+    /// `HostEvent::Error` mirror to the same owner audience, same message
+    /// (pre-fix the Host mirror `expect` timed out).
+    #[test]
+    fn error_notes_double_emit_host_error() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "gw1-e1");
+        // An unresolvable SetModel target routes `note_error` to the owners.
+        client.send(FromClient::Notification {
+            note: ClientNote::SetModel {
+                session_id: "gw1-e1".into(),
+                id: "definitely-not-a-model".into(),
+            },
+        });
+        let mut note_message: Option<String> = None;
+        let mut host_message: Option<String> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while note_message.is_none() || host_message.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GW1: the Error dual emit never completed (note={note_message:?} host={host_message:?})"
+            );
+            match client.recv() {
+                FromServer::Notification {
+                    note:
+                        ServerNote::Error {
+                            session_id: Some(sid),
+                            message,
+                        },
+                } if sid == "gw1-e1" => note_message = Some(message),
+                FromServer::Host {
+                    host: HostEvent::Error { message },
+                } => host_message = Some(message),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            note_message, host_message,
+            "GW1: the Host Error mirror carries the note's message"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW5 regression: unread is client-owned — the settle edge ALWAYS raises
+    /// `unread:true`, even when a client just reported focus on the session.
+    /// Pre-fix the server's single-slot `focused` mirror suppressed the delta
+    /// (and the desktop, which never sends FocusThread, lit unread for the
+    /// session the user was watching; multi-client focus was inexpressible).
+    #[test]
+    fn turn_settle_raises_unread_even_after_focus_report() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "gw5-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw5-s1", engine.clone(), events);
+        // The client reports focus; GW5 makes the server handler a no-op.
+        client.send(FromClient::Notification {
+            note: ClientNote::FocusThread {
+                session_id: Some("gw5-s1".into()),
+            },
+        });
+        client.settle();
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "gw5-s1".into(),
+                text: "hi".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect_host_status(&client, "gw5-s1", |running, _, _, _| running == Some(true));
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        // The settle edge carries unread:true REGARDLESS of the focus report
+        // (pre-fix: the focused mirror suppressed this delta and the expect
+        // timed out).
+        expect(&client, |m| {
+            matches!(
+                m,
+                FromServer::Host {
+                    host: HostEvent::SessionStatus {
+                        session_id,
+                        running: Some(false),
+                        unread: Some(true),
+                        ..
+                    }
+                } if session_id == "gw5-s1"
+            )
+        });
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW5 regression: the server keeps NO unread mirror — `FocusThread` is a
+    /// no-op (a legacy store-side mirror write survives it; pre-fix the
+    /// handler cleared it) and the §D.2 list response reports `unread:false`
+    /// regardless of the store (field deprecated, C4 removes it; pre-fix the
+    /// row carried the mirror value `true`).
+    #[test]
+    fn list_threads_unread_is_always_false_and_focus_is_noop() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // A cold thread the init scan indexes (the list row's source).
+        seed_session_file(&sessions, "gw5-s2", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        // Wait for the asynchronous scan to land the summary row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if manox_agent::thread_store::global()
+                .read(|s| s.summaries().iter().any(|t| t.id == "gw5-s2"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the init scan never indexed the seeded thread"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Simulate a legacy mirror write (the desktop's own store writes
+        // during the transition window).
+        manox_agent::thread_store::global().with_mut(|s| s.set_unread("gw5-s2", true));
+
+        // FocusThread is a server-side no-op now (GW5): the mirror survives.
+        client.send(FromClient::Notification {
+            note: ClientNote::FocusThread {
+                session_id: Some("gw5-s2".into()),
+            },
+        });
+        client.settle();
+        assert!(
+            manox_agent::thread_store::global().read(|s| s
+                .summaries()
+                .iter()
+                .any(|t| t.id == "gw5-s2" && t.has_unread)),
+            "GW5: FocusThread must no longer clear a store-side unread mirror (handler is a no-op)"
+        );
+
+        // The list response never carries the mirror (deprecated field,
+        // always false until C4 removes it).
+        let v = response_outcome(request(&client, "gw5-lt", ClientCall::ListThreads));
+        let row = v
+            .as_array()
+            .expect("ListThreads answers an array")
+            .iter()
+            .find(|r| r["id"] == "gw5-s2")
+            .expect("the seeded thread has a list row");
+        assert_eq!(
+            row["unread"],
+            json!(false),
+            "GW5: list responses carry no server unread mirror (deprecated, C4 removes the field)"
+        );
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("gw5-s2.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW6 regression: PageHistory on an OPENED session whose engine seam
+    /// answers "not materialized" must cold-read the persisted jsonl (§D.2
+    /// "冷读不激活 engine，jsonl 直读") — pre-fix it answered
+    /// `gateway/internal: journal engine is not materialized`.
+    #[test]
+    fn page_history_cold_reads_disk_for_opened_session_without_engine() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = seed_v4_chain(&sessions, "gw6-cold-1");
+        init_globals();
+        manox_agent::thread_store::init();
+        // Deterministic identity seed (the async init scan may not have
+        // landed yet): the open must find the path map entry.
+        manox_agent::thread_store::global().with_mut(|s| s.note_session_path("gw6-cold-1", &path));
+        let (server, client) = harness(vec![]);
+        // Open the cold session (restores from disk).
+        client.send(FromClient::Request {
+            id: MsgId::new("gw6-open"),
+            call: ClientCall::OpenSession {
+                session_id: "gw6-cold-1".into(),
+            },
+        });
+        expect(
+            &client,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "gw6-open"),
+        );
+        // Replace the engine with the unavailable-seam fake: the live read
+        // answers None, so the page must come from the disk journal.
+        let (engine, events) = FakeEngine::new();
+        engine.set_journal_unavailable();
+        server.set_session_engine_for_test("gw6-cold-1", engine, events);
+
+        let v = response_outcome(request(
+            &client,
+            "gw6-ph",
+            ClientCall::PageHistory {
+                session_id: "gw6-cold-1".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+        ));
+        assert_eq!(v["cursor"], 1, "the cold chain's tail seq is the cursor");
+        let records = v["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2, "both persisted entries cold-read");
+        assert_eq!(records[0]["seq"], 0);
+        assert_eq!(records[0]["type"], "message");
+        assert_eq!(records[1]["seq"], 1);
+        assert_eq!(v["has_more"], false);
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(&path);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW6 regression: PageHistory answers for a session NEVER opened on this
+    /// server — the cold path reads the persisted journal without activating
+    /// anything (§D.2). Pre-fix: `session/not-found` for any id outside the
+    /// live sessions table.
+    #[test]
+    fn page_history_reads_disk_without_live_session() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = seed_v4_chain(&sessions, "gw6-cold-2");
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        // No open/create: the session exists only on disk.
+        let v = response_outcome(request(
+            &client,
+            "gw6-ph2",
+            ClientCall::PageHistory {
+                session_id: "gw6-cold-2".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: Some(1),
+            },
+        ));
+        let records = v["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 1, "max_messages caps the cold page");
+        assert_eq!(records[0]["seq"], 1, "the page keeps the tail entry");
+        assert_eq!(v["cursor"], 1);
+        assert_eq!(v["has_more"], true, "seq 0 predates the window");
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(&path);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW6 pin: a truly unknown id (no live session, no persisted file) still
+    /// answers `session/not-found` — the cold read must not mask discovery
+    /// errors with an empty page.
+    #[test]
+    fn page_history_unknown_session_still_answers_not_found() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        match request(
+            &client,
+            "gw6-ph3",
+            ClientCall::PageHistory {
+                session_id: "gw6-does-not-exist".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+        ) {
+            FromServer::Response {
+                outcome: Err(e), ..
+            } => {
+                assert_eq!(
+                    e.data.as_ref().expect("coded error")["code"],
+                    manox_protocol::msg::CODE_SESSION_NOT_FOUND
+                );
+            }
+            other => panic!("expected session/not-found, got {other:?}"),
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW6 resume singleflight: concurrent compat CreateSession notes and an
+    /// OpenSession request racing the SAME cold id converge on exactly one
+    /// sessions entry and one pump — the argument: the cold-file probe
+    /// delegates to `open_session`, whose check-load-insert is one `sessions`
+    /// lock hold (GW2), so every racer serializes through it; the first
+    /// loads and inserts, the rest take the idempotent re-own branch. (The
+    /// fresh-mint path is covered by `insert_session`'s replace-and-stop
+    /// semantics.) This test pins the argument.
+    #[test]
+    fn concurrent_create_and_open_same_cold_id_singleflight() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // GW11 hygiene: unique id, seed removed in teardown.
+        seed_session_file(&sessions, "gw6-race", "/proj");
+        init_globals();
+        manox_agent::thread_store::init();
+        // Deterministic identity seed: every racer's load must find the path
+        // map entry regardless of the async scan's timing.
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.note_session_path("gw6-race", &sessions.join("gw6-race.jsonl")));
+        let server = AgentServer::new(PathBuf::from("/"));
+        let a = connect_sessions(&server, "sf-a", vec![], vec![]);
+        let b = connect_sessions(&server, "sf-b", vec![], vec![]);
+        let c = connect_sessions(&server, "sf-c", vec![], vec![]);
+
+        // Fire all three materializations back-to-back: two compat creates
+        // (fire-and-forget) and one open request.
+        a.send(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: "gw6-race".into(),
+                cwd: Some("/proj".into()),
+            },
+        });
+        b.send(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: "gw6-race".into(),
+                cwd: Some("/proj".into()),
+            },
+        });
+        c.send(FromClient::Request {
+            id: MsgId::new("sf-open"),
+            call: ClientCall::OpenSession {
+                session_id: "gw6-race".into(),
+            },
+        });
+        expect(
+            &c,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "sf-open"),
+        );
+
+        // Every racer converges on the SAME entry: one table row, one pump,
+        // all three owners.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut owners = server.0.owners("gw6-race");
+            owners.sort();
+            if owners == vec!["sf-a".to_string(), "sf-b".to_string(), "sf-c".to_string()] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the racers never converged on one owner set: {owners:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            server.0.sessions.lock().len(),
+            1,
+            "GW6 singleflight: exactly one sessions entry for the raced id"
+        );
+        expect_live_pumps(&server, 1, "GW6 singleflight: exactly one pump");
+        drop(a);
+        drop(b);
+        drop(c);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("gw6-race.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW3 regression: every adjudication delivery carries a stable
+    /// `deliveryId` on the wire (§D.4) — the handle a `cancelDelivery` call
+    /// references. Inspected through the wire JSON so the pin compiles
+    /// against the pre-GW3 enum (which lacked the field — the assertion
+    /// below is the red evidence). Also pins uniqueness across deliveries of
+    /// one session.
+    #[test]
+    fn adjudication_requests_carry_stable_delivery_id() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![
+            HookKind::Approve,
+            HookKind::AskUserQuestion,
+            HookKind::PlanVerdict,
+        ]);
+        create(&server, &client, "gw3-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw3-s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "gw3-s1".into(),
+                text: "do work".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect_host_status(&client, "gw3-s1", |running, _, _, _| running == Some(true));
+
+        // One ToolCallAuthorization → Approve with a non-empty deliveryId.
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "g3-a1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "run ls".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        let (approve_id, approve_dlv) = loop {
+            match client.recv() {
+                FromServer::Request { id, call } if matches!(&call, ServerCall::Approve { auth_id, .. } if auth_id == "g3-a1") =>
+                {
+                    let wire = serde_json::to_value(&call).unwrap();
+                    break (id, wire["deliveryId"].as_str().unwrap_or("").to_string());
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            !approve_dlv.is_empty(),
+            "GW3: the Approve delivery must carry a stable deliveryId"
+        );
+        assert!(
+            approve_dlv.contains("gw3-s1"),
+            "GW3: the deliveryId names its session ({approve_dlv})"
+        );
+        client.send(FromClient::Reply {
+            id: approve_id,
+            outcome: Ok(json!({"allow": true})),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if engine
+                .auth_responses
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| id == "g3-a1")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Approve reply never settled"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A second adjudication (AskUser) gets a DIFFERENT deliveryId.
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "g3-q1".into(),
+                    tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                    summary: "pick".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        let (ask_id, ask_dlv) = loop {
+            match client.recv() {
+                FromServer::Request { id, call } if matches!(&call, ServerCall::AskUserQuestion { auth_id, .. } if auth_id == "g3-q1") =>
+                {
+                    let wire = serde_json::to_value(&call).unwrap();
+                    break (id, wire["deliveryId"].as_str().unwrap_or("").to_string());
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            !ask_dlv.is_empty() && ask_dlv != approve_dlv,
+            "GW3: each delivery mints its own stable id ({approve_dlv} vs {ask_dlv})"
+        );
+        client.send(FromClient::Reply {
+            id: ask_id,
+            outcome: Ok(json!({"answers": [], "response": null})),
+        });
+
+        // PlanVerdict, the third waterfall arm, carries one too.
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "gw3-s1".into(),
+                enabled: true,
+            },
+        });
+        client.settle();
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: "/nonexistent/gw3-plan.md".into(),
+                title: "GW3 plan".into(),
+            })))
+            .unwrap();
+        let (verdict_id, verdict_dlv) = loop {
+            match client.recv() {
+                FromServer::Request { id, call }
+                    if matches!(&call, ServerCall::PlanVerdict { .. }) =>
+                {
+                    let wire = serde_json::to_value(&call).unwrap();
+                    break (id, wire["deliveryId"].as_str().unwrap_or("").to_string());
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            !verdict_dlv.is_empty() && verdict_dlv != approve_dlv && verdict_dlv != ask_dlv,
+            "GW3: PlanVerdict carries its own deliveryId ({verdict_dlv})"
+        );
+        // Refine: consumes the pending review without executing (keeps the
+        // session clean for teardown).
+        client.send(FromClient::Reply {
+            id: verdict_id,
+            outcome: Ok(json!({"choice": "refine"})),
+        });
+        client.settle();
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// GW3 regression: a client withdraws its pending adjudication delivery —
+    /// `cancelDelivery` (raw wire JSON below: the pre-GW3 vocabulary cannot
+    /// even express the call, its parse failure is red evidence) settles the
+    /// waterfall fail-closed through the EXISTING expire/converge path: the
+    /// engine receives Deny, the owners an Error note, and the receipt
+    /// reports the withdrawal. A second cancel after settlement reports
+    /// `cancelled:false`.
+    #[test]
+    fn cancel_delivery_converges_pending_adjudication() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let a = connect_sessions(&server, "gw3-a", vec![HookKind::Approve], vec![]);
+        let b = connect_sessions(&server, "gw3-b", vec![HookKind::Approve], vec![]);
+        create(&server, &a, "gw3-s2");
+        // b joins the owner set (the §D.4 fan-out audience).
+        b.send(FromClient::Request {
+            id: MsgId::new("gw3-open-b"),
+            call: ClientCall::OpenSession {
+                session_id: "gw3-s2".into(),
+            },
+        });
+        expect(
+            &b,
+            |m| matches!(m, FromServer::Response { id, outcome: Ok(_), .. } if id.0 == "gw3-open-b"),
+        );
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw3-s2", engine.clone(), events);
+        a.send(FromClient::Notification {
+            note: ClientNote::Submit {
+                session_id: "gw3-s2".into(),
+                text: "do work".into(),
+                images: vec![],
+                client_id: None,
+            },
+        });
+        expect_host_status(&a, "gw3-s2", |running, _, _, _| running == Some(true));
+        expect_host_status(&b, "gw3-s2", |running, _, _, _| running == Some(true));
+
+        // One authorization fans out to BOTH owners (§D.4).
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(
+                ThreadEvent::ToolCallAuthorization {
+                    id: "g3c-a1".into(),
+                    tool_name: "Bash".into(),
+                    summary: "run ls".into(),
+                    input: json!({}),
+                },
+            )))
+            .unwrap();
+        let dlv = loop {
+            match a.recv() {
+                FromServer::Request { call, .. } if matches!(&call, ServerCall::Approve { auth_id, .. } if auth_id == "g3c-a1") =>
+                {
+                    break serde_json::to_value(&call).unwrap()["deliveryId"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                }
+                _ => {}
+            }
+        };
+        assert!(!dlv.is_empty(), "GW3: the delivery carries its id");
+        expect(&b, |m| {
+            matches!(
+                m,
+                FromServer::Request {
+                    call: ServerCall::Approve { auth_id, .. },
+                    ..
+                } if auth_id == "g3c-a1"
+            )
+        });
+
+        // a withdraws its delivery (e.g. it navigated away from the
+        // session). Raw wire JSON: the pre-GW3 vocabulary cannot express
+        // this call (unknown method — the parse panic is the red evidence).
+        let cancel: FromClient = serde_json::from_value(json!({
+            "kind": "request",
+            "id": "gw3-cancel-1",
+            "call": { "method": "cancelDelivery", "deliveryId": dlv },
+        }))
+        .expect("GW3: the wire vocabulary expresses delivery cancellation");
+        a.send(cancel);
+        // The receipt races the convergence's Error note (dispatch task vs
+        // pump task): drain to the Response.
+        let receipt = loop {
+            match a.recv() {
+                FromServer::Response { id, outcome } if id.0 == "gw3-cancel-1" => break outcome,
+                _ => {}
+            }
+        };
+        match receipt {
+            Ok(v) => assert_eq!(v["cancelled"], json!(true), "the withdrawal is receipted"),
+            Err(e) => panic!("expected the cancel receipt, got err {e:?}"),
+        }
+
+        // The waterfall converged fail-closed through the expire path: the
+        // engine receives Deny for the authorization.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let denied = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+                id == "g3c-a1"
+                    && matches!(
+                        r,
+                        manox_agent::permission::ToolAuthorizationResponse::Decision(
+                            manox_agent::permission::PermissionDecision::Deny
+                        )
+                    )
+            });
+            if denied {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "GW3: the cancelled delivery never converged to a fail-closed Deny"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The owners see the rejection's Error mirror.
+        expect(&b, |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::Error { session_id: Some(sid), .. }
+                } if sid == "gw3-s2"
+            )
+        });
+        // After settlement the delivery is unregistered: b's late cancel
+        // reports nothing to withdraw (a receipt, never an error).
+        let cancel_b: FromClient = serde_json::from_value(json!({
+            "kind": "request",
+            "id": "gw3-cancel-2",
+            "call": { "method": "cancelDelivery", "deliveryId": dlv },
+        }))
+        .expect("GW3: the wire vocabulary expresses delivery cancellation");
+        b.send(cancel_b);
+        let receipt_b = loop {
+            match b.recv() {
+                FromServer::Response { id, outcome } if id.0 == "gw3-cancel-2" => break outcome,
+                _ => {}
+            }
+        };
+        match receipt_b {
+            Ok(v) => assert_eq!(
+                v["cancelled"],
+                json!(false),
+                "a settled delivery has nothing to withdraw"
+            ),
+            Err(e) => panic!("expected the late-cancel receipt, got err {e:?}"),
+        }
+        drop(a);
+        drop(b);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
     }

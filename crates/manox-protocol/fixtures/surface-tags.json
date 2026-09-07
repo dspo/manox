@@ -15,7 +15,8 @@
     "submit",
     "steer",
     "pageHistory",
-    "getConversationInfo"
+    "getConversationInfo",
+    "cancelDelivery"
   ],
   "clientNotes": [
     "createSession",

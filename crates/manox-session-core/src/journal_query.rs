@@ -48,16 +48,17 @@ impl ConversationInfoCache {
 /// cursor). Kernel rows with no §C.2 wire vocabulary (`ActiveToolsChange`,
 /// `Custom`, `CustomMessage`) are skipped and do not open gaps (§F.1 rule 2
 /// tolerates unclaimed seqs).
-pub async fn page_history(
-    thread: &ThreadHandle,
+///
+/// GW6: the caller resolves the chain read — the live engine seam when it is
+/// materialized, [`cold_snapshot`] (persisted-jsonl direct read, §D.2 "冷读
+/// 不激活 engine") otherwise — and hands the resulting snapshot in; the page
+/// fold itself never touches the engine.
+pub fn page_history(
+    snapshot: manox_agent::engine::JournalSnapshotData,
     through_seq: i64,
     before_seq: Option<i64>,
     max_messages: Option<u32>,
 ) -> Result<Value, manox_protocol::RpcError> {
-    let snapshot = thread.journal_snapshot().await.ok_or_else(|| {
-        manox_protocol::RpcError::new(-1, "journal engine is not materialized")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
-    })?;
     // Inclusive upper bound of the requested window.
     let through = if through_seq < 0 {
         snapshot.cursor
@@ -92,6 +93,28 @@ pub async fn page_history(
         "has_more": has_more,
         "cursor": cursor,
     }))
+}
+
+/// GW6 (§D.2 cold read): the whole active chain straight off the persisted
+/// journal file, through the harness's public read face —
+/// `JsonlSessionStorage::open` (a pure read: header validation + chain
+/// indexing, never a write) and `journal_cursor`/`journal_range` (the same
+/// §C.3 read seam the engine actor answers from). `None` when the session
+/// has no persisted file (or it is unreadable — a corrupt journal is the
+/// caller's `session/not-found`-class answer, never a silent empty page).
+///
+/// Cross-domain note: the harness read face is whole-chain (`journal_range`
+/// from seq 0); a bounded seq-range disk read would avoid loading long
+/// chains for tail pages — requested from the harness owners in the
+/// delivery report.
+pub async fn cold_snapshot(session_id: &str) -> Option<manox_agent::engine::JournalSnapshotData> {
+    let path = crate::agent_server::persisted_session_file(session_id)?;
+    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&path)
+        .await
+        .ok()?;
+    let records = storage.journal_range(0, u64::MAX).await.ok()?;
+    let cursor = storage.journal_cursor().await;
+    Some(manox_agent::engine::JournalSnapshotData { cursor, records })
 }
 
 /// `ClientCall::GetConversationInfo` (§E.3, Q face): the server-side fold of

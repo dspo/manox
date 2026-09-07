@@ -40,14 +40,19 @@ pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Tra
             // AskUserQuestion's authorization is an interactive question, not a
             // bare allow/deny: route it as its own ServerCall kind so the
             // client renders the ask card and returns structured answers.
+            // GW3: `delivery_id` stays empty here — translate is a pure
+            // projection; the gateway's single routing point (`route_call`)
+            // stamps the delivery identity before the frame hits the wire.
             if tool_name == manox_agent::tools::ASK_USER_QUESTION {
                 Call(ServerCall::AskUserQuestion {
+                    delivery_id: String::new(),
                     session_id: session_id.into(),
                     auth_id: id.clone(),
                     input: input.clone(),
                 })
             } else {
                 Call(ServerCall::Approve {
+                    delivery_id: String::new(),
                     session_id: session_id.into(),
                     auth_id: id.clone(),
                     tool_name: tool_name.clone(),

@@ -198,8 +198,11 @@ pub enum HostEvent {
     ThreadsUpdated { threads: Vec<ThreadListItem> },
     /// Per-session status mirror — the small high-frequency delta replacing
     /// the doomed turn-lifecycle notes. Broadcast to *all* connections; the
-    /// client applies the monotonic mirror rules of §D.5 (unread only
-    /// increases until focus, errored is an edge flag, running is latest).
+    /// client applies the monotonic mirror rules of §D.5 (errored is an edge
+    /// flag, running is latest). GW5: `unread` is client-owned — the server
+    /// raises `unread:true` at EVERY turn settle and never lowers it (it
+    /// keeps no focus mirror; clearing on focus happens client-side), so a
+    /// client watching the session clears its own badge locally.
     SessionStatus {
         session_id: String,
         running: Option<bool>,

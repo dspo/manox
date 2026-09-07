@@ -73,6 +73,7 @@ pub const RPC_ERROR_CODES: &[&str] = &[
     "resync-required",
     "model/unresolvable",
     "feature/unavailable",
+    "protocol/unsupported-epoch",
 ];
 
 /// `session/not-found` (§D.7).
@@ -95,6 +96,12 @@ pub const CODE_MODEL_UNRESOLVABLE: &str = "model/unresolvable";
 /// dead faces (GW7's terminal stubs), so a client can distinguish "not
 /// built" from a generic failure instead of losing the request silently.
 pub const CODE_FEATURE_UNAVAILABLE: &str = "feature/unavailable";
+/// `protocol/unsupported-epoch` (§D.7, C1): the handshake declared a
+/// [`protocol_epoch`](crate::handshake::Initialize) generation this server
+/// cannot interpret. The connection is refused at the handshake (no Ready),
+/// so a future client can distinguish "server speaks another epoch" from a
+/// generic failure and downgrade or prompt an upgrade.
+pub const CODE_PROTOCOL_UNSUPPORTED_EPOCH: &str = "protocol/unsupported-epoch";
 
 impl RpcError {
     /// Builder: tag this error with a §D.7 stable code (stored in
@@ -249,6 +256,7 @@ mod tests {
                     client_id: "test".into(),
                     capabilities: vec![crate::handshake::HookKind::Approve],
                     sessions: vec![],
+                    protocol_epoch: crate::handshake::PROTOCOL_EPOCH,
                 }),
             },
             FromClient::Request {
@@ -339,6 +347,12 @@ mod tests {
             FromClient::StreamCancel {
                 stream_id: crate::journal::StreamId::new("stream-1"),
             },
+            FromClient::Request {
+                id: MsgId::new("r-4"),
+                call: crate::client::ClientCall::CancelDelivery {
+                    delivery_id: "dlv-s1-1".into(),
+                },
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();
@@ -361,6 +375,7 @@ mod tests {
             FromServer::Request {
                 id: MsgId::new("adj-1"),
                 call: crate::server::ServerCall::Approve {
+                    delivery_id: "dlv-s1-1".into(),
                     session_id: "s1".into(),
                     auth_id: "auth-1".into(),
                     tool_name: "Bash".into(),
@@ -371,6 +386,7 @@ mod tests {
             FromServer::Request {
                 id: MsgId::new("adj-2"),
                 call: crate::server::ServerCall::AskUserQuestion {
+                    delivery_id: "dlv-s1-2".into(),
                     session_id: "s1".into(),
                     auth_id: "auth-2".into(),
 
@@ -380,6 +396,7 @@ mod tests {
             FromServer::Request {
                 id: MsgId::new("adj-3"),
                 call: crate::server::ServerCall::PlanVerdict {
+                    delivery_id: "dlv-s1-3".into(),
                     session_id: "s1".into(),
                     plan_file: "/plan.md".into(),
                     title: "Plan".into(),
@@ -516,5 +533,25 @@ mod tests {
         assert!(RPC_ERROR_CODES.contains(&"resync-required"));
         assert!(RPC_ERROR_CODES.contains(&CODE_MODEL_UNRESOLVABLE));
         assert!(RPC_ERROR_CODES.contains(&CODE_FEATURE_UNAVAILABLE));
+    }
+
+    /// C1 (§D.7 code-set addition): the epoch rejection has a stable code so
+    /// a future-generation client can distinguish "server speaks another
+    /// epoch" from a generic handshake failure.
+    #[test]
+    fn rpc_error_codes_declare_protocol_unsupported_epoch() {
+        assert!(
+            RPC_ERROR_CODES.contains(&"protocol/unsupported-epoch"),
+            "C1: the §D.7 code set must declare protocol/unsupported-epoch"
+        );
+        assert_eq!(
+            CODE_PROTOCOL_UNSUPPORTED_EPOCH,
+            "protocol/unsupported-epoch"
+        );
+        let err = RpcError::new(-1, "epoch 7").with_code(CODE_PROTOCOL_UNSUPPORTED_EPOCH);
+        assert_eq!(
+            err.data.as_ref().unwrap()["code"],
+            "protocol/unsupported-epoch"
+        );
     }
 }

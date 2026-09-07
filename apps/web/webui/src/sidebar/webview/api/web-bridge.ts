@@ -33,6 +33,11 @@ const RECONNECT_DELAY = 500;
 const CLIENT_ID_KEY = 'manox.webui.client-id';
 
 /** Capabilities the browser webview can answer (full hook surface). */
+/** C1 (§D handshake): the protocol epoch this client speaks — mirrors the
+ * server's `manox_protocol::PROTOCOL_EPOCH`. A handshake mismatch is refused
+ * server-side instead of silently misreading frames. */
+const PROTOCOL_EPOCH = 1;
+
 const WEB_CAPABILITIES = [
 	'approve',
 	'planVerdict',
@@ -146,6 +151,10 @@ export function createWebBridge(options: WebBridgeOptions = {}): Bridge {
 					clientId,
 					capabilities: [...WEB_CAPABILITIES],
 					sessions: [],
+					// C1 (§D handshake): this client speaks protocol epoch 1
+					// (the server's PROTOCOL_EPOCH); a mismatch refuses the
+					// handshake instead of misreading frames.
+					protocolEpoch: PROTOCOL_EPOCH,
 				},
 			};
 			send(init);

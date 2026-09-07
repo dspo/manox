@@ -407,6 +407,7 @@ wire_surface! {
             client_id: "test".into(),
             capabilities: vec![HookKind::Approve],
             sessions: vec![],
+            protocol_epoch: crate::handshake::PROTOCOL_EPOCH,
         }),
         ClientCall::OpenSession { .. } => "openSession" ~ ClientCall::OpenSession {
             session_id: "s1".into(),
@@ -468,6 +469,9 @@ wire_surface! {
         },
         ClientCall::GetConversationInfo { .. } => "getConversationInfo" ~ ClientCall::GetConversationInfo {
             session_id: "s1".into(),
+        },
+        ClientCall::CancelDelivery { .. } => "cancelDelivery" ~ ClientCall::CancelDelivery {
+            delivery_id: "dlv-s1-1".into(),
         },
     ]
 }
@@ -601,6 +605,7 @@ wire_surface! {
     ty: ServerCall,
     [
         ServerCall::Approve { .. } => "approve" ~ ServerCall::Approve {
+            delivery_id: "dlv-s1-1".into(),
             session_id: "s1".into(),
             auth_id: "a1".into(),
             tool_name: "Bash".into(),
@@ -608,12 +613,14 @@ wire_surface! {
             input: serde_json::json!({"command": "ls"}),
         },
         ServerCall::PlanVerdict { .. } => "planVerdict" ~ ServerCall::PlanVerdict {
+            delivery_id: "dlv-s1-2".into(),
             session_id: "s1".into(),
             plan_file: "/p.md".into(),
             title: "P".into(),
             content: Some("# P".into()),
         },
         ServerCall::AskUserQuestion { .. } => "askUserQuestion" ~ ServerCall::AskUserQuestion {
+            delivery_id: "dlv-s1-3".into(),
             session_id: "s1".into(),
             auth_id: "a2".into(),
             input: serde_json::json!({}),

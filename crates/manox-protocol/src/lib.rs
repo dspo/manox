@@ -42,7 +42,7 @@ pub mod transport;
 pub mod wire;
 
 pub use client::{ClientCall, ClientNote, ImageAttachment};
-pub use handshake::{ClientHello, HookKind, Initialize};
+pub use handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
 pub use journal::{
     JournalWireEntry, JournalWireEvent, ModelRef, StreamId, ThreadHeader, UsagePayload,
 };

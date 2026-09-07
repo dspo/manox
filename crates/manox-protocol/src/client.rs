@@ -124,6 +124,18 @@ pub enum ClientCall {
     GetConversationInfo {
         session_id: String,
     },
+    /// Withdraw a pending adjudication delivery (GW3, §D.4): references the
+    /// `deliveryId` of a received [`ServerCall::Approve` /
+    /// `PlanVerdict` / `AskUserQuestion`](crate::ServerCall) the client will
+    /// not answer (e.g. it navigated away from the session). The server
+    /// settles that delivery through the existing expire/converge path —
+    /// fail-closed for a waterfall — instead of waiting out the 300s call
+    /// timeout. Receipt response `{cancelled: bool}` (L7): `false` means the
+    /// delivery already settled or never targeted this client; a late
+    /// `Reply` for a withdrawn delivery is ignored.
+    CancelDelivery {
+        delivery_id: String,
+    },
 }
 
 /// Client → server fire-and-forget commands.
@@ -313,5 +325,22 @@ mod tests {
         assert_eq!(json["bytes"], serde_json::json!("YWJj"));
         let back: ClientNote = serde_json::from_value(json).unwrap();
         assert_eq!(note, back);
+    }
+
+    /// GW3 (§D.4): the wire vocabulary expresses delivery withdrawal — a
+    /// client that navigated away from a session cancels its pending
+    /// adjudication delivery instead of leaving it to the 300s expiry. The
+    /// parse itself is the red evidence against the pre-GW3 vocabulary
+    /// (unknown method `cancelDelivery`).
+    #[test]
+    fn cancel_delivery_call_round_trips() {
+        let call: ClientCall = serde_json::from_value(serde_json::json!({
+            "method": "cancelDelivery",
+            "deliveryId": "dlv-s1-1",
+        }))
+        .expect("GW3: the wire vocabulary expresses delivery cancellation");
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["method"], "cancelDelivery");
+        assert_eq!(json["deliveryId"], "dlv-s1-1");
     }
 }

@@ -4,7 +4,7 @@ import type { JsonValue } from "./serde_json/JsonValue";
 /**
  * Client → server queries; each expects a [`crate::FromServer::Response`].
  */
-export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, } | { "method": "createSession", cwd: string | null, project: string | null, initialModel: ModelRef | null, approvalMode: string | null, reasoningEffort: string | null, } | { "method": "submit", sessionId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "steer", sessionId: string, messageId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "pageHistory", sessionId: string, throughSeq: bigint, beforeSeq: bigint | null, maxMessages: number | null, } | { "method": "getConversationInfo", sessionId: string, };
+export type ClientCall = { "method": "initialize" } & Initialize | { "method": "openSession", sessionId: string, } | { "method": "listThreads" } | { "method": "listModels" } | { "method": "listCommands" } | { "method": "getUsage", sessionId: string, } | { "method": "getCurrentModel", sessionId: string, } | { "method": "threadInfo", sessionId: string, } | { "method": "terminalAttach", session: string, cols: number, rows: number, } | { "method": "terminalSnapshot", terminal: string, } | { "method": "modelChat", requestId: string, model: string, messages: JsonValue, tools: JsonValue, } | { "method": "createSession", cwd: string | null, project: string | null, initialModel: ModelRef | null, approvalMode: string | null, reasoningEffort: string | null, } | { "method": "submit", sessionId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "steer", sessionId: string, messageId: string, text: string, images: Array<ImageAttachment>, originRpc: string | null, } | { "method": "pageHistory", sessionId: string, throughSeq: bigint, beforeSeq: bigint | null, maxMessages: number | null, } | { "method": "getConversationInfo", sessionId: string, } | { "method": "cancelDelivery", deliveryId: string, };
 
 /**
  * Client identity + capability declaration carried on connect.
@@ -58,7 +58,15 @@ data: string, mimeType: string, };
  * First client→server request. Declares who the client is, which
  * [`HookKind`]s it can answer, and which sessions it initially owns.
  */
-export type Initialize = { clientId: string, capabilities: Array<HookKind>, sessions: Array<string>, };
+export type Initialize = { clientId: string, capabilities: Array<HookKind>, sessions: Array<string>, 
+/**
+ * The protocol epoch the client speaks (C1, L12). Serde default 0: a v1
+ * client that predates epoch negotiation omits the field and is accepted
+ * at the compat level; the server refuses epochs it does not recognize
+ * (`protocol/unsupported-epoch`, §D.7) and echoes the accepted epoch in
+ * `HostEvent::Ready`.
+ */
+protocolEpoch: number, };
 
 /**
  * One journal entry line as it travels the wire (§C.1 entry envelope):
@@ -201,7 +209,26 @@ data: JsonValue | null, };
  * [`crate::FromClient::Reply`]. Routed by session ownership ∩ declared
  * [`crate::HookKind`] capability; no capable owner fails closed.
  */
-export type ServerCall = { "method": "approve", sessionId: string, authId: string, toolName: string, summary: string, input: JsonValue, } | { "method": "planVerdict", sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "askUserQuestion", sessionId: string, authId: string, input: JsonValue, } | { "method": "browserOp", sessionId: string, op: JsonValue, } | { "method": "clipboardRead", sessionId: string, } | { "method": "openExternal", sessionId: string, url: string, };
+export type ServerCall = { "method": "approve", 
+/**
+ * GW3 (§D.4): stable identity of THIS delivery — the handle a
+ * [`CancelDelivery`](crate::ClientCall::CancelDelivery) call
+ * references to withdraw a pending adjudication (e.g. the client
+ * navigated away from the session). Minted per delivery by the
+ * gateway's single stamping point (`route_call`); the same
+ * fan-out delivery to N owners carries the SAME id, so the
+ * waterfall converges through the existing expire path when any
+ * recipient withdraws.
+ */
+deliveryId: string, sessionId: string, authId: string, toolName: string, summary: string, input: JsonValue, } | { "method": "planVerdict", 
+/**
+ * GW3 (§D.4): stable delivery identity — see [`Self::Approve`].
+ */
+deliveryId: string, sessionId: string, planFile: string, title: string, content: string | null, } | { "method": "askUserQuestion", 
+/**
+ * GW3 (§D.4): stable delivery identity — see [`Self::Approve`].
+ */
+deliveryId: string, sessionId: string, authId: string, input: JsonValue, } | { "method": "browserOp", sessionId: string, op: JsonValue, } | { "method": "clipboardRead", sessionId: string, } | { "method": "openExternal", sessionId: string, url: string, };
 
 /**
  * Server → client notifications (the retained §D.6 surface — see the
@@ -314,7 +341,15 @@ export type ThreadListItem = { id: string, title: string,
 /**
  * Unix seconds of the last interaction.
  */
-updated_at: number, running: boolean, unread: boolean, errored: boolean, pending_auth: boolean, 
+updated_at: number, running: boolean, 
+/**
+ * DEPRECATED (GW5): unread is client-owned — the server keeps no focus
+ * mirror, so list responses always report `false` and clients derive
+ * unread from the `SessionStatus.unread` deltas (raised at every settle)
+ * cleared locally on focus. Field retained for wire compatibility
+ * through the dual-protocol window; C4 removes it.
+ */
+unread: boolean, errored: boolean, pending_auth: boolean, 
 /**
  * A plan review verdict is due; the row shows the static blue wheel.
  */

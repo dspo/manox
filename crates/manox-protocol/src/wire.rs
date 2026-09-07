@@ -25,6 +25,11 @@ pub struct ThreadListItem {
     /// Unix seconds of the last interaction.
     pub updated_at: i32,
     pub running: bool,
+    /// DEPRECATED (GW5): unread is client-owned — the server keeps no focus
+    /// mirror, so list responses always report `false` and clients derive
+    /// unread from the `SessionStatus.unread` deltas (raised at every settle)
+    /// cleared locally on focus. Field retained for wire compatibility
+    /// through the dual-protocol window; C4 removes it.
     pub unread: bool,
     pub errored: bool,
     pub pending_auth: bool,

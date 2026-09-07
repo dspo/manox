@@ -119,6 +119,7 @@ mod tests {
     #[test]
     fn approve_call_maps_to_authorization() {
         let call = ServerCall::Approve {
+            delivery_id: "dlv-1".into(),
             session_id: "s1".into(),
             auth_id: "auth-1".into(),
             tool_name: "Bash".into(),
@@ -135,6 +136,7 @@ mod tests {
     #[test]
     fn ask_user_maps_to_authorization() {
         let call = ServerCall::AskUserQuestion {
+            delivery_id: "dlv-2".into(),
             session_id: "s1".into(),
             auth_id: "auth-2".into(),
             input: serde_json::json!({}),
@@ -149,6 +151,7 @@ mod tests {
     #[test]
     fn plan_verdict_maps_to_plan_ready() {
         let call = ServerCall::PlanVerdict {
+            delivery_id: "dlv-3".into(),
             session_id: "s1".into(),
             plan_file: "/plan.md".into(),
             title: "Plan".into(),

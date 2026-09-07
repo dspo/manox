@@ -280,6 +280,9 @@ mod tests {
             FromServer::Request {
                 id: MsgId::new("auth-1"),
                 call: ServerCall::Approve {
+                    // GW3: the gateway mints delivery ids; this scripted
+                    // frame carries a stable one.
+                    delivery_id: "dlv-s1-1".into(),
                     session_id: "s1".into(),
                     auth_id: "auth-1".into(),
                     tool_name: "bash".into(),
@@ -362,6 +365,8 @@ mod tests {
                     client_id: "vscode-9f2c".into(),
                     capabilities: vec![],
                     sessions: vec![],
+                    // C1: this client speaks the current protocol epoch.
+                    protocol_epoch: manox_protocol::PROTOCOL_EPOCH,
                 }),
             },
             FromClient::Notification {
