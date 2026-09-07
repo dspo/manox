@@ -443,6 +443,20 @@ mod tests {
                 stream_id: crate::journal::StreamId::new("stream-1"),
                 reason: crate::stream::StreamEndReason::Resync,
             },
+            // The sixth envelope variant (the production host-event lane) —
+            // formerly the only FromServer arm without round-trip coverage
+            // while the surface harness rode a fake Response envelope.
+            FromServer::Host {
+                host: crate::stream::HostEvent::SessionStatus {
+                    session_id: "s1".into(),
+                    running: Some(true),
+                    errored: None,
+                    unread: None,
+                    pending_auth: None,
+                    pending_plan: None,
+                    background_work: None,
+                },
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();

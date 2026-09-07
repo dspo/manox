@@ -6,12 +6,13 @@
 //!
 //! These are the v2 frame *payload* types. The §D.1 envelope variants that
 //! carry them (`FromClient::StreamOpen/StreamCancel`,
-//! `FromServer::StreamItem/StreamEnd`) landed with the T4 stream services;
-//! the `FromServer::Notification { host }` re-type onto [`HostEvent`] still
-//! waits on the T5 host-event migration (the live payload is the v1
-//! [`ServerNote`]). The backpressure policy below is the §D.7 strategy
-//! expressed over the frame vocabulary, wired by `manox-session-core`'s
-//! follow stream.
+//! `FromServer::StreamItem/StreamEnd`) landed with the T4 stream services,
+//! and [`HostEvent`] rides the sixth envelope variant `FromServer::Host`
+//! (in production use); `FromServer::Notification` still carries the v1
+//! [`ServerNote`] face until the §D.5 host-event migration (GW1) moves the
+//! remaining events onto it. The backpressure policy below is the §D.7
+//! strategy expressed over the frame vocabulary, wired by
+//! `manox-session-core`'s follow stream.
 
 use std::collections::BTreeMap;
 

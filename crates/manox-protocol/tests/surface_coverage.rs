@@ -1,486 +1,49 @@
-//! T2 declaration-surface coverage harness (§J.4 / J.5, L12).
+//! T2 declaration-surface coverage harness (§J.4 / J.5, L12), C3 revision.
 //!
 //! Builds a scripted conversation (§D.1 follow stream: snapshot → journal
 //! entry per declared `JournalWireEvent` → projections delta → stream end)
-//! plus the scripted `HostEvent` sequence, and asserts that every name in
-//! every declaration table of [`manox_protocol::surface`] (a) constructs,
-//! (b) round-trips through serde, (c) serializes with exactly the declared
-//! tag, and (d) appears inside some `FromServer` frame of the script.
+//! plus the scripted `HostEvent` sequence on the REAL `FromServer::Host`
+//! envelope, and asserts that every name in every declaration table of
+//! [`manox_protocol::surface`] (a) constructs, (b) round-trips through
+//! serde, (c) serializes with exactly the declared tag — cross-checked
+//! against the surface's exhaustive tag match — and (d) appears inside some
+//! scripted frame.
 //!
-//! (d) rides frames through the v1 `FromServer::Response` outcome payload:
-//! the §D.1 `StreamItem` / `StreamEnd` envelope variants cannot be added to
-//! the live enums without breaking the exhaustive consumer matches in
-//! `manox-session-core` / `agent-ui` (T2 stop-rule; see delivery report).
-//! T4/T5 re-point the harness at the real envelope variants — only the
-//! frame *construction* under test changes, never the tables.
+//! The tables, tag matches, and samples are generated from one
+//! `wire_surface!` list per enum (see the surface module docs): a new enum
+//! variant is a compile error until it is declared AND sampled, so this
+//! harness can no longer "pass" while a variant is invisible — the former
+//! self-referential gap (hand-written tables checked against hand-written
+//! samples, e.g. `FRAMES` lacking `followSession`, host events riding a
+//! fake `Response` envelope while production used `FromServer::Host`).
 
 use manox_protocol::journal::JournalWireEntry;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame};
+use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame, StreamKind};
 use manox_protocol::surface::{
-    CLIENT_CALLS, CLIENT_NOTES, FRAMES, HOST_EVENTS, JOURNAL_ENTRIES, PROJECTION_KEYS,
-    SERVER_CALLS, SERVER_NOTES, frame_samples, host_samples, journal_samples, scripted_host_events,
-    scripted_session, stream_end_samples,
+    CLIENT_CALLS, CLIENT_NOTES, HOST_EVENTS, JOURNAL_ENTRIES, PROJECTION_KEYS, SERVER_CALLS,
+    SERVER_NOTES, STREAM_END_REASONS, STREAM_FRAMES, STREAM_KINDS, client_call_samples,
+    client_call_tag, client_note_samples, client_note_tag, frame_samples, frames, host_samples,
+    host_wire_tag, journal_samples, journal_wire_tag, scripted_host_events, scripted_session,
+    scripted_stream_open, server_call_samples, server_call_tag, server_note_samples,
+    server_note_tag, stream_end_samples, stream_end_tag, stream_frame_tag, stream_kind_samples,
+    stream_kind_tag,
 };
-use manox_protocol::wire::{ModelInfo, ThreadListItem};
-use manox_protocol::{
-    ClientCall, ClientNote, HookKind, ImageAttachment, Initialize, RpcError, ServerCall, ServerNote,
-};
+use manox_protocol::{ClientCall, ClientNote, RpcError, ServerCall, ServerNote};
 
-// ── builders for the current call surface (one instance per variant) ──────
-
-fn client_call_samples() -> Vec<(String, ClientCall)> {
-    vec![
-        (
-            "initialize".into(),
-            ClientCall::Initialize(Initialize {
-                client_id: "test".into(),
-                capabilities: vec![HookKind::Approve],
-                sessions: vec![],
-            }),
-        ),
-        (
-            "openSession".into(),
-            ClientCall::OpenSession {
-                session_id: "s1".into(),
-            },
-        ),
-        ("listThreads".into(), ClientCall::ListThreads),
-        ("listModels".into(), ClientCall::ListModels),
-        ("listCommands".into(), ClientCall::ListCommands),
-        (
-            "getUsage".into(),
-            ClientCall::GetUsage {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "getCurrentModel".into(),
-            ClientCall::GetCurrentModel {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "threadInfo".into(),
-            ClientCall::ThreadInfo {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "terminalAttach".into(),
-            ClientCall::TerminalAttach {
-                session: "s1".into(),
-                cols: 80,
-                rows: 24,
-            },
-        ),
-        (
-            "terminalSnapshot".into(),
-            ClientCall::TerminalSnapshot {
-                terminal: "t1".into(),
-            },
-        ),
-        (
-            "modelChat".into(),
-            ClientCall::ModelChat {
-                request_id: "r1".into(),
-                model: "anthropic-main/claude-sonnet-4".into(),
-                messages: serde_json::json!([]),
-                tools: serde_json::json!([]),
-            },
-        ),
-        (
-            "createSession".into(),
-            ClientCall::CreateSession {
-                cwd: Some("/proj".into()),
-                project: Some("/proj".into()),
-                initial_model: Some(manox_protocol::ModelRef::new(
-                    "DeepSeek-anthropic/deepseek-chat",
-                )),
-                approval_mode: Some("workspace-write".into()),
-                reasoning_effort: Some("high".into()),
-            },
-        ),
-        (
-            "submit".into(),
-            ClientCall::Submit {
-                session_id: "s1".into(),
-                text: "hello".into(),
-                images: vec![ImageAttachment {
-                    data: vec![1, 2, 3],
-                    mime_type: "image/png".into(),
-                }],
-                origin_rpc: Some("rpc-echo-1".into()),
-            },
-        ),
-        (
-            "steer".into(),
-            ClientCall::Steer {
-                session_id: "s1".into(),
-                message_id: "m-1".into(),
-                text: "left".into(),
-                images: vec![],
-                origin_rpc: None,
-            },
-        ),
-        (
-            "pageHistory".into(),
-            ClientCall::PageHistory {
-                session_id: "s1".into(),
-                through_seq: -1,
-                before_seq: Some(40),
-                max_messages: Some(32),
-            },
-        ),
-        (
-            "getConversationInfo".into(),
-            ClientCall::GetConversationInfo {
-                session_id: "s1".into(),
-            },
-        ),
-    ]
-}
-
-fn client_note_samples() -> Vec<(String, ClientNote)> {
-    use ClientNote::*;
-    vec![
-        (
-            "createSession".into(),
-            CreateSession {
-                session_id: "s1".into(),
-                cwd: Some("/proj".into()),
-            },
-        ),
-        (
-            "disposeSession".into(),
-            DisposeSession {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "detachSession".into(),
-            DetachSession {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "submit".into(),
-            Submit {
-                session_id: "s1".into(),
-                text: "hello".into(),
-                images: vec![ImageAttachment {
-                    data: b"ab".to_vec(),
-                    mime_type: "image/png".into(),
-                }],
-                client_id: None,
-            },
-        ),
-        (
-            "steer".into(),
-            Steer {
-                session_id: "s1".into(),
-                client_id: "c1".into(),
-                text: "mid".into(),
-                images: vec![],
-            },
-        ),
-        (
-            "dropQueued".into(),
-            DropQueued {
-                session_id: "s1".into(),
-                client_id: "c1".into(),
-            },
-        ),
-        (
-            "cancelTurn".into(),
-            CancelTurn {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "setModel".into(),
-            SetModel {
-                session_id: "s1".into(),
-                id: "DeepSeek-anthropic/deepseek-chat".into(),
-            },
-        ),
-        (
-            "setReasoningEffort".into(),
-            SetReasoningEffort {
-                session_id: "s1".into(),
-                effort: "high".into(),
-            },
-        ),
-        (
-            "setApprovalMode".into(),
-            SetApprovalMode {
-                session_id: "s1".into(),
-                mode: "auto-edit".into(),
-            },
-        ),
-        (
-            "setCwd".into(),
-            SetCwd {
-                session_id: "s1".into(),
-                cwd: "/new".into(),
-            },
-        ),
-        (
-            "setPlanMode".into(),
-            SetPlanMode {
-                session_id: "s1".into(),
-                enabled: true,
-            },
-        ),
-        (
-            "planSeedExecution".into(),
-            PlanSeedExecution {
-                session_id: "s1".into(),
-                plan_file: "/plan.md".into(),
-            },
-        ),
-        (
-            "compact".into(),
-            Compact {
-                session_id: "s1".into(),
-                instructions: None,
-            },
-        ),
-        (
-            "goal".into(),
-            Goal {
-                session_id: "s1".into(),
-                action: "create".into(),
-                objective: Some("ship".into()),
-                budget: Some(10),
-                max_rounds: None,
-            },
-        ),
-        (
-            "stopBackgroundTask".into(),
-            StopBackgroundTask {
-                session_id: "s1".into(),
-                task_id: "b1".into(),
-            },
-        ),
-        (
-            "archiveThread".into(),
-            ArchiveThread {
-                session_id: "s1".into(),
-                archived: true,
-            },
-        ),
-        (
-            "pinThread".into(),
-            PinThread {
-                session_id: "s1".into(),
-                pinned: true,
-            },
-        ),
-        (
-            "focusThread".into(),
-            FocusThread {
-                session_id: Some("s1".into()),
-            },
-        ),
-        (
-            "terminalInput".into(),
-            TerminalInput {
-                terminal: "t1".into(),
-                bytes: b"x".to_vec(),
-            },
-        ),
-        (
-            "terminalResize".into(),
-            TerminalResize {
-                terminal: "t1".into(),
-                cols: 80,
-                rows: 24,
-            },
-        ),
-        (
-            "cancelModelChat".into(),
-            CancelModelChat {
-                request_id: "r1".into(),
-            },
-        ),
-        ("shutdown".into(), Shutdown),
-        (
-            "appendUserMessage".into(),
-            AppendUserMessage {
-                session_id: "s1".into(),
-                text: "queued".into(),
-                images: vec![],
-            },
-        ),
-        (
-            "appendUiNote".into(),
-            AppendUiNote {
-                session_id: "s1".into(),
-                kind: "notice".into(),
-                data: serde_json::json!({"text": "n"}),
-            },
-        ),
-    ]
-}
-
-fn server_call_samples() -> Vec<(String, ServerCall)> {
-    vec![
-        (
-            "approve".into(),
-            ServerCall::Approve {
-                session_id: "s1".into(),
-                auth_id: "a1".into(),
-                tool_name: "Bash".into(),
-                summary: "ls".into(),
-                input: serde_json::json!({"command": "ls"}),
-            },
-        ),
-        (
-            "planVerdict".into(),
-            ServerCall::PlanVerdict {
-                session_id: "s1".into(),
-                plan_file: "/p.md".into(),
-                title: "P".into(),
-                content: Some("# P".into()),
-            },
-        ),
-        (
-            "askUserQuestion".into(),
-            ServerCall::AskUserQuestion {
-                session_id: "s1".into(),
-                auth_id: "a2".into(),
-                input: serde_json::json!({}),
-            },
-        ),
-        (
-            "browserOp".into(),
-            ServerCall::BrowserOp {
-                session_id: "s1".into(),
-                op: serde_json::json!({"op": "navigate"}),
-            },
-        ),
-        (
-            "clipboardRead".into(),
-            ServerCall::ClipboardRead {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "openExternal".into(),
-            ServerCall::OpenExternal {
-                session_id: "s1".into(),
-                url: "https://x".into(),
-            },
-        ),
-    ]
-}
-
-fn model_stub() -> ModelInfo {
-    ModelInfo {
-        id: "deepseek-chat".into(),
-        name: "DeepSeek Chat".into(),
-        provider: "DeepSeek-anthropic".into(),
-        provider_name: None,
-        api: "anthropic".into(),
-        context_window: 131_072,
-        max_tokens: None,
-    }
-}
-
-fn thread_stub() -> ThreadListItem {
-    ThreadListItem {
-        id: "s1".into(),
-        title: "t".into(),
-        updated_at: 0,
-        running: false,
-        unread: false,
-        errored: false,
-        pending_auth: false,
-        pending_plan: false,
-        background_work: false,
-        model_id: "m".into(),
-        pinned: false,
-        archived: false,
-        parent_id: None,
-        depth: 0,
-    }
-}
-
-/// One instance per declared `ServerNote` arm, in table order. T10 (§D.6):
-/// the doomed arms are deleted; this is the retained face.
-fn server_note_samples() -> Vec<(String, ServerNote)> {
-    use ServerNote::*;
-    vec![
-        ("ready".into(), Ready),
-        (
-            "sessionCreated".into(),
-            SessionCreated {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "sessionDisposed".into(),
-            SessionDisposed {
-                session_id: "s1".into(),
-            },
-        ),
-        (
-            "threadsUpdated".into(),
-            ThreadsUpdated {
-                threads: vec![thread_stub()],
-            },
-        ),
-        (
-            "models".into(),
-            Models {
-                models: vec![model_stub()],
-            },
-        ),
-        (
-            "commands".into(),
-            Commands {
-                commands: serde_json::json!([]),
-            },
-        ),
-        (
-            "modelText".into(),
-            ModelText {
-                request_id: "r".into(),
-                text: "t".into(),
-            },
-        ),
-        (
-            "modelThinking".into(),
-            ModelThinking {
-                request_id: "r".into(),
-                text: "t".into(),
-            },
-        ),
-        (
-            "modelToolCall".into(),
-            ModelToolCall {
-                request_id: "r".into(),
-                id: "tc".into(),
-                name: "Bash".into(),
-                input: serde_json::json!({}),
-            },
-        ),
-        (
-            "modelChatDone".into(),
-            ModelChatDone {
-                request_id: "r".into(),
-                stop: None,
-                error: None,
-            },
-        ),
-        (
-            "error".into(),
-            Error {
-                session_id: None,
-                message: "boom".into(),
-            },
-        ),
-    ]
+/// Zip a generated table with its generated samples into `(name, value)`
+/// pairs for [`walk`]. Lengths are equal by construction (one macro list
+/// generates both); the assert documents that invariant.
+fn pairs<T>(table: &[&str], samples: Vec<T>) -> Vec<(String, T)> {
+    assert_eq!(
+        table.len(),
+        samples.len(),
+        "table/sample length mismatch — both come from one wire_surface! list"
+    );
+    table
+        .iter()
+        .zip(samples)
+        .map(|(name, value)| (name.to_string(), value))
+        .collect()
 }
 
 // ── generic walk: construct + declared tag + serde round-trip ─────────────
@@ -517,6 +80,11 @@ fn tag_of(value: &serde_json::Value, field: &str) -> String {
 #[test]
 fn journal_entries_surface_is_complete() {
     let samples = journal_samples();
+    // The exhaustive tag match agrees with serde on every sample (the match
+    // is the compile-time gate; this pins it to the wire representation).
+    for (tag, sample) in JOURNAL_ENTRIES.iter().zip(samples.iter()) {
+        assert_eq!(journal_wire_tag(sample), *tag);
+    }
     let pairs: Vec<(String, _)> = samples
         .iter()
         .cloned()
@@ -550,6 +118,9 @@ fn journal_entries_surface_is_complete() {
 #[test]
 fn host_events_surface_is_complete() {
     let samples = host_samples();
+    for (tag, sample) in HOST_EVENTS.iter().zip(samples.iter()) {
+        assert_eq!(host_wire_tag(sample), *tag);
+    }
     let pairs: Vec<(String, _)> = samples
         .iter()
         .cloned()
@@ -569,65 +140,94 @@ fn host_events_surface_is_complete() {
 
 #[test]
 fn frames_surface_is_complete() {
-    let samples = frame_samples();
-    let pairs: Vec<(String, _)> = samples
-        .iter()
-        .cloned()
-        .map(|f| {
-            let v = serde_json::to_value(&f).unwrap();
-            (tag_of(&v, "type"), f)
-        })
-        .collect();
+    for (tag, sample) in STREAM_KINDS.iter().zip(stream_kind_samples().iter()) {
+        assert_eq!(stream_kind_tag(sample), *tag);
+    }
     walk(
-        &FRAMES[..3],
+        STREAM_KINDS,
         "type",
-        pairs,
+        pairs(STREAM_KINDS, stream_kind_samples()),
+        |k| serde_json::to_value(k).unwrap(),
+        |v| serde_json::from_value::<StreamKind>(v).unwrap(),
+    );
+    for (tag, sample) in STREAM_FRAMES.iter().zip(frame_samples().iter()) {
+        assert_eq!(stream_frame_tag(sample), *tag);
+    }
+    walk(
+        STREAM_FRAMES,
+        "type",
+        pairs(STREAM_FRAMES, frame_samples()),
         |f| serde_json::to_value(f).unwrap(),
         |v| serde_json::from_value::<StreamFrame>(v).unwrap(),
     );
-    let end_names: Vec<String> = stream_end_samples()
-        .iter()
-        .map(|r| tag_of(&serde_json::to_value(r).unwrap(), "type"))
-        .collect();
-    let declared: Vec<&str> = end_names.iter().map(String::as_str).collect();
-    assert_eq!(declared, &FRAMES[3..], "stream-end tag drift");
+    for (tag, sample) in STREAM_END_REASONS.iter().zip(stream_end_samples().iter()) {
+        assert_eq!(stream_end_tag(sample), *tag);
+    }
+    walk(
+        STREAM_END_REASONS,
+        "type",
+        pairs(STREAM_END_REASONS, stream_end_samples()),
+        |r| serde_json::to_value(r).unwrap(),
+        |v| serde_json::from_value::<StreamEndReason>(v).unwrap(),
+    );
+    // `frames()` is the §D.1 vocabulary the spec names: the mechanical
+    // concatenation of the three generated tables.
+    let mut want = STREAM_KINDS.to_vec();
+    want.extend_from_slice(STREAM_FRAMES);
+    want.extend_from_slice(STREAM_END_REASONS);
+    assert_eq!(frames(), want);
 }
 
 #[test]
 fn current_call_surface_is_complete() {
+    for (tag, sample) in CLIENT_CALLS.iter().zip(client_call_samples().iter()) {
+        assert_eq!(client_call_tag(sample), *tag);
+    }
     walk(
         CLIENT_CALLS,
         "method",
-        client_call_samples(),
+        pairs(CLIENT_CALLS, client_call_samples()),
         |c| serde_json::to_value(c).unwrap(),
         |v| serde_json::from_value::<ClientCall>(v).unwrap(),
     );
+    for (tag, sample) in CLIENT_NOTES.iter().zip(client_note_samples().iter()) {
+        assert_eq!(client_note_tag(sample), *tag);
+    }
     walk(
         CLIENT_NOTES,
         "method",
-        client_note_samples(),
+        pairs(CLIENT_NOTES, client_note_samples()),
         |c| serde_json::to_value(c).unwrap(),
         |v| serde_json::from_value::<ClientNote>(v).unwrap(),
     );
+    for (tag, sample) in SERVER_CALLS.iter().zip(server_call_samples().iter()) {
+        assert_eq!(server_call_tag(sample), *tag);
+    }
     walk(
         SERVER_CALLS,
         "method",
-        server_call_samples(),
+        pairs(SERVER_CALLS, server_call_samples()),
         |c| serde_json::to_value(c).unwrap(),
         |v| serde_json::from_value::<ServerCall>(v).unwrap(),
     );
+    for (tag, sample) in SERVER_NOTES.iter().zip(server_note_samples().iter()) {
+        assert_eq!(server_note_tag(sample), *tag);
+    }
     walk(
         SERVER_NOTES,
         "method",
-        server_note_samples(),
+        pairs(SERVER_NOTES, server_note_samples()),
         |c| serde_json::to_value(c).unwrap(),
         |v| serde_json::from_value::<ServerNote>(v).unwrap(),
     );
 }
 
 /// §J.4 (d): every declared name appears, serialized, inside some scripted
-/// `FromServer` frame — the emit-side guarantee of the harness (T4/T5 will
-/// drive a real server instead of the script).
+/// frame — on the real production envelopes (`FromServer::StreamItem` /
+/// `StreamEnd` / `Host`, `FromClient::StreamOpen`). This is still a
+/// script-side proof: the J1b gate (real-composition emission coverage)
+/// drives an actual server; this harness guarantees the vocabulary itself
+/// is representable and represented.
 #[test]
 fn every_declared_surface_name_appears_in_scripted_frames() {
     let session: Vec<String> = scripted_session()
@@ -638,6 +238,13 @@ fn every_declared_surface_name_appears_in_scripted_frames() {
         .iter()
         .map(|m| serde_json::to_string(m).unwrap())
         .collect();
+    let open = serde_json::to_string(&scripted_stream_open()).unwrap();
+
+    // The scripted host frames ride the real FromServer::Host envelope.
+    assert!(
+        host.iter().all(|s| s.contains("\"kind\":\"host\"")),
+        "scripted host events must ride the production Host envelope: {host:?}"
+    );
 
     for name in JOURNAL_ENTRIES {
         assert!(
@@ -654,16 +261,23 @@ fn every_declared_surface_name_appears_in_scripted_frames() {
             "host event {name} never emitted in the scripted host stream"
         );
     }
-    for name in FRAMES {
+    for name in STREAM_FRAMES.iter().chain(STREAM_END_REASONS.iter()) {
         // Key-order-independent containment: serde's internally tagged
         // serialization does not place `type` first (struct-variant fields
         // may sort ahead of the tag — Snapshot and Failure both do), so never
-        // needle across a `{"type":…` boundary. FRAMES names collide with
+        // needle across a `{"type":…` boundary. Frame names collide with
         // neither journal-entry nor host-event tags.
         let needle = format!("\"type\":\"{name}\"");
         assert!(
             session.iter().any(|s| s.contains(&needle)),
             "frame {name} never emitted in the scripted session"
+        );
+    }
+    for name in STREAM_KINDS {
+        let needle = format!("\"type\":\"{name}\"");
+        assert!(
+            open.contains(&needle),
+            "stream kind {name} never emitted in the scripted StreamOpen"
         );
     }
     assert!(

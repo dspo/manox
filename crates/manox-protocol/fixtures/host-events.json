@@ -1,78 +1,78 @@
 [
   {
-    "type": "ready",
-    "epoch": 2
+    "epoch": 2,
+    "type": "ready"
   },
   {
-    "type": "models",
     "models": [
       {
-        "id": "deepseek-chat",
-        "name": "DeepSeek Chat",
-        "provider": "DeepSeek-anthropic",
-        "provider_name": "DeepSeek",
         "api": "anthropic",
         "context_window": 131072,
-        "max_tokens": 8192
+        "id": "deepseek-chat",
+        "max_tokens": 8192,
+        "name": "DeepSeek Chat",
+        "provider": "DeepSeek-anthropic",
+        "provider_name": "DeepSeek"
       }
-    ]
+    ],
+    "type": "models"
   },
   {
-    "type": "commands",
     "commands": [
       {
         "name": "/compact"
       }
-    ]
+    ],
+    "type": "commands"
   },
   {
-    "type": "threadsUpdated",
     "threads": [
       {
-        "id": "s1",
-        "title": "v2 migration",
-        "updated_at": 1756947200,
-        "running": true,
-        "unread": false,
+        "archived": false,
+        "background_work": false,
+        "depth": 0,
         "errored": false,
+        "id": "s1",
+        "model_id": "DeepSeek-anthropic/deepseek-chat",
+        "parent_id": null,
         "pending_auth": false,
         "pending_plan": false,
-        "background_work": false,
-        "model_id": "DeepSeek-anthropic/deepseek-chat",
         "pinned": false,
-        "archived": false,
-        "parent_id": null,
-        "depth": 0
+        "running": false,
+        "title": "v2 migration",
+        "unread": false,
+        "updated_at": 1756947200
       }
-    ]
+    ],
+    "type": "threadsUpdated"
   },
   {
-    "type": "sessionStatus",
-    "sessionId": "s1",
-    "running": true,
+    "backgroundWork": false,
     "errored": false,
-    "unread": true,
     "pendingAuth": false,
     "pendingPlan": null,
-    "backgroundWork": false
-  },
-  {
-    "type": "sessionCreated",
+    "running": true,
     "sessionId": "s1",
+    "type": "sessionStatus",
+    "unread": true
+  },
+  {
     "header": {
-      "id": "s1",
+      "createdAt": "2026-09-04T00:00:00Z",
       "cwd": "/proj",
-      "parentSession": null,
+      "id": "s1",
       "metadata": null,
-      "createdAt": "2026-09-04T00:00:00Z"
-    }
+      "parentSession": null
+    },
+    "sessionId": "s1",
+    "type": "sessionCreated"
   },
   {
-    "type": "sessionDisposed",
-    "sessionId": "s1"
+    "sessionId": "s1",
+    "type": "sessionDisposed"
   },
   {
-    "type": "error",
-    "message": "gateway/internal"
+    "message": "gateway/internal",
+    "type": "error"
   }
 ]

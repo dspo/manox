@@ -33,6 +33,34 @@ fn read_back<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_str(&text).expect("fixture parses")
 }
 
+/// C3/J.5: every declaration table as one JSON artifact. The TS guard
+/// suite asserts its tag arrays equal this file, so the Rust declaration
+/// (macro-generated from the wire enums) is the single source for both
+/// sides of the wire — the former hand-copied TS arrays could drift
+/// silently because unknown tags are tolerated by design.
+#[test]
+fn export_surface_tags() {
+    use manox_protocol::surface::{
+        CLIENT_CALLS, CLIENT_NOTES, HOST_EVENTS, JOURNAL_ENTRIES, PROJECTION_KEYS, SERVER_CALLS,
+        SERVER_NOTES, STREAM_END_REASONS, STREAM_FRAMES, STREAM_KINDS,
+    };
+    let value = serde_json::json!({
+        "journalEntries": JOURNAL_ENTRIES,
+        "projectionKeys": PROJECTION_KEYS,
+        "hostEvents": HOST_EVENTS,
+        "streamKinds": STREAM_KINDS,
+        "streamFrames": STREAM_FRAMES,
+        "streamEndReasons": STREAM_END_REASONS,
+        "clientCalls": CLIENT_CALLS,
+        "clientNotes": CLIENT_NOTES,
+        "serverCalls": SERVER_CALLS,
+        "serverNotes": SERVER_NOTES,
+    });
+    write("surface-tags.json", &value);
+    let back: serde_json::Value = read_back("surface-tags.json");
+    assert_eq!(back, value);
+}
+
 #[test]
 fn export_protocol_frame_fixtures() {
     let mut frames = frame_samples(); // snapshot, entry, projections
