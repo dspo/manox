@@ -96,7 +96,11 @@ impl SessionRepository {
     }
 }
 
-fn session_file_name(id: &str) -> String {
+/// The canonical journal file name for a session id (`<id>.jsonl`) — the
+/// single source shared by creation, repository scans, and on-disk identity
+/// probes (a cold `CreateSession` must find and restore this file, never
+/// re-mint over it).
+pub fn session_file_name(id: &str) -> String {
     format!("{id}.jsonl")
 }
 

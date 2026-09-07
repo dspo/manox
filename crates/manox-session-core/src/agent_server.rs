@@ -673,18 +673,21 @@ async fn handle_call(
             initial_model,
             approval_mode,
             reasoning_effort,
-        } => AgentServerInner::create_session_request(
-            inner,
-            client_id,
-            SessionIntent {
-                session_id: None,
-                cwd,
-                project,
-                initial_model,
-                approval_mode,
-                reasoning_effort,
-            },
-        ),
+        } => {
+            AgentServerInner::create_session_request(
+                inner,
+                client_id,
+                SessionIntent {
+                    session_id: None,
+                    cwd,
+                    project,
+                    initial_model,
+                    approval_mode,
+                    reasoning_effort,
+                },
+            )
+            .await
+        }
         ClientCall::Submit {
             session_id,
             text,
@@ -857,7 +860,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 approval_mode: None,
                 reasoning_effort: None,
             };
-            let _ = AgentServerInner::create_session_request(inner, owner, intent);
+            let _ = AgentServerInner::create_session_request(inner, owner, intent).await;
         }
         ClientNote::DisposeSession { session_id } => inner.dispose_session(owner, &session_id),
         ClientNote::DetachSession { session_id } => inner.detach_session(owner, &session_id),
@@ -961,6 +964,18 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
 
+/// The canonical on-disk journal path for a session id
+/// (`<config>/sessions/<id>.jsonl`) — the same name creation and the
+/// repository scan use, so the GW11 identity probe and the eventual
+/// materialization can never disagree about the file.
+fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
+    manox_agent::paths::sessions_dir().ok().map(|dir| {
+        dir.join(manox_harness::session::repository::session_file_name(
+            session_id,
+        ))
+    })
+}
+
 /// The §D.2 `CreateSession` intent: optional explicit id (the compat
 /// `ClientNote::CreateSession` always supplies one; the v2 request mints
 /// server-side), working directory, project binding, and the initial
@@ -984,8 +999,11 @@ impl AgentServerInner {
     /// `resolve_model_ref` (L8) *before* anything is created — an
     /// unresolvable canonical ref answers `model/unresolvable` without a
     /// side effect. Re-opening a live session id is idempotent: the
-    /// existing id answers and the live session is left untouched.
-    fn create_session_request(
+    /// existing id answers and the live session is left untouched. An id
+    /// whose journal file already exists on disk is an existing COLD
+    /// session: it restores through the `OpenSession` path (§D.2
+    /// idempotency on disk, GW11) and is never re-minted over its file.
+    async fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
         intent: SessionIntent,
@@ -1031,6 +1049,25 @@ impl AgentServerInner {
             && inner.sessions.lock().contains_key(existing)
         {
             inner.add_owner(existing, owner);
+            return Ok(json!({ "session_id": existing }));
+        }
+        // §D.2 idempotency on disk (GW11): an id whose journal file already
+        // exists is an existing COLD session — restore it through the
+        // OpenSession path instead of minting a fresh session over the id.
+        // The pre-fix fall-through reached `new_fresh` ("never restores the
+        // previous session"), whose deferred materialization rewrote the
+        // existing file wholesale on the first assistant message, erasing
+        // the cold session's history. The probe reads the canonical
+        // sessions-dir path directly rather than the store's scan-populated
+        // map, so it holds even when no list refresh has ever run;
+        // `note_session_path` seeds the identity map for the restore's
+        // `load_thread`.
+        if let Some(existing) = intent.session_id.as_deref()
+            && let Some(path) = persisted_session_file(existing)
+            && path.exists()
+        {
+            manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
+            open_session(inner, owner, existing).await?;
             return Ok(json!({ "session_id": existing }));
         }
         let session_id = intent
@@ -2384,6 +2421,10 @@ mod tests {
         (server, client)
     }
 
+    /// Create a session through the compat note. GW11: an id whose journal
+    /// file already exists in the (process-shared hermetic) sessions dir
+    /// RESTORES from disk instead of starting fresh — tests that seed real
+    /// files must use unique ids or remove them in teardown.
     fn create(_server: &AgentServer, client: &Client, id: &str) {
         client.send(FromClient::Notification {
             note: ClientNote::CreateSession {
@@ -2921,6 +2962,97 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// GW11 regression: CreateSession bearing an id whose journal file
+    /// already exists on disk (a cold session — the compat-note path the
+    /// desktop landing takes) must restore the persisted session, never
+    /// mint a fresh one over the id. Before the fix the request fell
+    /// through to `new_fresh` ("never restores the previous session"): a
+    /// deferred session with no path at all, whose first assistant message
+    /// rewrote the existing file wholesale, erasing the cold history. The
+    /// gateway-level observable is the live thread's engine binding —
+    /// `open_existing` seeds the active session path at spawn, independent
+    /// of the engine actor's asynchronous assembly (which needs provider
+    /// configuration this suite does not own).
+    #[test]
+    fn create_session_with_a_cold_persisted_id_restores_history() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+
+        // Keep any engine-actor registry writes (order-dependent: a prior
+        // test's model registration lets the actor survive startup) inside
+        // this test's own file instead of the shared hermetic registry.
+        let registry_tmp = std::env::temp_dir().join(format!(
+            "gw11-cold-restore-registry-{}.json",
+            std::process::id()
+        ));
+        manox_agent::thread_registry::set_registry_path_for_test(Some(registry_tmp.clone()));
+
+        // Seed a persisted v4 session under the hermetic sessions dir:
+        // header plus a dense two-entry chain, exactly what a real cold
+        // session looks like. The header cwd is a directory that exists —
+        // a restored actor re-pins its tool cwd to it. No list refresh
+        // runs: the restore must work from the authoritative on-disk probe
+        // alone.
+        let sessions = manox_agent::paths::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = sessions.parent().unwrap().to_string_lossy().into_owned();
+        let path = sessions.join("cold-1.jsonl");
+        let contents = format!(
+            r#"{{"type":"session","version":4,"id":"cold-1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"{cwd}"}}
+{{"type":"message","id":"m1","parentId":null,"seq":0,"timestamp":"2026-05-28T07:14:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"one"}}],"timestamp":1779952440000}}}}
+{{"type":"message","id":"m2","parentId":"m1","seq":1,"timestamp":"2026-05-28T07:14:10.000Z","message":{{"role":"user","content":[{{"type":"text","text":"two"}}],"timestamp":1779952450000}}}}
+"#
+        );
+        std::fs::write(&path, &contents).unwrap();
+
+        // The compat create note with an explicit id (the desktop landing
+        // path, `ClientNote::CreateSession`).
+        client.send(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: "cold-1".into(),
+                cwd: Some(cwd),
+            },
+        });
+        loop {
+            match client.recv() {
+                FromServer::Notification {
+                    note: ServerNote::SessionCreated { session_id },
+                } if session_id == "cold-1" => break,
+                _ => {}
+            }
+        }
+
+        // Restore identity: the live thread is bound to the persisted
+        // journal file. A fresh-minted session carries no active path
+        // (deferred until its first assistant message).
+        let thread = server
+            .0
+            .session_thread("cold-1")
+            .expect("the cold id became a live session");
+        let active = thread.read(|t| t.active_session_path());
+        assert_eq!(
+            active.as_deref(),
+            Some(path.as_path()),
+            "the restored session is bound to the persisted journal file"
+        );
+
+        // The restore reads the journal; it never rewrites it.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+
+        // Teardown: drop the live session, remove the seed file so later
+        // tests' directory scans never see it, and restore the shared
+        // registry path.
+        server.0.dispose_session("test", "cold-1");
+        let _ = std::fs::remove_file(&path);
+        manox_agent::thread_registry::set_registry_path_for_test(None);
+        let _ = std::fs::remove_file(&registry_tmp);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
     #[test]
     fn submit_streams_turn_started_then_finished() {
         let _g = lock_globals();
@@ -3029,6 +3161,10 @@ mod tests {
         );
         drop(client);
         drop(server);
+        // GW11 hygiene: create() with an id whose journal file exists
+        // on disk now RESTORES it; remove this test's seed so the shared
+        // hermetic sessions dir never hijacks a later test's create("s1").
+        let _ = std::fs::remove_file(sessions.join("s1.jsonl"));
         manox_agent::thread_store::drop_global_for_test();
     }
 
@@ -4389,6 +4525,10 @@ mod tests {
         drop(client);
         drop(client_reconn);
         drop(server);
+        // GW11 hygiene: create() with an id whose journal file exists
+        // on disk now RESTORES it; remove this test's seed so the shared
+        // hermetic sessions dir never hijacks a later test's create("s1").
+        let _ = std::fs::remove_file(sessions.join("s1.jsonl"));
         manox_agent::thread_store::drop_global_for_test();
     }
 
@@ -4590,6 +4730,10 @@ mod tests {
         assert_eq!(snap.records.len(), 2, "replay carries the whole chain");
         drop(client);
         drop(server);
+        // GW11 hygiene: create() with an id whose journal file exists
+        // on disk now RESTORES it; remove this test's seed so the shared
+        // hermetic sessions dir never hijacks a later test's create("s1").
+        let _ = std::fs::remove_file(sessions.join("s1.jsonl"));
         manox_agent::thread_store::drop_global_for_test();
     }
 

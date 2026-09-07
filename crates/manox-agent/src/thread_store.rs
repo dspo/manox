@@ -458,6 +458,17 @@ impl ThreadStore {
         self.live_threads.insert(id.to_string(), t.downgrade());
     }
 
+    /// Seed one session path from an authoritative on-disk probe: a cold
+    /// `CreateSession`/`OpenSession` must restore an id no list refresh has
+    /// indexed yet (a bare server never scans). A scanned mapping wins —
+    /// this never overwrites what a refresh grouped (thread-keyed leaf
+    /// pointers).
+    pub fn note_session_path(&mut self, id: &str, path: &std::path::Path) {
+        self.session_paths
+            .entry(id.to_string())
+            .or_insert_with(|| path.to_path_buf());
+    }
+
     /// Seed an active summary row without touching disk — lets foreign test
     /// modules exercise the archive cascade against real thread ids.
     #[cfg(any(test, feature = "test-support"))]
