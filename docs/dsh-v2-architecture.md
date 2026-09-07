@@ -17,7 +17,7 @@
 - **L7 响应不带领域数据**：ClientCall 写操作只回 receipt；领域结果经日志条目/投影到达。
 - **L8 wire 身份 canonical**：模型在 wire 上永远是 `{provider_registration}/{model_id}` 限定串；裸 id 仅服务端输入兼容，解析收敛在 `resolve_model_ref` 一处。
 - **L9 上层只经底座表达状态**：任何 UI 值必须且只需五者之一承载——J 日志条目 / P 推送投影 / Q 按需 fold / H host 事件 / client-owned 本地态。某需求无法表达 = 底座缺口，先扩底座，严禁组件层私开同步通道。
-- **L10 重放等于内存**：`Thread` 全部可观测状态可由 journal 重放确定性重建（回放一致性测试是内核合并门禁）。facade「镜像内核状态」的双份数据在迁移完成后消灭。
+- **L10 重放等于内存**：`Thread` 全部可观测状态可由 journal 重放确定性重建（回放一致性测试是内核合并门禁）。facade「镜像内核状态」的双份数据在迁移完成后消灭。as-built 注（K5）：受理条目的 payload timestamp = 受理时刻，run 内 harness 构造的内存副本与之有毫秒级差异——重放一致性以 journal 为准，timestamp 不作逐字节断言面。
 - **L11 单网关**：一个进程一个 `AgentServer` 实例；所有前端（GPUI/webui/VS Code）经 `RpcConnection`（in-proc 或 loopback WS+token）连它；传输无关由双路径一致性测试保证。
 - **L12 声明面即公开契约**：journal 条目词汇、投影 key 表、host 事件表、协议帧四张声明面（§J）稳定公开、版本化（journal header version、Initialize 携带 protocol epoch）；unknown 变体容忍（丢帧记日志不断连）。生态工具可直接读日志文件（dsh-replay/dsh-timesheet 先例）。
 
@@ -48,7 +48,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 
 | 组 | 条目 | 载荷要点 |
 |---|---|---|
-| transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；条目携带 `origin?`（乐观回显退休；**as-built**：Submit 的 origin_rpc 经 `SessionCmd::Prompt` → `Session::set_pending_user_origin` → 持久化中间件在本 turn 首个 user 消息落盘时一次性消费，`append_message_with_origin` 钉入条目） |
+| transcript | `message` | user/assistant/tool 消息；assistant 携带 `usage`（input/output/cacheRead/cacheWrite/reasoning）；条目携带 `origin?`（乐观回显退休；**as-built**：Submit 的 origin_rpc 经 `SessionCmd::Prompt` → `Session::set_pending_user_origin` → 持久化中间件在本 turn 首个 user 消息落盘时一次性消费，`append_message_with_origin` 钉入条目；**K5 as-built**：user 条目两个持久时机——direct Submit 在网关受理时 durable 落盘（`persist_user_submission`，accepted⟹logged：receipt 跟条目落地走，持久失败拒绝 receipt；网关跳过条件=残留 pending 会使合并 prompt 偏离本文本），或 queued Submit 在 actor drain 先于 run 持久（合并单条目）；middleware 经 `Session.accepted_user_entry`（entry id+序列化 content 精确匹配）one-shot 跳过重复 append（内容匹配防 next_turn/steer 的 user 行被误跳），jsonl duplicate-id 拒绝仅为结构防线。原设计「消息 id 作条目 id」修订为 pinned(entry_id, content) 槽——AgentMessage::User 无 id 字段，加字段会穿透 provider 序列化与 C.1 信封键独占） |
 | transcript | `ui_note` | 现 AppendUiNote 改 durable |
 | lifecycle | `turn_start` / `turn_finish{cancelled,failed,strandedSteerIds}` / `stop{reason}` / `retry{attempt,maxAttempts,delaySecs,reason}` / `error{message}` | `anyhow::Error` 过线/落盘转 `{message}` |
 | 流式 delta | `agent_text_delta{delta}` / `agent_thinking_delta{delta}` / `tool_call{callId,name,title,status,input}` / `tool_result{callId,output,isError}` / `tool_output_chunk{callId,chunk}` / `subagent_child{agentId,event}` / `subagent_progress{agentId,...}`（≥500ms 或状态变化才记） | dsh chunk 全落盘同款；分页读取端可做 chunk-run 打包（优化，不改语义）；`callId`/`agentId` 遵守 §C.1 信封键独占规则（**as-built**：kernel 侧字段名为 `delta`，wire 映射在 translate 层改名 `s`→`delta` 或直接沿用，见 T4 报告） |
@@ -67,6 +67,7 @@ L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine 
 - 读 API：`journal.cursor() -> u64`、`journal.slice(from..to) -> Vec<JournalEvent>`、`journal.replay() -> Thread`（L10 门禁）。compaction 后 `slice` 的 records 视图从 `firstKeptEntryId` 起（seq 连续性不变）。
 - 写放大对策：组提交（批量 flush，默认不逐条 fsync）；页读 chunk-run 打包。唯一允许的回退是 `subagent_progress` 降频，不得回退「条目皆可重放」。
 - 整文件重写原子性（K7）：懒 v3→v4 迁移与 deferred 物化一律经 sibling `.jsonl.tmp` 原子替换（write→fsync→rename→best-effort 目录 fsync）：崩溃或并发读者（侧栏扫描、生态工具、follow 冷读）只见完整旧文件或完整新文件，永不见截断中间态；`.tmp` 后缀不入会话目录扫描。
+- **durable append 面（K5/K4 as-built）**：storage trait 增 `append_entry_durable`（Jsonl 实现强制 deferred 物化：header 重写 + 已缓冲行 + 本行原子落盘），Session 增 `append_message_durable`；deferred 物化触发 = 首条 assistant 消息（TS parity 不变）**或任一 durable 标记的 append**；受理过 Submit 的 session 视为已交互、非 zombie。typed-append 写面统一 fail-loud（K4）：有界重试（3 次 × 50ms×attempt 退避）→ 永久失败 = durable `error` 条目记录丢失 kind 与原因（storage 自身 down 时 park 进 pending_journal，settle/idle drain 重试，恢复后可见；`error`-kind 行永不自补偿——断 tap 反馈环）+ facade `ThreadEvent::Error` 通知 + mid-run fail-closed（serializer abort 折进 abort_requested，settle 报 cancelled）。对照面：middleware 的 message-append 失败即 abort run（无重试，Wave 2 对称化候选）；`persist_ui_note` 仍静默（同列）。
 
 ## D. 协议 v2 完备规格（manox-protocol）
 

@@ -791,7 +791,11 @@ async fn handle_call(
             text,
             images,
             origin_rpc,
-        } => inner.submit(client_id, &session_id, text, images, None, origin_rpc),
+        } => {
+            inner
+                .submit(client_id, &session_id, text, images, None, origin_rpc)
+                .await
+        }
         ClientCall::Steer {
             session_id,
             message_id,
@@ -997,7 +1001,9 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             client_id,
         } => {
             // Compat entry: forward to the §D.2 receipt path, discard.
-            let _ = inner.submit(owner, &session_id, text, images, client_id, None);
+            let _ = inner
+                .submit(owner, &session_id, text, images, client_id, None)
+                .await;
         }
         ClientNote::Steer {
             session_id,
@@ -1345,12 +1351,14 @@ impl AgentServerInner {
 
     /// §D.2 `Submit`: performs the submission and answers with the receipt
     /// `{accepted, message_id?}` (L7 — the transcript arrives through the
-    /// follow stream). The `origin_rpc` correlation is accepted but not
-    /// journaled: the kernel user-message row has no origin field yet
-    /// (kernel-type change, lands at T5 — T4 gap in the delivery report);
-    /// the receipt + `message_id` is the interim retirement key. The
-    /// compat `ClientNote::Submit` forwards here with `origin_rpc = None`.
-    fn submit(
+    /// follow stream). K5: a direct (non-queued, non-slash) submission is
+    /// persisted BEFORE the receipt — accepted ⟹ logged — through
+    /// `ThreadEngine::persist_user_submission`; a persistence failure
+    /// REFUSES the receipt (coded `gateway/internal`). The `origin_rpc`
+    /// correlation rides the pinned origin on the entry (receipt-id pairing
+    /// from the append point is GW8). The compat `ClientNote::Submit`
+    /// forwards here with `origin_rpc = None`.
+    async fn submit(
         &self,
         owner: &str,
         session_id: &str,
@@ -1407,51 +1415,99 @@ impl AgentServerInner {
             });
             return receipt(true, None);
         }
-        // `slash` consumed the text display; the outcome distinguishes an
-        // empty submission (accepted = false) from a command / transcript
-        // insert.
-        enum Outcome {
-            Slash,
-            Empty,
-            Inserted,
-        }
-        let outcome = thread.with_mut(|t| {
-            t.set_pending_turn_origin(origin_rpc);
-            let ui = MessageUiMetadata {
-                model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
-                ..Default::default()
-            };
+        // Slash resolution first (its handlers mutate the facade): a slash
+        // hit keeps the legacy transcript semantics and never takes the
+        // accept-time persist path. The origin pin lands here, as before —
+        // a run started by a slash builtin carries it.
+        let slashed = thread.with_mut(|t| {
+            t.set_pending_turn_origin(origin_rpc.clone());
             if let Some((name, args)) = slash {
+                let ui = MessageUiMetadata {
+                    model_id: t.model().map(|m| m.id.clone()),
+                    approval_mode: Some(t.permission_mode().as_i64()),
+                    ..Default::default()
+                };
                 let slash_ui = MessageUiMetadata {
                     display_text: Some(text.clone()),
-                    ..ui.clone()
+                    ..ui
                 };
                 let builtin_hit = t.run_slash_builtin(&name, &args, Some(slash_ui.clone()));
                 let command_hit = manox_agent::command::try_global().is_some()
                     && t.submit_command(&name, &args, Some(slash_ui.clone()));
                 let skill_hit = manox_agent::skill::try_global().is_some()
                     && t.submit_skill(&name, &args, Some(slash_ui));
-                if builtin_hit || command_hit || skill_hit {
-                    return Outcome::Slash;
+                return builtin_hit || command_hit || skill_hit;
+            }
+            false
+        });
+        if slashed {
+            return receipt(true, None);
+        }
+        if text.trim().is_empty() && images.is_empty() {
+            return receipt(false, None);
+        }
+        // K5 (accepted ⟹ logged): persist the user entry BEFORE the
+        // receipt. Skipped when residual pending prompts would make
+        // run_turn's merged prompt differ from this text — the actor's
+        // drain-time persistence then covers the merged entry under the
+        // same content-match contract (persist_prompt_user_entry). An
+        // unmaterialized engine answers Ok(None) and falls to the same
+        // drain path.
+        let mut accepted_entry: Option<String> = None;
+        if !thread.read(|t| t.has_pending_prompts())
+            && let Some(engine) = thread.read(|t| t.engine_handle())
+        {
+            // The SAME (text, images) run_turn will hand the engine — the
+            // middleware skip is an exact content match (K5 contract):
+            // text normalized like `to_message_content` (no Text block
+            // when blank), images as kernel ContentBlocks.
+            let persist_text = if text.trim().is_empty() {
+                String::new()
+            } else {
+                text.clone()
+            };
+            let blocks: Vec<manox_harness::types::ContentBlock> = images
+                .iter()
+                .map(
+                    |(data, mime_type)| manox_harness::types::ContentBlock::Image {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                    },
+                )
+                .collect();
+            match engine
+                .persist_user_submission(&persist_text, blocks, origin_rpc.clone())
+                .await
+            {
+                Ok(id) => accepted_entry = id,
+                Err(err) => {
+                    // No durability, no receipt. Un-pin the origin so a
+                    // later run does not misattribute this refused submit,
+                    // and tell the client why.
+                    thread.with_mut(|t| t.set_pending_turn_origin(None));
+                    let message = format!("submit persistence failed: {err}");
+                    self.note_error(session_id, &message);
+                    return Err(RpcError::new(-1, message)
+                        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
                 }
             }
+        }
+        // Insert + run. The pin arms the actor's middleware skip so the
+        // run's own user MessageEnd records the accepted entry instead of
+        // appending a duplicate.
+        thread.with_mut(|t| {
+            t.set_pending_turn_accepted_entry(accepted_entry);
+            let ui = MessageUiMetadata {
+                model_id: t.model().map(|m| m.id.clone()),
+                approval_mode: Some(t.permission_mode().as_i64()),
+                ..Default::default()
+            };
             let content = to_message_content(text, images);
-            if content.is_empty() {
-                return Outcome::Empty;
-            }
             t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
             t.run_turn();
-            Outcome::Inserted
         });
-        match outcome {
-            Outcome::Empty => receipt(false, None),
-            Outcome::Slash => receipt(true, None),
-            Outcome::Inserted => {
-                let message_id = thread.read(|t| t.last_user_message_id().map(str::to_string));
-                receipt(true, message_id)
-            }
-        }
+        let message_id = thread.read(|t| t.last_user_message_id().map(str::to_string));
+        receipt(true, message_id)
     }
 
     /// §D.2 `Steer`: injects the steer and answers with the receipt
@@ -2524,6 +2580,10 @@ mod tests {
     use crate::test_support::{hermetic_home, init_globals, lock_globals};
     use manox_protocol::in_process_pair;
 
+    /// K5 probe record: one `run_with_origin` call — (prompt, origin,
+    /// accepted entry).
+    type OriginRun = (String, Option<String>, Option<String>);
+
     /// A scripted engine: records runs/steers/authorizations and lets a test
     /// inject `BackendNotice`s to drive the pump.
     struct FakeEngine {
@@ -2553,6 +2613,16 @@ mod tests {
         /// live PiEngine actor.
         journal_tx: tokio::sync::broadcast::Sender<manox_agent::engine::JournalFeed>,
         journal_data: StdMutex<manox_agent::engine::JournalSnapshotData>,
+        /// K5 probes: every `persist_user_submission` call — (text, image
+        /// count, origin) in order — and the scripted reply (`None` =
+        /// Ok(None) drain fallback; `Err(())` = storage failure). The trait
+        /// default would silently answer Ok(None), hiding the accept-time
+        /// persist contract from gateway tests.
+        persist_calls: StdMutex<Vec<(String, usize, Option<String>)>>,
+        persist_reply: StdMutex<Option<Result<Option<String>, ()>>>,
+        /// K5 probe: run_with_origin records — (prompt, origin, accepted
+        /// entry) — the pin-arming observable.
+        origin_runs: StdMutex<Vec<OriginRun>>,
     }
 
     impl FakeEngine {
@@ -2577,9 +2647,17 @@ mod tests {
                         cursor: 0,
                         records: Vec::new(),
                     }),
+                    persist_calls: StdMutex::new(Vec::new()),
+                    persist_reply: StdMutex::new(None),
+                    origin_runs: StdMutex::new(Vec::new()),
                 }),
                 events,
             )
+        }
+
+        /// Script the accept-time persistence reply (K5 gateway tests).
+        fn set_persist_reply(&self, reply: Option<Result<Option<String>, ()>>) {
+            *self.persist_reply.lock().unwrap() = reply;
         }
 
         /// Replace the scripted whole-chain read (§C.3): the cursor and the
@@ -2615,6 +2693,40 @@ mod tests {
         }
         fn run(&self, prompt: String, _: Vec<manox_harness::types::ContentBlock>) {
             self.runs.lock().unwrap().push(prompt);
+        }
+        fn run_with_origin(
+            &self,
+            prompt: String,
+            images: Vec<manox_harness::types::ContentBlock>,
+            origin: Option<String>,
+            accepted_entry: Option<String>,
+        ) {
+            self.origin_runs
+                .lock()
+                .unwrap()
+                .push((prompt.clone(), origin, accepted_entry));
+            self.run(prompt, images);
+        }
+        fn persist_user_submission(
+            &self,
+            text: &str,
+            images: Vec<manox_harness::types::ContentBlock>,
+            origin: Option<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<String>, anyhow::Error>> + Send>,
+        > {
+            self.persist_calls
+                .lock()
+                .unwrap()
+                .push((text.to_string(), images.len(), origin));
+            let reply = self.persist_reply.lock().unwrap().clone();
+            Box::pin(async move {
+                match reply {
+                    None => Ok(None),
+                    Some(Ok(id)) => Ok(id),
+                    Some(Err(())) => Err(anyhow::Error::msg("persist failure (test)")),
+                }
+            })
         }
         fn steer(&self, text: String, _: Vec<manox_harness::types::ContentBlock>) -> String {
             self.steer_calls.lock().unwrap().push(text);
@@ -6717,6 +6829,116 @@ mod tests {
         }
         drop(client);
         drop(_server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// K5 gateway regression: a direct Submit persists BEFORE its receipt
+    /// (accepted ⟹ logged). By the time the receipt arrives the persist
+    /// call is recorded with the SAME text/images/origin the run carries,
+    /// and the run itself carries the accepted entry id — the pin that
+    /// arms the middleware's one-shot duplicate skip.
+    #[test]
+    fn submit_receipt_waits_for_accept_time_persistence() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        engine.set_persist_reply(Some(Ok(Some("entry-42".to_string()))));
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Request {
+            id: MsgId::new("sub-1"),
+            call: ClientCall::Submit {
+                session_id: "s1".into(),
+                text: "persist me".into(),
+                images: vec![ImageAttachment {
+                    data: vec![1, 2, 3],
+                    mime_type: "image/png".into(),
+                }],
+                origin_rpc: Some("rpc-9".into()),
+            },
+        });
+        let outcome = loop {
+            if let FromServer::Response { id, outcome } = client.recv() {
+                assert_eq!(id.0, "sub-1");
+                break outcome;
+            }
+        };
+        assert!(
+            outcome.is_ok(),
+            "the receipt answers once persistence landed"
+        );
+        assert_eq!(
+            engine.persist_calls.lock().unwrap().clone(),
+            vec![("persist me".to_string(), 1, Some("rpc-9".to_string()))],
+            "persist precedes the receipt with the run's own (text, images, origin)"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let runs = engine.origin_runs.lock().unwrap().clone();
+            if !runs.is_empty() {
+                assert_eq!(runs[0].0, "persist me");
+                assert_eq!(runs[0].1, Some("rpc-9".to_string()));
+                assert_eq!(
+                    runs[0].2,
+                    Some("entry-42".to_string()),
+                    "the run carries the accepted entry (middleware-skip pin)"
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// K5 gateway regression: when persistence FAILS the Submit must not
+    /// receipt as accepted (accepted ⟹ logged) — the caller gets a coded
+    /// error and no turn starts.
+    #[test]
+    fn submit_persistence_failure_refuses_the_receipt() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        engine.set_persist_reply(Some(Err(())));
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        client.send(FromClient::Request {
+            id: MsgId::new("sub-2"),
+            call: ClientCall::Submit {
+                session_id: "s1".into(),
+                text: "doomed".into(),
+                images: vec![],
+                origin_rpc: Some("rpc-x".into()),
+            },
+        });
+        let outcome = loop {
+            if let FromServer::Response { id, outcome } = client.recv() {
+                assert_eq!(id.0, "sub-2");
+                break outcome;
+            }
+        };
+        let err = outcome.expect_err("a failed persist must refuse the receipt");
+        assert_eq!(
+            err.data.unwrap()["code"],
+            manox_protocol::msg::CODE_GATEWAY_INTERNAL
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            engine.runs.lock().unwrap().is_empty(),
+            "a refused submit must not start a run"
+        );
+        assert!(engine.origin_runs.lock().unwrap().is_empty());
+        drop(client);
+        drop(server);
         manox_agent::thread_store::drop_global_for_test();
     }
 }

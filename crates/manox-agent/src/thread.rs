@@ -1209,6 +1209,14 @@ impl Thread {
         self.pending_turn_accepted_entry = entry_id;
     }
 
+    /// The materialized engine handle, if any (`None` before landing /
+    /// `ensure_engine`). K5 gateway seam: clone the Arc and await
+    /// `persist_user_submission` OUTSIDE any facade lock — an async append
+    /// must never be awaited under `read`/`with_mut`.
+    pub fn engine_handle(&self) -> Option<Arc<dyn ThreadEngine>> {
+        self.engine.clone()
+    }
+
     pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
