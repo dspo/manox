@@ -8514,4 +8514,218 @@ mod tests {
             "C2: uncoded RpcError sites — every gateway error must carry a §D.7 stable code via `.with_code(...)`: {uncoded:?}"
         );
     }
+
+    /// J1 gate (real-composition emission coverage, §J.4): every declared
+    /// `HostEvent` must FIRE through the real gateway and every declared
+    /// `ClientCall` must be ANSWERED (a coded error is an answer — the
+    /// gateway spoke). The walk reads the C3 declaration tables as its
+    /// checklist, so a variant added to the wire vocabulary but not to the
+    /// real composition fails here instead of in production. The former
+    /// §J.4 "coverage" walked self-referential samples (scripted values
+    /// asserting themselves); this walks the live server. The journal-entry
+    /// face (37 tags through the follow stream) extends this gate when the
+    /// K1 all-types session builder lands.
+    #[test]
+    fn real_composition_emits_every_host_event_and_answers_every_client_call() {
+        use manox_protocol::surface::{CLIENT_CALLS, HOST_EVENTS, client_call_tag, host_wire_tag};
+        use std::collections::{HashMap, HashSet};
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        // The handshake's Host Ready echo is asserted (and consumed) by
+        // harness() itself — every test through it pins that frame.
+        let mut host_tags: HashSet<&'static str> = HashSet::new();
+        host_tags.insert("ready");
+
+        // A live session: the compat create fires SessionCreated (note,
+        // then the directed Host mirror — queued behind the note, so the
+        // drain below breaks on the note and the Host frame stays for the
+        // collection loop).
+        client.send(FromClient::Notification {
+            note: ClientNote::CreateSession {
+                session_id: "j1-s".into(),
+                cwd: Some("/".into()),
+            },
+        });
+        loop {
+            if let FromServer::Notification {
+                note: ServerNote::SessionCreated { session_id },
+            } = client.recv()
+            {
+                assert_eq!(session_id, "j1-s");
+                break;
+            }
+        }
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("j1-s", engine.clone(), events);
+        // The SessionStatus Host edge: a turn starting on the scripted
+        // engine. Drained to observation BEFORE the dispose below — the
+        // dispose stops the pump, and the gate must not race it.
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)))
+            .unwrap();
+        loop {
+            match client.recv() {
+                FromServer::Host { host } => {
+                    let tag = host_wire_tag(&host);
+                    host_tags.insert(tag);
+                    if tag == "sessionStatus" {
+                        break;
+                    }
+                }
+                FromServer::Notification { .. } => {}
+                other => panic!("unexpected frame before the status edge: {other:?}"),
+            }
+        }
+
+        // Every declared ClientCall, each under its own MsgId. The
+        // expected-answer set IS the declaration table: retired stubs
+        // answer with their coded error, the terminal stubs with
+        // feature/unavailable, ModelChat with the unknown-model note +
+        // empty receipt, CancelDelivery with cancelled:false — all
+        // answers, all counted.
+        let calls: Vec<ClientCall> = vec![
+            ClientCall::Initialize(Initialize {
+                client_id: "test".into(),
+                capabilities: vec![],
+                sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
+            }),
+            ClientCall::OpenSession {
+                session_id: "j1-s".into(),
+            },
+            ClientCall::ListThreads,
+            ClientCall::ListModels,
+            ClientCall::ListCommands,
+            ClientCall::GetUsage {
+                session_id: "j1-s".into(),
+            },
+            ClientCall::GetCurrentModel {
+                session_id: "j1-s".into(),
+            },
+            ClientCall::ThreadInfo {
+                session_id: "j1-s".into(),
+            },
+            ClientCall::TerminalAttach {
+                session: "j1-s".into(),
+                cols: 80,
+                rows: 24,
+            },
+            ClientCall::TerminalSnapshot {
+                terminal: "t1".into(),
+            },
+            ClientCall::ModelChat {
+                request_id: "j1-r".into(),
+                model: "no-such/model".into(),
+                messages: serde_json::json!([]),
+                tools: serde_json::json!([]),
+            },
+            ClientCall::CreateSession {
+                cwd: Some("/".into()),
+                project: None,
+                initial_model: None,
+                approval_mode: None,
+                reasoning_effort: None,
+            },
+            ClientCall::Submit {
+                session_id: "j1-s".into(),
+                text: "j1 submit".into(),
+                images: vec![],
+                origin_rpc: Some("j1-origin".into()),
+            },
+            ClientCall::Steer {
+                session_id: "j1-s".into(),
+                message_id: "j1-steer".into(),
+                text: "j1 nudge".into(),
+                images: vec![],
+                origin_rpc: None,
+            },
+            ClientCall::PageHistory {
+                session_id: "j1-s".into(),
+                through_seq: -1,
+                before_seq: None,
+                max_messages: None,
+            },
+            ClientCall::GetConversationInfo {
+                session_id: "j1-s".into(),
+            },
+            ClientCall::CancelDelivery {
+                delivery_id: "j1-nope".into(),
+            },
+        ];
+        let mut expected: HashMap<String, &'static str> = HashMap::new();
+        for (i, call) in calls.into_iter().enumerate() {
+            let tag = client_call_tag(&call);
+            let id = format!("j1-c{i}");
+            expected.insert(id.clone(), tag);
+            client.send(FromClient::Request {
+                id: MsgId::new(id),
+                call,
+            });
+        }
+        // The Error Host mirror: the terminal note stub answers its sender
+        // with a directed Error (note + host, GW7/GW1).
+        client.send(FromClient::Notification {
+            note: ClientNote::TerminalInput {
+                terminal: "t1".into(),
+                bytes: b"ls\n".to_vec(),
+            },
+        });
+        // The SessionDisposed Host mirror — sent LAST: FIFO dispatch queues
+        // every earlier answer ahead of the dispose.
+        client.send(FromClient::Notification {
+            note: ClientNote::DisposeSession {
+                session_id: "j1-s".into(),
+            },
+        });
+
+        // Collect until both declared sets are covered (recv carries its
+        // own timeout — a frame that never comes fails loudly there).
+        let mut answered: HashSet<&'static str> = HashSet::new();
+        // The deadline breaks the loop with the frames seen so far, so the
+        // asserts below NAME the missing surfaces instead of riding the
+        // 30s recv timeout (total silence still fails loudly there).
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if answered.len() == expected.len() && HOST_EVENTS.iter().all(|t| host_tags.contains(t))
+            {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            match client.recv() {
+                FromServer::Host { host } => {
+                    host_tags.insert(host_wire_tag(&host));
+                }
+                FromServer::Response { id, .. } => {
+                    if let Some(tag) = expected.get(&id.0) {
+                        answered.insert(tag);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let missing_calls: Vec<&&str> = CLIENT_CALLS
+            .iter()
+            .filter(|t| !answered.contains(**t))
+            .collect();
+        assert!(
+            missing_calls.is_empty(),
+            "J1: declared ClientCalls the real composition never answered: {missing_calls:?}"
+        );
+        let missing_hosts: Vec<&&str> = HOST_EVENTS
+            .iter()
+            .filter(|t| !host_tags.contains(*t))
+            .collect();
+        assert!(
+            missing_hosts.is_empty(),
+            "J1: declared HostEvents the real composition never emitted: {missing_hosts:?}"
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
 }
