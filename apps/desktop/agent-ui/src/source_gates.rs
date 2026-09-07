@@ -50,7 +50,11 @@ mod tests {
         const SENDS: &[&str] = &[".send_call(", ".send_note("];
         // (file, pattern-family name, needles, frozen count)
         let budget: &[(&str, &str, &[&str], usize)] = &[
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 27),
+            // U3a: nine redundant mirror writes removed (the server pump is the
+            // single writer in-proc); the residual budget is sanctioned
+            // debt — error-arm mark_idle gaps, verdict-time clears,
+            // user-action writes awaiting gateway calls (U3b).
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 18),
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 8),
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 30),
             ("workspace.rs", "protocol sends (U9)", SENDS, 18),

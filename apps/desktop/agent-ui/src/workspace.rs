@@ -1261,16 +1261,11 @@ impl Workspace {
                         r.cockpit_phase = CockpitPhase::AwaitingApproval;
                         cx.notify();
                     });
-                    // The card is visible now, but the marker survives a
-                    // switch-away before the verdict: a parked thread blocked
-                    // on this authorization still shows the sidebar badge.
-                    let thread_id = this
-                        .store
-                        .as_ref()
-                        .map(|s| s.read(cx).store.id.0.clone())
-                        .expect("foreground store present");
-                    let store = manox_agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_auth(&thread_id, true));
+                    // U3a: the pending-auth badge is the server pump's
+                    // store write + SessionStatus delta (single writer,
+                    // §F.2) — a parked thread blocked on this authorization
+                    // keeps its badge through the pump, not through a
+                    // desktop mirror write that only raced it.
                     cx.notify();
                 }
                 ThreadEvent::PlanReady { plan_file, title } => {
@@ -1289,16 +1284,11 @@ impl Workspace {
                     });
                     // The AgentServer pump already persisted the pending
                     // verdict flag on PlanReady (agent_server.rs), so a
-                    // restart re-emits the card without a UI-side write.
-                    // The sidebar row pauses its spinner (blue static) while
-                    // the verdict is due; `respond_plan_review` releases it.
-                    let thread_id = this
-                        .store
-                        .as_ref()
-                        .map(|s| s.read(cx).store.id.0.clone())
-                        .expect("foreground store present");
-                    let store = manox_agent::thread_store_global();
-                    store.with_mut(|s| s.mark_pending_plan(&thread_id, true));
+                    // restart re-emits the card without a UI-side write —
+                    // and U3a: the pump's store write + SessionStatus delta
+                    // are the badge's single writer. The sidebar row pauses
+                    // its spinner (blue static) while the verdict is due;
+                    // `respond_plan_review` releases it.
                     this.sync_list_count(cx);
                     // The finalized plan surfaces at the tail; reveal it like any
                     // user-initiated jump to the live end.
@@ -1377,21 +1367,10 @@ impl Workspace {
                     cx.notify();
                 }
                 ThreadEvent::TurnStarted => {
-                    // Light up the sidebar running indicator immediately —
-                    // before the first streaming delta arrives (model warm-up,
-                    // network latency). Terminal `TurnFinished`/`Error` below
-                    // clear it. A new turn also supersedes a stale error flag
-                    // from the previous turn.
-                    let thread_id = this
-                        .store
-                        .as_ref()
-                        .map(|s| s.read(cx).store.id.0.clone())
-                        .expect("foreground store present");
-                    let store = manox_agent::thread_store_global();
-                    store.with_mut(|s| {
-                        s.mark_running(&thread_id);
-                        s.set_errored(&thread_id, false);
-                    });
+                    // U3a: the running indicator is the server pump's store
+                    // write + SessionStatus delta (single writer) — it still
+                    // lights before the first streaming delta arrives (the
+                    // pump sees TurnStarted off the same facade broadcast).
                     // Drive the Thinking status row's per-second "for Xs"
                     // counter while this turn is live. The ticker polls
                     // `turn_active` and self-terminates on the terminal stop.
@@ -1433,24 +1412,11 @@ impl Workspace {
                         .map(|s| s.read(cx).store.id.0.clone())
                         .expect("foreground store present");
                     refresh_thread_list();
-                    // Sidebar running indicator: the turn released the running
-                    // slot, so the row stops spinning. A successful or
-                    // cancelled turn also supersedes a stale error flag. The
-                    // pending-plan badge survives a normal settle while a
-                    // review is still up (the card stays active below) — it
-                    // clears only when the verdict is moot or absent.
-                    let keep_plan_badge =
-                        !(*cancelled || *failed) && this.pending_plan_review.is_some();
-                    let store = manox_agent::thread_store_global();
-                    store.with_mut(|s| {
-                        s.mark_idle(&thread_id);
-                        if !keep_plan_badge {
-                            s.mark_pending_plan(&thread_id, false);
-                        }
-                        if !*failed {
-                            s.set_errored(&thread_id, false);
-                        }
-                    });
+                    // U3a: the settle flags (idle / pending-plan / errored)
+                    // are the server pump's store writes — one writer, no
+                    // race with this former mirror. The pump clears
+                    // pending-plan unconditionally at settle; the review
+                    // card's own demote below is UI state, not a store flag.
                     this.turn_active = false;
                     this.background_threads
                         .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
@@ -1792,17 +1758,12 @@ impl Workspace {
     ) -> Subscription {
         let store = store.clone();
         cx.subscribe(&store, move |this, _store, ev: &ThreadEvent, cx| match ev {
-            ThreadEvent::TurnStarted => {
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_running(&id));
-            }
-            ThreadEvent::ToolCallAuthorization { .. } => {
-                // A parked thread's question card is not visible; the
-                // sidebar badge is the only signal until the user
-                // switches back and the card re-surfaces.
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_pending_auth(&id, true));
-            }
+            // U3a: TurnStarted / ToolCallAuthorization badges are the
+            // server pump's store writes + SessionStatus deltas (single
+            // writer) — a parked thread's badge survives until the user
+            // switches back without a desktop mirror write. The heuristic
+            // auth CLEARS below stay (no server-side verdict-time clear
+            // exists yet — U3b debt).
             ThreadEvent::ToolCall { status, .. }
                 if !matches!(status, manox_agent::thread::ToolCallStatus::PendingApproval) =>
             {
@@ -1836,8 +1797,8 @@ impl Workspace {
                         content,
                     },
                 );
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_pending_plan(&id, true));
+                // U3a: the pending-plan badge rides the pump's PlanReady
+                // store write + delta (single writer).
             }
             ThreadEvent::TurnFinished {
                 cancelled,
@@ -1853,18 +1814,10 @@ impl Workspace {
                 if *cancelled || *failed {
                     this.pending_plans.remove(&id);
                 }
-                let has_stashed_plan = this.pending_plans.contains_key(&id);
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| {
-                    s.mark_idle(&id);
-                    if !has_stashed_plan {
-                        s.mark_pending_plan(&id, false);
-                    }
-                    s.mark_pending_auth(&id, false);
-                    if !*failed {
-                        s.set_errored(&id, false);
-                    }
-                });
+                // U3a: the settle flags are the pump's store writes (single
+                // writer); the stashed-plan nuance was already overridden by
+                // the pump's unconditional clear in-proc — the stash itself
+                // (UI state) is untouched.
                 // GW5: the parked settle's unread rise rides the leaf
                 // mirror (the client-owned badge source), not the
                 // server-side store mirror.
@@ -1896,13 +1849,9 @@ impl Workspace {
                 this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
             }
             ThreadEvent::BackgroundTaskUpdated { .. } => {
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| {
-                    s.mark_background_work(
-                        &id,
-                        manox_agent::background_task::thread_has_running_tasks(&id),
-                    );
-                });
+                // U3a: the background-work flag is the pump's store write +
+                // delta (single writer; the pump computes the same
+                // thread_has_running_tasks outside the store lock).
                 // GW5: a parked background-task update lights the badge
                 // through the leaf mirror, not the server-side store.
                 this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
