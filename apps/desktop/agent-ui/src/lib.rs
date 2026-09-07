@@ -22,6 +22,7 @@ pub mod multiplexer;
 pub(crate) mod overlap_diag;
 pub mod server_note_translate;
 pub mod slash_command;
+pub(crate) mod source_gates;
 pub mod views;
 pub mod vscode_app;
 pub mod workspace;
