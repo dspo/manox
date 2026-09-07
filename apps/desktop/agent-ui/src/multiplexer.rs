@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui::{AppContext as _, Context, Entity, Task};
+use gpui::{App, AppContext as _, Context, Entity, Task};
 
 use manox_protocol::handshake::HookKind;
 use manox_protocol::journal::ModelRef;
@@ -78,6 +78,9 @@ pub struct SessionMultiplexer {
     create_callbacks: HashMap<MsgId, CreateCallback>,
     _pump: Task<()>,
     _leaf_pump: Task<()>,
+    /// The client-owned focus (§F.2/GW5): the attached session's leaf
+    /// suppresses unread rises. Replaces the retired server-side mirror.
+    focused: Option<String>,
 }
 
 impl SessionMultiplexer {
@@ -121,6 +124,7 @@ impl SessionMultiplexer {
             create_callbacks: HashMap::new(),
             _pump,
             _leaf_pump,
+            focused: None,
         }
     }
 
@@ -184,30 +188,10 @@ impl SessionMultiplexer {
     /// for its session).
     fn route(&mut self, msg: FromServer, cx: &mut Context<Self>) {
         // §D.5 host events are global: fan out to all leaves, then return.
+        // U3/GW5: the leaves' client-owned mirrors are the only desktop
+        // consumer — the former thread-store mirror block here duplicated
+        // the server pump's own store writes (single-writer, §F.2).
         if let FromServer::Host { host } = &msg {
-            // Mirror `SessionStatus` into the thread-store (sidebar) flags
-            // under the §D.5 monotonic rules, so parked and foreground rows
-            // stay honest even without a live per-thread subscription.
-            if let manox_protocol::stream::HostEvent::SessionStatus {
-                session_id,
-                running,
-                errored,
-                unread,
-                pending_auth,
-                pending_plan,
-                background_work,
-            } = host
-            {
-                self.mirror_session_status(
-                    session_id,
-                    *running,
-                    *errored,
-                    *unread,
-                    *pending_auth,
-                    *pending_plan,
-                    *background_work,
-                );
-            }
             for handle in self.sessions.values() {
                 let m = FromServer::Host { host: host.clone() };
                 handle.update(cx, |h, cx| h.apply_from_server(m, cx));
@@ -362,6 +346,13 @@ impl SessionMultiplexer {
             h
         });
         self.sessions.insert(session_id.to_string(), handle.clone());
+        // A leaf created while its session is focused starts active (the
+        // attach flow can create the leaf after set_focused).
+        if self.focused.as_deref() == Some(session_id) {
+            handle.update(cx, |h, cx| {
+                h.set_active(true, cx);
+            });
+        }
         handle
     }
 
@@ -388,49 +379,49 @@ impl SessionMultiplexer {
         self.create_callbacks.insert(id, on_done);
     }
 
-    /// §D.5 monotonic mirror of a `SessionStatus` delta into the thread-store
-    /// sidebar flags: running takes the latest value, `errored` is a rising
-    /// edge cleared by a fresh turn, `unread` only rises (focus clears it),
-    /// the pending flags take the latest value.
-    // §D.5 SessionStatus carries six independent optional flags; the
-    // monotonic rules read each one by one — a struct would add ceremony.
-    #[allow(clippy::too_many_arguments)]
-    fn mirror_session_status(
-        &self,
-        session_id: &str,
-        running: Option<bool>,
-        errored: Option<bool>,
-        unread: Option<bool>,
-        pending_auth: Option<bool>,
-        pending_plan: Option<bool>,
-        background_work: Option<bool>,
-    ) {
-        use manox_agent::thread_store::global;
-        let id = session_id.to_string();
-        global().with_mut(|s| {
-            if running == Some(true) {
-                // A fresh turn supersedes the previous turn's error edge.
-                s.set_errored(&id, false);
-                s.mark_running(&id);
-            } else if running == Some(false) {
-                s.mark_idle(&id);
-            }
-            if errored == Some(true) {
-                s.set_errored(&id, true);
-            }
-            if unread == Some(true) {
-                s.set_unread(&id, true);
-            }
-            if let Some(p) = pending_auth {
-                s.mark_pending_auth(&id, p);
-            }
-            if let Some(p) = pending_plan {
-                s.mark_pending_plan(&id, p);
-            }
-            if let Some(b) = background_work {
-                s.mark_background_work(&id, b);
-            }
-        });
+    /// Client-side focus transition (§F.2/GW5): the newly attached
+    /// session's leaf goes active (clearing its monotonic unread/errored
+    /// mirrors); the previously attached one goes inert. Selection is
+    /// client-owned — the server-side focus mirror is retired.
+    pub fn set_focused(&mut self, session_id: Option<&str>, cx: &mut Context<Self>) {
+        if self.focused.as_deref() == session_id {
+            return;
+        }
+        if let Some(prev) = self.focused.take()
+            && let Some(leaf) = self.sessions.get(&prev)
+        {
+            leaf.update(cx, |h, cx| {
+                h.set_active(false, cx);
+            });
+        }
+        self.focused = session_id.map(str::to_string);
+        if let Some(sid) = session_id
+            && let Some(leaf) = self.sessions.get(sid)
+        {
+            leaf.update(cx, |h, cx| {
+                h.set_active(true, cx);
+            });
+        }
+    }
+
+    /// The client-owned unread mirrors of every live leaf (GW5): the
+    /// sidebar badge source — rows prefer these over the list summary's
+    /// flag, which the server-side mirror retirement empties.
+    pub fn unread_map(&self, cx: &App) -> HashMap<String, bool> {
+        self.sessions
+            .iter()
+            .map(|(sid, leaf)| (sid.clone(), leaf.read(cx).store.unread))
+            .collect()
+    }
+
+    /// Raise a parked session's client-owned unread mirror from local
+    /// knowledge (GW5): facts the server deltas do not carry — a parked
+    /// error or a background-task update — light the badge through the
+    /// leaf. The leaf's active gate suppresses the focused session.
+    pub fn note_unread(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if let Some(leaf) = self.sessions.get(session_id) {
+            leaf.update(cx, |h, cx| h.note_local_unread(cx));
+        }
     }
 
     /// Drop a session from the multiplexer (the server-side owner is released

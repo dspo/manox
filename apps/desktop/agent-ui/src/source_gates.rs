@@ -54,7 +54,9 @@ mod tests {
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 8),
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 30),
             ("workspace.rs", "protocol sends (U9)", SENDS, 18),
-            ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 1),
+            // U3/GW5: retired — the SessionStatus store-mirror block was
+            // the multiplexer's only write site.
+            ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),
             // The multiplexer IS the gateway client: its sends are the
             // sanctioned wire surface and stay unbudgeted here, but they
             // must never spread to other files (checked below).

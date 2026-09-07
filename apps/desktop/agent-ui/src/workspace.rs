@@ -790,7 +790,12 @@ impl Workspace {
         let (store, session_id) = {
             let session_id = landing_id.clone();
             let store = multiplexer.update(cx, |m, cx| {
-                m.open_or_create(&session_id, cwd.to_str().unwrap_or_default(), false, cx)
+                let handle =
+                    m.open_or_create(&session_id, cwd.to_str().unwrap_or_default(), false, cx);
+                // GW5: the landing session is the focused one from tick
+                // one — its leaf suppresses unread rises while attached.
+                m.set_focused(Some(&session_id), cx);
+                handle
             });
             (store, session_id)
         };
@@ -814,6 +819,9 @@ impl Workspace {
         });
 
         let sidebar = cx.new(|cx| Sidebar::new(px(SIDEBAR_WIDTH), cx));
+        // GW5 badge source: rows read the leaves' client-owned unread
+        // mirrors through the multiplexer.
+        sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
         let recipient = thread.read(|t| t.self_author());
         let conversation = cx.new(|_| ConversationState::new(recipient));
         let context_rail = {
@@ -1620,7 +1628,9 @@ impl Workspace {
                             s.mark_background_work(&thread_id, false);
                             s.mark_pending_plan(&thread_id, false);
                             s.set_errored(&thread_id, true);
-                            s.set_unread(&thread_id, true);
+                            // GW5: no unread rise for the FOREGROUND error —
+                            // the user is watching it; the errored triangle
+                            // is the signal (client-owned unread, §F.2).
                         });
                         this.turn_active = false;
                         this.background_threads
@@ -1854,8 +1864,11 @@ impl Workspace {
                     if !*failed {
                         s.set_errored(&id, false);
                     }
-                    s.set_unread(&id, true);
                 });
+                // GW5: the parked settle's unread rise rides the leaf
+                // mirror (the client-owned badge source), not the
+                // server-side store mirror.
+                this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
                 // Mirror the foreground terminal bookkeeping: steers the
                 // aborted turn never drained flip to `Failed` in the
                 // parked stash (a late `SteerInjected` can still heal
@@ -1877,8 +1890,10 @@ impl Workspace {
                     s.mark_pending_plan(&id, false);
                     s.mark_pending_auth(&id, false);
                     s.set_errored(&id, true);
-                    s.set_unread(&id, true);
                 });
+                // GW5: the parked error's unread rise rides the leaf mirror
+                // (the server's Error delta carries no unread flag).
+                this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
             }
             ThreadEvent::BackgroundTaskUpdated { .. } => {
                 let store = manox_agent::thread_store_global();
@@ -1887,8 +1902,10 @@ impl Workspace {
                         &id,
                         manox_agent::background_task::thread_has_running_tasks(&id),
                     );
-                    s.set_unread(&id, true);
                 });
+                // GW5: a parked background-task update lights the badge
+                // through the leaf mirror, not the server-side store.
+                this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
             }
             _ => {}
         })
@@ -3906,9 +3923,13 @@ impl Workspace {
             let cwd = thread_cwd(&new_thread, &None, cx)
                 .unwrap_or_default()
                 .to_string();
-            let store = self
-                .multiplexer
-                .update(cx, |m, cx| m.open_or_create(&new_sid, &cwd, reopen, cx));
+            let store = self.multiplexer.update(cx, |m, cx| {
+                let handle = m.open_or_create(&new_sid, &cwd, reopen, cx);
+                // GW5: focus follows the attach — the new leaf goes active
+                // (clearing its unread/errored mirrors), the old one inert.
+                m.set_focused(Some(&new_sid), cx);
+                handle
+            });
             self.store = Some(store);
             self.session_id = Some(new_sid);
         }

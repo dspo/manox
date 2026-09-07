@@ -301,6 +301,11 @@ fn external_session_is_loose(project: Option<&std::path::Path>, known_projects: 
 
 pub struct Sidebar {
     store: StoreHandle,
+    /// The gateway client (GW5 badge source): rows prefer the leaves'
+    /// client-owned unread mirrors over `summary.has_unread`. Bound by the
+    /// workspace after construction; unbound sidebars (tests) fall back to
+    /// the summary.
+    mux: Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     selected: Option<String>,
     /// The thread that was selected immediately before `selected`; its row
     /// plays a fade-out wash while the new row's wash fades in, so selection
@@ -350,6 +355,12 @@ pub struct Sidebar {
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
+    /// Bind the gateway client (GW5 badge source): sidebar rows prefer the
+    /// leaves' client-owned unread mirrors over the list summary's flag.
+    pub fn bind_multiplexer(&mut self, mux: gpui::Entity<crate::multiplexer::SessionMultiplexer>) {
+        self.mux = Some(mux);
+    }
+
     pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
         let store = manox_agent::thread_store_global();
         // The store is gpui-free: pump its event channel into `cx.notify()`
@@ -367,6 +378,7 @@ impl Sidebar {
         });
         Self {
             store,
+            mux: None,
             selected: None,
             collapsed: HashSet::new(),
             team_collapsed: HashSet::new(),
@@ -851,6 +863,12 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
+        // GW5 badge source: the leaves' client-owned unread mirrors.
+        let unread_map = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).unread_map(cx))
+            .unwrap_or_default();
         let expanded = !self.collapsed.contains(path);
         let name = std::path::Path::new(path)
             .file_name()
@@ -976,6 +994,7 @@ impl Sidebar {
                                     &s,
                                     is_selected,
                                     live,
+                                    unread_map.get(&s.id).copied(),
                                     RowNesting {
                                         indent: px(16. + tr.indent),
                                         team_leader: tr.team_leader,
@@ -1017,6 +1036,12 @@ impl Render for Sidebar {
         let known_projects = self.store.read(|s| s.known_projects().to_vec());
         let selected = self.selected.clone();
         let store = self.store.clone();
+        // GW5 badge source: the leaves' client-owned unread mirrors.
+        let unread_map = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).unread_map(cx))
+            .unwrap_or_default();
 
         let mut projects: Vec<(String, Vec<manox_agent::ThreadSummary>)> = Vec::new();
         let mut loose: Vec<manox_agent::ThreadSummary> = Vec::new();
@@ -1213,6 +1238,7 @@ impl Render for Sidebar {
                                                         &s,
                                                         is_selected,
                                                         live,
+                                                        unread_map.get(&s.id).copied(),
                                                         RowNesting {
                                                             indent: px(tr.indent),
                                                             team_leader: tr.team_leader,
@@ -1563,6 +1589,10 @@ impl SidebarThreadItem {
         summary: &manox_agent::ThreadSummary,
         selected: bool,
         live: ThreadLiveState,
+        // GW5: the leaf's client-owned unread mirror, when the session has
+        // a leaf; `None` falls back to the summary's (server-mirror-era)
+        // flag.
+        unread_override: Option<bool>,
         nesting: RowNesting,
         theme: &Theme,
     ) -> Self {
@@ -1580,7 +1610,7 @@ impl SidebarThreadItem {
             updated: format_relative(summary.interacted_at),
             pinned: summary.pinned,
             tag: summary.tag.clone(),
-            has_unread: summary.has_unread,
+            has_unread: unread_override.unwrap_or(summary.has_unread),
             errored: summary.errored,
             running: live.running,
             pending_auth: live.pending_auth,
@@ -2332,6 +2362,7 @@ mod tests {
             &sample_thread(),
             true,
             ThreadLiveState::default(),
+            None,
             RowNesting {
                 indent: px(0.),
                 team_leader: false,
@@ -2387,6 +2418,7 @@ mod tests {
             &sample_thread(),
             false,
             ThreadLiveState::default(),
+            None,
             RowNesting {
                 indent: px(0.),
                 team_leader: false,

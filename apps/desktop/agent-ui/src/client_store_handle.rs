@@ -67,6 +67,11 @@ pub struct ClientStoreHandle {
     /// The pending debounced Q-face fetch (§E.3); replacing it cancels the
     /// previous one, coalescing a committed burst into a trailing request.
     info_debounce: Option<Task<()>>,
+    /// Client-owned focus (§F.2/GW5): while this leaf's session is the
+    /// attached one, an `unread` rise is suppressed — the user is watching
+    /// it. Driven by [`Self::set_active`] (the multiplexer owns the
+    /// transitions); activation also runs the focus clear.
+    active: bool,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
@@ -93,6 +98,7 @@ impl ClientStoreHandle {
             info_committed: 0,
             materialized_notified: false,
             info_debounce: None,
+            active: false,
         }
     }
 
@@ -143,6 +149,10 @@ impl ClientStoreHandle {
                 } = host
                     && session_id == self.session_id
                 {
+                    // GW5: a focused session never lights up — the unread
+                    // rise is suppressed client-side (webui parity: its
+                    // mirror gates `unread === true && !active`).
+                    let unread = if self.active { None } else { unread };
                     self.store.apply_session_status(
                         running,
                         errored,
@@ -343,6 +353,34 @@ impl ClientStoreHandle {
             id,
             session_id: self.session_id.clone(),
         });
+    }
+
+    /// Client-side focus transition (§F.2/GW5). Activating clears the
+    /// monotonic unread/errored mirrors (the user is now watching); the
+    /// return reports whether anything cleared (badge refresh).
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) -> bool {
+        self.active = active;
+        if active {
+            let cleared = self.store.focus_cleared();
+            if cleared {
+                cx.notify();
+            }
+            return cleared;
+        }
+        false
+    }
+
+    /// Raise the client-owned unread mirror from local knowledge (GW5):
+    /// parked-thread facts the server deltas do not carry (a parked error,
+    /// a background-task update). Suppressed while active — the user is
+    /// watching, so nothing is "unread".
+    pub fn note_local_unread(&mut self, cx: &mut Context<Self>) {
+        if self.active {
+            return;
+        }
+        self.store
+            .apply_session_status(None, None, Some(true), None, None, None);
+        cx.notify();
     }
 
     /// Deliver a `PageHistory` response the leaf requested. Correlated by
@@ -1233,5 +1271,125 @@ mod tests {
             assert!(h.store.unread, "unread survives until focus");
             assert!(h.store.running, "running takes the latest value");
         });
+    }
+    /// GW5 regression: the client owns unread (§F.2) — the focused leaf
+    /// never lights up, activation clears the monotonic mirrors, and the
+    /// local-knowledge rise (parked error / background task) obeys the
+    /// same gate.
+    #[gpui::test]
+    fn active_leaf_suppresses_unread_and_focus_clears(cx: &mut TestAppContext) {
+        let handle = cx.new(|cx| ClientStoreHandle::leaf("s1", cx));
+        let delta = |unread: Option<bool>| FromServer::Host {
+            host: HostEvent::SessionStatus {
+                session_id: "s1".into(),
+                running: None,
+                errored: None,
+                unread,
+                pending_auth: None,
+                pending_plan: None,
+                background_work: None,
+            },
+        };
+        handle.update(cx, |h, cx| h.apply_from_server(delta(Some(true)), cx));
+        assert!(
+            handle.read_with(cx, |h, _| h.store.unread),
+            "an unfocused leaf lights up"
+        );
+        handle.update(cx, |h, cx| {
+            h.set_active(true, cx);
+        });
+        assert!(
+            !handle.read_with(cx, |h, _| h.store.unread),
+            "activation clears the unread mirror (focus_cleared)"
+        );
+        handle.update(cx, |h, cx| h.apply_from_server(delta(Some(true)), cx));
+        assert!(
+            !handle.read_with(cx, |h, _| h.store.unread),
+            "GW5: a focused leaf never lights up"
+        );
+        handle.update(cx, |h, cx| {
+            h.set_active(false, cx);
+        });
+        handle.update(cx, |h, cx| h.apply_from_server(delta(Some(true)), cx));
+        assert!(
+            handle.read_with(cx, |h, _| h.store.unread),
+            "the unfocused leaf lights up again"
+        );
+        handle.update(cx, |h, cx| {
+            h.set_active(true, cx);
+        });
+        handle.update(cx, |h, cx| h.note_local_unread(cx));
+        assert!(
+            !handle.read_with(cx, |h, _| h.store.unread),
+            "the local rise is suppressed while focused"
+        );
+    }
+
+    /// GW5 regression: multiplexer focus transitions drive the leaves'
+    /// active gates; `unread_map` is the sidebar badge source; a leaf
+    /// created while its session is focused starts active.
+    #[gpui::test]
+    fn multiplexer_focus_transitions_gate_the_leaf_mirrors(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        let leaf_a = mux.update(cx, |m, cx| m.open_or_create("s-a", "/p", false, cx));
+        let leaf_b = mux.update(cx, |m, cx| m.open_or_create("s-b", "/p", false, cx));
+        let delta = |sid: &str| FromServer::Host {
+            host: HostEvent::SessionStatus {
+                session_id: sid.into(),
+                running: None,
+                errored: None,
+                unread: Some(true),
+                pending_auth: None,
+                pending_plan: None,
+                background_work: None,
+            },
+        };
+        mux.update(cx, |m, cx| m.set_focused(Some("s-a"), cx));
+        server_conn.send_to_client(delta("s-a"));
+        server_conn.send_to_client(delta("s-b"));
+        cx.run_until_parked();
+        assert!(
+            !leaf_a.read_with(cx, |h, _| h.store.unread),
+            "the focused leaf stays dark"
+        );
+        assert!(
+            leaf_b.read_with(cx, |h, _| h.store.unread),
+            "the parked leaf lights up"
+        );
+        let (a, b) = mux.read_with(cx, |m, cx| {
+            let map = m.unread_map(cx);
+            (map.get("s-a").copied(), map.get("s-b").copied())
+        });
+        assert_eq!(a, Some(false), "unread_map is the sidebar badge source");
+        assert_eq!(b, Some(true));
+        // Switching focus clears the new foreground and re-arms the old.
+        mux.update(cx, |m, cx| m.set_focused(Some("s-b"), cx));
+        assert!(
+            !leaf_b.read_with(cx, |h, _| h.store.unread),
+            "activation clears the mirror"
+        );
+        server_conn.send_to_client(delta("s-a"));
+        cx.run_until_parked();
+        assert!(
+            leaf_a.read_with(cx, |h, _| h.store.unread),
+            "the deprioritized leaf re-arms"
+        );
+        // Local-knowledge rise: parked lights, focused is a no-op.
+        mux.update(cx, |m, cx| m.note_unread("s-a", cx));
+        assert!(leaf_a.read_with(cx, |h, _| h.store.unread));
+        mux.update(cx, |m, cx| m.note_unread("s-b", cx));
+        assert!(
+            !leaf_b.read_with(cx, |h, _| h.store.unread),
+            "note_unread on the focused leaf is suppressed"
+        );
+        // A leaf created while its session is focused starts active.
+        mux.update(cx, |m, cx| m.set_focused(Some("s-c"), cx));
+        let leaf_c = mux.update(cx, |m, cx| m.open_or_create("s-c", "/p", false, cx));
+        server_conn.send_to_client(delta("s-c"));
+        cx.run_until_parked();
+        assert!(
+            !leaf_c.read_with(cx, |h, _| h.store.unread),
+            "ensure_leaf auto-activates the focused session's leaf"
+        );
     }
 }
