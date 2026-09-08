@@ -315,7 +315,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
 | C5:字段漂移——文档面已对齐（D.3 清单 25 项/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
 | K9:ui_note 决断✓、cursor 语义注✓（均已入 §C.2/§F.1 as-built）；persist_ui_note 对称化✓（K9 提交）；死 schema 回收（无发射的 `UiNote` 变体/`uiNote` 标签） | C4 表面决断 | C4 |
-| 标题直写 sidecar→K2 title 缓存修复停用中(engine.rs:4823 注释锚点;rebuild 已 journal-first,scheduler 4499 已 `journal_title.or(sidecar)`)。**勘察修正**:直写点=`set_external_title`(workspace.rs ~3141-3170,外部会话标题;sidecar 写 ~3161);pi 线程 rename UI 未实现(title_menu 仅 doc 提及);thread_store 无 title API | 三段同批:①thread_store `rename_thread`(journal `title` 条目经 dispatch_store_journal_row+sidecar,与 pin_thread(594) 同构)②桌面 set_external_title 改道(与 ① 同批,否则外部 rename 被修复回退)③启用 4823 title 修复 | Wave 2(F1b 后,workspace.rs 域) |
 | plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
 | goal 权威在 threads.db(GoalBridge,goal_tools.rs:50;restore=db 事件折叠;`goal` 条目已在词汇且 replay 已折叠 state.goal,但生产写入仍走 db) | 迁移三段:①bridge 写入改经 dispatch_store_journal_row("goal")(条目携全量状态快照,末条即权威——replay 折叠已就绪)②restore 改读 journal 重放③db goal 表降级为缓存/退休;armed/goal_round_active 进程本地不入日志(activation 永不继承语义保留) | Wave 2(agent 域,可子 agent) |
 | Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |

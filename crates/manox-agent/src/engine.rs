@@ -4820,14 +4820,22 @@ async fn rebuild_restored_state(
         .filter(|enabled| meta.plan_mode.unwrap_or(false) != *enabled);
     let repair_snapshot =
         journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
-    // The TITLE is deliberately not repaired: the desktop rename writes
-    // the sidecar directly (no gateway rename note exists yet), so a
-    // sidecar title diverging from the chain may be a NEWER decision the
-    // journal never saw — repairing would silently revert the user's
-    // rename on the next open. The rebuild itself stays journal-first
-    // (the authority face); the cache converges once the rename decision
-    // point is routed through a journaled face (cross-domain request in
-    // the K3 report).
+    let repair_title = replayed
+        .title
+        .filter(|title| meta.title.as_deref() != Some(title.as_str()));
+    // K2 title repair, ENABLED (the rename-route decision): the only
+    // direct-sidecar title writer is `set_external_title`, which serves
+    // EXTERNAL TUI sessions — they carry no pi journal chain, never reach
+    // this rebuild, and their sidecar is desktop-authoritative by design
+    // (the external process owns the session file, so a journaled rename
+    // face does not apply and a cold journal append would race it). A pi
+    // thread's sidecar title is written only by the auto-title scheduler,
+    // whose decision journals the `title` entry first — so a divergence
+    // here is a stale cache and the chain re-stamps it. A chain that never
+    // saw a title keeps the sidecar value (hole-fill; the scheduler seeds
+    // through `journal_title.or(sidecar)`). A future pi rename UI must
+    // route a journaled face (`thread_store::rename_thread`,
+    // pin_thread-isomorphic).
     let repair_flags = replayed
         .pinned
         .zip(replayed.archived)
@@ -4845,6 +4853,7 @@ async fn rebuild_restored_state(
         || repair_snapshot.is_some()
         || repair_flags.is_some()
         || repair_project.is_some()
+        || repair_title.is_some()
     {
         let result =
             manox_harness::session_meta::update(sessions_dir, session.path(), move |meta| {
@@ -4866,6 +4875,9 @@ async fn rebuild_restored_state(
                 }
                 if let Some(project) = repair_project {
                     meta.project = project;
+                }
+                if let Some(title) = repair_title {
+                    meta.title = Some(title);
                 }
             })
             .await;
@@ -8816,14 +8828,15 @@ mod tests {
         assert!(live_rebuilt.plan_mode);
 
         // K2 cache repair: the diverging (here: empty) sidecar converges
-        // toward the journal authority — EXCEPT the title, which is never
-        // repaired over: a diverging sidecar title may be a newer desktop
-        // rename the journal never saw (the rename's journaled routing is
-        // the open cross-domain K3 request), so the cache keeps it.
+        // toward the journal authority — INCLUDING the title (the repair
+        // is enabled by the rename-route decision: a pi thread's sidecar
+        // title is written only by the journaled auto-title scheduler; the
+        // direct writer `set_external_title` serves external TUI sessions,
+        // which carry no pi chain and never reach this rebuild).
         let repaired = manox_harness::session_meta::load(&sessions, &live_path)
             .await
             .unwrap();
-        assert_eq!(repaired.title, None);
+        assert_eq!(repaired.title.as_deref(), Some("replayed title"));
         assert!(!repaired.pinned && repaired.archived);
         assert_eq!(repaired.project.as_deref(), Some("/replay/proj"));
         assert_eq!(
@@ -9023,14 +9036,14 @@ mod tests {
         assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
 
         // The cache converged toward the authority in the same pass —
-        // except the title: a diverging sidecar title may be a newer
-        // desktop rename the journal never saw, so repairing over it
-        // would silently revert the user's rename. The rebuild itself
-        // stays journal-first (the `rebuilt.title` assert above).
+        // the title INCLUDED (the rename-route decision: the pi-thread
+        // sidecar title's only writer is the journaled auto-title
+        // scheduler, so a divergence is a stale cache, not a newer user
+        // decision; external-session titles never reach this rebuild).
         let repaired = manox_harness::session_meta::load(&sessions, session.path())
             .await
             .unwrap();
-        assert_eq!(repaired.title.as_deref(), Some("stale sidecar title"));
+        assert_eq!(repaired.title.as_deref(), Some("journal title"));
         assert!(!repaired.pinned && repaired.archived);
         assert_eq!(repaired.approval_mode.as_deref(), Some("workspace-write"));
         assert_eq!(repaired.project.as_deref(), Some("/journal/project"));
