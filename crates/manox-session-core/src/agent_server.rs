@@ -1760,7 +1760,9 @@ impl AgentServerInner {
             // The SAME (text, images) run_turn will hand the engine — the
             // middleware skip is an exact content match (K5 contract):
             // text normalized like `to_message_content` (no Text block
-            // when blank), images as kernel ContentBlocks.
+            // when blank), images as kernel ContentBlocks. K5 edge: the
+            // engine expands before persisting, so the entry (and the pin)
+            // carry the POST-expansion shape the run announces.
             let persist_text = if text.trim().is_empty() {
                 String::new()
             } else {
@@ -3573,6 +3575,15 @@ mod tests {
             parent_id,
             timestamp: fixed_ts(),
             snapshot: json!([{"step": "s1"}]),
+        }
+    }
+    fn ent_plan_review(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+        SessionTreeEntry::PlanReview {
+            id,
+            parent_id,
+            timestamp: fixed_ts(),
+            state: "proposed".into(),
+            plan_file: Some("/plans/p.md".into()),
         }
     }
     fn ent_browser_suites(id: String, parent_id: Option<String>) -> SessionTreeEntry {
@@ -9144,6 +9155,7 @@ mod tests {
             ent_thinking_level_change,
             ent_plan_mode_change,
             ent_plan_update,
+            ent_plan_review,
             ent_goal,
             ent_title,
             ent_browser_suites,
@@ -9163,7 +9175,7 @@ mod tests {
             builders.len(),
             JOURNAL_ENTRIES.len(),
             "J1: the builder list must stay 1:1 with the declared vocabulary \
-             (both sides are exhaustive over the same 37)"
+             (both sides are exhaustive over the same 38)"
         );
         let mut prev: Option<String> = None;
         for (seq, build) in builders.into_iter().enumerate() {

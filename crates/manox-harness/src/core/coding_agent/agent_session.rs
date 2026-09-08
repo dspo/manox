@@ -150,38 +150,10 @@ impl AgentSession {
     }
 
     /// The TS `_expandSkillCommand` + `expandPromptTemplate` expansion.
+    /// Delegates to the free `expand_prompt_with` so the engine's
+    /// acceptance-side persistence (the K5 edge) expands identically.
     fn expand_prompt(&self, text: &str) -> String {
-        if let Some(rest) = text.strip_prefix("/skill:") {
-            let (name, args) = match rest.find(' ') {
-                Some(i) => (&rest[..i], rest[i + 1..].trim().to_string()),
-                None => (rest, String::new()),
-            };
-            if let Some(skill) = self.resources().skills.iter().find(|s| s.name == name) {
-                let block = crate::harness::format_skill_invocation(skill, None);
-                return if args.is_empty() {
-                    block
-                } else {
-                    format!("{block}\n\n{args}")
-                };
-            }
-            return text.to_string(); // Unknown skill, pass through.
-        }
-        if let Some(rest) = text.strip_prefix('/') {
-            let (name, args_string) = match rest.find(' ') {
-                Some(i) => (&rest[..i], rest[i + 1..].to_string()),
-                None => (rest, String::new()),
-            };
-            if let Some(template) = self
-                .resources()
-                .prompt_templates
-                .iter()
-                .find(|t| t.name == name)
-            {
-                let args = crate::harness::parse_command_args(&args_string);
-                return crate::harness::substitute_args(&template.content, &args);
-            }
-        }
-        text.to_string()
+        crate::harness::expand_prompt_with(self.resources(), text)
     }
 
     /// Continue from the current transcript.

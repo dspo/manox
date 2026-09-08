@@ -268,6 +268,11 @@ struct EngineState {
     /// before the first session assembles — the actor's drain-time
     /// persistence covers a Submit accepted in that window.
     current_appender: Mutex<Option<Arc<JournalAppender>>>,
+    /// K5 edge: the resources behind the acceptance-side expansion —
+    /// published with the appender at every build/swap so
+    /// `persist_user_submission` expands exactly like the run's
+    /// `prompt_input` will.
+    current_resources: Mutex<Option<manox_harness::harness::HarnessResources>>,
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -863,6 +868,7 @@ pub fn spawn_engine(
         pending_browser_suite: Mutex::new(None),
         pending_session_cmds: Mutex::new(Vec::new()),
         current_appender: Mutex::new(None),
+        current_resources: Mutex::new(None),
         gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
@@ -1003,6 +1009,16 @@ impl ThreadEngine for PiEngine {
             // Prompt cmd is processed (still before model-visible).
             let Some(appender) = state.current_appender.lock().unwrap().clone() else {
                 return Ok(None);
+            };
+            // K5 edge: the accepted entry carries the POST-expansion text —
+            // the same expansion the run's prompt_input announces — so the
+            // middleware content-match skip holds and a slash-command
+            // prompt never journals twice. Resources publish with the
+            // appender; an unassembled session passes through raw and the
+            // drain-time persistence expands under the same contract.
+            let text = match state.current_resources.lock().unwrap().clone() {
+                Some(resources) => manox_harness::harness::expand_prompt_with(&resources, &text),
+                None => text,
             };
             let message = prompt_user_message(&text, &images);
             // Durable: a still-deferred session (no file yet) materializes
@@ -2135,7 +2151,9 @@ fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentMessage {
 /// the middleware skip (entry id + accepted content) so the run's own user
 /// `MessageEnd` records the existing entry instead of appending a
 /// duplicate; jsonl's duplicate-entry-id refusal stays the backstop, never
-/// the normal path. An origin-less prompt (an internally-driven `run()`
+/// the normal path. The pin and any drain-time append carry the
+/// POST-expansion text (the K5 edge: the run announces the expanded
+/// shape); the acceptance-side persistence expands identically. An origin-less prompt (an internally-driven `run()`
 /// turn, a goal/monitor seed) keeps the legacy flow: the middleware
 /// persists its user message at announce time.
 async fn persist_prompt_user_entry(
@@ -2152,7 +2170,14 @@ async fn persist_prompt_user_entry(
     if accepted_entry.is_none() && origin_rpc.is_none() {
         return Ok(None);
     }
-    let message = prompt_user_message(text, images);
+    // K5 edge: the pin carries the POST-expansion content (the shape the
+    // run announces) and the queued-submit drain persistence logs the
+    // expanded text the model actually sees. Run-time input-hook
+    // transforms remain a residual edge: their mismatch double-journals
+    // acceptably (the raw pin is the user intent, the appended announce
+    // the model-visible truth).
+    let expanded = manox_harness::harness::expand_prompt_with(session.resources(), text);
+    let message = prompt_user_message(&expanded, images);
     let content = match &message {
         AgentMessage::User { content, .. } => {
             serde_json::to_value(content).unwrap_or(serde_json::Value::Null)
@@ -3232,6 +3257,7 @@ async fn run_actor(
     spawn_journal_relay(&session, &state.journal_tx);
     // K5: publish the acceptance-time writer for this session.
     *state.current_appender.lock().unwrap() = Some(session.journal_appender());
+    *state.current_resources.lock().unwrap() = Some(session.resources().clone());
     *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
     if let Some(project) = &project {
         bind_project(&sessions_dir, &session, project, &state, &notice_tx).await;
@@ -4031,6 +4057,8 @@ async fn run_actor(
                         // K5: the swapped session is the acceptance-time
                         // writer from here on.
                         *state.current_appender.lock().unwrap() = Some(session.journal_appender());
+                        *state.current_resources.lock().unwrap() =
+                            Some(session.resources().clone());
                         // The fresh session is pinned to the facade thread's id.
                         crate::thread_registry::set_active(&thread_id, &thread_id).await;
                         let new_path = session.path().to_path_buf();
@@ -4218,6 +4246,7 @@ async fn rebuild_session(
             spawn_journal_relay(session, &state.journal_tx);
             // K5: the rebuilt session is the acceptance-time writer.
             *state.current_appender.lock().unwrap() = Some(session.journal_appender());
+            *state.current_resources.lock().unwrap() = Some(session.resources().clone());
         }
         Err(err) => {
             let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
@@ -6224,6 +6253,7 @@ mod tests {
             pending_browser_suite: Mutex::new(None),
             pending_session_cmds: Mutex::new(Vec::new()),
             current_appender: Mutex::new(None),
+            current_resources: Mutex::new(None),
             gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
@@ -8670,6 +8700,73 @@ mod tests {
             ),
             ("error", json!({ "message": "scripted error row" })),
         ]
+    }
+
+    /// K5 edge: the middleware pin (and the queued-submit drain
+    /// persistence) carries the POST-expansion text — the shape the run
+    /// announces — so a slash-command prompt's content-match skip holds
+    /// and the journal never double-entries. The raw text must NOT match
+    /// the pin.
+    #[tokio::test]
+    async fn prompt_pin_carries_the_expanded_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+        let stream = Arc::new(ToolRoundsStream {
+            rounds: 0,
+            call: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let resources = manox_harness::harness::HarnessResources {
+            prompt_templates: vec![manox_harness::harness::PromptTemplate {
+                name: "deploy".into(),
+                content: "deploy $ARGUMENTS now".into(),
+            }],
+            ..Default::default()
+        };
+        let session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .with_resources(resources)
+            .build()
+            .await
+            .unwrap();
+
+        let id =
+            persist_prompt_user_entry(&session, "/deploy service", &[], Some("rpc-x".into()), None)
+                .await
+                .expect("the origin path persists")
+                .expect("an entry id comes back");
+        let expanded =
+            manox_harness::harness::expand_prompt_with(session.resources(), "/deploy service");
+        assert_eq!(expanded, "deploy service now");
+        let content_of = |text: &str| {
+            serde_json::to_value(match prompt_user_message(text, &[]) {
+                manox_harness::types::AgentMessage::User { content, .. } => content,
+                _ => unreachable!("prompt_user_message builds a user message"),
+            })
+            .unwrap()
+        };
+        let appender = session.journal_appender();
+        assert!(
+            appender
+                .take_accepted_user_entry(&content_of("/deploy service"))
+                .is_none(),
+            "the raw text must not match the pin"
+        );
+        assert_eq!(
+            appender
+                .take_accepted_user_entry(&content_of(&expanded))
+                .as_deref(),
+            Some(id.as_str()),
+            "the expanded announce consumes the pin"
+        );
     }
 
     /// Every on-disk `type` tag the replay-consistency regression must

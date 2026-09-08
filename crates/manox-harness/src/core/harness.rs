@@ -3639,6 +3639,45 @@ pub struct PromptTemplate {
     pub content: String,
 }
 
+/// The resource-driven prompt expansion (TS `_expandSkillCommand` +
+/// `expandPromptTemplate`), free-standing: the run side
+/// (`AgentSession::expand_prompt`) AND the engine's acceptance-side
+/// persistence (the K5 edge: `persist_user_submission` /
+/// `persist_prompt_user_entry`) must produce the SAME text — the accepted
+/// journal entry and the middleware pin carry the POST-expansion shape the
+/// run announces, or the content-match skip misses and a slash-command
+/// prompt journals twice (raw accepted + expanded announced). Idempotent:
+/// expanded text no longer carries the `/` command prefix, so the run's
+/// re-expansion passes through.
+pub fn expand_prompt_with(resources: &HarnessResources, text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("/skill:") {
+        let (name, args) = match rest.find(' ') {
+            Some(i) => (&rest[..i], rest[i + 1..].trim().to_string()),
+            None => (rest, String::new()),
+        };
+        if let Some(skill) = resources.skills.iter().find(|s| s.name == name) {
+            let block = format_skill_invocation(skill, None);
+            return if args.is_empty() {
+                block
+            } else {
+                format!("{block}\n\n{args}")
+            };
+        }
+        return text.to_string(); // Unknown skill, pass through.
+    }
+    if let Some(rest) = text.strip_prefix('/') {
+        let (name, args_string) = match rest.find(' ') {
+            Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+            None => (rest, String::new()),
+        };
+        if let Some(template) = resources.prompt_templates.iter().find(|t| t.name == name) {
+            let args = parse_command_args(&args_string);
+            return substitute_args(&template.content, &args);
+        }
+    }
+    text.to_string()
+}
+
 /// The harness's persistence middleware: appends every `MessageEnd` message
 /// to the session immediately — before any listener observes it — and
 /// records the entry id for the harness's transcript alignment. An append
