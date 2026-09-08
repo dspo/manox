@@ -7,6 +7,7 @@
     "models": [
       {
         "api": "anthropic",
+        "config_id": "deepseek-chat",
         "context_window": 131072,
         "id": "deepseek-chat",
         "max_tokens": 8192,
@@ -28,6 +29,7 @@
   {
     "threads": [
       {
+        "approval_mode": 0,
         "archived": false,
         "background_work": false,
         "depth": 0,
@@ -38,6 +40,7 @@
         "pending_auth": false,
         "pending_plan": false,
         "pinned": false,
+        "project": "/proj",
         "running": false,
         "title": "v2 migration",
         "unread": false,
@@ -74,5 +77,11 @@
   {
     "message": "gateway/internal",
     "type": "error"
+  },
+  {
+    "known": [
+      "/proj"
+    ],
+    "type": "projects"
   }
 ]

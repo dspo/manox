@@ -2296,6 +2296,9 @@ mod tests {
             archived: false,
             parent_id: None,
             depth: 0,
+            project: None,
+            tag: None,
+            approval_mode: None,
         }
     }
 

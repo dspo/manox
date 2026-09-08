@@ -288,6 +288,8 @@ wire_surface! {
                 api: "anthropic".into(),
                 context_window: 131_072,
                 max_tokens: Some(8_192),
+                config_id: Some("deepseek-chat".into()),
+                agents: None,
             }],
         },
         HostEvent::Commands { .. } => "commands" ~ HostEvent::Commands {
@@ -314,6 +316,9 @@ wire_surface! {
         },
         HostEvent::Error { .. } => "error" ~ HostEvent::Error {
             message: "gateway/internal".into(),
+        },
+        HostEvent::Projects { .. } => "projects" ~ HostEvent::Projects {
+            known: vec!["/proj".into()],
         },
     ]
 }
@@ -706,6 +711,8 @@ fn model_stub() -> ModelInfo {
         api: "anthropic".into(),
         context_window: 131_072,
         max_tokens: None,
+        config_id: None,
+        agents: None,
     }
 }
 
@@ -725,6 +732,9 @@ fn thread_stub() -> ThreadListItem {
         archived: false,
         parent_id: None,
         depth: 0,
+        project: Some("/proj".into()),
+        tag: None,
+        approval_mode: Some(0),
     }
 }
 

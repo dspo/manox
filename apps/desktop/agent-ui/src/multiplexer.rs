@@ -111,6 +111,10 @@ pub struct SessionMultiplexer {
     thread_list: Vec<ThreadListItem>,
     models: Vec<ModelInfo>,
     commands: serde_json::Value,
+    /// U2 cross-domain #1: the known-projects registry snapshot (§D.5 list
+    /// channel family) — the sidebar grouping's wire source, pushed with
+    /// every ListThreads answer.
+    known_projects: Vec<String>,
     /// The epoch the server accepted (§D.5 `Ready`); the handshake pull only
     /// runs when it equals [`PROTOCOL_EPOCH`] (C1).
     ready_epoch: Option<u32>,
@@ -166,6 +170,7 @@ impl SessionMultiplexer {
             create_callbacks: HashMap::new(),
             list_fetches: HashMap::new(),
             thread_list: Vec::new(),
+            known_projects: Vec::new(),
             models: Vec::new(),
             commands: serde_json::json!([]),
             ready_epoch: None,
@@ -381,6 +386,11 @@ impl SessionMultiplexer {
     }
 
     /// The epoch the server's `Ready` carried (C1).
+    /// The known-projects registry snapshot (U2 cross-domain #1).
+    pub fn known_projects(&self) -> &[String] {
+        &self.known_projects
+    }
+
     pub fn ready_epoch(&self) -> Option<u32> {
         self.ready_epoch
     }
@@ -452,6 +462,12 @@ impl SessionMultiplexer {
     /// reconciliation line here and never re-trigger a side effect.
     fn apply_host(&mut self, host: &HostEvent, cx: &mut Context<Self>) {
         match host {
+            // U2 cross-domain #1: the registry snapshot replaces the
+            // workspace's out-of-band decoration push for grouping.
+            HostEvent::Projects { known } => {
+                self.known_projects = known.clone();
+                cx.notify();
+            }
             HostEvent::Ready { epoch } => {
                 self.ready_epoch = Some(*epoch);
                 if *epoch == PROTOCOL_EPOCH {
@@ -832,6 +848,32 @@ mod tests {
         (mux, server_conn)
     }
 
+    /// U2 cross-domain #1: the Projects host mirror fills the
+    /// multiplexer's known-projects state (the sidebar grouping's wire
+    /// source — the workspace decoration push retires against it).
+    #[gpui::test]
+    fn projects_host_frame_fills_the_known_projects_state(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        server_conn.send_to_client(manox_protocol::FromServer::Host {
+            host: manox_protocol::stream::HostEvent::Projects {
+                known: vec!["/p/a".into(), "/p/b".into()],
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let known = mux.read_with(cx, |m, _| m.known_projects().to_vec());
+            if known == vec!["/p/a".to_string(), "/p/b".to_string()] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the Projects mirror never landed: {known:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn wire_row(id: &str) -> ThreadListItem {
         ThreadListItem {
             id: id.into(),
@@ -848,6 +890,9 @@ mod tests {
             archived: false,
             parent_id: None,
             depth: 0,
+            project: Some("/p/wire".into()),
+            tag: None,
+            approval_mode: Some(0),
         }
     }
 
@@ -860,6 +905,8 @@ mod tests {
             api: "anthropic".into(),
             context_window: 200_000,
             max_tokens: Some(8_192),
+            config_id: Some(format!("cfg-{id}")),
+            agents: None,
         }
     }
 

@@ -255,6 +255,9 @@ mod tests {
                 stream_id: StreamId::new("webui-stream-1"),
                 frame: StreamFrame::Entry {
                     seq: 8,
+                    id: "e-8".into(),
+                    parent_id: Some("e-7".into()),
+                    timestamp: "2026-09-05T00:00:00Z".into(),
                     event: JournalWireEvent::AgentTextDelta { s: "hi".into() },
                 },
             },
@@ -317,12 +320,21 @@ mod tests {
             stream_id: StreamId::new("st-1"),
             frame: StreamFrame::Entry {
                 seq: 3,
+                id: "e-3".into(),
+                parent_id: None,
+                timestamp: "2026-09-05T00:00:00Z".into(),
                 event: JournalWireEvent::AgentTextDelta { s: "x".into() },
             },
         });
         assert_eq!(item["kind"], "streamItem");
         assert_eq!(item["streamId"], "st-1");
         assert_eq!(item["frame"]["type"], "entry");
+        // U5 envelope keys (the §C.1 full frame) — the guard never covered
+        // them when the envelope landed; the TS parseFromServer reads them.
+        assert_eq!(item["frame"]["seq"], 3);
+        assert_eq!(item["frame"]["id"], "e-3");
+        assert_eq!(item["frame"]["parentId"], serde_json::Value::Null);
+        assert_eq!(item["frame"]["timestamp"], "2026-09-05T00:00:00Z");
         assert_eq!(item["frame"]["event"]["type"], "agentTextDelta");
 
         let end = pump_wire(&FromServer::StreamEnd {

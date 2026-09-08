@@ -500,6 +500,9 @@ impl ThreadStore {
     /// interacted_at (advanced by real activity only) and updated_at
     /// (advanced by every metadata save) diverge in production, and
     /// consumers pin the wire mapping between them.
+    // Explicit per-column seeding: every parameter is a wire-mapped column
+    // the list regression pins; a builder struct would obscure the mapping.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert_summary_with_times_for_test(
         &mut self,
@@ -507,11 +510,17 @@ impl ThreadStore {
         parent: Option<&str>,
         interacted_at: i64,
         updated_at: i64,
+        project: &str,
+        tag: Option<&str>,
+        approval_mode: i64,
     ) {
         self.insert_summary_for_test(id, parent);
         let summary = self.summaries.last_mut().expect("just inserted");
         summary.interacted_at = interacted_at;
         summary.updated_at = updated_at;
+        summary.project = project.to_string();
+        summary.tag = tag.map(str::to_string);
+        summary.approval_mode = approval_mode;
     }
 
     /// Archive (or unarchive) a session. The row moves between the active

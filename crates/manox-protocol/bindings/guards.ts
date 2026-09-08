@@ -46,7 +46,7 @@ export const JOURNAL_ENTRY_TAGS: readonly string[] = [
 /** §D.5 host event tags (HOST_EVENTS in src/surface.rs). */
 export const HOST_EVENT_TAGS: readonly string[] = [
   'ready', 'models', 'commands', 'threadsUpdated', 'sessionStatus',
-  'sessionCreated', 'sessionDisposed', 'error',
+  'sessionCreated', 'sessionDisposed', 'error', 'projects',
 ];
 
 export const isKnownJournalTag = (tag: unknown): tag is string =>
@@ -181,13 +181,17 @@ export function parseHostEvent(v: unknown): Guard<HostEventShape> {
     sessionCreated: ['type', 'sessionId', 'header'],
     sessionDisposed: ['type', 'sessionId'],
     error: ['type', 'message'],
+    // U2 cross-domain #1: the known-projects registry snapshot (rides the
+    // ListThreads push; a full snapshot, never a delta).
+    projects: ['type', 'known'],
   };
   const keys = arms[v.type];
   if (!exactKeys(v, keys)) {
     return { ok: false, reason: `host event ${v.type}: exact-keys check failed` };
   }
   if (v.type !== 'ready' && !typeofOr(v.sessionId, 'string') && v.type !== 'models'
-    && v.type !== 'commands' && v.type !== 'threadsUpdated' && v.type !== 'error') {
+    && v.type !== 'commands' && v.type !== 'threadsUpdated' && v.type !== 'error'
+    && v.type !== 'projects') {
     return { ok: false, reason: `host event ${v.type}: sessionId must be a string` };
   }
   return { ok: true, value: v as HostEventShape };

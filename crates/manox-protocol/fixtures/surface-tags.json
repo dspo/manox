@@ -53,7 +53,8 @@
     "sessionStatus",
     "sessionCreated",
     "sessionDisposed",
-    "error"
+    "error",
+    "projects"
   ],
   "journalEntries": [
     "message",

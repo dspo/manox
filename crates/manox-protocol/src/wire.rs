@@ -46,6 +46,21 @@ pub struct ThreadListItem {
     /// Nesting level: 0 is top-level, 1 is a team member of a top-level
     /// leader, and so on.
     pub depth: i32,
+    /// U2 cross-domain #1: the grouping / label / approval columns — the
+    /// sidebar's project grouping, tag chip and approval wash had no wire
+    /// source (the desktop pushed decorations out-of-band from the
+    /// in-process store). `project` is None for an ungrouped thread;
+    /// `approval_mode` is the PermissionMode i64. Additive + optional:
+    /// older actors' payloads deserialize with Nones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub approval_mode: Option<i64>,
 }
 
 /// One selectable model in the models list — the wire schema for
@@ -70,4 +85,16 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub max_tokens: Option<u32>,
+    /// U2 cross-domain #4: the provider-config key the external-CLI launch
+    /// cascade matches verbatim (`provider_glue::config_id` semantics —
+    /// falls back to the model id). Absent from older actors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub config_id: Option<String>,
+    /// U2 cross-domain #4: the registration's `agents` visibility filter
+    /// (the cascade menu filters by the launched agent id); empty or absent
+    /// = visible to all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub agents: Option<Vec<String>>,
 }

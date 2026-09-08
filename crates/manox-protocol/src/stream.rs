@@ -221,6 +221,12 @@ pub enum HostEvent {
     SessionDisposed { session_id: String },
     /// A host-level error.
     Error { message: String },
+    /// U2 cross-domain #1: the known-projects registry snapshot (the §D.5
+    /// list-channel family — a full snapshot, never a delta). Pushed to the
+    /// requester with the `ThreadsUpdated` list push; the sidebar's project
+    /// grouping reads it off the wire instead of the in-process store.
+    /// Host-only: a new surface, no v1 consumer.
+    Projects { known: Vec<String> },
 }
 
 impl HostEvent {
@@ -375,6 +381,9 @@ mod tests {
             },
             HostEvent::Error {
                 message: "boom".into(),
+            },
+            HostEvent::Projects {
+                known: vec!["/proj".into()],
             },
         ];
         for ev in &evs {

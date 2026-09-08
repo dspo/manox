@@ -43,7 +43,7 @@ export type HookKind = "approve" | "planVerdict" | "askUserQuestion" | "browserO
  *
  * Declaring surface: HOST_EVENTS.
  */
-export type HostEvent = { "type": "ready", epoch: number, } | { "type": "models", models: Array<ModelInfo>, } | { "type": "commands", commands: JsonValue, } | { "type": "threadsUpdated", threads: Array<ThreadListItem>, } | { "type": "sessionStatus", sessionId: string, running: boolean | null, errored: boolean | null, unread: boolean | null, pendingAuth: boolean | null, pendingPlan: boolean | null, backgroundWork: boolean | null, } | { "type": "sessionCreated", sessionId: string, header: ThreadHeader, } | { "type": "sessionDisposed", sessionId: string, } | { "type": "error", message: string, };
+export type HostEvent = { "type": "ready", epoch: number, } | { "type": "models", models: Array<ModelInfo>, } | { "type": "commands", commands: JsonValue, } | { "type": "threadsUpdated", threads: Array<ThreadListItem>, } | { "type": "sessionStatus", sessionId: string, running: boolean | null, errored: boolean | null, unread: boolean | null, pendingAuth: boolean | null, pendingPlan: boolean | null, backgroundWork: boolean | null, } | { "type": "sessionCreated", sessionId: string, header: ThreadHeader, } | { "type": "sessionDisposed", sessionId: string, } | { "type": "error", message: string, } | { "type": "projects", known: Array<string>, };
 
 /**
  * A base64-encoded image attachment (submit / steer payloads).
@@ -152,7 +152,19 @@ api: string, context_window: number,
 /**
  * Per-model output budget; absent from older actors.
  */
-max_tokens?: number, };
+max_tokens?: number, 
+/**
+ * U2 cross-domain #4: the provider-config key the external-CLI launch
+ * cascade matches verbatim (`provider_glue::config_id` semantics —
+ * falls back to the model id). Absent from older actors.
+ */
+config_id?: string, 
+/**
+ * U2 cross-domain #4: the registration's `agents` visibility filter
+ * (the cascade menu filters by the launched agent id); empty or absent
+ * = visible to all.
+ */
+agents?: Array<string>, };
 
 /**
  * Canonical model reference on the wire: `{provider_registration}/{model_id}`
@@ -367,7 +379,16 @@ parent_id: string | null,
  * Nesting level: 0 is top-level, 1 is a team member of a top-level
  * leader, and so on.
  */
-depth: number, };
+depth: number, 
+/**
+ * U2 cross-domain #1: the grouping / label / approval columns — the
+ * sidebar's project grouping, tag chip and approval wash had no wire
+ * source (the desktop pushed decorations out-of-band from the
+ * in-process store). `project` is None for an ungrouped thread;
+ * `approval_mode` is the PermissionMode i64. Additive + optional:
+ * older actors' payloads deserialize with Nones.
+ */
+project?: string, tag?: string, approval_mode?: bigint, };
 
 /**
  * Per-request token usage carried by the assistant `message` entry (§C.2

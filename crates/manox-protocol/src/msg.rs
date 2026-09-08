@@ -424,6 +424,8 @@ mod tests {
                         api: "anthropic".into(),
                         context_window: 131_072,
                         max_tokens: None,
+                        config_id: None,
+                        agents: None,
                     }],
                 },
             },

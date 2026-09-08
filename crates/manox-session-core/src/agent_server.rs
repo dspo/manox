@@ -492,6 +492,18 @@ impl AgentServerInner {
                                 conn.send_to_client(FromServer::Host {
                                     host: HostEvent::ThreadsUpdated { threads },
                                 });
+                                // U2 cross-domain #1: the known-projects
+                                // registry rides the list push (host-only —
+                                // a new surface, no v1 consumer for an
+                                // unsolicited registry push). The desktop's
+                                // store-event pump refetches ListThreads
+                                // after register_project, so the registry
+                                // snapshot stays in lockstep with the rows.
+                                let known = manox_agent::thread_store::global()
+                                    .read(|s| s.known_projects().to_vec());
+                                conn.send_to_client(FromServer::Host {
+                                    host: HostEvent::Projects { known },
+                                });
                             }
                             ListPush::Commands => {
                                 let commands = self.commands_snapshot();
@@ -838,6 +850,12 @@ impl AgentServerInner {
                     archived: t.archived,
                     parent_id: t.parent_id.clone(),
                     depth: t.depth,
+                    // U2 cross-domain #1: the grouping / label / approval
+                    // columns ride the wire row (the sidebar's decoration
+                    // push retires against them).
+                    project: (!t.project.is_empty()).then(|| t.project.clone()),
+                    tag: t.tag.clone(),
+                    approval_mode: Some(t.approval_mode),
                 })
                 .collect()
         })
@@ -3012,6 +3030,19 @@ fn model_to_wire(model: &manox_harness::types::Model) -> ModelInfo {
         api: model.api.clone(),
         context_window: model.context_window as u32,
         max_tokens: Some(model.max_tokens as u32),
+        // U2 cross-domain #4: the config key + agents visibility — the
+        // external-CLI launch cascade's columns (config_id falls back to
+        // the model id; empty/absent agents = visible to all).
+        config_id: Some(manox_agent::provider_glue::config_id(model)),
+        agents: model
+            .metadata
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            }),
     }
 }
 
@@ -9360,14 +9391,22 @@ mod tests {
     /// clients' recency ordering — the pre-migration sidebar sorted by
     /// interacted_at).
     #[test]
-    fn list_threads_maps_the_wire_recency_column_from_interacted_at() {
+    fn list_threads_maps_the_wire_recency_and_decoration_columns() {
         let _g = lock_globals();
         hermetic_home();
         init_globals();
         let (server, client) = harness(vec![]);
         manox_agent::thread_store::global().with_mut(|s| {
-            s.insert_summary_with_times_for_test("t-old", None, 500, 9000);
-            s.insert_summary_with_times_for_test("t-new", None, 800, 850);
+            s.insert_summary_with_times_for_test(
+                "t-old",
+                None,
+                500,
+                9000,
+                "/proj-old",
+                Some("tag-old"),
+                3,
+            );
+            s.insert_summary_with_times_for_test("t-new", None, 800, 850, "", None, 0);
         });
         client.send(FromClient::Request {
             id: MsgId::new("list"),
@@ -9405,6 +9444,12 @@ mod tests {
             new.updated_at, 800,
             "the wire recency column is interacted_at, not updated_at (850)"
         );
+        // U2 cross-domain #1: the decoration columns ride the wire row —
+        // project None for the empty store string, tag/approval mapped.
+        assert_eq!(old.project.as_deref(), Some("/proj-old"));
+        assert_eq!(old.tag.as_deref(), Some("tag-old"));
+        assert_eq!(old.approval_mode, Some(3));
+        assert_eq!(new.project, None, "an empty project maps to None");
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
@@ -9465,6 +9510,54 @@ mod tests {
             assert!(saw, "{who} never received the Models broadcast");
         }
         drop(client2);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U2 cross-domain #1: the ListThreads push carries the known-projects
+    /// registry beside the rows (host-only, requester-directed) — the
+    /// sidebar grouping's wire source. The desktop's store-event pump
+    /// refetches ListThreads after register_project, so the registry
+    /// snapshot stays in lockstep with the rows.
+    #[test]
+    fn list_threads_pushes_the_projects_registry() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.register_project("/p/a".into());
+        });
+        client.send(FromClient::Request {
+            id: MsgId::new("lt"),
+            call: ClientCall::ListThreads,
+        });
+        let mut saw_projects = false;
+        let mut saw_response = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(saw_projects && saw_response) {
+            match client.recv() {
+                FromServer::Host {
+                    host: HostEvent::Projects { known },
+                } => {
+                    assert!(
+                        known.iter().any(|p| p == "/p/a"),
+                        "the registry snapshot carries the registered project: {known:?}"
+                    );
+                    saw_projects = true;
+                }
+                FromServer::Response { id, outcome } if id.0 == "lt" => {
+                    outcome.expect("ListThreads answered");
+                    saw_response = true;
+                }
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the ListThreads push never completed (projects={saw_projects}, response={saw_response})"
+            );
+        }
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
