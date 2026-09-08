@@ -1577,48 +1577,16 @@ impl Workspace {
                     this.consume_steered_follow_up(message_id, cx);
                 }
                 _ => {
-                    // Live monitors / background bash keep the loop able to
-                    // self-advance; mirror the per-thread running-task check
-                    // into the store so the sidebar keeps the row spinning
-                    // even with no turn in flight. The event still falls
-                    // through to the conversation's task-card dispatch below.
-                    if let ThreadEvent::BackgroundTaskUpdated { .. } = ev {
-                        let thread_id = this
-                            .store
-                            .as_ref()
-                            .map(|s| s.read(cx).store.id.0.clone())
-                            .expect("foreground store present");
-                        let store = manox_agent::thread_store_global();
-                        store.with_mut(|s| {
-                            s.mark_background_work(
-                                &thread_id,
-                                manox_agent::background_task::thread_has_running_tasks(&thread_id),
-                            );
-                        });
-                    }
-                    // Tool traffic past a pending authorization proves the
-                    // verdict resolved (the call resumed or settled); drop
-                    // the sidebar badge. The `PendingApproval` card itself
-                    // precedes the authorization event and must not clear it.
-                    if matches!(
-                        ev,
-                        ThreadEvent::ToolCall { status, .. }
-                            if !matches!(
-                                status,
-                                manox_agent::thread::ToolCallStatus::PendingApproval
-                            )
-                    ) || matches!(
-                        ev,
-                        ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. }
-                    ) {
-                        let thread_id = this
-                            .store
-                            .as_ref()
-                            .map(|s| s.read(cx).store.id.0.clone())
-                            .expect("foreground store present");
-                        let store = manox_agent::thread_store_global();
-                        store.with_mut(|s| s.mark_pending_auth(&thread_id, false));
-                    }
+                    // U3b: the background-work flag is the server pump's
+                    // store write + delta (its BackgroundTaskUpdated arm
+                    // computes the same thread_has_running_tasks); the
+                    // event still falls through to the conversation's
+                    // task-card dispatch below.
+                    // U3b: the pending-auth badge drops at VERDICT time on
+                    // the server (clear_pending_auth_if_settled at all four
+                    // settle points + the §D.5 delta). The tool-traffic
+                    // heuristic this replaces only ran in-proc, only for
+                    // this client, and raced the actual verdict.
                     // `Error` is a terminal signal symmetric to a terminal
                     // `Stop`: the turn aborted, so this thread is no longer
                     // running. Pulled out of the catch-all rather than given a
@@ -1630,21 +1598,13 @@ impl Workspace {
                             .as_ref()
                             .map(|s| s.read(cx).store.id.0.clone())
                             .expect("foreground store present");
-                        // Sidebar running indicator: the turn aborted, so the
-                        // row stops spinning, flags the error, and surfaces
-                        // the unread state for the failed turn. A dead loop
-                        // can no longer self-advance, so any background-work
-                        // flag is stale and the row goes fully static.
-                        let store = manox_agent::thread_store_global();
-                        store.with_mut(|s| {
-                            s.mark_idle(&thread_id);
-                            s.mark_background_work(&thread_id, false);
-                            s.mark_pending_plan(&thread_id, false);
-                            s.set_errored(&thread_id, true);
-                            // GW5: no unread rise for the FOREGROUND error —
-                            // the user is watching it; the errored triangle
-                            // is the signal (client-owned unread, §F.2).
-                        });
+                        // U3b: the Error edge is the server pump's —
+                        // mark_idle, the errored flag and the full badge
+                        // clear ride its store write + the single delta
+                        // carrying the whole set. GW5 kept: no unread rise
+                        // for the FOREGROUND error — the user is watching
+                        // it; the errored triangle is the signal
+                        // (client-owned unread, §F.2).
                         this.turn_active = false;
                         this.background_threads
                             .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
@@ -1805,26 +1765,12 @@ impl Workspace {
     ) -> Subscription {
         let store = store.clone();
         cx.subscribe(&store, move |this, _store, ev: &ThreadEvent, cx| match ev {
-            // U3a: TurnStarted / ToolCallAuthorization badges are the
-            // server pump's store writes + SessionStatus deltas (single
-            // writer) — a parked thread's badge survives until the user
-            // switches back without a desktop mirror write. The heuristic
-            // auth CLEARS below stay (no server-side verdict-time clear
-            // exists yet — U3b debt).
-            ThreadEvent::ToolCall { status, .. }
-                if !matches!(status, manox_agent::thread::ToolCallStatus::PendingApproval) =>
-            {
-                // Tool traffic past a parked authorization proves the run
-                // resumed (the verdict resolved); drop the badge. The
-                // `PendingApproval` card itself precedes the authorization
-                // event and must not clear it.
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_pending_auth(&id, false));
-            }
-            ThreadEvent::ToolResult { .. } | ThreadEvent::ToolOutput { .. } => {
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_pending_auth(&id, false));
-            }
+            // U3a+U3b: the parked badges are the server pump's store
+            // writes + §D.5 deltas (single writer), and the pending-auth
+            // CLEAR is the server's verdict-time clear (U3b) — the
+            // tool-traffic heuristics this replaces only ran in-proc and
+            // raced the actual verdict. Tool traffic falls to the
+            // catch-all.
             ThreadEvent::SteerInjected { message_id } => {
                 this.consume_background_steer(&id, message_id);
             }
@@ -1883,14 +1829,9 @@ impl Workspace {
                 // An errored run voids a stashed plan review (the verdict
                 // is moot once the loop bailed out).
                 this.pending_plans.remove(&id);
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| {
-                    s.mark_idle(&id);
-                    s.mark_background_work(&id, false);
-                    s.mark_pending_plan(&id, false);
-                    s.mark_pending_auth(&id, false);
-                    s.set_errored(&id, true);
-                });
+                // U3b: the idle + full badge clear is the server Error
+                // arm's store write + the single delta carrying the whole
+                // set (the same five flags this mirror block wrote).
                 // GW5: the parked error's unread rise rides the leaf mirror
                 // (the server's Error delta carries no unread flag).
                 this.multiplexer.update(cx, |m, cx| m.note_unread(&id, cx));
@@ -6362,16 +6303,12 @@ impl Workspace {
         let Some(review) = self.pending_plan_review.take() else {
             return;
         };
-        // Every verdict consumes the card; clear the persisted pending flag
-        // and release the sidebar's plan-wait state. Capture the id before
-        // `ExecuteFresh` swaps in a new thread below.
-        let thread_id = self
-            .store
-            .as_ref()
-            .map(|s| s.read(cx).store.id.0.clone())
-            .expect("foreground store present");
+        // Every verdict consumes the card and releases the kernel review
+        // flag. U3b: the STORE badge clears server-side — every branch
+        // below answers the delivery (Refine/Execute Reply, ExecuteFresh
+        // CancelDelivery) and the server's verdict arms drop the flag with
+        // the §D.5 delta.
         self.thread.with_mut(|t| t.set_plan_review_pending(false));
-        manox_agent::thread_store_global().with_mut(|s| s.mark_pending_plan(&thread_id, false));
         if matches!(choice, PlanReviewChoice::Refine) {
             // The refine verdict must reach the server: without the Reply
             // the PlanVerdict delivery hangs until the 300s expire, whose

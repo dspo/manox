@@ -53,11 +53,15 @@ mod tests {
         const SENDS: &[&str] = &[".send_call(", ".send_note("];
         // (file, pattern-family name, needles, frozen count)
         let budget: &[(&str, &str, &[&str], usize)] = &[
-            // U3a: nine redundant mirror writes removed (the server pump is the
-            // single writer in-proc); the residual budget is sanctioned
-            // debt — error-arm mark_idle gaps, verdict-time clears,
-            // user-action writes awaiting gateway calls (U3b).
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 18),
+            // U3a+U3b: the redundant mirror writes are removed (the server
+            // pump is the single writer in-proc and its §D.5 deltas fold
+            // into the multiplexer's wire rows). The residual budget is
+            // sanctioned debt — user-action writes awaiting gateway calls
+            // (Archive/SetTag/RemoveProject, the park seeds, the attach
+            // badge clear, archive-if-idle, ExecuteFresh's archive,
+            // register_project), the dual-track bridge handle, and the
+            // registry-push decoration block.
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 11),
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 8),
             // U2: the list/registry reads are retired — the sidebar renders
             // the multiplexer's wire rows and the chip menu reads the pushed
@@ -68,7 +72,9 @@ mod tests {
             // acquisition whose rescan pump pushes the decoration columns the
             // wire list does not carry yet and re-pulls the list through the
             // gateway.
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 21),
+            // U3b: the seven mirror-write blocks took their
+            // thread_store_global() acquisitions with them (21 - 7).
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 14),
             // 19 = 18 + the GW3 CancelDelivery withdrawal send (the
             // plan-verdict abandonment path — a new protocol surface the
             // GW3-client migration adds by design; U9 folds it into the

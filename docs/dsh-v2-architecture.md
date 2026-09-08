@@ -304,11 +304,9 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 | 债务 | 现状 | 归属 |
 | --- | --- | --- |
-| U3b-桌面侧:workspace 前台泵/parked 启发式/裁决本地清等冗余写删除(服务端清零已落地 1a4d26cc,Error 臂单帧 delta 携全套) | GW3-client 同批(agent-ui)进行中 | Wave 1 |
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
 | U1-flush:parked follow-up 直写 facade(insert_user_message+run_turn 绕过网关 Submit) | 改道网关 Submit(服务端队列/drain/K5 持久已就绪) | Wave 2 |
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
-| GW3-client:三端裁决卡存 deliveryId + dismiss/dispose 时发 cancelDelivery(webui 无触发面,桌面有) | 桌面+webui 单批 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
 | U2-跨域#1:wire `ThreadListItem` 缺 project/tag/approval_mode 列,`known_projects` 无 wire 通道——sidebar 装饰靠 workspace 进程内推送(双轨债,sidebar 已被门禁钉 0) | 协议扩列+快照携项目注册表(或新 HostEvent) | C4/Wave 2 |
 | U2-跨域#4:wire `ModelInfo` 缺 config_id+metadata.agents——`views/model_cascade.rs`(外部 CLI 启动级联,发 raw cx config key)无法迁移,保留 provider_glue 直读(未入门禁针面) | ModelInfo 扩展 | Wave 2 |
