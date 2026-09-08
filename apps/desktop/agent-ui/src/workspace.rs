@@ -1142,11 +1142,8 @@ impl Workspace {
         });
         let recipient = thread.read(|t| t.self_author());
         let conversation = cx.new(|_| ConversationState::new(recipient));
-        let context_rail = {
-            cx.new(|_| {
-                crate::views::context_rail::ContextRail::new(thread.clone(), Some(store.clone()))
-            })
-        };
+        let context_rail =
+            { cx.new(|_| crate::views::context_rail::ContextRail::new(Some(store.clone()))) };
         let weak_ws = cx.weak_entity();
         context_rail.update(cx, |r, _| r.set_workspace(weak_ws));
 

@@ -2,14 +2,14 @@
 //! environment/cockpit information (run status, changes, branch, per-model
 //! token usage, context budget, execution plan, sources).
 //!
-//! The rail is a first-class view owned by [`crate::Workspace`]. It holds the
-//! cockpit state (run phase, the model's plan snapshot, per-cell counter
-//! animation state)
-//! that used to live directly on `Workspace`, plus strong handles to the
-//! active gpui-free `ThreadHandle` and the
-//! AgentServer-backed store mirror [`crate::ConversationState`] it renders
-//! against. Writes to cockpit state flow through `Workspace` →
-//! `self.context_rail.update(cx, |r, cx| …)`.
+//! The rail is a first-class view owned by [`crate::Workspace`]. It holds
+//! the cockpit state (run phase, the model's plan snapshot, per-cell
+//! counter animation state) that used to live directly on `Workspace`,
+//! plus the AgentServer-backed store mirror it renders against (U7b:
+//! the store leaf is the rail's ONLY read face — the former kernel
+//! thread-handle field outlived the γ-2a dual-read migration it was
+//! the fallback of, and retired). Writes to cockpit state flow through
+//! `Workspace` → `self.context_rail.update(cx, |r, cx| …)`.
 //!
 //! Layout: a fixed-width card that floats over the conversation column's
 //! top-right as an absolute overlay — a peer in the z-stack, not a flex
@@ -62,12 +62,12 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: manox_agent::thread::ThreadHandle,
-    /// γ-2a transitional read path: the AgentServer-backed store mirroring
-    /// kernel state via `ServerNote`s. `None` when the workspace has not
-    /// created the AgentServer connection; every kernel-state read dual-reads
-    /// this store first and falls back to `self.thread`. Mutations keep going
-    /// through `self.thread`.
+    /// The AgentServer-backed store mirroring kernel state via
+    /// `ServerNote`s (U7b: the rail's only read face — per-model usage,
+    /// project, cwd and title all read this leaf; the γ-2a dual-read
+    /// fallback the retired kernel thread-handle field served is gone).
+    /// `None` only before the workspace creates the AgentServer
+    /// connection.
     store: Option<Entity<ClientStoreHandle>>,
     /// Coarse run phase. Derived from `ThreadEvent`s routed here by
     /// `Workspace`; used to determine the main agent's status indicator.
@@ -99,12 +99,8 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(
-        thread: manox_agent::thread::ThreadHandle,
-        store: Option<Entity<ClientStoreHandle>>,
-    ) -> Self {
+    pub(crate) fn new(store: Option<Entity<ClientStoreHandle>>) -> Self {
         Self {
-            thread,
             store,
             cockpit_phase: CockpitPhase::Idle,
             plan: None,

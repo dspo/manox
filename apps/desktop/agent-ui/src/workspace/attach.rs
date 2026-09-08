@@ -573,7 +573,6 @@ impl Workspace {
         // IS recoverable: re-derived from the transcript's `UpdatePlan` tool
         // calls, falling back to the independent sidecar snapshot (the facade
         // mirrors the persisted copy on every `PlanUpdated` / `Ready`).
-        let new_thread_for_rail = self.thread.clone();
         let restored_plan = plan_from_messages.or_else(|| {
             self.store
                 .as_ref()
@@ -583,11 +582,11 @@ impl Workspace {
                 })
         });
         self.context_rail.update(cx, |r, cx| {
-            // Rebind the rail to the incoming thread. Without this the rail
-            // keeps reading the construction-time thread's `per_model` usage /
-            // project / display_title, so a freshly loaded thread with real
-            // usage data renders an empty "消费" section (no per-model tree).
-            r.thread = new_thread_for_rail;
+            // U7b: the rail's reads are store-only, so the rebind is the
+            // switch reset below — the incoming thread's leaf (already
+            // swapped on `self.store`) feeds every section (per-model
+            // usage, project, title); no kernel handle crosses into the
+            // view.
             r.reset_for_thread_switch(running, cx);
             if let Some(snapshot) = restored_plan {
                 r.set_plan(snapshot, cx);

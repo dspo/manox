@@ -329,10 +329,10 @@ mod tests {
 
     /// U9 / K.7-6 terminal grep gate: the view/component layer never
     /// touches the protocol send surface (the multiplexer is the only
-    /// wire face) and never holds kernel object handles. The frozen
-    /// kernel-handle budget is context_rail's `ThreadHandle` (doc line +
-    /// field + ctor) — the U7b rail-visibility migration item (Q-face
-    /// state ownership); it only shrinks.
+    /// wire face) and never holds kernel object handles. U7b complete:
+    /// the kernel-handle budget is ZERO — context_rail's `ThreadHandle`
+    /// (the last one) retired with the γ-2a dual-read it was the
+    /// fallback of; the store leaf is the rail's only read face.
     #[test]
     fn views_never_touch_wire_or_kernel_handles() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -362,9 +362,9 @@ mod tests {
             send_total, 0,
             "views must never touch the protocol send surface (U9 gate — the multiplexer is the only wire face)"
         );
-        assert!(
-            kernel_total <= 3,
-            "the views kernel-handle surface only shrinks (frozen budget 3 = context_rail's ThreadHandle doc/field/ctor, the U7b rail-visibility item); found {kernel_total}"
+        assert_eq!(
+            kernel_total, 0,
+            "views never hold kernel object handles (U7b complete: context_rail's ThreadHandle retired — the store leaf is the rail's only read face)"
         );
     }
 }
