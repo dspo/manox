@@ -78,7 +78,7 @@ use crate::views::composer_menu::{
 use crate::views::message::MessageItem;
 use crate::views::popup_menu;
 use crate::views::settings::{SettingsEvent, SettingsView};
-use crate::views::sidebar::{Sidebar, SidebarEvent, ThreadRowMeta};
+use crate::views::sidebar::{Sidebar, SidebarEvent};
 use crate::views::turn_navigator::{TurnNavigator, TurnNavigatorEvent, collect_user_turns};
 use crate::{
     CloseBrowserTab, CloseTerminalTab, FocusTerminal, NewTerminalTab, OpenBrowserTab,
@@ -843,15 +843,13 @@ impl Workspace {
         // list, and badges prefer the leaves' client-owned unread mirrors.
         sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
         // U2 dual-track bridge: the in-process store stays the rescan source
-        // the server's snapshot reads, so its event channel drives (a) the
-        // sidebar decoration push (the columns the wire list does not carry
-        // yet) and (b) the gateway list refetch. When the server owns the
-        // rescan itself, this bridge retires (cross-domain ask).
+        // the server's snapshot reads, so its event channel drives the
+        // gateway list refetch — the wire rows (with their decoration
+        // columns) and the Projects registry snapshot ride the answer, and
+        // the multiplexer's notify feeds the sidebar and the chip-menu
+        // caches. When the server owns the rescan itself, this bridge
+        // retires (cross-domain ask #5).
         let thread_store = manox_agent::thread_store_global();
-        let (thread_meta, thread_projects, known_projects) = read_thread_decor(&thread_store);
-        sidebar.update(cx, |s, cx| {
-            s.set_thread_meta(thread_meta, known_projects.clone(), cx)
-        });
         let store_rx = thread_store.subscribe();
         let _store_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
             while let Ok(_ev) = store_rx.recv().await {
@@ -859,8 +857,26 @@ impl Workspace {
             }
         });
         // The multiplexer's notify (its list/registry state changed)
-        // repaints the sidebar rows and the workspace's model surfaces.
+        // repaints the sidebar rows and the workspace's model surfaces, and
+        // feeds the chip-menu caches off the wire state (U2 cross-domain
+        // #1: the store-read decoration snapshot retired — the registry
+        // rides the Projects mirror, the per-thread projects ride the rows).
         let _mux_lists = cx.observe(&multiplexer, |this, _, cx| {
+            let (projects, known) = {
+                let m = this.multiplexer.read(cx);
+                let mut projects: Vec<String> = Vec::new();
+                for row in m.thread_list() {
+                    if let Some(project) = row.project.as_deref()
+                        && !project.is_empty()
+                        && !projects.iter().any(|p| p == project)
+                    {
+                        projects.push(project.to_string());
+                    }
+                }
+                (projects, m.known_projects().to_vec())
+            };
+            this.thread_projects = projects;
+            this.known_projects = known;
             this.sidebar.update(cx, |_, cx| cx.notify());
             cx.notify();
         });
@@ -885,8 +901,8 @@ impl Workspace {
             git_status_gen: 0,
             sidebar,
             thread_store,
-            thread_projects,
-            known_projects,
+            thread_projects: Vec::new(),
+            known_projects: Vec::new(),
             _store_pump,
             _mux_lists,
             conversation: conversation.clone(),
@@ -4429,16 +4445,12 @@ impl Workspace {
         self.attach_thread(loaded, true, window, cx);
     }
 
-    /// One in-process store-change tick (U2 dual-track bridge): push the
-    /// fresh decoration columns to the sidebar and re-pull the authoritative
-    /// list through the gateway. The list itself is never read off the store
-    /// — the multiplexer's wire rows are the sidebar's source.
+    /// One in-process store-change tick (U2 dual-track bridge): re-pull the
+    /// authoritative list through the gateway. The wire rows (with their
+    /// decoration columns) and the Projects registry snapshot ride the
+    /// answer; the multiplexer's notify then feeds the sidebar and the
+    /// chip-menu caches. The list itself is never read off the store.
     fn on_thread_store_changed(&mut self, cx: &mut Context<Self>) {
-        let (meta, projects, known) = read_thread_decor(&self.thread_store);
-        self.thread_projects = projects;
-        self.known_projects = known.clone();
-        self.sidebar
-            .update(cx, |s, cx| s.set_thread_meta(meta, known, cx));
         self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
     }
 
@@ -5470,9 +5482,16 @@ impl Workspace {
         let cwd = self.launcher_thread_cwd(cx);
         let ws = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
+            // U2 cross-domain #4: the cascade projects the multiplexer's
+            // wire models (the provider_glue direct read retired).
+            let models: Vec<manox_protocol::ModelInfo> = ws
+                .upgrade()
+                .map(|ws| ws.read(cx).multiplexer.read(cx).models().to_vec())
+                .unwrap_or_default();
             crate::views::model_cascade::build_model_cascade(
                 menu,
                 kind.agent_id(),
+                &models,
                 window,
                 cx,
                 move |provider, model, wire, window, cx| {
@@ -10150,40 +10169,6 @@ fn wire_commands_has(commands: &serde_json::Value, name: &str, kind: &str) -> bo
 /// section. This is the last kernel read feeding the sidebar — the cross-
 /// domain ask is to extend §D.5 `ThreadsUpdated` with these columns so it
 /// retires.
-fn read_thread_decor(
-    store: &manox_agent::thread_store::StoreHandle,
-) -> (HashMap<String, ThreadRowMeta>, Vec<String>, Vec<String>) {
-    store.read(|s| {
-        let mut meta: HashMap<String, ThreadRowMeta> = HashMap::new();
-        // Archived first so an active row with the same id overwrites it.
-        for sum in s.archived_summaries() {
-            meta.insert(
-                sum.id.clone(),
-                ThreadRowMeta {
-                    project: sum.project.clone(),
-                    tag: sum.tag.clone(),
-                    approval_mode: sum.approval_mode,
-                },
-            );
-        }
-        let mut projects: Vec<String> = Vec::new();
-        for sum in s.summaries() {
-            meta.insert(
-                sum.id.clone(),
-                ThreadRowMeta {
-                    project: sum.project.clone(),
-                    tag: sum.tag.clone(),
-                    approval_mode: sum.approval_mode,
-                },
-            );
-            if !sum.project.is_empty() && !projects.contains(&sum.project) {
-                projects.push(sum.project.clone());
-            }
-        }
-        (meta, projects, s.known_projects().to_vec())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     /// Serializes tests that init/replace the process-wide `thread_store`
@@ -11133,29 +11118,25 @@ mod tests {
             "the wire row carries the server's projection of the store flag"
         );
 
-        // (c) The decoration push reached both caches: the workspace's chip
-        // menu source and the sidebar's grouping registry (neither reads the
-        // kernel at render time any more).
-        let (ws_known, sb_known, sb_meta) = ws.read_with(&visual, |ws, cx| {
-            let sb = ws.sidebar.read(cx);
-            (
-                ws.known_projects.clone(),
-                sb.known_projects_for_test().to_vec(),
-                sb.thread_meta_for_test("t-u2-row").cloned(),
-            )
-        });
-        assert!(
-            ws_known.iter().any(|p| p == "/p/u2"),
-            "the chip menu's project cache rides the pump push"
-        );
-        assert!(
-            sb_known.iter().any(|p| p == "/p/u2"),
-            "the sidebar's grouping registry rides the pump push"
-        );
-        assert!(
-            sb_meta.is_some(),
-            "every listed row gets its decoration entry"
-        );
+        // (c) The registry rides the wire: the server pushed the Projects
+        // snapshot with the ListThreads answer, and the multiplexer's
+        // notify fed the workspace's chip-menu cache (the sidebar reads
+        // the mux directly — nothing reads the kernel at render time any
+        // more).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ws_known: Vec<String> = ws.read_with(&visual, |ws, _| ws.known_projects.clone());
+        loop {
+            if ws_known.iter().any(|p| p == "/p/u2") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the chip-menu project cache never rode the mux feed: {ws_known:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            cx.run_until_parked();
+            ws_known = ws.read_with(&visual, |ws, _| ws.known_projects.clone());
+        }
 
         drop(ws);
         drop(visual);

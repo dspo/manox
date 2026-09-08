@@ -274,6 +274,13 @@ pub fn wire_key(model: &manox_harness::types::Model) -> Option<&'static str> {
     manox_harness::provider::model_api_to_wire_key(&model.api)
 }
 
+/// The launch-pin wire key for a wire api string (U2 cross-domain #4: the
+/// cascade consumes the wire `ModelInfo`s, whose api column replaces the
+/// kernel `Model` this derived from).
+pub fn wire_key_from_api(api: &str) -> Option<&'static str> {
+    manox_harness::provider::model_api_to_wire_key(api)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

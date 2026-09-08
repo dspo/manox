@@ -4,9 +4,10 @@
 //! the rows are the multiplexer's wire `ThreadListItem`s (§D.5
 //! `ThreadsUpdated` mirrors / `ListThreads` responses with the
 //! `SessionStatus` deltas merged in) — the former kernel `StoreHandle` event
-//! pump is retired. The decoration columns the wire list does not carry yet
-//! (project grouping, tag chip, approval wash) are pushed by the workspace
-//! as [`ThreadRowMeta`]. Clicking a conversation entry emits
+//! pump is retired. The decoration columns (project grouping, tag chip,
+//! approval wash) ride the wire rows and the grouping registry rides the
+//! `HostEvent::Projects` mirror (U2 cross-domain #1). Clicking a
+//! conversation entry emits
 //! `OpenThread(id)`; the "Conversations" section header's "+" opens the
 //! flat new-session menu and each project folder header's ellipsis button opens the project
 //! action menu (new session / terminal / VS Code / remove project). Workspace subscribes to
@@ -307,34 +308,12 @@ fn external_session_is_loose(project: Option<&std::path::Path>, known_projects: 
     })
 }
 
-/// The row-decoration columns the wire `ThreadListItem` does not carry yet
-/// (U2 dual-track debt): project folder grouping, the tag chip, and the
-/// approval-mode wash. The workspace reads them off the in-process store and
-/// pushes them alongside every rescan; the cross-domain ask is to extend the
-/// wire list (§D.5 `ThreadsUpdated`) so this projection retires.
-#[derive(Clone, Debug, Default)]
-pub struct ThreadRowMeta {
-    /// Bound project folder path ("" = unbound → the loose Conversations list).
-    pub project: String,
-    /// User-assigned tag chip.
-    pub tag: Option<String>,
-    /// Permission mode (`PermissionMode::as_i64` mapping); the row wash color.
-    pub approval_mode: i64,
-}
-
 pub struct Sidebar {
     /// The gateway client (U2 list source + GW5 badge source): rows are its
     /// wire `ThreadListItem`s, and their unread badges prefer the leaves'
     /// client-owned mirrors. Bound by the workspace after construction; an
     /// unbound sidebar (tests) renders no thread rows.
     mux: Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
-    /// Per-thread decoration the wire list does not carry (project/tag/
-    /// approval wash), pushed by the workspace (`set_thread_meta`). Includes
-    /// the archived partition so a tag lookup addresses those rows too.
-    thread_meta: HashMap<String, ThreadRowMeta>,
-    /// Registered project folders (the grouping registry), pushed with the
-    /// decoration snapshot.
-    known_projects: Vec<String>,
     selected: Option<String>,
     /// The thread that was selected immediately before `selected`; its row
     /// plays a fade-out wash while the new row's wash fades in, so selection
@@ -394,8 +373,6 @@ impl Sidebar {
     pub fn new(width: Pixels, _cx: &mut Context<Self>) -> Self {
         Self {
             mux: None,
-            thread_meta: HashMap::new(),
-            known_projects: Vec::new(),
             selected: None,
             collapsed: HashSet::new(),
             team_collapsed: HashSet::new(),
@@ -413,21 +390,6 @@ impl Sidebar {
             width,
             scroll_handle: ScrollHandle::new(),
         }
-    }
-
-    /// Replace the decoration snapshot the wire list does not carry (U2):
-    /// per-thread project/tag/approval-mode plus the registered-project
-    /// folder list. Pushed by the workspace on every in-process store
-    /// rescan; the row list itself comes from the multiplexer.
-    pub fn set_thread_meta(
-        &mut self,
-        meta: HashMap<String, ThreadRowMeta>,
-        known_projects: Vec<String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.thread_meta = meta;
-        self.known_projects = known_projects;
-        cx.notify();
     }
 
     /// Replace the external-session projection. Called by the Workspace
@@ -815,10 +777,17 @@ impl Sidebar {
         }
     }
 
-    /// The persisted tag for a row, reading the pushed decoration snapshot
-    /// (which spans both store partitions — active rows win).
-    fn summary_tag(&self, id: &str, _cx: &App) -> Option<String> {
-        self.thread_meta.get(id).and_then(|m| m.tag.clone())
+    /// The persisted tag for a row (U2 cross-domain #1: it rides the wire
+    /// row — the wire list spans both store partitions, so archived rows'
+    /// tags resolve too).
+    fn summary_tag(&self, id: &str, cx: &App) -> Option<String> {
+        self.mux.as_ref().and_then(|m| {
+            m.read(cx)
+                .thread_list()
+                .iter()
+                .find(|i| i.id == id)
+                .and_then(|i| i.tag.clone())
+        })
     }
 
     /// Build the session-menu dropdown anchored below the trigger button
@@ -1005,7 +974,6 @@ impl Sidebar {
                         SidebarRow::Thread(s) => render_thread_item(
                             &SidebarThreadItem::from_wire(
                                 &s,
-                                self.thread_meta.get(&s.id),
                                 is_selected,
                                 unread_map.get(&s.id).copied(),
                                 RowNesting {
@@ -1052,7 +1020,13 @@ impl Render for Sidebar {
             .as_ref()
             .map(|m| m.read(cx).thread_list().to_vec())
             .unwrap_or_default();
-        let known_projects = self.known_projects.clone();
+        // U2 cross-domain #1: the grouping registry rides the wire (the
+        // `HostEvent::Projects` mirror), not a workspace push.
+        let known_projects = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).known_projects().to_vec())
+            .unwrap_or_default();
         let selected = self.selected.clone();
         // GW5 badge source: the leaves' client-owned unread mirrors.
         let unread_map = self
@@ -1066,13 +1040,9 @@ impl Render for Sidebar {
         for s in &items {
             // Only REGISTERED projects become folder groups; a session cwd
             // that was never bound as a project (e.g. the default home dir)
-            // stays in the loose Conversations list. The binding rides the
-            // pushed decoration snapshot (the wire row has no project yet).
-            let project = self
-                .thread_meta
-                .get(&s.id)
-                .map(|m| m.project.as_str())
-                .unwrap_or_default();
+            // stays in the loose Conversations list. U2 cross-domain #1:
+            // the binding rides the wire row's project column.
+            let project = s.project.as_deref().unwrap_or_default();
             if project.is_empty() || !known_projects.iter().any(|kp| kp == project) {
                 loose.push(s.clone());
             } else if let Some(entry) = projects.iter_mut().find(|(p, _)| p == project) {
@@ -1250,7 +1220,6 @@ impl Render for Sidebar {
                                             SidebarRow::Thread(s) => render_thread_item(
                                                 &SidebarThreadItem::from_wire(
                                                     &s,
-                                                    self.thread_meta.get(&s.id),
                                                     is_selected,
                                                     unread_map.get(&s.id).copied(),
                                                     RowNesting {
@@ -1321,9 +1290,21 @@ fn build_agent_model_cascade(
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let sidebar = sidebar.clone();
+    // U2 cross-domain #4: the cascade projects the multiplexer's wire
+    // models (the provider_glue direct read retired).
+    let models: Vec<manox_protocol::ModelInfo> = sidebar
+        .upgrade()
+        .and_then(|sb| {
+            sb.read(cx)
+                .mux
+                .as_ref()
+                .map(|m| m.read(cx).models().to_vec())
+        })
+        .unwrap_or_default();
     crate::views::model_cascade::build_model_cascade(
         menu,
         agent_id,
+        &models,
         window,
         cx,
         move |provider, model, wire, _window, cx| {
@@ -1536,7 +1517,7 @@ struct TagEdit {
 }
 
 /// A UI-layer sidebar row projected from either the gateway's wire
-/// `ThreadListItem` (+ its pushed [`ThreadRowMeta`] decoration) or an
+/// `ThreadListItem` (its decoration columns ride the row) or an
 /// `ExternalSessionSummary`, so the two render through one layout with a shared
 /// selection-slide animation, id tag, and hover archive action. Only display +
 /// identity fields live here — the sidebar never holds PTY handles.
@@ -1589,14 +1570,12 @@ struct SidebarThreadItem {
 }
 
 impl SidebarThreadItem {
-    /// Project a gateway wire row (U2): the live flags ride the row itself
-    /// (the server's list projection with the §D.5 `SessionStatus` deltas
-    /// merged by the multiplexer), and the decoration the wire does not
-    /// carry yet (tag chip, approval wash) comes from the pushed
-    /// [`ThreadRowMeta`].
+    /// Project a gateway wire row (U2): the live flags AND the decoration
+    /// columns (tag chip, approval wash — U2 cross-domain #1) ride the row
+    /// itself (the server's list projection with the §D.5 `SessionStatus`
+    /// deltas merged by the multiplexer).
     fn from_wire(
         item: &ThreadListItem,
-        meta: Option<&ThreadRowMeta>,
         selected: bool,
         // GW5: the leaf's client-owned unread mirror, when the session has
         // a leaf; `None` falls back to the row's flag (the deprecated wire
@@ -1617,7 +1596,7 @@ impl SidebarThreadItem {
             title,
             updated: format_relative(item.updated_at as i64),
             pinned: item.pinned,
-            tag: meta.and_then(|m| m.tag.clone()),
+            tag: item.tag.clone(),
             has_unread: unread_override.unwrap_or(item.unread),
             errored: item.errored,
             running: item.running,
@@ -1633,7 +1612,7 @@ impl SidebarThreadItem {
             nested: nesting.nested,
             icon: RowIcon::Thread,
             wash: approval_mode_color(
-                meta.map(|m| m.approval_mode)
+                item.approval_mode
                     .unwrap_or_else(|| PermissionMode::default().as_i64()),
                 theme,
             ),
@@ -2256,19 +2235,6 @@ mod tests {
     use super::*;
     use gpui_component::theme::ThemeColor;
 
-    /// Test accessors for the pushed decoration snapshot (U2). They live in
-    /// the test module so the file's production part (the source gate's
-    /// needle surface) stays free of test-only API.
-    impl Sidebar {
-        pub(crate) fn known_projects_for_test(&self) -> &[String] {
-            &self.known_projects
-        }
-
-        pub(crate) fn thread_meta_for_test(&self, id: &str) -> Option<&ThreadRowMeta> {
-            self.thread_meta.get(id)
-        }
-    }
-
     /// A real (non-transparent) theme — `Theme::default()` derives all-zero
     /// colors, so it cannot validate wash visibility.
     fn real_theme() -> Theme {
@@ -2299,16 +2265,6 @@ mod tests {
             project: None,
             tag: None,
             approval_mode: None,
-        }
-    }
-
-    /// The pushed decoration for [`sample_item`] (the columns the wire row
-    /// does not carry yet).
-    fn sample_meta() -> ThreadRowMeta {
-        ThreadRowMeta {
-            project: String::new(),
-            tag: None,
-            approval_mode: PermissionMode::default().as_i64(),
         }
     }
 
@@ -2398,7 +2354,6 @@ mod tests {
 
         let thread = SidebarThreadItem::from_wire(
             &sample_item(),
-            Some(&sample_meta()),
             true,
             None,
             RowNesting {
@@ -2454,7 +2409,6 @@ mod tests {
         let theme = real_theme();
         let thread = SidebarThreadItem::from_wire(
             &sample_item(),
-            Some(&sample_meta()),
             false,
             None,
             RowNesting {
@@ -2470,22 +2424,19 @@ mod tests {
         assert!(!external.selected);
     }
 
-    /// U2 row projection: the live flags ride the wire row (server
-    /// projection + `SessionStatus` deltas merged by the multiplexer), the
-    /// tag chip and wash come from the pushed decoration, and the leaf's
-    /// client-owned unread mirror wins over the deprecated row flag.
+    /// U2 row projection (cross-domain #1 adoption): the live flags AND the
+    /// decoration columns (tag chip, approval wash) ride the wire row, and
+    /// the leaf's client-owned unread mirror wins over the deprecated row
+    /// flag.
     #[test]
-    fn from_wire_merges_row_flags_meta_and_leaf_unread() {
+    fn from_wire_projects_the_wire_columns_and_leaf_unread() {
         let theme = real_theme();
         let mut item = sample_item();
         item.running = true;
         item.pending_plan = true;
         item.background_work = true;
-        let meta = ThreadRowMeta {
-            project: "/p/a".into(),
-            tag: Some("chip".into()),
-            approval_mode: PermissionMode::default().as_i64(),
-        };
+        item.tag = Some("chip".into());
+        item.approval_mode = Some(PermissionMode::default().as_i64());
         let nesting = RowNesting {
             indent: px(0.),
             team_leader: false,
@@ -2494,26 +2445,32 @@ mod tests {
         };
         // The leaf mirror (GW5 badge source) wins over the row's deprecated
         // constant-false unread.
-        let with_override =
-            SidebarThreadItem::from_wire(&item, Some(&meta), false, Some(true), nesting, &theme);
+        let with_override = SidebarThreadItem::from_wire(&item, false, Some(true), nesting, &theme);
         assert!(with_override.has_unread, "the leaf mirror wins");
         assert!(
             with_override.running && with_override.pending_plan && with_override.background_work,
             "the live flags ride the wire row"
         );
-        assert_eq!(with_override.tag.as_deref(), Some("chip"));
+        assert_eq!(
+            with_override.tag.as_deref(),
+            Some("chip"),
+            "the tag chip rides the wire row"
+        );
         assert_eq!(
             with_override.wash,
-            approval_mode_color(PermissionMode::default().as_i64(), &theme)
+            approval_mode_color(PermissionMode::default().as_i64(), &theme),
+            "the wash rides the wire row's approval column"
         );
         // No leaf: fall back to the row value (the client-owned mirror the
         // multiplexer keeps — false on a fresh snapshot row).
-        let no_override =
-            SidebarThreadItem::from_wire(&item, Some(&meta), false, None, nesting, &theme);
+        let no_override = SidebarThreadItem::from_wire(&item, false, None, nesting, &theme);
         assert!(!no_override.has_unread);
-        // No decoration yet (a row that outran the push): default wash, no
-        // tag — the row still renders.
-        let bare = SidebarThreadItem::from_wire(&item, None, false, None, nesting, &theme);
+        // A row without decoration columns: default wash, no tag — it still
+        // renders (the optional columns' absence is legal).
+        let mut bare_item = sample_item();
+        bare_item.tag = None;
+        bare_item.approval_mode = None;
+        let bare = SidebarThreadItem::from_wire(&bare_item, false, None, nesting, &theme);
         assert_eq!(bare.tag, None);
         assert_eq!(
             bare.wash,

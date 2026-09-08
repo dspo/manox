@@ -307,8 +307,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
-| U2-跨域#1:**wire 面已落地**——ThreadListItem + project/tag/approvalMode 可选列(serde-default/ts-optional,旧 actor 兼容),HostEvent::Projects{known} 注册表快照随 ListThreads 推送(host-only,Models-reload 先例;C3 表 8→9,J1 门禁自动吸收),mux known_projects 状态+访问器,guards/fixtures/ts-rs 同步(webui guards-surface 门禁抓住遗漏=按设计工作)。**残余桌面 adoption**:sidebar 分组/tag/wash 改读 wire 行+mux 注册表,workspace ThreadRowMeta 装饰推送+read_thread_decor 退休(棘轮读面可再降) | 桌面 adoption 批 | Wave 2 |
-| U2-跨域#4:**wire 面已落地**——ModelInfo + configId/agents 可选列,服务端映射 provider_glue::config_id+metadata.agents(两行映射编译期钉住,无值级测试——Model 无 Default、35 字段字面量得不偿失,adoption 侧语义覆盖,诚实记录)。**残余桌面 adoption**:model_cascade 改读 mux models wire 行,退休 provider_glue 直读 | 桌面 adoption 批 | Wave 2 |
 | U2-跨域#5:服务端 rescan 自持缺失——桌面 `refresh_thread_list()` 7 处仍为进程内 rescan 触发器+store 事件桥(双轨) | 服务端在生命周期边界/ListThreads 内自持 rescan,桌面退休桥 | Wave 2 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
@@ -339,7 +337,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 **客户端前置（note 臂删除前必须完成）**：
 - 桌面：`SessionCreated/Disposed/Error` 权威迁移——U2 `apply_host` 现仅对账这三类（v1 note 路径权威，has_follow 守卫钉住 follow 单开）→ C4a 先反转权威再删 note 臂。
-- 桌面：`model_cascade` provider_glue 直读 → ModelInfo 扩展（跨域#4）；`refresh_thread_list` 7 处+store 事件桥 → 服务端 rescan 自持（跨域#5）；ThreadRowMeta 装饰推送 → ThreadListItem 扩列+known_projects 通道（跨域#1）。
+- 桌面：`model_cascade`✓（改读 mux wire models,provider_glue 直读退休）、ThreadRowMeta 装饰推送✓（sidebar 分组/tag/wash 直读 wire 行,注册表读 mux `known_projects` 镜像,workspace 装饰推送/read_thread_decor 退休,chip 缓存改 mux observe 供给）——跨域#1/#4 全闭;残余仅 `refresh_thread_list` 7 处+store 事件桥 → 服务端 rescan 自持（跨域#5）。
 - webui：T7 v2-first✓；**消费残余已审计定界**（`apps/web/webui/src/sidebar/webview/state/store.ts`）：`notification` 路由 1 处（~325）+ `onServerNote` 纯 v1 臂 7 个——注册表 4 臂（models/commands/threadsUpdated/ready，~893-902，Host 直折已覆盖）+ 裁决 note 3 臂（approve/askUserQuestion/planVerdict，~917-939，Request 路径已覆盖，GW1 双发幂等折叠）；sessionCreated/sessionDisposed/error 3 臂被 Host 转换器内部复用（规范化入口，非 wire 残余）。C4b 删臂 = 删路由+7 臂，零行为变化（各臂的 Host/Request 等价路径已逐一核对存在）。
 - napi：适配面同步（vscode 徽章已列 follow-up）。
 
