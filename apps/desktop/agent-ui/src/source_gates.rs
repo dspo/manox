@@ -69,6 +69,12 @@ mod tests {
             // flag writer; its deltas already fed every mirror).
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 4),
             (
+                "workspace/render.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                0,
+            ),
+            (
                 "workspace/chips.rs",
                 "store mirror writes (U3)",
                 STORE_WRITE,
@@ -111,6 +117,12 @@ mod tests {
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            (
+                "workspace/render.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                0,
+            ),
             (
                 "workspace/chips.rs",
                 "facade writes (U1/U6)",
@@ -163,6 +175,7 @@ mod tests {
             // U9b⑤: the right pane's threads.db persistence reads moved with the
             // pane (7→4 here, its 3 freeze on the right_pane rows).
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 4),
+            ("workspace/render.rs", "store reads (U2)", STORE_GLOBAL, 0),
             ("workspace/chips.rs", "store reads (U2)", STORE_GLOBAL, 0),
             (
                 "workspace/right_pane.rs",
@@ -195,6 +208,7 @@ mod tests {
             // U9b cluster 6: the ask/auth resolve legs' five wire replies moved
             // with the chip families (16→11 here, frozen at 5 there).
             ("workspace.rs", "protocol sends (U9)", SENDS, 11),
+            ("workspace/render.rs", "protocol sends (U9)", SENDS, 0),
             ("workspace/chips.rs", "protocol sends (U9)", SENDS, 5),
             ("workspace/right_pane.rs", "protocol sends (U9)", SENDS, 0),
             ("workspace/external.rs", "protocol sends (U9)", SENDS, 0),
@@ -266,6 +280,9 @@ mod tests {
             // (budgeted by their own rows below — the five sends are the
             // ask/auth resolve legs' wire replies).
             "workspace/chips.rs",
+            // U9b cluster 7: the chrome render face (all-zero budgets
+            // below — pure element builders, no wire or store reach).
+            "workspace/render.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
