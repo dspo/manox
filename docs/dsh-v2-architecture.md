@@ -308,6 +308,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源)+ store-event refetch 桥(跨域#5 落地后的残余:仅泵旗写/sidecar 写尾的 refetch 触发器,thread_store 句柄的最后用户除 open_thread) | 投影权威反转后一并删 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
+| C4b 大宗删除 gate:vscode extension host 消费 note 形状事件(sessionCreated×3/threadsUpdated×2/sessionDisposed×2/ready×2/approve×2/planVerdict/askUserQuestion/models/commands——awaitSession 谓词+审批流);parseFromServer 不归一 host 帧 → 删臂=vscode 会话创建挂起(硬破坏,非 badge 类退化) | vscode host 迁移(parseFromServer 把 host 帧归一为 method 事件,或 sessionManager 谓词改 host 形状)为 C4b 大宗+compat 三件删除的硬前置;本期 C4b 仅删无消费方面 | C4 follow-up(硬) |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
@@ -323,7 +324,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 **协议删除面（L12 破坏性变更，单批收敛）**：
 1. 错误桩 ClientCall 三件：`GetUsage`/`GetCurrentModel`/`ThreadInfo`（§J.6 as-built 注记的存活桩）。
-2. compat ClientNote 三件：`CreateSession`/`Submit`/`Steer`——U1-flush 已落地（parked flush 改道网关，前台 flush 此前已迁）。**残余**：两处 flush 的批量前置插入仍骑 `AppendUserMessage` note（all-but-last 语义），其 v2 替代（逐项 Submit 靠服务端队列合并、或新增批量词汇）与 CreateSession landing / Steer note 退休同属 C4a。
+2. compat ClientNote 三件：`CreateSession`/`Submit`/`Steer`——U1-flush 已落地（parked flush 改道网关，前台 flush 此前已迁）。**C4a-2 验证（零迁移工作）**：三件的生产发送方已清零——桌面 create 走 `ClientCall::CreateSession`（multiplexer `create_session`，open_or_create 的 note 路径仅测试脚手架）、submit 走 `ClientCall::Submit`、steer 桌面无 UI；webui 三处 `method:'submit'/'steer'/'createSession'` 均为 **v2 `request()` call**（method 字符串曾误判为 note 残余）。实际发送方仅 **vscode extension host**（sidebarProvider/participant 的 submit note、sessionManager 的 createSession note——client-chosen-id + awaitSession 流，迁移是行为级改动，超出「仅保持编译」授权）→ 三件服务端臂为 vscode 保留，删除 gated 于 vscode 迁移（follow-up 行）。`AppendUserMessage` 批量前置插入为**合法 v1 note**（不在三件内）：flush 替代的语义决策点仍开放（逐项 Submit 在 idle 线程上首条即开行、余条并第二轮,与现状单轮批量不等价——需批量词汇或接受两轮形状并入档）。
 3. `FocusThread` 变体（GW5 起 handler no-op）。
 4. `ThreadListItem.unread` 弃用列（GW5 起恒 false，两端均已 delta+本地清零）。
 5. T2 死亡清单 `#[deprecated]` 类型（ServerNote 死亡清单=37 减 11 保留集的差集；保留集以 `SERVER_NOTES` 宏清单为单源）。
@@ -340,5 +341,5 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 - webui：T7 v2-first✓；**消费残余已审计定界**（`apps/web/webui/src/sidebar/webview/state/store.ts`）：`notification` 路由 1 处（~325）+ `onServerNote` 纯 v1 臂 7 个——注册表 4 臂（models/commands/threadsUpdated/ready，~893-902，Host 直折已覆盖）+ 裁决 note 3 臂（approve/askUserQuestion/planVerdict，~917-939，Request 路径已覆盖，GW1 双发幂等折叠）；sessionCreated/sessionDisposed/error 3 臂被 Host 转换器内部复用（规范化入口，非 wire 残余）。C4b 删臂 = 删路由+7 臂，零行为变化（各臂的 Host/Request 等价路径已逐一核对存在）。
 - napi：适配面同步（vscode 徽章已列 follow-up）。
 
-**顺序**：C4a 桌面权威迁移✓（C4a-1 已落地）+ **compat 退休（C4a-2，余）**——CreateSession landing 改 v2 call（mux create_callbacks 路径已就绪）、两处 flush 的 AppendUserMessage 替代（**语义决策点**：逐项 Submit 依赖服务端队列合并，但 flush 落在 idle 线程→首条即开行、余条并成第二轮,与现状「全部条目并一轮」不等价;需批量词汇或接受两轮形状并入档）、Steer note→v2 Steer call → C4b 协议删除批（单 commit：类型+宏表+穷举 match+ts-rs 再生+fixtures；J1 三面门禁对死面残留自动红）→ C4c §J.6「零残留」声明真实化收尾。
+**顺序**：C4a-1 桌面权威迁移✓ + C4a-2 compat 验证✓（生产发送方清零，vscode 除外——见上）→ **C4b 定界收窄**：本期可删 = 无任何消费方的面（FocusThread 变体+no-op 臂、ThreadListItem.unread 列、error-stub call、K9 死 schema——逐项 grep 证据后单批删除，J1/C3 门禁看守）；**死亡清单大宗**（注册表 4 臂 models/commands/threadsUpdated/ready + 裁决 3 臂 approve/askUserQuestion/planVerdict + 控制 3 臂 sessionCreated/disposed/error + compat 三件）**gated 于 vscode extension host 的 host 帧迁移**：sessionManager 的 awaitSession 谓词与审批流消费 note 形状事件（`ev.method === 'sessionCreated'` 等 12 消费点），parseFromServer 不把 host 帧归一为 method 事件——删臂即 vscode 建会话挂起（硬破坏，非 badge 类 UI 退化），sidebar webview 不受影响（sidebarProvider 原样转发全部 FromServer 含 host，webui store 已 onHostEvent 化）→ C4b 大宗+vscode host 迁移列为 PR 合并前硬 follow-up → C4c §J.6「零残留」声明随大宗删除真实化。
 **门禁证据**：C3 `wire_surface!` 宏单源（表/match/样本同收敛）；J1 host+call+journal 三面门禁；ts-rs exact-key 守卫+fixtures 导出；桌面棘轮针面（source_gates）。
