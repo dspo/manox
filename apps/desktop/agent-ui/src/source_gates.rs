@@ -67,7 +67,13 @@ mod tests {
             // U6b⑤: the park-seed store writes retired (mark_running/
             // mark_background_work — the U3b server pump is the single
             // flag writer; its deltas already fed every mirror).
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 7),
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 5),
+            (
+                "workspace/attach.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                2,
+            ),
             // U1-flush: the parked flush's two facade writes (insert_user_message
             // + run_turn) retired to the gateway wire.
             // U6b③: the two construction parks retired (both create flows
@@ -75,6 +81,12 @@ mod tests {
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            (
+                "workspace/attach.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                0,
+            ),
             // U2: the list/registry reads are retired — the sidebar renders
             // the multiplexer's wire rows and the chip menu reads the pushed
             // decoration cache. The residual 21 are sanctioned debt: the 16
@@ -88,7 +100,8 @@ mod tests {
             // thread_store_global() acquisitions with them (21 - 7).
             // U6b②: the bridge-head binding (U6a) and attach_created_session's
             // global() retired with the attach-face reads.
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 10),
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 8),
+            ("workspace/attach.rs", "store reads (U2)", STORE_GLOBAL, 2),
             // 21 = 18 + the GW3 CancelDelivery withdrawal send + the two
             // U1-flush parked-wire sends (the AppendUserMessage note + the
             // v2 Submit — protocol surfaces the migrations add by design;
@@ -102,7 +115,8 @@ mod tests {
             // PlanSeedExecution note (a bypass facade-seed became a wire
             // send — the ledger-mandated direction; the budget missed the
             // raise in that commit and is corrected here).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 24),
+            ("workspace.rs", "protocol sends (U9)", SENDS, 22),
+            ("workspace/attach.rs", "protocol sends (U9)", SENDS, 2),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
             ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),
@@ -146,6 +160,11 @@ mod tests {
             // mod tests;` declaration, so it carries no inner marker for
             // `production_part` to truncate at).
             "workspace/tests.rs",
+            // U9b: the attach-lifecycle split carries its own budget rows
+            // in the ratchet table below (the surface moved, it did not
+            // grow — the totals are preserved against the pre-split
+            // budgets).
+            "workspace/attach.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
