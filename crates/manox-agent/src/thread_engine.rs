@@ -256,6 +256,13 @@ pub struct ReadyInfo {
     /// A plan review card was pending when the session last settled;
     /// the facade re-emits `PlanReady` so the card re-surfaces.
     pub plan_review_pending: bool,
+    /// The journal-authoritative goal snapshot (goal migration stage ②):
+    /// the K2 rebuild's replayed last `goal` entry. `None` = the chain
+    /// never saw a goal (the bridge's db fold stands — the migration-window
+    /// fallback for pre-stage-① threads); `Some(Null)` = the explicit
+    /// clear. The facade hands it to the GoalBridge, which re-applies the
+    /// restart-paused demotion (activation is never inherited).
+    pub goal: Option<serde_json::Value>,
     /// Last `UpdatePlan` snapshot rebuilt journal-first (K2: the
     /// `plan_update` entries are the authority, the sidecar the derived
     /// cache); the facade mirrors it as the rebuild fallback after

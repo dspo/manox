@@ -144,6 +144,60 @@ impl GoalBridge {
         Ok(())
     }
 
+    /// Goal authority migration, stage ②: the restore seed from the
+    /// JOURNAL. The engine's K2 rebuild replays the chain's `goal`
+    /// snapshots and hands the last one here; the fold cache takes it
+    /// WHOLESALE (no event re-fold — the db `sync` cursor stays put, so
+    /// later mutations append on top of the seeded state). `None` = the
+    /// chain never saw a goal → the db fold stands (the migration-window
+    /// fallback for pre-stage-① threads). `Some(Null)` = the explicit
+    /// clear. A seeded Active goal demotes to restart-paused through the
+    /// usual mutation path, so the db AND the journal both see the
+    /// demotion (the stage-① dual-write).
+    pub fn seed_from_journal(&self, goal: Option<serde_json::Value>) {
+        let Some(snapshot) = goal else {
+            return;
+        };
+        let seeded = if snapshot.is_null() {
+            None
+        } else {
+            match serde_json::from_value::<ThreadGoal>(snapshot) {
+                Ok(goal) => Some(goal),
+                Err(err) => {
+                    tracing::error!(
+                        %err,
+                        "corrupt goal snapshot in the journal; the db fold stands"
+                    );
+                    return;
+                }
+            }
+        };
+        {
+            let mut cache = self.fold.lock().unwrap();
+            cache.state.current = seeded;
+        }
+        let active = self
+            .fold
+            .lock()
+            .unwrap()
+            .state
+            .current
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Active);
+        if active
+            && let Err(err) = self.set_status(
+                GoalStatus::Paused,
+                Some(GoalBlockReason {
+                    code: "restart-paused".into(),
+                    message: "paused after application restart".into(),
+                }),
+                GoalActor::System,
+            )
+        {
+            tracing::error!(%err, "restart-paused demotion failed on the journal seed");
+        }
+    }
+
     /// The actor installs the notice sender once it starts.
     pub fn set_sender(&self, tx: mpsc::UnboundedSender<BackendNotice>) {
         *self.notice_tx.lock().unwrap() = Some(tx);
@@ -783,6 +837,36 @@ impl AgentTool for UpdateGoalTool {
 mod tests {
     use super::*;
     use crate::goal::GoalEventKind;
+
+    /// Goal authority migration, stage ②: the journal seed is the restore
+    /// authority — a snapshot replaces the fold wholesale, the explicit
+    /// null clears it, a seeded Active goal demotes to restart-paused
+    /// (through the mutation path, so both persistence legs see it), and
+    /// `None` leaves the db fold standing (the migration-window fallback).
+    #[test]
+    fn journal_seed_is_the_restore_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, _rx) = bridge_in(&dir);
+        // A db-folded goal exists (the pre-migration shape).
+        bridge
+            .create_goal("db goal".into(), None, None, GoalActor::User)
+            .unwrap();
+        // None: the chain never saw a goal — the db fold stands.
+        bridge.seed_from_journal(None);
+        assert_eq!(bridge.snapshot().unwrap().objective, "db goal");
+        // A journal snapshot replaces the fold wholesale.
+        let mut seeded = bridge.snapshot().unwrap();
+        seeded.objective = "journal goal".into();
+        seeded.status = GoalStatus::Active;
+        bridge.seed_from_journal(Some(serde_json::to_value(&seeded).unwrap()));
+        let snap = bridge.snapshot().unwrap();
+        assert_eq!(snap.objective, "journal goal");
+        // The seeded Active goal demoted (activation is never inherited).
+        assert_eq!(snap.status, GoalStatus::Paused);
+        // The explicit null clears.
+        bridge.seed_from_journal(Some(serde_json::Value::Null));
+        assert!(bridge.snapshot().is_none());
+    }
 
     /// Goal authority migration, stage ① (dual-write): every goal event
     /// batch also routes a `goal` journal row — the FULL folded state as

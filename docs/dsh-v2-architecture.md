@@ -316,7 +316,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | C5:字段漂移——文档面已对齐（D.3 清单 25 项/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
 | K9:ui_note 决断✓、cursor 语义注✓（均已入 §C.2/§F.1 as-built）；persist_ui_note 对称化✓（K9 提交）；死 schema 回收（无发射的 `UiNote` 变体/`uiNote` 标签） | C4 表面决断 | C4 |
 | plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
-| goal 权威迁移:**stage ① 已落地**(双写——append_event 单事件漏斗统一入 append_events,全部 goal 批次经 StoreHandle::route_journal_row("goal",全量状态快照{goal:ThreadGoal|null})走 K3 dispatch;bridge 持构造期注入 store(for_thread=try_global,测试=standalone_for_test 免疫跨测试全局抖动);register_engine_route 升 pub(crate)) | 余:②restore 改读 journal 重放(Ready/restore 链携 goal 快照种入 bridge 折叠,含 restart-paused 降活时序)③db goal_events 降级退休;armed/goal_round_active 保持进程本地(activation 永不继承) | Wave 2 |
+| goal 权威迁移:**stage ①② 已落地**(①双写:全部 goal 批次经 route_journal_row("goal",全量快照)走 K3 dispatch,单/复数漏斗已统一;②restore 权威=journal:K2 rebuild 透传 replayed.goal → RestoredThreadState → ReadyInfo → facade Ready 臂 `seed_from_journal`(整体种入折叠,None=db 折叠站立=迁移窗回退,Some(Null)=显式清除,种入 Active 走变更路径降活 restart-paused——双腿可见;正常流不双降:构造期降活自带 journal 行)) | 余:③db goal_events 降级退休(桥 sync 读面+db append 移除,双写窗口结束后);armed/goal_round_active 保持进程本地(activation 永不继承) | Wave 2 |
 | Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |
 
 ### K.7.3 C4 收口准备清单（prep 盘点，非实施——执行顺序与前置以本表为准）

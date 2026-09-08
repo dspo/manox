@@ -3343,6 +3343,7 @@ async fn run_actor(
         plan_review_pending,
         plan_snapshot,
         title: restored_title,
+        goal: restored_state.goal.clone(),
         pinned: restored_state.pinned,
         archived: restored_state.archived,
         project: restored_state.project.clone(),
@@ -4730,6 +4731,10 @@ struct RestoredThreadState {
     plan_review_pending: bool,
     plan_snapshot: Option<serde_json::Value>,
     title: Option<String>,
+    /// Journal authority (goal stage ②): the replayed last `goal` snapshot
+    /// (`Some(Null)` = the explicit clear; `None` = the chain never saw one
+    /// — the bridge keeps its db fold).
+    goal: Option<serde_json::Value>,
     pinned: bool,
     archived: bool,
     project: Option<PathBuf>,
@@ -4782,6 +4787,7 @@ fn merge_restored_state(
             .title
             .clone()
             .or_else(|| meta.title.clone().filter(|t| !t.trim().is_empty())),
+        goal: replayed.goal.clone(),
         pinned: replayed.pinned.unwrap_or(meta.pinned),
         archived: replayed.archived.unwrap_or(meta.archived),
         project: match &replayed.project {
@@ -9027,6 +9033,13 @@ mod tests {
             )
             .await
             .unwrap();
+        appender
+            .append_typed(
+                "goal",
+                serde_json::json!({ "goal": { "objective": "restored goal" } }),
+            )
+            .await
+            .unwrap();
 
         let rebuilt = rebuild_restored_state(&session, &sessions).await;
         assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
@@ -9034,6 +9047,16 @@ mod tests {
         assert!(rebuilt.archived);
         assert_eq!(rebuilt.permission_mode, PermissionMode::WorkspaceWrite);
         assert_eq!(rebuilt.project, Some(PathBuf::from("/journal/project")));
+        // Goal stage ②: the rebuild passes the replayed journal snapshot
+        // through to the Ready chain (the bridge seed's authority).
+        assert_eq!(
+            rebuilt
+                .goal
+                .as_ref()
+                .and_then(|g| g.get("objective"))
+                .and_then(|o| o.as_str()),
+            Some("restored goal")
+        );
 
         // The cache converged toward the authority in the same pass —
         // the title INCLUDED (the rename-route decision: the pi-thread

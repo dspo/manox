@@ -918,6 +918,7 @@ impl Thread {
                     pinned,
                     archived,
                     project,
+                    goal,
                 } = *notice;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
@@ -933,6 +934,14 @@ impl Thread {
                 self.archived = archived;
                 if let Some(dir) = project {
                     self.project = Some(dir);
+                }
+                // Goal stage ②: the restore authority is the journal — the
+                // K2 rebuild's replayed snapshot seeds the bridge's fold
+                // (the db event log is the migration-window fallback when
+                // the chain never saw a goal). The seed re-applies the
+                // restart-paused demotion: activation is never inherited.
+                if let Some(bridge) = self.goal_bridge.as_ref() {
+                    bridge.seed_from_journal(goal);
                 }
                 // The restored session's model is authoritative only until the
                 // user names one: a pick made while the engine assembled is
@@ -2965,6 +2974,7 @@ pub(crate) mod tests {
             t.messages = vec![Message::user("preview-only".to_string())];
         });
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3044,6 +3054,7 @@ pub(crate) mod tests {
         // The fresh session's sidecar reports the default at Ready; the
         // user's ReadOnly choice must not be overwritten.
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3144,6 +3155,7 @@ pub(crate) mod tests {
         };
         let value = serde_json::to_value(&snapshot).unwrap();
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3182,6 +3194,7 @@ pub(crate) mod tests {
         // The fresh session's sidecar reports High at Ready; the user's Max
         // choice must not be overwritten.
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3215,6 +3228,7 @@ pub(crate) mod tests {
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3256,6 +3270,7 @@ pub(crate) mod tests {
     async fn ready_seeds_browser_suites_from_projection() {
         let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()));
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3288,6 +3303,7 @@ pub(crate) mod tests {
             t.set_browser_suite(crate::engine::BrowserSuite::WebExplore, true);
         });
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3340,6 +3356,7 @@ pub(crate) mod tests {
         });
         thread.read(|t| assert_eq!(t.display_title(), "fix the sidebar title bug"));
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3376,6 +3393,7 @@ pub(crate) mod tests {
 
     fn ready_with_model(model: Option<PiModel>) -> BackendNotice {
         BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model,
             permission_mode: PermissionMode::default(),
@@ -3433,6 +3451,7 @@ pub(crate) mod tests {
         let engine = Arc::new(FakeEngine::new());
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3461,6 +3480,7 @@ pub(crate) mod tests {
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.restore_project(PathBuf::from("/store/project")));
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
