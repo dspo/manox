@@ -211,6 +211,15 @@ pub enum JournalWireEvent {
     PlanModeChange { enabled: bool },
     /// The plan document updated (kernel snapshot shape, wire-opaque).
     PlanUpdate { snapshot: serde_json::Value },
+    /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
+    /// `state` = "proposed" (the review card is due — the pending
+    /// projection raises) | "resolved" (a verdict landed — it clears; the
+    /// verdict discriminant rides the notice plane). `plan_file` names the
+    /// reviewed plan (forensics; always serialized, null when unknown).
+    PlanReview {
+        state: String,
+        plan_file: Option<String>,
+    },
     /// Goal set / cleared (`None` = cleared).
     Goal { goal: Option<serde_json::Value> },
     /// Thread title changed.

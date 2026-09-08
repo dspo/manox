@@ -76,6 +76,7 @@
     "reasoningEffortChange",
     "planModeChange",
     "planUpdate",
+    "planReview",
     "goal",
     "title",
     "browserSuites",

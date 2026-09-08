@@ -50,6 +50,10 @@ pub struct ReplayedThreadState {
     /// Snapshot value from the last `plan_update` entry (an empty snapshot
     /// is the model's cleared plan, not an absent one).
     pub plan_snapshot: Option<serde_json::Value>,
+    /// Pending flag from the last `plan_review` entry (`"proposed"` raises,
+    /// any verdict clears). `None` = the chain never saw one — the sidecar
+    /// hint stands (the pre-vocabulary hole-fill).
+    pub plan_review_pending: Option<bool>,
     /// Goal value from the last `goal` entry; `Some(Null)` is an explicit
     /// clear.
     pub goal: Option<serde_json::Value>,
@@ -94,6 +98,9 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             }
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 state.plan_snapshot = Some(snapshot.clone());
+            }
+            SessionTreeEntry::PlanReview { state: review, .. } => {
+                state.plan_review_pending = Some(review == "proposed");
             }
             SessionTreeEntry::Goal { goal, .. } => {
                 state.goal = Some(goal.clone().unwrap_or(serde_json::Value::Null));

@@ -296,6 +296,12 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
         SessionTreeEntry::PlanUpdate { snapshot, .. } => W::PlanUpdate {
             snapshot: snapshot.clone(),
         },
+        SessionTreeEntry::PlanReview {
+            state, plan_file, ..
+        } => W::PlanReview {
+            state: state.clone(),
+            plan_file: plan_file.clone(),
+        },
         SessionTreeEntry::Goal { goal, .. } => W::Goal { goal: goal.clone() },
         SessionTreeEntry::Title { title, .. } => W::Title {
             title: title.clone(),

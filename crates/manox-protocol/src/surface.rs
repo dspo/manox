@@ -182,6 +182,10 @@ wire_surface! {
         JournalWireEvent::PlanUpdate { .. } => "planUpdate" ~ JournalWireEvent::PlanUpdate {
             snapshot: serde_json::json!({"body": "# plan"}),
         },
+        JournalWireEvent::PlanReview { .. } => "planReview" ~ JournalWireEvent::PlanReview {
+            state: "proposed".into(),
+            plan_file: Some("/plans/ship-plan.md".into()),
+        },
         JournalWireEvent::Goal { .. } => "goal" ~ JournalWireEvent::Goal {
             goal: Some(serde_json::json!({"objective": "ship v2", "budget": 10})),
         },

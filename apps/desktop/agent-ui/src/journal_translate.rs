@@ -248,6 +248,10 @@ pub fn thread_event_of(entry: &JournalWireEntry) -> Option<ThreadEvent> {
         JournalWireEvent::PlanUpdate { snapshot } => ThreadEvent::PlanUpdated {
             snapshot: serde_json::from_value(snapshot.clone()).ok()?,
         },
+        // C4 vocabulary augmentation: the review edge folds into the
+        // pending projection server-side (the client rides the
+        // SessionStatus pending_plan deltas) — no thread event.
+        JournalWireEvent::PlanReview { .. } => return None,
         JournalWireEvent::Goal { goal } => ThreadEvent::GoalChanged {
             goal: goal
                 .as_ref()

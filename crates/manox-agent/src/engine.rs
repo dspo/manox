@@ -3666,6 +3666,25 @@ async fn run_actor(
                 {
                     tracing::warn!(error = %err, "failed to persist plan review pending flag");
                 }
+                // C4 vocabulary augmentation: the review edge rides the
+                // journal (the pending projection's fold source — replay
+                // and the P face; the sidecar flag demotes to the
+                // pre-vocabulary hole-fill). "proposed"/"resolved" is the
+                // fold vocabulary; the verdict discriminant rides the
+                // notice plane.
+                let review_state = if pending { "proposed" } else { "resolved" };
+                if let Err(err) = session
+                    .append_typed(
+                        "plan_review",
+                        serde_json::json!({
+                            "state": review_state,
+                            "planFile": state.plan.plan_file(),
+                        }),
+                    )
+                    .await
+                {
+                    tracing::error!(%err, "failed to journal the plan review edge");
+                }
             }
             SessionCmd::PersistPlanSnapshot(snapshot) => {
                 let completed = snapshot
@@ -4726,8 +4745,9 @@ struct RestoredThreadState {
     /// Sidecar-only: the plan file has no journal vocabulary (the plan's
     /// content rides its own file; the entries carry mode + snapshot).
     plan_file: Option<String>,
-    /// Sidecar-only: the pending-review flag is a restart re-surface hint,
-    /// not a journaled state change.
+    /// Journal-first (the C4 `plan_review` vocabulary): the chain's last
+    /// review edge folds the pending flag; the sidecar hint is the
+    /// pre-vocabulary hole-fill.
     plan_review_pending: bool,
     plan_snapshot: Option<serde_json::Value>,
     title: Option<String>,
@@ -4781,7 +4801,9 @@ fn merge_restored_state(
             .plan_mode
             .unwrap_or(meta.plan_mode.unwrap_or(false)),
         plan_file: meta.plan_file.clone(),
-        plan_review_pending: meta.plan_review_pending.unwrap_or(false),
+        plan_review_pending: replayed
+            .plan_review_pending
+            .unwrap_or_else(|| meta.plan_review_pending.unwrap_or(false)),
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
             .title
@@ -8617,6 +8639,10 @@ mod tests {
                 "plan_update",
                 json!({ "snapshot": [{ "content": "step one", "status": "pending", "activeForm": "stepping" }] }),
             ),
+            (
+                "plan_review",
+                json!({ "state": "proposed", "planFile": "/replay/plan.md" }),
+            ),
             ("goal", json!({ "goal": { "objective": "replay" } })),
             ("title", json!({ "title": "replayed title" })),
             ("browser_suites", json!({ "suites": ["chrome_use"] })),
@@ -8676,6 +8702,7 @@ mod tests {
         "thinking_level_change",
         "plan_mode_change",
         "plan_update",
+        "plan_review",
         "goal",
         "title",
         "browser_suites",
@@ -9040,6 +9067,13 @@ mod tests {
             )
             .await
             .unwrap();
+        appender
+            .append_typed(
+                "plan_review",
+                serde_json::json!({ "state": "proposed", "planFile": null }),
+            )
+            .await
+            .unwrap();
 
         let rebuilt = rebuild_restored_state(&session, &sessions).await;
         assert_eq!(rebuilt.title.as_deref(), Some("journal title"));
@@ -9056,6 +9090,13 @@ mod tests {
                 .and_then(|g| g.get("objective"))
                 .and_then(|o| o.as_str()),
             Some("restored goal")
+        );
+        // Plan-review C4 vocabulary: the chain's proposed edge is the fold
+        // source — the sidecar carries no flag, so a sidecar-only merge
+        // would answer false.
+        assert!(
+            rebuilt.plan_review_pending,
+            "the journal plan_review edge must fold the pending flag"
         );
 
         // The cache converged toward the authority in the same pass —

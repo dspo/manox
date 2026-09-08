@@ -316,7 +316,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
 | C5:字段漂移——文档面已对齐（D.3 清单 24 项(C4b-narrow 后)/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
 | K9:ui_note 决断✓、cursor 语义注✓（均已入 §C.2/§F.1 as-built）；persist_ui_note 对称化✓（K9 提交）；~~死 schema 回收~~ **C4b-narrow 核验为误诊销项**：K9 对称化后 persist_ui_note 写 typed `ui_note` 条目（"legacy custom 行不再写"），translate→wire `uiNote`→webui/桌面消费链完整=活 schema | 无（回收项撤销） | ✓ 关闭 |
-| plan-verdict 无专用条目（37 词汇缺口；pending_plan 投影无折叠源，refine/reject 清理仍是 sidecar+内存） | 协议词汇增补与 C4 表面工作同批 | C4 |
 | goal 权威迁移:**stage ①② 已落地**(①双写:全部 goal 批次经 route_journal_row("goal",全量快照)走 K3 dispatch,单/复数漏斗已统一;②restore 权威=journal:K2 rebuild 透传 replayed.goal → RestoredThreadState → ReadyInfo → facade Ready 臂 `seed_from_journal`(整体种入折叠,None=db 折叠站立=迁移窗回退,Some(Null)=显式清除,种入 Active 走变更路径降活 restart-paused——双腿可见;正常流不双降:构造期降活自带 journal 行)) | 余:③db goal_events 降级退休(桥 sync 读面+db append 移除,双写窗口结束后);armed/goal_round_active 保持进程本地(activation 永不继承) | Wave 2 |
 | Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |
 
@@ -330,7 +329,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 5. T2 死亡清单 `#[deprecated]` 类型（ServerNote 死亡清单=37 减 11 保留集的差集；保留集以 `SERVER_NOTES` 宏清单为单源）。
 6. `UiNote` 内核变体 + `uiNote` wire 标签 **✗ 误诊销项（C4b-narrow 核验）**：K9 对称化已使 persist_ui_note 写 typed `ui_note` 条目（engine 注释："The legacy `custom` row is no longer written"），translate 投影为 wire `uiNote`，webui `case 'uiNote'`/桌面消费链完整——**活 schema，不回收**（本批删除曾短暂触及，编译+persist 路径核验在提交前拦下，harness/replay 复原为净零 diff）。
 7. `SetModel.id:String` → 类型化 `ModelRef` 字段（C5 wire 收敛）。
-8. plan-verdict 专用条目词汇增补（38+，pending_plan 投影获得折叠源，refine/reject 清理去 sidecar 化）。
+8. plan-verdict 专用条目词汇增补 **✓ 已落地（`plan_review` 条目=词汇第 38）**——`state: "proposed"|"resolved"` 双边沿（verdict 区分值骑 notice 面，条目为投影折叠源；区分值增补记为可选扩展）：actor `SetPlanReviewPending` 臂单点 append（提案/裁决全部经此收口，桌面+服务端调用方零改动）；replay 折叠 `plan_review_pending: Option<bool>`（None=链未见=sidecar 提示站立）；P 面投影 `set("plan_review_pending")`；restore journal-first 合并（sidecar 降 pre-vocabulary hole-fill）；桌面 `thread_event_of` 显式 None（pending 骑 SessionStatus delta）；webui entries default 安全忽略+guards tag 同步（C3/J.5 门禁曾按设计红——fixture 再生后绿）。
 9. vscode：focusThread 死帧 **✓ 已删（C4b-narrow，sidebarProvider 死帧行）**；徽章迁移仍 follow-up（与 unread 列删除同批）。
 
 **服务端删除面**：GW1 双发的 v1 note 臂全删（8 个 HostEvent 发射点保留 Host 帧；C3 宏表 SERVER_NOTES 37→11 收敛，穷举 tag match 使类型/表/样本同步）。

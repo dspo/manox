@@ -230,28 +230,37 @@
     "type": "planUpdate"
   },
   {
+    "id": "e-23",
+    "parentId": "e-22",
+    "planFile": "/plans/ship-plan.md",
+    "seq": 23,
+    "state": "proposed",
+    "timestamp": "2026-09-04T00:00:00Z",
+    "type": "planReview"
+  },
+  {
     "goal": {
       "budget": 10,
       "objective": "ship v2"
     },
-    "id": "e-23",
-    "parentId": "e-22",
-    "seq": 23,
-    "timestamp": "2026-09-04T00:00:00Z",
-    "type": "goal"
-  },
-  {
     "id": "e-24",
     "parentId": "e-23",
     "seq": 24,
     "timestamp": "2026-09-04T00:00:00Z",
-    "title": "v2 migration",
-    "type": "title"
+    "type": "goal"
   },
   {
     "id": "e-25",
     "parentId": "e-24",
     "seq": 25,
+    "timestamp": "2026-09-04T00:00:00Z",
+    "title": "v2 migration",
+    "type": "title"
+  },
+  {
+    "id": "e-26",
+    "parentId": "e-25",
+    "seq": 26,
     "suites": [
       "web_explore"
     ],
@@ -259,9 +268,9 @@
     "type": "browserSuites"
   },
   {
-    "id": "e-26",
-    "parentId": "e-25",
-    "seq": 26,
+    "id": "e-27",
+    "parentId": "e-26",
+    "seq": 27,
     "snapshot": {
       "tasks": []
     },
@@ -270,11 +279,11 @@
   },
   {
     "authId": "auth-1",
-    "id": "e-27",
+    "id": "e-28",
     "kind": "request",
-    "parentId": "e-26",
+    "parentId": "e-27",
     "reason": null,
-    "seq": 27,
+    "seq": 28,
     "timestamp": "2026-09-04T00:00:00Z",
     "toolCallId": "tc-1",
     "toolName": "Bash",
@@ -283,17 +292,17 @@
   },
   {
     "archived": false,
-    "id": "e-28",
-    "parentId": "e-27",
+    "id": "e-29",
+    "parentId": "e-28",
     "pinned": true,
-    "seq": 28,
+    "seq": 29,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "pinnedArchived"
   },
   {
-    "id": "e-29",
-    "parentId": "e-28",
-    "seq": 29,
+    "id": "e-30",
+    "parentId": "e-29",
+    "seq": 30,
     "timestamp": "2026-09-04T00:00:00Z",
     "tools": [
       "Bash",
@@ -303,41 +312,41 @@
   },
   {
     "firstKeptEntryId": "e-30",
-    "id": "e-30",
+    "id": "e-31",
     "messagesCompacted": 12,
-    "parentId": "e-29",
+    "parentId": "e-30",
     "retainedTail": [
       {
         "role": "user"
       }
     ],
-    "seq": 30,
+    "seq": 31,
     "summary": "…",
     "timestamp": "2026-09-04T00:00:00Z",
     "tokensBefore": 40000,
     "type": "compaction"
   },
   {
-    "id": "e-31",
-    "parentId": "e-30",
-    "seq": 31,
+    "id": "e-32",
+    "parentId": "e-31",
+    "seq": 32,
     "timestamp": "2026-09-04T00:00:00Z",
     "tokensBefore": 40000,
     "type": "compactionStarted"
   },
   {
-    "id": "e-32",
-    "parentId": "e-31",
-    "seq": 32,
+    "id": "e-33",
+    "parentId": "e-32",
+    "seq": 33,
     "text": "fork note",
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "branchSummary"
   },
   {
-    "id": "e-33",
+    "id": "e-34",
     "label": "checkpoint",
-    "parentId": "e-32",
-    "seq": 33,
+    "parentId": "e-33",
+    "seq": 34,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "label"
   },
@@ -345,16 +354,16 @@
     "data": {
       "k": "v"
     },
-    "id": "e-34",
-    "parentId": "e-33",
-    "seq": 34,
+    "id": "e-35",
+    "parentId": "e-34",
+    "seq": 35,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "sessionInfo"
   },
   {
-    "id": "e-35",
-    "parentId": "e-34",
-    "seq": 35,
+    "id": "e-36",
+    "parentId": "e-35",
+    "seq": 36,
     "targetId": "e-12",
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "leaf"
@@ -363,10 +372,10 @@
     "data": {
       "reprocessedTokens": 12345
     },
-    "id": "e-36",
+    "id": "e-37",
     "kind": "cache_invalidation",
-    "parentId": "e-35",
-    "seq": 36,
+    "parentId": "e-36",
+    "seq": 37,
     "timestamp": "2026-09-04T00:00:00Z",
     "type": "metrics"
   }

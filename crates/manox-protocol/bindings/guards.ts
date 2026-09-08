@@ -37,7 +37,7 @@ export const JOURNAL_ENTRY_TAGS: readonly string[] = [
   'agentTextDelta', 'agentThinkingDelta', 'toolCall', 'toolResult',
   'toolOutputChunk', 'subagentChild', 'subagentProgress', 'modelChange',
   'cwdChange', 'projectChange', 'permissionModeChange',
-  'reasoningEffortChange', 'planModeChange', 'planUpdate', 'goal', 'title',
+  'reasoningEffortChange', 'planModeChange', 'planUpdate', 'planReview', 'goal', 'title',
   'browserSuites', 'backgroundTask', 'approval', 'pinnedArchived',
   'activeToolsChange', 'compaction', 'compactionStarted', 'branchSummary',
   'label', 'sessionInfo', 'leaf', 'metrics',

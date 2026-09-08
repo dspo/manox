@@ -173,6 +173,17 @@ impl ProjectionSet {
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 self.set("plan", snapshot.clone(), seq);
             }
+            SessionTreeEntry::PlanReview { state, .. } => {
+                // C4 vocabulary augmentation: the pending_plan projection's
+                // fold source (the sidecar flag is the pre-vocabulary
+                // hole-fill; the verdict discriminant rides the notice
+                // plane).
+                self.set(
+                    "plan_review_pending",
+                    serde_json::json!(state == "proposed"),
+                    seq,
+                );
+            }
             SessionTreeEntry::Goal { goal, .. } => {
                 self.set("goal", goal.clone().unwrap_or(JsonValue::Null), seq);
             }

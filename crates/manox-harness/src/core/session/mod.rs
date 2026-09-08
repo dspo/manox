@@ -181,6 +181,20 @@ pub enum SessionTreeEntry {
     // keys (`seq`/`id`/`parentId`/`timestamp`/`type`) are exclusive: payload
     // fields never reuse them, so tool handles are `callId` and subagent
     // handles `agentId` (§C.1 exclusivity rule).
+    /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
+    /// `state` is `"proposed"` (a review card is due — the pending
+    /// projection raises) or `"resolved"` (a verdict landed — it clears;
+    /// the verdict discriminant rides the notice plane). The fold source
+    /// for the pending projection; the sidecar `plan_review_pending` flag
+    /// demotes to the pre-vocabulary hole-fill.
+    #[serde(rename = "plan_review", rename_all = "camelCase")]
+    PlanReview {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        state: String,
+        plan_file: Option<String>,
+    },
     /// A persisted UI note card (was the fire-and-forget AppendUiNote).
     #[serde(rename = "ui_note", rename_all = "camelCase")]
     UiNote {
@@ -464,6 +478,7 @@ impl SessionTreeEntry {
             PermissionModeChange,
             PlanModeChange,
             PlanUpdate,
+            PlanReview,
             Goal,
             Title,
             BrowserSuites,
@@ -1824,6 +1839,7 @@ pub enum EntryType {
     PermissionModeChange,
     PlanModeChange,
     PlanUpdate,
+    PlanReview,
     Goal,
     Title,
     BrowserSuites,
@@ -1867,6 +1883,7 @@ impl EntryType {
             EntryType::PermissionModeChange => "permission_mode_change",
             EntryType::PlanModeChange => "plan_mode_change",
             EntryType::PlanUpdate => "plan_update",
+            EntryType::PlanReview => "plan_review",
             EntryType::Goal => "goal",
             EntryType::Title => "title",
             EntryType::BrowserSuites => "browser_suites",
@@ -2067,6 +2084,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::PermissionModeChange { .. } => EntryType::PermissionModeChange,
         SessionTreeEntry::PlanModeChange { .. } => EntryType::PlanModeChange,
         SessionTreeEntry::PlanUpdate { .. } => EntryType::PlanUpdate,
+        SessionTreeEntry::PlanReview { .. } => EntryType::PlanReview,
         SessionTreeEntry::Goal { .. } => EntryType::Goal,
         SessionTreeEntry::Title { .. } => EntryType::Title,
         SessionTreeEntry::BrowserSuites { .. } => EntryType::BrowserSuites,
