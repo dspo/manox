@@ -479,9 +479,14 @@ impl Sidebar {
         self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
+        // The menu-build closures run EAGERLY inside this Sidebar update,
+        // so the cascade builders get the mux handle up front — reading
+        // the Sidebar entity from inside them double-leases it (the
+        // acceptance-run crash).
+        let mux = self.mux.clone();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             if project.is_some() {
-                return build_project_menu(menu, &sidebar, &theme, window, cx);
+                return build_project_menu(menu, &sidebar, &mux, &theme, window, cx);
             }
             let mut menu = menu
                 .max_w(gpui::px(280.))
@@ -540,6 +545,7 @@ impl Sidebar {
             ] {
                 let sidebar = sidebar.clone();
                 let theme = theme.clone();
+                let mux_agent = mux.clone();
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 menu = menu.submenu_with_icon(
@@ -553,7 +559,9 @@ impl Sidebar {
                     window,
                     cx,
                     move |submenu, window, cx| {
-                        build_agent_model_cascade(submenu, kind, agent_id, &sidebar, window, cx)
+                        build_agent_model_cascade(
+                            submenu, kind, agent_id, &sidebar, &mux_agent, window, cx,
+                        )
                     },
                 );
             }
@@ -1286,20 +1294,21 @@ fn build_agent_model_cascade(
     kind: crate::external_session::SessionKind,
     agent_id: &'static str,
     sidebar: &WeakEntity<Sidebar>,
+    mux: &Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let sidebar = sidebar.clone();
     // U2 cross-domain #4: the cascade projects the multiplexer's wire
-    // models (the provider_glue direct read retired).
-    let models: Vec<manox_protocol::ModelInfo> = sidebar
-        .upgrade()
-        .and_then(|sb| {
-            sb.read(cx)
-                .mux
-                .as_ref()
-                .map(|m| m.read(cx).models().to_vec())
-        })
+    // models (the provider_glue direct read retired). The mux handle is
+    // passed IN: this builder runs eagerly inside the Sidebar's own
+    // update listener, so upgrading + reading the Sidebar entity here
+    // would double-lease it — GPUI panics ("cannot read Sidebar while
+    // it is already being updated"), and in the real app the objc
+    // callback frame turns the panic into a non-unwinding abort.
+    let models: Vec<manox_protocol::ModelInfo> = mux
+        .as_ref()
+        .map(|m| m.read(cx).models().to_vec())
         .unwrap_or_default();
     crate::views::model_cascade::build_model_cascade(
         menu,
@@ -1327,12 +1336,16 @@ fn build_agent_model_cascade(
 fn build_project_menu(
     menu: PopupMenu,
     sidebar: &WeakEntity<Sidebar>,
+    mux: &Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     theme: &Theme,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let theme = theme.clone();
     let sidebar = sidebar.clone();
+    // Owned clone: the submenu closures are `move` and must be 'static
+    // (deferred builds), so they cannot capture the borrowed parameter.
+    let mux = mux.clone();
     let mut menu = menu.max_w(gpui::px(280.));
     // New-session submenu: Manox flat row + one provider→model cascade per
     // external agent kind.
@@ -1377,6 +1390,7 @@ fn build_project_menu(
                 crate::external_session::SessionKind::GithubCopilot,
             ] {
                 let sidebar_agent = sidebar_new.clone();
+                let mux_agent = mux.clone();
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 submenu = submenu.submenu_with_icon(
@@ -1395,6 +1409,7 @@ fn build_project_menu(
                             kind,
                             agent_id,
                             &sidebar_agent,
+                            &mux_agent,
                             window,
                             cx,
                         )
@@ -2554,5 +2569,53 @@ mod tests {
         summary.resuming = true;
         let item = SidebarThreadItem::from_external(&summary, false, px(0.), &theme);
         assert!(item.resuming);
+    }
+
+    /// The acceptance-run crash: opening a project group's new-session
+    /// menu builds the provider→model cascades EAGERLY inside the
+    /// Sidebar's own update listener, and the cascade builder's
+    /// `sidebar.upgrade().read(cx)` double-leased the entity — GPUI
+    /// panics "cannot read Sidebar while it is already being updated"
+    /// (and the objc callback frame turns the panic into an abort in
+    /// the real app). The cascade builders now receive the mux handle
+    /// up front; opening either menu shape inside an update must build
+    /// cleanly.
+    struct MenuHost;
+    impl Render for MenuHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::Empty
+        }
+    }
+
+    #[gpui::test]
+    fn new_session_menu_builds_inside_sidebar_update(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let host = cx.new(|_| MenuHost);
+                gpui_component::Root::new(host, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let sidebar = cx.new(|cx| Sidebar::new(gpui::px(240.), cx));
+        // The project-group shape: the crash path (build_project_menu →
+        // the nested per-agent cascade submenus).
+        visual.update(|window, cx| {
+            sidebar.update(cx, |s, cx| {
+                s.open_new_session_menu(Some(std::path::PathBuf::from("/tmp/p")), window, cx);
+            });
+        });
+        // The flat shape: the cascade submenus built directly.
+        visual.update(|window, cx| {
+            sidebar.update(cx, |s, cx| {
+                s.open_new_session_menu(None, window, cx);
+            });
+        });
     }
 }
