@@ -4,13 +4,17 @@
 //! reported explicitly through the Goal tools; there is deliberately no
 //! per-turn evaluator in this module.
 //!
-//! The durable state is event-sourced: every mutation appends a full
-//! post-mutation snapshot (`Created`/`Updated`) or a tombstone (`Cleared`) to
-//! the thread's `thread_events` stream, and a `Round` event records one
-//! admitted continuation round with its token accounting delta. The current
-//! goal is always the strict fold of that stream (`fold_goal_events`); the
-//! fold is fail-loud — a corrupt, malformed, or out-of-order event is an
-//! error, never a silent fallback.
+//! The durable state is the journal: every mutation batch routes a `goal`
+//! entry carrying the FULL post-mutation snapshot (last entry wins — the
+//! replay fold's authority), and the restore seed rides the engine's Ready
+//! chain (`seed_from_journal`). In-process the state is the strict fold of
+//! the `GoalEvent` stream — full post-mutation snapshots (`Created`/
+//! `Updated`), tombstones (`Cleared`), and `Round` token accounting — via
+//! `apply_goal_event`/`fold_goal_events`; the fold is fail-loud: a corrupt,
+//! malformed, or out-of-order event is an error, never a silent fallback.
+//! The db `thread_events` goal stream retired with the goal authority's
+//! stage ③ (a pre-release clean cut: the journal is the only durable
+//! plane).
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};

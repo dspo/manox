@@ -743,10 +743,11 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        // Goal bridge seeds from the persisted goal (restore path) and is
-        // shared with the engine's goal tools; db unavailability degrades
-        // goal features off rather than blocking the thread.
-        let goal_bridge = GoalBridge::for_thread(&id.0);
+        // The goal bridge is shared with the engine's goal tools; its
+        // restore seed rides the Ready chain (seed_from_journal — the
+        // journal is the goal authority; stage ③ retired the db leg and
+        // with it the "goal features disabled" degrade).
+        let goal_bridge = Some(GoalBridge::for_thread(&id.0));
         let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
@@ -815,7 +816,7 @@ impl Thread {
             return;
         }
         if self.goal_bridge.is_none() {
-            self.goal_bridge = GoalBridge::for_thread(&self.id.0);
+            self.goal_bridge = Some(GoalBridge::for_thread(&self.id.0));
         }
         let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
         let model = self.model.clone();

@@ -309,12 +309,11 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源)+ store-event refetch 桥(跨域#5 落地后的残余:仅泵旗写/sidecar 写尾的 refetch 触发器,thread_store 句柄的最后用户除 open_thread) | 投影权威反转后一并删 | Wave 2 |
 | vscode:徽章迁移(GW5 后列表 unread 恒 false;focusThread 死帧行已随 C4b-narrow 删除) | 与 ThreadListItem.unread 列删除同批(webui ThreadRow 类型手术+badge 同形) | C4 |
 | C4b 大宗删除 gate:vscode extension host 消费 note 形状事件(sessionCreated×3/threadsUpdated×2/sessionDisposed×2/ready×2/approve×2/planVerdict/askUserQuestion/models/commands——awaitSession 谓词+审批流);parseFromServer 不归一 host 帧 → 删臂=vscode 会话创建挂起(硬破坏,非 badge 类退化) | vscode host 迁移(parseFromServer 把 host 帧归一为 method 事件,或 sessionManager 谓词改 host 形状)为 C4b 大宗+compat 三件删除的硬前置;本期 C4b 仅删无消费方面 | C4 follow-up(硬) |
-| C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
+| C2:无码错误归码 ✓(错误码纪律+结构门禁 every_production_rpc_error_carries_a_stable_code,aed45a57);RpcOutcome 类型化 → **归 C4b 大宗批**(§D.7 as-built 自注:「波及全客户端 Response 消费面,与 C4 wire 工作同批」;vscode host 迁移 gate 同批适用) | C4 | C4 |
 | U7b:Q 面 visibility 门控(rail 可见性状态归属) | U9 拆分后做 | U9 |
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |
 | C5:字段漂移——文档面已对齐（D.3 清单 24 项(C4b-narrow 后)/SetModel `id` 字段/cwd 双面命名/ui_note 决断/cursor 语义）；SetModel 类型化 ModelRef 字段重命名=破坏性 wire 变更 | C4 时代 wire 收敛 | C4 |
 | K9:ui_note 决断✓、cursor 语义注✓（均已入 §C.2/§F.1 as-built）；persist_ui_note 对称化✓（K9 提交）；~~死 schema 回收~~ **C4b-narrow 核验为误诊销项**：K9 对称化后 persist_ui_note 写 typed `ui_note` 条目（"legacy custom 行不再写"），translate→wire `uiNote`→webui/桌面消费链完整=活 schema | 无（回收项撤销） | ✓ 关闭 |
-| goal 权威迁移:**stage ①② 已落地**(①双写:全部 goal 批次经 route_journal_row("goal",全量快照)走 K3 dispatch,单/复数漏斗已统一;②restore 权威=journal:K2 rebuild 透传 replayed.goal → RestoredThreadState → ReadyInfo → facade Ready 臂 `seed_from_journal`(整体种入折叠,None=db 折叠站立=迁移窗回退,Some(Null)=显式清除,种入 Active 走变更路径降活 restart-paused——双腿可见;正常流不双降:构造期降活自带 journal 行)) | 余:③db goal_events 降级退休(桥 sync 读面+db append 移除,双写窗口结束后);armed/goal_round_active 保持进程本地(activation 永不继承) | Wave 2 |
 | Ready 快照可能以旧值覆盖加载期 pin 的 facade 镜像（gateway 投影 higher-seq-wins 自愈、桌面读 summary 不受影响） | 已注释级风险，观察 | 观察 |
 
 ### K.7.3 C4 收口准备清单（prep 盘点，非实施——执行顺序与前置以本表为准）
