@@ -135,100 +135,163 @@ async fn run_follow_stream(
     // ── Snapshot (whole active chain via the kernel read seam, §C.3). ──────
     //
     // The seam answers from the engine actor's command loop. While the
-    // engine is still booting (or has been replaced by `open_session`) the
-    // oneshot reply can be dropped without an answer, which surfaces as an
-    // `Err` -> `None` from `journal_snapshot()`. Treat that as "not materialized yet" and
-    // retry with a bounded backoff; a genuinely absent engine (landing
-    // thread) is answered with `Failure`.
-    let end = match snapshot_with_retry(&thread, &cancel).await {
-        SnapshotResult::Data(data) => {
-            let mut records: Vec<manox_protocol::journal::JournalWireEntry> =
-                Vec::with_capacity(data.records.len());
-            // The per-stream projection set (P face, §E): seeded from the
-            // live thread, folded forward by every record — including the
-            // wire-projection-less ones (folds are kernel-level). After the
-            // loop the baseline is consistent with the snapshot cursor.
-            let mut projections = crate::projections::ProjectionSet::seed(&thread);
-            for record in &data.records {
-                projections.apply_event(record.seq, &record.entry);
-                // The §C.2 projection is total (no wire-less kinds), so the
-                // page is seq-dense end-to-end — the fold's `assertPage`
-                // adjacency holds.
-                if let Some(entry) = wire_entry(record.seq, &record.entry) {
-                    records.push(entry);
-                }
-            }
-            // Header `createdAt` fallback: the oldest wire-mapped record
-            // (§C.3 seam carries no file header — T4 gap note).
-            let oldest = records.first().map(|r| r.timestamp.clone());
-            // `max_messages` bounds the initial window from the tail.
-            let (window, has_more) = match max_messages {
-                Some(n) if (records.len() as u32) > n => {
-                    let start = records.len() - n as usize;
-                    (records.split_off(start), true)
-                }
-                _ => (records, false),
-            };
-            let snapshot = SessionSnapshot {
-                session_id: session_id.clone(),
-                header: snapshot_header(&thread, &session_id, oldest),
-                cursor: data.cursor,
-                records: window,
-                has_more,
-                // T5 projection registry: no keys folded yet — empty
-                // baseline, as of the read cursor (§D.1).
-                projections: projections.baseline(),
-                projections_as_of_seq: data.cursor,
-            };
-            conn.send_to_client(FromServer::StreamItem {
-                stream_id: stream_id.clone(),
-                frame: StreamFrame::Snapshot(snapshot),
-            });
-            forward_entries(
-                &conn,
-                &stream_id,
-                &session_id,
-                &mut feed,
-                &mut projections,
-                &cancel,
-                &reason,
-            )
-            .await
-        }
+    // engine is still booting (or has been replaced by `open_session`) —
+    // or is genuinely absent on a landing/cold thread — the reply can be
+    // dropped without an answer, which surfaces as an `Err` -> `None`
+    // from `journal_snapshot()`. GW6-neighbor: an UNANSWERED seam falls
+    // back to the cold disk read (PageHistory parity) instead of burning
+    // a 30s retry window and dead-ending in `Failure` (with the client's
+    // reopen spinning against it). The disk is the sound authority at any
+    // instant — an unassembled engine has appended nothing, and one that
+    // appended did so durably — and the stream stays open, upgrading in
+    // place as soon as the seam answers.
+    let (data, cold) = match opening_snapshot(&thread, &session_id, &cancel).await {
+        SnapshotResult::Data(data) => (data, false),
+        SnapshotResult::Cold(data) => (data, true),
         SnapshotResult::Unavailable => {
-            requested_reason(&reason).unwrap_or(StreamEndReason::Failure {
-                code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.into(),
-                message: "journal engine is not materialized".into(),
-            })
+            // Reachable only via cancellation now: an unanswered seam
+            // falls to the cold disk read (PageHistory parity), never to
+            // a dead-end terminal frame.
+            let end = requested_reason(&reason).unwrap_or(StreamEndReason::Closed);
+            return finish(&conn, &stream_id, end);
         }
     };
+    let mut projections =
+        send_snapshot(&conn, &stream_id, &session_id, &thread, &data, max_messages);
+    if cold {
+        // GW6-neighbor upgrade: the cold snapshot (disk authority, empty
+        // when the file has not materialized yet) holds the stream open
+        // until the engine does. The upgrade is IN PLACE — resubscribe
+        // BEFORE the live snapshot (the same atomicity order as the open),
+        // send a second Snapshot (the client's fold restarts and its
+        // cursor advances — the reopen mechanism, no client change), and
+        // forward from the live feed. The wait is a cheap server-side
+        // poll: the client never spin-reopens against a thread that may
+        // stay unmaterialized indefinitely.
+        loop {
+            if cancel.is_cancelled() {
+                let end = requested_reason(&reason).unwrap_or(StreamEndReason::Closed);
+                return finish(&conn, &stream_id, end);
+            }
+            // Subscribe BEFORE the live read (the open's atomicity order):
+            // the upgraded snapshot and its feed are consistent, and the
+            // second Snapshot restarts the client's fold at the live
+            // cursor.
+            let upgraded = thread.subscribe_journal_feed();
+            if let Some(live) = thread.journal_snapshot().await {
+                feed = upgraded;
+                projections =
+                    send_snapshot(&conn, &stream_id, &session_id, &thread, &live, max_messages);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+    let end = forward_entries(
+        &conn,
+        &stream_id,
+        &session_id,
+        &mut feed,
+        &mut projections,
+        &cancel,
+        &reason,
+    )
+    .await;
     finish(&conn, &stream_id, end)
+}
+
+/// Build and send one `Snapshot` frame (the opening read or the
+/// materialization upgrade) and return the per-stream projection set (P
+/// face, §E): seeded from the live thread, folded forward by every record —
+/// including the wire-projection-less ones (folds are kernel-level) — so
+/// after the loop the baseline is consistent with the snapshot cursor.
+fn send_snapshot(
+    conn: &Arc<dyn RpcConnection>,
+    stream_id: &StreamId,
+    session_id: &str,
+    thread: &ThreadHandle,
+    data: &manox_agent::engine::JournalSnapshotData,
+    max_messages: Option<u32>,
+) -> crate::projections::ProjectionSet {
+    let mut records: Vec<manox_protocol::journal::JournalWireEntry> =
+        Vec::with_capacity(data.records.len());
+    let mut projections = crate::projections::ProjectionSet::seed(thread);
+    for record in &data.records {
+        projections.apply_event(record.seq, &record.entry);
+        // The §C.2 projection is total (no wire-less kinds), so the page is
+        // seq-dense end-to-end — the fold's `assertPage` adjacency holds.
+        if let Some(entry) = wire_entry(record.seq, &record.entry) {
+            records.push(entry);
+        }
+    }
+    // Header `createdAt` fallback: the oldest wire-mapped record (§C.3 seam
+    // carries no file header — T4 gap note).
+    let oldest = records.first().map(|r| r.timestamp.clone());
+    // `max_messages` bounds the initial window from the tail.
+    let (window, has_more) = match max_messages {
+        Some(n) if (records.len() as u32) > n => {
+            let start = records.len() - n as usize;
+            (records.split_off(start), true)
+        }
+        _ => (records, false),
+    };
+    let snapshot = SessionSnapshot {
+        session_id: session_id.to_string(),
+        header: snapshot_header(thread, session_id, oldest),
+        cursor: data.cursor,
+        records: window,
+        has_more,
+        // T5 projection registry: no keys folded yet — empty baseline, as
+        // of the read cursor (§D.1).
+        projections: projections.baseline(),
+        projections_as_of_seq: data.cursor,
+    };
+    conn.send_to_client(FromServer::StreamItem {
+        stream_id: stream_id.clone(),
+        frame: StreamFrame::Snapshot(snapshot),
+    });
+    projections
 }
 
 /// Outcome of the opening snapshot read (§C.3 seam).
 enum SnapshotResult {
     Data(manox_agent::engine::JournalSnapshotData),
+    /// GW6-neighbor: the live seam went unanswered (booting, swapped, or
+    /// absent engine) — the disk answered instead (empty when no file
+    /// exists yet). The stream holds open and upgrades in place when the
+    /// seam starts answering.
+    Cold(manox_agent::engine::JournalSnapshotData),
     Unavailable,
 }
 
-/// Read the whole active chain with a bounded retry window: the seam answers
-/// from the engine actor's command loop, so a reply dropped during engine
-/// boot / session replacement is retried (~30s at 100ms — a materializing
-/// PiEngine answers promptly; a never-materializing landing thread gets the
-/// `Failure` terminal frame).
-async fn snapshot_with_retry(thread: &ThreadHandle, cancel: &CancellationToken) -> SnapshotResult {
-    for _ in 0..300u32 {
-        if cancel.is_cancelled() {
-            return SnapshotResult::Unavailable;
-        }
-        match thread.journal_snapshot().await {
-            Some(data) => return SnapshotResult::Data(data),
-            None => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        }
+/// The opening snapshot read (§C.3 seam) with the cold fallback
+/// (GW6-neighbor): ONE live read attempt — a booting/absent engine drops
+/// the oneshot reply — then the persisted jsonl answers (empty when no
+/// file exists yet: a live session with neither an engine nor a file has
+/// an EMPTY journal, not a missing one; PageHistory parity). The retry
+/// window this replaced was a workaround for the missing cold read; it
+/// dead-ended landing threads in `Failure` after 30s of client reopen
+/// spin. The upgrade loop converges the stream onto the live seam as soon
+/// as an engine answers.
+async fn opening_snapshot(
+    thread: &ThreadHandle,
+    session_id: &str,
+    cancel: &CancellationToken,
+) -> SnapshotResult {
+    if cancel.is_cancelled() {
+        return SnapshotResult::Unavailable;
     }
-    SnapshotResult::Unavailable
+    match thread.journal_snapshot().await {
+        Some(data) => SnapshotResult::Data(data),
+        None => SnapshotResult::Cold(
+            crate::journal_query::cold_snapshot(session_id)
+                .await
+                .unwrap_or(manox_agent::engine::JournalSnapshotData {
+                    cursor: 0,
+                    records: Vec::new(),
+                }),
+        ),
+    }
 }
 
 /// Forward live feed events as Entry frames until cancelled / Lagged /

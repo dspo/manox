@@ -309,7 +309,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源)+ store-event refetch 桥(跨域#5 落地后的残余:仅泵旗写/sidecar 写尾的 refetch 触发器,thread_store 句柄的最后用户除 open_thread) | 投影权威反转后一并删 | Wave 2 |
 | vscode:徽章迁移(GW5 后列表 unread 恒 false;focusThread 死帧行已随 C4b-narrow 删除) | 与 ThreadListItem.unread 列删除同批(webui ThreadRow 类型手术+badge 同形) | C4 |
 | C4b 大宗删除 gate:vscode extension host 消费 note 形状事件(sessionCreated×3/threadsUpdated×2/sessionDisposed×2/ready×2/approve×2/planVerdict/askUserQuestion/models/commands——awaitSession 谓词+审批流);parseFromServer 不归一 host 帧 → 删臂=vscode 会话创建挂起(硬破坏,非 badge 类退化) | vscode host 迁移(parseFromServer 把 host 帧归一为 method 事件,或 sessionManager 谓词改 host 形状)为 C4b 大宗+compat 三件删除的硬前置;本期 C4b 仅删无消费方面 | C4 follow-up(硬) |
-| GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |
 | U7b:Q 面 visibility 门控(rail 可见性状态归属) | U9 拆分后做 | U9 |
 | U9:workspace.rs(11.7k 行)/agent_server.rs(6.7k 行)拆分 + 三层归属表 + 依赖门禁 | — | U9 |

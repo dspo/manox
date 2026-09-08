@@ -8298,6 +8298,126 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// GW6-neighbor: a follow stream cold-opened on an engine-less
+    /// (landing) thread answers from disk IMMEDIATELY — the cold snapshot
+    /// replaces the pre-fix 30s retry window that dead-ended in `Failure`
+    /// (with the client's reopen spinning against it). The stream then
+    /// holds open and upgrades IN PLACE when an engine materializes: a
+    /// second Snapshot (the live seam's data) rides the same stream id,
+    /// and the live feed forwards Entry frames.
+    #[test]
+    fn follow_stream_cold_opens_and_upgrades_on_materialization() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        // Land the thread, then kill the seam with the unavailable fake
+        // (the page_history cold-read idiom): the live read drops its
+        // reply promptly whatever create spawned, and the cold disk read
+        // answers the open. Seed the persisted chain + path map after.
+        create(&server, &client, "gw6n-cold-1");
+        let (dead, dead_events) = FakeEngine::new();
+        dead.set_journal_unavailable();
+        server.set_session_engine_for_test("gw6n-cold-1", dead, dead_events);
+        let path = seed_v4_chain(&sessions, "gw6n-cold-1");
+        manox_agent::thread_store::global().with_mut(|s| s.note_session_path("gw6n-cold-1", &path));
+        client.send(FromClient::StreamOpen {
+            stream_id: StreamId::new("gw6n-st-1"),
+            stream_kind: StreamKind::FollowSession {
+                session_id: "gw6n-cold-1".into(),
+                max_messages: None,
+            },
+        });
+        // The cold snapshot arrives promptly (recv's own timeout bounds the
+        // wait far under the pre-fix 30s window).
+        let first = loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::stream::StreamFrame::Snapshot(snap),
+                } if stream_id.0 == "gw6n-st-1" => {
+                    break serde_json::to_value(&snap).unwrap();
+                }
+                FromServer::StreamEnd {
+                    stream_id, reason, ..
+                } if stream_id.0 == "gw6n-st-1" => {
+                    panic!("the cold open dead-ended: {reason:?}")
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(
+            first["cursor"], 1,
+            "the cold chain's tail seq is the cursor"
+        );
+        let records = first["records"].as_array().expect("records array");
+        assert_eq!(records.len(), 2, "both persisted entries cold-read");
+
+        // An answering seam: the stream upgrades in place — a second
+        // Snapshot (the fresh fake's seam data: empty chain, cursor 0)
+        // replaces the cold page, then the live feed forwards.
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("gw6n-cold-1", engine.clone(), events);
+        let second = loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::stream::StreamFrame::Snapshot(snap),
+                } if stream_id.0 == "gw6n-st-1" => {
+                    break serde_json::to_value(&snap).unwrap();
+                }
+                FromServer::StreamEnd {
+                    stream_id, reason, ..
+                } if stream_id.0 == "gw6n-st-1" => {
+                    panic!("the upgrade dead-ended: {reason:?}")
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(
+            second["cursor"], 0,
+            "the upgraded snapshot is the live seam's"
+        );
+        assert!(
+            second["records"].as_array().expect("records").is_empty(),
+            "the fake's chain is empty"
+        );
+        // The upgraded feed forwards live entries.
+        engine
+            .journal_tx
+            .send(manox_agent::engine::JournalFeed::Event(
+                manox_harness::session::jsonl::JournalEvent {
+                    seq: 7,
+                    entry: std::sync::Arc::new(ent_goal("g7".into(), None)),
+                },
+            ))
+            .expect("the upgraded stream is subscribed");
+        let entry_seq = loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::stream::StreamFrame::Entry { seq, .. },
+                } if stream_id.0 == "gw6n-st-1" => break seq,
+                FromServer::StreamEnd {
+                    stream_id, reason, ..
+                } if stream_id.0 == "gw6n-st-1" => {
+                    panic!("the live feed dead-ended: {reason:?}")
+                }
+                _ => {}
+            }
+        };
+        assert_eq!(entry_seq, 7, "the live entry forwards on the upgraded feed");
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("gw6n-cold-1.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
     /// GW6 regression: PageHistory on an OPENED session whose engine seam
     /// answers "not materialized" must cold-read the persisted jsonl (§D.2
     /// "冷读不激活 engine，jsonl 直读") — pre-fix it answered
