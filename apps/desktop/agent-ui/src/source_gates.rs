@@ -67,10 +67,11 @@ mod tests {
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 9),
             // U1-flush: the parked flush's two facade writes (insert_user_message
             // + run_turn) retired to the gateway wire.
-            // U6b②/④: the dismissal write retired (the server's Submit arm owns
-            // the implicit dismissal) — residual: the two construction
-            // parks + the two browser-suite landing fallbacks.
-            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 4),
+            // U6b③: the two construction parks retired (both create flows
+            // ride the v2 CreateSession intent now) — residual: the two
+            // browser-suite landing fallbacks (the designed landing-park
+            // path, replayed by ensure_engine on materialization).
+            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
             // U2: the list/registry reads are retired — the sidebar renders
             // the multiplexer's wire rows and the chip menu reads the pushed
             // decoration cache. The residual 21 are sanctioned debt: the 16

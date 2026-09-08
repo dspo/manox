@@ -4352,21 +4352,59 @@ impl Workspace {
             .as_ref()
             .map(|s| s.read(cx).store.permission_mode)
             .unwrap_or_else(|| old.read(|t| t.permission_mode()));
-        // T6: detached rendering mirror (see `start_new_thread`) — no
-        // pre-spawned engine; the inherited state rides the facade and the
-        // session materializes server-side on first submit.
-        let new = Thread::landing_with_id(ThreadId(uuid::Uuid::new_v4().to_string()), cwd);
-        new.with_mut(|t| {
-            if let Some(dir) = &project {
-                t.restore_project(dir.clone());
-            }
-            if let Some(model) = model {
-                t.set_model(model.clone());
-            }
-            t.set_reasoning_effort(effort);
-            t.set_permission_mode(permission);
+        // U6b③: the inherited state rides the v2 CreateSession intent —
+        // the compat-note create this replaces carried only the cwd, so
+        // the parked model/project/effort/permission never reached the
+        // server (the #765 round-2 inheritance defect's shape); the
+        // receipt's minted id attaches through the standard
+        // created-session path.
+        let cwd_str = cwd.to_string_lossy().to_string();
+        let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
+        let model_str = model.map(|m| format!("{}/{}", m.provider, m.id));
+        let approval = serde_json::to_value(permission)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string));
+        let effort_str = match effort {
+            manox_agent::language_model::ReasoningEffort::High => Some("high".to_string()),
+            manox_agent::language_model::ReasoningEffort::Max => Some("max".to_string()),
+        };
+        let ws = cx.weak_entity();
+        let dir_for_store = project.clone();
+        self.multiplexer.update(cx, |m, _| {
+            m.create_session_intent(
+                (project.is_none()).then(|| cwd_str.clone()),
+                project_str,
+                model_str,
+                approval,
+                effort_str,
+                Box::new(move |done, cx| {
+                    let sid = match done {
+                        crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
+                            session_id
+                        }
+                        crate::multiplexer::CreateSessionDone::Failed { message } => {
+                            tracing::warn!(error = %message, "inheriting create intent failed");
+                            return;
+                        }
+                    };
+                    // Defer the workspace bind out of the multiplexer's
+                    // update borrow: the attach re-enters the mux
+                    // (`open_or_create`), so it must land on a later tick.
+                    cx.spawn(async move |_, cx| {
+                        if let Some(dir) = &dir_for_store {
+                            let _ = ws.update(cx, |_ws, cx| {
+                                Workspace::register_project_in_store(dir, cx);
+                            });
+                        }
+                        let _ = ws.update_in(cx, |this, window, cx| {
+                            this.attach_created_session(&sid, window, cx);
+                        });
+                    })
+                    .detach();
+                }),
+            );
         });
-        self.attach_thread(new, false, window, cx);
+        let _ = window;
     }
 
     /// Park the active thread into the background (preserving its run + event
@@ -6318,7 +6356,7 @@ impl Workspace {
     pub(crate) fn respond_plan_review(
         &mut self,
         choice: PlanReviewChoice,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(review) = self.pending_plan_review.take() else {
@@ -6414,26 +6452,79 @@ impl Workspace {
                 .as_ref()
                 .map(|s| s.read(cx).store.permission_mode)
                 .expect("foreground store present");
-            let new = match &project {
-                Some(dir) => {
-                    Thread::new_in_project(ThreadId(uuid::Uuid::new_v4().to_string()), dir.clone())
-                }
-                None => Thread::new_fresh(ThreadId(uuid::Uuid::new_v4().to_string()), cwd),
+            // U6b③: the fresh thread rides the v2 CreateSession intent
+            // (the inherited fields actually reach the server), and the
+            // seed turn rides the PlanSeedExecution note: the server
+            // renders the seed text (the same render_plan_mode_approved),
+            // inserts it under the Harness author, and runs the turn on
+            // the session's own engine. The desktop-side `Thread::new_*`
+            // + facade seed this replaces was the last in-process
+            // execution path — its `ensure_engine` spawned a SECOND
+            // engine racing the gateway's for the same session file.
+            let cwd_str = cwd.to_string_lossy().to_string();
+            let project_str = project.as_ref().map(|p| p.to_string_lossy().to_string());
+            let model_str = model.map(|m| format!("{}/{}", m.provider, m.id));
+            let approval = serde_json::to_value(permission)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string));
+            let effort_str = match effort {
+                manox_agent::language_model::ReasoningEffort::High => Some("high".to_string()),
+                manox_agent::language_model::ReasoningEffort::Max => Some("max".to_string()),
             };
-            new.with_mut(|t| {
-                if let Some(model) = model {
-                    t.set_model(model);
-                }
-                t.set_reasoning_effort(effort);
-                t.set_permission_mode(permission);
-                t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui));
+            let plan_file = review.plan_file.clone();
+            let ws = cx.weak_entity();
+            let dir_for_store = project.clone();
+            self.multiplexer.update(cx, |m, _| {
+                m.create_session_intent(
+                    (project.is_none()).then(|| cwd_str.clone()),
+                    project_str,
+                    model_str,
+                    approval,
+                    effort_str,
+                    Box::new(move |done, cx| {
+                        let sid = match done {
+                            crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
+                                session_id
+                            }
+                            crate::multiplexer::CreateSessionDone::Failed { message } => {
+                                tracing::warn!(
+                                    error = %message,
+                                    "ExecuteFresh create intent failed"
+                                );
+                                return;
+                            }
+                        };
+                        let plan_file = plan_file.clone();
+                        let old_id = old_id.clone();
+                        cx.spawn(async move |_, cx| {
+                            if let Some(dir) = &dir_for_store {
+                                let _ = ws.update(cx, |_ws, cx| {
+                                    Workspace::register_project_in_store(dir, cx);
+                                });
+                            }
+                            let _ = ws.update_in(cx, |this, window, cx| {
+                                this.attach_created_session(&sid, window, cx);
+                                // The archive lands BEFORE the refetch
+                                // (cross-domain #5: the answer's self-held
+                                // rescan must see it).
+                                manox_agent::thread_store_global()
+                                    .with_mut(|s| s.archive_thread(&old_id, true));
+                                this.multiplexer.update(cx, |m, _| m.fetch_thread_list());
+                                // The seed turn: the server renders +
+                                // inserts + runs it, FIFO behind the
+                                // attach's OpenSession on this connection.
+                                let _ = this.send_note(|s| {
+                                    manox_protocol::ClientNote::PlanSeedExecution {
+                                        session_id: s.to_string(),
+                                        plan_file,
+                                    }
+                                });
+                            });
+                        })
+                        .detach();
+                    }),
+                );
             });
-            self.attach_thread(new, false, window, cx);
-            manox_agent::thread_store_global().with_mut(|s| s.archive_thread(&old_id, true));
-            // Cross-domain #5: the refetch lands AFTER the archive write so
-            // the answer's self-held rescan sees it (the former kernel
-            // refresh ran before the write and relied on its event tail).
-            self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         } else {
             // Compact/keep-context: the engine exits plan mode, optionally
             // compacts the planning context toward the plan file, then runs

@@ -2128,7 +2128,11 @@ impl AgentServerInner {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
-                author: Some(t.self_author()),
+                // The expanded plan directive is written by the harness on
+                // the user's behalf, so the bubble header names the harness
+                // (the desktop's local seed path always did; U6b③ aligns
+                // the gateway path as both migrate onto it).
+                author: Some(manox_agent::MessageAuthor::Harness),
                 ..Default::default()
             };
             t.seed_plan_execution(plan_file, seed_text, Some(ui));
@@ -8749,6 +8753,46 @@ mod tests {
             !manox_agent::thread_store::global().read(|s| s.pending_plan_contains("u6b-d1")),
             "the submit must clear the pending-review badge (implicit dismissal)"
         );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U6b③: the PlanSeedExecution note drives the seed turn server-side —
+    /// the session facade renders the seed text, inserts it under the
+    /// Harness author, and runs the turn on the session's engine (the path
+    /// the desktop's ExecuteFresh local kernel seed migrated onto: its
+    /// `ensure_engine` used to spawn a second engine racing the gateway's
+    /// for the same session file).
+    #[test]
+    fn plan_seed_note_runs_the_seed_turn_server_side() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "u6b-seed-1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("u6b-seed-1", engine.clone(), events);
+        // The seed rendering reads the plan file.
+        let plan = std::env::temp_dir().join(format!("u6b-seed-plan-{}.md", uuid::Uuid::new_v4()));
+        std::fs::write(&plan, "# Plan\n\n- step one\n").unwrap();
+        client.send(FromClient::Notification {
+            note: ClientNote::PlanSeedExecution {
+                session_id: "u6b-seed-1".into(),
+                plan_file: plan.to_string_lossy().to_string(),
+            },
+        });
+        // The settle round-trip is the FIFO sync point behind the note.
+        client.settle();
+        // The seed turn fired on the session's engine (the facade's
+        // seed_plan_execution runs it through run_with_origin).
+        assert_eq!(
+            engine.origin_runs.lock().unwrap().len(),
+            1,
+            "the seed turn must run on the session engine"
+        );
+        let _ = std::fs::remove_file(&plan);
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();
