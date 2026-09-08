@@ -67,7 +67,13 @@ mod tests {
             // U6b⑤: the park-seed store writes retired (mark_running/
             // mark_background_work — the U3b server pump is the single
             // flag writer; its deltas already fed every mirror).
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 5),
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 4),
+            (
+                "workspace/plan_review.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                1,
+            ),
             (
                 "workspace/attach.rs",
                 "store mirror writes (U3)",
@@ -81,6 +87,12 @@ mod tests {
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            (
+                "workspace/plan_review.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                0,
+            ),
             (
                 "workspace/attach.rs",
                 "facade writes (U1/U6)",
@@ -100,7 +112,13 @@ mod tests {
             // thread_store_global() acquisitions with them (21 - 7).
             // U6b②: the bridge-head binding (U6a) and attach_created_session's
             // global() retired with the attach-face reads.
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 8),
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 7),
+            (
+                "workspace/plan_review.rs",
+                "store reads (U2)",
+                STORE_GLOBAL,
+                1,
+            ),
             ("workspace/attach.rs", "store reads (U2)", STORE_GLOBAL, 2),
             // 21 = 18 + the GW3 CancelDelivery withdrawal send + the two
             // U1-flush parked-wire sends (the AppendUserMessage note + the
@@ -115,7 +133,8 @@ mod tests {
             // PlanSeedExecution note (a bypass facade-seed became a wire
             // send — the ledger-mandated direction; the budget missed the
             // raise in that commit and is corrected here).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 22),
+            ("workspace.rs", "protocol sends (U9)", SENDS, 19),
+            ("workspace/plan_review.rs", "protocol sends (U9)", SENDS, 3),
             ("workspace/attach.rs", "protocol sends (U9)", SENDS, 2),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
@@ -165,6 +184,9 @@ mod tests {
             // grow — the totals are preserved against the pre-split
             // budgets).
             "workspace/attach.rs",
+            // U9b cluster 2: the plan-review verdict surface (budgeted
+            // by its own rows below).
+            "workspace/plan_review.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
