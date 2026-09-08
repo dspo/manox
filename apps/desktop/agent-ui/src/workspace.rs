@@ -6361,12 +6361,14 @@ impl Workspace {
         let Some(review) = self.pending_plan_review.take() else {
             return;
         };
-        // Every verdict consumes the card and releases the kernel review
-        // flag. U3b: the STORE badge clears server-side — every branch
-        // below answers the delivery (Refine/Execute Reply, ExecuteFresh
-        // CancelDelivery) and the server's verdict arms drop the flag with
-        // the §D.5 delta.
-        self.thread.with_mut(|t| t.set_plan_review_pending(false));
+        // Every verdict consumes the card; the kernel review flag AND the
+        // store badge both clear server-side (U3b, ledger-sanctioned):
+        // every branch below answers the delivery (Refine/Execute Reply,
+        // ExecuteFresh CancelDelivery), and the server's verdict arms drop
+        // the store flag with the §D.5 delta and clear the shared facade —
+        // the journal's `resolved` edge rides that write. The former local
+        // facade clear was its redundant twin (a second engine cmd writing
+        // a second `resolved` row).
         if matches!(choice, PlanReviewChoice::Refine) {
             // The refine verdict must reach the server: without the Reply
             // the PlanVerdict delivery hangs until the 300s expire, whose
