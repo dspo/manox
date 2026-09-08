@@ -592,7 +592,7 @@ fn engine_routes() -> &'static std::sync::Mutex<HashMap<String, EngineRoute>> {
     ENGINE_ROUTES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-fn register_engine_route(thread_id: &str, tx: &mpsc::UnboundedSender<SessionCmd>) {
+pub(crate) fn register_engine_route(thread_id: &str, tx: &mpsc::UnboundedSender<SessionCmd>) {
     engine_routes().lock().unwrap().insert(
         thread_id.to_string(),
         EngineRoute {

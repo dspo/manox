@@ -176,6 +176,16 @@ impl StoreHandle {
         });
     }
 
+    /// Route a decision-point row into the thread's journal (the K3
+    /// mechanism, generalized): the live engine actor serializes it against
+    /// every other writer of the session; a thread without an engine
+    /// cold-appends on the session file. Callers without a store (foreign
+    /// test fixtures) skip the route via `try_global`.
+    pub fn route_journal_row(&self, id: &str, kind: &str, payload: serde_json::Value) {
+        let path = self.read(|s| s.session_paths.get(id).cloned());
+        crate::engine::dispatch_store_journal_row(id.to_string(), path, kind.to_string(), payload);
+    }
+
     /// Persist one queued sidecar write on the agent runtime. The rescan
     /// follows the write — a rescan racing the write would re-read stale
     /// sidecar flags and revert the in-memory state.
@@ -965,8 +975,18 @@ fn session_info_to_summary(
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
+    let handle = standalone_for_test(db);
+    *TEST_OVERRIDE.lock().unwrap() = Some(handle);
+}
+
+/// A standalone store handle over `db` (test-support): NO process global
+/// involved. Tests that inject a store directly (the goal bridge's journal
+/// routing) use this to stay immune to cross-test TEST_OVERRIDE churn —
+/// the agent suite runs its store tests in parallel.
+#[cfg(any(test, feature = "test-support"))]
+pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-    let handle = StoreHandle::new(ThreadStore {
+    StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
@@ -980,8 +1000,7 @@ pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
         sessions_dir: dir,
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
-    });
-    *TEST_OVERRIDE.lock().unwrap() = Some(handle);
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]

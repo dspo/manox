@@ -67,6 +67,13 @@ pub struct GoalBridge {
     /// rationale as `armed`: the engine sets it and settles it on the actor
     /// thread, and tool reads happen inside a run that only the actor drives.
     goal_round_active: AtomicBool,
+    /// The store handle for the journal-routing leg of the goal authority
+    /// migration (stage ① dual-write). Captured at construction — NOT read
+    /// through the process global per append, so tests injecting a
+    /// standalone store stay immune to cross-test global churn. `None`
+    /// skips the journal leg (store-less fixtures; the db event log is the
+    /// bridge's working store until stage ②).
+    store: Option<crate::thread_store::StoreHandle>,
 }
 
 impl GoalBridge {
@@ -84,7 +91,11 @@ impl GoalBridge {
                 return None;
             }
         };
-        let bridge = Arc::new(Self::new(thread_id.to_string(), db));
+        let bridge = Arc::new(Self::new(
+            thread_id.to_string(),
+            db,
+            crate::thread_store::try_global(),
+        ));
         if let Err(error) = bridge.restore() {
             tracing::warn!("goal restore failed for {thread_id}: {error:#}");
             return None;
@@ -92,7 +103,11 @@ impl GoalBridge {
         Some(bridge)
     }
 
-    fn new(thread_id: String, db: Arc<ThreadsDatabase>) -> Self {
+    fn new(
+        thread_id: String,
+        db: Arc<ThreadsDatabase>,
+        store: Option<crate::thread_store::StoreHandle>,
+    ) -> Self {
         Self {
             thread_id,
             db,
@@ -100,6 +115,7 @@ impl GoalBridge {
             fold: Mutex::new(GoalFoldCache::default()),
             armed: AtomicBool::new(false),
             goal_round_active: AtomicBool::new(false),
+            store,
         }
     }
 
@@ -190,16 +206,11 @@ impl GoalBridge {
 
     /// Validate an event against the cached fold, persist it, and re-fold.
     fn append_event(&self, event: &GoalEvent) -> Result<()> {
-        self.sync()?;
-        {
-            let cache = self.fold.lock().unwrap();
-            apply_goal_event(&cache.state, event)?;
-        }
-        let data = serde_json::to_string(event)?;
-        self.db
-            .append_goal_events(&self.thread_id, &[(event.event_type(), &data)])?;
-        self.sync()?;
-        Ok(())
+        // Single-event form of the batch funnel: one persistence path for
+        // the db append AND the goal-authority journal routing (the stage-①
+        // dual-write below) — create/edit/set-status once silently bypassed
+        // the batch funnel's journal leg.
+        self.append_events(std::slice::from_ref(event))
     }
 
     /// Whether a goal round run is in flight (the engine's settle path uses
@@ -229,6 +240,22 @@ impl GoalBridge {
             .collect();
         self.db.append_goal_events(&self.thread_id, &refs)?;
         self.sync()?;
+        // Goal authority migration, stage ① (dual-write): the folded goal
+        // state rides a `goal` journal row — a FULL-state snapshot whose
+        // last entry is the authority the replay fold already implements
+        // (`goal` is a REPLAY_COVERAGE kind; `None` serializes as the
+        // explicit clear). The db event log stays the bridge's working
+        // store until stage ② (restore reads the journal, the db demotes).
+        // Routing is the store's K3 dispatch: the live engine actor
+        // serializes the row, a store-less fixture skips it.
+        if let Some(store) = self.store.as_ref() {
+            let snapshot = self.fold.lock().unwrap().state.current.clone();
+            store.route_journal_row(
+                &self.thread_id,
+                "goal",
+                serde_json::json!({ "goal": snapshot }),
+            );
+        }
         Ok(())
     }
 
@@ -757,6 +784,64 @@ mod tests {
     use super::*;
     use crate::goal::GoalEventKind;
 
+    /// Goal authority migration, stage ① (dual-write): every goal event
+    /// batch also routes a `goal` journal row — the FULL folded state as
+    /// the payload (last-entry-wins authority), dispatched through the
+    /// store's K3 router (here: a live engine route). The clear batch
+    /// routes the explicit null snapshot.
+    #[tokio::test]
+    async fn goal_batches_route_journal_snapshot_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            Arc::new(ThreadsDatabase::open(&dir.path().join("threads.db")).expect("open temp db"));
+        // A STANDALONE store (no process global): the agent suite runs its
+        // store tests in parallel, and a global-based route would race the
+        // cross-test TEST_OVERRIDE churn.
+        let store = crate::thread_store::standalone_for_test(db.clone());
+        let thread_id = format!("goal-route-{}", uuid::Uuid::new_v4());
+        db.upsert(&thread_record(&thread_id), false).unwrap();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        crate::engine::register_engine_route(&thread_id, &cmd_tx);
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
+        let bridge = GoalBridge::new(thread_id.clone(), db.clone(), Some(store));
+        bridge.set_sender(notice_tx);
+
+        bridge
+            .create_goal("ship stage one".into(), None, None, GoalActor::User)
+            .expect("create routes");
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("the create batch must route a journal row")
+            .expect("the route channel stays open");
+        match row {
+            crate::engine::SessionCmd::AppendJournal { kind, payload } => {
+                assert_eq!(kind, "goal");
+                assert_eq!(
+                    payload["goal"]["objective"].as_str(),
+                    Some("ship stage one"),
+                    "the row carries the FULL folded state: {payload}"
+                );
+            }
+            _ => panic!("expected the goal AppendJournal row, got a different command"),
+        }
+
+        bridge.clear_goal(GoalActor::User).expect("clear routes");
+        let row = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+            .await
+            .expect("the clear batch must route a journal row")
+            .expect("the route channel stays open");
+        match row {
+            crate::engine::SessionCmd::AppendJournal { kind, payload } => {
+                assert_eq!(kind, "goal");
+                assert!(
+                    payload["goal"].is_null(),
+                    "the clear rides the explicit null snapshot: {payload}"
+                );
+            }
+            _ => panic!("expected the goal AppendJournal row, got a different command"),
+        }
+    }
+
     /// Seeds an in-memory db with the owning thread row and returns a bridge
     /// over it with a live notice channel.
     fn bridge_in(
@@ -764,7 +849,7 @@ mod tests {
     ) -> (Arc<GoalBridge>, mpsc::UnboundedReceiver<BackendNotice>) {
         let db = ThreadsDatabase::open(&dir.path().join("threads.db")).expect("open temp db");
         let (tx, rx) = mpsc::unbounded_channel();
-        let bridge = GoalBridge::new("t1".into(), Arc::new(db));
+        let bridge = GoalBridge::new("t1".into(), Arc::new(db), None);
         bridge.set_sender(tx);
         (Arc::new(bridge), rx)
     }
@@ -1032,7 +1117,7 @@ mod tests {
             assert!(bridge.armed());
         }
         let db = ThreadsDatabase::open(&dir.path().join("threads.db")).unwrap();
-        let restored = GoalBridge::new("t1".into(), Arc::new(db));
+        let restored = GoalBridge::new("t1".into(), Arc::new(db), None);
         restored.restore().unwrap();
         let goal = restored.snapshot().unwrap();
         assert_eq!(goal.status, GoalStatus::Paused);
