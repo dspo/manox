@@ -198,6 +198,16 @@ pub enum ClientNote {
         session_id: String,
         enabled: bool,
     },
+    /// Toggle an opt-in browser tool suite (U6b: the desktop's direct
+    /// facade write retired to the gateway). `suite` is the closed wire
+    /// name ("chromeuse" | "webexplore" — the engine `BrowserSuite` serde
+    /// vocabulary); the toggle's effect returns via the
+    /// `BrowserSuitesChanged` echo like every sibling setter.
+    SetBrowserSuite {
+        session_id: String,
+        suite: String,
+        enable: bool,
+    },
     PlanSeedExecution {
         session_id: String,
         plan_file: String,

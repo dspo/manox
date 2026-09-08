@@ -81,7 +81,12 @@ mod tests {
             // U1-flush parked-wire sends (the AppendUserMessage note + the
             // v2 Submit — protocol surfaces the migrations add by design;
             // U9 folds them into the multiplexer with the rest).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 21),
+            // U6b① grew this 21→23 by design: the browser-suite toggles
+            // migrated FROM the FACADE_WRITE bypass surface TO the protocol
+            // (the ledger-mandated direction — a bypass write became two
+            // wire sends; their landing-fallback keeps the facade needle,
+            // so FACADE_WRITE holds at 5).
+            ("workspace.rs", "protocol sends (U9)", SENDS, 23),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
             ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),

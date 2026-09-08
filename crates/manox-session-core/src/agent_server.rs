@@ -1429,6 +1429,26 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::PinThread { session_id, pinned } => {
             manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
         }
+        // U6b①: the browser-suite toggle rides the gateway (the setter-note
+        // family shape: a string suite name, fire-and-forget — the effect
+        // returns via the facade's BrowserSuitesChanged echo). The desktop's
+        // direct facade write was the U6 dual-source face; unknown suite
+        // names answer an error note (never a panic).
+        ClientNote::SetBrowserSuite {
+            session_id,
+            suite,
+            enable,
+        } => {
+            let Some(parsed) = manox_agent::engine::BrowserSuite::from_wire(&suite) else {
+                inner.note_error(&session_id, &format!("unknown browser suite: {suite}"));
+                return;
+            };
+            let Some(thread) = inner.session_thread(&session_id) else {
+                inner.note_error(&session_id, "unknown session");
+                return;
+            };
+            thread.with_mut(|t| t.set_browser_suite(parsed, enable));
+        }
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
             // β-3b: route to TerminalHandle. GW7: until then, an explicit
             // Error note to the SENDING client — pre-fix the note was
@@ -8611,6 +8631,65 @@ mod tests {
         drop(client);
         drop(server);
         let _ = std::fs::remove_file(sessions.join("u6a-1.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U6b①: the browser-suite toggle rides the gateway — the setter note
+    /// lands the toggle on the session's facade (a landing thread parks it
+    /// in the mirror; a live engine follows via the facade→engine cmd), and
+    /// an unknown suite name answers an error note instead of panicking.
+    #[test]
+    fn set_browser_suite_note_lands_on_the_facade() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "u6b-1");
+        client.settle();
+        client.send(FromClient::Notification {
+            note: ClientNote::SetBrowserSuite {
+                session_id: "u6b-1".into(),
+                suite: "chromeuse".into(),
+                enable: true,
+            },
+        });
+        // The settle round-trip is the FIFO sync point: the dispatch loop
+        // processes the note before answering it.
+        client.settle();
+        let thread = server
+            .0
+            .session_thread("u6b-1")
+            .expect("the created session exists");
+        let suites = thread.read(|t| t.browser_suites().to_vec());
+        assert!(
+            suites.contains(&manox_agent::engine::BrowserSuite::ChromeUse),
+            "the toggle must land on the facade mirror: {suites:?}"
+        );
+        // An unknown suite name answers an error note (never a panic).
+        client.send(FromClient::Notification {
+            note: ClientNote::SetBrowserSuite {
+                session_id: "u6b-1".into(),
+                suite: "nosuchsuite".into(),
+                enable: true,
+            },
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_error = false;
+        while !saw_error {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the unknown suite never answered"
+            );
+            if let FromServer::Notification {
+                note: ServerNote::Error { session_id, .. },
+            } = client.recv()
+            {
+                saw_error = session_id.as_deref() == Some("u6b-1");
+            }
+        }
+        drop(client);
+        drop(server);
         manox_agent::thread_store::drop_global_for_test();
     }
 

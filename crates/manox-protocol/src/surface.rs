@@ -539,6 +539,11 @@ wire_surface! {
             session_id: "s1".into(),
             enabled: true,
         },
+        ClientNote::SetBrowserSuite { .. } => "setBrowserSuite" ~ ClientNote::SetBrowserSuite {
+            session_id: "s1".into(),
+            suite: "chromeuse".into(),
+            enable: true,
+        },
         ClientNote::PlanSeedExecution { .. } => "planSeedExecution" ~ ClientNote::PlanSeedExecution {
             session_id: "s1".into(),
             plan_file: "/plan.md".into(),

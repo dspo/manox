@@ -7978,7 +7978,20 @@ impl Workspace {
         suite: manox_agent::engine::BrowserSuite,
         _cx: &mut Context<Self>,
     ) {
-        self.thread.with_mut(|t| t.set_browser_suite(suite, true));
+        // U6b①: the toggle rides the gateway (the setter-note family, like
+        // SetPlanMode/SetModel) — the server arm lands it on the session's
+        // facade, whose BrowserSuitesChanged echo drives the chip exactly
+        // as the retired direct facade write did.
+        if !self.send_note(|sid| manox_protocol::ClientNote::SetBrowserSuite {
+            session_id: sid.to_string(),
+            suite: suite.wire().to_string(),
+            enable: true,
+        }) {
+            // Landing thread (no session yet): park the toggle in the
+            // facade mirror — `ensure_engine` replays it on materialization
+            // (the designed landing-park path, not a dual-source write).
+            self.thread.with_mut(|t| t.set_browser_suite(suite, true));
+        }
     }
 
     /// Deactivate a browser tool suite on the bound thread; the chip follows
@@ -7988,7 +8001,15 @@ impl Workspace {
         suite: manox_agent::engine::BrowserSuite,
         _cx: &mut Context<Self>,
     ) {
-        self.thread.with_mut(|t| t.set_browser_suite(suite, false));
+        // U6b①: the gateway leg (see `activate_browser_tool_suite`); the
+        // landing fallback parks in the facade mirror.
+        if !self.send_note(|sid| manox_protocol::ClientNote::SetBrowserSuite {
+            session_id: sid.to_string(),
+            suite: suite.wire().to_string(),
+            enable: false,
+        }) {
+            self.thread.with_mut(|t| t.set_browser_suite(suite, false));
+        }
     }
 
     /// Open the native file picker and add chosen paths as pending

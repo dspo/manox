@@ -1457,6 +1457,26 @@ impl BrowserSuite {
             Self::WebExplore => WEBEXPLORE_TOOL_NAMES,
         }
     }
+
+    /// The closed wire name (the §D.3 setter-note family carries it as a
+    /// `String`, like every sibling setter; matches the serde `lowercase`
+    /// representation the journal and ReadyInfo already serialize).
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::ChromeUse => "chromeuse",
+            Self::WebExplore => "webexplore",
+        }
+    }
+
+    /// Parse a wire suite name; `None` for anything outside the closed
+    /// vocabulary (the gateway answers an error note, never a panic).
+    pub fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "chromeuse" => Some(Self::ChromeUse),
+            "webexplore" => Some(Self::WebExplore),
+            _ => None,
+        }
+    }
 }
 /// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
 /// orchestration (assembly mirrors the `pi-extensions` orchestration example).

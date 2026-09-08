@@ -28,6 +28,7 @@
     "setApprovalMode",
     "setCwd",
     "setPlanMode",
+    "setBrowserSuite",
     "planSeedExecution",
     "compact",
     "goal",

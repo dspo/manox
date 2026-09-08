@@ -295,6 +295,13 @@ mod tests {
                 },
             },
             FromClient::Notification {
+                note: crate::client::ClientNote::SetBrowserSuite {
+                    session_id: "s1".into(),
+                    suite: "chromeuse".into(),
+                    enable: true,
+                },
+            },
+            FromClient::Notification {
                 note: crate::client::ClientNote::SetCwd {
                     session_id: "s1".into(),
                     cwd: "/new".into(),
