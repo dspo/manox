@@ -43,7 +43,7 @@ export type HookKind = "approve" | "planVerdict" | "askUserQuestion" | "browserO
  *
  * Declaring surface: HOST_EVENTS.
  */
-export type HostEvent = { "type": "ready", epoch: number, } | { "type": "models", models: Array<ModelInfo>, } | { "type": "commands", commands: JsonValue, } | { "type": "threadsUpdated", threads: Array<ThreadListItem>, } | { "type": "sessionStatus", sessionId: string, running: boolean | null, errored: boolean | null, unread: boolean | null, pendingAuth: boolean | null, pendingPlan: boolean | null, backgroundWork: boolean | null, } | { "type": "sessionCreated", sessionId: string, header: ThreadHeader, } | { "type": "sessionDisposed", sessionId: string, } | { "type": "error", message: string, } | { "type": "projects", known: Array<string>, };
+export type HostEvent = { "type": "ready", epoch: number, } | { "type": "models", models: Array<ModelInfo>, } | { "type": "commands", commands: JsonValue, } | { "type": "threadsUpdated", threads: Array<ThreadListItem>, } | { "type": "sessionStatus", sessionId: string, running: boolean | null, errored: boolean | null, unread: boolean | null, pendingAuth: boolean | null, pendingPlan: boolean | null, backgroundWork: boolean | null, } | { "type": "sessionCreated", sessionId: string, header: ThreadHeader, } | { "type": "sessionDisposed", sessionId: string, } | { "type": "error", message: string, sessionId: string | null, } | { "type": "projects", known: Array<string>, };
 
 /**
  * A base64-encoded image attachment (submit / steer payloads).

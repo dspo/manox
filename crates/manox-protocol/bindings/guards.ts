@@ -180,7 +180,7 @@ export function parseHostEvent(v: unknown): Guard<HostEventShape> {
     ],
     sessionCreated: ['type', 'sessionId', 'header'],
     sessionDisposed: ['type', 'sessionId'],
-    error: ['type', 'message'],
+    error: ['type', 'message', 'sessionId'],
     // U2 cross-domain #1: the known-projects registry snapshot (rides the
     // ListThreads push; a full snapshot, never a delta).
     projects: ['type', 'known'],

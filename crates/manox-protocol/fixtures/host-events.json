@@ -76,6 +76,7 @@
   },
   {
     "message": "gateway/internal",
+    "sessionId": "s1",
     "type": "error"
   },
   {

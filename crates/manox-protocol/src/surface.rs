@@ -316,6 +316,7 @@ wire_surface! {
         },
         HostEvent::Error { .. } => "error" ~ HostEvent::Error {
             message: "gateway/internal".into(),
+            session_id: Some("s1".into()),
         },
         HostEvent::Projects { .. } => "projects" ~ HostEvent::Projects {
             known: vec!["/proj".into()],

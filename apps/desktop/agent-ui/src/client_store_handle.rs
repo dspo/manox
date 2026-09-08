@@ -141,32 +141,69 @@ impl ClientStoreHandle {
             FromServer::StreamEnd { reason, .. } => self.apply_stream_end(reason, cx),
             // §D.5 host event routed by session: `SessionStatus` mirrors into
             // the store under the monotonic rules (the multiplexer broadcasts
-            // to every leaf, including parked ones).
+            // to every leaf, including parked ones). C4a: the control events
+            // (`SessionCreated`/`SessionDisposed`/`Error`) normalize into the
+            // note path here — the host frames are the authority face, so
+            // C4b can retire the wire notes with zero behavior change (the
+            // webui `onHostEvent` pattern; GW1 dual-emit makes the double
+            // processing idempotent during the window).
             FromServer::Host { host } => {
-                if let manox_protocol::stream::HostEvent::SessionStatus {
-                    session_id,
-                    running,
-                    errored,
-                    unread,
-                    pending_auth,
-                    pending_plan,
-                    background_work,
-                } = host
-                    && session_id == self.session_id
-                {
-                    // GW5: a focused session never lights up — the unread
-                    // rise is suppressed client-side (webui parity: its
-                    // mirror gates `unread === true && !active`).
-                    let unread = if self.active { None } else { unread };
-                    self.store.apply_session_status(
+                use manox_protocol::stream::HostEvent;
+                match host {
+                    HostEvent::SessionStatus {
+                        session_id,
                         running,
                         errored,
                         unread,
                         pending_auth,
                         pending_plan,
                         background_work,
-                    );
-                    cx.notify();
+                    } if session_id == self.session_id => {
+                        // GW5: a focused session never lights up — the unread
+                        // rise is suppressed client-side (webui parity: its
+                        // mirror gates `unread === true && !active`).
+                        let unread = if self.active { None } else { unread };
+                        self.store.apply_session_status(
+                            running,
+                            errored,
+                            unread,
+                            pending_auth,
+                            pending_plan,
+                            background_work,
+                        );
+                        cx.notify();
+                    }
+                    HostEvent::SessionCreated { session_id, .. }
+                        if session_id == self.session_id =>
+                    {
+                        self.store
+                            .apply_server_note(&manox_protocol::ServerNote::SessionCreated {
+                                session_id: session_id.clone(),
+                            });
+                        cx.notify();
+                    }
+                    HostEvent::SessionDisposed { session_id } if session_id == self.session_id => {
+                        self.store.apply_server_note(
+                            &manox_protocol::ServerNote::SessionDisposed {
+                                session_id: session_id.clone(),
+                            },
+                        );
+                    }
+                    HostEvent::Error {
+                        session_id: Some(session_id),
+                        message,
+                    } if session_id == self.session_id => {
+                        let note = manox_protocol::ServerNote::Error {
+                            session_id: Some(session_id.clone()),
+                            message: message.clone(),
+                        };
+                        self.store.apply_server_note(&note);
+                        if let Some(ev) = server_note_to_thread_event(&note) {
+                            cx.emit(ev);
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1018,6 +1055,75 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(handle.update(cx, |h, _| h.store.id.0.clone()), "s1");
+    }
+
+    /// C4a: the leaf normalizes the control HOST frames into its note path
+    /// (the webui onHostEvent pattern) — SessionCreated binds the empty
+    /// store id and a scoped Error emits ThreadEvent::Error — so C4b can
+    /// retire the wire notes with zero leaf-side change. A foreign
+    /// session's frames stay silent (the fan-out reaches every leaf).
+    #[gpui::test]
+    fn host_control_frames_normalize_into_the_leaf(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
+        let errors: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = errors.clone();
+        let subscribed = handle.clone();
+        let _sub = handle.update(cx, move |_, cx| {
+            cx.subscribe(&subscribed, move |_, _, ev: &ThreadEvent, _| {
+                if let ThreadEvent::Error(err) = ev {
+                    sink.borrow_mut().push(err.to_string());
+                }
+            })
+        });
+        // The compat create flow leaves store.id empty until SessionCreated
+        // lands; the HOST frame binds it now (the v1 note did before C4a).
+        server_conn.send_to_client(FromServer::Host {
+            host: manox_protocol::stream::HostEvent::SessionCreated {
+                session_id: "s1".into(),
+                header: manox_protocol::journal::ThreadHeader {
+                    id: "s1".into(),
+                    cwd: "/w".into(),
+                    parent_session: None,
+                    metadata: None,
+                    created_at: "2026-09-05T00:00:00Z".into(),
+                },
+            },
+        });
+        server_conn.send_to_client(FromServer::Host {
+            host: manox_protocol::stream::HostEvent::Error {
+                message: "boom-s1".into(),
+                session_id: Some("s1".into()),
+            },
+        });
+        // A foreign session's error must stay silent on this leaf.
+        server_conn.send_to_client(FromServer::Host {
+            host: manox_protocol::stream::HostEvent::Error {
+                message: "boom-s2".into(),
+                session_id: Some("s2".into()),
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let bound = handle.update(cx, |h, _| h.store.id.0.clone());
+            let seen = errors.borrow().clone();
+            if bound == "s1" && seen.iter().any(|m| m.contains("boom-s1")) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host control frames never normalized (id={bound:?}, errors={seen:?})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let seen = errors.borrow().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the foreign session's error stays silent: {seen:?}"
+        );
     }
 
     /// T10c e2e restore regression (the gap the v1-fold deletion exposed):

@@ -219,8 +219,16 @@ pub enum HostEvent {
     },
     /// A session was disposed (owner-set control).
     SessionDisposed { session_id: String },
-    /// A host-level error.
-    Error { message: String },
+    /// A host-level error. C4a: `session_id` scopes the error to a session
+    /// (the desktop leaf normalization emits it there, exactly like the v1
+    /// note's scope); `None` is connection-scoped (no leaf owns it —
+    /// consumers log it). Always serialized (null when None) so client
+    /// exact-key guards keep a static shape.
+    Error {
+        message: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
     /// U2 cross-domain #1: the known-projects registry snapshot (the §D.5
     /// list-channel family — a full snapshot, never a delta). Pushed to the
     /// requester with the `ThreadsUpdated` list push; the sidebar's project
@@ -381,6 +389,7 @@ mod tests {
             },
             HostEvent::Error {
                 message: "boom".into(),
+                session_id: Some("s1".into()),
             },
             HostEvent::Projects {
                 known: vec!["/proj".into()],

@@ -798,8 +798,9 @@ impl AgentServerInner {
     fn note_error(&self, session_id: &str, message: &str) {
         // GW1 dual emit: the §D.5 `HostEvent::Error` mirror rides to the
         // SAME owner audience as the v1 note (a session-scoped error is not
-        // broadcast to non-owners; the HostEvent vocabulary carries no
-        // session id, the audience carries the scope).
+        // broadcast to non-owners). C4a: the host frame carries the session
+        // scope itself — the desktop leaf normalization (the authority face
+        // after C4a) filters on it.
         self.route_note(
             session_id,
             ServerNote::Error {
@@ -811,6 +812,7 @@ impl AgentServerInner {
             session_id,
             HostEvent::Error {
                 message: message.into(),
+                session_id: Some(session_id.into()),
             },
         );
     }
@@ -1381,6 +1383,9 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 owner,
                 HostEvent::Error {
                     message: message.into(),
+                    // Connection-scoped (the note's session_id is None):
+                    // no leaf owns it, consumers log.
+                    session_id: None,
                 },
             );
         }
@@ -8166,7 +8171,7 @@ mod tests {
                         },
                 } if sid == "gw1-e1" => note_message = Some(message),
                 FromServer::Host {
-                    host: HostEvent::Error { message },
+                    host: HostEvent::Error { message, .. },
                 } => host_message = Some(message),
                 _ => {}
             }

@@ -263,23 +263,21 @@ impl SessionMultiplexer {
         }
         let sid = match &msg {
             FromServer::Notification { note } => {
-                // v1 compat: a `SessionCreated` note re-seats the handle and
-                // triggers the first follow-stream open (the create path —
-                // `open_or_create(reopen=false)` has no client-chosen id, so
-                // the id only lands here). The leaf must exist BEFORE the
-                // follow opens: the note races ahead of the create receipt,
-                // and the intent path deliberately pre-creates nothing — so
-                // the on-demand leaf lands here, not after the open (the
-                // round-5 warn: `open_follow: no leaf registered` bailed and
-                // the stream only survived via the receipt arm's re-open).
+                // C4a: the v1 `SessionCreated` note is reconciliation-only
+                // — the host mirror owns the leaf creation + the first
+                // follow open (see `apply_host`). The note still fans out
+                // to the leaf below (its store-id bind is idempotent with
+                // the leaf's host normalization — the GW1 dual-track
+                // contract) until C4b retires the note arms server-side.
                 let sid = note.session_id().map(str::to_string);
                 if let Some(sid) = sid.as_ref()
                     && matches!(note, manox_protocol::ServerNote::SessionCreated { .. })
                     && !self.has_follow(sid)
                 {
-                    let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
-                    self.ensure_leaf(sid, cx);
-                    self.open_follow(sid, stream_id);
+                    tracing::debug!(
+                        session = %sid,
+                        "v1 SessionCreated note (the host mirror is authoritative)"
+                    );
                 }
                 sid
             }
@@ -459,11 +457,12 @@ impl SessionMultiplexer {
     }
 
     /// Consume one §D.5 host frame for the multiplexer's own state, after
-    /// the leaf fan-out. Dual-track idempotence: the v1 note path stays
-    /// authoritative for per-session side effects (the `SessionCreated` note
-    /// arm owns leaf creation + the `has_follow`-guarded follow open, the
-    /// `Error` note owns surfacing), so those host mirrors only log a
-    /// reconciliation line here and never re-trigger a side effect.
+    /// the leaf fan-out. C4a: the HOST frames are the authority face for
+    /// the per-session control events — `SessionCreated` owns the leaf
+    /// creation + the `has_follow`-guarded follow open here, and the leaves
+    /// normalize `SessionCreated`/`SessionDisposed`/`Error` host frames
+    /// into their store/emit path. The v1 note arms are reconciliation-only
+    /// (idempotent under the GW1 dual-emit) and retire with C4b.
     fn apply_host(&mut self, host: &HostEvent, cx: &mut Context<Self>) {
         match host {
             // U2 cross-domain #1: the registry snapshot replaces the
@@ -520,23 +519,48 @@ impl SessionMultiplexer {
                 }
             }
             HostEvent::SessionCreated { session_id, .. } => {
+                // C4a authority: the leaf creation + the first follow open
+                // ride the host frame (the create path —
+                // `open_or_create(reopen=false)` — pre-creates nothing, so
+                // the on-demand leaf lands here; the `has_follow` guard
+                // keeps the open single when the v2 create Response path
+                // raced ahead). The leaf must exist BEFORE the follow
+                // opens (the round-5 warn: `open_follow: no leaf
+                // registered` bailed and the stream only survived via the
+                // receipt arm's re-open).
+                if !self.has_follow(session_id) {
+                    let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
+                    self.ensure_leaf(session_id, cx);
+                    self.open_follow(session_id, stream_id);
+                }
                 if !self.thread_list.iter().any(|r| r.id == *session_id) {
                     tracing::debug!(
                         session = %session_id,
-                        "host SessionCreated mirror ahead of the list snapshot"
+                        "host SessionCreated ahead of the list snapshot"
                     );
                 }
+                cx.notify();
             }
             HostEvent::SessionDisposed { session_id } => {
+                // C4a: the leaf normalizes the disposal (store/emit); the
+                // v1 note was already a desktop no-op — nothing to inherit.
                 tracing::debug!(
                     session = %session_id,
-                    "host SessionDisposed mirror (the note path is authoritative)"
+                    "host SessionDisposed (the leaf normalizes; C4b retires the note)"
                 );
             }
-            HostEvent::Error { message } => {
+            HostEvent::Error {
+                session_id,
+                message,
+            } => {
+                // C4a: a scoped error rides the leaf normalization (the
+                // leaf emits it as the ThreadEvent the workspace surfaces);
+                // a connection-scoped error (session_id None) has no leaf —
+                // logged here, matching the v1 route's drop.
                 tracing::debug!(
+                    session = ?session_id,
                     error = %message,
-                    "host Error mirror (the v1 note path is authoritative)"
+                    "host Error (the leaf normalization is authoritative)"
                 );
             }
         }
@@ -1254,12 +1278,69 @@ mod tests {
         );
     }
 
-    /// U2 dual-track idempotence: the `SessionCreated` host mirror must not
-    /// open a follow stream — the v1 note path (with its `has_follow`
-    /// guard) stays the single trigger.
+    /// C4a authority flip: the `SessionCreated` HOST mirror owns the leaf
+    /// creation + the first follow open (the `has_follow` guard keeps it
+    /// single); the v1 note is reconciliation-only. Red-green of the flip:
+    /// the note alone never opens the follow; the host frame does.
     #[gpui::test]
-    async fn session_created_mirror_never_opens_a_follow(cx: &mut TestAppContext) {
-        let (mux, server_conn) = test_mux(cx);
+    fn session_created_host_mirror_owns_the_leaf_and_follow(cx: &mut TestAppContext) {
+        let (_mux, server_conn) = test_mux(cx);
+        let header = manox_protocol::journal::ThreadHeader {
+            id: "s1".into(),
+            cwd: "/w".into(),
+            parent_session: None,
+            metadata: None,
+            created_at: "2026-09-05T00:00:00Z".into(),
+        };
+        // The v1 note alone: reconciliation only — no leaf, no StreamOpen.
+        server_conn.send_to_client(FromServer::Notification {
+            note: manox_protocol::ServerNote::SessionCreated {
+                session_id: "s1".into(),
+            },
+        });
+        // A bounded settle window (a slow pump must not fake the absence).
+        // The fan-out's on-demand leaf is generic routing, not the created
+        // side effect — only the FOLLOW OPEN flipped to the host frame.
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let rx = server_conn.client_rx();
+            while let Ok(msg) = rx.try_recv() {
+                if let FromClient::StreamOpen { .. } = msg {
+                    panic!("the reconciliation-only note must not open the follow")
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The host mirror: leaf + follow.
+        server_conn.send_to_client(FromServer::Host {
+            host: HostEvent::SessionCreated {
+                session_id: "s1".into(),
+                header,
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut opened = false;
+        while !opened {
+            cx.run_until_parked();
+            let rx = server_conn.client_rx();
+            while let Ok(msg) = rx.try_recv() {
+                if let FromClient::StreamOpen { stream_kind, .. } = msg
+                    && matches!(&stream_kind, manox_protocol::StreamKind::FollowSession { session_id, .. } if session_id == "s1")
+                {
+                    opened = true;
+                }
+            }
+            if opened {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host mirror never opened the follow stream"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Idempotence: a second host frame (the dual-emit tail) never
+        // double-opens (the has_follow guard).
         server_conn.send_to_client(FromServer::Host {
             host: HostEvent::SessionCreated {
                 session_id: "s1".into(),
@@ -1272,23 +1353,15 @@ mod tests {
                 },
             },
         });
-        cx.run_until_parked();
-        let rx = server_conn.client_rx();
-        while let Ok(msg) = rx.try_recv() {
-            match msg {
-                FromClient::Request { call, .. } => assert!(
-                    !matches!(call, ClientCall::OpenSession { .. }),
-                    "the host mirror must not re-trigger the follow open"
-                ),
-                FromClient::StreamOpen { .. } => {
-                    panic!("no StreamOpen may ride the SessionCreated mirror")
+        for _ in 0..20 {
+            cx.run_until_parked();
+            let rx = server_conn.client_rx();
+            while let Ok(msg) = rx.try_recv() {
+                if let FromClient::StreamOpen { .. } = msg {
+                    panic!("the has_follow guard must keep the open single")
                 }
-                _ => {}
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(
-            mux.read_with(cx, |m, _| m.sessions.is_empty()),
-            "the mirror creates no leaf either — the note path owns creation"
-        );
     }
 }

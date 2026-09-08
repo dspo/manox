@@ -771,7 +771,9 @@ export class Store {
 			case 'error':
 				this.onServerNote({
 					method: 'error',
-					sessionId: null,
+					// C4a: the host frame carries the session scope (the v1
+					// note parity); null = connection-scoped global error.
+					sessionId: asString(ev.sessionId) ?? null,
 					message: asString(ev.message) ?? '',
 				});
 				return;
