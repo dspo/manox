@@ -40,15 +40,6 @@ pub enum ClientCall {
     ListThreads,
     ListModels,
     ListCommands,
-    GetUsage {
-        session_id: String,
-    },
-    GetCurrentModel {
-        session_id: String,
-    },
-    ThreadInfo {
-        session_id: String,
-    },
     /// Attach to a terminal; response carries the scrollback snapshot.
     TerminalAttach {
         session: String,
@@ -233,9 +224,6 @@ pub enum ClientNote {
     PinThread {
         session_id: String,
         pinned: bool,
-    },
-    FocusThread {
-        session_id: Option<String>,
     },
     TerminalInput {
         terminal: String,

@@ -141,7 +141,6 @@ class ManoxSidebarProvider implements vscode.WebviewViewProvider {
 				kind: 'notification',
 				note: { method: 'sessionCreated', sessionId },
 			});
-			manager.send(notification({ method: 'focusThread', sessionId: null }));
 			manager.send(request({ method: 'openSession', sessionId }));
 			return;
 		}

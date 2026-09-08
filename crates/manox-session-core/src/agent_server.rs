@@ -1066,19 +1066,6 @@ async fn handle_call(
                 .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
         }),
         ClientCall::ListCommands => Ok(inner.commands_snapshot()),
-        // T10 (§D.6): the v1 query surface is retired — usage rides the
-        // journal (Q face `GetConversationInfo`), the model and every header
-        // chip field ride the projection baseline/deltas (§E). The variants
-        // stay in the enum for the dual-protocol window; answering with an
-        // explicit error is the removal signal.
-        ClientCall::GetUsage { .. }
-        | ClientCall::GetCurrentModel { .. }
-        | ClientCall::ThreadInfo { .. } => Err(RpcError::new(
-            -1,
-            "v1 query surface removed (T10): use the \
-                 follow stream, projections, and GetConversationInfo",
-        )
-        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
         // GW7: an explicit stable code, not a bare -1 — clients that
         // declared terminal support must be able to distinguish "feature
         // not built yet" from a generic failure (§D.7 code set, ratified
@@ -1356,13 +1343,6 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::PinThread { session_id, pinned } => {
             manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
         }
-        // GW5: unread is client-owned — the server's single-slot `focused`
-        // mirror is removed (it could not express multi-client focus, and
-        // the desktop never sent FocusThread, so the session the user was
-        // WATCHING still lit unread). The note variant survives the
-        // dual-protocol window as a no-op; C4 removes it. Clients clear
-        // their own unread badge on focus.
-        ClientNote::FocusThread { .. } => {}
         ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
             // β-3b: route to TerminalHandle. GW7: until then, an explicit
             // Error note to the SENDING client — pre-fix the note was
@@ -8199,13 +8179,8 @@ mod tests {
         create(&server, &client, "gw5-s1");
         let (engine, events) = FakeEngine::new();
         server.set_session_engine_for_test("gw5-s1", engine.clone(), events);
-        // The client reports focus; GW5 makes the server handler a no-op.
-        client.send(FromClient::Notification {
-            note: ClientNote::FocusThread {
-                session_id: Some("gw5-s1".into()),
-            },
-        });
-        client.settle();
+        // (The focus-report probe retired with the FocusThread variant —
+        // C4b: no focus report can reach the server at all.)
         client.send(FromClient::Notification {
             note: ClientNote::Submit {
                 session_id: "gw5-s1".into(),
@@ -8245,11 +8220,13 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
-    /// GW5 regression: the server keeps NO unread mirror — `FocusThread` is a
-    /// no-op (a legacy store-side mirror write survives it; pre-fix the
-    /// handler cleared it) and the §D.2 list response reports `unread:false`
-    /// regardless of the store (field deprecated, C4 removes it; pre-fix the
-    /// row carried the mirror value `true`).
+    /// GW5 regression: the server keeps NO unread mirror — a legacy
+    /// store-side mirror write survives (nothing server-side clears it; the
+    /// `FocusThread` probe retired with its variant in C4b, so no focus
+    /// report can reach the server at all) and the §D.2 list response
+    /// reports `unread:false` regardless of the store (field deprecated,
+    /// the C4b bulk removes it; pre-fix the row carried the mirror value
+    /// `true`).
     #[test]
     fn list_threads_unread_is_always_false_and_focus_is_noop() {
         let _g = lock_globals();
@@ -8281,19 +8258,13 @@ mod tests {
         // during the transition window).
         manox_agent::thread_store::global().with_mut(|s| s.set_unread("gw5-s2", true));
 
-        // FocusThread is a server-side no-op now (GW5): the mirror survives.
-        client.send(FromClient::Notification {
-            note: ClientNote::FocusThread {
-                session_id: Some("gw5-s2".into()),
-            },
-        });
-        client.settle();
+        // The legacy store mirror survives (nothing server-side clears it).
         assert!(
             manox_agent::thread_store::global().read(|s| s
                 .summaries()
                 .iter()
                 .any(|t| t.id == "gw5-s2" && t.has_unread)),
-            "GW5: FocusThread must no longer clear a store-side unread mirror (handler is a no-op)"
+            "GW5: a store-side unread mirror survives; the wire list stays deprecated-false"
         );
 
         // The list response never carries the mirror (deprecated field,
@@ -8989,15 +8960,6 @@ mod tests {
             ClientCall::ListThreads,
             ClientCall::ListModels,
             ClientCall::ListCommands,
-            ClientCall::GetUsage {
-                session_id: "j1-s".into(),
-            },
-            ClientCall::GetCurrentModel {
-                session_id: "j1-s".into(),
-            },
-            ClientCall::ThreadInfo {
-                session_id: "j1-s".into(),
-            },
             ClientCall::TerminalAttach {
                 session: "j1-s".into(),
                 cols: 80,

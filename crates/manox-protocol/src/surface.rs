@@ -421,15 +421,6 @@ wire_surface! {
         ClientCall::ListThreads => "listThreads" ~ ClientCall::ListThreads,
         ClientCall::ListModels => "listModels" ~ ClientCall::ListModels,
         ClientCall::ListCommands => "listCommands" ~ ClientCall::ListCommands,
-        ClientCall::GetUsage { .. } => "getUsage" ~ ClientCall::GetUsage {
-            session_id: "s1".into(),
-        },
-        ClientCall::GetCurrentModel { .. } => "getCurrentModel" ~ ClientCall::GetCurrentModel {
-            session_id: "s1".into(),
-        },
-        ClientCall::ThreadInfo { .. } => "threadInfo" ~ ClientCall::ThreadInfo {
-            session_id: "s1".into(),
-        },
         ClientCall::TerminalAttach { .. } => "terminalAttach" ~ ClientCall::TerminalAttach {
             session: "s1".into(),
             cols: 80,
@@ -570,9 +561,6 @@ wire_surface! {
         ClientNote::PinThread { .. } => "pinThread" ~ ClientNote::PinThread {
             session_id: "s1".into(),
             pinned: true,
-        },
-        ClientNote::FocusThread { .. } => "focusThread" ~ ClientNote::FocusThread {
-            session_id: Some("s1".into()),
         },
         ClientNote::TerminalInput { .. } => "terminalInput" ~ ClientNote::TerminalInput {
             terminal: "t1".into(),

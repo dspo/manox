@@ -265,7 +265,7 @@ mod tests {
             },
             FromClient::Request {
                 id: MsgId::new("r-3"),
-                call: crate::client::ClientCall::ThreadInfo {
+                call: crate::client::ClientCall::OpenSession {
                     session_id: "s1".into(),
                 },
             },
