@@ -141,6 +141,11 @@ mod tests {
             "source_gates.rs",
             // The gateway client half legitimately constructs wire frames.
             "client_store_handle.rs",
+            // U9a: the extracted workspace test module is test code in its
+            // entirety (it compiles only under the parent's `#[cfg(test)]
+            // mod tests;` declaration, so it carries no inner marker for
+            // `production_part` to truncate at).
+            "workspace/tests.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
@@ -183,5 +188,46 @@ mod tests {
                 offenders.push(rel);
             }
         }
+    }
+
+    /// U9 / K.7-6 terminal grep gate: the view/component layer never
+    /// touches the protocol send surface (the multiplexer is the only
+    /// wire face) and never holds kernel object handles. The frozen
+    /// kernel-handle budget is context_rail's `ThreadHandle` (doc line +
+    /// field + ctor) — the U7b rail-visibility migration item (Q-face
+    /// state ownership); it only shrinks.
+    #[test]
+    fn views_never_touch_wire_or_kernel_handles() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("views");
+        const SENDS: &[&str] = &[".send_call(", ".send_note("];
+        const KERNEL: &[&str] = &["ThreadHandle"];
+        let mut send_total = 0;
+        let mut kernel_total = 0;
+        for entry in fs::read_dir(&dir).expect("views dir readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().map(|e| e != "rs").unwrap_or(true) {
+                continue;
+            }
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("gate cannot read {}: {e}", path.display()));
+            send_total += SENDS
+                .iter()
+                .map(|n| source.matches(n).count())
+                .sum::<usize>();
+            kernel_total += KERNEL
+                .iter()
+                .map(|n| source.matches(n).count())
+                .sum::<usize>();
+        }
+        assert_eq!(
+            send_total, 0,
+            "views must never touch the protocol send surface (U9 gate — the multiplexer is the only wire face)"
+        );
+        assert!(
+            kernel_total <= 3,
+            "the views kernel-handle surface only shrinks (frozen budget 3 = context_rail's ThreadHandle doc/field/ctor, the U7b rail-visibility item); found {kernel_total}"
+        );
     }
 }
