@@ -67,7 +67,13 @@ mod tests {
             // U6b⑤: the park-seed store writes retired (mark_running/
             // mark_background_work — the U3b server pump is the single
             // flag writer; its deltas already fed every mirror).
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 4),
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 3),
+            (
+                "workspace/composer_render.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                1,
+            ),
             (
                 "workspace/render.rs",
                 "store mirror writes (U3)",
@@ -116,7 +122,17 @@ mod tests {
             // ride the v2 CreateSession intent now) — residual: the two
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
-            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            // U9b cluster 8: workspace.rs hits ZERO facade writes — the two
+            // browser-suite landing fallbacks (the designed landing-park
+            // path) moved with the toggles into composer_render.rs and
+            // freeze there.
+            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 0),
+            (
+                "workspace/composer_render.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                2,
+            ),
             (
                 "workspace/render.rs",
                 "facade writes (U1/U6)",
@@ -174,7 +190,13 @@ mod tests {
             // global() retired with the attach-face reads.
             // U9b⑤: the right pane's threads.db persistence reads moved with the
             // pane (7→4 here, its 3 freeze on the right_pane rows).
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 4),
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 3),
+            (
+                "workspace/composer_render.rs",
+                "store reads (U2)",
+                STORE_GLOBAL,
+                1,
+            ),
             ("workspace/render.rs", "store reads (U2)", STORE_GLOBAL, 0),
             ("workspace/chips.rs", "store reads (U2)", STORE_GLOBAL, 0),
             (
@@ -207,7 +229,13 @@ mod tests {
             // raise in that commit and is corrected here).
             // U9b cluster 6: the ask/auth resolve legs' five wire replies moved
             // with the chip families (16→11 here, frozen at 5 there).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 11),
+            ("workspace.rs", "protocol sends (U9)", SENDS, 6),
+            (
+                "workspace/composer_render.rs",
+                "protocol sends (U9)",
+                SENDS,
+                5,
+            ),
             ("workspace/render.rs", "protocol sends (U9)", SENDS, 0),
             ("workspace/chips.rs", "protocol sends (U9)", SENDS, 5),
             ("workspace/right_pane.rs", "protocol sends (U9)", SENDS, 0),
@@ -283,6 +311,11 @@ mod tests {
             // U9b cluster 7: the chrome render face (all-zero budgets
             // below — pure element builders, no wire or store reach).
             "workspace/render.rs",
+            // U9b cluster 8: the composer + overlay render helpers
+            // (budgeted by their own rows below — they carry the two
+            // browser-suite landing fallbacks and the blank-project
+            // store legs).
+            "workspace/composer_render.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
