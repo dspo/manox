@@ -43,6 +43,11 @@ pub enum LeafRequest {
     /// §E.3 Q-face fetch: send `GetConversationInfo` and route the Response
     /// back by MsgId.
     ConversationInfo { id: MsgId, session_id: String },
+    /// Cross-domain #5: ask the multiplexer for a `ListThreads` refetch —
+    /// the leaf's materialization edge made a deferred session list-visible
+    /// (its file landed). The kernel rescan trigger retired; the server
+    /// self-holds the scan inside its answer.
+    RefreshList,
 }
 
 /// A gpui entity that owns a single session's [`ClientStore`], the v2
@@ -287,7 +292,12 @@ impl ClientStoreHandle {
             })
         {
             self.materialized_notified = true;
-            manox_agent::thread_store::refresh_thread_list();
+            // Cross-domain #5: the deferred session just became
+            // list-visible — ask the multiplexer for a wire refetch (the
+            // server self-holds the rescan); the kernel trigger retired.
+            if let Some(outbound) = self.outbound.clone() {
+                let _ = outbound.try_send(LeafRequest::RefreshList);
+            }
         }
         // §E.3 Q face: a message row landing in the window is the committed
         // edge — refresh the usage panel (per-turn frequency; the wire usage

@@ -184,6 +184,10 @@ impl SessionMultiplexer {
 
     fn handle_leaf_request(&mut self, req: LeafRequest) {
         match req {
+            // Cross-domain #5: the leaf's materialization edge asks for a
+            // list refetch — the server self-holds the rescan in its
+            // ListThreads answer.
+            LeafRequest::RefreshList => self.fetch_thread_list(),
             LeafRequest::ConversationInfo { id, session_id } => {
                 let call = ClientCall::GetConversationInfo {
                     session_id: session_id.clone(),
@@ -846,6 +850,33 @@ mod tests {
         let client = Arc::new(AgentClient::from_conn(client_conn));
         let mux = cx.new(|cx| SessionMultiplexer::with_client(client, cx));
         (mux, server_conn)
+    }
+
+    /// Cross-domain #5: the leaf's RefreshList ask becomes a wire
+    /// `ListThreads` fetch — the kernel rescan trigger it replaces is
+    /// retired; the server self-holds the scan in the answer.
+    #[gpui::test]
+    fn leaf_refresh_list_request_pulls_the_wire_list(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        let tx = mux.update(cx, |m, _| m.leaf_tx.clone());
+        tx.try_send(crate::client_store_handle::LeafRequest::RefreshList)
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let calls = drain_calls(&server_conn);
+            if calls
+                .iter()
+                .any(|(_, c)| matches!(c, manox_protocol::ClientCall::ListThreads))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the RefreshList ask never became a ListThreads fetch"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// U2 cross-domain #1: the Projects host mirror fills the

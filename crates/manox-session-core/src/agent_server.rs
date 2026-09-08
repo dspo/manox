@@ -499,8 +499,9 @@ impl AgentServerInner {
                                 // store-event pump refetches ListThreads
                                 // after register_project, so the registry
                                 // snapshot stays in lockstep with the rows.
-                                let known = manox_agent::thread_store::global()
-                                    .read(|s| s.known_projects().to_vec());
+                                let known = manox_agent::thread_store::try_global()
+                                    .map(|store| store.read(|s| s.known_projects().to_vec()))
+                                    .unwrap_or_default();
                                 conn.send_to_client(FromServer::Host {
                                     host: HostEvent::Projects { known },
                                 });
@@ -821,7 +822,15 @@ impl AgentServerInner {
     // `Snapshot` frame; thread meta-info rides the projection baseline +
     // P-face deltas (§E); `has_interacted` is a projection key.
     fn threads_snapshot(&self) -> Vec<ThreadListItem> {
-        let store = manox_agent::thread_store_global();
+        // Teardown-tolerant (cross-domain #5 side): the self-held rescan
+        // delayed list answers enough that a straggler dispatch task can
+        // outlive its test's store guard — a strict global() there panics
+        // a foreign worker thread and trips the gpui test scheduler of an
+        // UNRELATED test. Production initializes the store for the process
+        // lifetime; None answers an empty list.
+        let Some(store) = manox_agent::thread_store::try_global() else {
+            return Vec::new();
+        };
         store.read(|s| {
             s.summaries()
                 .iter()
@@ -1024,10 +1033,32 @@ async fn handle_call(
                 .await
         }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
-        ClientCall::ListThreads => serde_json::to_value(inner.threads_snapshot()).map_err(|_| {
-            RpcError::new(-1, "threads serialization failed")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
-        }),
+        ClientCall::ListThreads => {
+            // Cross-domain #5: the rescan self-hold — answer from a FRESH
+            // scan (awaited, not the fire-and-forget spawn) so no client
+            // needs an in-process rescan trigger. The desktop's
+            // store-event bridge retires against this.
+            //
+            // The scan runs block-in-place on the dispatch worker: the
+            // answer keeps the same-poll timing profile it had before the
+            // self-hold (an `.await` gap let the response wake slip out of
+            // the gpui test scheduler's parked window — its determinism
+            // asserts tripped on the foreign-thread wake), and the dispatch
+            // loop never interleaves a half-scanned list. The agent runtime
+            // is multi-threaded, so one worker blocking on a millisecond
+            // scan is contained.
+            if !manox_agent::thread_store::test_override_active()
+                && let Some(store) = manox_agent::thread_store::try_global()
+            {
+                tokio::task::block_in_place(|| {
+                    manox_agent::runtime::handle().block_on(store.refresh_now())
+                });
+            }
+            serde_json::to_value(inner.threads_snapshot()).map_err(|_| {
+                RpcError::new(-1, "threads serialization failed")
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            })
+        }
         ClientCall::ListModels => serde_json::to_value(inner.models_snapshot()).map_err(|_| {
             RpcError::new(-1, "models serialization failed")
                 .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
@@ -9408,26 +9439,12 @@ mod tests {
             );
             s.insert_summary_with_times_for_test("t-new", None, 800, 850, "", None, 0);
         });
-        client.send(FromClient::Request {
-            id: MsgId::new("list"),
-            call: ClientCall::ListThreads,
-        });
-        let items = loop {
-            match client.recv() {
-                FromServer::Response {
-                    id,
-                    outcome: Ok(payload),
-                } if id.0 == "list" => {
-                    break serde_json::from_value::<Vec<manox_protocol::ThreadListItem>>(payload)
-                        .unwrap();
-                }
-                FromServer::Response {
-                    id,
-                    outcome: Err(e),
-                } if id.0 == "list" => panic!("ListThreads failed: {e:?}"),
-                _ => {}
-            }
-        };
+        // The mapping face directly: the ListThreads HANDLER now self-holds
+        // a rescan (cross-domain #5), which clobbers in-memory seeded
+        // summaries (the file scan is the summary source) — the wire
+        // roundtrip is pinned by list_threads_self_holds_the_rescan and the
+        // projects-registry push test.
+        let items = server.0.threads_snapshot();
         let old = items
             .iter()
             .find(|i| i.id == "t-old")
@@ -9558,6 +9575,45 @@ mod tests {
                 "the ListThreads push never completed (projects={saw_projects}, response={saw_response})"
             );
         }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// Cross-domain #5: ListThreads self-holds the rescan — a session file
+    /// that landed on disk without any in-process store event (another
+    /// writer's shape, or a deferred session materialized by its engine)
+    /// shows up in the very next answer. The desktop's refresh_thread_list
+    /// triggers and its store-event bridge retire against this.
+    #[test]
+    fn list_threads_self_holds_the_rescan() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![]);
+        let sessions = manox_agent::paths::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        seed_session_file(&sessions, "s-cold-list", "/proj-cold");
+        client.send(FromClient::Request {
+            id: MsgId::new("lt-cold"),
+            call: ClientCall::ListThreads,
+        });
+        let items = loop {
+            match client.recv() {
+                FromServer::Response { id, outcome } if id.0 == "lt-cold" => {
+                    break serde_json::from_value::<Vec<manox_protocol::ThreadListItem>>(
+                        outcome.expect("ListThreads answered"),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            items.iter().any(|i| i.id == "s-cold-list"),
+            "the self-held rescan surfaces the cold file without any client-side trigger"
+        );
+        std::fs::remove_file(sessions.join("s-cold-list.jsonl")).ok();
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();

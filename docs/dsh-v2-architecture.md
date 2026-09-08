@@ -298,6 +298,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | GW6 | 冷读缺位 → 无 engine 会话 PageHistory 30s 挂起 | `page_history_cold_reads_disk_for_opened_session_without_engine`、`page_history_reads_disk_without_live_session`、`page_history_unknown_session_still_answers_not_found`、`concurrent_create_and_open_same_cold_id_singleflight`(session-core) |
 | 测试隔离 | 触达 plugin_hooks::fire 的测试单独跑 panic(runtime 未初始化) | `mid_run_append_ui_note_mirrors_now_and_parks_persist`(agent;自持 runtime::init) |
 | 测试隔离 | Approve 能力+TurnStarted 组合的测试在同进程任何先行测试后,首个 running-delta expect 恒 30s 超时(同链无能力的 `detach_while_running` 稳健;有能力无 TurnStarted 的 `approve_verdict_clears…` 亦稳健);根因未定位,疑共享全局态 | `error_edge_idles_store_and_clears_adjudication_flags` 重设计为无能力配置+徽章 store 直写前置;真实裁决流由 approve_verdict 测试独立覆盖(未决:根因) |
+| 测试隔离 | gpui 确定性调度 vs ListThreads 自持 rescan:毫秒级应答延迟使 foreign-thread(tokio-rt-worker)唤醒落入 scheduler 活动窗 → navigator_fill/right_pane_state_machine 等报 "not deterministic"(block_in_place 同轮询化亦不愈;teardown 竞态的严格 global() panic 已另行 try_global 容错) | `thread_store::test_override_active()` 时跳过自持扫描:生产(init 无 override)恒扫,session-core 套件(生产 init)以 `list_threads_self_holds_the_rescan` 钉真实自持;gpui 套件回 #5 前时序剖面 |
 
 
 ### K.7.2 余债账本(整改波内的认可债务,单一事实源;清偿归 Wave 2/C4)
@@ -305,9 +306,8 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | 债务 | 现状 | 归属 |
 | --- | --- | --- |
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
-| U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
+| U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源)+ store-event refetch 桥(跨域#5 落地后的残余:仅泵旗写/sidecar 写尾的 refetch 触发器,thread_store 句柄的最后用户除 open_thread) | 投影权威反转后一并删 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
-| U2-跨域#5:服务端 rescan 自持缺失——桌面 `refresh_thread_list()` 7 处仍为进程内 rescan 触发器+store 事件桥(双轨) | 服务端在生命周期边界/ListThreads 内自持 rescan,桌面退休桥 | Wave 2 |
 | GW6 邻域:follow 流冷开对未物化 engine 30s 重试窗口;engine=None 窗口开的流订阅 dummy feed | 冷快照直读磁盘候选 | Wave 2 |
 | K5 边缘:expand_prompt/Input-hook 改写 user 文本时 content-match skip 失配(网关路径免疫) | expansion 前移受理侧或 pin 携 expansion 后文本 | Wave 2 |
 | C2:RpcOutcome 类型化 + 无码错误归码 | protocol + 全消费点 | Wave 2 |

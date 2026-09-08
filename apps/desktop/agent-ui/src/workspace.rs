@@ -4,7 +4,7 @@
 //! `ClientStoreHandle` mirror + `Entity<Sidebar>`;
 //! `cx.subscribe` handles:
 //! - `ThreadEvent`: text/thinking/tool deltas go to `ConversationState`; `ToolCallAuthorization` opens the question card;
-//!   the terminal `Stop` (non-ToolUse) triggers `refresh_thread_list`.
+//!   the terminal `Stop` (non-ToolUse) triggers the gateway list refetch.
 //! - `SidebarEvent`: new conversation / open history / delete.
 //!
 //! Enter in the input box → append a user message + run_turn + persist (the sidebar shows the new entry immediately).
@@ -49,7 +49,7 @@ use manox_agent::collaboration_mode::PlanReviewChoice;
 use manox_agent::language_model::StopReason;
 use manox_agent::thread::PermissionMode;
 use manox_agent::thread_engine::BrowserTabId;
-use manox_agent::{Thread, ThreadEvent, ThreadId, refresh_thread_list};
+use manox_agent::{Thread, ThreadEvent, ThreadId};
 use manox_components::markdown::HeadingMode;
 use manox_components::markdown::Markdown;
 use serde::{Deserialize, Serialize};
@@ -842,13 +842,16 @@ impl Workspace {
         // U2 list source + GW5 badge source: rows are the multiplexer's wire
         // list, and badges prefer the leaves' client-owned unread mirrors.
         sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
-        // U2 dual-track bridge: the in-process store stays the rescan source
-        // the server's snapshot reads, so its event channel drives the
-        // gateway list refetch — the wire rows (with their decoration
+        // U2 dual-track bridge: the in-process store's event channel drives
+        // the gateway list refetch — the wire rows (with their decoration
         // columns) and the Projects registry snapshot ride the answer, and
         // the multiplexer's notify feeds the sidebar and the chip-menu
-        // caches. When the server owns the rescan itself, this bridge
-        // retires (cross-domain ask #5).
+        // caches. Cross-domain #5 landed the server-side rescan self-hold
+        // (the ListThreads answer scans fresh) and retired the desktop's
+        // kernel rescan triggers; the bridge STAYS as the refetch trigger
+        // for server-pump flag writes and sidecar-write rescans, and
+        // retires with the U6 attach-face inversion (the last thread_store
+        // handle user besides open_thread).
         let thread_store = manox_agent::thread_store_global();
         let store_rx = thread_store.subscribe();
         let _store_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
@@ -1474,7 +1477,10 @@ impl Workspace {
                         .as_ref()
                         .map(|s| s.read(cx).store.id.0.clone())
                         .expect("foreground store present");
-                    refresh_thread_list();
+                    // Cross-domain #5: the wire refetch replaces the kernel
+                    // rescan trigger — the server self-holds the scan in its
+                    // ListThreads answer.
+                    this.multiplexer.update(cx, |m, _| m.fetch_thread_list());
                     // U3a: the settle flags (idle / pending-plan / errored)
                     // are the server pump's store writes — one writer, no
                     // race with this former mirror. The pump clears
@@ -1534,7 +1540,7 @@ impl Workspace {
                     // engaged — re-pins to the end on the next layout.
                     // Persist on terminal state (not the ToolUse mid-state).
                     if !matches!(reason, StopReason::ToolUse) {
-                        refresh_thread_list();
+                        this.multiplexer.update(cx, |m, _| m.fetch_thread_list());
                         // `Stop` is a provider-round boundary. Queue draining,
                         // idle state, and git refresh wait for `TurnFinished`.
                     }
@@ -4667,8 +4673,10 @@ impl Workspace {
             };
             tracing::warn!("unknown {}", i18n::t_str(i18n_key, &[("name", key)]));
         }
-        // Persist on submit so the sidebar shows the new entry immediately.
-        refresh_thread_list();
+        // Persist on submit so the sidebar shows the new entry immediately
+        // (cross-domain #5: the wire refetch — the server self-holds the
+        // rescan in its answer).
+        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         cx.notify();
     }
 
@@ -4732,10 +4740,10 @@ impl Workspace {
             );
         }
         self.append_and_run_user_turn(turn, weak, cx);
-        // The conversation exists the moment the message is sent: refresh
-        // the sidebar list now (the transcript-side refresh on the user
+        // The conversation exists the moment the message is sent: refetch
+        // the sidebar list now (the transcript-side refetch on the user
         // MessageEnd notice then fills in the summary text).
-        refresh_thread_list();
+        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
     }
 
     /// Hand a parked follow-up to the thread's steer queue — the running turn
@@ -4919,7 +4927,7 @@ impl Workspace {
                 let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
             }
         }
-        refresh_thread_list();
+        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         cx.notify();
     }
 
@@ -5860,7 +5868,7 @@ impl Workspace {
         self.sync_list_count(cx);
         self.follow_message_tail();
         let _ = self.send_submit_v2(text.clone(), Vec::new(), cx);
-        refresh_thread_list();
+        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         self.editor_state.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
@@ -6456,8 +6464,11 @@ impl Workspace {
                 t.seed_plan_execution(review.plan_file.clone(), seed_text, Some(ui));
             });
             self.attach_thread(new, false, window, cx);
-            refresh_thread_list();
             manox_agent::thread_store_global().with_mut(|s| s.archive_thread(&old_id, true));
+            // Cross-domain #5: the refetch lands AFTER the archive write so
+            // the answer's self-held rescan sees it (the former kernel
+            // refresh ran before the write and relied on its event tail).
+            self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         } else {
             // Compact/keep-context: the engine exits plan mode, optionally
             // compacts the planning context toward the plan file, then runs

@@ -152,19 +152,27 @@ impl StoreHandle {
     /// the agent runtime so a large session folder cannot stall the caller;
     /// `SummariesUpdated` broadcasts when the scan lands.
     pub fn refresh(&self) {
-        let dir = self.read(|s| s.sessions_dir.clone());
         let this = self.clone();
         crate::runtime::handle().spawn(async move {
-            let rows = load_summaries(&dir).await;
-            let registry = crate::thread_registry::load().await;
-            this.with_mut(|s| {
-                let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
-                resolve_depths(&mut summaries);
-                s.session_paths = session_paths;
-                s.summaries = summaries;
-                s.archived_summaries = archived;
-                s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
-            });
+            this.refresh_now().await;
+        });
+    }
+
+    /// The awaiting form of [`Self::refresh`]: the scan lands before the
+    /// return. The gateway's `ListThreads` self-hold (cross-domain #5)
+    /// answers from a fresh scan, so no client needs an in-process rescan
+    /// trigger or a store-event bridge to time its refetch.
+    pub async fn refresh_now(&self) {
+        let dir = self.read(|s| s.sessions_dir.clone());
+        let rows = load_summaries(&dir).await;
+        let registry = crate::thread_registry::load().await;
+        self.with_mut(|s| {
+            let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
+            resolve_depths(&mut summaries);
+            s.session_paths = session_paths;
+            s.summaries = summaries;
+            s.archived_summaries = archived;
+            s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         });
     }
 
@@ -225,6 +233,24 @@ pub fn init() {
     });
     handle.refresh();
     *GLOBAL.lock().unwrap() = Some(handle);
+}
+
+/// Whether the process-global store is a test override (`init_for_test`).
+/// The gateway's ListThreads rescan self-hold skips the scan under an
+/// override: the gpui test scheduler flags the millisecond answer latency
+/// as foreign-thread activity (its determinism window is microscopic), and
+/// the gpui suites never exercise the cross-process freshness the scan
+/// serves — the session-core suite (production `init`, no override) pins
+/// the real self-hold.
+pub fn test_override_active() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        TEST_OVERRIDE.lock().unwrap().is_some()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
 }
 
 /// Returns the global [`StoreHandle`]. Panics if `init` was not called.
