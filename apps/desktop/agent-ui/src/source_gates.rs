@@ -64,7 +64,10 @@ mod tests {
             // U6b②: the two attach-face store reads retired (open_thread's
             // load_thread + attach_created_session's live/load pair) — the
             // attach path is the landing mirror now.
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 9),
+            // U6b⑤: the park-seed store writes retired (mark_running/
+            // mark_background_work — the U3b server pump is the single
+            // flag writer; its deltas already fed every mirror).
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 7),
             // U1-flush: the parked flush's two facade writes (insert_user_message
             // + run_turn) retired to the gateway wire.
             // U6b③: the two construction parks retired (both create flows
@@ -85,7 +88,7 @@ mod tests {
             // thread_store_global() acquisitions with them (21 - 7).
             // U6b②: the bridge-head binding (U6a) and attach_created_session's
             // global() retired with the attach-face reads.
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 12),
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 10),
             // 21 = 18 + the GW3 CancelDelivery withdrawal send + the two
             // U1-flush parked-wire sends (the AppendUserMessage note + the
             // v2 Submit — protocol surfaces the migrations add by design;
@@ -95,7 +98,11 @@ mod tests {
             // (the ledger-mandated direction — a bypass write became two
             // wire sends; their landing-fallback keeps the facade needle,
             // so FACADE_WRITE holds at 5).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 23),
+            // U6b③ grew this 23→24: the ExecuteFresh seed turn's
+            // PlanSeedExecution note (a bypass facade-seed became a wire
+            // send — the ledger-mandated direction; the budget missed the
+            // raise in that commit and is corrected here).
+            ("workspace.rs", "protocol sends (U9)", SENDS, 24),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
             ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),

@@ -256,16 +256,17 @@ struct SubagentPrompt {
     dispatched_at: i64,
 }
 
-/// A thread parked in the background while still running a turn. The held
-/// `Subscription` is a minimal handler that only tracks terminal `Stop`/`Error`
-/// to clear the running indicator, mark the thread unread, and drop it from
-/// `background_threads` — it never touches `conversation`/`self.thread`, so a
-/// background thread's events cannot be misattributed to the foreground
-/// thread. The store + connection keep the parked thread's AgentServer session
-/// alive (reclaim re-attaches them; no `DisposeSession` is ever sent while
-/// parking — that would cancel a running turn).
+/// A thread parked in the background while still running a turn. U6b⑤: the
+/// park holds NO kernel entity — just the id, the leaf (the wire-state home
+/// whose mirrors the server's §D.5 deltas keep fed while the session stays
+/// attached), and the parked subscription (it coordinates the settle
+/// unread, the parked plan-review stash and the follow-up stash; it never
+/// touches `conversation`/`self.thread`, so a background thread's events
+/// cannot be misattributed to the foreground thread). The turn itself runs
+/// server-side and survives parking regardless; nothing detaches or
+/// disposes while parked — the reclaim is an in-place re-attach, no reopen.
 struct BackgroundThread {
-    entity: manox_agent::thread::ThreadHandle,
+    id: String,
     store: Option<gpui::Entity<ClientStoreHandle>>,
     session_id: Option<String>,
     _sub: Subscription,
@@ -334,11 +335,11 @@ pub struct Workspace {
     /// γ-3: the AgentServer session_id for the landing thread. Used as the
     /// `session_id` field in `FromClient` commands.
     pub(crate) session_id: Option<String>,
-    /// Threads that were running when the user switched away. Holding strong
-    /// references keeps their `run_turn_loop` tasks alive so they can finish
-    /// in the background and persist via the spawned-task save backstop. Each
-    /// carries a minimal subscription so a terminal `Stop`/`Error` arriving
-    /// while parked marks the thread unread for the sidebar red dot.
+    /// Threads that were running when the user switched away (U6b⑤: the
+    /// turn runs server-side and survives the switch on its own — the park
+    /// keeps the session ATTACHED so the reclaim re-attaches in place with
+    /// no reopen, and the parked subscription keeps the settle unread, the
+    /// plan-review stash and the follow-up stash coordinated).
     background_threads: Vec<BackgroundThread>,
     /// Generation counter for git-status refreshes: bumping it means any
     /// prior in-flight refresh self-cancels instead of overwriting newer
@@ -1028,7 +1029,7 @@ impl Workspace {
         } else {
             self.background_threads
                 .iter()
-                .find(|b| b.entity.read(|t| t.id.0.as_str() == thread_id))
+                .find(|b| b.id == thread_id)
                 .and_then(|bg| bg.store.as_ref())
         };
         if let Some(store) = store {
@@ -1459,8 +1460,7 @@ impl Workspace {
                     // pending-plan unconditionally at settle; the review
                     // card's own demote below is UI state, not a store flag.
                     this.turn_active = false;
-                    this.background_threads
-                        .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
+                    this.background_threads.retain(|b| b.id != thread_id);
                     // Only a cancelled/failed turn demotes an outstanding plan
                     // review — the verdict is moot once the loop released the
                     // turn abnormally. A normal settle right after
@@ -1600,8 +1600,7 @@ impl Workspace {
                         // it; the errored triangle is the signal
                         // (client-owned unread, §F.2).
                         this.turn_active = false;
-                        this.background_threads
-                            .retain(|b| b.entity.read(|t| t.id.0 != thread_id));
+                        this.background_threads.retain(|b| b.id != thread_id);
                         // Persist the error card so a reloaded thread reproduces
                         // what went wrong at the failed turn's position. The
                         // append rides the actor queue behind the settling run;
@@ -3796,33 +3795,26 @@ impl Workspace {
             self.queued_follow_ups = queue;
         }
 
-        // If the old thread is still running a turn, park it in the background
-        // so its `run_turn_loop` task stays alive (the entity is otherwise only
-        // held by `self.thread`; overwriting that field would drop it and
-        // silently kill the turn via `WeakEntity::upgrade() -> None`).
-        // Park a still-running old thread in the background. Its store,
-        // connection and session are carried along (never `DisposeSession` —
-        // that would cancel the running turn): reclaim re-attaches them and
-        // the sidebar badges read them. An idle old thread's session has no
-        // activity to preserve, so its store is simply dropped.
-        let old_running = (old_thread.read(|t| t.is_running())
+        // Park a still-running old thread in the background (U6b⑤: the
+        // turn runs server-side and survives the switch on its own —
+        // parking keeps the session ATTACHED so the reclaim is an in-place
+        // re-attach with no reopen, and the parked leaf keeps receiving
+        // the §D.5 deltas that drive the sidebar badges). The running
+        // truth is the foreground LEAF's wire mirror: the facade
+        // `is_running` this replaces is a dead flag on the detached
+        // mirrors the attach path builds since U6b②. The store-flag seeds
+        // retired with the U3b single-writer discipline — the server's
+        // pump marked running/background_work when the turn/task started,
+        // and its deltas already fed every mirror. An idle old thread's
+        // session has no activity to preserve, so it detaches.
+        let old_running = (self
+            .store
+            .as_ref()
+            .map(|s| s.read(cx).store.running)
+            .unwrap_or(false)
             || manox_agent::background_task::thread_has_running_tasks(&old_id))
             && old_id != new_id;
         if old_running {
-            // Seed the live-state sets for whatever is still in flight: the
-            // background subscription below reacts only to future events, so a
-            // turn that started (or a monitor / task that spawned) while this
-            // thread was foreground would otherwise never reach the sidebar's
-            // running indicator. A task-only thread (no turn) gets the
-            // background-work seed, not the running one.
-            if old_thread.read(|t| t.is_running()) {
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_running(&old_id));
-            }
-            if manox_agent::background_task::thread_has_running_tasks(&old_id) {
-                let store = manox_agent::thread_store_global();
-                store.with_mut(|s| s.mark_background_work(&old_id, true));
-            }
             let old_store = self.store.take();
             let old_sid = self.session_id.take();
             let sub = self.subscribe_background_thread(
@@ -3833,7 +3825,7 @@ impl Workspace {
                 cx,
             );
             self.background_threads.push(BackgroundThread {
-                entity: old_thread,
+                id: old_id.clone(),
                 store: old_store,
                 session_id: old_sid,
                 _sub: sub,
@@ -3859,11 +3851,7 @@ impl Workspace {
         // (entity + store) so it becomes the foreground thread and is no longer
         // double-held. The parked session stayed attached to the shared
         // connection, so no `OpenSession` is needed on reclaim.
-        if let Some(pos) = self
-            .background_threads
-            .iter()
-            .position(|b| b.entity.read(|t| t.id.0 == new_id))
-        {
+        if let Some(pos) = self.background_threads.iter().position(|b| b.id == new_id) {
             let bg = self.background_threads.remove(pos);
             self.store = bg.store;
             self.session_id = bg.session_id;
@@ -3892,8 +3880,7 @@ impl Workspace {
 
         // If the new thread was previously parked in the background, reclaim it
         // so it becomes the foreground thread and is no longer double-held.
-        self.background_threads
-            .retain(|b| b.entity.read(|t| t.id.0 != new_id));
+        self.background_threads.retain(|b| b.id != new_id);
 
         // Persist the old thread's current state before switching away. The
         // spawned-task save backstop in `run_turn` will persist again when the
@@ -4436,13 +4423,13 @@ impl Workspace {
     fn open_thread(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         // If the thread is already running in the background, reclaim it
         // instead of loading a stale snapshot from the db.
-        if let Some(pos) = self
-            .background_threads
-            .iter()
-            .position(|b| b.entity.read(|t| t.id.0 == id))
-        {
-            let bg = self.background_threads.remove(pos);
-            self.attach_thread(bg.entity, true, window, cx);
+        // U6b⑤: the reclaim re-attaches a fresh landing mirror for the
+        // parked id — `attach_thread`'s own reclaim branch finds the park
+        // by id and restores its leaf/session, so no reopen is needed
+        // (the parked session never detached).
+        if self.background_threads.iter().any(|b| b.id == id) {
+            let thread = Thread::landing_with_id(ThreadId(id), self.cwd.clone());
+            self.attach_thread(thread, true, window, cx);
             return;
         }
         // U6b②: the attach read is the landing mirror — the SERVER owns
@@ -6483,9 +6470,9 @@ impl Workspace {
                     effort_str,
                     Box::new(move |done, cx| {
                         let sid = match done {
-                            crate::multiplexer::CreateSessionDone::Created { session_id, .. } => {
-                                session_id
-                            }
+                            crate::multiplexer::CreateSessionDone::Created {
+                                session_id, ..
+                            } => session_id,
                             crate::multiplexer::CreateSessionDone::Failed { message } => {
                                 tracing::warn!(
                                     error = %message,
@@ -11373,6 +11360,125 @@ mod tests {
             "SetModel must update the model projection (was {m:?}, target {target})"
         );
         let _ = sid;
+    }
+
+    /// U6b⑤: the park decision reads the foreground LEAF's wire running
+    /// mirror (the server-pump-fed truth) — not the facade `is_running`,
+    /// a dead flag on the detached mirrors the attach path builds since
+    /// U6b②. A switch away from a running turn parks the thread (its
+    /// session stays attached — no `DetachSession`), and the switch back
+    /// reclaims the park in place: the same leaf entity, no reopen.
+    #[gpui::test]
+    fn park_rides_the_leaf_running_mirror_and_reclaim_skips_reopen(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path = std::env::temp_dir().join(format!("manox-u6b5-park-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+
+        // Attach thread A (the create leg registers its leaf), then raise
+        // the leaf's wire running mirror — the truth the park reads.
+        let a_id = format!("u6b5-a-{}", uuid_like_id());
+        visual.update(|window, cx| {
+            ws.update(cx, |this, cx| {
+                let a = manox_agent::Thread::landing_with_id(
+                    manox_agent::ThreadId(a_id.clone()),
+                    this.cwd.clone(),
+                );
+                this.attach_thread(a, false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        ws.update(cx, |this, cx| {
+            let leaf = this.store.as_ref().expect("A attached with a leaf");
+            leaf.update(cx, |h, _cx| {
+                h.store
+                    .apply_session_status(Some(true), None, None, None, None, None);
+            });
+        });
+
+        // Switch to B while A's turn runs: A must park, not detach.
+        let b_id = format!("u6b5-b-{}", uuid_like_id());
+        visual.update(|window, cx| {
+            ws.update(cx, |this, cx| {
+                let b = manox_agent::Thread::landing_with_id(
+                    manox_agent::ThreadId(b_id.clone()),
+                    this.cwd.clone(),
+                );
+                this.attach_thread(b, false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let (parked_len, parked_id, fg_sid) = ws.read_with(&visual, |this, _| {
+            (
+                this.background_threads.len(),
+                this.background_threads.first().map(|b| b.id.clone()),
+                this.session_id.clone(),
+            )
+        });
+        assert_eq!(parked_len, 1, "the running thread A parks on the switch");
+        assert_eq!(parked_id.as_deref(), Some(a_id.as_str()));
+        assert_eq!(
+            fg_sid.as_deref(),
+            Some(b_id.as_str()),
+            "B is the foreground session"
+        );
+        let parked_leaf_id = ws.read_with(&visual, |this, _| {
+            this.background_threads
+                .first()
+                .and_then(|b| b.store.as_ref())
+                .map(|s| s.entity_id())
+        });
+
+        // Switch back to A: the reclaim restores the parked leaf + session
+        // in place (no reopen — the parked session never detached).
+        visual.update(|window, cx| {
+            ws.update(cx, |this, cx| {
+                let a2 = manox_agent::Thread::landing_with_id(
+                    manox_agent::ThreadId(a_id.clone()),
+                    this.cwd.clone(),
+                );
+                this.attach_thread(a2, true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let (after_len, after_sid, after_leaf) = ws.read_with(&visual, |this, _| {
+            (
+                this.background_threads.len(),
+                this.session_id.clone(),
+                this.store.as_ref().map(|s| s.entity_id()),
+            )
+        });
+        assert_eq!(after_len, 0, "the park is reclaimed, not double-held");
+        assert_eq!(after_sid.as_deref(), Some(a_id.as_str()));
+        assert_eq!(
+            after_leaf, parked_leaf_id,
+            "the reclaim restores the parked leaf in place (no reopen)"
+        );
+        let _ = std::fs::remove_file(&db_path);
     }
 
     /// Regression lock (#765 symptom 2): clicking a sidebar thread loads the
