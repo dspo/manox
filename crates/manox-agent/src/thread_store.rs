@@ -482,18 +482,6 @@ impl ThreadStore {
         Some(handle)
     }
 
-    /// The live (in-memory) thread for `id`, if it is still alive. Unlike
-    /// [`ThreadStore::load_thread`], never restores from disk.
-    pub fn live_thread(&self, id: &str) -> Option<ThreadHandle> {
-        self.live_threads.get(id).and_then(ThreadHandle::upgrade)
-    }
-
-    /// Track a live thread so the facade can address it by id alone. Stores
-    /// only a weak reference; the caller keeps the thread alive.
-    pub fn register_live_thread(&mut self, id: &str, t: &ThreadHandle) {
-        self.live_threads.insert(id.to_string(), t.downgrade());
-    }
-
     /// Seed one session path from an authoritative on-disk probe: a cold
     /// `CreateSession`/`OpenSession` must restore an id no list refresh has
     /// indexed yet (a bare server never scans). A scanned mapping wins —

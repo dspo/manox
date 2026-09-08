@@ -61,10 +61,16 @@ mod tests {
             // badge clear, archive-if-idle, ExecuteFresh's archive,
             // register_project), the dual-track bridge handle, and the
             // registry-push decoration block.
-            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 11),
+            // U6b②: the two attach-face store reads retired (open_thread's
+            // load_thread + attach_created_session's live/load pair) — the
+            // attach path is the landing mirror now.
+            ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 9),
             // U1-flush: the parked flush's two facade writes (insert_user_message
             // + run_turn) retired to the gateway wire.
-            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 5),
+            // U6b②/④: the dismissal write retired (the server's Submit arm owns
+            // the implicit dismissal) — residual: the two construction
+            // parks + the two browser-suite landing fallbacks.
+            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 4),
             // U2: the list/registry reads are retired — the sidebar renders
             // the multiplexer's wire rows and the chip menu reads the pushed
             // decoration cache. The residual 21 are sanctioned debt: the 16
@@ -76,7 +82,9 @@ mod tests {
             // gateway.
             // U3b: the seven mirror-write blocks took their
             // thread_store_global() acquisitions with them (21 - 7).
-            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 14),
+            // U6b②: the bridge-head binding (U6a) and attach_created_session's
+            // global() retired with the attach-face reads.
+            ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 12),
             // 21 = 18 + the GW3 CancelDelivery withdrawal send + the two
             // U1-flush parked-wire sends (the AppendUserMessage note + the
             // v2 Submit — protocol surfaces the migrations add by design;

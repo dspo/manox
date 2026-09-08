@@ -1852,6 +1852,25 @@ impl AgentServerInner {
         if text.trim().is_empty() && images.is_empty() {
             return receipt(false, None);
         }
+        // U6b②/④: the implicit dismissal — a Submit landing while a plan
+        // review is pending means the user is discussing or revising, not
+        // accepting (the desktop consumes its card locally; the durable
+        // half lives HERE, where the session facade has the engine that
+        // journals the `resolved` plan_review edge). Both planes clear:
+        // the session facade (engine cmd → journal + sidecar) and the
+        // store badge flag; this turn's own §D.5 deltas then carry the
+        // cleared flag to every client.
+        if manox_agent::thread_store::try_global()
+            .map(|store| store.read(|s| s.pending_plan_contains(session_id)))
+            .unwrap_or(false)
+        {
+            if let Some(thread) = self.session_thread(session_id) {
+                thread.with_mut(|t| t.set_plan_review_pending(false));
+            }
+            if let Some(store) = manox_agent::thread_store::try_global() {
+                store.with_mut(|s| s.mark_pending_plan(session_id, false));
+            }
+        }
         // K5 (accepted ⟹ logged): persist the user entry BEFORE the
         // receipt. Skipped when residual pending prompts would make
         // run_turn's merged prompt differ from this text — the actor's
@@ -8688,6 +8707,48 @@ mod tests {
                 saw_error = session_id.as_deref() == Some("u6b-1");
             }
         }
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// U6b②/④: the implicit dismissal — a Submit landing while a plan
+    /// review is pending clears the durable pending state server-side (the
+    /// store badge; the session facade's engine journals the `resolved`
+    /// edge — pinned by the plan_review batch). The desktop's attach
+    /// mirror has no engine, so the dismissal of record can only be
+    /// written where the session lives.
+    #[test]
+    fn submit_while_review_pending_implicitly_dismisses() {
+        let _g = lock_globals();
+        hermetic_home();
+        init_globals();
+        manox_agent::thread_store::init();
+        let (server, client) = harness(vec![]);
+        create(&server, &client, "u6b-d1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("u6b-d1", engine, events);
+        // Raise the review-pending state (the PlanReady side).
+        manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan("u6b-d1", true));
+        assert!(
+            manox_agent::thread_store::global().read(|s| s.pending_plan_contains("u6b-d1")),
+            "the review state is raised before the submit"
+        );
+        let outcome = response_outcome(request(
+            &client,
+            "u6b-dis",
+            ClientCall::Submit {
+                session_id: "u6b-d1".into(),
+                text: "let's discuss the plan first".into(),
+                images: vec![],
+                origin_rpc: Some("rpc-dis".into()),
+            },
+        ));
+        assert_eq!(outcome["accepted"], json!(true), "the submit is accepted");
+        assert!(
+            !manox_agent::thread_store::global().read(|s| s.pending_plan_contains("u6b-d1")),
+            "the submit must clear the pending-review badge (implicit dismissal)"
+        );
         drop(client);
         drop(server);
         manox_agent::thread_store::drop_global_for_test();

@@ -346,17 +346,6 @@ pub struct Workspace {
     /// result back via `async_channel`, the same bridge the worktree tool uses.
     git_status_gen: u64,
     pub(crate) sidebar: Entity<Sidebar>,
-    /// The in-process thread store handle (U2 dual-track residue). The list
-    /// itself lives on the multiplexer (the gateway client); this handle
-    /// serves the surfaces the wire does not carry yet:
-    /// - the rescan-event pump that pushes the sidebar's decoration columns
-    ///   (project/tag/approval wash) and re-pulls the list through the
-    ///   gateway,
-    /// - `open_thread`'s kernel thread-handle load (U6/attach surface).
-    ///
-    /// The right-pane `threads.db` persistence keeps its own ad-hoc reads
-    /// (desktop-local UI state; a migration item of its own).
-    thread_store: manox_agent::thread_store::StoreHandle,
     /// Distinct bound-project paths of the active summaries, in list order
     /// (the project chip's "recent, unregistered" section; U2 push cache).
     thread_projects: Vec<String>,
@@ -841,14 +830,9 @@ impl Workspace {
         // U2 list source + GW5 badge source: rows are the multiplexer's wire
         // list, and badges prefer the leaves' client-owned unread mirrors.
         sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
-        // U6a: the store-event bridge is retired — the server's store
-        // watcher broadcasts the list refresh (ThreadsUpdated + Projects to
-        // every connection) on any summary write, so the desktop no longer
-        // subscribes to the in-process store to time its refetches; the
-        // list reaches the sidebar through the multiplexer's wire-state
-        // fold alone. The handle itself stays: the attach-face reads
-        // (open_thread / attach_created_session) are the U6b remainder.
-        let thread_store = manox_agent::thread_store_global();
+        // U6a/U6b②: no store handle at all — the list refresh rides the
+        // server's watcher broadcast, and the attach path is the landing
+        // mirror (the wire owns the session state).
         // The multiplexer's notify (its list/registry state changed)
         // repaints the sidebar rows and the workspace's model surfaces, and
         // feeds the chip-menu caches off the wire state (U2 cross-domain
@@ -893,7 +877,6 @@ impl Workspace {
             background_threads: Vec::new(),
             git_status_gen: 0,
             sidebar,
-            thread_store,
             thread_projects: Vec::new(),
             known_projects: Vec::new(),
             _mux_lists,
@@ -2183,25 +2166,18 @@ impl Workspace {
     /// the outgoing thread, restores drafts/queues) against a thread handle
     /// for the new id, then re-open — `open_or_create(reopen = true)`
     /// idempotently re-runs `OpenSession` and binds the follow stream that
-    /// the create intent already opened. The handle is either the live
-    /// server-side thread (when present) or a detached *rendering mirror*
-    /// (a landing thread, no engine — the server owns the transcript, so no
-    /// second actor ever races the session file).
+    /// the create intent already opened. U6b②: the handle is ALWAYS the
+    /// detached *rendering mirror* (a landing thread, no engine — the
+    /// server owns the transcript, so no second actor ever races the
+    /// session file); the former live_thread/load_thread store reads were
+    /// the U6 dual source and are gone.
     fn attach_created_session(
         &mut self,
         session_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let store = manox_agent::thread_store::global();
-        let thread = store
-            .with_mut(|s| {
-                s.live_thread(session_id)
-                    .or_else(|| s.load_thread(session_id))
-            })
-            .unwrap_or_else(|| {
-                Thread::landing_with_id(ThreadId(session_id.to_string()), self.cwd.clone())
-            });
+        let thread = Thread::landing_with_id(ThreadId(session_id.to_string()), self.cwd.clone());
         self.attach_thread(thread, true, window, cx);
     }
 
@@ -4431,13 +4407,15 @@ impl Workspace {
             self.attach_thread(bg.entity, true, window, cx);
             return;
         }
-        // U6/attach surface: the kernel thread-handle load stays a store
-        // read until the attach path migrates (the LIST itself is already
-        // gateway-owned — the row this click came from is a wire item).
-        let Some(loaded) = self.thread_store.with_mut(|s| s.load_thread(&id)) else {
-            return;
-        };
-        self.attach_thread(loaded, true, window, cx);
+        // U6b②: the attach read is the landing mirror — the SERVER owns
+        // the session and the restore rides the wire reopen flow
+        // (OpenSession + the follow stream's Snapshot + the §D.5 mirrors),
+        // exactly like the create path. The kernel-side `load_thread` (the
+        // U6 dual source: a db-restored facade racing the live wire state)
+        // is gone; the row this click came from is itself a wire item, so
+        // the id is server-known by construction.
+        let thread = Thread::landing_with_id(ThreadId(id), self.cwd.clone());
+        self.attach_thread(thread, true, window, cx);
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4700,7 +4678,12 @@ impl Workspace {
         // lingering Implement button would act on the now-outdated plan text.
         let dismissed_plan = self.pending_plan_review.take();
         if let Some(review) = dismissed_plan.as_ref() {
-            self.thread.with_mut(|t| t.set_plan_review_pending(false));
+            // U6b②/④: the DURABLE dismissal lives server-side — the
+            // gateway's Submit arm runs the implicit dismissal (it clears
+            // the session facade, whose engine journals the `resolved`
+            // plan_review edge, and the store badge). The desktop's attach
+            // mirror has no engine and the state is session-owned; the
+            // UI-side half (card consume, collapsed record) stays here.
             self.conversation
                 .update(cx, |c, cx| c.consume_plan_review(cx));
             // The demoted plan card stays in place but flips inactive —
