@@ -69,7 +69,11 @@ mod tests {
             // wire list does not carry yet and re-pulls the list through the
             // gateway.
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 21),
-            ("workspace.rs", "protocol sends (U9)", SENDS, 18),
+            // 19 = 18 + the GW3 CancelDelivery withdrawal send (the
+            // plan-verdict abandonment path — a new protocol surface the
+            // GW3-client migration adds by design; U9 folds it into the
+            // multiplexer with the rest).
+            ("workspace.rs", "protocol sends (U9)", SENDS, 19),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
             ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),

@@ -76,6 +76,12 @@ pub struct ClientStore {
     /// Pending plan-verdict ServerCall from the AgentServer, keyed by
     /// `plan_file`. The workspace uses the MsgId to send the verdict reply.
     pub pending_plan_verdict: HashMap<String, manox_protocol::MsgId>,
+    /// GW3: the delivery identities of the pending adjudications, keyed
+    /// like `pending_auth` / `pending_plan_verdict`. A `Reply` answers by
+    /// MsgId; a `CancelDelivery` withdraws by delivery_id (an abandoned
+    /// plan verdict — ExecuteFresh — or an explicit card withdrawal).
+    pub pending_auth_delivery: HashMap<String, String>,
+    pub pending_plan_delivery: HashMap<String, String>,
     // ── v2 (§F.2 SessionStore) ──────────────────────────────────────────
     /// The gap-free journal window: wire entries with dense seq, oldest
     /// first. The single source of the v2 `display` fold (§F.1 rule 1-4).
@@ -178,6 +184,8 @@ impl Default for ClientStore {
             per_model_cost: HashMap::new(),
             per_request_usage: HashMap::new(),
             pending_auth: HashMap::new(),
+            pending_auth_delivery: HashMap::new(),
+            pending_plan_delivery: HashMap::new(),
             pending_plan_verdict: HashMap::new(),
             window: Vec::new(),
             window_has_more: false,

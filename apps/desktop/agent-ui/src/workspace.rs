@@ -6310,6 +6310,49 @@ impl Workspace {
     /// execute / refine. Execute verdicts exit plan mode and run the rendered
     /// execution seed referencing the plan file; refine keeps plan mode on
     /// and waits for the user's feedback turn.
+    /// Answer the captured `PlanVerdict` delivery (GW3/U3b): the `Reply`
+    /// rides the captured MsgId, and the server's verdict arms consume the
+    /// review flag, clear the pending-plan badge, and seed an execution.
+    /// Returns false when the correlation is absent (the Request never
+    /// reached the leaf) — the caller falls back to the in-process facade
+    /// path.
+    fn reply_plan_verdict_choice(&self, plan_file: &str, choice: &str, cx: &App) -> bool {
+        let Some(msg_id) = self.store.as_ref().and_then(|s| {
+            s.read(cx)
+                .store
+                .pending_plan_verdict
+                .get(plan_file)
+                .cloned()
+        }) else {
+            return false;
+        };
+        self.client
+            .send_reply(msg_id, Ok(serde_json::json!({ "choice": choice })));
+        true
+    }
+
+    /// Withdraw the captured `PlanVerdict` delivery (GW3): a
+    /// `CancelDelivery` retires the server waterfall at once — the GW9
+    /// cancel path converges it (never executes). Used when the verdict
+    /// ABANDONS this thread's plan (`ExecuteFresh` continues on a fresh
+    /// thread), where a stale delivery would otherwise hang until the 300s
+    /// expire and converge as a rejection against the archived thread.
+    /// Returns false when the correlation is absent.
+    fn cancel_plan_verdict_delivery(&self, plan_file: &str, cx: &App) -> bool {
+        let Some(delivery_id) = self.store.as_ref().and_then(|s| {
+            s.read(cx)
+                .store
+                .pending_plan_delivery
+                .get(plan_file)
+                .cloned()
+        }) else {
+            return false;
+        };
+        self.client
+            .send_call(manox_protocol::ClientCall::CancelDelivery { delivery_id });
+        true
+    }
+
     pub(crate) fn respond_plan_review(
         &mut self,
         choice: PlanReviewChoice,
@@ -6330,6 +6373,12 @@ impl Workspace {
         self.thread.with_mut(|t| t.set_plan_review_pending(false));
         manox_agent::thread_store_global().with_mut(|s| s.mark_pending_plan(&thread_id, false));
         if matches!(choice, PlanReviewChoice::Refine) {
+            // The refine verdict must reach the server: without the Reply
+            // the PlanVerdict delivery hangs until the 300s expire, whose
+            // GW9 convergence CANCELS the parked turn — the very turn
+            // refine keeps alive for the feedback round. The server's
+            // refine arm consumes the review flag and clears the badge.
+            self.reply_plan_verdict_choice(&review.plan_file, "refine", cx);
             // Keep plan mode ON: demote the card and prompt for feedback.
             // The feedback turn runs under the plan-mode instructions; the
             // model updates the plan file and proposes again (fresh card).
@@ -6366,6 +6415,11 @@ impl Workspace {
         meta.author = Some(manox_agent::MessageAuthor::Harness);
         let ui = Self::message_ui_metadata(&meta);
         if matches!(choice, PlanReviewChoice::ExecuteFresh) {
+            // This thread's plan is abandoned (the fresh thread executes
+            // it): withdraw the verdict delivery so the server converges
+            // at once instead of hanging to the 300s expire and rejecting
+            // against the archived thread.
+            self.cancel_plan_verdict_delivery(&review.plan_file, cx);
             // Fresh context: archive this thread and continue on a new one
             // seeded with the execution directive. The plan file persists on
             // disk, so the new thread reads it from the path — no inline
@@ -6442,16 +6496,7 @@ impl Workspace {
                 PlanReviewChoice::ExecuteKeep => "execute_keep",
                 _ => "execute_keep",
             };
-            if let Some(msg_id) = self.store.as_ref().and_then(|s| {
-                s.read(cx)
-                    .store
-                    .pending_plan_verdict
-                    .get(&review.plan_file)
-                    .cloned()
-            }) {
-                self.client
-                    .send_reply(msg_id, Ok(serde_json::json!({ "choice": choice_str })));
-            } else {
+            if !self.reply_plan_verdict_choice(&review.plan_file, choice_str, cx) {
                 self.thread.with_mut(|thread| {
                     thread.approve_plan(compact, compact_instructions, seed_text, Some(ui));
                 });

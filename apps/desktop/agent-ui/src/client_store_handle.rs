@@ -456,6 +456,24 @@ impl ClientStoreHandle {
         call: &manox_protocol::ServerCall,
         cx: &mut Context<Self>,
     ) {
+        if let Some(delivery_id) = delivery_id_of(call) {
+            // GW3 capture: the withdrawal identity, keyed like the Reply
+            // correlations below.
+            match call {
+                manox_protocol::ServerCall::PlanVerdict { plan_file, .. } => {
+                    self.store
+                        .pending_plan_delivery
+                        .insert(plan_file.clone(), delivery_id);
+                }
+                _ => {
+                    if let Some(auth_id) = auth_id_of(call) {
+                        self.store
+                            .pending_auth_delivery
+                            .insert(auth_id, delivery_id);
+                    }
+                }
+            }
+        }
         if let Some(auth_id) = auth_id_of(call) {
             self.store.pending_auth.insert(auth_id, id.clone());
             cx.notify();
@@ -479,6 +497,19 @@ fn auth_id_of(call: &manox_protocol::ServerCall) -> Option<String> {
         ServerCall::Approve { auth_id, .. } | ServerCall::AskUserQuestion { auth_id, .. } => {
             Some(auth_id.clone())
         }
+        _ => None,
+    }
+}
+
+/// The GW3 delivery identity of an adjudication ServerCall (the variants
+/// carry it at the variant level; the same fan-out id reaches every
+/// reviewer, and any holder's `CancelDelivery` converges the waterfall).
+fn delivery_id_of(call: &manox_protocol::ServerCall) -> Option<String> {
+    use manox_protocol::ServerCall;
+    match call {
+        ServerCall::Approve { delivery_id, .. }
+        | ServerCall::AskUserQuestion { delivery_id, .. }
+        | ServerCall::PlanVerdict { delivery_id, .. } => Some(delivery_id.clone()),
         _ => None,
     }
 }
@@ -515,6 +546,63 @@ mod tests {
         let client = Arc::new(AgentClient::from_conn(client_conn));
         let mux = cx.new(|cx| SessionMultiplexer::with_client(client, cx));
         (mux, server_conn)
+    }
+
+    /// GW3 capture: an adjudication Request deposits BOTH correlations on
+    /// the leaf — the MsgId (a `Reply` answers by it) and the delivery_id
+    /// (a `CancelDelivery` withdraws by it). The withdrawal identity is
+    /// what lets `ExecuteFresh` retire the server waterfall at once
+    /// instead of hanging it to the 300s expire.
+    #[gpui::test]
+    fn adjudication_requests_capture_reply_and_delivery_correlations(cx: &mut TestAppContext) {
+        let (mux, server_conn) = test_mux(cx);
+        let handle = mux.update(cx, |m, cx| m.open_or_create("s1", "/w", false, cx));
+        cx.run_until_parked();
+        server_conn.send_to_client(manox_protocol::FromServer::Request {
+            id: manox_protocol::MsgId::new("req-1"),
+            call: manox_protocol::ServerCall::Approve {
+                delivery_id: "dlv-s1-1".into(),
+                session_id: "s1".into(),
+                auth_id: "auth-1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                input: serde_json::json!({}),
+            },
+        });
+        server_conn.send_to_client(manox_protocol::FromServer::Request {
+            id: manox_protocol::MsgId::new("req-2"),
+            call: manox_protocol::ServerCall::PlanVerdict {
+                delivery_id: "dlv-s1-2".into(),
+                session_id: "s1".into(),
+                plan_file: "/plans/p.md".into(),
+                title: "Plan".into(),
+                content: None,
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            cx.run_until_parked();
+            let got = handle.read_with(cx, |h, _| {
+                (
+                    h.store.pending_auth.get("auth-1").cloned(),
+                    h.store.pending_auth_delivery.get("auth-1").cloned(),
+                    h.store.pending_plan_verdict.get("/plans/p.md").cloned(),
+                    h.store.pending_plan_delivery.get("/plans/p.md").cloned(),
+                )
+            });
+            let landed = matches!(&got.0, Some(id) if *id == manox_protocol::MsgId::new("req-1"))
+                && matches!(&got.1, Some(d) if d == "dlv-s1-1")
+                && matches!(&got.2, Some(id) if *id == manox_protocol::MsgId::new("req-2"))
+                && matches!(&got.3, Some(d) if d == "dlv-s1-2");
+            if landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the adjudication correlations never landed on the leaf"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// §E.3 Q face wiring: a message row landing in the window (the
