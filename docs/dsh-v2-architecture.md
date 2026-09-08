@@ -305,7 +305,6 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | 债务 | 现状 | 归属 |
 | --- | --- | --- |
 | U3b:用户动作写无网关调用(archive/tag/remove_project/register_project 直写 store) | 需协议新 call(与 C4 面一起设计) | C4 |
-| U1-flush:parked follow-up 直写 facade(insert_user_message+run_turn 绕过网关 Submit) | 改道网关 Submit(服务端队列/drain/K5 持久已就绪) | Wave 2 |
 | U6:attach 路径 live_thread/load_thread 直读内核(landing 镜像与活 facade 双源) | 投影权威反转后删 | Wave 2 |
 | vscode:focusThread 死帧 + 徽章迁移(GW5 后列表 unread 恒 false) | C4 一并 | C4 |
 | U2-跨域#1:wire `ThreadListItem` 缺 project/tag/approval_mode 列,`known_projects` 无 wire 通道——sidebar 装饰靠 workspace 进程内推送(双轨债,sidebar 已被门禁钉 0) | 协议扩列+快照携项目注册表(或新 HostEvent) | C4/Wave 2 |
@@ -327,7 +326,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 
 **协议删除面（L12 破坏性变更，单批收敛）**：
 1. 错误桩 ClientCall 三件：`GetUsage`/`GetCurrentModel`/`ThreadInfo`（§J.6 as-built 注记的存活桩）。
-2. compat ClientNote 三件：`CreateSession`/`Submit`/`Steer`——**前置：桌面 landing/旧写路径先迁移**（Submit→U1-flush/GW8 批；CreateSession landing 与 Steer 的 v2 等价路线在 U1 批内定稿）。
+2. compat ClientNote 三件：`CreateSession`/`Submit`/`Steer`——U1-flush 已落地（parked flush 改道网关，前台 flush 此前已迁）。**残余**：两处 flush 的批量前置插入仍骑 `AppendUserMessage` note（all-but-last 语义），其 v2 替代（逐项 Submit 靠服务端队列合并、或新增批量词汇）与 CreateSession landing / Steer note 退休同属 C4a。
 3. `FocusThread` 变体（GW5 起 handler no-op）。
 4. `ThreadListItem.unread` 弃用列（GW5 起恒 false，两端均已 delta+本地清零）。
 5. T2 死亡清单 `#[deprecated]` 类型（ServerNote 死亡清单=37 减 11 保留集的差集；保留集以 `SERVER_NOTES` 宏清单为单源）。

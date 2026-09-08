@@ -62,7 +62,9 @@ mod tests {
             // register_project), the dual-track bridge handle, and the
             // registry-push decoration block.
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 11),
-            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 8),
+            // U1-flush: the parked flush's two facade writes (insert_user_message
+            // + run_turn) retired to the gateway wire.
+            ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 6),
             // U2: the list/registry reads are retired — the sidebar renders
             // the multiplexer's wire rows and the chip menu reads the pushed
             // decoration cache. The residual 21 are sanctioned debt: the 16
@@ -75,11 +77,11 @@ mod tests {
             // U3b: the seven mirror-write blocks took their
             // thread_store_global() acquisitions with them (21 - 7).
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 14),
-            // 19 = 18 + the GW3 CancelDelivery withdrawal send (the
-            // plan-verdict abandonment path — a new protocol surface the
-            // GW3-client migration adds by design; U9 folds it into the
-            // multiplexer with the rest).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 19),
+            // 21 = 18 + the GW3 CancelDelivery withdrawal send + the two
+            // U1-flush parked-wire sends (the AppendUserMessage note + the
+            // v2 Submit — protocol surfaces the migrations add by design;
+            // U9 folds them into the multiplexer with the rest).
+            ("workspace.rs", "protocol sends (U9)", SENDS, 21),
             // U3/GW5: retired — the SessionStatus store-mirror block was
             // the multiplexer's only write site.
             ("multiplexer.rs", "store mirror writes (U3)", STORE_WRITE, 0),

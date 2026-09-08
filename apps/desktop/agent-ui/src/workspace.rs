@@ -1886,45 +1886,76 @@ impl Workspace {
     /// switch-back rebuild shows it through the thread mirror). `Queued`
     /// items coalesce into one `run_turn`, matching the foreground flush;
     /// `SteerPending`/`Failed` cards stay parked for the user.
+    /// Drain the stashed `Queued` follow-ups of a parked thread whose turn
+    /// just settled. U1-flush: the flush rides the gateway — all but the
+    /// last drain as `AppendUserMessage` notes (accept without a run) and
+    /// the last as the v2 `Submit` that starts the next turn, mirroring the
+    /// foreground flush's batching. The pre-migration direct facade write
+    /// (`insert_user_message` + `run_turn`) bypassed the journal's
+    /// accept-time persistence (K5) and the server's queue/drain merge; the
+    /// parked thread has no optimistic bubble, so no echo is pushed — the
+    /// origin_rpc still rides the Submit for the entry correlation.
+    /// `SteerPending`/`Failed` cards stay parked for the user.
     fn flush_parked_follow_ups(&mut self, thread_id: &str, _cx: &mut Context<Self>) {
         let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
             return;
         };
-        let Some(thread) = self
-            .background_threads
-            .iter()
-            .find(|b| b.entity.read(|t| t.id.0 == thread_id))
-            .map(|b| b.entity.clone())
-        else {
-            return;
-        };
+        use base64::Engine as _;
+        use manox_agent::language_model::MessageContent;
         let mut retain: std::collections::VecDeque<QueuedFollowUp> =
             std::collections::VecDeque::new();
-        let mut flushed = false;
+        let mut drained: Vec<DeferredUserTurn> = Vec::new();
         while let Some(item) = queue.pop_front() {
-            let is_queued = matches!(&item.state, FollowUpState::Queued);
-            if is_queued {
-                let mut content: Vec<manox_agent::language_model::MessageContent> =
-                    vec![manox_agent::language_model::MessageContent::Text(
-                        item.turn.text,
-                    )];
-                content.extend(item.turn.images);
-                let ui = item.turn.ui;
-                thread.with_mut(|t| {
-                    t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
-                });
-                flushed = true;
+            if matches!(&item.state, FollowUpState::Queued) {
+                drained.push(item.turn);
             } else {
                 retain.push_back(item);
             }
-        }
-        if flushed {
-            thread.with_mut(|t| t.run_turn());
         }
         if retain.is_empty() {
             self.queued_follow_ups_by_thread.remove(thread_id);
         } else {
             *queue = retain;
+        }
+        if drained.is_empty() {
+            return;
+        }
+        let n = drained.len();
+        for (i, turn) in drained.into_iter().enumerate() {
+            let attachments: Vec<manox_protocol::ImageAttachment> = turn
+                .images
+                .iter()
+                .filter_map(|c| match c {
+                    MessageContent::Image { data, mime_type } => {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(data.as_bytes())
+                            .ok()
+                            .map(|bytes| manox_protocol::ImageAttachment {
+                                data: bytes,
+                                mime_type: mime_type.clone(),
+                            })
+                    }
+                    _ => None,
+                })
+                .collect();
+            if i + 1 < n {
+                // All but the last: accept without starting a run.
+                self.client
+                    .send_note(manox_protocol::ClientNote::AppendUserMessage {
+                        session_id: thread_id.to_string(),
+                        text: turn.text.clone(),
+                        images: attachments,
+                    });
+            } else {
+                // Last: accept + start the turn (K5 persists at acceptance;
+                // the server's queue/drain merges anything racing in).
+                self.client.send_call(manox_protocol::ClientCall::Submit {
+                    session_id: thread_id.to_string(),
+                    text: turn.text,
+                    images: attachments,
+                    origin_rpc: Some(uuid::Uuid::new_v4().to_string()),
+                });
+            }
         }
     }
 
@@ -10866,6 +10897,150 @@ mod tests {
     /// store change rides the dual-track bridge — the store event drives the
     /// workspace pump, which pushes the decoration columns to the sidebar
     /// and re-pulls `ListThreads`, so the sidebar's rows arrive as the
+    /// U1-flush: the parked follow-up flush rides the gateway wire — all
+    /// but the last item as `AppendUserMessage` notes, the last as the v2
+    /// `Submit` (origin_rpc riding for the entry correlation) — and the
+    /// non-`Queued` cards stay parked. The pre-migration flush wrote the
+    /// facade directly (`insert_user_message` + `run_turn`), bypassing K5
+    /// accept-time persistence and the server queue merge.
+    #[gpui::test]
+    fn parked_follow_up_flush_rides_the_gateway_wire(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _store = store_test_guard();
+        cx.update(gpui_component::init);
+        let db_path =
+            std::env::temp_dir().join(format!("manox-u1-flush-test-{}.db", uuid_like_id()));
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+        );
+        cx.update(|_cx| {
+            manox_agent::runtime::init();
+            manox_agent::provider_glue::init();
+            manox_agent::thread_store::init_for_test(db.clone());
+        });
+        cx.background_executor.allow_parking();
+        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let slot = captured.clone();
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(window, cx));
+                *slot.borrow_mut() = Some(workspace.clone());
+                gpui_component::Root::new(workspace, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let ws = captured.borrow().clone().expect("workspace captured");
+        // Spy client: the flush's wire frames land on a raw pair this test
+        // reads directly (the multiplexer keeps its own server connection).
+        let (client_conn, server_conn) = manox_protocol::in_process_pair();
+        ws.update(cx, |ws, _| {
+            ws.client = std::sync::Arc::new(
+                manox_session_core::agent_client::AgentClient::from_conn(client_conn),
+            );
+        });
+        // Seed the parked stash: two Queued drains + one Failed card that
+        // must stay parked.
+        ws.update(cx, |ws, cx| {
+            let turn = |text: &str, cx: &mut Context<Workspace>| -> super::DeferredUserTurn {
+                let meta = ws.user_turn_meta(cx);
+                let ui = Workspace::message_ui_metadata(&meta);
+                super::DeferredUserTurn {
+                    text: text.to_string(),
+                    images: vec![],
+                    user_images: vec![],
+                    meta,
+                    ui,
+                }
+            };
+            let mut q = std::collections::VecDeque::new();
+            q.push_back(super::QueuedFollowUp {
+                turn: turn("first", cx),
+                state: super::FollowUpState::Queued,
+            });
+            q.push_back(super::QueuedFollowUp {
+                turn: turn("second", cx),
+                state: super::FollowUpState::Queued,
+            });
+            q.push_back(super::QueuedFollowUp {
+                turn: turn("failed-card", cx),
+                state: super::FollowUpState::Failed {
+                    message_id: "m-9".into(),
+                },
+            });
+            ws.queued_follow_ups_by_thread.insert("s-parked".into(), q);
+        });
+        ws.update(cx, |ws, cx| ws.flush_parked_follow_ups("s-parked", cx));
+        // The two wire frames: the Append note first, the Submit last.
+        use manox_protocol::RpcConnection as _;
+        let rx = server_conn.client_rx();
+        let mut frames = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while frames.len() < 2 {
+            cx.run_until_parked();
+            while let Ok(m) = rx.try_recv() {
+                frames.push(m);
+            }
+            if frames.len() >= 2 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked flush never reached the wire ({} frames)",
+                frames.len()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        match &frames[0] {
+            manox_protocol::FromClient::Notification {
+                note:
+                    manox_protocol::ClientNote::AppendUserMessage {
+                        session_id,
+                        text,
+                        images,
+                    },
+            } => {
+                assert_eq!(session_id, "s-parked");
+                assert_eq!(text, "first");
+                assert!(images.is_empty());
+            }
+            other => panic!("expected the AppendUserMessage note first, got {other:?}"),
+        }
+        match &frames[1] {
+            manox_protocol::FromClient::Request {
+                call:
+                    manox_protocol::ClientCall::Submit {
+                        session_id,
+                        text,
+                        origin_rpc,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(session_id, "s-parked");
+                assert_eq!(text, "second");
+                assert!(
+                    origin_rpc.is_some(),
+                    "the Submit rides an origin_rpc for the entry correlation"
+                );
+            }
+            other => panic!("expected the v2 Submit last, got {other:?}"),
+        }
+        // The Failed card stays parked; the Queued drains are gone.
+        ws.read_with(&visual, |ws, _| {
+            let q = ws
+                .queued_follow_ups_by_thread
+                .get("s-parked")
+                .expect("the Failed card keeps the stash alive");
+            assert_eq!(q.len(), 1, "{:?}", q.len());
+            assert!(matches!(q[0].state, super::FollowUpState::Failed { .. }));
+        });
+        std::fs::remove_file(&db_path).ok();
+    }
+
     /// server's wire projection instead of a kernel read.
     #[gpui::test]
     fn u2_thread_list_flows_through_the_gateway(cx: &mut gpui::TestAppContext) {
