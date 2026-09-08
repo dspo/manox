@@ -362,7 +362,6 @@ pub struct Workspace {
     thread_projects: Vec<String>,
     /// Registered project folders (chip menu + the sidebar grouping push).
     known_projects: Vec<String>,
-    _store_pump: gpui::Task<()>,
     /// Repaint observer on the multiplexer's list/registry state (U2): its
     /// notify drives the sidebar rows and the workspace's model surfaces.
     _mux_lists: gpui::Subscription,
@@ -842,23 +841,14 @@ impl Workspace {
         // U2 list source + GW5 badge source: rows are the multiplexer's wire
         // list, and badges prefer the leaves' client-owned unread mirrors.
         sidebar.update(cx, |s, _| s.bind_multiplexer(multiplexer.clone()));
-        // U2 dual-track bridge: the in-process store's event channel drives
-        // the gateway list refetch — the wire rows (with their decoration
-        // columns) and the Projects registry snapshot ride the answer, and
-        // the multiplexer's notify feeds the sidebar and the chip-menu
-        // caches. Cross-domain #5 landed the server-side rescan self-hold
-        // (the ListThreads answer scans fresh) and retired the desktop's
-        // kernel rescan triggers; the bridge STAYS as the refetch trigger
-        // for server-pump flag writes and sidecar-write rescans, and
-        // retires with the U6 attach-face inversion (the last thread_store
-        // handle user besides open_thread).
+        // U6a: the store-event bridge is retired — the server's store
+        // watcher broadcasts the list refresh (ThreadsUpdated + Projects to
+        // every connection) on any summary write, so the desktop no longer
+        // subscribes to the in-process store to time its refetches; the
+        // list reaches the sidebar through the multiplexer's wire-state
+        // fold alone. The handle itself stays: the attach-face reads
+        // (open_thread / attach_created_session) are the U6b remainder.
         let thread_store = manox_agent::thread_store_global();
-        let store_rx = thread_store.subscribe();
-        let _store_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            while let Ok(_ev) = store_rx.recv().await {
-                let _ = this.update(cx, |ws, cx| ws.on_thread_store_changed(cx));
-            }
-        });
         // The multiplexer's notify (its list/registry state changed)
         // repaints the sidebar rows and the workspace's model surfaces, and
         // feeds the chip-menu caches off the wire state (U2 cross-domain
@@ -906,7 +896,6 @@ impl Workspace {
             thread_store,
             thread_projects: Vec::new(),
             known_projects: Vec::new(),
-            _store_pump,
             _mux_lists,
             conversation: conversation.clone(),
             input_state,
@@ -4449,15 +4438,6 @@ impl Workspace {
             return;
         };
         self.attach_thread(loaded, true, window, cx);
-    }
-
-    /// One in-process store-change tick (U2 dual-track bridge): re-pull the
-    /// authoritative list through the gateway. The wire rows (with their
-    /// decoration columns) and the Projects registry snapshot ride the
-    /// answer; the multiplexer's notify then feeds the sidebar and the
-    /// chip-menu caches. The list itself is never read off the store.
-    fn on_thread_store_changed(&mut self, cx: &mut Context<Self>) {
-        self.multiplexer.update(cx, |m, _| m.fetch_thread_list());
     }
 
     pub(crate) fn submit_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11099,14 +11079,24 @@ mod tests {
         );
 
         // (b) A store change: seed a summary row with a pending-auth badge
-        // and register a project folder. `with_mut` fires SummariesUpdated;
-        // the pump pushes the decoration and re-pulls the list.
+        // and register a project folder, then drive the wire leg. U6a: in
+        // production the SERVER's store watcher broadcasts the list refresh
+        // on this write; in the suite the desktop's global-singleton server
+        // was constructed by the first workspace test (its watcher rode
+        // that test's store), so this test pulls the list explicitly — the
+        // same in-memory snapshot the broadcast would carry. The broadcast
+        // mechanism is pinned by store_change_broadcasts_the_list_refresh
+        // (session-core) and the mux's ThreadsUpdated fold by the host
+        // list-mirror tests.
         cx.update(|_cx| {
             manox_agent::thread_store_global().with_mut(|s| {
                 s.register_project("/p/u2".to_string());
                 s.insert_summary_for_test("t-u2-row", None);
                 s.mark_pending_auth("t-u2-row", true);
             });
+        });
+        ws.update(cx, |ws, cx| {
+            ws.multiplexer.update(cx, |m, _| m.fetch_thread_list());
         });
         let mut row = None;
         for _ in 0..300 {
@@ -11125,7 +11115,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let row = row.expect("the store event must re-pull the list through the gateway");
+        let row = row.expect("the list refresh must flow through the gateway");
         assert!(
             row.pending_auth,
             "the wire row carries the server's projection of the store flag"

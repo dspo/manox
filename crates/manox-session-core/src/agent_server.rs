@@ -264,6 +264,20 @@ pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
 
 impl AgentServer {
     pub fn new(cwd: PathBuf) -> Self {
+        Self::new_inner(cwd, true)
+    }
+
+    /// Test-only constructor WITHOUT the U6a store watcher: the
+    /// strict-frame-sequence tests keep deterministic streams (the
+    /// watcher's list-refresh broadcasts are pinned by their dedicated
+    /// regression, `store_change_broadcasts_the_list_refresh`, through
+    /// `harness_with_store_watcher`).
+    #[cfg(test)]
+    pub fn new_without_store_watcher(cwd: PathBuf) -> Self {
+        Self::new_inner(cwd, false)
+    }
+
+    fn new_inner(cwd: PathBuf, store_watcher: bool) -> Self {
         let inner = Arc::new(AgentServerInner {
             cwd,
             sessions: Mutex::new(HashMap::new()),
@@ -293,6 +307,40 @@ impl AgentServer {
                 }
             }
         })));
+        // U6a (§D.5 "ThreadsUpdated(元数据变更时全量快照)" made real): the
+        // store-event watcher owns the list-refresh broadcast — any store
+        // summary write (title auto-stamps, interacted_at bumps, pin/
+        // archive/tag, rescans) reaches EVERY connection as the
+        // ThreadsUpdated push, so no client needs an in-process store
+        // subscription to keep its list fresh (the desktop's store-event
+        // bridge retired against this). Weak like the reload listener: a
+        // dropped server leaves the watcher inert, and the store's channel
+        // close (teardown) retires the task. A store-less construction
+        // (foreign fixtures) skips the watcher — there is nothing to watch.
+        if store_watcher && let Some(store) = manox_agent::thread_store::try_global() {
+            let rx = store.subscribe();
+            let weak = Arc::downgrade(&inner);
+            manox_agent::runtime::handle().spawn(async move {
+                use manox_agent::thread_store::ThreadStoreEvent;
+                while let Ok(ev) = rx.recv().await {
+                    // Coalesce bursts (a bulk rescan or the startup refresh
+                    // pushes one event per write): one broadcast covers the
+                    // drained batch. RunningChanged is skipped — the running
+                    // column rides the §D.5 SessionStatus deltas.
+                    let mut summaries = matches!(*ev, ThreadStoreEvent::SummariesUpdated);
+                    while let Ok(more) = rx.try_recv() {
+                        summaries |= matches!(*more, ThreadStoreEvent::SummariesUpdated);
+                    }
+                    if !summaries {
+                        continue;
+                    }
+                    let Some(inner) = weak.upgrade() else {
+                        return;
+                    };
+                    inner.broadcast_threads_after_store_change();
+                }
+            });
+        }
         Self(inner)
     }
 
@@ -753,6 +801,44 @@ impl AgentServerInner {
     fn broadcast_models_after_reload(&self) {
         let models = self.models_snapshot();
         self.broadcast_host(HostEvent::Models { models });
+    }
+
+    /// U6a: the list-refresh broadcast on a store change — the same frame
+    /// shape as the `ListPush::Threads` arm (the v1 note first, then the
+    /// Host mirror, then the host-only `Projects` registry — GW1 dual emit
+    /// to the global list audience), sent to EVERY connection (the list is
+    /// a global registry channel, not owner-scoped).
+    fn broadcast_threads_after_store_change(&self) {
+        let threads = self.threads_snapshot();
+        let known = manox_agent::thread_store::try_global()
+            .map(|store| store.read(|s| s.known_projects().to_vec()))
+            .unwrap_or_default();
+        // Clone the connection list under the lock, then send outside it
+        // (the broadcast_host discipline: a stalled peer must not freeze
+        // the shared `clients` lock).
+        let conns: Vec<Arc<dyn RpcConnection>> = self
+            .clients
+            .lock()
+            .values()
+            .map(|entry| entry.conn.clone())
+            .collect();
+        for conn in conns {
+            conn.send_to_client(FromServer::Notification {
+                note: ServerNote::ThreadsUpdated {
+                    threads: threads.clone(),
+                },
+            });
+            conn.send_to_client(FromServer::Host {
+                host: HostEvent::ThreadsUpdated {
+                    threads: threads.clone(),
+                },
+            });
+            conn.send_to_client(FromServer::Host {
+                host: HostEvent::Projects {
+                    known: known.clone(),
+                },
+            });
+        }
     }
 
     fn broadcast_host(&self, host: manox_protocol::stream::HostEvent) {
@@ -3355,7 +3441,7 @@ mod tests {
 
     fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let (client_conn, server_conn) = in_process_pair();
         server.accept(Arc::new(server_conn));
         let client = Client { conn: client_conn };
@@ -3394,6 +3480,43 @@ mod tests {
             ),
             "expected the Host Ready epoch echo (GW1/C1), got {host_ready:?}"
         );
+        (server, client)
+    }
+
+    /// The harness with the U6a store watcher ENABLED (the production
+    /// constructor): only the broadcast regression uses it — every other
+    /// test keeps the watcher off for deterministic frame streams.
+    fn harness_with_store_watcher(caps: Vec<HookKind>) -> (AgentServer, Client) {
+        manox_agent::thread_store::init();
+        let server = AgentServer::new(PathBuf::from("/"));
+        let (client_conn, server_conn) = in_process_pair();
+        server.accept(Arc::new(server_conn));
+        let client = Client { conn: client_conn };
+        let id = MsgId::new("init");
+        client.send(FromClient::Request {
+            id,
+            call: ClientCall::Initialize(Initialize {
+                client_id: "test".into(),
+                capabilities: caps,
+                sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
+            }),
+        });
+        // Tolerant drain: the watcher's scan-era broadcasts may interleave
+        // with the handshake frames (the plain harness pins the exact
+        // Ready sequence; here only the ack gates construction, and the
+        // Ready pair rides the test's own leading drain).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let m = client.recv();
+            if matches!(&m, FromServer::Response { id, .. } if id.0 == "init") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the init ack never arrived (last frame: {m:?})"
+            );
+        }
         (server, client)
     }
 
@@ -4046,7 +4169,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
 
         // Client "gated": the handshake passes (non-Host frames delegate),
         // then the first Host frame parks inside send_to_client.
@@ -7078,7 +7201,7 @@ mod tests {
         seed_session_file(&sessions, "gw2-conc-1", "/proj");
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let client_a = connect_sessions(&server, "racer-a", vec![HookKind::Approve], vec![]);
         let client_b = connect_sessions(&server, "racer-b", vec![HookKind::Approve], vec![]);
 
@@ -7520,7 +7643,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
 
         let _first = connect_sessions(&server, "gw10", vec![], vec!["gw10-s1".into()]);
         assert_eq!(server.0.owners("gw10-s1"), vec!["gw10".to_string()]);
@@ -7810,7 +7933,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let (client_conn, server_conn) = serde_pair();
         server.accept(Arc::new(server_conn));
         let client = SerdeClient { conn: client_conn };
@@ -7860,7 +7983,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let (client_conn, server_conn) = serde_pair();
         server.accept(Arc::new(server_conn));
         let client = SerdeClient { conn: client_conn };
@@ -7904,7 +8027,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let (client_conn, server_conn) = in_process_pair();
         server.accept(Arc::new(server_conn));
         let client = Client { conn: client_conn };
@@ -8029,7 +8152,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let owner = connect_sessions(&server, "gw1-owner", vec![], vec![]);
         let bystander = connect_sessions(&server, "gw1-bystander", vec![], vec![]);
 
@@ -8418,6 +8541,79 @@ mod tests {
         manox_agent::thread_store::drop_global_for_test();
     }
 
+    /// U6a: the server's store watcher owns the list refresh — a store
+    /// summary write (here: the pin path, a direct store write per the U3b
+    /// row) reaches every connection as the ThreadsUpdated note + Host
+    /// broadcast WITHOUT any client fetch. This is the mechanism the
+    /// desktop's retired store-event bridge used to trigger by refetch.
+    #[tokio::test]
+    async fn store_change_broadcasts_the_list_refresh() {
+        let _g = lock_globals();
+        hermetic_home();
+        let sessions = manox_agent::paths::manox_config_dir()
+            .expect("config dir")
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // A cold thread the init scan indexes — the list row the broadcast
+        // carries. (A create-only session has no file, no summary row, and
+        // no session path: pinning it would write no flag and fire no
+        // event — the scan-indexed row is the list-visible shape.)
+        seed_session_file(&sessions, "u6a-1", "/proj");
+        init_globals();
+        let (server, client) = harness_with_store_watcher(vec![]);
+        // Wait for the asynchronous scan to land the summary row.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if manox_agent::thread_store::global()
+                .read(|s| s.summaries().iter().any(|t| t.id == "u6a-1"))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the init scan never indexed the seeded thread"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Drain the handshake/scan-era frames (the scan's SummariesUpdated
+        // already broadcast once — unpinned rows the wait loop skips).
+        client.settle();
+        std::thread::sleep(Duration::from_millis(100));
+        while client.conn.server_rx().try_recv().is_ok() {}
+        // A store summary write with NO gateway call in between.
+        manox_agent::thread_store::global().with_mut(|s| s.pin_thread("u6a-1", true));
+        // The broadcast must reach the client without any fetch. The
+        // watcher coalesces per drain, not per write, so earlier
+        // broadcasts may precede the pin's: wait for the PINNED rows; the
+        // deadline fails a never-arriving pin broadcast.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut saw_note = false;
+        let mut saw_host = false;
+        while !(saw_note && saw_host) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the store change never broadcast the pinned list (note={saw_note}, host={saw_host})"
+            );
+            match client.recv() {
+                FromServer::Notification {
+                    note: ServerNote::ThreadsUpdated { threads },
+                } => {
+                    saw_note |= threads.iter().any(|t| t.id == "u6a-1" && t.pinned);
+                }
+                FromServer::Host {
+                    host: HostEvent::ThreadsUpdated { threads },
+                } => {
+                    saw_host |= threads.iter().any(|t| t.id == "u6a-1" && t.pinned);
+                }
+                _ => {}
+            }
+        }
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_file(sessions.join("u6a-1.jsonl"));
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
     /// GW6 regression: PageHistory on an OPENED session whose engine seam
     /// answers "not materialized" must cold-read the persisted jsonl (§D.2
     /// "冷读不激活 engine，jsonl 直读") — pre-fix it answered
@@ -8574,7 +8770,7 @@ mod tests {
         // map entry regardless of the async scan's timing.
         manox_agent::thread_store::global()
             .with_mut(|s| s.note_session_path("gw6-race", &sessions.join("gw6-race.jsonl")));
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let a = connect_sessions(&server, "sf-a", vec![], vec![]);
         let b = connect_sessions(&server, "sf-b", vec![], vec![]);
         let c = connect_sessions(&server, "sf-c", vec![], vec![]);
@@ -8800,7 +8996,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
         let a = connect_sessions(&server, "gw3-a", vec![HookKind::Approve], vec![]);
         let b = connect_sessions(&server, "gw3-b", vec![HookKind::Approve], vec![]);
         create(&server, &a, "gw3-s2");

@@ -151,7 +151,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(std::path::PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(std::path::PathBuf::from("/"));
         let client = AgentClient::connect(
             &server,
             "ta-test",
@@ -201,7 +201,7 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(std::path::PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(std::path::PathBuf::from("/"));
         let client = AgentClient::connect(&server, "ta-call", vec![], vec![]);
         // Drain the handshake (ack + v1 Ready note + the GW1/C1 Host Ready
         // epoch echo).
