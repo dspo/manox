@@ -69,6 +69,12 @@ mod tests {
             // flag writer; its deltas already fed every mirror).
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 4),
             (
+                "workspace/composer.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                0,
+            ),
+            (
                 "workspace/plan_review.rs",
                 "store mirror writes (U3)",
                 STORE_WRITE,
@@ -87,6 +93,12 @@ mod tests {
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            (
+                "workspace/composer.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                0,
+            ),
             (
                 "workspace/plan_review.rs",
                 "facade writes (U1/U6)",
@@ -113,6 +125,7 @@ mod tests {
             // U6b②: the bridge-head binding (U6a) and attach_created_session's
             // global() retired with the attach-face reads.
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 7),
+            ("workspace/composer.rs", "store reads (U2)", STORE_GLOBAL, 0),
             (
                 "workspace/plan_review.rs",
                 "store reads (U2)",
@@ -133,7 +146,8 @@ mod tests {
             // PlanSeedExecution note (a bypass facade-seed became a wire
             // send — the ledger-mandated direction; the budget missed the
             // raise in that commit and is corrected here).
-            ("workspace.rs", "protocol sends (U9)", SENDS, 19),
+            ("workspace.rs", "protocol sends (U9)", SENDS, 16),
+            ("workspace/composer.rs", "protocol sends (U9)", SENDS, 3),
             ("workspace/plan_review.rs", "protocol sends (U9)", SENDS, 3),
             ("workspace/attach.rs", "protocol sends (U9)", SENDS, 2),
             // U3/GW5: retired — the SessionStatus store-mirror block was
@@ -187,6 +201,9 @@ mod tests {
             // U9b cluster 2: the plan-review verdict surface (budgeted
             // by its own rows below).
             "workspace/plan_review.rs",
+            // U9b cluster 3: the composer turn surface (budgeted by its
+            // own rows below).
+            "workspace/composer.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
