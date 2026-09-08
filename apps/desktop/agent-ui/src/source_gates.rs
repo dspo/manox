@@ -69,6 +69,12 @@ mod tests {
             // flag writer; its deltas already fed every mirror).
             ("workspace.rs", "store mirror writes (U3)", STORE_WRITE, 4),
             (
+                "workspace/external.rs",
+                "store mirror writes (U3)",
+                STORE_WRITE,
+                0,
+            ),
+            (
                 "workspace/composer.rs",
                 "store mirror writes (U3)",
                 STORE_WRITE,
@@ -93,6 +99,12 @@ mod tests {
             // browser-suite landing fallbacks (the designed landing-park
             // path, replayed by ensure_engine on materialization).
             ("workspace.rs", "facade writes (U1/U6)", FACADE_WRITE, 2),
+            (
+                "workspace/external.rs",
+                "facade writes (U1/U6)",
+                FACADE_WRITE,
+                0,
+            ),
             (
                 "workspace/composer.rs",
                 "facade writes (U1/U6)",
@@ -125,6 +137,7 @@ mod tests {
             // U6b②: the bridge-head binding (U6a) and attach_created_session's
             // global() retired with the attach-face reads.
             ("workspace.rs", "store reads (U2)", STORE_GLOBAL, 7),
+            ("workspace/external.rs", "store reads (U2)", STORE_GLOBAL, 0),
             ("workspace/composer.rs", "store reads (U2)", STORE_GLOBAL, 0),
             (
                 "workspace/plan_review.rs",
@@ -147,6 +160,7 @@ mod tests {
             // send — the ledger-mandated direction; the budget missed the
             // raise in that commit and is corrected here).
             ("workspace.rs", "protocol sends (U9)", SENDS, 16),
+            ("workspace/external.rs", "protocol sends (U9)", SENDS, 0),
             ("workspace/composer.rs", "protocol sends (U9)", SENDS, 3),
             ("workspace/plan_review.rs", "protocol sends (U9)", SENDS, 3),
             ("workspace/attach.rs", "protocol sends (U9)", SENDS, 2),
@@ -204,6 +218,9 @@ mod tests {
             // U9b cluster 3: the composer turn surface (budgeted by its
             // own rows below).
             "workspace/composer.rs",
+            // U9b cluster 4: the external-view session family (all-zero
+            // budgets below — it never touched the wire or the store).
+            "workspace/external.rs",
         ];
         let mut offenders: Vec<String> = Vec::new();
         collect_rs_files(&src, &src, &mut offenders, exempt);
