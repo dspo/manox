@@ -148,6 +148,20 @@ async fn run_follow_stream(
     let (data, cold) = match opening_snapshot(&thread, &session_id, &cancel).await {
         SnapshotResult::Data(data) => (data, false),
         SnapshotResult::Cold(data) => (data, true),
+        SnapshotResult::Corrupt(err) => {
+            // §二.6: surface the corruption as a terminal Failure. The
+            // client's reopen budget (§二.3) bounds the retries, so a
+            // genuinely broken journal becomes a visible error rather than
+            // an infinite silent spin.
+            return finish(
+                &conn,
+                &stream_id,
+                StreamEndReason::Failure {
+                    code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.to_string(),
+                    message: format!("journal corrupt: {err}"),
+                },
+            );
+        }
         SnapshotResult::Unavailable => {
             // Reachable only via cancellation now: an unanswered seam
             // falls to the cold disk read (PageHistory parity), never to
@@ -261,6 +275,9 @@ enum SnapshotResult {
     /// exists yet). The stream holds open and upgrades in place when the
     /// seam starts answering.
     Cold(manox_agent::engine::JournalSnapshotData),
+    /// §二.6: the persisted journal exists but failed to load. A corrupt
+    /// journal is a LOUD terminal — never a silent empty snapshot.
+    Corrupt(String),
     Unavailable,
 }
 
@@ -283,14 +300,18 @@ async fn opening_snapshot(
     }
     match thread.journal_snapshot().await {
         Some(data) => SnapshotResult::Data(data),
-        None => SnapshotResult::Cold(
-            crate::journal_query::cold_snapshot(session_id)
-                .await
-                .unwrap_or(manox_agent::engine::JournalSnapshotData {
+        None => match crate::journal_query::cold_read(session_id).await {
+            crate::journal_query::ColdRead::Data(data) => SnapshotResult::Cold(data),
+            // A live session with no file yet has an EMPTY journal, not a
+            // missing one (unchanged semantics).
+            crate::journal_query::ColdRead::NotFound => {
+                SnapshotResult::Cold(manox_agent::engine::JournalSnapshotData {
                     cursor: 0,
                     records: Vec::new(),
-                }),
-        ),
+                })
+            }
+            crate::journal_query::ColdRead::Corrupt(err) => SnapshotResult::Corrupt(err),
+        },
     }
 }
 

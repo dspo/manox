@@ -50,7 +50,7 @@ impl ConversationInfoCache {
 /// tolerates unclaimed seqs).
 ///
 /// GW6: the caller resolves the chain read — the live engine seam when it is
-/// materialized, [`cold_snapshot`] (persisted-jsonl direct read, §D.2 "冷读
+/// materialized, [`cold_read`] (persisted-jsonl direct read, §D.2 "冷读
 /// 不激活 engine") otherwise — and hands the resulting snapshot in; the page
 /// fold itself never touches the engine.
 pub fn page_history(
@@ -107,14 +107,42 @@ pub fn page_history(
 /// from seq 0); a bounded seq-range disk read would avoid loading long
 /// chains for tail pages — requested from the harness owners in the
 /// delivery report.
-pub async fn cold_snapshot(session_id: &str) -> Option<manox_agent::engine::JournalSnapshotData> {
-    let path = crate::agent_server::persisted_session_file(session_id)?;
-    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&path)
-        .await
-        .ok()?;
-    let records = storage.journal_range(0, u64::MAX).await.ok()?;
-    let cursor = storage.journal_cursor().await;
-    Some(manox_agent::engine::JournalSnapshotData { cursor, records })
+/// The cold-read outcome (§二.6): `NotFound` and `Corrupt` are DIFFERENT
+/// answers. The old `.ok()?` collapsed a load failure into `None` and the
+/// callers turned `None` into an empty page — one corrupt line rendered
+/// the session's history silently, permanently empty, contradicting this
+/// module's own contract above ("a corrupt journal is the caller's
+/// not-found-class answer, never a silent empty page"). Callers now answer
+/// corruption loudly (an `RpcError` / a `StreamEnd::Failure`).
+pub enum ColdRead {
+    /// No persisted file for the id (or the id fails the B5 shape gate) —
+    /// the `session/not-found` class.
+    NotFound,
+    /// The file exists but the load failed — surface it; never an empty
+    /// page. The string carries the load error for the client-facing
+    /// message.
+    Corrupt(String),
+    /// The whole active chain.
+    Data(manox_agent::engine::JournalSnapshotData),
+}
+
+pub async fn cold_read(session_id: &str) -> ColdRead {
+    let Some(path) = crate::agent_server::persisted_session_file(session_id) else {
+        return ColdRead::NotFound;
+    };
+    if !path.exists() {
+        return ColdRead::NotFound;
+    }
+    match manox_harness::session::jsonl::JsonlSessionStorage::open(&path).await {
+        Err(err) => ColdRead::Corrupt(err.to_string()),
+        Ok(storage) => match storage.journal_range(0, u64::MAX).await {
+            Err(err) => ColdRead::Corrupt(err.to_string()),
+            Ok(records) => {
+                let cursor = storage.journal_cursor().await;
+                ColdRead::Data(manox_agent::engine::JournalSnapshotData { cursor, records })
+            }
+        },
+    }
 }
 
 /// `ClientCall::GetConversationInfo` (§E.3, Q face): the server-side fold of

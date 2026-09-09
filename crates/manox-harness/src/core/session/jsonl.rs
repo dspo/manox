@@ -235,7 +235,30 @@ impl JsonlSessionStorage {
     }
 
     async fn load(path: &Path) -> Result<Self, anyhow::Error> {
-        let file = File::open(path).await?;
+        let mut file = File::open(path).await?;
+        // Torn-tail tolerance (§二.6): whether the file ends mid-line (no
+        // trailing '\n') is decided once, up front. An unparseable TAIL
+        // line in a file without the trailing newline is a torn append —
+        // the non-atomic `write_all` racing a crash or a concurrent
+        // reader — and is dropped with a warning instead of failing the
+        // whole chain (pre-fix, one bad byte made the session permanently
+        // unreadable, compounding with the cold read into a silent empty
+        // history). A parse failure on ANY earlier line — or on a
+        // newline-terminated tail — stays a hard error: committed history
+        // is never silently truncated.
+        let ends_with_newline = {
+            use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let len = file.metadata().await?.len();
+            if len == 0 {
+                true
+            } else {
+                file.seek(std::io::SeekFrom::End(-1)).await?;
+                let mut last = [0u8; 1];
+                file.read_exact(&mut last).await?;
+                file.seek(std::io::SeekFrom::Start(0)).await?;
+                last[0] == b'\n'
+            }
+        };
         let reader = BufReader::new(file);
         let mut lines = reader.lines();
         let header_line = lines
@@ -267,7 +290,22 @@ impl JsonlSessionStorage {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: JsonValue = serde_json::from_str(&line)?;
+            let value: JsonValue = match serde_json::from_str(&line) {
+                Ok(value) => value,
+                Err(err) => {
+                    if !ends_with_newline && lines.next_line().await?.is_none() {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "dropping an unterminated unparseable tail line (torn append): {err}"
+                        );
+                        break;
+                    }
+                    return Err(anyhow::anyhow!(
+                        "unparseable session entry line in {}: {err}",
+                        path.display()
+                    ));
+                }
+            };
             // Wire-level structural checks before deserializing: a missing
             // required field must not be silently read as `null` (TS
             // `parseEntryLine` treats a missing `parentId`/`targetId` as an
@@ -844,6 +882,50 @@ impl SessionStorage for JsonlSessionStorage {
 
 #[cfg(test)]
 mod tests {
+    /// §二.6 torn-tail tolerance: an unparseable TAIL line in a file
+    /// WITHOUT the trailing newline is a torn append (the non-atomic
+    /// `write_all` racing a crash or a concurrent reader) — dropped with a
+    /// warning, the committed chain stays readable. A newline-terminated
+    /// bad tail, or a bad line mid-chain, stays a hard error: committed
+    /// history is never silently truncated.
+    #[tokio::test]
+    async fn torn_tail_tolerated_committed_corruption_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = "{\"type\":\"session\",\"version\":3,\"id\":\"tt-1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{\"host\":\"manox\"}}";
+        let valid = "{\"type\":\"model_change\",\"id\":\"tt-m0\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"provider\":\"p\",\"modelId\":\"m\"}";
+        let torn = "{\"type\":\"model_ch";
+
+        // Torn tail: no trailing newline after the partial line.
+        let torn_path = dir.path().join("tt-torn.jsonl");
+        std::fs::write(&torn_path, format!("{header}\n{valid}\n{torn}")).unwrap();
+        let storage = JsonlSessionStorage::open(&torn_path)
+            .await
+            .expect("the torn tail is tolerated");
+        let records = storage.journal_range(0, u64::MAX).await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the committed entry survives, the torn tail drops"
+        );
+
+        // Newline-terminated bad tail: a committed line that does not parse
+        // is corruption, not a torn write.
+        let bad_tail = dir.path().join("tt-badtail.jsonl");
+        std::fs::write(&bad_tail, format!("{header}\n{valid}\n{torn}\n")).unwrap();
+        assert!(
+            JsonlSessionStorage::open(&bad_tail).await.is_err(),
+            "a terminated bad tail is a hard error"
+        );
+
+        // Mid-chain corruption: never tolerated.
+        let mid = dir.path().join("tt-mid.jsonl");
+        std::fs::write(&mid, format!("{header}\n{torn}\n{valid}\n")).unwrap();
+        assert!(
+            JsonlSessionStorage::open(&mid).await.is_err(),
+            "a mid-chain bad line is a hard error"
+        );
+    }
+
     use super::*;
     use crate::types::AgentMessage;
 

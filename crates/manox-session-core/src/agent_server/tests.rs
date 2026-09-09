@@ -242,10 +242,14 @@ impl Client {
         self.conn.send_to_server(msg);
     }
     fn recv(&self) -> FromServer {
-        // 30s (not 10s): on slow CI runners the agent-runtime task that
-        // answers a call can spawn noticeably later than the test thread
-        // sends it, and a too-tight deadline flakes the test.
-        self.recv_timeout(Duration::from_secs(30))
+        // 60s: on slow CI runners — and on a dev machine while the full
+        // workspace gate runs — the agent-runtime task that answers a call
+        // can spawn noticeably later than the test thread sends it, and a
+        // too-tight deadline flakes the test. The review's §二.1
+        // timeout-budget family, observed at head:
+        // detach_then_reopen_replays_history timed out at 37s under the
+        // gates' full-load run while green in isolation and on CI.
+        self.recv_timeout(Duration::from_secs(60))
     }
     fn recv_timeout(&self, timeout: Duration) -> FromServer {
         // Poll the async channel from the test thread (the dispatch/pump
@@ -7111,4 +7115,54 @@ fn dispose_and_detach_never_hold_the_clients_lock_across_sends() {
     drop(healthy);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §二.6: a corrupt journal answers PageHistory LOUDLY — an error carrying
+/// the stable gateway/internal code, never a silent empty page. The old
+/// `.ok()?` collapse rendered one bad line as "this session has no
+/// history", contradicting the journal_query contract ("never a silent
+/// empty page") and, combined with the follow cold fallback, permanently
+/// emptying the session's transcript view.
+#[test]
+fn page_history_cold_read_answers_corruption_loudly() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let (_server, client) = harness(vec![]);
+    let dir = manox_agent::thread_store::global_sessions_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("corrupt-s1.jsonl"),
+        "{\"type\":\"session\",\"version\":4,\"id\":\"corrupt-s1\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/tmp\",\"metadata\":{\"host\":\"manox\"}}\n\
+         {\"type\":\"turn_start\",\"id\":\"c-e0\",\"parentId\":null,\"timestamp\":\"2026-01-01T00:00:01Z\",\"seq\":0}\n\
+         NOT JSON AT ALL\n",
+    )
+    .unwrap();
+    client.send(FromClient::Request {
+        id: MsgId::new("ph-corrupt"),
+        call: ClientCall::PageHistory {
+            session_id: "corrupt-s1".into(),
+            through_seq: -1,
+            before_seq: None,
+            max_messages: None,
+        },
+    });
+    match client.recv() {
+        FromServer::Response {
+            outcome: Err(e), ..
+        } => {
+            assert!(
+                e.message.contains("journal corrupt"),
+                "the message names the corruption: {}",
+                e.message
+            );
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(
+                v["data"]["code"], "gateway/internal",
+                "the stable §D.7 code rides the error"
+            );
+        }
+        other => panic!("expected an error response (never a silent empty page), got {other:?}"),
+    }
 }

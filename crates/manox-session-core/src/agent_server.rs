@@ -1093,15 +1093,26 @@ async fn handle_call(
             };
             let snapshot = match snapshot {
                 Some(data) => data,
-                None => match journal_query::cold_snapshot(&session_id).await {
-                    Some(data) => data,
-                    None if thread.is_some() => manox_agent::engine::JournalSnapshotData {
-                        cursor: 0,
-                        records: Vec::new(),
-                    },
-                    None => {
+                None => match journal_query::cold_read(&session_id).await {
+                    journal_query::ColdRead::Data(data) => data,
+                    // A live session with no file yet has an EMPTY journal,
+                    // not a missing one (unchanged semantics).
+                    journal_query::ColdRead::NotFound if thread.is_some() => {
+                        manox_agent::engine::JournalSnapshotData {
+                            cursor: 0,
+                            records: Vec::new(),
+                        }
+                    }
+                    journal_query::ColdRead::NotFound => {
                         return Err(RpcError::new(-1, "unknown session")
                             .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+                    }
+                    // §二.6: a corrupt journal is a loud error, never an
+                    // empty page — the old `.ok()?` collapse contradicted
+                    // the journal_query contract.
+                    journal_query::ColdRead::Corrupt(err) => {
+                        return Err(RpcError::new(-1, format!("journal corrupt: {err}"))
+                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
                     }
                 },
             };
