@@ -967,17 +967,43 @@ fn handshake_registers_client_and_sends_ready() {
 /// delegates everything else to an ordinary in-process pair. It stands
 /// in for a stalled WS peer whose bounded carrier blocks in
 /// `send_blocking`.
+/// Which Host frame parks the gated send. A content filter is
+/// deterministic where an arm-flag would race the async handshake
+/// (the GW1 Host Ready mirror and the U6a watcher broadcasts are
+/// Host frames too — they must pass through, not consume the park).
+#[derive(Clone, Copy, PartialEq)]
+enum HostPark {
+    Status,
+    Disposed,
+}
+
 struct GatedConn {
     inner: manox_protocol::InProcessConnection,
     /// Signalled when a Host frame enters `send_to_client` and parks.
     entered: StdMutex<std::sync::mpsc::Sender<()>>,
     /// The parked send waits here until the test flips it.
     release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+    /// The Host frame kind that parks; every other frame delegates.
+    park_on: HostPark,
 }
 
 impl RpcConnection for GatedConn {
     fn send_to_client(&self, msg: FromServer) {
-        if matches!(msg, FromServer::Host { .. }) {
+        let park = matches!(
+            (&msg, self.park_on),
+            (
+                FromServer::Host {
+                    host: HostEvent::SessionStatus { .. }
+                },
+                HostPark::Status
+            ) | (
+                FromServer::Host {
+                    host: HostEvent::SessionDisposed { .. }
+                },
+                HostPark::Disposed
+            )
+        );
+        if park {
             let _ = self.entered.lock().unwrap().send(());
             let (lock, cvar) = &*self.release;
             let mut released = lock.lock().unwrap();
@@ -1025,6 +1051,7 @@ fn stalled_host_broadcast_never_holds_the_clients_lock() {
         inner: gated_server_conn,
         entered: StdMutex::new(entered_tx),
         release: release.clone(),
+        park_on: HostPark::Status,
     }));
     let gated = Client {
         conn: gated_client_conn,
@@ -6945,4 +6972,139 @@ fn persisted_session_file_rejects_traversal_ids() {
             "the traversal/hostile id {bad:?} must not mint a path"
         );
     }
+}
+
+/// B4 (review round 2): `dispose_session`/`detach_session` told the
+/// requesting client via two blocking sends taken inside an `if let`
+/// whose scrutinee temporary (the `clients` MutexGuard) lives to the
+/// end of the body — a saturated s2c queue parked the dispatch task
+/// WITH the shared lock, freezing every other connection's Reply
+/// dispatch, route_call registration and host broadcast (GW4's class,
+/// §D.7's "clone under the lock, send outside it"). One gated
+/// connection per leg parks inside the Host send; a healthy client's
+/// ListThreads round-trip (which needs the lock for the reply) must
+/// complete while each send is parked.
+#[test]
+fn dispose_and_detach_never_hold_the_clients_lock_across_sends() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+
+    // The healthy client creates the session FIRST (while it is the only
+    // connection, so the create-time Host broadcast cannot park a gate).
+    let (healthy_client_conn, healthy_server_conn) = in_process_pair();
+    server.accept(Arc::new(healthy_server_conn));
+    let healthy = Client {
+        conn: healthy_client_conn,
+    };
+    healthy.send(FromClient::Request {
+        id: MsgId::new("init-b4"),
+        call: ClientCall::Initialize(Initialize {
+            client_id: "b4-healthy".into(),
+            capabilities: vec![],
+            sessions: vec![],
+            protocol_epoch: PROTOCOL_EPOCH,
+        }),
+    });
+    assert!(matches!(healthy.recv(), FromServer::Response { .. }));
+    assert!(matches!(
+        healthy.recv(),
+        FromServer::Notification {
+            note: ServerNote::Ready
+        }
+    ));
+    create(&server, &healthy, "b4-d1");
+
+    // Two gated connections: one per leg (each parks on its first Host
+    // frame — the SessionDisposed mirror of its note).
+    let gate = |server: &AgentServer, name: &str| {
+        let (client_conn, server_conn) = in_process_pair();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        server.accept(Arc::new(GatedConn {
+            inner: server_conn,
+            entered: StdMutex::new(entered_tx),
+            release: release.clone(),
+            park_on: HostPark::Disposed,
+        }));
+        let client = Client { conn: client_conn };
+        client.send(FromClient::Request {
+            id: MsgId::new(format!("init-{name}")),
+            call: ClientCall::Initialize(Initialize {
+                client_id: name.into(),
+                capabilities: vec![],
+                sessions: vec![],
+                protocol_epoch: PROTOCOL_EPOCH,
+            }),
+        });
+        assert!(matches!(client.recv(), FromServer::Response { .. }));
+        assert!(matches!(
+            client.recv(),
+            FromServer::Notification {
+                note: ServerNote::Ready
+            }
+        ));
+        (client, entered_rx, release)
+    };
+    let (gated_d, entered_d, release_d) = gate(&server, "b4-dispose");
+    let (gated_t, entered_t, release_t) = gate(&server, "b4-detach");
+
+    // The regression assertion (the stalled-broadcast test's mechanism):
+    // while a gated send is parked, the shared lock must stay acquirable.
+    let lock_free = |tag: &str| {
+        assert!(
+            server
+                .0
+                .clients
+                .try_lock_for(Duration::from_millis(500))
+                .is_some(),
+            "{tag}: clients lock held across a stalled send_to_client (B4)"
+        );
+        // Targeted traffic to the healthy client is dispatched while the
+        // gated send is parked (reaching the release at all proves
+        // note_to_client did not block on the contended lock).
+        server.0.note_to_client(
+            "b4-healthy",
+            ServerNote::Error {
+                session_id: None,
+                message: format!("b4-ping-{tag}"),
+            },
+        );
+    };
+
+    // Leg 1: dispose parks on the Host mirror send.
+    gated_d.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "b4-d1".into(),
+        },
+    });
+    entered_d
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the dispose Host send reached the gate");
+    lock_free("dispose");
+
+    // Leg 2: detach parks the same way.
+    gated_t.send(FromClient::Notification {
+        note: ClientNote::DetachSession {
+            session_id: "b4-d1".into(),
+        },
+    });
+    entered_t
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the detach Host send reached the gate");
+    lock_free("detach");
+
+    // Release both gates so the parked dispatch tasks finish.
+    for release in [&release_d, &release_t] {
+        let (lock, cvar) = &**release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    drop(gated_d);
+    drop(gated_t);
+    drop(healthy);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
 }

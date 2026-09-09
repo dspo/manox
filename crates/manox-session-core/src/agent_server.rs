@@ -1694,7 +1694,14 @@ impl AgentServerInner {
         // session survives for every other owner (broadcasting here made a
         // second client's UI drop a still-live session). Owner-table
         // removal below is per-client regardless.
-        if let Some(conn) = self.clients.lock().get(owner).map(|e| e.conn.clone()) {
+        // B4 (review round 2): clone the connection in its OWN statement —
+        // an `if let` scrutinee temporary (the clients MutexGuard) lives to
+        // the end of the body, so the blocking sends below would otherwise
+        // run under the lock and one saturated s2c queue would freeze every
+        // dispatch, broadcast and route_call on it (§D.7: clone under the
+        // lock, send outside it — the route_note pattern).
+        let conn = self.clients.lock().get(owner).map(|e| e.conn.clone());
+        if let Some(conn) = conn {
             conn.send_to_client(FromServer::Notification {
                 note: ServerNote::SessionDisposed {
                     session_id: session_id.into(),
@@ -1733,7 +1740,14 @@ impl AgentServerInner {
         // turn keeps running for any other owner, and the thread persists for
         // reopen. Only the detaching client is told (it stops being an owner,
         // so route_note would drop the note after the table changes).
-        if let Some(conn) = self.clients.lock().get(owner).map(|e| e.conn.clone()) {
+        // B4 (review round 2): clone the connection in its OWN statement —
+        // an `if let` scrutinee temporary (the clients MutexGuard) lives to
+        // the end of the body, so the blocking sends below would otherwise
+        // run under the lock and one saturated s2c queue would freeze every
+        // dispatch, broadcast and route_call on it (§D.7: clone under the
+        // lock, send outside it — the route_note pattern).
+        let conn = self.clients.lock().get(owner).map(|e| e.conn.clone());
+        if let Some(conn) = conn {
             conn.send_to_client(FromServer::Notification {
                 note: ServerNote::SessionDisposed {
                     session_id: session_id.into(),
