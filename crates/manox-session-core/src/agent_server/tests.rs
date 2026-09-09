@@ -6909,3 +6909,40 @@ fn poll_store(what: &str, pred: impl Fn(&manox_agent::thread_store::ThreadStore)
         std::thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// B5 (review round 2): `persisted_session_file` joins a WIRE-supplied
+/// session id into a path, and the cold reads (PageHistory, the follow cold
+/// snapshot) run it BEFORE any not-found guard — an unvalidated id
+/// ("subagents/<uuid>", "../../x") could probe arbitrary jsonl-shaped files
+/// under the manox home. The shape gate admits only the minters' charset.
+#[test]
+fn persisted_session_file_rejects_traversal_ids() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    assert!(
+        persisted_session_file("3f2b8c1e-9d4a-4c7e-8f2b-1a6b5c4d3e2f").is_some(),
+        "a uuid-shaped id maps to its session file"
+    );
+    assert!(
+        persisted_session_file("u6b-d1").is_some(),
+        "the suite's alphanumeric-dash ids stay valid"
+    );
+    for bad in [
+        "",
+        "..",
+        ".",
+        "../../etc/passwd",
+        "subagents/abc",
+        "back\\slash",
+        "with space",
+        "dot.suffix",
+        "nul\u{0}",
+        "external:claude:deadbeef",
+    ] {
+        assert!(
+            persisted_session_file(bad).is_none(),
+            "the traversal/hostile id {bad:?} must not mint a path"
+        );
+    }
+}

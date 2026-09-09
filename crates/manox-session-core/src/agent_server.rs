@@ -1502,6 +1502,22 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
 /// repository scan use, so the GW11 identity probe, the GW6 cold read, and
 /// the eventual materialization can never disagree about the file.
 pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
+    // B5 (review round 2): wire-supplied ids reach this join BEFORE the
+    // not-found guards (PageHistory / the follow cold read), so an
+    // unvalidated id could probe arbitrary jsonl-shaped files under the
+    // manox home ("subagents/<uuid>", "../../x"). Session ids are the
+    // minters' uuid charset; admit ASCII alphanumeric, '-' and '_' only —
+    // no separators, no dots, no control bytes — and keep this function
+    // the sole wire-id → path mint (the repository's own
+    // `session_file_name` join reads ids from journal headers, never from
+    // the wire).
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
     manox_agent::paths::sessions_dir().ok().map(|dir| {
         dir.join(manox_harness::session::repository::session_file_name(
             session_id,
