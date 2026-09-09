@@ -2606,7 +2606,7 @@ pub(crate) mod tests {
     /// would defeat the very condition under test.
     #[test]
     fn registry_display_persistence_dispatches_off_runtime() {
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
 
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.jsonl");

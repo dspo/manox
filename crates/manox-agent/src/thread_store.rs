@@ -997,10 +997,11 @@ pub fn drop_for_test() {
 }
 
 /// The directory the global store scans for session transcripts.
-/// Test-support: an end-to-end test seeds transcripts here, calls
-/// [`StoreHandle::refresh`], and switches threads to assert a cold restore
-/// loads the persisted transcript (the #765 thread-switch regression lock).
-#[cfg(any(test, feature = "test-support"))]
+/// The store is the sessions-dir single authority (review round 3, P0-1):
+/// the gateway's cold read resolves through this seam in production, so it
+/// is not test-gated. The desktop end-to-end test seeds transcripts here,
+/// calls [`StoreHandle::refresh`], and switches threads to assert a cold
+/// restore loads the persisted transcript (the #765 regression lock).
 pub fn global_sessions_dir() -> PathBuf {
     global().read(|s| s.sessions_dir.clone())
 }
@@ -1490,7 +1491,7 @@ mod tests {
     #[test]
     fn archive_survives_concurrent_pinned_write() {
         let (db, db_path) = temp_db();
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         let store = store_handle(db.clone());
@@ -1529,7 +1530,7 @@ mod tests {
     #[test]
     fn set_thread_tag_persists_to_sidecar() {
         let (db, db_path) = temp_db();
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         // A real session file so the post-write rescan keeps the row (and
@@ -1654,7 +1655,7 @@ mod tests {
     #[test]
     fn pin_and_archive_decisions_cold_append_pinned_archived_entries() {
         let (db, db_path) = temp_db();
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         // Real session files (v3 headers: the cold append rides the lazy
         // v3→v4 migration like any other writer). The child carries its

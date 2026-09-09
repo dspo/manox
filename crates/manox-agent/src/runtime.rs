@@ -84,6 +84,44 @@ pub fn init() {
     });
 }
 
+/// Throwaway HOME for test processes (review round 3, P0-2): the
+/// single-instance flock lives at `$HOME/.manox/runtime.lock`, so a
+/// developer's live app turns every test binary that calls [`init`] into a
+/// silent mid-suite `exit(1)` — no failures list, no panic location, and
+/// every later test in the binary never runs. Redirecting HOME once per
+/// process (before the first `init`) sends the flock, the provider-config
+/// lookup, and the session paths to a temp dir. Never restored: the test
+/// process is disposable.
+static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn hermetic_home_for_test() {
+    TEST_HOME.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let home = std::env::temp_dir().join(format!(
+            "manox-hermetic-home-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create hermetic test home");
+        // SAFETY: test setup only; the OnceLock runs this exactly once and
+        // callers serialize behind their crate's test globals lock before
+        // the first runtime::init.
+        unsafe { std::env::set_var("HOME", &home) };
+        home
+    });
+}
+
+/// [`init`] with the hermetic HOME redirect applied first — the test-side
+/// entry point (see [`hermetic_home_for_test`]).
+#[cfg(any(test, feature = "test-support"))]
+pub fn init_hermetic_for_test() {
+    hermetic_home_for_test();
+    init();
+}
+
 /// Returns the global tokio `Handle`. Panics if `init` was not called.
 pub fn handle() -> &'static tokio::runtime::Handle {
     HANDLE

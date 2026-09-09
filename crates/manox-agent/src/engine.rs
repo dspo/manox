@@ -6204,7 +6204,7 @@ mod tests {
     /// feed in order — the §C.3 host read face T4's follow streams ride.
     #[tokio::test]
     async fn journal_relay_feeds_storage_appends_in_seq_order() {
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
             &dir.path().join("s.jsonl"),
@@ -7235,7 +7235,7 @@ mod tests {
 
         // settle_run fires the (detached) plugin `Stop` hook through the
         // global runtime handle.
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
@@ -7957,7 +7957,7 @@ mod tests {
         // only passes when an earlier test in the binary happened to init
         // the runtime (pre-existing isolation fragility, HEAD-verified:
         // alone it panics "tokio runtime not initialized").
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();

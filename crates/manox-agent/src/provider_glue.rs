@@ -17,6 +17,11 @@ static REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 /// so registration runs exactly once per process.
 static READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static READY_FLAG: AtomicBool = AtomicBool::new(false);
+/// Set by [`install_for_test`]: once a deterministic stub is pinned, the
+/// background registration spawned by later [`init`] calls (other test
+/// scaffolds in the same binary) lands the ready flag but skips the swap.
+/// Production never sets this.
+static TEST_FROZEN: AtomicBool = AtomicBool::new(false);
 
 fn build() -> Arc<ProviderRegistry> {
     let registry = Arc::new(ProviderRegistry::new());
@@ -65,7 +70,12 @@ pub fn init() {
     }
     std::thread::spawn(move || {
         let fresh = build();
-        if let Some(lock) = REGISTRY.get() {
+        // A test-installed stub wins: once `install_for_test` froze the
+        // global, later scaffolds' builds land the ready flag but skip the
+        // swap (P0-1 determinism).
+        if !TEST_FROZEN.load(Ordering::Acquire)
+            && let Some(lock) = REGISTRY.get()
+        {
             *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
         READY_FLAG.store(true, Ordering::Release);
@@ -79,6 +89,37 @@ pub fn init() {
 #[cfg(test)]
 pub fn init_for_test() {
     let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
+}
+
+/// Test seam (review round 3, P0-1): install a pre-built registry as the
+/// process global, deterministically. Tests must not read the developer's
+/// real provider config (absent on CI ⇒ the desktop suite's
+/// `expect("a model exists")` was a deterministic red) nor race `init`'s
+/// background registration (a late Arc swap). The install FREEZES the
+/// global: later `init` calls in the same binary still run their build
+/// (landing the ready flag) but skip the swap. If a build is in flight,
+/// this waits for it first, so the install is the last write.
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_for_test(registry: Arc<ProviderRegistry>) {
+    TEST_FROZEN.store(true, Ordering::Release);
+    if REGISTRY.get().is_some() {
+        for _ in 0..500 {
+            if READY_FLAG.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    match REGISTRY.get() {
+        Some(slot) => *slot.write().unwrap_or_else(|e| e.into_inner()) = registry,
+        None => {
+            let _ = REGISTRY.set(RwLock::new(registry));
+        }
+    }
+    READY_FLAG.store(true, Ordering::Release);
+    if let Some(notify) = READY.get() {
+        notify.notify_waiters();
+    }
 }
 
 /// Wait for the one-shot initial registration to finish. Returns at once

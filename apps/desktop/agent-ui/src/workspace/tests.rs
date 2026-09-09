@@ -432,7 +432,66 @@ static STORE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// poisoned case recovers rather than cascading a failed assertion into
 /// the other store-backed test.
 fn store_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    // P0-2 (review round 3): every scaffold that reaches `runtime::init()`
+    // passes through here first — redirect HOME to a throwaway dir so the
+    // single-instance flock cannot contend a developer's live app (which
+    // used to `exit(1)` the whole test binary mid-suite with zero
+    // diagnostics). The realdata boot test opts out through its
+    // MANOX_REALDATA_HOME gate (it wants a real home).
+    if std::env::var_os("MANOX_REALDATA_HOME").is_none() {
+        manox_agent::runtime::hermetic_home_for_test();
+    }
     STORE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The P0-1 stub (review round 3): a deterministic one-model registry
+/// installed over the process global. Desktop tests must not read the
+/// developer's real `cx.providers.config.yaml` (absent on CI ⇒
+/// `expect("a model exists")` was a deterministic red) nor race
+/// `provider_glue::init()`'s background registration (a late Arc swap);
+/// `install_for_test` freezes the global so later scaffolds' `init()`
+/// calls cannot clobber it.
+fn install_stub_provider_registry() {
+    use manox_harness::core::{
+        Api, Cost, InputModality, ProviderConfig, ProviderModelConfig, ProviderRegistry,
+    };
+    let model_cfg = |id: &str| ProviderModelConfig {
+        id: id.into(),
+        name: id.into(),
+        reasoning: false,
+        input: vec![InputModality::Text],
+        context_window: 131_072,
+        max_tokens: 8_192,
+        cost: Cost::default(),
+        api: None,
+        base_url: None,
+        metadata: std::collections::HashMap::new(),
+    };
+    let registry = ProviderRegistry::new();
+    // "anthropic" with model "m" is what the switch test's v3 fixture
+    // projects on restore (`no provider registered for "anthropic"` was
+    // the silent fresh-fallback root cause); "p" covers the fixture's
+    // model_change provider id; "stub-model" gives the intent/SetModel
+    // test a distinct target. No network is ever dialed (no turn runs).
+    let provider = |models: Vec<ProviderModelConfig>| ProviderConfig {
+        name: Some("Stub".into()),
+        base_url: Some("https://stub.example".into()),
+        api_key: Some("sk-literal".into()),
+        api: Some(Api::AnthropicMessages),
+        headers: None,
+        auth_header: true,
+        models,
+    };
+    registry
+        .register_provider(
+            "anthropic",
+            provider(vec![model_cfg("m"), model_cfg("stub-model")]),
+        )
+        .unwrap();
+    registry
+        .register_provider("p", provider(vec![model_cfg("m")]))
+        .unwrap();
+    manox_agent::provider_glue::install_for_test(std::sync::Arc::new(registry));
 }
 
 /// The chip's display resolution is an EXACT registration match — a stale
@@ -485,14 +544,28 @@ fn resolve_model_identity_exact_match_only() {
     );
 }
 
-/// Unique-ish id for temp files without pulling in a uuid dependency.
+/// Unique-ish id for temp files and test session ids without pulling in a
+/// uuid dependency. The shape stays inside the wire-id charset (ASCII
+/// alphanumeric plus `-`/`_` — the B5 gate on `persisted_session_file`),
+/// because these ids double as session ids in the switch/attach tests and
+/// must survive the gateway's cold-read path: nanos for time uniqueness,
+/// the pid for cross-binary uniqueness (cargo runs test binaries in
+/// parallel), a process-local counter for same-nanos collisions. The old
+/// `{:?}` thread suffix printed `ThreadId(..)` — parens and spaces the
+/// gate rejects.
 fn uuid_like_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("{nanos}-{:?}", std::thread::current().id())
+    format!(
+        "{nanos}-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 /// A walk entered from a non-empty composer hands the user's own text
 /// back after the whole round trip: the draft is carried through every
@@ -997,6 +1070,7 @@ fn new_thread_intent_lands_projections_and_set_model_updates(cx: &mut gpui::Test
         manox_agent::provider_glue::init();
         manox_agent::thread_store::init_for_test(db.clone());
     });
+    install_stub_provider_registry();
     cx.background_executor.allow_parking();
     let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
@@ -1254,6 +1328,7 @@ fn sidebar_thread_switch_restores_transcript(cx: &mut gpui::TestAppContext) {
         manox_agent::provider_glue::init();
         manox_agent::thread_store::init_for_test(db.clone());
     });
+    install_stub_provider_registry();
     cx.background_executor.allow_parking();
 
     // Seed two persisted transcripts in the store's scan directory.

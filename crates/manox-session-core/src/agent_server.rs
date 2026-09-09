@@ -1519,11 +1519,22 @@ pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
     {
         return None;
     }
-    manox_agent::paths::sessions_dir().ok().map(|dir| {
+    // Sessions-dir single authority (review round 3, P0-1): the thread
+    // store owns the sessions dir — the production store is built from
+    // `paths::sessions_dir()` (same value, no behavior change), a test
+    // store points at its standalone temp dir, and the gateway's cold read
+    // must resolve through the store's seam or store-side fixtures starve
+    // the cold path (the `sidebar_thread_switch_restores_transcript` red).
+    // An uninitialized store falls back to the paths authority (the
+    // pre-fix behavior).
+    let dir = manox_agent::thread_store::try_global()
+        .map(|_| manox_agent::thread_store::global_sessions_dir())
+        .or_else(|| manox_agent::paths::sessions_dir().ok())?;
+    Some(
         dir.join(manox_harness::session::repository::session_file_name(
             session_id,
-        ))
-    })
+        )),
+    )
 }
 
 /// The §D.2 `CreateSession` intent: optional explicit id (the compat
