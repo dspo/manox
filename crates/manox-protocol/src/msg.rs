@@ -67,7 +67,6 @@ impl std::error::Error for RpcError {}
 /// `RpcError::new(-1, msg).with_code(CODE_MODEL_UNRESOLVABLE)`).
 pub const RPC_ERROR_CODES: &[&str] = &[
     "session/not-found",
-    "session/busy",
     "gateway/bad-request",
     "gateway/internal",
     "resync-required",
@@ -78,8 +77,6 @@ pub const RPC_ERROR_CODES: &[&str] = &[
 
 /// `session/not-found` (§D.7).
 pub const CODE_SESSION_NOT_FOUND: &str = "session/not-found";
-/// `session/busy` (§D.7).
-pub const CODE_SESSION_BUSY: &str = "session/busy";
 /// `gateway/bad-request` (§D.7).
 pub const CODE_GATEWAY_BAD_REQUEST: &str = "gateway/bad-request";
 /// `gateway/internal` (§D.7).

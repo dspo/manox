@@ -28,8 +28,10 @@ pub struct ThreadListItem {
     /// DEPRECATED (GW5): unread is client-owned — the server keeps no focus
     /// mirror, so list responses always report `false` and clients derive
     /// unread from the `SessionStatus.unread` deltas (raised at every settle)
-    /// cleared locally on focus. Field retained for wire compatibility
-    /// through the dual-protocol window; C4 removes it.
+    /// cleared locally on focus. Field retained for wire compatibility; the
+    /// dual-protocol window collapsed to the in-repo C4b batch when the VS
+    /// Code extension (its last external consumer) was removed — the
+    /// repository-boundary ruling records the retirement.
     pub unread: bool,
     pub errored: bool,
     pub pending_auth: bool,

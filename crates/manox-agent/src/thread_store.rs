@@ -1835,7 +1835,7 @@ mod tests {
                 "round {round}: both decisions readable through the chain (a fork strands one)"
             );
             assert!(
-                entries.iter().any(|e| *e == (true, true)),
+                entries.contains(&(true, true)),
                 "round {round}: the archive full-state row landed: {entries:?}"
             );
         }
