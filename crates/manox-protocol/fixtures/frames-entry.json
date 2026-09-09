@@ -1,11 +1,11 @@
 {
-  "event": {
-    "s": "hi",
-    "type": "agentTextDelta"
-  },
+  "type": "entry",
+  "seq": 2,
   "id": "e-2",
   "parentId": "e-1",
-  "seq": 2,
   "timestamp": "2026-09-04T00:00:00Z",
-  "type": "entry"
+  "event": {
+    "type": "agentTextDelta",
+    "s": "hi"
+  }
 }

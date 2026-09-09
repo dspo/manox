@@ -1,11 +1,11 @@
 //! Shared-vector conformance tests for the [`JournalStream`] engine (T3).
 //!
-//! Loads `crates/manox-protocol/test-vectors/journal-cases.json` — the same
-//! file the webui vitest suite loads (`apps/web/webui/src/sidebar/webview/
-//! state/journal.test.ts`) — and drives the engine case by case, asserting the
-//! exact publish sequence and the first protocol violation. The TS twin engine
-//! in `state/journal.ts` must stay behaviourally identical; the vectors are the
-//! equivalence contract.
+//! Loads `crates/manox-protocol/test-vectors/journal-cases.json` and drives
+//! the engine case by case, asserting the exact publish sequence and the
+//! first protocol violation. The vectors were the shared equivalence
+//! contract with the webui's TS twin engine (`state/journal.ts`, removed
+//! with the frontend; final state at tag `archive/frontends-final`); the
+//! Rust side remains the contract's executor.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

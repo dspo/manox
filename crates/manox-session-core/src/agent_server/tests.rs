@@ -2045,7 +2045,7 @@ fn open_session_snapshot_subscribe_is_atomic() {
 use manox_protocol::transport::{BACKPRESSURE_CAPACITY, BackpressurePolicy, RpcConnection};
 
 /// A serde-loopback connection: every message crosses the wire as JSON —
-/// the serialization shape the napi/webui transports use. Round-trips
+/// the serialization shape the napi and WS-gateway transports use. Round-trips
 /// `FromServer`/`FromClient` through `serde_json` inside the send calls
 /// and applies the same backpressure semantics as the in-process pair.
 struct SerdeLoopbackConn {

@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn initialize_round_trips() {
         let init = Initialize {
-            client_id: "webui".into(),
+            client_id: "client-a".into(),
             capabilities: vec![HookKind::Approve],
             sessions: vec![],
             protocol_epoch: PROTOCOL_EPOCH,

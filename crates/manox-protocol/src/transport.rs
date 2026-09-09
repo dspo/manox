@@ -8,7 +8,8 @@
 //!
 //! Scope decision (ε closeout, 2026-08-31): no tauri transport is planned —
 //! the transport surface stays in-process (desktop) and serde-serialized
-//! (napi/webui). A tauri shell, if ever pursued, opens its own plan.
+//! (napi, and the WS gateway in `manox-session-core::ws`). A tauri shell,
+//! if ever pursued, opens its own plan.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,7 +55,7 @@ pub enum BackpressurePolicy {
 
 impl ServerNote {
     /// Legacy (v1) streaming classification — kept verbatim because live
-    /// consumers (webui ws pump, session-core pumps) compare against
+    /// consumers (the session-core ws gateway and pumps) compare against
     /// `Drop`/`Disconnect`. The §D.7 successor strategy is expressed over
     /// the v2 vocabulary: [`crate::stream::StreamFrame::backpressure_policy`]
     /// (Snapshot/Projections/StreamEnd never drop; Entry bounded ⇒ resync)

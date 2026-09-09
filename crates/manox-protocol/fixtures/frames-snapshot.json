@@ -1,13 +1,39 @@
 {
-  "cursor": 1,
-  "hasMore": false,
+  "type": "snapshot",
+  "sessionId": "s1",
   "header": {
-    "createdAt": "2026-09-04T00:00:00Z",
-    "cwd": "/proj",
     "id": "s1",
+    "cwd": "/proj",
+    "parentSession": null,
     "metadata": null,
-    "parentSession": null
+    "createdAt": "2026-09-04T00:00:00Z"
   },
+  "cursor": 1,
+  "records": [
+    {
+      "seq": 0,
+      "id": "e-0",
+      "parentId": null,
+      "timestamp": "2026-09-04T00:00:00Z",
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "hello"
+        }
+      ],
+      "usage": {
+        "input": 10,
+        "output": 2,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "reasoning": 0
+      },
+      "originRpc": "rpc-echo-1"
+    }
+  ],
+  "hasMore": false,
   "projections": {
     "agent_label": "agent_label",
     "archived": "archived",
@@ -30,31 +56,5 @@
     "self_author": "self_author",
     "title": "title"
   },
-  "projectionsAsOfSeq": 0,
-  "records": [
-    {
-      "content": [
-        {
-          "text": "hello",
-          "type": "text"
-        }
-      ],
-      "id": "e-0",
-      "originRpc": "rpc-echo-1",
-      "parentId": null,
-      "role": "user",
-      "seq": 0,
-      "timestamp": "2026-09-04T00:00:00Z",
-      "type": "message",
-      "usage": {
-        "cacheRead": 0,
-        "cacheWrite": 0,
-        "input": 10,
-        "output": 2,
-        "reasoning": 0
-      }
-    }
-  ],
-  "sessionId": "s1",
-  "type": "snapshot"
+  "projectionsAsOfSeq": 0
 }

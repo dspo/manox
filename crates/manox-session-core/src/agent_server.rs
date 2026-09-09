@@ -1,7 +1,8 @@
 //! AgentServer — the single protocol gateway.
 //!
 //! The only public surface between frontends and the gpui-free kernel: every
-//! client (gpui desktop, WebUI, future VS Code) speaks [`manox_protocol`] over
+//! client (the gpui desktop in-process, and any WS-gateway or napi host)
+//! speaks [`manox_protocol`] over
 //! an [`RpcConnection`], and the server drives kernel [`ThreadHandle`]s from
 //! those messages. Kernel [`ThreadEvent`]s are projected through
 //! [`crate::translate`] into [`ServerNote`] (streamed to the owning client) or
@@ -1339,7 +1340,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             // Compat entry (§D.3 dual-protocol window): forward to the §D.2
             // request path (no intent fields beyond cwd) and discard the
             // receipt — v1 clients never await it. The explicit
-            // `session_id` is passed through so the desktop/webui ids stay
+            // `session_id` is passed through so the desktop ids stay
             // stable; the request path is idempotent on a live session.
             let intent = SessionIntent {
                 session_id: Some(session_id),

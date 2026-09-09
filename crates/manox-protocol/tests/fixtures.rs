@@ -1,5 +1,8 @@
-//! Fixture export (§D.8): real frames as JSON files consumed by the webui
-//! vitest guard suite (T3) — dual-path consistency on the TS side (J.5).
+//! Fixture export (§D.8): real frames as JSON files. Historically consumed
+//! by the webui vitest guard suite (T3, J.5 dual-path consistency); the TS
+//! twin was removed with the frontend (final state at tag
+//! `archive/frontends-final`) and the fixtures remain the exported
+//! wire-contract surface (L12) for any future client.
 //!
 //! Every run of the test suite rewrites `crates/manox-protocol/fixtures/`
 //! from the same typed samples the surface harness walks, so fixtures can

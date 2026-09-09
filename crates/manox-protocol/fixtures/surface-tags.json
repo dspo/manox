@@ -1,58 +1,4 @@
 {
-  "clientCalls": [
-    "initialize",
-    "openSession",
-    "listThreads",
-    "listModels",
-    "listCommands",
-    "terminalAttach",
-    "terminalSnapshot",
-    "modelChat",
-    "createSession",
-    "submit",
-    "steer",
-    "pageHistory",
-    "getConversationInfo",
-    "cancelDelivery"
-  ],
-  "clientNotes": [
-    "createSession",
-    "disposeSession",
-    "detachSession",
-    "submit",
-    "steer",
-    "dropQueued",
-    "cancelTurn",
-    "setModel",
-    "setReasoningEffort",
-    "setApprovalMode",
-    "setCwd",
-    "setPlanMode",
-    "setBrowserSuite",
-    "planSeedExecution",
-    "compact",
-    "goal",
-    "stopBackgroundTask",
-    "archiveThread",
-    "pinThread",
-    "terminalInput",
-    "terminalResize",
-    "cancelModelChat",
-    "shutdown",
-    "appendUserMessage",
-    "appendUiNote"
-  ],
-  "hostEvents": [
-    "ready",
-    "models",
-    "commands",
-    "threadsUpdated",
-    "sessionStatus",
-    "sessionCreated",
-    "sessionDisposed",
-    "error",
-    "projects"
-  ],
   "journalEntries": [
     "message",
     "uiNote",
@@ -115,6 +61,74 @@
     "agent_label",
     "self_author"
   ],
+  "hostEvents": [
+    "ready",
+    "models",
+    "commands",
+    "threadsUpdated",
+    "sessionStatus",
+    "sessionCreated",
+    "sessionDisposed",
+    "error",
+    "projects"
+  ],
+  "streamKinds": [
+    "followSession"
+  ],
+  "streamFrames": [
+    "snapshot",
+    "entry",
+    "projections"
+  ],
+  "streamEndReasons": [
+    "closed",
+    "cancelled",
+    "resync",
+    "failure"
+  ],
+  "clientCalls": [
+    "initialize",
+    "openSession",
+    "listThreads",
+    "listModels",
+    "listCommands",
+    "terminalAttach",
+    "terminalSnapshot",
+    "modelChat",
+    "createSession",
+    "submit",
+    "steer",
+    "pageHistory",
+    "getConversationInfo",
+    "cancelDelivery"
+  ],
+  "clientNotes": [
+    "createSession",
+    "disposeSession",
+    "detachSession",
+    "submit",
+    "steer",
+    "dropQueued",
+    "cancelTurn",
+    "setModel",
+    "setReasoningEffort",
+    "setApprovalMode",
+    "setCwd",
+    "setPlanMode",
+    "setBrowserSuite",
+    "planSeedExecution",
+    "compact",
+    "goal",
+    "stopBackgroundTask",
+    "archiveThread",
+    "pinThread",
+    "terminalInput",
+    "terminalResize",
+    "cancelModelChat",
+    "shutdown",
+    "appendUserMessage",
+    "appendUiNote"
+  ],
   "serverCalls": [
     "approve",
     "planVerdict",
@@ -135,19 +149,5 @@
     "modelToolCall",
     "modelChatDone",
     "error"
-  ],
-  "streamEndReasons": [
-    "closed",
-    "cancelled",
-    "resync",
-    "failure"
-  ],
-  "streamFrames": [
-    "snapshot",
-    "entry",
-    "projections"
-  ],
-  "streamKinds": [
-    "followSession"
   ]
 }

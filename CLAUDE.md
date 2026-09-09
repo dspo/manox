@@ -18,11 +18,11 @@ crates/                    # Rust workspace 成员
     src/ext/               # 经内核拓展点扩展的业务能力
   manox-protocol/          # 协议定义
   manox-session-core/      # 会话核心
-  manox-webui/             # Web UI 共享逻辑
   supervisor/              # 子进程监督
   hyperlinks/              # 超链接解析
   lsp/                     # LSP 集成
   cx/                      # cx CLI 路由域
+  manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
 
 apps/                      # 应用二进制与 UI
   desktop/                 # 桌面应用
@@ -32,9 +32,6 @@ apps/                      # 应用二进制与 UI
     manox-components/      # 共享 UI 组件库
     manox-webview/         # WebView 桥
     manox-webview-macros/  # WebView 过程宏
-  vscode/                  # VS Code 扩展（TS） + manox-napi
-  web/                     # Web UI 前端
-    webui/                 # 前端源码
 ```
 
 ## 构建与开发命令
