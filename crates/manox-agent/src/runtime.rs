@@ -92,6 +92,7 @@ pub fn init() {
 /// process (before the first `init`) sends the flock, the provider-config
 /// lookup, and the session paths to a temp dir. Never restored: the test
 /// process is disposable.
+#[cfg(any(test, feature = "test-support"))]
 static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-support"))]

@@ -688,16 +688,14 @@ mod tests {
             &mut seq,
         );
 
-        let declared: std::collections::BTreeSet<String> =
-            manox_protocol::surface::PROJECTION_KEYS
-                .iter()
-                .map(|k| k.to_string())
-                .collect();
-        let seed_only: std::collections::BTreeSet<String> =
-            ["depth", "agent_label", "self_author"]
-                .into_iter()
-                .map(|k| k.to_string())
-                .collect();
+        let declared: std::collections::BTreeSet<String> = manox_protocol::surface::PROJECTION_KEYS
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        let seed_only: std::collections::BTreeSet<String> = ["depth", "agent_label", "self_author"]
+            .into_iter()
+            .map(|k| k.to_string())
+            .collect();
         let undeclared: Vec<&String> = folded.difference(&declared).collect();
         assert!(
             undeclared.is_empty(),

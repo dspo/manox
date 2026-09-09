@@ -51,6 +51,13 @@ run_leg() {
 }
 
 run_leg "fmt" cargo fmt --all -- --check
+# The production-unit shape: no dev-deps, no reverse-dependency feature
+# enablement — cfg-gated items whose consumers are all gated are
+# dead_code HERE, exactly the unit CI compiles (the a6df124e TEST_HOME
+# lesson: the local --all-targets unification can mask it).
+run_leg "prod-libs" cargo check \
+    -p manox-agent -p manox-session-core -p manox-protocol \
+    -p manox-harness -p manox-napi -p cx --lib
 run_leg "clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_leg "test-real" cargo test --workspace --all-targets --no-fail-fast
 

@@ -616,11 +616,7 @@ mod tests {
         // ("workspace-write", "high") equalled the unwrap_or_default
         // fallbacks, so a total parse failure was indistinguishable from
         // success (the review's "zero discriminating power" note).
-        store.merge_projection(
-            "permission_mode",
-            Value::String("read-only".into()),
-            1,
-        );
+        store.merge_projection("permission_mode", Value::String("read-only".into()), 1);
         store.merge_projection("reasoning_effort", Value::String("max".into()), 1);
         store.merge_projection("plan_mode", Value::Bool(true), 1);
         store.merge_projection("running", Value::Bool(true), 1);

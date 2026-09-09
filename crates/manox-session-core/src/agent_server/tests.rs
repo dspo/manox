@@ -1572,7 +1572,11 @@ fn set_model_and_thread_info() {
     assert_eq!(got, want, "snapshot baseline IS the declared surface");
     let p = &snap.projections;
     assert_eq!(p["cwd"], json!("/"));
-    assert_eq!(p["permission_mode"], json!("workspace_write"));
+    // P0-5: the seed speaks the entry vocabulary — `PermissionMode::wire()`
+    // kebab, the same string the fold passes through and the desktop
+    // parses with serde. The snake_case literal this asserted was the
+    // split vocabulary the unwrap_or_default fallback silently absorbed.
+    assert_eq!(p["permission_mode"], json!("workspace-write"));
     assert_eq!(p["self_author"], json!("lead"));
     assert_eq!(p["running"], json!(false));
     assert_eq!(p["plan_mode"], json!(false));
