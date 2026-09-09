@@ -1,19 +1,24 @@
-// Append-only JSONL session storage (format version 3).
+// Append-only JSONL session storage (format version 4; a v3 file loads
+// and lazily migrates on its next append).
 //
 // Layout of a session file (the caller picks the path — typically a
 // `timestamp_sessionId.jsonl` under a per-cwd directory, matching the TS Pi
 // repo naming):
-//   line 0 — a session header: `{"type":"session","version":3,"id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`.
+//   line 0 — a session header: `{"type":"session","version":4,"id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`
+//              (a v3 header, `"version":3`, loads and migrates).
 //   line 1.. — session-tree entries, appended in occurrence order. A `leaf`
 //              entry records a cursor move to an older branch point
 //              (`targetId`); any other entry implicitly makes itself the
 //              cursor. The leaf cursor is `targetId` for a trailing leaf
-//              entry, otherwise the last entry's id. The file is strictly
-//              append-only: no field is ever rewritten.
+//              entry, otherwise the last entry's id. Appends are strictly
+//              additive — no field of an existing line is ever rewritten;
+//              the one whole-file replace is the v3→v4 lazy migration,
+//              which stamps the chain-dense v4 `seq` onto every line
+//              (§C.1) through the atomic temp+rename below.
 //
 // `open` takes the exact file path. A missing file is created with `metadata`
-// as its header; an existing file must begin with a valid v3 session header,
-// otherwise this errors rather than guessing at a repair.
+// as its header; an existing file must begin with a valid v3 or v4 session
+// header, otherwise this errors rather than guessing at a repair.
 
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -221,7 +226,7 @@ impl JsonlSessionStorage {
 
     /// Open an existing session file at `path`.
     ///
-    /// The file must exist and begin with a valid v3 session header; otherwise
+    /// The file must exist and begin with a valid v3 or v4 session header;
     /// this errors rather than guessing at a repair. Unlike [`Self::create`], a
     /// missing or mis-typed path surfaces as an error so a recovery path can
     /// never silently materialize an empty session.
@@ -472,10 +477,20 @@ impl JsonlSessionStorage {
         // the sidebar scan or an ecosystem tool reading the journal) staring
         // at a half-written or empty session file; with rename, readers see
         // either the complete old file or the complete new one, never a
-        // truncation in between. The temp name is per-session and the rewrite
-        // runs under `append_lock`, so two rewrites can never race on it, and
-        // the `.tmp` suffix keeps session-directory scans off the artifact.
-        let tmp = self.jsonl_path.with_extension("jsonl.tmp");
+        // truncation in between. `append_lock` serializes rewrites WITHIN
+        // one instance only — two instances over one file (the B3 cold
+        // append race) each hold their own — so the temp name itself is
+        // unique per rewrite (pid + process-local counter): a concurrent
+        // writer can never truncate this rewrite's artifact mid-flight.
+        // The `.tmp` suffix keeps session-directory scans
+        // (extension == "jsonl") off the artifact.
+        static REWRITE_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let tmp = self.jsonl_path.with_extension(format!(
+            "jsonl.{}.{}.tmp",
+            std::process::id(),
+            REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let mut file = File::create(&tmp).await?;
         file.write_all(content.as_bytes()).await?;
         file.sync_all().await?;

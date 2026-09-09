@@ -759,6 +759,30 @@ async fn wait_then_cold_journal_append(
     cold_journal_append(session_path, kind, payload).await;
 }
 
+/// B3 (review round 3): the cold-append serialization locks, keyed by
+/// journal path. Each cold append opens a FRESH storage instance whose
+/// `append_lock`/leaf/seq views are instance-scoped — two spawned
+/// decisions on one engine-less thread (pin + archive is the canonical
+/// pair, and a retiring actor's `Fate::Wait` queue funnels several)
+/// raced: same parent, self-stamped seqs, a forked chain the load
+/// validator accepts (sibling rows are legal) while the cursor keeps
+/// only the file-last branch — the earlier decision silently left the
+/// chain. Entries are never evicted: one small map entry per distinct
+/// cold-appended session, process-lifetime.
+static COLD_APPEND_LOCKS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::OnceLock::new();
+
+fn cold_append_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = COLD_APPEND_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.entry(path.to_path_buf())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
 /// Cold journal append for a decision whose thread has no live engine (K3):
 /// open the session file and land the typed row through the same storage
 /// face a live actor uses (`append_typed`: parent selection + append lock +
@@ -783,6 +807,13 @@ async fn cold_journal_append(
         tracing::debug!(kind, path = %path.display(), "session file does not exist; the sidecar carries the flag");
         return;
     }
+    // B3: the file-level serialization the per-instance append_lock cannot
+    // give — held across the open (leaf/seq view) AND the append (stamp +
+    // write + the v3 lazy migration), so concurrent cold appends to one
+    // file run strictly one after another. The live-engine path needs no
+    // such lock: its actor owns the file.
+    let path_lock = cold_append_lock(&path);
+    let _guard = path_lock.lock().await;
     let storage = match manox_harness::session::jsonl::JsonlSessionStorage::open(&path).await {
         Ok(storage) => storage,
         Err(err) => {

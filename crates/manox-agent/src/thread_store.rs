@@ -1756,4 +1756,89 @@ mod tests {
         );
         std::fs::remove_file(db_path).ok();
     }
+
+    /// B3/P0-4 (review round 3): two store decisions on one engine-less
+    /// thread each spawn their own cold append — fresh storage instances
+    /// whose instance-scoped append locks never see each other. Raced on a
+    /// v3 file (where both appends also race the lazy v3→v4 migration,
+    /// which used to share one temp name), they must still land a LINEAR
+    /// chain: the chain-walking journal_range reads BOTH `pinned_archived`
+    /// rows. Pre-fix the pair forked — both rows parented to the same
+    /// leaf, each seq self-stamped, the load validator accepts siblings,
+    /// and the cursor kept only the file-last branch, so the range never
+    /// reached 2 and the earlier decision silently left the chain. Three
+    /// rounds: the race window is narrow; the serialization (the engine's
+    /// per-path cold-append lock + the rewrite's unique temp name) is what
+    /// makes every round converge.
+    #[test]
+    fn concurrent_cold_appends_land_a_linear_chain() {
+        let (db, db_path) = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let entries_for = |path: &std::path::Path| -> Vec<(bool, bool)> {
+            crate::runtime::handle()
+                .block_on(async {
+                    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+                        .await
+                        .unwrap();
+                    storage.journal_range(0, u64::MAX).await.unwrap()
+                })
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::PinnedArchived {
+                        pinned,
+                        archived,
+                        ..
+                    } => Some((pinned, archived)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_for_entries = |path: &std::path::Path, count: usize| {
+            for _ in 0..1500 {
+                let entries = entries_for(path);
+                if entries.len() >= count {
+                    return entries;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "the racing cold appends never landed a linear chain in {}: {:?}",
+                path.display(),
+                entries_for(path)
+            );
+        };
+        let store = store_handle(db.clone());
+        for round in 0..3u32 {
+            let id = format!("k3-race-{round}");
+            let path = dir.path().join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
+            )
+            .unwrap();
+            store.with_mut(|s| {
+                s.session_paths.insert(id.clone(), path.clone());
+                s.insert_summary_for_test(&id, None);
+            });
+            // Fire BOTH decisions back-to-back: their cold-append tasks
+            // race for the same file. The lock serializes but does not
+            // order them, so assert the chain, not the sequence: both
+            // rows readable through the walk, and the archive's
+            // full-state row among them.
+            store.with_mut(|s| s.pin_thread(&id, true));
+            store.with_mut(|s| s.archive_thread(&id, true));
+            let entries = wait_for_entries(&path, 2);
+            assert_eq!(
+                entries.len(),
+                2,
+                "round {round}: both decisions readable through the chain (a fork strands one)"
+            );
+            assert!(
+                entries.iter().any(|e| *e == (true, true)),
+                "round {round}: the archive full-state row landed: {entries:?}"
+            );
+        }
+        std::fs::remove_file(db_path).ok();
+    }
 }
