@@ -612,12 +612,16 @@ mod tests {
     #[test]
     fn projections_materialize_mirror_fields() {
         let mut store = ClientStore::default();
+        // P0-5: feed the NON-default variants — the old feeds
+        // ("workspace-write", "high") equalled the unwrap_or_default
+        // fallbacks, so a total parse failure was indistinguishable from
+        // success (the review's "zero discriminating power" note).
         store.merge_projection(
             "permission_mode",
-            Value::String("workspace-write".into()),
+            Value::String("read-only".into()),
             1,
         );
-        store.merge_projection("reasoning_effort", Value::String("high".into()), 1);
+        store.merge_projection("reasoning_effort", Value::String("max".into()), 1);
         store.merge_projection("plan_mode", Value::Bool(true), 1);
         store.merge_projection("running", Value::Bool(true), 1);
         store.merge_projection("depth", Value::from(2u64), 1);
@@ -630,11 +634,22 @@ mod tests {
         );
         assert_eq!(
             store.permission_mode,
-            manox_agent::thread::PermissionMode::WorkspaceWrite
+            manox_agent::thread::PermissionMode::ReadOnly
         );
         assert_eq!(
             store.reasoning_effort,
-            manox_agent::language_model::ReasoningEffort::High
+            manox_agent::language_model::ReasoningEffort::Max
+        );
+        // The third variant too: one merge can never be a one-shot fluke
+        // of the fallback value.
+        store.merge_projection(
+            "permission_mode",
+            Value::String("danger-full-access".into()),
+            2,
+        );
+        assert_eq!(
+            store.permission_mode,
+            manox_agent::thread::PermissionMode::DangerFullAccess
         );
         assert!(store.plan_mode);
         assert!(store.running);

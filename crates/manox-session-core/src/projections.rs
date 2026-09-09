@@ -40,11 +40,14 @@ impl ProjectionSet {
 
     /// Seed from a thread reference (test / replay entry point).
     pub fn seed_from(t: &Thread) -> Self {
-        let permission = match t.permission_mode() {
-            manox_harness::sandbox::PermissionMode::ReadOnly => "read_only",
-            manox_harness::sandbox::PermissionMode::WorkspaceWrite => "workspace_write",
-            manox_harness::sandbox::PermissionMode::DangerFullAccess => "danger_full_access",
-        };
+        // P0-5 (review round 3): the SAME `wire()` the engine mints entry
+        // strings with — the fold passes those kebab strings through and
+        // the desktop parses them through serde's kebab rename. The old
+        // snake_case literals split the vocabulary in two: a read-only or
+        // danger-full-access session seeded a baseline the desktop's
+        // `unwrap_or_default` silently rendered as workspace-write until
+        // the first change entry landed (every reopen/resync replayed it).
+        let permission = t.permission_mode().wire();
         let effort = match t.reasoning_effort() {
             manox_agent::language_model::ReasoningEffort::High => "high",
             manox_agent::language_model::ReasoningEffort::Max => "max",
@@ -173,17 +176,13 @@ impl ProjectionSet {
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 self.set("plan", snapshot.clone(), seq);
             }
-            SessionTreeEntry::PlanReview { state, .. } => {
-                // C4 vocabulary augmentation: the pending_plan projection's
-                // fold source (the sidecar flag is the pre-vocabulary
-                // hole-fill; the verdict discriminant rides the notice
-                // plane).
-                self.set(
-                    "plan_review_pending",
-                    serde_json::json!(state == "proposed"),
-                    seq,
-                );
-            }
+            // `PlanReview` folds nothing: `pending_plan` rides the §D.5
+            // SessionStatus deltas (the server verdict legs clear it). The
+            // arm used to write `plan_review_pending` — a key that was
+            // never declared, so set() silently no-op'd it (§二.5's dead
+            // fold write; the P0-5 debug_assert below now catches any
+            // recurrence in every test that folds).
+            SessionTreeEntry::PlanReview { .. } => {}
             SessionTreeEntry::Goal { goal, .. } => {
                 self.set("goal", goal.clone().unwrap_or(JsonValue::Null), seq);
             }
@@ -295,16 +294,23 @@ impl ProjectionSet {
     }
 
     fn set(&mut self, key: &'static str, value: JsonValue, seq: u64) {
-        if let Some(slot) = self.slots.get_mut(key) {
-            if slot.value != value {
-                slot.value = value;
-                slot.as_of_seq = seq;
-                slot.dirty = true;
-            } else if seq > slot.as_of_seq {
-                // Same value re-derived later: no publish (idempotent), but
-                // the stamp stays monotonic for the frame contract.
-                slot.as_of_seq = seq;
-            }
+        let Some(slot) = self.slots.get_mut(key) else {
+            // P0-5/§二.5: an undeclared key is a vocabulary bug — the dead
+            // `plan_review_pending` write survived exactly this silent
+            // no-op. The declared surface (PROJECTION_KEYS ↔ the seed) is
+            // the contract: production folds drop it, debug builds fail
+            // loud.
+            debug_assert!(false, "projection set() on undeclared key {key:?}");
+            return;
+        };
+        if slot.value != value {
+            slot.value = value;
+            slot.as_of_seq = seq;
+            slot.dirty = true;
+        } else if seq > slot.as_of_seq {
+            // Same value re-derived later: no publish (idempotent), but
+            // the stamp stays monotonic for the frame contract.
+            slot.as_of_seq = seq;
         }
     }
 }
@@ -449,5 +455,262 @@ mod tests {
         let (seq, changed) = set.drain_changed().unwrap();
         assert_eq!(seq, 5);
         assert!(changed.contains_key("model"));
+    }
+
+    /// P0-5 parity lock: the seed's `wire()` and the fold's pass-through
+    /// of the engine-minted entry string are ONE vocabulary — serde's
+    /// kebab rename and `wire()` must mint the same string for every
+    /// variant (the desktop parses the projection value with serde; a
+    /// disagreement silently renders its unwrap_or_default fallback).
+    #[test]
+    fn permission_mode_wire_and_serde_agree() {
+        use manox_harness::sandbox::PermissionMode;
+        for mode in [
+            PermissionMode::ReadOnly,
+            PermissionMode::WorkspaceWrite,
+            PermissionMode::DangerFullAccess,
+        ] {
+            assert_eq!(
+                serde_json::json!(mode.wire()),
+                serde_json::json!(mode),
+                "wire() and the serde rename must mint one string"
+            );
+        }
+    }
+
+    /// P0-5 structural lock (review round 3): every declared key except
+    /// the explicit seed-only trio (`depth`, `agent_label`, `self_author`
+    /// — sidecar/scan-driven, no journal entry mints them) is written by
+    /// at least one fold arm, and no fold arm writes an undeclared key
+    /// (the set() debug_assert would fire first in this debug build; the
+    /// collected set makes the coverage direction explicit). The feeds
+    /// deliberately differ from the seed defaults so every arm's write
+    /// registers as dirty.
+    #[test]
+    fn fold_arms_cover_every_declared_key_but_the_seed_only_trio() {
+        use manox_harness::session::SessionTreeEntry as E;
+        use manox_harness::types::ContentBlock;
+        let mut set = seeded();
+        let ts = chrono::Utc::now();
+        let mut seq = 1u64;
+        let mut folded = std::collections::BTreeSet::new();
+        let mut feed = |set: &mut ProjectionSet, entry: E, seq: &mut u64| {
+            set.apply_event(*seq, &entry);
+            *seq += 1;
+            if let Some((_, values)) = set.drain_changed() {
+                folded.extend(values.into_keys());
+            }
+        };
+        feed(
+            &mut set,
+            E::Message {
+                id: "sw-m".into(),
+                parent_id: None,
+                timestamp: ts,
+                message: AgentMessage::User {
+                    content: vec![ContentBlock::Text {
+                        text: "hi".into(),
+                        signature: None,
+                    }],
+                    timestamp: ts,
+                },
+                origin: None,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::TurnStart {
+                id: "sw-ts".into(),
+                parent_id: None,
+                timestamp: ts,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::TurnFinish {
+                id: "sw-tf".into(),
+                parent_id: None,
+                timestamp: ts,
+                cancelled: false,
+                failed: false,
+                stranded_steer_ids: vec![],
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::ModelChange {
+                id: "sw-mc".into(),
+                parent_id: None,
+                timestamp: ts,
+                provider: "anthropic".into(),
+                model_id: "sweep-model".into(),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::CwdChange {
+                id: "sw-cw".into(),
+                parent_id: None,
+                timestamp: ts,
+                cwd: "/sweep".into(),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::ProjectChange {
+                id: "sw-pj".into(),
+                parent_id: None,
+                timestamp: ts,
+                path: Some("/sweep-project".into()),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::ThinkingLevelChange {
+                id: "sw-tl".into(),
+                parent_id: None,
+                timestamp: ts,
+                thinking_level: "max".into(),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::PermissionModeChange {
+                id: "sw-pm".into(),
+                parent_id: None,
+                timestamp: ts,
+                mode: "read-only".into(),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::PlanModeChange {
+                id: "sw-plm".into(),
+                parent_id: None,
+                timestamp: ts,
+                enabled: true,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::PlanUpdate {
+                id: "sw-plu".into(),
+                parent_id: None,
+                timestamp: ts,
+                snapshot: serde_json::json!({ "steps": [] }),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::Goal {
+                id: "sw-g".into(),
+                parent_id: None,
+                timestamp: ts,
+                goal: Some(serde_json::json!({ "objective": "sweep" })),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::Title {
+                id: "sw-t".into(),
+                parent_id: None,
+                timestamp: ts,
+                title: "sweep-title".into(),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::BrowserSuites {
+                id: "sw-bs".into(),
+                parent_id: None,
+                timestamp: ts,
+                suites: vec!["webexplore".into()],
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::PinnedArchived {
+                id: "sw-pa".into(),
+                parent_id: None,
+                timestamp: ts,
+                pinned: true,
+                archived: true,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::BranchSummary {
+                id: "sw-br".into(),
+                parent_id: None,
+                timestamp: ts,
+                from_id: "sw-m".into(),
+                summary: "sweep summary".into(),
+                details: None,
+                usage: None,
+                from_hook: None,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::BackgroundTask {
+                id: "sw-bt".into(),
+                parent_id: None,
+                timestamp: ts,
+                snapshot: serde_json::json!({ "taskId": "sweep-task" }),
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::Approval {
+                id: "sw-ap".into(),
+                parent_id: None,
+                timestamp: ts,
+                kind: "request".into(),
+                auth_id: "sweep-auth".into(),
+                payload: serde_json::json!({}),
+            },
+            &mut seq,
+        );
+
+        let declared: std::collections::BTreeSet<String> =
+            manox_protocol::surface::PROJECTION_KEYS
+                .iter()
+                .map(|k| k.to_string())
+                .collect();
+        let seed_only: std::collections::BTreeSet<String> =
+            ["depth", "agent_label", "self_author"]
+                .into_iter()
+                .map(|k| k.to_string())
+                .collect();
+        let undeclared: Vec<&String> = folded.difference(&declared).collect();
+        assert!(
+            undeclared.is_empty(),
+            "fold wrote undeclared keys: {undeclared:?}"
+        );
+        let unfolded: Vec<String> = declared
+            .difference(&folded)
+            .filter(|k| !seed_only.contains(*k))
+            .cloned()
+            .collect();
+        assert!(
+            unfolded.is_empty(),
+            "declared keys no fold arm writes (and not in the seed-only trio): {unfolded:?}"
+        );
     }
 }
