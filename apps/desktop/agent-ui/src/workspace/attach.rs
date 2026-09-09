@@ -581,12 +581,18 @@ impl Workspace {
                     serde_json::from_value::<manox_agent::plan::PlanSnapshot>(v.clone()).ok()
                 })
         });
+        let rail_leaf = self.store.clone();
         self.context_rail.update(cx, |r, cx| {
-            // U7b: the rail's reads are store-only, so the rebind is the
-            // switch reset below — the incoming thread's leaf (already
-            // swapped on `self.store`) feeds every section (per-model
-            // usage, project, title); no kernel handle crosses into the
-            // view.
+            // Rail-freeze fix (the visual-acceptance report): the store is
+            // the rail's only read face (U7b), and the SessionStatus deltas
+            // and info-fetch responses feeding it only reach the ATTACHED
+            // session's leaf — re-bind to the incoming leaf (already swapped
+            // on `self.store` above) so the status row and the usage
+            // sections track the live thread instead of the
+            // construction-time one.
+            r.bind_store(rail_leaf, cx);
+            // U7b: the rail's reads are store-only; the switch reset below
+            // clears the per-thread cockpit state.
             r.reset_for_thread_switch(running, cx);
             if let Some(snapshot) = restored_plan {
                 r.set_plan(snapshot, cx);

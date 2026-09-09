@@ -138,7 +138,7 @@ impl ContextRail {
 
     /// Diagnostic: the entity id of the bound store leaf (the rail-freeze
     /// regression asserts the attach-time re-bind).
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn diagnostic_store_id(&self) -> Option<gpui::EntityId> {
         self.store.as_ref().map(|s| s.entity_id())
     }

@@ -2105,87 +2105,86 @@ fn realdata_boot_set_model_and_single_event_open(cx: &mut gpui::TestAppContext) 
     // process (the MANOX_REALDATA_HOME gate) and the agent-runtime
     // background tasks (session-list refresh) outlive the test — dropping
     // the slot makes their `global()` panic after the asserts.
+}
 
-    /// Rail-freeze regression (the visual-acceptance report): the
-    /// ContextRail reads its status row (`store.running`) and its usage
-    /// face (`per_model_usage` / `cumulative_*`) from the store leaf it is
-    /// bound to. The binding used to happen once at construction, so after
-    /// a thread switch the rail kept watching the outgoing leaf — the
-    /// live session's SessionStatus deltas miss its id filter and its
-    /// committed count never advances (follow frames route to the attached
-    /// leaf), so the status row and the usage sections never moved while
-    /// the conversation ran. The attach flow must re-bind the rail to the
-    /// incoming leaf.
-    #[gpui::test]
-    fn rail_store_rebinds_on_thread_attach(cx: &mut gpui::TestAppContext) {
-        use gpui::AppContext as _;
-        let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _store = store_test_guard();
-        cx.update(gpui_component::init);
-        let db_path =
-            std::env::temp_dir().join(format!("manox-rail-rebind-{}.db", uuid_like_id()));
-        let db = std::sync::Arc::new(
-            manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
-        );
-        cx.update(|_cx| {
-            manox_agent::runtime::init();
-            manox_agent::provider_glue::init();
-            manox_agent::thread_store::init_for_test(db.clone());
-        });
-        cx.background_executor.allow_parking();
-        let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(None));
-        let slot = captured.clone();
-        let window = cx.open_window(
-            gpui::size(gpui::px(960.), gpui::px(640.)),
-            move |window, cx| {
-                let workspace = cx.new(|cx| Workspace::new(window, cx));
-                *slot.borrow_mut() = Some(workspace.clone());
-                gpui_component::Root::new(workspace, window, cx)
-            },
-        );
-        cx.run_until_parked();
-        let visual = gpui::VisualTestContext::from_window(window.into(), cx);
-        let ws = captured.borrow().clone().expect("workspace captured");
+/// Rail-freeze regression (the visual-acceptance report): the
+/// ContextRail reads its status row (`store.running`) and its usage
+/// face (`per_model_usage` / `cumulative_*`) from the store leaf it is
+/// bound to. The binding used to happen once at construction, so after
+/// a thread switch the rail kept watching the outgoing leaf — the
+/// live session's SessionStatus deltas miss its id filter and its
+/// committed count never advances (follow frames route to the attached
+/// leaf), so the status row and the usage sections never moved while
+/// the conversation ran. The attach flow must re-bind the rail to the
+/// incoming leaf.
+#[gpui::test]
+fn rail_store_rebinds_on_thread_attach(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _store = store_test_guard();
+    cx.update(gpui_component::init);
+    let db_path = std::env::temp_dir().join(format!("manox-rail-rebind-{}.db", uuid_like_id()));
+    let db = std::sync::Arc::new(
+        manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+    );
+    cx.update(|_cx| {
+        manox_agent::runtime::init();
+        manox_agent::provider_glue::init();
+        manox_agent::thread_store::init_for_test(db.clone());
+    });
+    cx.background_executor.allow_parking();
+    let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = captured.clone();
+    let window = cx.open_window(
+        gpui::size(gpui::px(960.), gpui::px(640.)),
+        move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            *slot.borrow_mut() = Some(workspace.clone());
+            gpui_component::Root::new(workspace, window, cx)
+        },
+    );
+    cx.run_until_parked();
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    let ws = captured.borrow().clone().expect("workspace captured");
 
-        // Construction: the rail is bound to the ctor leaf.
-        let ctor = ws.read_with(&visual, |this, cx| {
-            (
-                this.store.as_ref().map(|s| s.entity_id()),
-                this.context_rail.read(cx).diagnostic_store_id(),
-            )
-        });
-        assert!(ctor.0.is_some(), "the ctor workspace has a leaf");
-        assert_eq!(ctor.0, ctor.1, "ctor rail binds the ctor leaf");
+    // Construction: the rail is bound to the ctor leaf.
+    let ctor = ws.read_with(&visual, |this, cx| {
+        (
+            this.store.as_ref().map(|s| s.entity_id()),
+            this.context_rail.read(cx).diagnostic_store_id(),
+        )
+    });
+    assert!(ctor.0.is_some(), "the ctor workspace has a leaf");
+    assert_eq!(ctor.0, ctor.1, "ctor rail binds the ctor leaf");
 
-        // Attach thread B: the workspace swaps in B's leaf; the rail must
-        // follow (before the fix it kept the ctor leaf and froze).
-        let b_id = format!("rail-b-{}", uuid_like_id());
-        visual.update(|window, cx| {
-            ws.update(cx, |this, cx| {
-                let b = manox_agent::Thread::landing_with_id(
-                    manox_agent::ThreadId(b_id.clone()),
-                    this.cwd.clone(),
-                );
-                this.attach_thread(b, false, window, cx);
-            });
+    // Attach thread B: the workspace swaps in B's leaf; the rail must
+    // follow (before the fix it kept the ctor leaf and froze).
+    let b_id = format!("rail-b-{}", uuid_like_id());
+    visual.update(|window, cx| {
+        ws.update(cx, |this, cx| {
+            let b = manox_agent::Thread::landing_with_id(
+                manox_agent::ThreadId(b_id.clone()),
+                this.cwd.clone(),
+            );
+            this.attach_thread(b, false, window, cx);
         });
-        cx.run_until_parked();
-        let after = ws.read_with(&visual, |this, cx| {
-            (
-                this.store.as_ref().map(|s| s.entity_id()),
-                this.context_rail.read(cx).diagnostic_store_id(),
-            )
-        });
-        assert!(after.0.is_some(), "B attached with a leaf");
-        assert_ne!(
-            after.0, ctor.0,
-            "the attach swapped the workspace leaf (test precondition)"
-        );
-        assert_eq!(
-            after.0, after.1,
-            "the rail must re-bind to the attached thread's leaf (the rail-freeze regression)"
-        );
-        let _ = std::fs::remove_file(&db_path);
-    }
+    });
+    cx.run_until_parked();
+    let after = ws.read_with(&visual, |this, cx| {
+        (
+            this.store.as_ref().map(|s| s.entity_id()),
+            this.context_rail.read(cx).diagnostic_store_id(),
+        )
+    });
+    assert!(after.0.is_some(), "B attached with a leaf");
+    assert_ne!(
+        after.0, ctor.0,
+        "the attach swapped the workspace leaf (test precondition)"
+    );
+    assert_eq!(
+        after.0, after.1,
+        "the rail must re-bind to the attached thread's leaf (the rail-freeze regression)"
+    );
+    let _ = std::fs::remove_file(&db_path);
 }
