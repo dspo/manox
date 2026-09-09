@@ -36,10 +36,8 @@ which = "7.0"
 zstd.workspace = true
 resvg = { version = "0.47", optional = true }
 image = { version = "0.25", optional = true }
-manox-webui = { workspace = true }
 manox-agent = { workspace = true }
 manox-session-core = { workspace = true }
-open = { workspace = true }
 
 [features]
 image-output = ["resvg", "image"]

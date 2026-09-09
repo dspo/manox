@@ -389,7 +389,6 @@ fn main() {
                     Ok(()) => {
                         cx.set_quit_mode(QuitMode::Explicit);
                         tray::spawn_pump(cx);
-                        manox_webui::spawn_server();
                     }
                     // The fallback sentence is platform-true: macOS keeps a
                     // window-less app alive by default (dock icon reopens),
@@ -402,14 +401,6 @@ fn main() {
                     Err(e) => tracing::warn!(
                         "system tray unavailable: {e:#}; closing the last window quits"
                     ),
-                }
-                // `--webui` forces the WebUI server on regardless of the tray
-                // outcome (the listener otherwise starts only from the tray /
-                // menu entry — unreachable when the tray cannot install, e.g.
-                // window-server resource exhaustion).
-                if std::env::args().any(|a| a == "--webui") {
-                    manox_webui::spawn_server();
-                    manox_webui::start_server();
                 }
             });
 

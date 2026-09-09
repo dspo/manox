@@ -1259,14 +1259,11 @@ enum CxCommand {
         /// 要注入的文本（与 --clear-buffer 至少传其一）
         text: Option<String>,
     },
-    /// 启动 WebUI 服务（浏览器界面）
+    /// 启动无头 WS 网关（类型化协议的网络面；浏览器前端已删除）
     Web {
         /// 监听端口（默认随机分配）
         #[arg(long, value_name = "PORT")]
         port: Option<u16>,
-        /// 不自动打开浏览器
-        #[arg(long)]
-        no_open: bool,
     },
 }
 
@@ -1301,7 +1298,6 @@ enum DispatchCommand {
     },
     Web {
         port: Option<u16>,
-        no_open: bool,
     },
 }
 
@@ -1366,7 +1362,7 @@ fn dispatch_command(raw_args: &[String]) -> Result<DispatchCommand> {
                 clear_buffer,
                 text,
             }),
-            Some(CxCommand::Web { port, no_open }) => Ok(DispatchCommand::Web { port, no_open }),
+            Some(CxCommand::Web { port }) => Ok(DispatchCommand::Web { port }),
             None => Ok(DispatchCommand::Launch {
                 args: agent_args,
                 pty: cli.pty,
@@ -1460,7 +1456,7 @@ pub fn run() -> Result<()> {
             clear_buffer,
             text,
         } => run_send(session, clear_buffer, text),
-        DispatchCommand::Web { port, no_open } => run_web(port, no_open),
+        DispatchCommand::Web { port } => run_web(port),
         DispatchCommand::Launch {
             args,
             pty,
@@ -1592,33 +1588,40 @@ fn run_send(session: Option<String>, clear_buffer: bool, text: Option<String>) -
     Ok(())
 }
 
-/// Start the WebUI server and optionally open a browser tab.
-fn run_web(_port: Option<u16>, no_open: bool) -> Result<()> {
+/// Start the headless WS gateway and wait for Ctrl+C. The browser frontend
+/// is gone (the frontend-removal decision); the gateway keeps the typed
+/// protocol's network face alive for out-of-process clients, which discover
+/// the endpoint from the printed line or `<config>/gateway-ws.json`.
+fn run_web(port: Option<u16>) -> Result<()> {
     let rt = tokio::runtime::Runtime::new().context("failed to build web runtime")?;
     rt.block_on(async move {
         // Full agent boot (PATH, runtime, i18n, providers, MCP, ThreadStore,
         // skill/command/hook registries) — `runtime::init()` alone leaves the
         // ThreadStore uninitialized, so the first `listThreads`/`listModels`
-        // would panic. Mirrors the napi/VS Code startup path.
+        // would panic. Mirrors the napi host startup path.
         manox_agent::init();
-        manox_webui::spawn_server();
-        manox_webui::start_server();
+        manox_session_core::ws::start(manox_session_core::ws::default_cwd(), port.unwrap_or(0));
 
-        // Wait for the server to start and obtain the URL.
-        let url = loop {
-            if let Some(url) = manox_webui::service_url() {
-                break url;
+        // Bounded wait for the bind: a failed bind logs through tracing and
+        // never publishes an endpoint, so waiting forever would hang.
+        let mut tries = 0u32;
+        let endpoint = loop {
+            if let Some(endpoint) = manox_session_core::ws::service_endpoint() {
+                break endpoint;
             }
+            if tries >= 200 {
+                anyhow::bail!("WS gateway failed to bind within 10s (see logs)");
+            }
+            tries += 1;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         };
 
-        println!("WebUI 服务已启动: {url}");
-        if !no_open && let Err(e) = open::that(&url) {
-            eprintln!("警告: 无法打开浏览器: {e:#}");
-        }
-
+        println!(
+            "WS 网关已启动: {} (token: {})",
+            endpoint.url, endpoint.token
+        );
         tokio::signal::ctrl_c().await.context("等待 Ctrl+C 失败")?;
-        println!("\nWebUI 服务已关闭");
+        println!("\nWS 网关已关闭");
         Ok(())
     })
 }
