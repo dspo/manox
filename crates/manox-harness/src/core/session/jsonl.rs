@@ -484,8 +484,7 @@ impl JsonlSessionStorage {
         // writer can never truncate this rewrite's artifact mid-flight.
         // The `.tmp` suffix keeps session-directory scans
         // (extension == "jsonl") off the artifact.
-        static REWRITE_COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tmp = self.jsonl_path.with_extension(format!(
             "jsonl.{}.{}.tmp",
             std::process::id(),
