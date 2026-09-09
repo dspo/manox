@@ -121,6 +121,28 @@ impl ContextRail {
         self.weak_workspace = weak;
     }
 
+    /// Re-bind the rail's read face to the newly attached thread's leaf.
+    /// The store is the rail's ONLY data source (U7b): the SessionStatus
+    /// deltas and the Q-face info-fetch responses only reach the leaf of
+    /// the ATTACHED session, so a rail left bound to a previous leaf
+    /// renders a permanently frozen status row and usage face (the
+    /// rail-freeze regression from the visual-acceptance run).
+    pub(crate) fn bind_store(
+        &mut self,
+        store: Option<Entity<ClientStoreHandle>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.store = store;
+        cx.notify();
+    }
+
+    /// Diagnostic: the entity id of the bound store leaf (the rail-freeze
+    /// regression asserts the attach-time re-bind).
+    #[cfg(feature = "test-support")]
+    pub fn diagnostic_store_id(&self) -> Option<gpui::EntityId> {
+        self.store.as_ref().map(|s| s.entity_id())
+    }
+
     /// Whether the floating context card is shown at the given main-column
     /// body width. `None` means the window is too narrow: the card folds away
     /// and the conversation column takes the full body.
