@@ -63,7 +63,16 @@ pub fn server_call_to_thread_event(call: &ServerCall) -> Option<ThreadEvent> {
             plan_file: plan_file.clone(),
             title: title.clone(),
         }),
-        BrowserOp { .. } | ClipboardRead { .. } | OpenExternal { .. } => None,
+        // Round 4 §4.3: the desktop implements none of the capability calls
+        // — dropping them silently is fail-open (the server parks on the
+        // 300s timeout with zero client-side trace). The debug log is the
+        // minimum trace; implementing them is C4 wire work.
+        BrowserOp { .. } | ClipboardRead { .. } | OpenExternal { .. } => {
+            tracing::debug!(
+                "capability call not supported by the desktop client (will time out server-side)"
+            );
+            None
+        }
     }
 }
 

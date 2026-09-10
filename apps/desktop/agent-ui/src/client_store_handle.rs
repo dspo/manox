@@ -452,10 +452,22 @@ impl ClientStoreHandle {
         }
         self.pending_page = None;
         let records = match outcome {
+            // Round 4 §3.5: the server answered but the records failed to
+            // parse — feeding the gap repair an EMPTY page would keep the
+            // window short forever. The degraded empty page stays (the
+            // repair path reports the shortfall loudly), but never
+            // without a trace.
             Ok(v) => v
                 .get("records")
                 .and_then(|r| {
-                    serde_json::from_value::<Vec<manox_protocol::JournalWireEntry>>(r.clone()).ok()
+                    serde_json::from_value::<Vec<manox_protocol::JournalWireEntry>>(r.clone())
+                    .map_err(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "PageHistory records failed to parse; feeding the repair an empty page"
+                        );
+                    })
+                    .ok()
                 })
                 .unwrap_or_default(),
             Err(e) => {

@@ -428,13 +428,28 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
 fn content_blocks(blocks: &[manox_harness::types::ContentBlock]) -> Vec<serde_json::Value> {
     blocks
         .iter()
-        .filter_map(|b| serde_json::to_value(b).ok())
+        .filter_map(|b| {
+            serde_json::to_value(b)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "content block dropped (serialization failure)");
+                })
+                .ok()
+        })
         .collect()
 }
 
 /// The full kernel JSON object of a non-transcript message (wire-opaque).
 fn message_value(message: &AgentMessage) -> Vec<serde_json::Value> {
-    vec![serde_json::to_value(message).unwrap_or(serde_json::Value::Null)]
+    match serde_json::to_value(message) {
+        Ok(v) => vec![v],
+        Err(e) => {
+            tracing::error!(error = %e, "message serialization failed");
+            vec![serde_json::json!({
+                "type": "error",
+                "text": format!("message serialization failed: {e}"),
+            })]
+        }
+    }
 }
 
 use Translated::*;

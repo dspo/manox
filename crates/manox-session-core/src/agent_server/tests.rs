@@ -7405,7 +7405,7 @@ async fn create_race_insert_adopts_the_winning_entry() {
         pump_cancel: tokio_util::sync::CancellationToken::new(),
         pump: tokio::spawn(async {}),
         turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        pending_submits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        pending_submits: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
 
     // The race winner, already seated.
@@ -7460,7 +7460,7 @@ async fn create_with_a_live_id_is_idempotent() {
         pump_cancel: tokio_util::sync::CancellationToken::new(),
         pump: tokio::spawn(async {}),
         turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        pending_submits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        pending_submits: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
     };
     let winner_cancel = winner.pump_cancel.clone();
     server.0.sessions.lock().insert("idem-1".into(), winner);
@@ -7479,6 +7479,53 @@ async fn create_with_a_live_id_is_idempotent() {
     assert_eq!(out["session_id"], json!("idem-1"));
     assert!(!winner_cancel.is_cancelled());
     assert_eq!(server.0.owners("idem-1"), vec!["idem-client".to_string()]);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// Round 4 §3.2: one panic inside the pending-submit lock holder must not
+/// cascade. Pre-fix the queue was a `StdMutex` locked with `.unwrap()` — a
+/// panic under the guard poisoned it and EVERY subsequent submit / steer /
+/// drain panicked permanently. The queue is a parking_lot mutex now (never
+/// poisons); this drives the real `drop_queued` surface after a deliberate
+/// panic-while-locked probe. Mutation-red verified against the StdMutex
+/// shape (drop_queued panics on the poisoned lock).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // test-serialization guard, single-thread runtime
+async fn pending_submit_queue_survives_a_panicking_lock_holder() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+
+    let session = ServerSession {
+        thread: manox_agent::Thread::new_fresh(
+            manox_agent::ThreadId("poison-1".into()),
+            PathBuf::from("/"),
+        ),
+        pump_cancel: tokio_util::sync::CancellationToken::new(),
+        pump: tokio::spawn(async {}),
+        turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_submits: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+    let queue = session.pending_submits.clone();
+    server.0.sessions.lock().insert("poison-1".into(), session);
+
+    // A holder that panics while holding the lock.
+    let probe = queue.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _guard = probe.lock();
+        panic!("poison probe under the pending-submit lock");
+    }));
+
+    // The queue still serves: drop_queued locks and retains without
+    // panicking (pre-fix: `.lock().unwrap()` on the poisoned mutex).
+    server.0.drop_queued("poison-1", "c1".into());
+    assert!(
+        queue.lock().is_empty(),
+        "the queue is servicable after the panicking holder"
+    );
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
 }
