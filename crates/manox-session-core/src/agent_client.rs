@@ -1,6 +1,6 @@
 //! Unified client-side connection + handshake wrapper for the [`AgentServer`].
 //!
-//! Every host (gpui desktop, napi/VS Code, WebUI bridge) repeats the same
+//! Every host (gpui desktop, napi binding, WS client) repeats the same
 //! three steps to reach the server: build an in-process connection pair, hand
 //! the server end to [`AgentServer::accept`], and declare itself with the
 //! `Initialize` handshake. `AgentClient` owns that sequence so a host only
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use manox_protocol::handshake::{HookKind, Initialize};
+use manox_protocol::handshake::{HookKind, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::transport::{InProcessConnection, RpcConnection, in_process_pair};
 use manox_protocol::{ClientCall, ClientNote, FromClient, MsgId, RpcError};
 
@@ -51,6 +51,8 @@ impl AgentClient {
                 client_id: client_id.clone(),
                 capabilities,
                 sessions,
+                // C1: declare the epoch this client speaks (L12).
+                protocol_epoch: PROTOCOL_EPOCH,
             }),
         });
         Self {
@@ -140,14 +142,16 @@ mod tests {
 
     /// `connect` must reproduce the legacy handshake: the server acks the
     /// `Initialize` request and then announces `Ready`, both observable on the
-    /// client end the wrapper exposes.
+    /// client end the wrapper exposes. GW1/C1: the v1 `Ready` note is
+    /// followed by the §D.5 `HostEvent::Ready` mirror carrying the server's
+    /// protocol epoch (dual emit through the C4 close-out).
     #[test]
     fn connect_handshake_yields_ack_and_ready() {
         let _g = lock_globals();
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(std::path::PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(std::path::PathBuf::from("/"));
         let client = AgentClient::connect(
             &server,
             "ta-test",
@@ -174,6 +178,19 @@ mod tests {
             ),
             "expected Ready, got {second:?}"
         );
+        // GW1/C1: the Host mirror of the handshake — Ready echoes the
+        // protocol epoch (pre-fix this recv timed out: no Host frame ever
+        // followed the v1 note).
+        let third = recv(client.conn());
+        assert!(
+            matches!(
+                third,
+                FromServer::Host {
+                    host: manox_protocol::stream::HostEvent::Ready { epoch: 1 }
+                }
+            ),
+            "expected the Host Ready epoch echo (GW1/C1), got {third:?}"
+        );
     }
 
     /// A call sent through the wrapper reaches the server and the response
@@ -184,16 +201,19 @@ mod tests {
         hermetic_home();
         init_globals();
         manox_agent::thread_store::init();
-        let server = AgentServer::new(std::path::PathBuf::from("/"));
+        let server = AgentServer::new_without_store_watcher(std::path::PathBuf::from("/"));
         let client = AgentClient::connect(&server, "ta-call", vec![], vec![]);
-        // Drain the handshake (ack + Ready).
+        // Drain the handshake (ack + v1 Ready note + the GW1/C1 Host Ready
+        // epoch echo).
+        let _ = recv(client.conn());
         let _ = recv(client.conn());
         let _ = recv(client.conn());
         let id = client.send_call(ClientCall::ListThreads);
         // ListThreads responds (empty store) and additionally pushes a
-        // ThreadsUpdated notification; find the Response and check its id.
+        // ThreadsUpdated notification PLUS its GW1 Host mirror; find the
+        // Response and check its id.
         let mut got_response = false;
-        for _ in 0..4 {
+        for _ in 0..6 {
             match recv(client.conn()) {
                 FromServer::Response { id: rid, .. } if rid == id => {
                     got_response = true;

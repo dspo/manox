@@ -796,6 +796,7 @@ mod tests {
             parent_id: None,
             timestamp: chrono::Utc::now(),
             message: AgentMessage::user(text),
+            origin: None,
         }
     }
 

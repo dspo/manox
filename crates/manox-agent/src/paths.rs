@@ -24,6 +24,14 @@ pub fn agents_dir() -> Result<PathBuf> {
     Ok(manox_config_dir()?.join("agents"))
 }
 
+/// `$HOME/.manox/sessions` — session journal transcripts: the repository
+/// scan root and the canonical creation/materialization target, so an
+/// on-disk identity probe and the eventual file can never disagree about
+/// the path.
+pub fn sessions_dir() -> Result<PathBuf> {
+    Ok(manox_config_dir()?.join("sessions"))
+}
+
 /// `$HOME/.manox/skills` — user-authored skills (`<name>/SKILL.md`).
 /// Plugin skills live under each plugin's `skills/` subdir instead.
 pub fn skills_dir() -> Result<PathBuf> {

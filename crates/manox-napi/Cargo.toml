@@ -1,0 +1,21 @@
+[package]
+name = "manox-napi"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[lib]
+# `cdylib` for the packaged `.node` binding; `rlib` so `cargo test` can link
+# the unit tests against the crate as a regular library (napi-rs convention).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi4"] }
+napi-derive = "2"
+manox-protocol.workspace = true
+manox-session-core.workspace = true
+manox-agent.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build = "2"

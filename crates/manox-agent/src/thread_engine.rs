@@ -34,6 +34,24 @@ pub trait ThreadEngine: Send + Sync {
     /// queue orders it against prompts.
     fn append_ui_note(&self, _record: crate::db::UiNoteRecord) {}
 
+    /// The thread's journal feed (§C.3): ordered appends across session
+    /// swaps; `Lagged` is the resync signal (L5). Backends without a
+    /// journal yield an immediately-closed channel.
+    fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        tokio::sync::broadcast::channel(1).0.subscribe()
+    }
+
+    /// A one-shot whole-chain journal read (§C.3). Backends without a
+    /// journal resolve the receiver with a send error.
+    fn journal_snapshot(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<crate::engine::JournalSnapshotData> {
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        rx
+    }
+
     /// Token usage keyed by user-message id, as the env card renders it.
     fn request_token_usage(&self) -> HashMap<String, TokenUsage>;
 
@@ -155,6 +173,44 @@ pub trait ThreadEngine: Send + Sync {
     ) {
     }
 
+    /// `run` with the client's origin RPC id pinned onto this turn's first
+    /// user message (§F.2) and — K5 — the journal entry id the Submit was
+    /// accepted under ([`Self::persist_user_submission`] persisted it before
+    /// the receipt): the engine arms the middleware skip from it instead of
+    /// appending its own user entry. Engines without origin support ignore
+    /// both.
+    fn run_with_origin(
+        &self,
+        prompt: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+        accepted_entry: Option<String>,
+    ) {
+        let _ = (origin, accepted_entry);
+        self.run(prompt, images);
+    }
+
+    /// K5: persist the user message entry (with its origin) DURABLY at
+    /// Submit acceptance — on disk before the caller receipts the Submit,
+    /// so a crash after `accepted` can never lose the text and the echo can
+    /// retire — and return the journal entry id for
+    /// [`Self::run_with_origin`]. `Ok(None)`: the backend has no journal
+    /// session yet; the entry persists at drain instead, still before
+    /// model-visible. `Err`: the entry could not be persisted — the caller
+    /// must NOT receipt the Submit as accepted (fail loud: accepted ⟹
+    /// logged). Backends without a journal resolve `Ok(None)`.
+    fn persist_user_submission(
+        &self,
+        text: &str,
+        images: Vec<manox_harness::types::ContentBlock>,
+        origin: Option<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Option<String>, anyhow::Error>> + Send>,
+    > {
+        let _ = (text, images, origin);
+        Box::pin(async { Ok(None) })
+    }
+
     /// Run a manual context-compaction pass (`/compact`). Backends without
     /// kernel compaction ignore this; backends that require an idle
     /// transcript no-op while a turn is in flight.
@@ -200,14 +256,34 @@ pub struct ReadyInfo {
     /// A plan review card was pending when the session last settled;
     /// the facade re-emits `PlanReady` so the card re-surfaces.
     pub plan_review_pending: bool,
-    /// Last `UpdatePlan` snapshot persisted in the sidecar; the facade
-    /// mirrors it as the rebuild fallback after compaction summarized
-    /// the transcript's plan tool calls away.
+    /// The journal-authoritative goal snapshot (goal migration stage ②):
+    /// the K2 rebuild's replayed last `goal` entry. `None` = the chain
+    /// never saw a goal (the bridge's db fold stands — the migration-window
+    /// fallback for pre-stage-① threads); `Some(Null)` = the explicit
+    /// clear. The facade hands it to the GoalBridge, which re-applies the
+    /// restart-paused demotion (activation is never inherited).
+    pub goal: Option<serde_json::Value>,
+    /// Last `UpdatePlan` snapshot rebuilt journal-first (K2: the
+    /// `plan_update` entries are the authority, the sidecar the derived
+    /// cache); the facade mirrors it as the rebuild fallback after
+    /// compaction summarized the transcript's plan tool calls away.
     pub plan_snapshot: Option<serde_json::Value>,
-    /// Display title persisted in the session sidecar; the facade mirrors
-    /// it so the title bar matches the sidebar's
+    /// Display title rebuilt journal-first from the session's active
+    /// chain (the sidecar fills a chain that never saw a `title` entry);
+    /// the facade mirrors it so the title bar matches the sidebar's
     /// [`crate::db::ThreadSummary::display_title`] source of truth.
     pub title: Option<String>,
+    /// Pin flag rebuilt journal-first (K2: the `pinned_archived` entries
+    /// are the authority, the sidecar the derived cache); the facade
+    /// mirrors it so the projection baseline seeds from journal-backed
+    /// state.
+    pub pinned: bool,
+    /// Archive flag rebuilt journal-first (K2), mirrored like `pinned`.
+    pub archived: bool,
+    /// The bound project rebuilt journal-first (K2: the `project_change`
+    /// entries are the authority); `None` leaves the facade's binding
+    /// untouched (an unbound chain with no sidecar binding).
+    pub project: Option<std::path::PathBuf>,
 }
 
 /// Notices the backend sends back to the facade's gpui drainer.

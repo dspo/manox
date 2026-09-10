@@ -105,6 +105,7 @@ mod tests {
                 }],
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         }
     }
 

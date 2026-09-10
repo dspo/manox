@@ -2139,8 +2139,6 @@ dependencies = [
  "manox-ext-agents",
  "manox-providers",
  "manox-session-core",
- "manox-webui",
- "open",
  "portable-pty",
  "rand 0.8.6",
  "ratatui",
@@ -3554,7 +3552,7 @@ dependencies = [
  "pollster 0.4.0",
  "postage",
  "profiling",
- "proptest",
+ "proptest 1.10.0",
  "rand 0.9.4",
  "raw-window-handle",
  "refineable",
@@ -4618,25 +4616,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89194689a993ab15268672e99e7b0e19da2da3268ac682e8f02d29d4d1434cd7"
 
 [[package]]
-name = "include_dir"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "923d117408f1e49d914f1a379a309cffe4f18c05cf4e3d12e613a15fc81bd0dd"
-dependencies = [
- "include_dir_macros",
-]
-
-[[package]]
-name = "include_dir_macros"
-version = "0.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cab85a7ed0bd5f0e76d93846e0147172bed2e2d3f859bcc33a8d9699cad1a75"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
 name = "indenter"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5436,7 +5415,6 @@ dependencies = [
  "manox-agent",
  "manox-ext-agents",
  "manox-terminal",
- "manox-webui",
  "supervisor",
  "terminal-ui",
  "tracing",
@@ -5592,9 +5570,9 @@ dependencies = [
  "async-channel 2.5.0",
  "base64",
  "parking_lot",
+ "proptest 1.11.0",
  "serde",
  "serde_json",
- "ts-rs",
 ]
 
 [[package]]
@@ -5617,6 +5595,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-trait",
+ "axum",
  "chrono",
  "futures",
  "manox-agent",
@@ -5625,8 +5604,10 @@ dependencies = [
  "parking_lot",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.24.0",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -5650,27 +5631,6 @@ dependencies = [
  "sysinfo 0.39.6",
  "tokio",
  "toml 0.8.23",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "manox-webui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "axum",
- "base64",
- "futures",
- "include_dir",
- "manox-agent",
- "manox-protocol",
- "manox-session-core",
- "open",
- "serde",
- "serde_json",
- "tokio",
  "tracing",
  "uuid",
 ]
@@ -7620,6 +7580,25 @@ dependencies = [
  "bitflags 2.13.0",
  "num-traits",
  "proptest-macro",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rand_xorshift",
+ "regex-syntax",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
+]
+
+[[package]]
+name = "proptest"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+dependencies = [
+ "bit-set 0.8.0",
+ "bit-vec 0.8.0",
+ "bitflags 2.13.0",
+ "num-traits",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "rand_xorshift",
@@ -10873,30 +10852,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "ts-rs"
-version = "10.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e640d9b0964e9d39df633548591090ab92f7a4567bc31d3891af23471a3365c6"
-dependencies = [
- "lazy_static",
- "serde_json",
- "thiserror 2.0.18",
- "ts-rs-macros",
-]
-
-[[package]]
-name = "ts-rs-macros"
-version = "10.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e9d8656589772eeec2cf7a8264d9cda40fb28b9bc53118ceb9e8c07f8f38730"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.118",
- "termcolor",
-]
 
 [[package]]
 name = "ttf-parser"

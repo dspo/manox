@@ -1,0 +1,306 @@
+//! Journal read services on the gateway: `PageHistory` (cold chain page,
+//! §D.2) and `GetConversationInfo` (the §E.3 Q-face fold), T4.
+//!
+//! Both ride the kernel journal read seam (§C.3, `ThreadHandle::
+//! journal_snapshot`): a whole active-chain read answered by the engine
+//! actor. "Cold" here means the page fold never starts a provider turn and
+//! never touches the engine's live transcript mirror — it is a pure chain
+//! read (§D.2). `PageHistory` serves the §F.1 gap-repair and backwards
+//! paging pages; `GetConversationInfo` folds turns / messages / per-model
+//! usage (§E.3) and is cached by `(thread_id, cursor)` — recomputed only
+//! when the cursor advances.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use manox_agent::thread::ThreadHandle;
+use manox_protocol::journal::{JournalWireEntry, ModelRef};
+use serde_json::{Value, json};
+
+use crate::translate::wire_entry;
+
+/// `(thread_id, cursor) → folded payload` (§E.3 cache).
+#[derive(Default)]
+pub struct ConversationInfoCache {
+    map: HashMap<(String, u64), Value>,
+}
+
+impl ConversationInfoCache {
+    fn get(&self, thread_id: &str, cursor: u64) -> Option<&Value> {
+        self.map.get(&(thread_id.to_string(), cursor))
+    }
+    fn put(&mut self, thread_id: &str, cursor: u64, value: Value) {
+        // Bound the cache to the sessions currently served: keep at most
+        // one entry per thread (the previous cursor's fold is dead once the
+        // journal moves).
+        self.map.retain(|(t, _), _| t != thread_id);
+        self.map.insert((thread_id.to_string(), cursor), value);
+    }
+}
+
+/// `ClientCall::PageHistory` (§D.2): `{records, has_more, cursor}`.
+///
+/// `through_seq` is the inclusive tail (`-1` = latest); `before_seq` is an
+/// exclusive upper bound for backwards paging; `max_messages` caps the page
+/// from the tail. The returned `records` are the §C.1 wire entries of the
+/// active chain slice — dense, oldest-first — and `cursor` is the tail seq
+/// of the page (the §F.1 repair contract: a non-empty page ends at its
+/// cursor). Kernel rows with no §C.2 wire vocabulary (`ActiveToolsChange`,
+/// `Custom`, `CustomMessage`) are skipped and do not open gaps (§F.1 rule 2
+/// tolerates unclaimed seqs).
+///
+/// GW6: the caller resolves the chain read — the live engine seam when it is
+/// materialized, [`cold_read`] (persisted-jsonl direct read — §D.2: the
+/// cold read does not materialize the engine) otherwise — and hands the
+/// resulting snapshot in; the page
+/// fold itself never touches the engine.
+pub fn page_history(
+    snapshot: manox_agent::engine::JournalSnapshotData,
+    through_seq: i64,
+    before_seq: Option<i64>,
+    max_messages: Option<u32>,
+) -> Result<Value, manox_protocol::RpcError> {
+    // Inclusive upper bound of the requested window.
+    let through = if through_seq < 0 {
+        snapshot.cursor
+    } else {
+        (through_seq as u64).min(snapshot.cursor)
+    };
+    let through = match before_seq {
+        Some(b) if b > 0 => through.min((b as u64).saturating_sub(1)),
+        // `before_seq <= 0` asks for entries strictly before the root / an
+        // inverted window: empty page, cursor pinned at the bound.
+        Some(_) => return Ok(json!({ "records": [], "has_more": false, "cursor": through })),
+        None => through,
+    };
+    let mut records: Vec<JournalWireEntry> = snapshot
+        .records
+        .iter()
+        .filter(|r| r.seq <= through)
+        .filter_map(|r| wire_entry(r.seq, &r.entry))
+        .collect();
+    let window = match max_messages {
+        Some(n) if (records.len() as u32) > n => {
+            let start = records.len() - n as usize;
+            records.split_off(start)
+        }
+        _ => std::mem::take(&mut records),
+    };
+    let has_more =
+        !window.is_empty() && (window.first().is_some_and(|r| r.seq > 0) || (!records.is_empty()));
+    let cursor = window.last().map(|r| r.seq).unwrap_or(through);
+    Ok(json!({
+        "records": window,
+        "has_more": has_more,
+        "cursor": cursor,
+    }))
+}
+
+/// GW6 (§D.2 cold read): the whole active chain straight off the persisted
+/// journal file, through the harness's public read face —
+/// `JsonlSessionStorage::open` (a pure read: header validation + chain
+/// indexing, never a write) and `journal_cursor`/`journal_range` (the same
+/// §C.3 read seam the engine actor answers from). `None` when the session
+/// has no persisted file (or it is unreadable — a corrupt journal is the
+/// caller's `session/not-found`-class answer, never a silent empty page).
+///
+/// Cross-domain note: the harness read face is whole-chain (`journal_range`
+/// from seq 0); a bounded seq-range disk read would avoid loading long
+/// chains for tail pages — requested from the harness owners in the
+/// delivery report.
+/// The cold-read outcome (§二.6): `NotFound` and `Corrupt` are DIFFERENT
+/// answers. The old `.ok()?` collapsed a load failure into `None` and the
+/// callers turned `None` into an empty page — one corrupt line rendered
+/// the session's history silently, permanently empty, contradicting this
+/// module's own contract above ("a corrupt journal is the caller's
+/// not-found-class answer, never a silent empty page"). Callers now answer
+/// corruption loudly (an `RpcError` / a `StreamEnd::Failure`).
+pub enum ColdRead {
+    /// No persisted file for the id (or the id fails the B5 shape gate) —
+    /// the `session/not-found` class.
+    NotFound,
+    /// The file exists but the load failed — surface it; never an empty
+    /// page. The string carries the load error for the client-facing
+    /// message.
+    Corrupt(String),
+    /// The whole active chain.
+    Data(manox_agent::engine::JournalSnapshotData),
+}
+
+pub async fn cold_read(session_id: &str) -> ColdRead {
+    let Some(path) = crate::agent_server::persisted_session_file(session_id) else {
+        return ColdRead::NotFound;
+    };
+    if !path.exists() {
+        return ColdRead::NotFound;
+    }
+    match manox_harness::session::jsonl::JsonlSessionStorage::open(&path).await {
+        Err(err) => ColdRead::Corrupt(err.to_string()),
+        Ok(storage) => match storage.journal_range(0, u64::MAX).await {
+            Err(err) => ColdRead::Corrupt(err.to_string()),
+            Ok(records) => {
+                let cursor = storage.journal_cursor().await;
+                ColdRead::Data(manox_agent::engine::JournalSnapshotData { cursor, records })
+            }
+        },
+    }
+}
+
+/// `ClientCall::GetConversationInfo` (§E.3, Q face): the server-side fold of
+/// the journal, cached by `(thread_id, cursor)` — recomputed only when the
+/// cursor advances.
+///
+/// Field sourcing (best effort per §E.3; missing → `null`):
+/// - `turns` = `turn_start` entry count; `messages` = `message` entry count;
+/// - `models[]` aggregates assistant messages by `{provider}/{model}` with
+///   per-request usage (`input/output/cacheRead/cacheWrite/reasoning`),
+///   `calls`, `lastTotal` (last request's total context tokens);
+/// - `contextWindow` / `hitRate` / `pct` are token-meter semantics that need
+///   the provider registry + cache accounting beyond the journal — `null`
+///   in T4 (T5 projection/registry work);
+/// - `cumulativeCost` from the engine's priced accumulation;
+/// - `git` = null placeholder (git stats stay a host lookup, §E.3 note).
+pub async fn conversation_info(
+    cache: &Arc<std::sync::Mutex<ConversationInfoCache>>,
+    thread: &ThreadHandle,
+    session_id: &str,
+) -> Result<Value, manox_protocol::RpcError> {
+    let snapshot = thread.journal_snapshot().await.ok_or_else(|| {
+        manox_protocol::RpcError::new(-1, "journal engine is not materialized")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+    })?;
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(hit) = guard.get(session_id, snapshot.cursor) {
+            return Ok(hit.clone());
+        }
+    }
+    let folded = fold_conversation_info(thread, session_id, &snapshot.records, snapshot.cursor);
+    cache
+        .lock()
+        .unwrap()
+        .put(session_id, snapshot.cursor, folded.clone());
+    Ok(folded)
+}
+
+/// The pure fold over one chain read (split out so tests can drive it
+/// directly). `records` are dense seq-ordered kernel chain positions.
+fn fold_conversation_info(
+    thread: &ThreadHandle,
+    session_id: &str,
+    records: &[manox_harness::session::jsonl::JournalRecord],
+    cursor: u64,
+) -> Value {
+    use manox_harness::session::SessionTreeEntry as E;
+    use manox_harness::types::AgentMessage as M;
+
+    let mut turns: u64 = 0;
+    let mut messages: u64 = 0;
+    // (provider, model) → aggregate.
+    let mut models: HashMap<(String, String), ModelAgg> = HashMap::new();
+    let mut title: Option<String> = None;
+    for record in records {
+        match &record.entry {
+            E::TurnStart { .. } => turns += 1,
+            E::Title { title: t, .. } => title = Some(t.clone()),
+            E::Message { message, .. } => {
+                messages += 1;
+                if let M::Assistant {
+                    provider,
+                    model,
+                    usage,
+                    ..
+                } = message
+                {
+                    let agg = models.entry((provider.clone(), model.clone())).or_default();
+                    agg.input += usage.input_tokens;
+                    agg.output += usage.output_tokens;
+                    agg.cache_read += usage.cache_read_input_tokens;
+                    agg.cache_write += usage.cache_creation_input_tokens;
+                    agg.reasoning += usage.reasoning_tokens.unwrap_or(0);
+                    agg.calls += 1;
+                    // tokenMeter semantics: the last request's full context
+                    // numerator (input incl. cache classes + output).
+                    agg.last_total = usage
+                        .total_tokens
+                        .max(usage.total_input() + usage.output_tokens);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut model_rows: Vec<Value> = models
+        .into_iter()
+        .map(|((provider, model), agg)| {
+            json!({
+                "provider": provider,
+                // Canonical wire identity (L8): `{provider}/{model}`.
+                "model": ModelRef::new(format!("{provider}/{model}")).0,
+                "input": agg.input,
+                "output": agg.output,
+                "cacheRead": agg.cache_read,
+                "cacheWrite": agg.cache_write,
+                "reasoning": agg.reasoning,
+                "calls": agg.calls,
+                "lastTotal": agg.last_total,
+                // Token-meter fields need the provider registry (T5): null.
+                "contextWindow": Value::Null,
+                "hitRate": Value::Null,
+                "pct": Value::Null,
+            })
+        })
+        .collect();
+    model_rows.sort_by_key(|row| {
+        (
+            row["provider"].as_str().unwrap_or("").to_string(),
+            row["model"].as_str().unwrap_or("").to_string(),
+        )
+    });
+    let display_title = thread.read(|t| t.display_title());
+    json!({
+        "threadId": session_id,
+        "cursor": cursor,
+        "title": title.or(Some(display_title)),
+        "cwd": thread.read(|t| t.cwd().to_string_lossy().into_owned()),
+        "project": thread.read(|t| t.project().map(|p| p.to_string_lossy().into_owned())),
+        "model": thread.read(|t| t.model().map(|m| format!("{}/{}", m.provider, m.id))),
+        "contextWindow": thread.read(|t| t.model().map(|m| m.context_window)),
+        "turns": turns,
+        "messages": messages,
+        "models": model_rows,
+        // Real cost folding is T5 (§E.3); 0.0 placeholder keeps the row
+        // shape stable for clients.
+        // Real thread-wide cost from the engine's rate-card accumulation
+        // (the journal's usage rows are per-model inputs; the engine already
+        // maintains the authoritative priced total — read it once here).
+        "cumulativeCost": thread.read(|t| t.cumulative_cost()),
+        "cumulativeUsage": thread.read(|t| {
+            let u = t.cumulative_token_usage();
+            json!({
+                "input": u.input_tokens,
+                "output": u.output_tokens,
+                "cacheWrite": u.cache_creation_input_tokens,
+                "cacheRead": u.cache_read_input_tokens,
+            })
+        }),
+        "perModelCost": thread.read(|t|
+            t.per_model_cost()
+                .into_iter()
+                .collect::<std::collections::BTreeMap<String, f64>>()
+        ),
+        // Git stats are a host lookup (§E.3 note); null placeholder in T4.
+        "git": Value::Null,
+    })
+}
+
+/// Per-model usage aggregate (the §E.3 `models[]` row).
+#[derive(Default, Clone, Copy)]
+struct ModelAgg {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+    calls: u64,
+    last_total: u64,
+}

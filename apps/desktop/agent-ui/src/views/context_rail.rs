@@ -2,14 +2,14 @@
 //! environment/cockpit information (run status, changes, branch, per-model
 //! token usage, context budget, execution plan, sources).
 //!
-//! The rail is a first-class view owned by [`crate::Workspace`]. It holds the
-//! cockpit state (run phase, the model's plan snapshot, per-cell counter
-//! animation state)
-//! that used to live directly on `Workspace`, plus strong handles to the
-//! active gpui-free `ThreadHandle` and the
-//! AgentServer-backed store mirror [`crate::ConversationState`] it renders
-//! against. Writes to cockpit state flow through `Workspace` →
-//! `self.context_rail.update(cx, |r, cx| …)`.
+//! The rail is a first-class view owned by [`crate::Workspace`]. It holds
+//! the cockpit state (run phase, the model's plan snapshot, per-cell
+//! counter animation state) that used to live directly on `Workspace`,
+//! plus the AgentServer-backed store mirror it renders against (U7b:
+//! the store leaf is the rail's ONLY read face — the former kernel
+//! thread-handle field outlived the γ-2a dual-read migration it was
+//! the fallback of, and retired). Writes to cockpit state flow through
+//! `Workspace` → `self.context_rail.update(cx, |r, cx| …)`.
 //!
 //! Layout: a fixed-width card that floats over the conversation column's
 //! top-right as an absolute overlay — a peer in the z-stack, not a flex
@@ -62,12 +62,12 @@ const RAIL_NARROW_BREAK: f32 = 900.;
 /// environment/cockpit panel that used to float as an absolute card over the
 /// conversation.
 pub(crate) struct ContextRail {
-    pub(crate) thread: manox_agent::thread::ThreadHandle,
-    /// γ-2a transitional read path: the AgentServer-backed store mirroring
-    /// kernel state via `ServerNote`s. `None` when the workspace has not
-    /// created the AgentServer connection; every kernel-state read dual-reads
-    /// this store first and falls back to `self.thread`. Mutations keep going
-    /// through `self.thread`.
+    /// The AgentServer-backed store mirroring kernel state via
+    /// `ServerNote`s (U7b: the rail's only read face — per-model usage,
+    /// project, cwd and title all read this leaf; the γ-2a dual-read
+    /// fallback the retired kernel thread-handle field served is gone).
+    /// `None` only before the workspace creates the AgentServer
+    /// connection.
     store: Option<Entity<ClientStoreHandle>>,
     /// Coarse run phase. Derived from `ThreadEvent`s routed here by
     /// `Workspace`; used to determine the main agent's status indicator.
@@ -99,12 +99,8 @@ pub(crate) struct ContextRail {
 }
 
 impl ContextRail {
-    pub(crate) fn new(
-        thread: manox_agent::thread::ThreadHandle,
-        store: Option<Entity<ClientStoreHandle>>,
-    ) -> Self {
+    pub(crate) fn new(store: Option<Entity<ClientStoreHandle>>) -> Self {
         Self {
-            thread,
             store,
             cockpit_phase: CockpitPhase::Idle,
             plan: None,
@@ -123,6 +119,28 @@ impl ContextRail {
     /// open their observation panel.
     pub(crate) fn set_workspace(&mut self, weak: WeakEntity<Workspace>) {
         self.weak_workspace = weak;
+    }
+
+    /// Re-bind the rail's read face to the newly attached thread's leaf.
+    /// The store is the rail's ONLY data source (U7b): the SessionStatus
+    /// deltas and the Q-face info-fetch responses only reach the leaf of
+    /// the ATTACHED session, so a rail left bound to a previous leaf
+    /// renders a permanently frozen status row and usage face (the
+    /// rail-freeze regression from the visual-acceptance run).
+    pub(crate) fn bind_store(
+        &mut self,
+        store: Option<Entity<ClientStoreHandle>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.store = store;
+        cx.notify();
+    }
+
+    /// Diagnostic: the entity id of the bound store leaf (the rail-freeze
+    /// regression asserts the attach-time re-bind).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn diagnostic_store_id(&self) -> Option<gpui::EntityId> {
+        self.store.as_ref().map(|s| s.entity_id())
     }
 
     /// Whether the floating context card is shown at the given main-column
@@ -277,10 +295,11 @@ impl ContextRail {
     /// `Render` impl positions this as an absolute overlay over the
     /// conversation column's top-right; this fn only paints the card itself.
     fn render_panel(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let project = self
-            .store
-            .as_ref()
-            .map(|s| std::path::PathBuf::from(s.read(cx).store.cwd.clone()));
+        let project = self.store.as_ref().map(|s| {
+            s.read(cx)
+                .store
+                .with(|st| std::path::PathBuf::from(st.cwd.clone()))
+        });
         let agents_section = self.render_agents_section(theme, cx);
 
         v_flex()
@@ -356,7 +375,7 @@ impl ContextRail {
         let cumulative_cost = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.cumulative_cost)
+            .map(|s| s.read(cx).store.with(|st| st.cumulative_cost))
             .unwrap_or(0.0);
         let total = if cumulative_cost > 0.0 {
             SharedString::from(format!("{total} · {}", format_cost(cumulative_cost)))
@@ -607,11 +626,18 @@ impl ContextRail {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // The store mirrors the session's effective cwd as a string.
-        let cwd_path = self
-            .store
-            .as_ref()
-            .and_then(|s| s.read(cx).store.cwd_path.clone());
+        // The store mirrors the session's effective cwd as a string (the v2
+        // `cwd` projection; T10c retired the separate `cwd_path` note field —
+        // it was the same directory path).
+        let cwd_path = self.store.as_ref().and_then(|s| {
+            s.read(cx).store.with(|st| {
+                if st.cwd.is_empty() {
+                    None
+                } else {
+                    Some(st.cwd.clone())
+                }
+            })
+        });
         let display = self.git_branch_display.clone();
 
         // Branch label: branch / detached sha + (detached).
@@ -760,7 +786,7 @@ impl ContextRail {
         let running = self
             .store
             .as_ref()
-            .map(|s| s.read(cx).store.running)
+            .map(|s| s.read(cx).store.with(|st| st.running))
             .unwrap_or(false);
         let main_status = if self.cockpit_phase == CockpitPhase::Failed {
             manox_agent::ToolCallStatus::Error

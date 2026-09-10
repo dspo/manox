@@ -329,6 +329,21 @@ pub struct Thread {
     /// Text of user messages inserted since the last run, drained by
     /// `run_turn` into one prompt.
     pending_prompts: Vec<String>,
+    /// The client RPC id pinned onto THIS turn's first user message (echo
+    /// retirement, §F.2): set by the host right before `run_turn`, consumed
+    /// by it. One turn carries one origin — a queued batch merges into a
+    /// single turn, so the last non-None origin wins (documented; receipts
+    /// keep per-call correlation).
+    pending_turn_origin: Option<String>,
+    /// K5: the journal entry id persisted at Submit acceptance
+    /// (`ThreadEngine::persist_user_submission`) for the turn's user
+    /// message. Set by the host right before `run_turn` (a direct submit —
+    /// one Submit, one prompt, one entry); consumed by `run_turn`, which
+    /// hands it to the engine so the persistence middleware records the
+    /// accepted entry instead of appending a duplicate. A merged queued
+    /// batch carries no accepted entry — the engine persists the merged
+    /// prompt at drain instead.
+    pending_turn_accepted_entry: Option<String>,
     /// Image blocks attached to the pending prompts, drained by `run_turn`
     /// onto the engine (kernel `ContentBlock::Image`).
     pending_images: Vec<manox_harness::types::ContentBlock>,
@@ -627,6 +642,23 @@ impl ThreadHandle {
     }
 }
 
+impl ThreadHandle {
+    /// The thread's journal feed (§C.3 read face for session-core follow
+    /// streams); a pre-engine (landing) thread yields a closed channel.
+    pub fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        self.read(|t| t.subscribe_journal_feed())
+    }
+
+    /// One whole-chain journal read (§C.3). The engine Arc is cloned under
+    /// the read lock and awaited outside it (L1: no lock across await).
+    pub async fn journal_snapshot(&self) -> Option<crate::engine::JournalSnapshotData> {
+        let engine = self.read(|t| t.engine.clone())?;
+        engine.journal_snapshot().await.ok()
+    }
+}
+
 impl Thread {
     /// The startup landing state: a detached thread with no engine. No
     /// session is loaded at launch — the user picks a conversation from the
@@ -655,6 +687,8 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -709,10 +743,11 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        // Goal bridge seeds from the persisted goal (restore path) and is
-        // shared with the engine's goal tools; db unavailability degrades
-        // goal features off rather than blocking the thread.
-        let goal_bridge = GoalBridge::for_thread(&id.0);
+        // The goal bridge is shared with the engine's goal tools; its
+        // restore seed rides the Ready chain (seed_from_journal — the
+        // journal is the goal authority; stage ③ retired the db leg and
+        // with it the "goal features disabled" degrade).
+        let goal_bridge = Some(GoalBridge::for_thread(&id.0));
         let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
@@ -740,6 +775,8 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -779,7 +816,7 @@ impl Thread {
             return;
         }
         if self.goal_bridge.is_none() {
-            self.goal_bridge = GoalBridge::for_thread(&self.id.0);
+            self.goal_bridge = Some(GoalBridge::for_thread(&self.id.0));
         }
         let cwd = project.clone().unwrap_or_else(|| self.cwd.clone());
         let model = self.model.clone();
@@ -879,12 +916,34 @@ impl Thread {
                     plan_review_pending,
                     plan_snapshot,
                     title,
+                    pinned,
+                    archived,
+                    project,
+                    goal,
                 } = *notice;
                 // Unconditional: a session switch must drop the previous
                 // session's plan when the opened session has none.
                 self.persisted_plan = plan_snapshot.and_then(|v| serde_json::from_value(v).ok());
                 self.restored = restored;
                 self.title = title;
+                // K2: the flags and the project binding rebuild from the
+                // journal chain (the sidecar filled whatever the chain
+                // never saw) — the facade mirrors the authority so the
+                // projection baseline seeds from journal-backed state.
+                // A `None` project leaves an existing binding untouched.
+                self.pinned = pinned;
+                self.archived = archived;
+                if let Some(dir) = project {
+                    self.project = Some(dir);
+                }
+                // Goal stage ②: the restore authority is the journal — the
+                // K2 rebuild's replayed snapshot seeds the bridge's fold
+                // (the db event log is the migration-window fallback when
+                // the chain never saw a goal). The seed re-applies the
+                // restart-paused demotion: activation is never inherited.
+                if let Some(bridge) = self.goal_bridge.as_ref() {
+                    bridge.seed_from_journal(goal);
+                }
                 // The restored session's model is authoritative only until the
                 // user names one: a pick made while the engine assembled is
                 // already queued to the actor, and this boot-time snapshot
@@ -995,10 +1054,29 @@ impl Thread {
                     manox_harness::steer_bus::AgentId::Captain => "captain".to_string(),
                     manox_harness::steer_bus::AgentId::User => "user".to_string(),
                 };
-                self.deliver_peer_messages(vec![crate::team::PeerMessage {
-                    from: sender,
-                    content: payload.text,
-                }]);
+                if self.running {
+                    // Mid-run: a peer message would strand the report in
+                    // pending_prompts until the turn settles (the round-8
+                    // repro: five Sailor failure reports sat unseen while
+                    // the Captain kept working for 20+ minutes). Inject as a
+                    // steer instead — the running turn absorbs it at its
+                    // next safe join point (the engine re-queues it as a
+                    // follow-up if the run has already ended by then).
+                    let report = format!("[{sender}] {}", payload.text);
+                    if let Some(engine) = &self.engine {
+                        engine.steer(report, Vec::new());
+                    } else {
+                        self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                            from: sender,
+                            content: payload.text,
+                        }]);
+                    }
+                } else {
+                    self.deliver_peer_messages(vec![crate::team::PeerMessage {
+                        from: sender,
+                        content: payload.text,
+                    }]);
+                }
             }
             // Bus / browser / session-list arms are dispatched at the handle
             // level (`ThreadHandle::handle_notice`); they never reach here.
@@ -1139,6 +1217,29 @@ impl Thread {
         id
     }
 
+    /// Pin the origin RPC id for the next turn (§F.2). Must be set before
+    /// `run_turn`; cleared by it.
+    pub fn set_pending_turn_origin(&mut self, origin: Option<String>) {
+        self.pending_turn_origin = origin;
+    }
+
+    /// K5: pin the journal entry id persisted at Submit acceptance
+    /// (`ThreadEngine::persist_user_submission`) for the next turn's user
+    /// message. Must be set before `run_turn`; cleared by it. The engine
+    /// arms the middleware skip from it, so the accepted entry is never
+    /// appended twice.
+    pub fn set_pending_turn_accepted_entry(&mut self, entry_id: Option<String>) {
+        self.pending_turn_accepted_entry = entry_id;
+    }
+
+    /// The materialized engine handle, if any (`None` before landing /
+    /// `ensure_engine`). K5 gateway seam: clone the Arc and await
+    /// `persist_user_submission` OUTSIDE any facade lock — an async append
+    /// must never be awaited under `read`/`with_mut`.
+    pub fn engine_handle(&self) -> Option<Arc<dyn ThreadEngine>> {
+        self.engine.clone()
+    }
+
     pub fn run_turn(&mut self) {
         if self.running || (self.pending_prompts.is_empty() && self.pending_images.is_empty()) {
             return;
@@ -1146,12 +1247,14 @@ impl Thread {
         self.ensure_engine(self.project.clone());
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
+        let origin = self.pending_turn_origin.take();
+        let accepted_entry = self.pending_turn_accepted_entry.take();
         self.running = true;
         self.pending_events.push(ThreadEvent::TurnStarted);
         self.engine
             .as_ref()
             .expect("ensure_engine materialized the engine")
-            .run(prompt, images);
+            .run_with_origin(prompt, images, origin, accepted_entry);
     }
 
     /// Explicit user cancel (Go-style cancel context): aborts the active
@@ -1327,6 +1430,26 @@ impl Thread {
             .as_ref()
             .map(|e| e.cumulative_cost())
             .unwrap_or(0.0)
+    }
+
+    /// The thread's journal feed (§C.3 read face for session-core follow
+    /// streams); a pre-engine (landing) thread yields a closed channel.
+    pub fn subscribe_journal_feed(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::engine::JournalFeed> {
+        self.engine
+            .as_ref()
+            .map(|e| e.subscribe_journal_feed())
+            .unwrap_or_else(|| tokio::sync::broadcast::channel(1).0.subscribe())
+    }
+
+    /// One whole-chain journal read (§C.3); `None` when no engine is
+    /// materialized yet.
+    pub async fn journal_snapshot(&self) -> Option<crate::engine::JournalSnapshotData> {
+        match &self.engine {
+            Some(engine) => engine.journal_snapshot().await.ok(),
+            None => None,
+        }
     }
 
     pub fn per_model_cost(&self) -> HashMap<String, f64> {
@@ -1572,6 +1695,8 @@ impl Thread {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -2315,6 +2440,8 @@ pub(crate) mod tests {
         runs: Mutex<Vec<(String, Vec<manox_harness::types::ContentBlock>)>>,
         /// Recorded `persist_plan_snapshot` calls (serialized snapshots).
         plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
+        /// Recorded `steer` calls (the mid-run injection texts).
+        steers: Mutex<Vec<String>>,
     }
 
     impl FakeEngine {
@@ -2328,6 +2455,7 @@ pub(crate) mod tests {
                 thinking_level: Mutex::new(None),
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
+                steers: Mutex::new(Vec::new()),
             }
         }
     }
@@ -2360,7 +2488,8 @@ pub(crate) mod tests {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, _text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+        fn steer(&self, text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+            self.steers.lock().unwrap().push(text);
             String::new()
         }
 
@@ -2423,6 +2552,8 @@ pub(crate) mod tests {
             display: Vec::new(),
             request_usage: HashMap::new(),
             pending_prompts: Vec::new(),
+            pending_turn_origin: None,
+            pending_turn_accepted_entry: None,
             pending_images: Vec::new(),
             pending_steers: VecDeque::new(),
             last_user_ui: None,
@@ -2475,7 +2606,7 @@ pub(crate) mod tests {
     /// would defeat the very condition under test.
     #[test]
     fn registry_display_persistence_dispatches_off_runtime() {
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
 
         let dir = tempfile::tempdir().unwrap();
         let session_path = dir.path().join("session.jsonl");
@@ -2517,6 +2648,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         // Mid-run mirror refresh: the live partial lands in `messages`.
@@ -2556,6 +2688,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         // The prompt form enters plan mode and runs the turn with the
@@ -2618,6 +2751,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| {
@@ -2678,6 +2812,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2730,6 +2865,49 @@ pub(crate) mod tests {
         assert!(has_user, "a user message was injected for the completion");
     }
 
+    /// Round-8 regression: a Sailor report arriving while the Captain's turn
+    /// is RUNNING must inject as a steer (absorbed at the run's next safe
+    /// join point) — NOT queue as a peer message, which strands the report
+    /// until the turn settles (five Sailor failures sat unseen for 20+
+    /// minutes while the Captain kept working).
+    #[tokio::test]
+    async fn sailor_report_mid_run_injects_as_steer_not_peer_turn() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        // The Captain's turn is in flight.
+        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        thread.handle_notice(BackendNotice::SteerDelivered {
+            from: manox_harness::steer_bus::AgentId::Subagent("review-kernel".into()),
+            reason: manox_harness::steer_bus::SteerReason::Complete,
+            payload: manox_harness::steer_bus::SteerPayload {
+                text: "SUBAGENT FAILED: http 402 Insufficient Balance".into(),
+            },
+        });
+        {
+            let steers = engine.steers.lock().unwrap();
+            assert_eq!(
+                steers.len(),
+                1,
+                "the mid-run report must inject exactly one steer"
+            );
+            assert!(
+                steers[0].contains("[review-kernel]"),
+                "the steer identifies its sender: {:?}",
+                steers[0]
+            );
+            assert!(
+                steers[0].contains("http 402"),
+                "the steer carries the report body: {:?}",
+                steers[0]
+            );
+        }
+        let runs = engine.runs.lock().unwrap();
+        assert!(
+            runs.is_empty(),
+            "no peer-message turn may fire while the Captain is running"
+        );
+    }
+
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
     /// the image (kernel pushes the empty text block, TS parity).
@@ -2743,6 +2921,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2767,6 +2946,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.run_turn());
@@ -2787,6 +2967,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
@@ -2794,6 +2975,7 @@ pub(crate) mod tests {
             t.messages = vec![Message::user("preview-only".to_string())];
         });
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -2804,6 +2986,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         let (phase, texts) = thread.read(|t| {
             let texts: Vec<String> = t
@@ -2838,6 +3023,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.with_mut(|t| {
@@ -2862,12 +3048,14 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
         // The fresh session's sidecar reports the default at Ready; the
         // user's ReadOnly choice must not be overwritten.
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -2878,6 +3066,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(
             thread.read(|t| t.permission_mode()),
@@ -2897,6 +3088,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let engine_ref = Arc::clone(&engine);
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -2952,6 +3144,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         let snapshot = crate::plan::PlanSnapshot {
@@ -2963,6 +3156,7 @@ pub(crate) mod tests {
         };
         let value = serde_json::to_value(&snapshot).unwrap();
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -2973,6 +3167,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: Some(value),
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(t.persisted_plan(), Some(&snapshot));
@@ -2991,12 +3188,14 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_reasoning_effort(ReasoningEffort::Max));
         // The fresh session's sidecar reports High at Ready; the user's Max
         // choice must not be overwritten.
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3007,6 +3206,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
     }
@@ -3023,9 +3225,11 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3036,6 +3240,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         assert_eq!(thread.read(|t| t.reasoning_effort()), ReasoningEffort::Max);
     }
@@ -3064,6 +3271,7 @@ pub(crate) mod tests {
     async fn ready_seeds_browser_suites_from_projection() {
         let thread = thread_with_engine(HistoryPhase::Loading, Arc::new(FakeEngine::new()));
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3074,6 +3282,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(
@@ -3093,6 +3304,7 @@ pub(crate) mod tests {
             t.set_browser_suite(crate::engine::BrowserSuite::WebExplore, true);
         });
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3103,6 +3315,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| {
             assert_eq!(
@@ -3124,6 +3339,7 @@ pub(crate) mod tests {
             thinking_level: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
+            steers: Mutex::new(Vec::new()),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.cancel());
@@ -3141,6 +3357,7 @@ pub(crate) mod tests {
         });
         thread.read(|t| assert_eq!(t.display_title(), "fix the sidebar title bug"));
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: true,
             model: None,
             permission_mode: PermissionMode::default(),
@@ -3151,6 +3368,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: Some("终端标题修复".into()),
+            pinned: false,
+            archived: false,
+            project: None,
         })));
         thread.read(|t| assert_eq!(t.display_title(), "终端标题修复"));
         thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
@@ -3174,6 +3394,7 @@ pub(crate) mod tests {
 
     fn ready_with_model(model: Option<PiModel>) -> BackendNotice {
         BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
             restored: false,
             model,
             permission_mode: PermissionMode::default(),
@@ -3184,6 +3405,9 @@ pub(crate) mod tests {
             plan_review_pending: false,
             plan_snapshot: None,
             title: None,
+            pinned: false,
+            archived: false,
+            project: None,
         }))
     }
 
@@ -3216,5 +3440,64 @@ pub(crate) mod tests {
             thread.read(|t| t.model().cloned()),
             Some(facade_model("restored"))
         );
+    }
+
+    /// K2: the `Ready` projection carries the journal-rebuilt flags and
+    /// project binding — the facade mirrors them so the gateway's
+    /// projection baseline seeds from journal-backed state instead of the
+    /// construction defaults (a restored pin/archive/binding must be
+    /// visible without touching the sidecar cache).
+    #[test]
+    fn ready_projection_mirrors_journal_rebuilt_flags_and_project() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: Some("journal title".into()),
+            pinned: true,
+            archived: true,
+            project: Some(PathBuf::from("/journal/project")),
+        })));
+        thread.read(|t| {
+            assert!(t.is_pinned(), "the journal-rebuilt pin must mirror");
+            assert!(t.archived(), "the journal-rebuilt archive must mirror");
+            assert_eq!(t.project(), Some(&PathBuf::from("/journal/project")));
+            assert_eq!(t.display_title(), "journal title");
+        });
+
+        // A `None` project leaves an existing binding untouched (an
+        // unbound chain with no sidecar binding never clobbers a
+        // binding the store already restored).
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| t.restore_project(PathBuf::from("/store/project")));
+        thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
+            goal: None,
+            restored: true,
+            model: None,
+            permission_mode: PermissionMode::default(),
+            reasoning_effort: ReasoningEffort::default(),
+            browser_suites: Vec::new(),
+            plan_mode: false,
+            plan_file: None,
+            plan_review_pending: false,
+            plan_snapshot: None,
+            title: None,
+            pinned: false,
+            archived: false,
+            project: None,
+        })));
+        thread.read(|t| {
+            assert_eq!(t.project(), Some(&PathBuf::from("/store/project")));
+        });
     }
 }

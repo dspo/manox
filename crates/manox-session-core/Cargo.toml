@@ -7,9 +7,9 @@ publish = false
 [dependencies]
 # The session core drives gpui-free `ThreadHandle`s through the `agent`
 # handles and runtime, so the crate must stay out of the agent test-support
-# feature graph: feature unification would leak `test-support` into a
-# release build that pulls this crate (the WebUI host). The test-support
-# dev-dependency below keeps that graph out of the normal build.
+# feature graph: feature unification would leak `test-support` into any
+# release build that pulls this crate. The test-support dev-dependency
+# below keeps that graph out of the normal build.
 manox-agent.workspace = true
 manox-harness.workspace = true
 futures.workspace = true
@@ -20,7 +20,15 @@ tokio.workspace = true
 tokio-util.workspace = true
 manox-protocol.workspace = true
 parking_lot.workspace = true
+# The WS gateway transport arm (`src/ws/`) — the network face of the
+# protocol gateway, kept per the frontend-removal decision ("keep the
+# implemented http/ws interfaces"); `cx web` starts it headless.
+# (async-channel is already a dependency below.)
+axum.workspace = true
 tracing.workspace = true
+# §D.2 `CreateSession` mints session ids server-side for v2 clients.
+uuid.workspace = true
+async-channel.workspace = true
 
 [dev-dependencies]
 # The session tests swap scripted engines via `set_engine_for_test` and tear
@@ -31,3 +39,6 @@ tracing.workspace = true
 anyhow.workspace = true
 manox-agent = { workspace = true, features = ["test-support"] }
 async-channel = { workspace = true }
+# W7: the WS e2e test's client leg (same version axum's ws feature already
+# pulls into the graph — no new resolution).
+tokio-tungstenite.workspace = true

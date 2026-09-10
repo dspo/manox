@@ -5,25 +5,21 @@
 //! are camelCase on the wire.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::handshake::Initialize;
 
 /// A base64-encoded image attachment (submit / steer payloads).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachment {
     /// base64-encoded image bytes.
     #[serde(with = "crate::base64_bytes")]
-    #[ts(type = "string")]
     pub data: Vec<u8>,
     pub mime_type: String,
 }
 
 /// Client → server queries; each expects a [`crate::FromServer::Response`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",
@@ -40,15 +36,6 @@ pub enum ClientCall {
     ListThreads,
     ListModels,
     ListCommands,
-    GetUsage {
-        session_id: String,
-    },
-    GetCurrentModel {
-        session_id: String,
-    },
-    ThreadInfo {
-        session_id: String,
-    },
     /// Attach to a terminal; response carries the scrollback snapshot.
     TerminalAttach {
         session: String,
@@ -65,17 +52,92 @@ pub enum ClientCall {
         messages: serde_json::Value,
         tools: serde_json::Value,
     },
+    // ── v2 write calls (§D.2, L7: writes answer with receipts only) ───────
+    /// Create a session with intent; the response is `{session_id}` (id on
+    /// an idempotent re-open of an existing session). `initial_model` is a
+    /// canonical [`ModelRef`](crate::journal::ModelRef) (L8); approval mode
+    /// and reasoning effort ride the server's wire vocabularies
+    /// (`read-only`/`workspace-write`/`danger-full-access`,
+    /// `low|medium|high`). Replaces the fire-and-forget
+    /// [`ClientNote::CreateSession`] (kept as a compat entry through the
+    /// migration window, §D.3).
+    CreateSession {
+        cwd: Option<String>,
+        project: Option<String>,
+        initial_model: Option<crate::journal::ModelRef>,
+        approval_mode: Option<String>,
+        reasoning_effort: Option<String>,
+    },
+    /// Submit a user message (starts a turn unless it is a slash command);
+    /// the response is the receipt `{accepted, message_id?}` — the
+    /// transcript itself arrives through the follow stream (L3/L7).
+    /// `origin_rpc` echoes on the durable user-message entry's origin
+    /// field once the kernel carries it (kernel-type change; T4 gap), so
+    /// clients can retire their optimistic echo by correlation. Replaces
+    /// the fire-and-forget [`ClientNote::Submit`] (compat entry kept).
+    Submit {
+        session_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        origin_rpc: Option<String>,
+    },
+    /// Steer a message into the running turn; receipt response
+    /// (`{accepted, message_id?}`). `message_id` identifies the steer
+    /// (echo-retirement and `DropQueued` target); the durable steer entry
+    /// carries it. Replaces [`ClientNote::Steer`] (compat entry kept).
+    Steer {
+        session_id: String,
+        message_id: String,
+        text: String,
+        images: Vec<ImageAttachment>,
+        origin_rpc: Option<String>,
+    },
+    /// Cold page-read of the journal (§D.2): reads straight from the stored
+    /// active chain without activating the engine. `through_seq` is the
+    /// inclusive tail (`-1` = latest); `before_seq` is an exclusive upper
+    /// bound for backwards paging; `max_messages` bounds the page size.
+    /// The response is `{records, has_more, cursor}` — `records` are
+    /// [`JournalWireEntry`](crate::journal::JournalWireEntry) shapes.
+    PageHistory {
+        session_id: String,
+        through_seq: i64,
+        before_seq: Option<i64>,
+        max_messages: Option<u32>,
+    },
+    /// On-demand conversation fold (§E.3, Q face): the server folds the
+    /// journal (turns / messages / per-model usage), cached by
+    /// `(thread_id, cursor)`. The response is the §E.3 payload; fields the
+    /// fold cannot source yet are `null`.
+    GetConversationInfo {
+        session_id: String,
+    },
+    /// Withdraw a pending adjudication delivery (GW3, §D.4): references the
+    /// `deliveryId` of a received [`ServerCall::Approve` /
+    /// `PlanVerdict` / `AskUserQuestion`](crate::ServerCall) the client will
+    /// not answer (e.g. it navigated away from the session). The server
+    /// settles that delivery through the existing expire/converge path —
+    /// fail-closed for a waterfall — instead of waiting out the 300s call
+    /// timeout. Receipt response `{cancelled: bool}` (L7): `false` means the
+    /// delivery already settled or never targeted this client; a late
+    /// `Reply` for a withdrawn delivery is ignored.
+    CancelDelivery {
+        delivery_id: String,
+    },
 }
 
 /// Client → server fire-and-forget commands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
 pub enum ClientNote {
+    /// Compat entry (§D.3 dual-protocol window): superseded by
+    /// [`ClientCall::CreateSession`] (§D.2), which carries the session
+    /// intent and answers with the id receipt. The server forwards this
+    /// note internally to the request path; the receipt is discarded.
+    /// Removal is scheduled at T10.
     CreateSession {
         session_id: String,
         cwd: Option<String>,
@@ -86,12 +148,18 @@ pub enum ClientNote {
     DetachSession {
         session_id: String,
     },
+    /// Compat entry (§D.3 window): superseded by [`ClientCall::Submit`]
+    /// (§D.2 receipt + `originRpc` echo retirement). Forwarded internally
+    /// to the request path; removal at T10.
     Submit {
         session_id: String,
         text: String,
         images: Vec<ImageAttachment>,
         client_id: Option<String>,
     },
+    /// Compat entry (§D.3 window): superseded by [`ClientCall::Steer`].
+    /// Forwarded internally (the note's `client_id` becomes the call's
+    /// `message_id`); removal at T10.
     Steer {
         session_id: String,
         client_id: String,
@@ -125,6 +193,16 @@ pub enum ClientNote {
         session_id: String,
         enabled: bool,
     },
+    /// Toggle an opt-in browser tool suite (U6b: the desktop's direct
+    /// facade write retired to the gateway). `suite` is the closed wire
+    /// name ("chromeuse" | "webexplore" — the engine `BrowserSuite` serde
+    /// vocabulary); the toggle's effect returns via the
+    /// `BrowserSuitesChanged` echo like every sibling setter.
+    SetBrowserSuite {
+        session_id: String,
+        suite: String,
+        enable: bool,
+    },
     PlanSeedExecution {
         session_id: String,
         plan_file: String,
@@ -152,13 +230,9 @@ pub enum ClientNote {
         session_id: String,
         pinned: bool,
     },
-    FocusThread {
-        session_id: Option<String>,
-    },
     TerminalInput {
         terminal: String,
         #[serde(with = "crate::base64_bytes")]
-        #[ts(type = "string")]
         bytes: Vec<u8>,
     },
     TerminalResize {
@@ -243,5 +317,22 @@ mod tests {
         assert_eq!(json["bytes"], serde_json::json!("YWJj"));
         let back: ClientNote = serde_json::from_value(json).unwrap();
         assert_eq!(note, back);
+    }
+
+    /// GW3 (§D.4): the wire vocabulary expresses delivery withdrawal — a
+    /// client that navigated away from a session cancels its pending
+    /// adjudication delivery instead of leaving it to the 300s expiry. The
+    /// parse itself is the red evidence against the pre-GW3 vocabulary
+    /// (unknown method `cancelDelivery`).
+    #[test]
+    fn cancel_delivery_call_round_trips() {
+        let call: ClientCall = serde_json::from_value(serde_json::json!({
+            "method": "cancelDelivery",
+            "deliveryId": "dlv-s1-1",
+        }))
+        .expect("GW3: the wire vocabulary expresses delivery cancellation");
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["method"], "cancelDelivery");
+        assert_eq!(json["deliveryId"], "dlv-s1-1");
     }
 }

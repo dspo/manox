@@ -13,7 +13,6 @@ use crate::i18n;
 use gpui::{AnyElement, App, ScrollHandle, SharedString, Window, prelude::*, px};
 use gpui_component::{Icon, IconName, Sizable as _, Theme, h_flex, v_flex};
 
-use crate::slash_command::SlashCommandRegistry;
 use crate::views::popup_menu::{self, LIST_HORIZONTAL_PADDING, MAX_LIST_HEIGHT};
 
 /// What a completion row represents — drives its icon.
@@ -92,24 +91,41 @@ pub fn detect(value: &str, cursor: usize) -> Option<Detection> {
 }
 
 /// All registered slash commands (built-ins, markdown macros, and mirrored
-/// skills), filtered + sorted by `query`. Skills mirrored into the registry by
-/// `slash_command::init` surface here with `CompletionKind::Skill` via each
-/// adapter's `kind()`, so `/git` lists `gitwork:deliver` with the skill icon.
-pub fn slash_source(query: &str) -> Vec<CompletionItem> {
-    {
-        let Some(reg) = SlashCommandRegistry::global() else {
-            return Vec::new();
-        };
-        let items: Vec<CompletionItem> = reg
-            .commands()
-            .map(|cmd| CompletionItem {
-                name: cmd.name().to_string().into(),
-                description: cmd.description().to_string().into(),
-                kind: cmd.kind(),
+/// skills), filtered + sorted by `query`. U2: the listing is the gateway's
+/// command snapshot (§D.5 `Commands` / `ListCommands` — the server projects
+/// the same registries the desktop's dispatch adapters mirror), so a remote
+/// server's registry drives the popover. Built-ins carry their fluent
+/// `i18n_key` (description null) and localize here; macros and skills carry
+/// their frontmatter description verbatim. Execution still dispatches
+/// through the desktop-local registry (`slash_command::parse`/`dispatch`).
+pub fn slash_source(query: &str, commands: &serde_json::Value) -> Vec<CompletionItem> {
+    let Some(entries) = commands.as_array() else {
+        return Vec::new();
+    };
+    let items: Vec<CompletionItem> = entries
+        .iter()
+        .filter_map(|entry| {
+            let name = entry.get("name")?.as_str()?.to_string();
+            let kind = match entry.get("kind").and_then(|k| k.as_str()) {
+                Some("skill") => CompletionKind::Skill,
+                _ => CompletionKind::Command,
+            };
+            let description = match entry.get("description").and_then(|d| d.as_str()) {
+                Some(d) => d.to_string(),
+                None => entry
+                    .get("i18n_key")
+                    .and_then(|k| k.as_str())
+                    .map(|k| i18n::t(k).to_string())
+                    .unwrap_or_default(),
+            };
+            Some(CompletionItem {
+                name: name.into(),
+                description: description.into(),
+                kind,
             })
-            .collect();
-        filter_sort(items, query)
-    }
+        })
+        .collect();
+    filter_sort(items, query)
 }
 
 /// Skills + subagents, filtered + sorted by `query`. Skills are shared

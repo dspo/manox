@@ -150,38 +150,10 @@ impl AgentSession {
     }
 
     /// The TS `_expandSkillCommand` + `expandPromptTemplate` expansion.
+    /// Delegates to the free `expand_prompt_with` so the engine's
+    /// acceptance-side persistence (the K5 edge) expands identically.
     fn expand_prompt(&self, text: &str) -> String {
-        if let Some(rest) = text.strip_prefix("/skill:") {
-            let (name, args) = match rest.find(' ') {
-                Some(i) => (&rest[..i], rest[i + 1..].trim().to_string()),
-                None => (rest, String::new()),
-            };
-            if let Some(skill) = self.resources().skills.iter().find(|s| s.name == name) {
-                let block = crate::harness::format_skill_invocation(skill, None);
-                return if args.is_empty() {
-                    block
-                } else {
-                    format!("{block}\n\n{args}")
-                };
-            }
-            return text.to_string(); // Unknown skill, pass through.
-        }
-        if let Some(rest) = text.strip_prefix('/') {
-            let (name, args_string) = match rest.find(' ') {
-                Some(i) => (&rest[..i], rest[i + 1..].to_string()),
-                None => (rest, String::new()),
-            };
-            if let Some(template) = self
-                .resources()
-                .prompt_templates
-                .iter()
-                .find(|t| t.name == name)
-            {
-                let args = crate::harness::parse_command_args(&args_string);
-                return crate::harness::substitute_args(&template.content, &args);
-            }
-        }
-        text.to_string()
+        crate::harness::expand_prompt_with(self.resources(), text)
     }
 
     /// Continue from the current transcript.
@@ -831,6 +803,60 @@ impl AgentSession {
         self.harness
             .session()
             .append_custom(custom_type, data)
+            .await
+    }
+
+    /// Append a typed v4 journal entry by wire kind (§C.2); id, parent and
+    /// timestamp are assigned at the session's single append point.
+    pub async fn append_typed(
+        &self,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<String, anyhow::Error> {
+        self.harness.session().append_typed(kind, payload).await
+    }
+
+    /// Pin this turn's origin RPC id (echo retirement, §F.2).
+    pub fn set_pending_user_origin(&self, origin: Option<String>) {
+        self.harness.session().set_pending_user_origin(origin);
+    }
+
+    /// The shared mid-run journal writer: the same `Arc<Session>` the
+    /// persistence middleware holds. Appends through it are linearized by
+    /// the session's append lock (parent-selection + append never fork the
+    /// chain) and broadcast to journal subscribers like any other append —
+    /// a host can persist facade-level rows (subagent progress, retries)
+    /// WHILE a run holds the session, instead of parking them for
+    /// turn-settle.
+    pub fn journal_appender(
+        &self,
+    ) -> std::sync::Arc<crate::session::Session<crate::session::jsonl::JsonlSessionStorage>> {
+        self.harness.session_arc()
+    }
+
+    /// Subscribe to this session's ordered journal appends (the §C.3 read
+    /// face; the host relays this to session-core's follow streams).
+    pub fn subscribe_journal(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::session::jsonl::JournalEvent> {
+        self.harness.session().storage().subscribe_journal()
+    }
+
+    /// The journal cursor (seq of the active leaf).
+    pub async fn journal_cursor(&self) -> u64 {
+        self.harness.session().storage().journal_cursor().await
+    }
+
+    /// Read a seq range off the active chain (inclusive, clamped).
+    pub async fn journal_range(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+    ) -> Result<Vec<crate::session::jsonl::JournalRecord>, anyhow::Error> {
+        self.harness
+            .session()
+            .storage()
+            .journal_range(from_seq, to_seq)
             .await
     }
 
@@ -3160,11 +3186,16 @@ mod tests {
                 .await
                 .unwrap();
             // A switches the model; B changes the thinking level. Both patch
-            // the shared settings file on different keys.
+            // the shared settings file on different keys. A's target model is
+            // non-thinking, so its patch writes ONLY defaultProvider/
+            // defaultModel — set_model conditionally declares a thinking
+            // default too, and with it the final defaultThinkingLevel would
+            // depend on patch ORDER (last writer wins), making the assertions
+            // below flaky by construction.
             let (ra, rb) = tokio::join!(
                 a.set_model(Model {
                     id: format!("beta-{round}"),
-                    thinking: crate::types::ThinkingKind::Enabled,
+                    thinking: crate::types::ThinkingKind::None,
                     ..test_model()
                 }),
                 b.set_thinking_level(Some("high".into()))

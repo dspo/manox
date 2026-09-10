@@ -1,8 +1,14 @@
 //! Conversation history sidebar.
 //!
-//! A standalone gpui Entity that subscribes to the gpui-free `ThreadStore`
-//! (via a `StoreHandle` event pump) and lists past threads. Clicking a
-//! conversation entry emits `OpenThread(id)`; the "Conversations" section header's "+" opens the
+//! A standalone gpui Entity that lists past threads from the gateway (U2):
+//! the rows are the multiplexer's wire `ThreadListItem`s (§D.5
+//! `ThreadsUpdated` mirrors / `ListThreads` responses with the
+//! `SessionStatus` deltas merged in) — the former kernel `StoreHandle` event
+//! pump is retired. The decoration columns (project grouping, tag chip,
+//! approval wash) ride the wire rows and the grouping registry rides the
+//! `HostEvent::Projects` mirror (U2 cross-domain #1). Clicking a
+//! conversation entry emits
+//! `OpenThread(id)`; the "Conversations" section header's "+" opens the
 //! flat new-session menu and each project folder header's ellipsis button opens the project
 //! action menu (new session / terminal / VS Code / remove project). Workspace subscribes to
 //! these events.
@@ -32,7 +38,7 @@ use gpui_component::{
     v_flex,
 };
 use manox_agent::thread::PermissionMode;
-use manox_agent::thread_store::StoreHandle;
+use manox_protocol::ThreadListItem;
 
 /// How far the row wash translates (in pixels, clipped to the row) during the
 /// selection-slide. The two adjacent rows animate in opposite directions so
@@ -99,23 +105,25 @@ enum AnimRole {
     None,
 }
 
-/// A row in the Conversations list — either a manox thread or an external
-/// agent CLI session, unified so the two can be merged and ordered by recency
-/// instead of living in separate sections. Both row kinds share the
-/// selection-slide: their ids join one `flat_ids` ordering and `render_thread_item`
-/// applies the same `SlideCtx` wash to either.
+/// A row in the Conversations list — either a manox thread (the gateway's
+/// wire `ThreadListItem`, U2) or an external agent CLI session, unified so
+/// the two can be merged and ordered by recency instead of living in
+/// separate sections. Both row kinds share the selection-slide: their ids
+/// join one `flat_ids` ordering and `render_thread_item` applies the same
+/// `SlideCtx` wash to either.
 enum SidebarRow {
-    Thread(manox_agent::ThreadSummary),
+    Thread(ThreadListItem),
     External(crate::external_session::ExternalSessionSummary),
 }
 
 impl SidebarRow {
-    /// Recency sort key (newest first). Threads use `interacted_at`; external
-    /// sessions use their spawn `created_at` — manox cannot observe in-TUI
-    /// interaction, so the spawn time is the only signal it has.
+    /// Recency sort key (newest first). Threads use the wire row's
+    /// `updated_at` (unix seconds; the list snapshot's recency column);
+    /// external sessions use their spawn `created_at` — manox cannot observe
+    /// in-TUI interaction, so the spawn time is the only signal it has.
     fn sort_key(&self) -> i64 {
         match self {
-            Self::Thread(s) => s.interacted_at,
+            Self::Thread(s) => s.updated_at as i64,
             Self::External(s) => s.created_at,
         }
     }
@@ -128,9 +136,10 @@ impl SidebarRow {
     }
 }
 
-/// Row geometry + team nesting metadata for [`SidebarThreadItem::from_thread`]:
+/// Row geometry + team nesting metadata for [`SidebarThreadItem::from_wire`]:
 /// `indent` offsets members under their leader, `nested` draws the left guide
 /// rail.
+#[derive(Clone, Copy)]
 struct RowNesting {
     indent: gpui::Pixels,
     team_leader: bool,
@@ -205,10 +214,10 @@ pub enum SidebarEvent {
 /// store); a collapsed leader hides its subtree.
 fn team_forest(
     team_collapsed: &HashSet<String>,
-    threads: &[manox_agent::ThreadSummary],
+    threads: &[ThreadListItem],
     externals: &[crate::external_session::ExternalSessionSummary],
 ) -> Vec<ThreadRender> {
-    let mut members: HashMap<&str, Vec<&manox_agent::ThreadSummary>> = HashMap::new();
+    let mut members: HashMap<&str, Vec<&ThreadListItem>> = HashMap::new();
     let ids: HashSet<&str> = threads.iter().map(|s| s.id.as_str()).collect();
     for s in threads {
         if s.depth > 0
@@ -247,7 +256,7 @@ fn team_forest(
         });
         if team_leader && !team_collapsed.contains(&id) {
             let mut kids = members.get(id.as_str()).cloned().unwrap_or_default();
-            kids.sort_by_key(|k| std::cmp::Reverse(k.interacted_at));
+            kids.sort_by_key(|k| std::cmp::Reverse(k.updated_at));
             for kid in kids {
                 push_member(team_collapsed, &mut out, kid, 1.0, &members);
             }
@@ -266,9 +275,9 @@ const MAX_TEAM_RENDER_DEPTH: f32 = 8.0;
 fn push_member(
     team_collapsed: &HashSet<String>,
     out: &mut Vec<ThreadRender>,
-    s: &manox_agent::ThreadSummary,
+    s: &ThreadListItem,
     depth: f32,
-    members: &HashMap<&str, Vec<&manox_agent::ThreadSummary>>,
+    members: &HashMap<&str, Vec<&ThreadListItem>>,
 ) {
     let has_kids = members.contains_key(s.id.as_str());
     out.push(ThreadRender {
@@ -279,7 +288,7 @@ fn push_member(
     });
     if has_kids && !team_collapsed.contains(&s.id) && depth < MAX_TEAM_RENDER_DEPTH {
         let mut kids = members.get(s.id.as_str()).cloned().unwrap_or_default();
-        kids.sort_by_key(|k| std::cmp::Reverse(k.interacted_at));
+        kids.sort_by_key(|k| std::cmp::Reverse(k.updated_at));
         for kid in kids {
             push_member(team_collapsed, out, kid, depth + 1.0, members);
         }
@@ -300,7 +309,11 @@ fn external_session_is_loose(project: Option<&std::path::Path>, known_projects: 
 }
 
 pub struct Sidebar {
-    store: StoreHandle,
+    /// The gateway client (U2 list source + GW5 badge source): rows are its
+    /// wire `ThreadListItem`s, and their unread badges prefer the leaves'
+    /// client-owned mirrors. Bound by the workspace after construction; an
+    /// unbound sidebar (tests) renders no thread rows.
+    mux: Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     selected: Option<String>,
     /// The thread that was selected immediately before `selected`; its row
     /// plays a fade-out wash while the new row's wash fades in, so selection
@@ -344,29 +357,22 @@ pub struct Sidebar {
     /// Scroll offset + child-bounds reader for the sidebar scroll body; the
     /// sticky section-header overlay reads it to decide which header to show.
     scroll_handle: ScrollHandle,
-    _pump: gpui::Task<()>,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}
 
 impl Sidebar {
-    pub fn new(width: Pixels, cx: &mut Context<Self>) -> Self {
-        let store = manox_agent::thread_store_global();
-        // The store is gpui-free: pump its event channel into `cx.notify()`
-        // through a spawned task instead of `cx.subscribe` (transitional;
-        // γ replaces this with a client store + entity subscription).
-        let rx = store.subscribe();
-        let _pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
-            while let Ok(_ev) = rx.recv().await {
-                let _ = this.update(cx, |_, cx| {
-                    // The event value is not needed — any store change
-                    // repaints the list.
-                    cx.notify();
-                });
-            }
-        });
+    /// Bind the gateway client (U2 list source, GW5 badge source): rows are
+    /// the multiplexer's wire `ThreadListItem`s, and their unread badges
+    /// prefer the leaves' client-owned mirrors over the (deprecated,
+    /// constant-false) row flag.
+    pub fn bind_multiplexer(&mut self, mux: gpui::Entity<crate::multiplexer::SessionMultiplexer>) {
+        self.mux = Some(mux);
+    }
+
+    pub fn new(width: Pixels, _cx: &mut Context<Self>) -> Self {
         Self {
-            store,
+            mux: None,
             selected: None,
             collapsed: HashSet::new(),
             team_collapsed: HashSet::new(),
@@ -383,12 +389,7 @@ impl Sidebar {
             row_menu_sub: None,
             width,
             scroll_handle: ScrollHandle::new(),
-            _pump,
         }
-    }
-
-    pub fn store(&self) -> StoreHandle {
-        self.store.clone()
     }
 
     /// Replace the external-session projection. Called by the Workspace
@@ -478,9 +479,14 @@ impl Sidebar {
         self.new_session_project = project.clone();
         let theme = cx.theme().clone();
         let sidebar = cx.entity().downgrade();
+        // The menu-build closures run EAGERLY inside this Sidebar update,
+        // so the cascade builders get the mux handle up front — reading
+        // the Sidebar entity from inside them double-leases it (the
+        // acceptance-run crash).
+        let mux = self.mux.clone();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             if project.is_some() {
-                return build_project_menu(menu, &sidebar, &theme, window, cx);
+                return build_project_menu(menu, &sidebar, &mux, &theme, window, cx);
             }
             let mut menu = menu
                 .max_w(gpui::px(280.))
@@ -539,6 +545,7 @@ impl Sidebar {
             ] {
                 let sidebar = sidebar.clone();
                 let theme = theme.clone();
+                let mux_agent = mux.clone();
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 menu = menu.submenu_with_icon(
@@ -552,7 +559,9 @@ impl Sidebar {
                     window,
                     cx,
                     move |submenu, window, cx| {
-                        build_agent_model_cascade(submenu, kind, agent_id, &sidebar, window, cx)
+                        build_agent_model_cascade(
+                            submenu, kind, agent_id, &sidebar, &mux_agent, window, cx,
+                        )
                     },
                 );
             }
@@ -776,15 +785,16 @@ impl Sidebar {
         }
     }
 
-    /// The persisted tag for a row, reading both sidebar partitions.
-    fn summary_tag(&self, id: &str, _cx: &App) -> Option<String> {
-        self.store.read(|store| {
-            store
-                .summaries()
+    /// The persisted tag for a row (U2 cross-domain #1: it rides the wire
+    /// row — the wire list spans both store partitions, so archived rows'
+    /// tags resolve too).
+    fn summary_tag(&self, id: &str, cx: &App) -> Option<String> {
+        self.mux.as_ref().and_then(|m| {
+            m.read(cx)
+                .thread_list()
                 .iter()
-                .chain(store.archived_summaries())
-                .find(|s| s.id == id)
-                .and_then(|s| s.tag.clone())
+                .find(|i| i.id == id)
+                .and_then(|i| i.tag.clone())
         })
     }
 
@@ -819,13 +829,18 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// The currently selected thread id (the highlight source).
+    pub fn selected_id(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+
     /// Order threads as a team forest: top-level rows (threads + externals)
     /// merged by recency, each leader followed by its indented member
     /// subtree. Orphans and cycles stay top-level (`depth` is zeroed for
     /// them at the store); a collapsed leader hides its subtree.
     fn order_rows(
         &self,
-        threads: &[manox_agent::ThreadSummary],
+        threads: &[ThreadListItem],
         externals: &[crate::external_session::ExternalSessionSummary],
     ) -> Vec<ThreadRender> {
         team_forest(&self.team_collapsed, threads, externals)
@@ -839,13 +854,18 @@ impl Sidebar {
     fn render_project_group(
         &self,
         path: &str,
-        group: &[manox_agent::ThreadSummary],
+        group: &[ThreadListItem],
         selected: Option<&str>,
-        store: &StoreHandle,
         slide: &SlideCtx,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
+        // GW5 badge source: the leaves' client-owned unread mirrors.
+        let unread_map = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).unread_map(cx))
+            .unwrap_or_default();
         let expanded = !self.collapsed.contains(path);
         let name = std::path::Path::new(path)
             .file_name()
@@ -959,32 +979,24 @@ impl Sidebar {
                 .children(team_rows.into_iter().map(|tr| {
                     let is_selected = selected == Some(tr.row.id());
                     match tr.row {
-                        SidebarRow::Thread(s) => {
-                            let live = store.read(|store| ThreadLiveState {
-                                running: store.is_running(&s.id),
-                                pending_auth: store.pending_auth_contains(&s.id),
-                                pending_plan: store.pending_plan_contains(&s.id),
-                                background_work: store.background_work_contains(&s.id),
-                            });
-                            render_thread_item(
-                                &SidebarThreadItem::from_thread(
-                                    &s,
-                                    is_selected,
-                                    live,
-                                    RowNesting {
-                                        indent: px(16. + tr.indent),
-                                        team_leader: tr.team_leader,
-                                        team_collapsed: tr.team_collapsed,
-                                        nested: tr.indent > 0.0,
-                                    },
-                                    &theme,
-                                ),
-                                slide,
-                                self,
+                        SidebarRow::Thread(s) => render_thread_item(
+                            &SidebarThreadItem::from_wire(
+                                &s,
+                                is_selected,
+                                unread_map.get(&s.id).copied(),
+                                RowNesting {
+                                    indent: px(16. + tr.indent),
+                                    team_leader: tr.team_leader,
+                                    team_collapsed: tr.team_collapsed,
+                                    nested: tr.indent > 0.0,
+                                },
                                 &theme,
-                                cx,
-                            )
-                        }
+                            ),
+                            slide,
+                            self,
+                            &theme,
+                            cx,
+                        ),
                         SidebarRow::External(s) => render_thread_item(
                             &SidebarThreadItem::from_external(&s, is_selected, px(16.), &theme),
                             slide,
@@ -1008,23 +1020,43 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let summaries = self.store.read(|s| s.summaries().to_vec());
-        let known_projects = self.store.read(|s| s.known_projects().to_vec());
+        // U2: the rows are the gateway's wire list (the multiplexer's
+        // `ThreadListItem`s — §D.5 mirrors / `ListThreads` responses with
+        // the `SessionStatus` deltas merged), never a kernel store read.
+        let items: Vec<ThreadListItem> = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).thread_list().to_vec())
+            .unwrap_or_default();
+        // U2 cross-domain #1: the grouping registry rides the wire (the
+        // `HostEvent::Projects` mirror), not a workspace push.
+        let known_projects = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).known_projects().to_vec())
+            .unwrap_or_default();
         let selected = self.selected.clone();
-        let store = self.store.clone();
+        // GW5 badge source: the leaves' client-owned unread mirrors.
+        let unread_map = self
+            .mux
+            .as_ref()
+            .map(|m| m.read(cx).unread_map(cx))
+            .unwrap_or_default();
 
-        let mut projects: Vec<(String, Vec<manox_agent::ThreadSummary>)> = Vec::new();
-        let mut loose: Vec<manox_agent::ThreadSummary> = Vec::new();
-        for s in &summaries {
+        let mut projects: Vec<(String, Vec<ThreadListItem>)> = Vec::new();
+        let mut loose: Vec<ThreadListItem> = Vec::new();
+        for s in &items {
             // Only REGISTERED projects become folder groups; a session cwd
             // that was never bound as a project (e.g. the default home dir)
-            // stays in the loose Conversations list.
-            if s.project.is_empty() || !known_projects.contains(&s.project) {
+            // stays in the loose Conversations list. U2 cross-domain #1:
+            // the binding rides the wire row's project column.
+            let project = s.project.as_deref().unwrap_or_default();
+            if project.is_empty() || !known_projects.iter().any(|kp| kp == project) {
                 loose.push(s.clone());
-            } else if let Some(entry) = projects.iter_mut().find(|(p, _)| *p == s.project) {
+            } else if let Some(entry) = projects.iter_mut().find(|(p, _)| p == project) {
                 entry.1.push(s.clone());
             } else {
-                projects.push((s.project.clone(), vec![s.clone()]));
+                projects.push((project.to_string(), vec![s.clone()]));
             }
         }
         // Merge registered projects that have no active threads — they still
@@ -1134,7 +1166,7 @@ impl Render for Sidebar {
         let projects_el: Vec<AnyElement> = projects
             .into_iter()
             .map(|(path, group)| {
-                self.render_project_group(&path, &group, selected.as_deref(), &store, &slide, cx)
+                self.render_project_group(&path, &group, selected.as_deref(), &slide, cx)
             })
             .collect();
 
@@ -1193,35 +1225,24 @@ impl Render for Sidebar {
                                     .children(team_rows.into_iter().map(|tr| {
                                         let is_selected = selected.as_deref() == Some(tr.row.id());
                                         match tr.row {
-                                            SidebarRow::Thread(s) => {
-                                                let live = store.read(|store| ThreadLiveState {
-                                                    running: store.is_running(&s.id),
-                                                    pending_auth: store
-                                                        .pending_auth_contains(&s.id),
-                                                    pending_plan: store
-                                                        .pending_plan_contains(&s.id),
-                                                    background_work: store
-                                                        .background_work_contains(&s.id),
-                                                });
-                                                render_thread_item(
-                                                    &SidebarThreadItem::from_thread(
-                                                        &s,
-                                                        is_selected,
-                                                        live,
-                                                        RowNesting {
-                                                            indent: px(tr.indent),
-                                                            team_leader: tr.team_leader,
-                                                            team_collapsed: tr.team_collapsed,
-                                                            nested: tr.indent > 0.0,
-                                                        },
-                                                        &theme,
-                                                    ),
-                                                    &slide,
-                                                    self,
+                                            SidebarRow::Thread(s) => render_thread_item(
+                                                &SidebarThreadItem::from_wire(
+                                                    &s,
+                                                    is_selected,
+                                                    unread_map.get(&s.id).copied(),
+                                                    RowNesting {
+                                                        indent: px(tr.indent),
+                                                        team_leader: tr.team_leader,
+                                                        team_collapsed: tr.team_collapsed,
+                                                        nested: tr.indent > 0.0,
+                                                    },
                                                     &theme,
-                                                    cx,
-                                                )
-                                            }
+                                                ),
+                                                &slide,
+                                                self,
+                                                &theme,
+                                                cx,
+                                            ),
                                             SidebarRow::External(s) => render_thread_item(
                                                 &SidebarThreadItem::from_external(
                                                     &s,
@@ -1273,13 +1294,26 @@ fn build_agent_model_cascade(
     kind: crate::external_session::SessionKind,
     agent_id: &'static str,
     sidebar: &WeakEntity<Sidebar>,
+    mux: &Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let sidebar = sidebar.clone();
+    // U2 cross-domain #4: the cascade projects the multiplexer's wire
+    // models (the provider_glue direct read retired). The mux handle is
+    // passed IN: this builder runs eagerly inside the Sidebar's own
+    // update listener, so upgrading + reading the Sidebar entity here
+    // would double-lease it — GPUI panics ("cannot read Sidebar while
+    // it is already being updated"), and in the real app the objc
+    // callback frame turns the panic into a non-unwinding abort.
+    let models: Vec<manox_protocol::ModelInfo> = mux
+        .as_ref()
+        .map(|m| m.read(cx).models().to_vec())
+        .unwrap_or_default();
     crate::views::model_cascade::build_model_cascade(
         menu,
         agent_id,
+        &models,
         window,
         cx,
         move |provider, model, wire, _window, cx| {
@@ -1302,12 +1336,16 @@ fn build_agent_model_cascade(
 fn build_project_menu(
     menu: PopupMenu,
     sidebar: &WeakEntity<Sidebar>,
+    mux: &Option<gpui::Entity<crate::multiplexer::SessionMultiplexer>>,
     theme: &Theme,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
     let theme = theme.clone();
     let sidebar = sidebar.clone();
+    // Owned clone: the submenu closures are `move` and must be 'static
+    // (deferred builds), so they cannot capture the borrowed parameter.
+    let mux = mux.clone();
     let mut menu = menu.max_w(gpui::px(280.));
     // New-session submenu: Manox flat row + one provider→model cascade per
     // external agent kind.
@@ -1352,6 +1390,7 @@ fn build_project_menu(
                 crate::external_session::SessionKind::GithubCopilot,
             ] {
                 let sidebar_agent = sidebar_new.clone();
+                let mux_agent = mux.clone();
                 let label = kind.label();
                 let agent_id = kind.agent_id();
                 submenu = submenu.submenu_with_icon(
@@ -1370,6 +1409,7 @@ fn build_project_menu(
                             kind,
                             agent_id,
                             &sidebar_agent,
+                            &mux_agent,
                             window,
                             cx,
                         )
@@ -1491,17 +1531,8 @@ struct TagEdit {
     _sub: Subscription,
 }
 
-/// Live per-thread state the store tracks for the row's icon: the spin /
-/// blue-static / triangle decision is purely a function of these four flags.
-#[derive(Clone, Copy, Default)]
-struct ThreadLiveState {
-    running: bool,
-    pending_auth: bool,
-    pending_plan: bool,
-    background_work: bool,
-}
-
-/// A UI-layer sidebar row projected from either a manox `ThreadSummary` or an
+/// A UI-layer sidebar row projected from either the gateway's wire
+/// `ThreadListItem` (its decoration columns ride the row) or an
 /// `ExternalSessionSummary`, so the two render through one layout with a shared
 /// selection-slide animation, id tag, and hover archive action. Only display +
 /// identity fields live here — the sidebar never holds PTY handles.
@@ -1554,33 +1585,39 @@ struct SidebarThreadItem {
 }
 
 impl SidebarThreadItem {
-    fn from_thread(
-        summary: &manox_agent::ThreadSummary,
+    /// Project a gateway wire row (U2): the live flags AND the decoration
+    /// columns (tag chip, approval wash — U2 cross-domain #1) ride the row
+    /// itself (the server's list projection with the §D.5 `SessionStatus`
+    /// deltas merged by the multiplexer).
+    fn from_wire(
+        item: &ThreadListItem,
         selected: bool,
-        live: ThreadLiveState,
+        // GW5: the leaf's client-owned unread mirror, when the session has
+        // a leaf; `None` falls back to the row's flag (the deprecated wire
+        // field the multiplexer's monotonic mirror keeps client-owned).
+        unread_override: Option<bool>,
         nesting: RowNesting,
         theme: &Theme,
     ) -> Self {
-        let display = summary.display_title();
-        let title = if display.is_empty() {
+        let title = if item.title.is_empty() {
             i18n::t("sidebar-empty-summary").to_string()
         } else {
-            truncate(display, 24)
+            truncate(&item.title, 24)
         };
         Self {
-            short_id: summary.id.chars().take(8).collect(),
-            copy_value: summary.id.clone(),
-            id: summary.id.clone(),
+            short_id: item.id.chars().take(8).collect(),
+            copy_value: item.id.clone(),
+            id: item.id.clone(),
             title,
-            updated: format_relative(summary.interacted_at),
-            pinned: summary.pinned,
-            tag: summary.tag.clone(),
-            has_unread: summary.has_unread,
-            errored: summary.errored,
-            running: live.running,
-            pending_auth: live.pending_auth,
-            pending_plan: live.pending_plan,
-            background_work: live.background_work,
+            updated: format_relative(item.updated_at as i64),
+            pinned: item.pinned,
+            tag: item.tag.clone(),
+            has_unread: unread_override.unwrap_or(item.unread),
+            errored: item.errored,
+            running: item.running,
+            pending_auth: item.pending_auth,
+            pending_plan: item.pending_plan,
+            background_work: item.background_work,
             resumable: false,
             resuming: false,
             selected,
@@ -1589,9 +1626,13 @@ impl SidebarThreadItem {
             team_collapsed: nesting.team_collapsed,
             nested: nesting.nested,
             icon: RowIcon::Thread,
-            wash: approval_mode_color(summary.approval_mode, theme),
+            wash: approval_mode_color(
+                item.approval_mode
+                    .unwrap_or_else(|| PermissionMode::default().as_i64()),
+                theme,
+            ),
             kind: RowKind::Thread {
-                archived: summary.archived,
+                archived: item.archived,
             },
         }
     }
@@ -2215,27 +2256,30 @@ mod tests {
         Theme::from(&*ThemeColor::light())
     }
 
-    fn sample_thread() -> manox_agent::ThreadSummary {
-        manox_agent::ThreadSummary {
+    /// The U2 wire row sample: the server projects the display title into
+    /// `title` and the recency column into `updated_at` (unix seconds).
+    fn sample_item() -> ThreadListItem {
+        ThreadListItem {
             id: "thread-abcdef12".into(),
-            summary: "Summarize the diff".into(),
-            title: None,
-            title_override: None,
-            model_id: "claude".into(),
-            provider_id: None,
-            approval_mode: PermissionMode::default().as_i64(),
-            project: String::new(),
-            depth: 0,
-            parent_id: None,
-            archived: false,
-            pinned: false,
-            tag: None,
-            has_unread: false,
-            errored: false,
-            created_at: 0,
-            interacted_at: 0,
+            title: "Summarize the diff".into(),
             updated_at: 0,
-            cumulative_total_tokens: 0,
+            running: false,
+            // GW5: the wire unread field is the deprecated constant-false;
+            // badges come from the leaf mirrors (or the multiplexer's
+            // client-owned row mirror).
+            unread: false,
+            errored: false,
+            pending_auth: false,
+            pending_plan: false,
+            background_work: false,
+            model_id: "claude".into(),
+            pinned: false,
+            archived: false,
+            parent_id: None,
+            depth: 0,
+            project: None,
+            tag: None,
+            approval_mode: None,
         }
     }
 
@@ -2259,11 +2303,11 @@ mod tests {
     #[test]
     fn team_forest_keeps_members_when_leader_is_in_another_partition() {
         let thread = |id: &str, parent: Option<&str>, depth: i32, at: i64| {
-            let mut s = sample_thread();
+            let mut s = sample_item();
             s.id = id.into();
             s.parent_id = parent.map(str::to_string);
             s.depth = depth;
-            s.interacted_at = at;
+            s.updated_at = at as i32;
             s
         };
         // Only the active partition is handed to the forest; the leader sits
@@ -2283,11 +2327,11 @@ mod tests {
     #[test]
     fn team_forest_nests_members_and_honors_collapse() {
         let thread = |id: &str, parent: Option<&str>, depth: i32, at: i64| {
-            let mut s = sample_thread();
+            let mut s = sample_item();
             s.id = id.into();
             s.parent_id = parent.map(str::to_string);
             s.depth = depth;
-            s.interacted_at = at;
+            s.updated_at = at as i32;
             s
         };
         let threads = vec![
@@ -2323,10 +2367,10 @@ mod tests {
     fn external_selection_mirrors_thread_selection() {
         let theme = real_theme();
 
-        let thread = SidebarThreadItem::from_thread(
-            &sample_thread(),
+        let thread = SidebarThreadItem::from_wire(
+            &sample_item(),
             true,
-            ThreadLiveState::default(),
+            None,
             RowNesting {
                 indent: px(0.),
                 team_leader: false,
@@ -2378,10 +2422,10 @@ mod tests {
     #[test]
     fn external_and_thread_rows_share_deselected_state() {
         let theme = real_theme();
-        let thread = SidebarThreadItem::from_thread(
-            &sample_thread(),
+        let thread = SidebarThreadItem::from_wire(
+            &sample_item(),
             false,
-            ThreadLiveState::default(),
+            None,
             RowNesting {
                 indent: px(0.),
                 team_leader: false,
@@ -2393,6 +2437,60 @@ mod tests {
         let external = SidebarThreadItem::from_external(&sample_external(), false, px(0.), &theme);
         assert!(!thread.selected);
         assert!(!external.selected);
+    }
+
+    /// U2 row projection (cross-domain #1 adoption): the live flags AND the
+    /// decoration columns (tag chip, approval wash) ride the wire row, and
+    /// the leaf's client-owned unread mirror wins over the deprecated row
+    /// flag.
+    #[test]
+    fn from_wire_projects_the_wire_columns_and_leaf_unread() {
+        let theme = real_theme();
+        let mut item = sample_item();
+        item.running = true;
+        item.pending_plan = true;
+        item.background_work = true;
+        item.tag = Some("chip".into());
+        item.approval_mode = Some(PermissionMode::default().as_i64());
+        let nesting = RowNesting {
+            indent: px(0.),
+            team_leader: false,
+            team_collapsed: false,
+            nested: false,
+        };
+        // The leaf mirror (GW5 badge source) wins over the row's deprecated
+        // constant-false unread.
+        let with_override = SidebarThreadItem::from_wire(&item, false, Some(true), nesting, &theme);
+        assert!(with_override.has_unread, "the leaf mirror wins");
+        assert!(
+            with_override.running && with_override.pending_plan && with_override.background_work,
+            "the live flags ride the wire row"
+        );
+        assert_eq!(
+            with_override.tag.as_deref(),
+            Some("chip"),
+            "the tag chip rides the wire row"
+        );
+        assert_eq!(
+            with_override.wash,
+            approval_mode_color(PermissionMode::default().as_i64(), &theme),
+            "the wash rides the wire row's approval column"
+        );
+        // No leaf: fall back to the row value (the client-owned mirror the
+        // multiplexer keeps — false on a fresh snapshot row).
+        let no_override = SidebarThreadItem::from_wire(&item, false, None, nesting, &theme);
+        assert!(!no_override.has_unread);
+        // A row without decoration columns: default wash, no tag — it still
+        // renders (the optional columns' absence is legal).
+        let mut bare_item = sample_item();
+        bare_item.tag = None;
+        bare_item.approval_mode = None;
+        let bare = SidebarThreadItem::from_wire(&bare_item, false, None, nesting, &theme);
+        assert_eq!(bare.tag, None);
+        assert_eq!(
+            bare.wash,
+            approval_mode_color(PermissionMode::default().as_i64(), &theme)
+        );
     }
 
     /// The pinned slot shows the Conversations header when no registered
@@ -2471,5 +2569,53 @@ mod tests {
         summary.resuming = true;
         let item = SidebarThreadItem::from_external(&summary, false, px(0.), &theme);
         assert!(item.resuming);
+    }
+
+    /// The acceptance-run crash: opening a project group's new-session
+    /// menu builds the provider→model cascades EAGERLY inside the
+    /// Sidebar's own update listener, and the cascade builder's
+    /// `sidebar.upgrade().read(cx)` double-leased the entity — GPUI
+    /// panics "cannot read Sidebar while it is already being updated"
+    /// (and the objc callback frame turns the panic into an abort in
+    /// the real app). The cascade builders now receive the mux handle
+    /// up front; opening either menu shape inside an update must build
+    /// cleanly.
+    struct MenuHost;
+    impl Render for MenuHost {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            gpui::Empty
+        }
+    }
+
+    #[gpui::test]
+    fn new_session_menu_builds_inside_sidebar_update(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.open_window(
+            gpui::size(gpui::px(960.), gpui::px(640.)),
+            move |window, cx| {
+                let host = cx.new(|_| MenuHost);
+                gpui_component::Root::new(host, window, cx)
+            },
+        );
+        cx.run_until_parked();
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let sidebar = cx.new(|cx| Sidebar::new(gpui::px(240.), cx));
+        // The project-group shape: the crash path (build_project_menu →
+        // the nested per-agent cascade submenus).
+        visual.update(|window, cx| {
+            sidebar.update(cx, |s, cx| {
+                s.open_new_session_menu(Some(std::path::PathBuf::from("/tmp/p")), window, cx);
+            });
+        });
+        // The flat shape: the cascade submenus built directly.
+        visual.update(|window, cx| {
+            sidebar.update(cx, |s, cx| {
+                s.open_new_session_menu(None, window, cx);
+            });
+        });
     }
 }

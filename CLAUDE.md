@@ -18,11 +18,11 @@ crates/                    # Rust workspace 成员
     src/ext/               # 经内核拓展点扩展的业务能力
   manox-protocol/          # 协议定义
   manox-session-core/      # 会话核心
-  manox-webui/             # Web UI 共享逻辑
   supervisor/              # 子进程监督
   hyperlinks/              # 超链接解析
   lsp/                     # LSP 集成
   cx/                      # cx CLI 路由域
+  manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
 
 apps/                      # 应用二进制与 UI
   desktop/                 # 桌面应用
@@ -32,9 +32,6 @@ apps/                      # 应用二进制与 UI
     manox-components/      # 共享 UI 组件库
     manox-webview/         # WebView 桥
     manox-webview-macros/  # WebView 过程宏
-  vscode/                  # VS Code 扩展（TS） + manox-napi
-  web/                     # Web UI 前端
-    webui/                 # 前端源码
 ```
 
 ## 构建与开发命令
@@ -84,6 +81,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
+- WS 网关端点（`cx web` 专用）：`~/.manox/gateway-ws.json`（0600；`cx web` 启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）

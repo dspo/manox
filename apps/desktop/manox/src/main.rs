@@ -81,6 +81,10 @@ fn main() {
         )
         .with_thread_ids(true)
         .with_thread_names(true)
+        // stderr: Rust never block-buffers it, so GUI launches (stdout is a
+        // pipe) still stream logs live instead of losing the tail in a dead
+        // buffer.
+        .with_writer(std::io::stderr)
         .init();
 
     let app = gpui_platform::application().with_assets(agent_ui::assets::ExtrasAssetSource::new());
@@ -385,7 +389,6 @@ fn main() {
                     Ok(()) => {
                         cx.set_quit_mode(QuitMode::Explicit);
                         tray::spawn_pump(cx);
-                        manox_webui::spawn_server();
                     }
                     // The fallback sentence is platform-true: macOS keeps a
                     // window-less app alive by default (dock icon reopens),

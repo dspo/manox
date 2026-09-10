@@ -7,6 +7,7 @@
 //! render time from `MdStyles`, so parsing needs no theme.
 
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 
 use gpui::{FontStyle, FontWeight, HighlightStyle};
 use hyperlinks::{
@@ -103,13 +104,45 @@ pub enum Block {
     ThematicBreak,
 }
 
+/// Run the third-party mdast compiler behind a panic fence.
+///
+/// markdown-rs 1.0.0's `to_mdast` has input classes that violate its own
+/// compile-stack invariants — most prominently a setext underline line
+/// followed later by another underline/thematic-break sequence
+/// (`"a\n===\n---\nb\n---"`, `"a\n---\n---\nb\n---"`, `"a\n===\n===\nb\n==="`
+/// all panic `tail_push: Cannot push to non-parent`; minimized from 17 hits
+/// in real session transcripts). Conversation content is arbitrary and a
+/// renderer may never abort on it — the 2026-09-10 acceptance run aborted
+/// the whole app rendering one such message. The fence catches the panic
+/// (suppressing the hook print for this call only, restoring whatever hook
+/// was installed) and the caller degrades to a plain-text paragraph.
+fn to_mdast_fenced(src: &str, opts: &ParseOptions) -> Option<Node> {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let out = std::panic::catch_unwind(AssertUnwindSafe(|| to_mdast(src, opts)))
+        .ok()
+        .and_then(|result| result.ok());
+    std::panic::set_hook(prev_hook);
+    out
+}
+
+/// The degraded render for input the fenced compiler cannot digest: the raw
+/// text as one plain paragraph (no overlays, no structure) — the message
+/// stays readable, the app stays up.
+fn fallback_paragraph(src: &str) -> Vec<Block> {
+    vec![Block::Paragraph(InlineRuns {
+        text: src.to_string(),
+        ..InlineRuns::default()
+    })]
+}
+
 /// Parse markdown source into manox blocks. GFM parse options so tables /
 /// strikethrough round-trip through the AST even before they are rendered.
 pub fn parse(src: &str) -> Vec<Block> {
     let opts = ParseOptions::gfm();
-    match to_mdast(src, &opts) {
-        Ok(Node::Root(root)) => root.children.iter().filter_map(block_of).collect(),
-        _ => Vec::new(),
+    match to_mdast_fenced(src, &opts) {
+        Some(Node::Root(root)) => root.children.iter().filter_map(block_of).collect(),
+        _ => fallback_paragraph(src),
     }
 }
 
@@ -124,8 +157,8 @@ pub fn parse(src: &str) -> Vec<Block> {
 /// `end` and the next block's `start`.
 pub(crate) fn parse_tail(src: &str) -> Vec<(Block, usize, usize)> {
     let opts = ParseOptions::gfm();
-    match to_mdast(src, &opts) {
-        Ok(Node::Root(root)) => root
+    match to_mdast_fenced(src, &opts) {
+        Some(Node::Root(root)) => root
             .children
             .iter()
             .filter_map(|node| {
@@ -135,7 +168,13 @@ pub(crate) fn parse_tail(src: &str) -> Vec<(Block, usize, usize)> {
                 block_of(node).map(|b| (b, start, end))
             })
             .collect(),
-        _ => Vec::new(),
+        // Same fence as `parse`: the degraded tail is one paragraph block
+        // spanning the whole tail (positions relative to the tail, per the
+        // contract above).
+        _ => fallback_paragraph(src)
+            .into_iter()
+            .map(|b| (b, 0, src.len()))
+            .collect(),
     }
 }
 
@@ -392,6 +431,44 @@ fn collect_inline(children: &[Node], active: ActiveStyle, runs: &mut InlineRuns)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The panic-fence regression (2026-09-10 acceptance abort): markdown-rs
+    /// 1.0.0's `to_mdast` panics `tail_push: Cannot push to non-parent` on
+    /// double setext-underline sequences — minimized from 17 hits in real
+    /// session transcripts (plan diffs, file listings). Pre-fix this
+    /// panicked the render thread into `failed to initiate panic` → abort.
+    /// The fence must degrade BOTH entry points to a readable plain
+    /// paragraph, never panic, never render empty.
+    #[test]
+    fn setext_underline_sequences_never_panic_the_parser() {
+        for src in [
+            "a\n===\n---\nb\n---",
+            "a\n---\n---\nb\n---",
+            "a\n===\n===\nb\n===",
+            // The corpus shapes the minimizer produced them from (paths,
+            // diffs, listings) — same class, fenced the same way.
+            ".md\n===\n---\nliver\n---",
+        ] {
+            let blocks = parse(src);
+            match blocks.as_slice() {
+                [Block::Paragraph(runs)] => assert_eq!(
+                    runs.text, src,
+                    "the degraded render carries the raw text verbatim"
+                ),
+                other => panic!("parse({src:?}) must degrade to one paragraph, got {other:?}"),
+            }
+            let tail = parse_tail(src);
+            match tail.as_slice() {
+                [(Block::Paragraph(runs), 0, end)] => {
+                    assert_eq!(runs.text, src);
+                    assert_eq!(*end, src.len(), "the degraded tail spans the whole tail");
+                }
+                other => {
+                    panic!("parse_tail({src:?}) must degrade to one tail paragraph, got {other:?}")
+                }
+            }
+        }
+    }
 
     #[test]
     fn parses_paragraph_and_heading() {

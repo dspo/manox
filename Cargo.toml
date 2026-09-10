@@ -27,8 +27,7 @@ members = [
 	    "crates/cx",
 	    "crates/manox-providers",
 	    "crates/manox-session-core",
-	    "apps/vscode/manox-napi",
-	    "crates/manox-webui",
+	    "crates/manox-napi",
 	    "crates/manox-protocol",
 	    "crates/hyperlinks",
 	    "crates/manox-ext-agents",
@@ -54,7 +53,6 @@ lsp = { path = "crates/lsp" }
 manox-webview = { path = "apps/desktop/manox-webview" }
 manox-webview-macros = { path = "apps/desktop/manox-webview-macros" }
 		manox-session-core = { path = "crates/manox-session-core" }
-manox-webui = { path = "crates/manox-webui" }
 manox-protocol = { path = "crates/manox-protocol" }
 manox-harness = { path = "crates/manox-harness" }
 hyperlinks = { path = "crates/hyperlinks" }
@@ -68,10 +66,8 @@ manox-providers = { path = "crates/manox-providers" }
 anyhow = "1"
 async-channel = "2"
 futures-lite = "2"
-ts-rs = { version = "10", features = ["serde-json-impl"] }
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
-include_dir = "0.7"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"

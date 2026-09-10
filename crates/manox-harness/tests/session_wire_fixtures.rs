@@ -187,6 +187,7 @@ fn fixture_branch_entries() -> Vec<manox_harness::session::SessionTreeEntry> {
             parent_id: parent.map(Into::into),
             timestamp: chrono::Utc::now(),
             message: manox_harness::AgentMessage::user(text),
+            origin: None,
         }
     }
     fn assistant_tool(id: &str, parent: &str, name: &str, path: &str) -> SessionTreeEntry {
@@ -213,6 +214,7 @@ fn fixture_branch_entries() -> Vec<manox_harness::session::SessionTreeEntry> {
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         }
     }
     let tool_result = SessionTreeEntry::Message {
@@ -232,6 +234,7 @@ fn fixture_branch_entries() -> Vec<manox_harness::session::SessionTreeEntry> {
             added_tool_names: None,
             timestamp: chrono::Utc::now(),
         },
+        origin: None,
     };
     let custom = SessionTreeEntry::CustomMessage {
         id: "c1".into(),
@@ -293,6 +296,7 @@ fn fixture_branch_entries() -> Vec<manox_harness::session::SessionTreeEntry> {
                 error_message: None,
                 timestamp: chrono::Utc::now(),
             },
+            origin: None,
         },
         assistant_tool("a2", "a1", "Write", "a.rs"),
         assistant_tool("a3", "a2", "Read", "b.rs"),

@@ -8,7 +8,8 @@
 //!
 //! Scope decision (ε closeout, 2026-08-31): no tauri transport is planned —
 //! the transport surface stays in-process (desktop) and serde-serialized
-//! (napi/webui). A tauri shell, if ever pursued, opens its own plan.
+//! (napi, and the WS gateway in `manox-session-core::ws`). A tauri shell,
+//! if ever pursued, opens its own plan.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,22 +29,45 @@ pub const BACKPRESSURE_CAPACITY: usize = 1024;
 pub enum BackpressurePolicy {
     /// Streaming payload: drop the message (caller may coalesce and re-send
     /// with a gap marker). The connection stays up.
+    ///
+    /// Legacy (v1) class only: under protocol v2 (§D.7) the Drop class is
+    /// DOOMED — durable delta traffic moves to
+    /// [`crate::stream::StreamFrame::Entry`], which is [`Self::BoundedResync`]
+    /// (L5: snapshots never drop, overflow resyncs; silent drops of journal
+    /// entries would open gaps a client cannot close).
     Drop,
     /// Control / lifecycle message: the client is presumed dead; disconnect.
+    /// §D.7 "control frames block, never drop": Request/Response/Reply and
+    /// host traffic take this class (blocking send on the in-process pair).
     Disconnect,
+    /// §D.7: `StreamItem(Snapshot | Projections)` and `StreamEnd` — must
+    /// never be dropped; the sender blocks until capacity frees (same
+    /// mechanics as [`Self::Disconnect`] on the in-process pair).
+    NeverDrop,
+    /// §D.7: `StreamItem(Entry)` — a bounded queue
+    /// ([`crate::stream::ENTRY_BACKPRESSURE_CAPACITY`]); when full, the
+    /// stream is ended with
+    /// [`StreamEndReason::Resync`](crate::stream::StreamEndReason::Resync)
+    /// and the client re-follows from a fresh snapshot (L5 — no server-side
+    /// replay buffers).
+    BoundedResync,
 }
 
 impl ServerNote {
-    /// Streaming payloads tolerate loss; everything else is control traffic a
-    /// dead client must not silently miss.
+    /// Legacy (v1) streaming classification — kept verbatim because live
+    /// consumers (the session-core ws gateway and pumps) compare against
+    /// `Drop`/`Disconnect`. The §D.7 successor strategy is expressed over
+    /// the v2 vocabulary: [`crate::stream::StreamFrame::backpressure_policy`]
+    /// (Snapshot/Projections/StreamEnd never drop; Entry bounded ⇒ resync)
+    /// and [`crate::stream::v2_backpressure_policy`] for the host/legacy
+    /// notification stream. Wiring those into the transports (and deleting
+    /// the `Drop` class with the doomed notes) is the T4/T5 envelope
+    /// migration.
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         match self {
-            ServerNote::AgentText { .. }
-            | ServerNote::AgentThinking { .. }
-            | ServerNote::ToolOutput { .. }
-            | ServerNote::ThreadHistory { .. }
-            | ServerNote::ModelText { .. }
-            | ServerNote::ModelThinking { .. } => BackpressurePolicy::Drop,
+            ServerNote::ModelText { .. } | ServerNote::ModelThinking { .. } => {
+                BackpressurePolicy::Drop
+            }
             _ => BackpressurePolicy::Disconnect,
         }
     }
@@ -58,45 +82,9 @@ impl ServerNote {
     pub fn session_id(&self) -> Option<&str> {
         use ServerNote::*;
         match self {
-            SessionCreated { session_id, .. }
-            | SessionDisposed { session_id, .. }
-            | TurnStarted { session_id, .. }
-            | TurnFinished { session_id, .. }
-            | Stop { session_id, .. }
-            | AgentText { session_id, .. }
-            | AgentThinking { session_id, .. }
-            | ToolCall { session_id, .. }
-            | ToolResult { session_id, .. }
-            | ToolOutput { session_id, .. }
-            | ThreadHistory { session_id, .. }
-            | ThreadInfo { session_id, .. }
-            | Usage { session_id, .. }
-            | UsageSnapshot { session_id, .. }
-            | CurrentModel { session_id, .. }
-            | PlanReady { session_id, .. }
-            | PlanUpdated { session_id, .. }
-            | PlanModeChanged { session_id, .. }
-            | GoalChanged { session_id, .. }
-            | CwdChanged { session_id, .. }
-            | PermissionModeChanged { session_id, .. }
-            | ReasoningEffortChanged { session_id, .. }
-            | BrowserSuitesChanged { session_id, .. }
-            | CompactionStarted { session_id, .. }
-            | Compaction { session_id, .. }
-            | CacheInvalidation { session_id, .. }
-            | SubagentStarted { session_id, .. }
-            | SubagentProgress { session_id, .. }
-            | SubagentChild { session_id, .. }
-            | BackgroundTaskUpdated { session_id, .. }
-            | SteerPending { session_id, .. }
-            | SteerInjected { session_id, .. }
-            | ApprovalDecision { session_id, .. }
-            | Branch { session_id, .. }
-            | GitStats { session_id, .. }
-            | HistoryProgress { session_id, .. }
-            | Retry { session_id, .. }
-            | PeerMessage { session_id, .. }
-            | TokenUsage { session_id, .. } => Some(session_id),
+            SessionCreated { session_id, .. } | SessionDisposed { session_id, .. } => {
+                Some(session_id)
+            }
             Error { session_id, .. } => session_id.as_deref(),
             Ready
             | Models { .. }
@@ -135,14 +123,35 @@ pub struct InProcessConnection {
     s2c_rx: Receiver<FromServer>,
 }
 
-/// Two [`InProcessConnection`] ends sharing one pair of bounded channels.
+/// Two [`InProcessConnection`] ends sharing one pair of channels.
+///
+/// Unbounded by design: both ends live in one process, so the only cost of
+/// queue depth is memory — while a bounded pair deadlocks the moment both
+/// directions fill at once (each side parked in `send_blocking` waiting for
+/// the other to consume; the gpui main thread frozen mid-submit is the
+/// round-10 "UI shows no reaction" repro). Flooding policies still apply per
+/// message via [`BackpressurePolicy`] on the bounded test pair.
 pub fn in_process_pair() -> (InProcessConnection, InProcessConnection) {
-    in_process_pair_with_capacity(BACKPRESSURE_CAPACITY)
+    let (c2s_tx, c2s_rx) = async_channel::unbounded();
+    let (s2c_tx, s2c_rx) = async_channel::unbounded();
+    let client = InProcessConnection {
+        c2s_tx: c2s_tx.clone(),
+        c2s_rx: c2s_rx.clone(),
+        s2c_tx: s2c_tx.clone(),
+        s2c_rx: s2c_rx.clone(),
+    };
+    let server = InProcessConnection {
+        c2s_tx,
+        c2s_rx,
+        s2c_tx,
+        s2c_rx,
+    };
+    (client, server)
 }
 
 /// Capacity-injectable variant for backpressure tests: a small buffer makes
-/// overflow reachable without flooding. Production callers use
-/// [`in_process_pair`] (the standing [`BACKPRESSURE_CAPACITY`]).
+/// overflow reachable without flooding. Production callers use the unbounded
+/// [`in_process_pair`].
 pub fn in_process_pair_with_capacity(cap: usize) -> (InProcessConnection, InProcessConnection) {
     let (c2s_tx, c2s_rx) = async_channel::bounded(cap);
     let (s2c_tx, s2c_rx) = async_channel::bounded(cap);
@@ -217,10 +226,23 @@ impl RpcPeer {
     }
 
     /// Register a waiter for `id`; returns the receiver it resolves on.
-    pub fn register(&self, id: MsgId) -> Receiver<Result<serde_json::Value, RpcError>> {
+    ///
+    /// A duplicate registration of the same id is refused: `None` answers
+    /// and the FIRST waiter stays registered (GW2 — the pre-fix map insert
+    /// clobbered the earlier sender, dropping it, which closed the first
+    /// waiter's receiver immediately; callers fold a closed receiver into a
+    /// fail-closed rejection, so a double-routed `ServerCall` auto-denied
+    /// the approval before the user could answer). Callers must treat
+    /// `None` as a routing bug and skip the delivery fail-closed.
+    pub fn register(&self, id: MsgId) -> Option<Receiver<Result<serde_json::Value, RpcError>>> {
         let (tx, rx) = async_channel::bounded(1);
-        self.pending.lock().insert(id, tx);
-        rx
+        match self.pending.lock().entry(id) {
+            std::collections::hash_map::Entry::Occupied(_) => None,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(tx);
+                Some(rx)
+            }
+        }
     }
 
     /// Resolve the waiter for `id`. Returns `false` when no waiter exists
@@ -263,11 +285,11 @@ mod tests {
         // Fill the single buffer slot with a Disconnect-policy note —
         // send_blocking succeeds immediately while space exists.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnStarted {
+            note: ServerNote::SessionCreated {
                 session_id: "s1".into(),
             },
         });
-        // The buffer is full: a streaming note is dropped by policy, not
+        // The buffer is full: a streaming side-note is dropped by policy, not
         // queued — the connection stays up.
         server.send_to_client(FromServer::Notification {
             note: ServerNote::ModelThinking {
@@ -279,7 +301,7 @@ mod tests {
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnStarted { .. }
+                note: ServerNote::SessionCreated { .. }
             }
         ));
         // The dropped note never occupied a slot: the next receive is empty
@@ -287,17 +309,17 @@ mod tests {
         assert!(rx.try_recv().is_err());
         // Space freed: a further control note is delivered in order.
         server.send_to_client(FromServer::Notification {
-            note: ServerNote::TurnFinished {
-                session_id: "s1".into(),
-                cancelled: false,
-                failed: false,
-                stranded_steer_ids: Vec::new(),
+            note: ServerNote::ModelToolCall {
+                request_id: "r1".into(),
+                id: "tc1".into(),
+                name: "Bash".into(),
+                input: serde_json::json!({}),
             },
         });
         assert!(matches!(
             rx.recv_blocking().unwrap(),
             FromServer::Notification {
-                note: ServerNote::TurnFinished { .. }
+                note: ServerNote::ModelToolCall { .. }
             }
         ));
     }
@@ -324,18 +346,58 @@ mod tests {
         ));
     }
 
+    /// Round-10 regression: the production pair is unbounded, so a burst on
+    /// one (or both) directions never parks a sender — the historical bounded
+    /// pair deadlocked the gpui main thread mid-submit once both directions
+    /// filled (each side parked in `send_blocking` waiting for the other's
+    /// consumer). Flood far past the old [`BACKPRESSURE_CAPACITY`] with NO
+    /// consumer attached, then drain and count.
+    #[test]
+    fn in_process_pair_never_blocks_on_bidirectional_flood() {
+        let (client, server) = in_process_pair();
+        let n = BACKPRESSURE_CAPACITY * 3;
+        // Both directions flood with no consumer: every send must return
+        // immediately (a bounded pair would park here and the test would
+        // hang, failing by timeout).
+        for i in 0..n {
+            client.send_to_server(FromClient::Reply {
+                id: MsgId::new(format!("c-{i}")),
+                outcome: Ok(serde_json::json!(null)),
+            });
+            server.send_to_client(FromServer::Notification {
+                note: ServerNote::SessionCreated {
+                    session_id: format!("s-{i}"),
+                },
+            });
+        }
+        let c2s = server.client_rx();
+        let s2c = client.server_rx();
+        for i in 0..n {
+            assert!(matches!(
+                c2s.recv_blocking().unwrap(),
+                FromClient::Reply { id, .. } if id.0 == format!("c-{i}")
+            ));
+            assert!(matches!(
+                s2c.recv_blocking().unwrap(),
+                FromServer::Notification {
+                    note: ServerNote::SessionCreated { session_id }
+                } if session_id == format!("s-{i}")
+            ));
+        }
+    }
+
     #[test]
     fn streaming_note_drops_when_full_control_disconnects() {
         assert_eq!(
-            ServerNote::AgentText {
-                session_id: "t".into(),
+            ServerNote::ModelText {
+                request_id: "r".into(),
                 text: "x".into()
             }
             .backpressure_policy(),
             BackpressurePolicy::Drop
         );
         assert_eq!(
-            ServerNote::TurnStarted {
+            ServerNote::SessionCreated {
                 session_id: "t".into()
             }
             .backpressure_policy(),
@@ -354,7 +416,9 @@ mod tests {
     #[test]
     fn rpc_peer_register_complete_resolves() {
         let peer = RpcPeer::new();
-        let rx = peer.register(MsgId::new("c-1"));
+        let rx = peer
+            .register(MsgId::new("c-1"))
+            .expect("fresh id registers");
         assert!(peer.complete(&MsgId::new("c-1"), Ok(serde_json::json!({"ok": true}))));
         let outcome = rx.recv_blocking().unwrap();
         assert_eq!(outcome.unwrap(), serde_json::json!({"ok": true}));
@@ -362,10 +426,42 @@ mod tests {
         assert!(!peer.complete(&MsgId::new("c-1"), Ok(serde_json::json!(null))));
     }
 
+    /// GW2 regression: a duplicate `register` of the same MsgId must NOT
+    /// clobber the first waiter. Pre-fix the map insert dropped the earlier
+    /// sender, closing its receiver immediately — a double-routed
+    /// ServerCall then read the closed receiver as a fail-closed rejection
+    /// and auto-denied before the user answered. The refused second
+    /// registration answers `None` and the first waiter still resolves on
+    /// `complete`.
+    #[test]
+    fn rpc_peer_duplicate_register_keeps_the_first_waiter_alive() {
+        let peer = RpcPeer::new();
+        let first = peer
+            .register(MsgId::new("dup"))
+            .expect("fresh id registers");
+        assert!(
+            peer.register(MsgId::new("dup")).is_none(),
+            "a duplicate MsgId registration must be refused, not clobber"
+        );
+        // The first waiter survives the refused duplicate: it is still open
+        // (pre-fix its sender was dropped here, so recv failed closed).
+        assert!(
+            first.is_empty() && !first.is_closed(),
+            "the first waiter's receiver must stay open after a refused duplicate"
+        );
+        assert!(peer.complete(&MsgId::new("dup"), Ok(serde_json::json!({"ok": 1}))));
+        assert_eq!(
+            first.recv_blocking().unwrap().unwrap(),
+            serde_json::json!({"ok": 1})
+        );
+    }
+
     #[test]
     fn rpc_peer_cancel_resolves_with_error() {
         let peer = RpcPeer::new();
-        let rx = peer.register(MsgId::new("c-2"));
+        let rx = peer
+            .register(MsgId::new("c-2"))
+            .expect("fresh id registers");
         assert!(peer.cancel(&MsgId::new("c-2"), RpcError::new(-1, "gone")));
         let outcome = rx.recv_blocking().unwrap();
         assert_eq!(outcome.unwrap_err().message, "gone");
@@ -374,8 +470,8 @@ mod tests {
     #[test]
     fn rpc_peer_cancel_all_resolves_every_waiter() {
         let peer = RpcPeer::new();
-        let r1 = peer.register(MsgId::new("a"));
-        let r2 = peer.register(MsgId::new("b"));
+        let r1 = peer.register(MsgId::new("a")).expect("fresh id registers");
+        let r2 = peer.register(MsgId::new("b")).expect("fresh id registers");
         peer.cancel_all(RpcError::new(-2, "disconnect"));
         assert_eq!(r1.recv_blocking().unwrap().unwrap_err().code, -2);
         assert_eq!(r2.recv_blocking().unwrap().unwrap_err().code, -2);

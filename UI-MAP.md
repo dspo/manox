@@ -187,19 +187,19 @@ Every non-Settings `ViewMode` renders through one shared shell ([WorkspaceShell]
 
 The shared window shell built by `Workspace::shell_root(sidebar, main)`: an `h_flex` root with `sidebar-slot | 6px SidebarDivider | main view`, the mode-switching actions (`FocusConversation` / `FocusTerminal` / `NewTerminalTab` / `CloseTerminalTab`), and the sidebar drag/reset handling. Every full-window `ViewMode` routes through it — the sidebar slot is the conversation `Sidebar` for Workspace / Terminal / ExternalSession modes and the [SettingsLeftNav](#settingsleftnav) for Settings; the Workspace mode chains the conversation-only actions (settings / editor / browser / completion / archive…) and the turn-navigator overlay onto it, and passes a [MainView](#mainview) (message column + right side view) as the main slot; the Terminal and ExternalSession modes pass a single-column [TerminalColumn](#terminalcolumn) instead. The divider drag/double-click-reset writes one shared width (`Workspace::sidebar_width`) and syncs it to both the `Sidebar` entity and the `SettingsView`, so the Settings page resizes its sidebar exactly like the app page. Terminal-style main views are built by `Workspace::render_terminal_column` ([TerminalColumn](#terminalcolumn)).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### MainView
 
 The Workspace mode's main slot: an `h_flex` container holding the [MessageColumn](#messagecolumn) and, when any right-pane tab is open, the [EditorDivider](#editordivider) + [RightPane](#rightpane) as sub-columns. Nesting the right pane inside the main view keeps the shell uniformly `sidebar | divider | main view` across every view mode — the right pane is no longer a third top-level shell column. The right side view's contents are per-thread: switching threads stashes the outgoing editor draft and restores the incoming one, so no thread ever shows another thread's right-side content, and returning to a thread recovers its editor text.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### TerminalColumn
 
 The terminal-style main column shared by [ViewMode::Terminal](#viewmodeterminal) and [ViewMode::ExternalSession](#viewmodeexternalsession): a [TitleBar](#titlebar) (leading icon + title) over a full-bleed terminal view (`flex_1`). One shape for both, so the two terminal surfaces read as peers inside the shared shell.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 ### 3.1 Sidebar
 
@@ -286,7 +286,7 @@ to its thread, so a restart must not resurface it as a top-level resumable row
 
 6px drag handle between Sidebar and the mode main view, `cursor:col-resize`. Constructed once inside [WorkspaceShell](#workspaceshell), so it appears — and behaves identically (drag-resize, double-click reset to the 260px default) — in the conversation, terminal, and external-session views.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 ### 3.2 MessageColumn
 
@@ -296,37 +296,37 @@ Central conversation column, flex-1 — the left sub-column of the [MainView](#m
 
 Vertical flex container, fills remaining width.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### TitleBar
 
 Absolute-positioned top bar at the message-column level (not the conversation body), height `TITLE_BAR_HEIGHT`, spans both [MessageColumn](#messagecolumn) and the [ContextRail](#contextrail) card so the pair reads as one message column under a single bar. Contains thread title, the "..." menu, and the [RightPaneToggleBtn](#rightpanetogglebtn) at its right edge.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### TitleBarThreadTitle
 
 Thread title text, clickable → opens [TitleMenu](#titlemenu).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### TitleBarMenuButton
 
 "..." button → opens [TitleMenu](#titlemenu) popup.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### RightPaneToggleBtn
 
 Ghost icon button at the TitleBar's right edge toggling the [RightPane](#rightpane)'s visibility (`Workspace::toggle_right_pane`). The icon is lucide `panel-right-dashed` (a manox-local asset through `ExtrasAssetSource`) while the pane is hidden and `IconName::PanelRight` while shown. Hiding never discards tabs — the visibility gate (`right_pane_visible`) is orthogonal to the tab list; showing with no tabs opens a fresh [LauncherTab](#launchertab). Composer/ContextRail suppression keyed off an active Editor tab applies only while the pane is actually visible.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### Body
 
 Vertical flex below TitleBar, `pt:TITLE_BAR_HEIGHT`, houses [Hero](#hero) (with the [LoadingIndicator](#loadingindicator) while an empty session restores) or [MessageArea](#messagearea) + [Footer](#footer).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 
 #### 3.2.1 Hero
@@ -337,13 +337,13 @@ Shown when the thread has no substantive messages (and is not loading).
 
 Vertically centered welcome area: logo/heading + inline [Composer](#composer).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### LoadingIndicator
 
 Centered BrailleSpinner + "Loading conversation…" (`workspace-loading-history`), shown inside the [Hero](#hero) while a sidebar-opened session's history is still restoring. The composer mounts immediately below it and accepts draft edits; send remains disabled and keyboard submission is gated on the thread's `HistoryPhase` until `Ready`. Preview batches stream into the [MessageArea](#messagearea) incrementally (`ThreadEvent::HistoryProgress`); once the first preview content lands, the composer moves to the [Footer](#footer) without waiting for the authoritative restore.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### 3.2.2 MessageArea
 
@@ -354,13 +354,13 @@ Shown when the thread has messages. Replaces [Hero](#hero).
 
 Wraps [MessageList](#messagelist).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### MessageList
 
 Virtual list backed by native `gpui::list` (`gpui::list(list_state, render_item)`, `ListState` held directly on `Workspace`). GPUI owns virtualization, scroll, the per-item height cache, and tail-follow; `ListAlignment::Bottom` gives native chat-log semantics — short histories sit at the viewport bottom, long ones scroll — and `FollowMode::Tail` pins to the live end on each layout while following (disengaging on upward scroll, re-arming at the bottom). The row factory captures `Conversation` directly and is strictly read-only during list measurement/prepaint; Workspace-derived ask-card snapshots are synchronized before list construction. `MSG_LIST_OVERDRAW` pre-measures rows below the viewport. Visible rows re-measure every frame, but the pinned official GPUI revision retains off-screen row heights across width changes, so `MessageListWidthInvalidator` observes the final positive list width after layout, invalidates the complete cache with `remeasure_items`, and requests a settling frame while preserving the logical item/offset anchor. Count changes are reconciled via `splice` and in-place mutations via `remeasure_items`, both driven from the `ThreadEvent` handler's `ApplyOutcome`. Only the visible items render. Markdown text rows use Manox's public-API `RichText` leaf rather than GPUI `StyledText`: every width constraint is shaped independently, widths narrower than one em are treated as intrinsic probes, and prepaint reconciles shaping with the final allocated width. This prevents zero-width explosion from entering the list cache and makes painted glyph height match the row allocation without a Zed fork.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs` (`ListState` wiring, `MSG_LIST_OVERDRAW`), `apps/desktop/manox-components/src/markdown/rich_text.rs` (constraint-safe shaping and paint geometry)
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs` (`ListState` wiring, `MSG_LIST_OVERDRAW`), `apps/desktop/manox-components/src/markdown/rich_text.rs` (constraint-safe shaping and paint geometry)
 
 #### MessageItem
 
@@ -451,7 +451,7 @@ Bottom area of MessageColumn, below [MessageArea](#messagearea) (or below [Hero]
 
 Vertical flex, `flex_shrink_0`, `py_2`, contains [Composer](#composer) or [AskDrawer](#askdrawer).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 ##### Composer
 
@@ -467,19 +467,19 @@ A [TurnNavigator](#capability-matrix) `⌘↵` fill is a walk landing too: the w
 the draft the fill displaced is the working line `⌥↓` returns — `InputState::set_value` clears the input's undo
 history, so nothing else survives that replacement.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### QueuedFollowUps
 
 Flat stack of follow-up items parked above the input while a turn is running. Every submitted follow-up starts as **Queued**: a `corner-right-up` queue arrow and one-line truncated summary on the left, with an explicit Steer text button, `Delete`, and `Ellipsis` on the right. Clicking Steer immediately hides the queue row and appends an optimistic user bubble to the message list with a 「待引导」 badge. When `ThreadEvent::SteerInjected { message_id }` confirms that the turn loop drained the message at a safe join point, the existing bubble becomes persistent and its badge changes to 「已引导」; no duplicate bubble is appended. If the turn is cancelled, rejected, or exits before confirmation, the optimistic bubble becomes an invisible tombstone and the item returns as a red **Failed** queue row with Retry-Steer / Remove. A late confirmation can still heal that provisional rollback. Ordinary queued messages retain submission order and coalesce into the next turn only after the current turn task has fully unwound. Queues are retained in memory per task across task switches, but are not persisted across app restarts. `⌘ + ⌥ + /` (`UndoLastQueued`) pops the tail and cancels a matching pending backend steer.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs` (`render_queued_follow_ups`, `steer_follow_up`, `consume_steered_follow_up`, `mark_stranded_steers_failed`); badge render in `apps/desktop/agent-ui/src/views/message.rs` (`render_user`); drain + event in `crates/manox-agent/src/thread.rs` (`drain_pending_steer`, `ThreadEvent::SteerInjected`); persisted marker in `crates/manox-agent/src/message.rs` (`MessageUiMetadata::steered`).
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs` (`render_queued_follow_ups`, `steer_follow_up`, `consume_steered_follow_up`, `mark_stranded_steers_failed`); badge render in `apps/desktop/agent-ui/src/views/message.rs` (`render_user`); drain + event in `crates/manox-agent/src/thread.rs` (`drain_pending_steer`, `ThreadEvent::SteerInjected`); persisted marker in `crates/manox-agent/src/message.rs` (`MessageUiMetadata::steered`).
 
 #### ComposerDivider
 
 1px horizontal border above the composer.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### AttachmentChips
 
@@ -489,7 +489,7 @@ rendered by `Workspace::render_attachments`): a file/image attachment row
 (`render_browser_chips`, persists across submits; removing a chip deactivates
 the ChromeUse / WebExplore tool suite).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs` + `apps/desktop/agent-ui/src/views/composer_menu.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs` + `apps/desktop/agent-ui/src/views/composer_menu.rs`
 
 #### AttachmentChip
 
@@ -508,37 +508,37 @@ remove btn. Removing it calls `deactivate_browser_tool_suite`.
 
 Horizontal flex: [InputField](#inputfield) + [SendBtn](#sendbtn) + chips.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### InputField
 
 Multi-line auto-grow text input, placeholder text.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs` (via `gpui_component::Input`)
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs` (via `gpui_component::Input`)
 
 #### SendBtn
 
 Circular button, `primary` color (idle) / `danger` color (running, acts as stop).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### ModelChip
 
 Dropdown chip showing `provider · model · effort` (the reasoning-effort wire value, `high`/`max`) → [ModelMenu](#modelmenu) popup.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### AccessChip
 
 Dropdown chip showing [PermissionMode](#permission-modes) → [AccessMenu](#accessmenu) popup.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### ProjectChip
 
 Dropdown chip showing current project → [ProjectMenu](#projectmenu) popup.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 ##### AskDrawer
 
@@ -551,43 +551,43 @@ options carry the decision.
 
 Multi-step question navigator replacing the footer.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerHeader
 
 Title + stepper "N/M".
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerQuestion
 
 Header tag + question text.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerOptions
 
 Checkbox/radio list with labels + descriptions.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerOtherInput
 
 Free-text input for "Other" option (conditional).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerResponseInput
 
 Free-form response input overriding all answers (conditional).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AskDrawerNav
 
 Prev / Next / Cancel / Submit buttons.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### 3.2.4 Popups & Dropdowns
 
@@ -597,25 +597,25 @@ Prev / Next / Cancel / Submit buttons.
 
 Trigger: typing `/` (slash commands) or `@` (skills + subagents) at the caret in [InputField](#inputfield). A typeahead list anchored above the composer: filters live on every keystroke, navigated with up/down, confirmed with Tab or Enter, dismissed with Escape. While open the composer wrapper sets a `completion = open` key context so the `completion == open > Input` keybindings shadow the Input's own navigation bindings. A pure render overlay — [InputField](#inputfield) keeps focus throughout, so the query keeps filtering as the user types.
 
-> Source: `apps/desktop/agent-ui/src/views/completion.rs` (state + detection + rendering), wired in `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/views/completion.rs` (state + detection + rendering), wired in `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 #### ModelMenu
 
 Trigger: [ModelChip](#modelchip). Model selector dropdown: provider submenus for the model list, then a Reasoning effort block (High / Max, current effort checked) under a separator.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### AccessMenu
 
 Trigger: [AccessChip](#accesschip). [PermissionMode](#permission-modes) selector: Read Only / Workspace Write / Danger Full Access.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### ProjectMenu
 
 Trigger: [ProjectChip](#projectchip). Recent projects + create blank / select folder.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/chips.rs`
 
 #### TitleMenu
 
@@ -632,7 +632,7 @@ Absolute-positioned over [Body](#body), with scrim.
 
 Trigger: "Create blank project" from [ProjectMenu](#projectmenu). Centered modal: project name input + confirm.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/composer_render.rs`
 
 ### 3.3 ContextRail
 
@@ -728,25 +728,25 @@ Right side view of the [MainView](#mainview), shown when any right-pane tab is o
 
 6px drag handle between MessageColumn and the right side view (conditional — shown while any right-pane tab is open).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### RightPane
 
 Vertical flex, right sub-column of the [MainView](#mainview). A tab container holding the markdown editor, the [LauncherTab](#launchertab), browser views, sub-agent observers, and embedded [SessionTab](#sessiontab) terminals as peer tab types. Visibility is the `right_pane_visible` gate AND a non-empty `right_tabs` — the [RightPaneToggleBtn](#rightpanetogglebtn) hides/shows without discarding tabs, and closing the last tab hides the pane automatically. The active tab's content fills the body. The pane state (tab list, active tab, visibility) is **per-thread**: `attach_thread` stashes the outgoing pane into an in-session map (`right_pane_by_thread`, live tabs keep their webview/panel entities) and restores the incoming one, and every mutation persists the foreground thread's snapshot to `threads.db` (`thread_right_pane` — one opaque UI-layer-owned JSON row keyed by thread id). Subagent tabs are ephemeral — cleared on switch, never stashed or persisted. Browser tabs persist as their URL (rebuilt as fresh webviews after a restart, re-registered in the host routing table + title poll); Session tabs restore only while the external session is still alive — after a restart they drop (the sidebar's resumable rows remain the external-session recovery surface). The retired team-member observation tab (old `RightTab::Member` + `MemberPanel`) was removed with the `Entity<Team>` cleanup.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### RightTabBar
 
 Top-level underline tab bar over `right_tabs`. Every tab is fixed-width (`RIGHT_TAB_WIDTH`, 160px) with long labels capped at 16 chars + `…` (the full text rides the tab's tooltip); selecting a tab switches `active_right_tab`. Hovering a tab reveals a `×` suffix that closes the tab via `close_right_tab` (click stops propagation so it does not also select) — for every tab kind: the Editor keeps its draft-transfer semantics (`close_editor`), a Session kills the session (`close_external_session`). A `+` suffix button right of the last tab opens (or focuses) a [LauncherTab](#launchertab).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### LauncherTab
 
 The right pane's "new tab" surface (`RightTab::Launcher`): five vertically centered shortcut rows — 打开集成浏览器 / 打开集成终端 / 打开 Claude Code / 打开 Codex / 打开 Github Copilot (i18n `launcher-open-*`). The picked view opens **on the tab itself**: the browser via `open_browser_tab(DEFAULT_URL)`; the terminal and the three CLI agents via `spawn_plain_session` / `spawn_external_session` with `SessionPlacement::RightPane` and the **active thread's cwd** as the spawn CWD (workspace-cwd fallback when unset). A CLI-agent row first opens the shared provider→model cascade (the popup anchored under the row; `views/model_cascade.rs`) and spawns on model pick.
 
-> Source: `apps/desktop/agent-ui/src/views/launcher.rs`, `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/views/launcher.rs`, `apps/desktop/agent-ui/src/workspace/right_pane.rs` (content + picks), `apps/desktop/agent-ui/src/workspace/render.rs` (tab mount)
 
 #### SessionTab
 
@@ -755,25 +755,25 @@ Sessions mounted here are thread-bound (`ExternalSession.thread_bound`):
 excluded from the sidebar's top-level list and sidecar-free; the tab `×` still
 kills through `close_external_session`.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### EditorWriteTab
 
 Plain-text multi-line [InputField](#inputfield) for markdown editing. A second-level Write/Preview toggle lives inside the Editor tab's content area. Cmd/Ctrl+Enter submits only after the active thread's authoritative history is ready; restoring sessions keep the draft intact and ignore the shortcut until then.
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### EditorPreviewTab
 
 Rendered markdown view (`Markdown`).
 
-> Source: `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### SubagentPanel
 
 A right-pane read-only observation tab for one Steer-bus sub-agent run (`RightTab::Subagent(address)`, equal citizen of the right tab bar). The tab label shows the subagent's **address** (`SubagentProgress.id`, e.g. `Sailor_0`); the panel's second-level header banner shows the **topic** — status indicator + mono topic text (the shared `subagent_topic` / dispatch-prompt first-line derivation, address fallback when empty). Body: a miniature conversation rendered through the **same `ConversationState` + message pipeline as the main conversation** — it opens with the Captain's dispatch prompt as a user bubble (captured from the Steer tool call into `Workspace::subagent_prompts` with its send time), header reading `Captain > {recipient}·{model}·{time}` where `recipient` is the sub-agent type (the conversation's `to`) and `model` is the child session's dispatch-reported model (`SubagentChildEvent::Model`, sent once at dispatch; the parent's live model label stands in until then and after reload), then the bridged child events translated to the shared `ThreadEvent` contract (`AgentText` / `AgentThinking` / `ToolCall` / `ToolResult`, child tool ids pair start/end under parallel child execution and titles derive via the shared `tool_title`) — assistant bubbles, reasoning folds, tool cards, tail-follow scrolling. The live accumulation lives in `Workspace::subagent_transcripts` and is kept for the session lifetime (no longer trimmed at terminal status), so a tab opened after the run replays the full work; a panel opened after a reload falls back to `subagent_final_text` replayed as the assistant message plus the `subagent-panel-final-note` hint. Opened by clicking the sub-agent row in the [ContextRail](#contextrail) agents section; tabs are dropped together with their transcripts on thread switch (`clear_subagent_observation`, which reseats the active tab for bulk removal).
 
-> Source: `apps/desktop/agent-ui/src/views/subagent_panel.rs`, `apps/desktop/agent-ui/src/workspace.rs`
+> Source: `apps/desktop/agent-ui/src/views/subagent_panel.rs`, `apps/desktop/agent-ui/src/workspace/render.rs`
 
 #### BrowserView
 

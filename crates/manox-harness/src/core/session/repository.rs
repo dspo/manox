@@ -87,9 +87,20 @@ impl SessionRepository {
             .await
             .map_err(|e| anyhow::anyhow!("failed to delete session {}: {e}", path.display()))
     }
+
+    /// The [`SessionInfo`] for one transcript, without scanning the
+    /// directory. An explicit open only ever needs this — a store-wide
+    /// [`Self::list`] is O(every file) and must never gate it.
+    pub async fn info(&self, path: &Path) -> Result<SessionInfo, anyhow::Error> {
+        build_session_info(path).await
+    }
 }
 
-fn session_file_name(id: &str) -> String {
+/// The canonical journal file name for a session id (`<id>.jsonl`) — the
+/// single source shared by creation, repository scans, and on-disk identity
+/// probes (a cold `CreateSession` must find and restore this file, never
+/// re-mint over it).
+pub fn session_file_name(id: &str) -> String {
     format!("{id}.jsonl")
 }
 

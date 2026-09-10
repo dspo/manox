@@ -439,7 +439,6 @@ slash-compact-desc = Compact the conversation: summarize older history into a ha
 menu-settings = Settings…
 menu-quit = Quit
 menu-open-manox = Open Manox
-menu-webui = WebUI
 menu-file = File
 menu-about = About Manox
 menu-tools = Tools

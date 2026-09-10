@@ -1315,6 +1315,16 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.session.as_ref()
     }
 
+    /// The shared session handle — the same `Arc` the persistence
+    /// middleware holds. A mid-run writer through this handle is safe by
+    /// construction: the session's append lock linearizes
+    /// parent-selection + append, so a concurrent appender can never fork
+    /// the chain (the storage broadcast fires for every append regardless
+    /// of caller, so followers see the row live).
+    pub fn session_arc(&self) -> Arc<Session<S>> {
+        Arc::clone(&self.session)
+    }
+
     /// Access the agent.
     pub fn agent(&self) -> &Agent {
         &self.agent
@@ -3629,10 +3639,81 @@ pub struct PromptTemplate {
     pub content: String,
 }
 
+/// The resource-driven prompt expansion (TS `_expandSkillCommand` +
+/// `expandPromptTemplate`), free-standing: the run side
+/// (`AgentSession::expand_prompt`) AND the engine's acceptance-side
+/// persistence (the K5 edge: `persist_user_submission` /
+/// `persist_prompt_user_entry`) must produce the SAME text — the accepted
+/// journal entry and the middleware pin carry the POST-expansion shape the
+/// run announces, or the content-match skip misses and a slash-command
+/// prompt journals twice (raw accepted + expanded announced). Idempotent:
+/// expanded text no longer carries the `/` command prefix, so the run's
+/// re-expansion passes through.
+pub fn expand_prompt_with(resources: &HarnessResources, text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("/skill:") {
+        let (name, args) = match rest.find(' ') {
+            Some(i) => (&rest[..i], rest[i + 1..].trim().to_string()),
+            None => (rest, String::new()),
+        };
+        if let Some(skill) = resources.skills.iter().find(|s| s.name == name) {
+            let block = format_skill_invocation(skill, None);
+            return if args.is_empty() {
+                block
+            } else {
+                format!("{block}\n\n{args}")
+            };
+        }
+        return text.to_string(); // Unknown skill, pass through.
+    }
+    if let Some(rest) = text.strip_prefix('/') {
+        let (name, args_string) = match rest.find(' ') {
+            Some(i) => (&rest[..i], rest[i + 1..].to_string()),
+            None => (rest, String::new()),
+        };
+        if let Some(template) = resources.prompt_templates.iter().find(|t| t.name == name) {
+            let args = parse_command_args(&args_string);
+            return substitute_args(&template.content, &args);
+        }
+    }
+    text.to_string()
+}
+
 /// The harness's persistence middleware: appends every `MessageEnd` message
 /// to the session immediately — before any listener observes it — and
 /// records the entry id for the harness's transcript alignment. An append
 /// failure aborts the run, keeping the persisted prefix as the truth.
+/// K9: the append-attempt budget and backoff for the persistence
+/// middleware — the K4 typed-append discipline (3 attempts, 50ms×attempt)
+/// mirrored on the harness side (the engine's constants live in the agent
+/// crate; the dependency direction forbids sharing them).
+const APPEND_ATTEMPTS: u32 = 3;
+const APPEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Run one journal append under the bounded-retry discipline: a transient
+/// storage hiccup must not void the turn; after the budget the error
+/// propagates unchanged (the caller's fail-fast semantics — for the
+/// middleware, aborting the run with the message restored as unsent).
+async fn with_append_retries<F, Fut, T>(face: &'static str, mut op: F) -> Result<T, anyhow::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
+{
+    let mut attempt = 1u32;
+    loop {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if attempt >= APPEND_ATTEMPTS {
+                    return Err(err);
+                }
+                tracing::warn!(%err, face, attempt, "journal append failed; retrying");
+                tokio::time::sleep(APPEND_RETRY_DELAY * attempt).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 fn build_persistence_middleware<S: SessionStorage + 'static>(
     control: Arc<HarnessControl>,
     session: Arc<Session<S>>,
@@ -3642,7 +3723,44 @@ fn build_persistence_middleware<S: SessionStorage + 'static>(
         let control = Arc::clone(&control);
         Box::pin(async move {
             if let AgentEvent::MessageEnd { message } = event {
-                let id = session.append_message((*message).clone()).await?;
+                // K5: a user message persisted before the run (at Submit
+                // acceptance, or at drain for a queued submit) already owns
+                // its journal entry — the engine pinned the entry id with
+                // the accepted content. Consume the pin on the content
+                // match and record the id for transcript alignment instead
+                // of appending a duplicate; the content gate keeps a
+                // `next_turn`-queued user message announced ahead of the
+                // accepted one (and every steer) on the normal append path.
+                if let crate::types::AgentMessage::User { content, .. } = &*message {
+                    let content_value =
+                        serde_json::to_value(content).unwrap_or(serde_json::Value::Null);
+                    if let Some(entry_id) = session.take_accepted_user_entry(&content_value) {
+                        control
+                            .message_entry_ids
+                            .lock()
+                            .unwrap()
+                            .push(Some(entry_id));
+                        return Ok(());
+                    }
+                }
+                // The host pinned this turn's origin RPC id (echo
+                // retirement, §F.2): drain it on exactly the first user
+                // message append; every other message appends with None.
+                let origin = if matches!(&*message, crate::types::AgentMessage::User { .. }) {
+                    session.take_pending_user_origin()
+                } else {
+                    None
+                };
+                // K9: bounded retries before the fail-fast propagation (K4
+                // symmetry) — each attempt re-clones the message/origin so a
+                // partial previous attempt can never alias into the next.
+                let id = with_append_retries("message", || {
+                    let session = Arc::clone(&session);
+                    let message = (*message).clone();
+                    let origin = origin.clone();
+                    async move { session.append_message_with_origin(message, origin).await }
+                })
+                .await?;
                 control.message_entry_ids.lock().unwrap().push(Some(id));
             }
             Ok(())
@@ -4028,7 +4146,10 @@ pub(crate) mod tests {
         leaf_id: std::sync::Mutex<Option<String>>,
         /// Number of `append_entry` calls so far.
         append_calls: std::sync::Mutex<u64>,
-        /// Call number at which `append_entry` fails; `u64::MAX` means never.
+        /// Call number FROM WHICH `append_entry` fails, persistently (K9:
+        /// the middleware's bounded retries must not bridge an injected
+        /// failure — an abort test needs a failure that stays failed);
+        /// `u64::MAX` means never. Reset to `u64::MAX` to lift.
         fail_at_call: std::sync::Mutex<u64>,
         /// When set, a `model_change` append for this model id fails — the
         /// durability hook for flush tests.
@@ -4074,7 +4195,7 @@ pub(crate) mod tests {
             }
             let mut calls = self.append_calls.lock().unwrap();
             *calls += 1;
-            if *calls == *self.fail_at_call.lock().unwrap() {
+            if *calls >= *self.fail_at_call.lock().unwrap() {
                 anyhow::bail!("injected append failure");
             }
             drop(calls);
@@ -7903,6 +8024,7 @@ pub(crate) mod tests {
                 parent_id: Some("mc".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("hello"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -7940,6 +8062,7 @@ pub(crate) mod tests {
                 parent_id: Some("bs1".into()),
                 timestamp: chrono::Utc::now(),
                 message: AgentMessage::user("after"),
+                origin: None,
             })
             .await
             .unwrap();
@@ -8255,8 +8378,10 @@ pub(crate) mod tests {
             1
         );
 
-        // With the failure spent, continuing answers the pending user
+        // Lift the injected failure (K9 made it persistent — the retries
+        // must not bridge it); continuing then answers the pending user
         // message — the conversation continues coherently, not forked.
+        *harness.session().storage().fail_at_call.lock().unwrap() = u64::MAX;
         let produced = harness.continue_().await.unwrap();
         assert!(
             produced
@@ -10327,5 +10452,49 @@ pub(crate) mod tests {
         let messages = harness.prompt("Hello").await.unwrap();
         assert_eq!(messages.len(), 2, "user message plus the response");
         assert_eq!(seen.lock().unwrap().as_slice(), ["base prompt"]);
+    }
+
+    /// K9: the append retry discipline bridges transient failures and caps
+    /// at the attempt budget, propagating the permanent error unchanged —
+    /// the middleware's fail-fast abort semantics downstream are unchanged.
+    #[tokio::test]
+    async fn append_retries_bridge_transient_failures_then_cap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let landed = super::with_append_retries("test", move || {
+            let c = Arc::clone(&c);
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(anyhow::anyhow!("transient failure {n}"))
+                } else {
+                    Ok("landed")
+                }
+            }
+        })
+        .await;
+        assert_eq!(landed.unwrap(), "landed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two transient failures then the success"
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let down = super::with_append_retries::<_, _, ()>("test", move || {
+            let c = Arc::clone(&c);
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("storage down"))
+            }
+        })
+        .await;
+        assert!(down.is_err(), "the permanent failure propagates");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "exactly the attempt budget, then the error"
+        );
     }
 }

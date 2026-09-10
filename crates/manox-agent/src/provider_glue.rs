@@ -17,6 +17,11 @@ static REGISTRY: OnceLock<RwLock<Arc<ProviderRegistry>>> = OnceLock::new();
 /// so registration runs exactly once per process.
 static READY: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static READY_FLAG: AtomicBool = AtomicBool::new(false);
+/// Set by [`install_for_test`]: once a deterministic stub is pinned, the
+/// background registration spawned by later [`init`] calls (other test
+/// scaffolds in the same binary) lands the ready flag but skips the swap.
+/// Production never sets this.
+static TEST_FROZEN: AtomicBool = AtomicBool::new(false);
 
 fn build() -> Arc<ProviderRegistry> {
     let registry = Arc::new(ProviderRegistry::new());
@@ -43,9 +48,34 @@ fn build() -> Arc<ProviderRegistry> {
 pub fn init() {
     let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
     let notify = READY.get_or_init(tokio::sync::Notify::new);
+    // Routing note: provider HTTP clients are DIRECT (no_proxy). A shell
+    // proxy env var (`HTTP(S)_PROXY` / `ALL_PROXY`) silently rerouting LLM
+    // traffic turns every request into a tunnel failure when that proxy is
+    // down; tools that want a proxy (web_fetch) opt in themselves.
+    let proxy_env = [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ]
+    .into_iter()
+    .find(|k| std::env::var_os(k).is_some_and(|v| !v.is_empty()));
+    if let Some(var) = proxy_env {
+        tracing::info!(
+            var,
+            "proxy environment detected — provider (LLM) traffic connects directly and ignores it"
+        );
+    }
     std::thread::spawn(move || {
         let fresh = build();
-        if let Some(lock) = REGISTRY.get() {
+        // A test-installed stub wins: once `install_for_test` froze the
+        // global, later scaffolds' builds land the ready flag but skip the
+        // swap (P0-1 determinism).
+        if !TEST_FROZEN.load(Ordering::Acquire)
+            && let Some(lock) = REGISTRY.get()
+        {
             *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
         READY_FLAG.store(true, Ordering::Release);
@@ -59,6 +89,37 @@ pub fn init() {
 #[cfg(test)]
 pub fn init_for_test() {
     let _ = REGISTRY.set(RwLock::new(Arc::new(ProviderRegistry::new())));
+}
+
+/// Test seam (review round 3, P0-1): install a pre-built registry as the
+/// process global, deterministically. Tests must not read the developer's
+/// real provider config (absent on CI ⇒ the desktop suite's
+/// `expect("a model exists")` was a deterministic red) nor race `init`'s
+/// background registration (a late Arc swap). The install FREEZES the
+/// global: later `init` calls in the same binary still run their build
+/// (landing the ready flag) but skip the swap. If a build is in flight,
+/// this waits for it first, so the install is the last write.
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_for_test(registry: Arc<ProviderRegistry>) {
+    TEST_FROZEN.store(true, Ordering::Release);
+    if REGISTRY.get().is_some() {
+        for _ in 0..500 {
+            if READY_FLAG.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    match REGISTRY.get() {
+        Some(slot) => *slot.write().unwrap_or_else(|e| e.into_inner()) = registry,
+        None => {
+            let _ = REGISTRY.set(RwLock::new(registry));
+        }
+    }
+    READY_FLAG.store(true, Ordering::Release);
+    if let Some(notify) = READY.get() {
+        notify.notify_waiters();
+    }
 }
 
 /// Wait for the one-shot initial registration to finish. Returns at once
@@ -93,6 +154,19 @@ pub fn global() -> Arc<ProviderRegistry> {
         .clone()
 }
 
+/// Post-swap reload listener (single slot, last registration wins): the
+/// gateway registers here so a provider reload broadcasts a fresh Models
+/// snapshot to every connection (§D.5 "Models(provider reload 即推)"
+/// as-built — U2 cross-domain #2). Fires on `reload()`'s background
+/// thread after the snapshot swap; implementations must not block.
+static RELOAD_LISTENER: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+
+/// Register (or clear, with `None`) the post-swap reload listener.
+pub fn set_reload_listener(listener: Option<Box<dyn Fn() + Send + Sync>>) {
+    *RELOAD_LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = listener;
+}
+
 /// Rebuild from the config file and atomically swap the snapshot. The
 /// previous snapshot is kept on failure. Blocking (keychain / shell
 /// commands) — call from a background thread.
@@ -107,6 +181,15 @@ pub fn reload() -> anyhow::Result<()> {
         .get()
         .expect("pi_providers not initialized; call manox_agent::init first");
     *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+    // Fire the listener OUTSIDE the registry write lock: the broadcast
+    // re-reads the fresh snapshot through global().
+    if let Some(listener) = RELOAD_LISTENER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        listener();
+    }
     Ok(())
 }
 
@@ -230,6 +313,13 @@ pub fn config_id(model: &manox_harness::types::Model) -> String {
 /// `"responses"` / `"completions"`); `None` for non-cx registrations.
 pub fn wire_key(model: &manox_harness::types::Model) -> Option<&'static str> {
     manox_harness::provider::model_api_to_wire_key(&model.api)
+}
+
+/// The launch-pin wire key for a wire api string (U2 cross-domain #4: the
+/// cascade consumes the wire `ModelInfo`s, whose api column replaces the
+/// kernel `Model` this derived from).
+pub fn wire_key_from_api(api: &str) -> Option<&'static str> {
+    manox_harness::provider::model_api_to_wire_key(api)
 }
 
 #[cfg(test)]

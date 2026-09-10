@@ -152,20 +152,38 @@ impl StoreHandle {
     /// the agent runtime so a large session folder cannot stall the caller;
     /// `SummariesUpdated` broadcasts when the scan lands.
     pub fn refresh(&self) {
-        let dir = self.read(|s| s.sessions_dir.clone());
         let this = self.clone();
         crate::runtime::handle().spawn(async move {
-            let rows = load_summaries(&dir).await;
-            let registry = crate::thread_registry::load().await;
-            this.with_mut(|s| {
-                let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
-                resolve_depths(&mut summaries);
-                s.session_paths = session_paths;
-                s.summaries = summaries;
-                s.archived_summaries = archived;
-                s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
-            });
+            this.refresh_now().await;
         });
+    }
+
+    /// The awaiting form of [`Self::refresh`]: the scan lands before the
+    /// return. The gateway's `ListThreads` self-hold (cross-domain #5)
+    /// answers from a fresh scan, so no client needs an in-process rescan
+    /// trigger or a store-event bridge to time its refetch.
+    pub async fn refresh_now(&self) {
+        let dir = self.read(|s| s.sessions_dir.clone());
+        let rows = load_summaries(&dir).await;
+        let registry = crate::thread_registry::load().await;
+        self.with_mut(|s| {
+            let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
+            resolve_depths(&mut summaries);
+            s.session_paths = session_paths;
+            s.summaries = summaries;
+            s.archived_summaries = archived;
+            s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+        });
+    }
+
+    /// Route a decision-point row into the thread's journal (the K3
+    /// mechanism, generalized): the live engine actor serializes it against
+    /// every other writer of the session; a thread without an engine
+    /// cold-appends on the session file. Callers without a store (foreign
+    /// test fixtures) skip the route via `try_global`.
+    pub fn route_journal_row(&self, id: &str, kind: &str, payload: serde_json::Value) {
+        let path = self.read(|s| s.session_paths.get(id).cloned());
+        crate::engine::dispatch_store_journal_row(id.to_string(), path, kind.to_string(), payload);
     }
 
     /// Persist one queued sidecar write on the agent runtime. The rescan
@@ -225,6 +243,24 @@ pub fn init() {
     });
     handle.refresh();
     *GLOBAL.lock().unwrap() = Some(handle);
+}
+
+/// Whether the process-global store is a test override (`init_for_test`).
+/// The gateway's ListThreads rescan self-hold skips the scan under an
+/// override: the gpui test scheduler flags the millisecond answer latency
+/// as foreign-thread activity (its determinism window is microscopic), and
+/// the gpui suites never exercise the cross-process freshness the scan
+/// serves — the session-core suite (production `init`, no override) pins
+/// the real self-hold.
+pub fn test_override_active() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        TEST_OVERRIDE.lock().unwrap().is_some()
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        false
+    }
 }
 
 /// Returns the global [`StoreHandle`]. Panics if `init` was not called.
@@ -446,16 +482,15 @@ impl ThreadStore {
         Some(handle)
     }
 
-    /// The live (in-memory) thread for `id`, if it is still alive. Unlike
-    /// [`ThreadStore::load_thread`], never restores from disk.
-    pub fn live_thread(&self, id: &str) -> Option<ThreadHandle> {
-        self.live_threads.get(id).and_then(ThreadHandle::upgrade)
-    }
-
-    /// Track a live thread so the facade can address it by id alone. Stores
-    /// only a weak reference; the caller keeps the thread alive.
-    pub fn register_live_thread(&mut self, id: &str, t: &ThreadHandle) {
-        self.live_threads.insert(id.to_string(), t.downgrade());
+    /// Seed one session path from an authoritative on-disk probe: a cold
+    /// `CreateSession`/`OpenSession` must restore an id no list refresh has
+    /// indexed yet (a bare server never scans). A scanned mapping wins —
+    /// this never overwrites what a refresh grouped (thread-keyed leaf
+    /// pointers).
+    pub fn note_session_path(&mut self, id: &str, path: &std::path::Path) {
+        self.session_paths
+            .entry(id.to_string())
+            .or_insert_with(|| path.to_path_buf());
     }
 
     /// Seed an active summary row without touching disk — lets foreign test
@@ -483,6 +518,33 @@ impl ThreadStore {
             updated_at: 0,
             cumulative_total_tokens: 0,
         });
+    }
+
+    /// Like `insert_summary_for_test`, with explicit recency columns —
+    /// interacted_at (advanced by real activity only) and updated_at
+    /// (advanced by every metadata save) diverge in production, and
+    /// consumers pin the wire mapping between them.
+    // Explicit per-column seeding: every parameter is a wire-mapped column
+    // the list regression pins; a builder struct would obscure the mapping.
+    #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_summary_with_times_for_test(
+        &mut self,
+        id: &str,
+        parent: Option<&str>,
+        interacted_at: i64,
+        updated_at: i64,
+        project: &str,
+        tag: Option<&str>,
+        approval_mode: i64,
+    ) {
+        self.insert_summary_for_test(id, parent);
+        let summary = self.summaries.last_mut().expect("just inserted");
+        summary.interacted_at = interacted_at;
+        summary.updated_at = updated_at;
+        summary.project = project.to_string();
+        summary.tag = tag.map(str::to_string);
+        summary.approval_mode = approval_mode;
     }
 
     /// Archive (or unarchive) a session. The row moves between the active
@@ -525,6 +587,12 @@ impl ThreadStore {
                 summary.archived = false;
                 self.summaries.push(summary);
             }
+            // K3 (L3): every cascaded row's flag decision journals its own
+            // `pinned_archived` entry (the entry is the authority, K2); a
+            // skipped row already carries the target state and stays
+            // silent, matching the no-op discipline of this method.
+            let pinned = self.summary_by_id(&tid).is_some_and(|s| s.pinned);
+            self.journal_pinned_archived(&tid, pinned, archived);
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
                 // Plugin lifecycle: archiving ends the session's working life
@@ -557,10 +625,31 @@ impl ThreadStore {
 
     /// Toggle the pinned flag on a session (persisted in its sidecar).
     pub fn pin_thread(&mut self, id: &str, pinned: bool) {
+        let archived = self.summary_by_id(id).is_some_and(|s| s.archived);
         if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
+        // K3 (L3): the flag decision journals a `pinned_archived` entry —
+        // the entry is the authority (K2) and the sidecar write below is
+        // the derived fast-list cache. The entry carries BOTH flags, so
+        // one entry fully re-establishes the pair on rebuild.
+        self.journal_pinned_archived(id, pinned, archived);
         self.write_meta(id, move |meta| meta.pinned = pinned);
+    }
+
+    /// Route a `pinned_archived` decision into the thread's journal (K3):
+    /// the live engine actor serializes it against every other writer of
+    /// the session; a thread without an engine cold-appends on the session
+    /// file. The flag pair is the post-decision full state, sourced from
+    /// the summary mirror (a thread whose summary never loaded carries the
+    /// decided flag alone — every later decision re-carries the pair).
+    fn journal_pinned_archived(&self, id: &str, pinned: bool, archived: bool) {
+        crate::engine::dispatch_store_journal_row(
+            id.to_string(),
+            self.session_paths.get(id).cloned(),
+            "pinned_archived".into(),
+            serde_json::json!({ "pinned": pinned, "archived": archived }),
+        );
     }
 
     /// Set the user tag on a session (persisted in its sidecar); `None`
@@ -874,8 +963,18 @@ fn session_info_to_summary(
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
+    let handle = standalone_for_test(db);
+    *TEST_OVERRIDE.lock().unwrap() = Some(handle);
+}
+
+/// A standalone store handle over `db` (test-support): NO process global
+/// involved. Tests that inject a store directly (the goal bridge's journal
+/// routing) use this to stay immune to cross-test TEST_OVERRIDE churn —
+/// the agent suite runs its store tests in parallel.
+#[cfg(any(test, feature = "test-support"))]
+pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
     let dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-    let handle = StoreHandle::new(ThreadStore {
+    StoreHandle::new(ThreadStore {
         summaries: Vec::new(),
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
@@ -889,13 +988,22 @@ pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
         sessions_dir: dir,
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
-    });
-    *TEST_OVERRIDE.lock().unwrap() = Some(handle);
+    })
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn drop_for_test() {
     *TEST_OVERRIDE.lock().unwrap() = None;
+}
+
+/// The directory the global store scans for session transcripts.
+/// The store is the sessions-dir single authority (review round 3, P0-1):
+/// the gateway's cold read resolves through this seam in production, so it
+/// is not test-gated. The desktop end-to-end test seeds transcripts here,
+/// calls [`StoreHandle::refresh`], and switches threads to assert a cold
+/// restore loads the persisted transcript (the #765 regression lock).
+pub fn global_sessions_dir() -> PathBuf {
+    global().read(|s| s.sessions_dir.clone())
 }
 
 /// Serializes tests that install the process-global store override
@@ -1383,7 +1491,7 @@ mod tests {
     #[test]
     fn archive_survives_concurrent_pinned_write() {
         let (db, db_path) = temp_db();
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         let store = store_handle(db.clone());
@@ -1422,7 +1530,7 @@ mod tests {
     #[test]
     fn set_thread_tag_persists_to_sidecar() {
         let (db, db_path) = temp_db();
-        crate::runtime::init();
+        crate::runtime::init_hermetic_for_test();
         let dir = tempfile::tempdir().unwrap();
         let session = dir.path().join("t1.jsonl");
         // A real session file so the post-write rescan keeps the row (and
@@ -1535,6 +1643,202 @@ mod tests {
                     .any(|s| s.id == "member" && s.archived)
             );
         });
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// K3 (L3) regression: a pin / archive decision on a thread with no
+    /// live engine journals its `pinned_archived` entry through the cold
+    /// storage append — the decision-point entry lands on the session's
+    /// chain (authority for the K2 rebuild), not only in the sidecar
+    /// cache. Covers the cascade too: archiving a lead journals an entry
+    /// for every descendant row that actually moves.
+    #[test]
+    fn pin_and_archive_decisions_cold_append_pinned_archived_entries() {
+        let (db, db_path) = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        // Real session files (v3 headers: the cold append rides the lazy
+        // v3→v4 migration like any other writer). The child carries its
+        // team edge in the header so the post-write rescans (which rebuild
+        // the summaries from disk) keep the cascade link.
+        let write_session = |id: &str, metadata: &str| {
+            let path = dir.path().join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{metadata}}}\n"),
+            )
+            .unwrap();
+            path
+        };
+        let lead = write_session("k3-lead", "{\"host\":\"manox\"}");
+        let child = write_session(
+            "k3-child",
+            "{\"host\":\"manox\",\"team\":{\"parent\":\"k3-lead\"}}",
+        );
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.sessions_dir = dir.path().to_path_buf();
+            s.session_paths.insert("k3-lead".to_string(), lead.clone());
+            s.session_paths
+                .insert("k3-child".to_string(), child.clone());
+            s.insert_summary_for_test("k3-lead", None);
+            s.insert_summary_for_test("k3-child", Some("k3-lead"));
+        });
+
+        // The pinned_archived entries each decision must land, in order.
+        let entries_for = |path: &std::path::Path| -> Vec<(bool, bool)> {
+            crate::runtime::handle()
+                .block_on(async {
+                    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+                        .await
+                        .unwrap();
+                    storage.journal_range(0, u64::MAX).await.unwrap()
+                })
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::PinnedArchived {
+                        pinned,
+                        archived,
+                        ..
+                    } => Some((pinned, archived)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_for_entries = |path: &std::path::Path, count: usize| {
+            for _ in 0..1500 {
+                let entries = entries_for(path);
+                if entries.len() >= count {
+                    return entries;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "the decision-point entry never landed in {}: {:?}",
+                path.display(),
+                entries_for(path)
+            );
+        };
+
+        // Pin: one entry carrying BOTH flags (the pair fully re-establishes
+        // the state on rebuild), appended while the sidecar cache follows.
+        store.with_mut(|s| s.pin_thread("k3-lead", true));
+        let pinned = wait_for_entries(&lead, 1);
+        assert_eq!(
+            pinned,
+            vec![(true, false)],
+            "pin journals {{pinned:true, archived:false}}"
+        );
+
+        // Archive cascades: the lead AND the child each journal their own
+        // entry, carrying the pinned flag the summary mirror holds.
+        store.with_mut(|s| s.archive_thread("k3-lead", true));
+        let lead_entries = wait_for_entries(&lead, 2);
+        assert_eq!(
+            lead_entries[1],
+            (true, true),
+            "the cascade entry carries the full post-decision flag pair"
+        );
+        let child_entries = wait_for_entries(&child, 1);
+        assert_eq!(
+            child_entries[0],
+            (false, true),
+            "the child journals its own entry"
+        );
+
+        // Re-asserting the current state is a no-op: no duplicate entry.
+        store.with_mut(|s| s.archive_thread("k3-lead", true));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            entries_for(&lead).len(),
+            2,
+            "a no-op decision must not journal"
+        );
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// B3/P0-4 (review round 3): two store decisions on one engine-less
+    /// thread each spawn their own cold append — fresh storage instances
+    /// whose instance-scoped append locks never see each other. Raced on a
+    /// v3 file (where both appends also race the lazy v3→v4 migration,
+    /// which used to share one temp name), they must still land a LINEAR
+    /// chain: the chain-walking journal_range reads BOTH `pinned_archived`
+    /// rows. Pre-fix the pair forked — both rows parented to the same
+    /// leaf, each seq self-stamped, the load validator accepts siblings,
+    /// and the cursor kept only the file-last branch, so the range never
+    /// reached 2 and the earlier decision silently left the chain. Three
+    /// rounds: the race window is narrow; the serialization (the engine's
+    /// per-path cold-append lock + the rewrite's unique temp name) is what
+    /// makes every round converge.
+    #[test]
+    fn concurrent_cold_appends_land_a_linear_chain() {
+        let (db, db_path) = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let entries_for = |path: &std::path::Path| -> Vec<(bool, bool)> {
+            crate::runtime::handle()
+                .block_on(async {
+                    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+                        .await
+                        .unwrap();
+                    storage.journal_range(0, u64::MAX).await.unwrap()
+                })
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::PinnedArchived {
+                        pinned,
+                        archived,
+                        ..
+                    } => Some((pinned, archived)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let wait_for_entries = |path: &std::path::Path, count: usize| {
+            for _ in 0..1500 {
+                let entries = entries_for(path);
+                if entries.len() >= count {
+                    return entries;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!(
+                "the racing cold appends never landed a linear chain in {}: {:?}",
+                path.display(),
+                entries_for(path)
+            );
+        };
+        let store = store_handle(db.clone());
+        for round in 0..3u32 {
+            let id = format!("k3-race-{round}");
+            let path = dir.path().join(format!("{id}.jsonl"));
+            std::fs::write(
+                &path,
+                format!("{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\"metadata\":{{\"host\":\"manox\"}}}}\n"),
+            )
+            .unwrap();
+            store.with_mut(|s| {
+                s.session_paths.insert(id.clone(), path.clone());
+                s.insert_summary_for_test(&id, None);
+            });
+            // Fire BOTH decisions back-to-back: their cold-append tasks
+            // race for the same file. The lock serializes but does not
+            // order them, so assert the chain, not the sequence: both
+            // rows readable through the walk, and the archive's
+            // full-state row among them.
+            store.with_mut(|s| s.pin_thread(&id, true));
+            store.with_mut(|s| s.archive_thread(&id, true));
+            let entries = wait_for_entries(&path, 2);
+            assert_eq!(
+                entries.len(),
+                2,
+                "round {round}: both decisions readable through the chain (a fork strands one)"
+            );
+            assert!(
+                entries.contains(&(true, true)),
+                "round {round}: the archive full-state row landed: {entries:?}"
+            );
+        }
         std::fs::remove_file(db_path).ok();
     }
 }
