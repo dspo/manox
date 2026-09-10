@@ -50,8 +50,9 @@ impl ConversationInfoCache {
 /// tolerates unclaimed seqs).
 ///
 /// GW6: the caller resolves the chain read — the live engine seam when it is
-/// materialized, [`cold_read`] (persisted-jsonl direct read, §D.2 "冷读
-/// 不激活 engine") otherwise — and hands the resulting snapshot in; the page
+/// materialized, [`cold_read`] (persisted-jsonl direct read — §D.2: the
+/// cold read does not materialize the engine) otherwise — and hands the
+/// resulting snapshot in; the page
 /// fold itself never touches the engine.
 pub fn page_history(
     snapshot: manox_agent::engine::JournalSnapshotData,

@@ -11,18 +11,18 @@
 //!
 //! serde shape: internally tagged by `type` (camelCase), struct variants with
 //! camelCase payload fields. `unknown-variant-tolerant` on the read side is a
-//! client rule (L12: drop + log, never disconnect); the guards in
-//! `bindings/guards.ts` implement it for TypeScript consumers.
+//! client rule (L12: drop + log, never disconnect); the former TS guard
+//! (`bindings/guards.ts`, retired with the frontends — the TS face was
+//! deleted wholesale per the round 3 §二.9 ruling) implemented it for the
+//! consumers that no longer exist.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// Opaque handle of one server↔client stream (`StreamOpen` / `StreamItem` /
 /// `StreamEnd` all carry it). Minted by the client; unique per connection.
 ///
 /// Declaring surface: FRAMES (§D.1).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StreamId(pub String);
 
 impl StreamId {
@@ -42,8 +42,7 @@ impl StreamId {
 ///
 /// Declaring surface: shared identity type of the JOURNAL_ENTRIES /
 /// PROJECTION_KEYS / frame payloads (§D, L8).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRef(pub String);
 
 impl ModelRef {
@@ -54,8 +53,7 @@ impl ModelRef {
 
 /// Per-request token usage carried by the assistant `message` entry (§C.2
 /// transcript group). `anyhow`-style payloads are flattened to plain numbers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsagePayload {
     pub input: u64,
@@ -69,8 +67,7 @@ pub struct UsagePayload {
 /// [`crate::stream::SessionSnapshot`] so a snapshot is self-describing.
 ///
 /// Declaring surface: frame payload of `StreamFrame::Snapshot` (§D.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadHeader {
     /// Thread / session id.
@@ -88,8 +85,7 @@ pub struct ThreadHeader {
 /// One journal wire event: the §C.2 entry vocabulary, verbatim. Variant
 /// payload fields match the §C.2 table; the row group is in each variant's
 /// doc comment.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -278,8 +274,7 @@ pub enum JournalWireEvent {
 /// chain-dense `seq` + identity + timestamp + the [`JournalWireEvent`].
 /// `StreamFrame::Entry { seq, id, parent_id, timestamp, event }` carries the same envelope inside the
 /// frame tag (§D.1).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalWireEntry {
     /// Chain depth, dense 0-based, stamped at the single append point (L4).

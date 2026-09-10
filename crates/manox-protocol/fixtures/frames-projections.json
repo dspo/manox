@@ -1,8 +1,0 @@
-{
-  "type": "projections",
-  "sessionId": "s1",
-  "asOfSeq": 3,
-  "values": {
-    "title": "v2 migration"
-  }
-}

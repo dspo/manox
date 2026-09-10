@@ -155,6 +155,14 @@ pub enum JournalFeed {
     Lagged(u64),
 }
 
+/// The feed's broadcast capacity (§D.7, the Entry window bound the L5
+/// overflow-resync semantics ride on). The kernel cannot reference
+/// `manox_protocol::ENTRY_BACKPRESSURE_CAPACITY` (protocol sits above the
+/// kernel), so the value is declared here and LOCKED equal by
+/// `entry_window_capacity_matches_the_protocol_declaration` in
+/// session-core's agent-server tests — change them together.
+pub const JOURNAL_FEED_CAPACITY: usize = 4096;
+
 /// One whole-chain journal read (§C.3), answered by the actor.
 #[derive(Debug, Clone)]
 pub struct JournalSnapshotData {
@@ -878,7 +886,8 @@ pub fn spawn_engine(
     gate.set_journal_sink(cmd_tx.clone());
     // The thread-scoped journal feed; session relays publish into it as
     // sessions come and go (capacity matches the storage broadcast, L5).
-    let (journal_feed_handle, _) = tokio::sync::broadcast::channel::<JournalFeed>(4096);
+    let (journal_feed_handle, _) =
+        tokio::sync::broadcast::channel::<JournalFeed>(JOURNAL_FEED_CAPACITY);
     let state = Arc::new(EngineState {
         running: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
@@ -6102,8 +6111,9 @@ mod tests {
         assert!(text.contains("Shall we?"));
     }
 
-    /// L3机械化验证：每个被 tap 映射的 ThreadEvent，其 (kind, payload) 都
-    /// 必须能构造出类型化 journal 条目——映射与词汇表永不脱钩。
+    /// L3 mechanical verification: every ThreadEvent the tap maps must
+    /// have its (kind, payload) construct a typed journal entry — the
+    /// mapping and the vocabulary never drift apart.
     #[test]
     fn durable_journal_mapping_round_trips_every_journaled_event() {
         use crate::thread::{SubagentChildEvent, ThreadEvent, ToolCallStatus};
@@ -6210,7 +6220,8 @@ mod tests {
             .unwrap_or_else(|err| panic!("kind {kind} payload must construct: {err}"));
             assert_eq!(entry.id(), "e-test");
         }
-        // 已由各自归属流程持久化/快照语义的事件不得重复入日志。
+        // Events whose persistence/snapshot semantics belong to their
+        // own flows must not double-enter the journal.
         let excluded = vec![
             ThreadEvent::ModelChanged {
                 from: None,
@@ -6291,7 +6302,7 @@ mod tests {
             notes_gen: AtomicU64::new(0),
             pending_ui_notes: Mutex::new(Vec::new()),
             pending_journal: Mutex::new(Vec::new()),
-            journal_tx: tokio::sync::broadcast::channel(4096).0,
+            journal_tx: tokio::sync::broadcast::channel(JOURNAL_FEED_CAPACITY).0,
             request_usage: Mutex::new(HashMap::new()),
             per_model_last_usage: Mutex::new(HashMap::new()),
             cumulative: Mutex::new(TokenUsage::default()),

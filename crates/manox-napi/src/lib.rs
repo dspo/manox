@@ -194,8 +194,10 @@ mod tests {
     //!   to_string -> tsfn`: typed `FromServer`, so any variant (including
     //!   `StreamItem` / `StreamEnd` / `Host`) is forwarded verbatim. These
     //!   tests drive a real in-process pair, serialize what the pump would
-    //!   serialize, and assert the exact JSON key shapes the TS bindings
-    //!   (`crates/manox-protocol/bindings/protocol.ts`) declare.
+    //!   serialize, and assert the exact JSON key shapes the wire surface
+    //!   declares (`wire_surface!` in `manox-protocol/src/surface.rs`; the
+    //!   former TS binding mirror was retired with the frontends, round 3
+    //!   §二.9).
     //! * The `send_command` path is `serde_json::from_str::<FromClient>`:
     //!   `StreamOpen` / `StreamCancel` must parse, and an unknown `kind` tag
     //!   must surface an error (never a panic) — the TS relay logs and drops

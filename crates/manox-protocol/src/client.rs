@@ -5,25 +5,21 @@
 //! are camelCase on the wire.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::handshake::Initialize;
 
 /// A base64-encoded image attachment (submit / steer payloads).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageAttachment {
     /// base64-encoded image bytes.
     #[serde(with = "crate::base64_bytes")]
-    #[ts(type = "string")]
     pub data: Vec<u8>,
     pub mime_type: String,
 }
 
 /// Client → server queries; each expects a [`crate::FromServer::Response`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",
@@ -130,8 +126,7 @@ pub enum ClientCall {
 }
 
 /// Client → server fire-and-forget commands.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",
@@ -238,7 +233,6 @@ pub enum ClientNote {
     TerminalInput {
         terminal: String,
         #[serde(with = "crate::base64_bytes")]
-        #[ts(type = "string")]
         bytes: Vec<u8>,
     },
     TerminalResize {

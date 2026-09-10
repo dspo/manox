@@ -17,7 +17,6 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::journal::{JournalWireEntry, ThreadHeader};
 use crate::server::ServerNote;
@@ -33,8 +32,7 @@ pub const ENTRY_BACKPRESSURE_CAPACITY: usize = 4096;
 /// What a client asks a stream to carry (§D.1 `StreamOpen.kind`).
 ///
 /// Declaring surface: FRAMES.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -53,8 +51,7 @@ pub enum StreamKind {
 /// (§D.1).
 ///
 /// Declaring surface: FRAMES.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
@@ -116,8 +113,7 @@ pub fn v2_backpressure_policy(note: &ServerNote) -> BackpressurePolicy {
 /// the thread header, the journal cursor, and the full projection baseline.
 ///
 /// Declaring surface: FRAMES (payload of `StreamFrame::Snapshot`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
     pub session_id: String,
@@ -144,8 +140,7 @@ pub struct SessionSnapshot {
 /// only changed entries are carried; clients keep higher-`as_of_seq`-wins.
 ///
 /// Declaring surface: FRAMES (payload of `StreamFrame::Projections`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionsFrame {
     pub session_id: String,
@@ -159,8 +154,7 @@ pub struct ProjectionsFrame {
 /// must re-follow (fresh snapshot), never replay from a server buffer.
 ///
 /// Declaring surface: FRAMES (payload of `StreamEnd`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum StreamEndReason {
     /// Server closed the stream cleanly (session disposed, ownership lost).
@@ -182,8 +176,7 @@ pub enum StreamEndReason {
 /// unknown variants are dropped + logged, never disconnecting).
 ///
 /// Declaring surface: HOST_EVENTS.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",

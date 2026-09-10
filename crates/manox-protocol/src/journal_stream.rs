@@ -1,7 +1,7 @@
 //! [`JournalStream`] — the transport-neutral snapshot-first journal window
-//! engine (architecture v2 §F.1, a rule-by-rule port of the deepseek-harness
-//! `RemoteJournalStream`, journal-stream.ts:296-373 with the gap-free
-//! opening/read semantics of history.ts `follow`).
+//! engine (architecture v2 §F.1; a rule-by-rule port of the upstream harness
+//! journal-stream engine — the per-rule name correspondence and the port's
+//! divergence notes live in §F.1 of the architecture doc).
 //!
 //! The engine is **pure algebra**: it knows nothing about sessions, the wire,
 //! or any async runtime. It folds a stream of [`JournalInput`] events into a
@@ -14,54 +14,54 @@
 //!   wired to the `PageHistory` call by T4; tests inject a fake);
 //! - output flows through the `publish` and `failed` callbacks.
 //!
-//! Because the cursor is fixed to dense `u64` seq, the dsh pluggable
+//! Because the cursor is fixed to dense `u64` seq, the pluggable
 //! `compare`/`follows` algebra specialises to `u64` ordering and the adjacency
-//! test `right == left + 1`. The dsh `emptyCursor` (the cursor of an
+//! test `right == left + 1`. The `emptyCursor` (the cursor of an
 //! entry-less journal, `-1` in the signed wire model) is represented by
 //! `None` in the engine's internal cursor state (spec §F.1 keeps the u64 wire
 //! cursor: the page tail equals it verbatim, while the signed `-1` is only
 //! reachable through the Option).
 //!
-//! # Rules (spec §F.1, each line aligned with dsh)
+//! # Rules (spec §F.1)
 //!
 //! 1. **Opening** ([`JournalInput::Opened`]): the page tail must equal the
-//!    opening cursor (dsh `assertPageThrough`) and the page must be
-//!    internally adjacent (dsh `assertPage`); publishes `Replace`. A
+//!    opening cursor (`assertPageThrough`) and the page must be
+//!    internally adjacent (`assertPage`); publishes `Replace`. A
 //!    generation restart (§rule 3) opening behind the last applied cursor is
 //!    a protocol violation (`resumed at a cursor behind the last applied
 //!    entry`); re-opening at exactly the resume cursor is the seamless
-//!    ("无感") case — the old window is replaced by the new snapshot.
+//!    case — the old window is replaced by the new snapshot.
 //! 2. **Entry** ([`JournalInput::Entry`]): an entry whose `last` is at-or-
 //!    behind the window tail is silently dropped (idempotent replay);
 //!    `first <= tail < last` is a violation (`partially overlapping entry`);
 //!    a hole past the tail is a **gap** — the engine reads repair pages
 //!    through [`JournalSource::read_page`] until the hole is sealed, merging
-//!    entries that arrive while repairing by ascending `first` (dsh
-//!    `mergeReplacement`: stale dropped, partial overlap a violation, a
+//!    entries that arrive while repairing by ascending `first`
+//!    (`mergeReplacement`: stale dropped, partial overlap a violation, a
 //!    remaining hole retried once, still short a violation `page did not
 //!    reach its opening cursor`) and publishes one `Replace`.
 //! 3. **Generation** ([`JournalInput::Generation`]): the connection restarted;
 //!    the next [`JournalInput::Opened`] is validated as a resume and the old
 //!    window stays published until the new snapshot lands (seamless
-//!    reconnect, dsh `restart()` + `replaceGeneration(resumed)`).
+//!    reconnect, `restart()` + `replaceGeneration(resumed)`).
 //! 4. **Prepend** ([`JournalInput::Prepend`]): a backwards history page; the
 //!    page must be internally adjacent and (when it contributes entries) end
 //!    immediately before the current window head, otherwise a violation
 //!    (`history page is discontinuous`). Entries at-or-after the window head
-//!    are dropped (dsh drops entries with `first >= firstCursor` before the
+//!    are dropped (entries with `first >= firstCursor` are dropped before the
 //!    adjacency test, so an already-covered page is a no-op).
 //! 5. Cursors (`first`/`last`/`resume`) are recorded on every successful
 //!    apply; see [`JournalStream::cursors`] and the
 //!    `expectedCursors` field of the shared test vectors.
 //!
-//! # Degenerated dsh paths (synchronous model)
+//! # Degenerate paths (synchronous model)
 //!
-//! The dsh async machinery — `Promise.race` against the follow iterator, the
-//! `superseded` generation hand-off during a page read, and the aborted-page
-//! waits — degenerates: [`JournalInput::Generation`] is followed by its
-//! [`JournalInput::Opened`] atomically (no interleaved frames exist in the
-//! synchronous abstraction), and a repair page that "ended while reading"
-//! (dsh `ended while reading its replacement page` /
+//! The upstream async machinery — `Promise.race` against the follow iterator,
+//! the `superseded` generation hand-off during a page read, and the
+//! aborted-page waits — degenerates: [`JournalInput::Generation`] is followed
+//! by its [`JournalInput::Opened`] atomically (no interleaved frames exist in
+//! the synchronous abstraction), and a repair page that "ended while reading"
+//! (`ended while reading its replacement page` /
 //! `ended while replacing an aborted page generation`) is exactly a page
 //! whose tail falls short of its requested cursor: the engine reports it as
 //! `journal ended while reading its replacement page` on the first repair
@@ -88,7 +88,7 @@ pub trait JournalEntry {
 pub enum JournalInput<E> {
     /// A generation's opening frame (the follow stream's `Snapshot`): the
     /// page is the current tail window and `cursor` is the journal cursor at
-    /// opening time (the page tail; dsh `opened.cursor`). On a
+    /// opening time (the page tail; `opened.cursor`). On a
     /// [`JournalInput::Generation`] re-open `cursor` must not precede the
     /// last applied cursor.
     Opened { cursor: u64, page: Vec<E> },
@@ -96,7 +96,7 @@ pub enum JournalInput<E> {
     Entry(E),
     /// A backwards history page (the `PageHistory` result consumed by the
     /// client); `has_more` mirrors the page's "older entries exist" flag
-    /// (dsh `options.hasMore(page)`).
+    /// (`options.hasMore(page)`).
     Prepend { page: Vec<E>, has_more: bool },
     /// The connection restarted: the next [`JournalInput::Opened`] belongs to
     /// a new physical generation and is validated as a resume.
@@ -121,7 +121,7 @@ pub enum JournalChange<E> {
 ///
 /// In production this is wired to the `PageHistory` call (T4); tests inject a
 /// fake. `name` is the diagnostic stream label embedded in protocol-failure
-/// messages (dsh `options.name`).
+/// messages (`options.name`).
 pub trait JournalSource<E> {
     /// Read the page ending at `through` (inclusive).
     fn read_page(&mut self, through: u64) -> Vec<E>;
@@ -138,11 +138,11 @@ pub trait JournalSource<E> {
 pub struct JournalCursors {
     /// Head (oldest) cursor currently in the published window.
     pub first: Option<u64>,
-    /// Tail (newest) cursor currently in the published window (dsh
-    /// `lastCursor`).
+    /// Tail (newest) cursor currently in the published window
+    /// (`lastCursor`).
     pub last: Option<u64>,
-    /// Cursor a follow stream must resume from at the next opening (dsh
-    /// `resumeCursor`).
+    /// Cursor a follow stream must resume from at the next opening
+    /// (`resumeCursor`).
     pub resume: Option<u64>,
 }
 
@@ -209,7 +209,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
     ///
     /// Returns `Err(message)` on a protocol violation — the same message is
     /// reported through the `failed` callback before the `Err` is returned,
-    /// mirroring dsh (`consume` catch → `options.failed(error)` → throw). A
+    /// mirroring the upstream (`consume` catch → `options.failed(error)` → throw). A
     /// violation is terminal for the stream in production (the transport
     /// closes it after `failed` fires); `apply` itself is reentrant, so the
     /// shared test vectors can keep driving after a recorded violation.
@@ -251,12 +251,12 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(())
     }
 
-    /// dsh `replaceFromOpening`: `assertPageThrough(page, cursor)` then
+    /// `replaceFromOpening`: `assertPageThrough(page, cursor)` then
     /// `assertPage(entries)` then record `first/last/resume` and publish
     /// `Replace`.
     fn replace_from_opening(&mut self, cursor: u64, page: Vec<E>) -> Result<(), String> {
-        // A non-empty opening page must end at its cursor (the dsh
-        // `follow` contract). The dsh `emptyCursor` (`-1`, the only cursor an
+        // A non-empty opening page must end at its cursor (the upstream
+        // `follow` contract). The `emptyCursor` (`-1`, the only cursor an
         // entry-less opening page may carry) has no inclusive `u64` seq value:
         // the u64 encoding of "journal is empty" is an empty page at any
         // cursor, and the tail bookkeeping stays `None` until the first entry
@@ -282,7 +282,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         }
         let (first, entry_last) = self.entry_range(&entry)?;
         let Some(tail) = self.last_cursor else {
-            // dsh: `follows(emptyCursor, first)` ⇒ a fresh journal accepts
+            // `follows(emptyCursor, first)`: a fresh journal accepts
             // only the contiguous head entry; anything past it is a gap.
             if first != 0 {
                 return self.replace_through(entry_last, vec![entry], false);
@@ -313,18 +313,18 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(())
     }
 
-    /// dsh `replaceThrough`: read a repair page ending at `required`, merge
+    /// `replaceThrough`: read a repair page ending at `required`, merge
     /// the entries that queued during the read, retry once when the merged
     /// window still does not reach the target cursor, then publish `Replace`.
     ///
     /// The published window is exactly the repair page plus the queued entries
-    /// — the caller is responsible for serving a window-aligned page (dsh's
+    /// — the caller is responsible for serving a window-aligned page (the upstream
     /// repair request is derived from the initial page request unbounded, so
     /// `entries(page)` already spans the window; T4 wires `PageHistory` with
     /// the client's retained window head).
     ///
-    /// `repaired` tracks the dsh retry position (the second `assertPageThrough`
-    /// in dsh reports "page did not reach its opening cursor" only after the
+    /// `repaired` tracks the upstream retry position (the second `assertPageThrough`
+    /// the upstream reports "page did not reach its opening cursor" only after the
     /// merged window still falls short).
     fn replace_through(
         &mut self,
@@ -334,7 +334,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
     ) -> Result<(), String> {
         let page = self.source.read_page(required);
         if page.is_empty() {
-            // The synchronous degradation of dsh's "stream ended while the
+            // The synchronous degradation of the upstream "stream ended while the
             // replacement page was being read" (see module docs).
             return self.violation(if repaired {
                 "page did not reach its opening cursor"
@@ -362,7 +362,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(())
     }
 
-    /// dsh `mergeReplacement`: validate the repair page, then absorb queued
+    /// `mergeReplacement`: validate the repair page, then absorb queued
     /// entries by ascending `first`: stale entries are dropped, a partially
     /// overlapping queued entry is a violation, and a queue entry that does
     /// not adjoin the merged tail leaves a hole (`Ok(None)` → retry the read
@@ -393,7 +393,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(Some(entries))
     }
 
-    /// dsh `prepend`: read-and-apply is split on the client; the page arrives
+    /// `prepend`: read-and-apply is split on the client; the page arrives
     /// as a [`JournalInput::Prepend`] input.
     fn on_prepend(&mut self, page: Vec<E>, has_more: bool) -> Result<(), String> {
         if !self.opened {
@@ -443,7 +443,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(())
     }
 
-    /// dsh `assertPage`: entries are internally adjacent
+    /// `assertPage`: entries are internally adjacent
     /// (`last + 1 == next first`).
     fn assert_page(&self, entries: &[E]) -> Result<(), String> {
         let mut previous: Option<u64> = None;
@@ -459,7 +459,7 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok(())
     }
 
-    /// dsh `entryRange`: reject an inverted cursor range.
+    /// `entryRange`: reject an inverted cursor range.
     fn entry_range(&self, entry: &E) -> Result<(u64, u64), String> {
         let first = entry.first();
         let last = entry.last();
@@ -469,8 +469,8 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         Ok((first, last))
     }
 
-    /// dsh `assertPageThrough`: a non-empty page tail must equal its requested
-    /// cursor. An empty page tails at the dsh `emptyCursor`, which has no
+    /// `assertPageThrough`: a non-empty page tail must equal its requested
+    /// cursor. An empty page tails at the `emptyCursor`, which has no
     /// valid positive seq-space value — the [`JournalStream::replace_from_opening`]
     /// / [`JournalStream::replace_through`] callers gate emptiness before.
     fn assert_page_through(&self, page: &[E], through: u64) -> Result<(), String> {

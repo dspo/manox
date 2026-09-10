@@ -288,7 +288,7 @@ impl Workspace {
     }
 
     /// Launch ChatGPT.app through cx's injection path with the provider + model
-    /// picked in the macOS `工具 → ChatGPT.app` menu cascade. The launch blocks
+    /// picked in the macOS Tools (工具) → ChatGPT.app menu cascade. The launch blocks
     /// (config load, model catalog build, CDP injection — up to ~20s), so it runs
     /// on a background thread and reports the outcome as a notification; the app
     /// itself detaches and keeps running independently of manox.
@@ -338,12 +338,12 @@ impl Workspace {
     }
 
     /// Launch VS Code with injections resolved from the persisted
-    /// `vscode_app:` settings (Settings → 外部工具 → Visual Studio Code.app):
+    /// `vscode_app:` settings (Settings → External Tools (外部工具) → Visual Studio Code.app):
     /// Claude Code Extension block → ANTHROPIC_* env; Codex Extension block →
-    /// CODEX_HOME + config.toml; both off → plain open. (工具 → VS Code menu
+    /// CODEX_HOME + config.toml; both off → plain open. (Tools (工具) → VS Code menu
     /// entry and the sidebar new-session menu's VS Code item.) `folder` is
     /// `Some` when the launch should open a directory (the sidebar passes the
-    /// project path or the workspace cwd); the 工具 menu passes `None` for a
+    /// project path or the workspace cwd); the Tools (工具) menu passes `None` for a
     /// folder-less launch. Same background-spawn + notification shape as
     /// `launch_chatgpt_app`; the cx injection path may block on login-shell
     /// env resolution and — when VS Code is already running — on the restart

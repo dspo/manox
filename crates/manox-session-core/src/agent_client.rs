@@ -1,6 +1,6 @@
 //! Unified client-side connection + handshake wrapper for the [`AgentServer`].
 //!
-//! Every host (gpui desktop, napi/VS Code, WebUI bridge) repeats the same
+//! Every host (gpui desktop, napi binding, WS client) repeats the same
 //! three steps to reach the server: build an in-process connection pair, hand
 //! the server end to [`AgentServer::accept`], and declare itself with the
 //! `Initialize` handshake. `AgentClient` owns that sequence so a host only

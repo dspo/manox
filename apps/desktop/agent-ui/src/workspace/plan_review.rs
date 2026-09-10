@@ -32,8 +32,8 @@ impl Workspace {
         });
     }
 
-    /// The user's verdict on a proposed plan (oh-my-pi's four options):
-    /// execute in fresh context / compact then execute / keep context and
+    /// The user's verdict on a proposed plan — four options: execute in
+    /// fresh context / compact then execute / keep context and
     /// execute / refine. Execute verdicts exit plan mode and run the rendered
     /// execution seed referencing the plan file; refine keeps plan mode on
     /// and waits for the user's feedback turn.

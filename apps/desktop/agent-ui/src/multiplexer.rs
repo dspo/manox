@@ -601,7 +601,8 @@ impl SessionMultiplexer {
     /// Replace the rows from a list snapshot, preserving the client-owned
     /// unread flags of rows that persist across the fold (GW5: the wire
     /// field is the deprecated constant-false, so the monotonic mirror must
-    /// survive the refresh — webui `foldThreads` parity).
+    /// survive the refresh — the deleted webui host's foldThreads had the same
+    /// property).
     fn set_threads(&mut self, mut threads: Vec<ThreadListItem>) {
         for row in &mut threads {
             if self
@@ -615,7 +616,7 @@ impl SessionMultiplexer {
         self.thread_list = threads;
     }
 
-    /// §D.5 monotonic mirror rules onto the list rows (webui
+    /// §D.5 monotonic mirror rules onto the list rows (the deleted webui
     /// `mirrorSessionStatus` parity): `running` / the pending flags are
     /// latest-wins, `errored` sets on true edges (only a list snapshot
     /// clears it), `unread` only rises for a non-focused session and clears
@@ -1108,7 +1109,7 @@ mod tests {
         mux.read_with(cx, |m, _| assert_eq!(m.thread_list(), rows.as_slice()));
     }
 
-    /// §D.5 monotonic mirror rules onto the rows (webui
+    /// §D.5 monotonic mirror rules onto the rows (the deleted webui
     /// `mirrorSessionStatus` parity): running/pending latest-wins, errored
     /// edge-sets and only a snapshot clears it, unread is client-owned —
     /// it rises for a non-focused session, survives list snapshots, and
@@ -1190,7 +1191,8 @@ mod tests {
         });
 
         // A list snapshot clears the errored edge but PRESERVES the
-        // client-owned unread (webui foldThreads parity: the wire field is
+        // client-owned unread (the deleted webui host's foldThreads behaved the
+        // same: the wire field is
         // the deprecated constant-false).
         server_conn.send_to_client(FromServer::Host {
             host: HostEvent::ThreadsUpdated { threads: rows },

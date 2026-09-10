@@ -1,7 +1,6 @@
 //! Connection handshake and capability declaration.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// The protocol epoch this crate's wire vocabulary belongs to (L12/§D.2:
 /// "Initialize carries protocol epoch"). A client declares the highest epoch
@@ -16,8 +15,7 @@ pub const PROTOCOL_EPOCH: u32 = 1;
 /// Capabilities a client can answer when the server issues a [`super::ServerCall`].
 /// Declared in [`ClientHello`] so the server routes each call only to clients
 /// able to fulfil it; a call with no capable owner fails closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HookKind {
     Approve,
@@ -30,8 +28,7 @@ pub enum HookKind {
 
 /// First client→server request. Declares who the client is, which
 /// [`HookKind`]s it can answer, and which sessions it initially owns.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Initialize {
     pub client_id: String,
@@ -47,8 +44,7 @@ pub struct Initialize {
 }
 
 /// Client identity + capability declaration carried on connect.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientHello {
     pub client_id: String,

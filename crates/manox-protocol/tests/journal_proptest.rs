@@ -1,10 +1,12 @@
 //! Property tests for the [`JournalStream`] engine (architecture v2 §F.1.5,
-//! J.3: "随机 drop/重排/断流/重连序列 → 收敛等于服务端状态").
+//! J.3: random drop / reorder / disconnect / reconnect sequences must
+//! converge to the server state).
 //!
 //! Model: a dense server journal `0..len`. A random, possibly lossy
 //! (duplicate/drop/out-of-order) live stream drives the engine; random
 //! reconnects (`Generation` + fresh `Opened`) may supersede it mid-flight
-//! (断流/换代). A shadow reference stream — the *gap-free* server delivery
+//! (disconnect/generation hand-off). A shadow reference stream — the *gap-free*
+//! server delivery
 //! (`history.follow` semantics: every event exactly once, ascending, and a
 //! reconnect re-opens at exactly the engine's resume cursor) — is folded into
 //! an ideal window.
@@ -43,7 +45,7 @@ impl JournalEntry for Seq {
 }
 
 /// One action in the random stream (the same action drives both the engine
-/// and the ideal reference, so "重排" and "丢帧" are real perturbations
+/// and the ideal reference, so "reorder" and "drop" are real perturbations
 /// rather than two unrelated models):
 ///
 /// - `Deliver(s)`: attempt to feed live entry `s` to the engine; the ideal
@@ -280,7 +282,7 @@ proptest! {
         );
     }
 
-    /// Irrecoverable holes (§J.3 随机注入{丢帧…}): a `Skip` whose seq the
+    /// Irrecoverable holes (§J.3 random injection {dropped frames…}): a `Skip` whose seq the
     /// server itself cannot deliver must surface as exactly one violation on
     /// the first repair attempt — never a panic, never silent data loss.
     #[test]
@@ -310,7 +312,7 @@ proptest! {
         let _ = &failures;
     }
 
-    /// Malformed inputs never panic (§J.3 随机注入): entries before opening,
+    /// Malformed inputs never panic (§J.3 random injection): entries before opening,
     /// inverted ranges, generations without a following snapshot, prepends
     /// onto a closed window — the engine must reject with `Err`/`failed`
     /// rather than abort.

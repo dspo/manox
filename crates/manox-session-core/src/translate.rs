@@ -1,22 +1,27 @@
-//! Translation from kernel `ThreadEvent` to protocol `ServerNote` / `ServerCall`.
+//! Translation from kernel `ThreadEvent` to protocol `ServerCall`.
 //!
 //! The AgentServer's event pump receives `Arc<ThreadEvent>` from each
-//! [`ThreadHandle::subscribe`] and routes them through this module:
-//! streaming events become [`ServerNote`] (fire-and-forget to the client),
-//! adjudication events become [`ServerCall`] (the server awaits the client's
-//! [`FromClient::Reply`]), and diagnostic-only events are dropped (they carry
-//! no UI-visible state and would clutter the wire for no projection benefit).
+//! [`ThreadHandle::subscribe`] and routes them through this module. The
+//! terminal shape (T10, §D.6): every session-scoped domain fact rides the
+//! journal — entries for the transcript/delta stream, projections for hot
+//! state, SessionStatus host deltas for list flags — so the only kernel
+//! event that still crosses here is the authorization request, an
+//! adjudication (ServerCall waterfall, §D.4) the server issues while
+//! awaiting the client's [`FromClient::Reply`]. Everything else is
+//! diagnostic-only or already carried by the v2 stream and translates to
+//! [`Translated::Skip`]. (The former `Note` arm — streaming events as
+//! fire-and-forget `ServerNote`s — went with the v1 note mirrors; round 3
+//! §二.10③ retired its never-constructed variant.)
 
-use manox_protocol::{ServerCall, ServerNote};
+use manox_protocol::ServerCall;
 
 /// The translation result for one `ThreadEvent`.
 pub enum Translated {
-    /// A streaming notification — fire-and-forget to the owning client(s).
-    Note(ServerNote),
     /// An adjudication / capability call — the server issues it and awaits the
     /// client's [`FromClient::Reply`].
     Call(ServerCall),
-    /// Not over the wire: diagnostic-only or handled by a different path.
+    /// Not over the wire: diagnostic-only or carried by the v2 stream
+    /// (journal entries / projections / host deltas).
     Skip,
 }
 
@@ -102,8 +107,8 @@ pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Tra
 
 // ── v4 journal → wire mapping (§C.2 / §D.1, T4) ─────────────────────────────
 //
-// The kernel `SessionTreeEntry` vocabulary (37 variants, journal v4) projects
-// onto the wire [`manox_protocol::JournalWireEvent`] (37 variants). The
+// The kernel `SessionTreeEntry` vocabulary (38 variants, journal v4) projects
+// onto the wire [`manox_protocol::JournalWireEvent`] (38 variants). The
 // projection is TOTAL: every kernel variant has a §C.2 wire row — including
 // the wire-opaque extension kinds (`ActiveToolsChange`, `Custom`,
 // `CustomMessage`), which ride verbatim. Totality is a hard §F.1 requirement:
@@ -522,12 +527,17 @@ mod tests {
         assert_eq!(round.len(), tail.len());
     }
 
-    /// §J.4 (d) coverage: the kernel `SessionTreeEntry` vocabulary has 37
+    /// §J.4 (d) coverage: the kernel `SessionTreeEntry` vocabulary has 38
     /// variants and `wire_event` maps every one of them — the projection is
     /// TOTAL (§F.1 density: the follow snapshot page must be seq-dense, so no
-    /// kernel kind may be wire-less). If a new kernel variant is added, the
-    /// exhaustive `match` in `wire_event` stops compiling; this test is the
-    /// behavioral pin that the None-set stays empty.
+    /// kernel kind may be wire-less). Two locks, each covering what the
+    /// other cannot: the exhaustive `match` in `wire_event` makes a NEW
+    /// variant without a wire arm a compile error (but says nothing about
+    /// the sample list), and the length cross-check against
+    /// `JOURNAL_ENTRIES` makes a new variant WITHOUT a sample here a test
+    /// failure (round 3 §二.7④ — PlanReview sat exactly in that gap: armed,
+    /// declared, unsampled, self-asserted "37"). The `dropped` leg pins the
+    /// value-level half: no EXISTING arm may map to `None`.
     #[test]
     fn wire_projection_covers_every_kernel_variant_totally() {
         use manox_harness::session::SessionTreeEntry as E;
@@ -626,6 +636,16 @@ mod tests {
                 parent_id: pid(),
                 timestamp: now,
                 target_id: Some("t".into()),
+            },
+            // Round 3 §二.7④: PlanReview was the missing 38th sample —
+            // the wire arm existed (see `wire_event`), the builder census
+            // had it, only this list lagged at 37.
+            E::PlanReview {
+                id: id(),
+                parent_id: pid(),
+                timestamp: now,
+                state: "proposed".into(),
+                plan_file: None,
             },
             E::UiNote {
                 id: id(),
@@ -799,7 +819,15 @@ mod tests {
                 data: serde_json::json!({}),
             },
         ];
-        assert_eq!(all.len(), 37, "kernel vocabulary is 37 variants");
+        assert_eq!(
+            all.len(),
+            manox_protocol::surface::JOURNAL_ENTRIES.len(),
+            "the kernel sample must stay 1:1 with the wire declaration table \
+             (a new kernel variant forces a wire arm to compile, the \
+             wire_surface! macro forces its JOURNAL_ENTRIES row, and this \
+             cross-check forces its sample here — round 3 §二.7④ replaced \
+             the stale self-asserted 37 with this cross-face lock)"
+        );
         // The projection is TOTAL (§F.1 density): no kernel kind may be
         // wire-less — a hole in the follow snapshot page violates the client
         // fold's `assertPage` adjacency and loops snapshot → Resync (the
@@ -818,7 +846,7 @@ mod tests {
             Vec::<&str>::new(),
             "no kernel variant may lack a wire row"
         );
-        // All 37 project (and round-trip through the wire enum).
+        // All of them project (and round-trip through the wire enum).
         for e in &all {
             if wire_event(e).is_none() {
                 continue;

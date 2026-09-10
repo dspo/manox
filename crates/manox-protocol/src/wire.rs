@@ -8,7 +8,6 @@
 //! wire to match the existing client contract.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// One row in the threads list — the wire schema for
 /// [`crate::ServerNote::ThreadsUpdated`] `threads`. Combines the persisted
@@ -17,8 +16,7 @@ use ts_rs::TS;
 /// thread store tracks; the server projects both into this flat shape so the
 /// client list never reads two sources. Field names are snake_case on the
 /// wire to match the existing client contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ThreadListItem {
     pub id: String,
     pub title: String,
@@ -55,21 +53,17 @@ pub struct ThreadListItem {
     /// `approval_mode` is the PermissionMode i64. Additive + optional:
     /// older actors' payloads deserialize with Nones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub approval_mode: Option<i64>,
 }
 
 /// One selectable model in the models list — the wire schema for
 /// [`crate::ServerNote::Models`] `models`. Field names are snake_case on the
 /// wire to match the existing client contract.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
@@ -77,7 +71,6 @@ pub struct ModelInfo {
     /// Provider display name (e.g. "DeepSeek" for the "DeepSeek-anthropic"
     /// registration id). Absent only from older actors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub provider_name: Option<String>,
     /// Wire API shape ("anthropic", "openai_responses", …); drives the
     /// cascade menu's badge and tint.
@@ -85,18 +78,15 @@ pub struct ModelInfo {
     pub context_window: u32,
     /// Per-model output budget; absent from older actors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub max_tokens: Option<u32>,
     /// U2 cross-domain #4: the provider-config key the external-CLI launch
     /// cascade matches verbatim (`provider_glue::config_id` semantics —
     /// falls back to the model id). Absent from older actors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub config_id: Option<String>,
     /// U2 cross-domain #4: the registration's `agents` visibility filter
     /// (the cascade menu filters by the launched agent id); empty or absent
     /// = visible to all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub agents: Option<Vec<String>>,
 }

@@ -18,12 +18,10 @@
 //! `FromServer::Notification` still waits on the T5 consumer migration.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 /// Correlation id for a request/response or call/reply pair. Opaque to the
 /// transport; minted by the caller and echoed verbatim by the responder.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MsgId(pub String);
 
 impl MsgId {
@@ -33,8 +31,7 @@ impl MsgId {
 }
 
 /// Error carried in a `Response`/`Reply` `Err` outcome.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcError {
     /// Application-defined code; non-zero always means failure.
     pub code: i32,
@@ -112,8 +109,7 @@ impl RpcError {
 }
 
 /// Client → server message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",
@@ -148,8 +144,7 @@ pub enum FromClient {
 }
 
 /// Server → client message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     rename_all = "camelCase",

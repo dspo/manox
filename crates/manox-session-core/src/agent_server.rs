@@ -296,7 +296,7 @@ impl AgentServer {
             pumps_spawned: AtomicU64::new(0),
             pumps_finished: AtomicU64::new(0),
         });
-        // U2 cross-domain #2 (§D.5 "Models(provider reload 即推)"): a
+        // U2 cross-domain #2 (§D.5 Models: pushed immediately on provider reload): a
         // provider reload broadcasts the fresh snapshot to every
         // connection. Weak, so a dropped server leaves an inert listener;
         // a newer server re-registers (last one wins).
@@ -308,7 +308,7 @@ impl AgentServer {
                 }
             }
         })));
-        // U6a (§D.5 "ThreadsUpdated(元数据变更时全量快照)" made real): the
+        // U6a (§D.5 ThreadsUpdated — full snapshot on metadata change — made real): the
         // store-event watcher owns the list-refresh broadcast — any store
         // summary write (title auto-stamps, interacted_at bumps, pin/
         // archive/tag, rescans) reaches EVERY connection as the
@@ -1077,7 +1077,8 @@ async fn handle_call(
             before_seq,
             max_messages,
         } => {
-            // §D.2: "冷读不激活 engine，jsonl 直读" (GW6). The live engine
+            // §D.2: the cold read does not materialize the engine; the jsonl is
+            // read directly (GW6). The live engine
             // seam answers when it is materialized; otherwise the persisted
             // journal is read straight off disk — a cold session must never
             // answer "journal engine is not materialized" (pre-fix the
@@ -3168,7 +3169,6 @@ fn spawn_pump(
                 _ => {}
             }
             match translate(&ev, &session_id) {
-                Translated::Note(note) => inner.route_note(&session_id, note),
                 Translated::Call(call) => route_call(&inner, &session_id, call).await,
                 Translated::Skip => {}
             }

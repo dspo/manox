@@ -423,8 +423,8 @@ fn jentry(
 }
 
 // ── J1 journal-face builders: the remaining §C.2 vocabulary (the
-// twelve dual-path builders above + these twenty-five = the full 37,
-// 1:1 with the kernel's SessionTreeEntry variants). ──
+// thirteen dual-path builders above + these twenty-five = the full 38,
+// 1:1 with the kernel's 38 SessionTreeEntry variants). ──
 fn ent_message(id: String, parent_id: Option<String>) -> SessionTreeEntry {
     SessionTreeEntry::Message {
         id,
@@ -5635,7 +5635,7 @@ fn plan_seed_note_runs_the_seed_turn_server_side() {
 
 /// GW6 regression: PageHistory on an OPENED session whose engine seam
 /// answers "not materialized" must cold-read the persisted jsonl (§D.2
-/// "冷读不激活 engine，jsonl 直读") — pre-fix it answered
+/// the cold read does not materialize the engine, jsonl direct) — pre-fix it answered
 /// `gateway/internal: journal engine is not materialized`.
 #[test]
 fn page_history_cold_reads_disk_for_opened_session_without_engine() {
@@ -6169,20 +6169,32 @@ fn cancel_delivery_converges_pending_adjudication() {
 /// `.with_code` directly.
 #[test]
 fn every_production_rpc_error_carries_a_stable_code() {
+    // Round 3 §二.7③: the list missed the ws transport files and the
+    // model_chat / projections / waterfall faces (all currently zero
+    // `RpcError::new` sites — they are listed so a FUTURE site cannot
+    // silently escape the gate), and an unreadable file was a `continue`
+    // (a rename would hollow the gate out quietly) — both fixed: the list
+    // is every production source, and a read failure fails the gate.
     const FILES: &[&str] = &[
         "src/agent_server.rs",
         "src/journal_query.rs",
         "src/follow.rs",
         "src/translate.rs",
         "src/agent_client.rs",
+        "src/model_chat.rs",
+        "src/projections.rs",
+        "src/waterfall.rs",
+        "src/ws/mod.rs",
+        "src/ws/connection.rs",
+        "src/ws/listener.rs",
     ];
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut uncoded: Vec<String> = Vec::new();
     for file in FILES {
         let path = root.join(file);
-        let Ok(source) = std::fs::read_to_string(&path) else {
-            continue;
-        };
+        let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("gate cannot read {file} ({e}) — a renamed production source must update FILES")
+        });
         let prod = match source.find("\nmod tests {") {
             Some(idx) => &source[..idx],
             None => source.as_str(),
@@ -6228,7 +6240,7 @@ fn every_production_rpc_error_carries_a_stable_code() {
 /// real composition fails here instead of in production. The former
 /// §J.4 "coverage" walked self-referential samples (scripted values
 /// asserting themselves); this walks the live server. The journal-entry
-/// face (37 tags through the follow stream) extends this gate when the
+/// face (38 tags through the follow stream) extends this gate when the
 /// K1 all-types session builder lands.
 #[test]
 fn real_composition_emits_every_host_event_and_answers_every_client_call() {
@@ -6461,7 +6473,7 @@ fn real_composition_streams_every_journal_entry_tag() {
             break;
         }
     }
-    // The full vocabulary, 1:1 with the kernel's 37 SessionTreeEntry
+    // The full vocabulary, 1:1 with the kernel's 38 SessionTreeEntry
     // variants, chained (each entry's parent is its predecessor).
     let builders: Vec<fn(String, Option<String>) -> SessionTreeEntry> = vec![
         ent_message,
@@ -6783,7 +6795,7 @@ fn list_threads_maps_the_wire_recency_and_decoration_columns() {
 }
 
 /// U2 cross-domain #2: a provider reload broadcasts a fresh Models
-/// snapshot to EVERY connection — §D.5's "Models(provider reload 即推)"
+/// snapshot to EVERY connection — §D.5's Models push (full model list on provider reload)
 /// promise, previously unimplemented (the only emission was the
 /// requester-directed ListModels response mirror). The desktop's
 /// menu-open refetch stays for the startup-registration race; the
@@ -7245,4 +7257,22 @@ fn follow_upgrade_poll_ends_at_the_deadline() {
             _ => {}
         }
     }
+}
+
+/// §D.7 single-source discipline for the Entry window bound: the kernel
+/// declares the feed capacity (`manox_agent::engine::JOURNAL_FEED_CAPACITY`)
+/// and the protocol declares the Entry backpressure window
+/// (`manox_protocol::ENTRY_BACKPRESSURE_CAPACITY`); layering forbids either
+/// side from referencing the other's constant, so this lock is the equality
+/// proof — change them together (round 3 §二.1a: the protocol constant was
+/// previously declared-but-never-referenced while the kernel hardcoded the
+/// bare literal).
+#[test]
+fn entry_window_capacity_matches_the_protocol_declaration() {
+    assert_eq!(
+        manox_agent::engine::JOURNAL_FEED_CAPACITY,
+        manox_protocol::ENTRY_BACKPRESSURE_CAPACITY,
+        "the kernel feed capacity and the protocol Entry window bound must \
+         stay equal — the §D.7 overflow-resync semantics assume one number"
+    );
 }

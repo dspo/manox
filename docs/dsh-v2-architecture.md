@@ -28,8 +28,8 @@
 L6 域旁路   terminal(PTY 自有通道) · ModelChat 侧流 · MCP · LSP        ——不进会话日志
 L5 扩展面   webui slot registry · 插件 bundle 静态通道 · plugin routes · 宿主服务缝清单
 L4 UI       GPUI agent-ui（selector-only） · webui React（slots+hooks） · VS Code webview（复用 webui）
-L3 客户端SDK JournalStream 引擎(Rust+TS 双胞胎) · SessionStore · selector · echo/retire · 重连
-L2 协议     manox-protocol v2：帧/Call/Note/ServerCall/HostEvent · ts-rs · TS 守卫 · fixtures
+L3 客户端SDK JournalStream 引擎(Rust 单实现；TS 双胞胎已随前端删除) · SessionStore · selector · echo/retire · 重连
+L2 协议     manox-protocol v2：帧/Call/Note/ServerCall/HostEvent（ts-rs/TS 守卫/fixtures 已按 round 3 §二.9 裁决整体退役，见 §D.8）
 L1 网关     AgentServer 单例：FollowStream · PageHistory · ProjectionRegistry · RPC回执
             · HostEvent 总线 · ServerCall waterfall · 能力路由 · plugin route 注册
 L0 内核     ThreadCore + Journal v4（append-only、链稠密 seq）· engine · 持久化 · provider/credentials
@@ -127,8 +127,8 @@ enum StreamEndReason { Closed, Cancelled, Resync, Failure { code: String, messag
 - 服务端广播纪律（GW4）：`broadcast_host`/`note_to_client` 一律锁内 clone 连接列表、锁外发送——单个停滞的网络客户端不得持 `clients` 锁冻结全网关（克隆后发送，照 `route_note` 范本）。
 - `RpcError{code, message}`，code 集：`session/not-found, session/busy, gateway/bad-request, gateway/internal, resync-required, model/unresolvable, feature/unavailable, protocol/unsupported-epoch`（C1：epoch ∉ {0, PROTOCOL_EPOCH}）（GW7 增补：协议已声明但尚未实现的能力臂以此作答，客户端可区分「功能未建」与一般失败；Terminal 死桩为首个使用者）。**C2 错误码纪律**：离开网关的每个 `RpcError` 都携稳定码（生产区零无码——结构门禁 `every_production_rpc_error_carries_a_stable_code` 扫描构造点，构造必须立即链 `.with_code`）；成功载荷的类型化 RpcOutcome 为 Wave 2 项（波及全客户端 Response 消费面，与 C4 wire 工作同批）。
 
-### D.8 TS 侧
-ts-rs 绑定再生成；帧层手写 exact-key 守卫（dsh stream-protocol.ts:270-291 同款）；cargo 测试导出真实帧 JSON fixture（`crates/manox-protocol/fixtures/`）→ vitest 断言守卫解析（双路径一致性的 TS 侧，M0 围栏）。
+### D.8 TS 侧（已退役——round 3 §二.9 裁决）
+原设计：ts-rs 绑定再生成；帧层手写 exact-key 守卫（dsh stream-protocol.ts:270-291 同款）；cargo 测试导出真实帧 JSON fixture（`crates/manox-protocol/fixtures/`）→ vitest 断言守卫解析（双路径一致性的 TS 侧，M0 围栏）。前端删除后该面零 TS 消费者（head 全树 grep 证实），按裁决整体退役：`bindings/{protocol,guards}.ts`、`fixtures/*.json`、ts-rs 依赖与全部 `#[ts]` 属性、导出/漂移测试一并删除（W1 建立的 fixtures 深比漂移门随之作废）；样本 serde 往返覆盖由 `tests/surface_coverage.rs` 内存承载（fixtures 测试无独有覆盖）。契约面收敛为：`wire_surface!` 单源声明表 + 共享向量 + Rust 测试。
 
 ## E. 投影注册表（P 面）
 
@@ -144,6 +144,8 @@ static PROJECTIONS: &[&dyn ProjectionDef] = &[ ... ];    // 声明面（L12）
 ```
 AgentServer 每会话持投影实例组；泵转发条目时 fold；变更 key 随 `Projections` 帧发布（as_of_seq=触发条目 seq）。快照带全量。客户端 per-key `{value,seq}`，higher-seq-wins。
 
+**`running` 的权威链（round 3 §二.5 落字）**：真值是内核 facade 的 `is_running()`（turn 循环持有者）；投影 `running` 是它的**镜像**（种子读 facade，此后由 TurnStart/TurnFinish/Stop/Error 等 journal 条目 fold，崩溃恢复后由重放重建——与 facade 最终一致，恢复窗口内可能滞后）；`SessionStatus` 主机帧的 `running` 字段是**通知面 delta**（事件时刻的 facade 瞬象，settle 边沿发 `running:false`）。三者冲突时（理论短暂窗口）：渲染以投影为准（带 seq 可比较），列表徽章以 SessionStatus delta 为准（边沿语义），facade 永远是事实源——任何把镜像当权威的读法都是 bug。
+
 ### E.2 key 全表（首版 20 个）
 `title, cwd, project, model{provider,id}, permission_mode, reasoning_effort, plan_mode, plan, goal, running, has_interacted, pinned, archived, depth, branch, browser_suites, pending_auth, background_tasks, agent_label, self_author`。
 （`running` fold `turn_start/turn_finish/stop/error`；`has_interacted` fold user `message`；`pending_auth` fold `approval` 双态。）
@@ -154,8 +156,8 @@ AgentServer 每会话持投影实例组；泵转发条目时 fold；变更 key �
 ## F. 客户端 SDK（L3 层）
 
 ### F.1 JournalStream 引擎（Rust `crates/manox-protocol/src/journal_stream.rs`；原 TS 双胞胎 `webui .../state/journal.ts` 已随前端删除——仓库边界裁决,共享向量由 Rust 侧单独执行）
-泛型 `JournalStream<P,E>`（cursor=u64），注入代数：`entries(page)/hasMore/first/last/compare/follows/publish/failed`。规则（dsh journal-stream.ts:296-373 直译）：
-1. 打开：首帧必为 `Snapshot`，校验页内条目互相邻接、页尾=cursor；发布 `Replace{records, projections}`。（**cursor 语义统一,review round 3 §二.8**：wire `cursor` = 活链尾条目的 inclusive seq——非空窗口 = 最后一条 record 的 seq;空 journal = 0（u64 域无 dsh 的 `-1` emptyCursor,消费方以 `records.is_empty()` 判空窗）。生产两端（engine `journal_cursor`、冷读 `window.last().seq`）、blessed 样本、fixtures、共享向量全部同形,无换算点。）
+泛型 `JournalStream<P,E>`（cursor=u64），注入代数：`entries(page)/hasMore/first/last/compare/follows/publish/failed`。规则（dsh journal-stream.ts:296-373 直译；代码内反引号规则名——`assertPage`、`assertPageThrough`、`mergeReplacement`、`replaceThrough`、`restart()` 等——即上游同名规则的对应锚点，round 3 §二.10① 起出处只落在本节）：
+1. 打开：首帧必为 `Snapshot`，校验页内条目互相邻接、页尾=cursor；发布 `Replace{records, projections}`。（**cursor 语义统一,review round 3 §二.8**：wire `cursor` = 活链尾条目的 inclusive seq——非空窗口 = 最后一条 record 的 seq;空 journal = 0（u64 域无 dsh 的 `-1` emptyCursor,消费方以 `records.is_empty()` 判空窗）。生产两端（engine `journal_cursor`、冷读 `window.last().seq`）、blessed 样本与共享向量全部同形,无换算点。）
 2. Entry：`last<=已见` 丢弃（幂等）；部分重叠=协议违规（报 failed）；`follows` 不成立=缺口 → `PageHistory(through=缺口尾)` 补齐 + 期间到达条目按 seq 归并 + 整体 `Replace` 发布；补页尾仍不达=违规。
 3. 重开（连接换代）：`restart()` → 重新 follow → 新 Snapshot cursor 必须 ≥ lastCursor，否则违规；保留旧窗口直到新快照落地（无感重连）。
 4. `prepend(page)`：历史翻页，不连续=违规。
@@ -184,7 +186,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 2. 回放一致性（L10）：落盘重载 == 内存（display/投影/游标）。**K1 as-built**：门禁 `journal_replay_is_consistent_across_disk_reload` 覆盖 30 种 on-disk kind（REPLAY_COVERAGE_KINDS 对链断言防空转），经生产 `builder.open` 重载路径逐面相等。两个 as-built 非逐字节面（测试内注明）：消息载荷 timestamp（K5 受理/运行毫秒差）与 **display message id**（`entries_to_display` 每次重建新铸 UUID、非 journal 派生——候选后续：display id 改由条目 id 派生以获得 UI key 稳定性，T6/T7 关联）。
 3. JournalStream 属性测试（F.1.5）。
 4. 声明面覆盖（L12）：journal 条目/投影 key/host 事件/协议帧四张表，emit 点 100%（coverage 测试：脚本化会话驱动后断言每个声明面出现在 FromServer 流；扩展 `dual_path_transport_consistency`）。
-5. 双路径一致性：in-proc ≡ serde ≡ TS 守卫（fixtures）。
+5. 双路径一致性：in-proc ≡ serde（TS 守卫与 fixtures 腿已随 TS 面退役——round 3 §二.9 裁决，见 §D.8）。
 6. grep 门禁（终局）：视图/组件层不得 import 协议发送面；死亡清单残留以 §D.6 as-built 保留集为准（原「零残留」声明经审计证伪），并按 U9 扩展到内核对象面（views 不得持 ThreadHandle）。
 7. 病灶回归：has_interacted 首交互即显（投影）；消费统计实时+历史（Q 面折叠）；项目/模型继承（CreateSession 意图）；选中一次生效（client-owned）；模型不串号（canonical+零解析）。
 
@@ -352,4 +354,4 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 - napi：适配面同步（vscode 徽章已列 follow-up）。
 
 **顺序**：C4a-1 桌面权威迁移✓ + C4a-2 compat 验证✓（生产发送方清零，vscode 除外——见上）→ **C4b 定界收窄**：本期可删 = 无任何消费方的面（FocusThread 变体+no-op 臂、ThreadListItem.unread 列、error-stub call、K9 死 schema——逐项 grep 证据后单批删除，J1/C3 门禁看守）；**死亡清单大宗**（注册表 4 臂 models/commands/threadsUpdated/ready + 裁决 3 臂 approve/askUserQuestion/planVerdict + 控制 3 臂 sessionCreated/disposed/error + compat 三件）**原 gated 于 vscode extension host 的 host 帧迁移——该项目已整体删除(仓库边界裁决),gate 解除**：sessionManager 的 awaitSession 谓词与审批流消费 note 形状事件（`ev.method === 'sessionCreated'` 等 12 消费点），parseFromServer 不把 host 帧归一为 method 事件——删臂即 vscode 建会话挂起（硬破坏，非 badge 类 UI 退化），sidebar webview 不受影响（sidebarProvider 原样转发全部 FromServer 含 host，webui store 已 onHostEvent 化）→ C4b 大宗+vscode host 迁移列为 PR 合并前硬 follow-up → C4c §J.6「零残留」声明随大宗删除真实化。
-**门禁证据**：C3 `wire_surface!` 宏单源（表/match/样本同收敛）；J1 host+call+journal 三面门禁；ts-rs exact-key 守卫+fixtures 导出；桌面棘轮针面（source_gates）。
+**门禁证据**：C3 `wire_surface!` 宏单源（表/match/样本同收敛）；J1 host+call+journal 三面门禁；TS 面（守卫+fixtures）已按 §二.9 裁决退役；桌面棘轮针面（source_gates）。

@@ -16,15 +16,13 @@
 //! host events.
 
 use serde::{Deserialize, Serialize};
-use ts_rs::TS;
 
 use crate::wire::{ModelInfo, ThreadListItem};
 
 /// Server → client adjudication / capability calls; the client answers with a
 /// [`crate::FromClient::Reply`]. Routed by session ownership ∩ declared
 /// [`crate::HookKind`] capability; no capable owner fails closed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",
@@ -110,8 +108,7 @@ impl ServerCall {
 
 /// Server → client notifications (the retained §D.6 surface — see the
 /// module docs for the per-group rationale).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "protocol.ts")]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
     rename_all = "camelCase",

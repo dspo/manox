@@ -88,7 +88,7 @@ pub struct ClientStore {
     pub window: Vec<JournalWireEntry>,
     /// Older records exist before the window head (truncated snapshot).
     pub window_has_more: bool,
-    /// The positive fold of the window (§F.2 "display = 对 window 的通用
+    /// The positive fold of the window (§F.2: display = a plain fold over the
     /// UI fold"): messages interleaved with UI notes, derived by
     /// [`crate::journal_translate`] — never stored independently.
     pub display: Vec<manox_agent::db::HistoryEntry>,

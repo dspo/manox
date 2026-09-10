@@ -7,9 +7,9 @@
 //! - store mirror writes (`with_mut(|s|`) — U3 single-writer: the server
 //!   pump owns the thread-store flags; the desktop mirror writes are
 //!   redundant in-proc and race the pump across processes.
-//! - facade writes (`with_mut(|t|`) — U1/U6: user intent goes through the
-//!   gateway (`ClientCall::Submit` etc.); rendering state comes from the
-//!   client store, not a locally driven kernel facade.
+//! - facade writes (`with_mut(|t|` / `with_mut(|thread|`) — U1/U6: user
+//!   intent goes through the gateway (`ClientCall::Submit` etc.); rendering
+//!   state comes from the client store, not a locally driven kernel facade.
 //! - store reads (`thread_store::global()` / `thread_store_global()`) — U2:
 //!   lists and summaries come from `ListThreads` + host events. Landed for
 //!   the list/registry surface (the sidebar reads the multiplexer's wire
@@ -48,7 +48,13 @@ mod tests {
     fn desktop_bypass_surface_never_grows() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         const STORE_WRITE: &[&str] = &["with_mut(|s|"];
-        const FACADE_WRITE: &[&str] = &["with_mut(|t|"];
+        // Round 3 §二.7①: the needle missed the receiver form
+        // `self.thread.with_mut(|thread|` — seven kernel-write faces were
+        // invisible to the frozen budget. The needle now names both closure
+        // spellings; the seven pre-existing sites freeze at their audited
+        // counts (chips 2, composer 4, plan_review 1 — composer_render's
+        // two use the `|t|` spelling and were already counted).
+        const FACADE_WRITE: &[&str] = &["with_mut(|t|", "with_mut(|thread|"];
         const STORE_GLOBAL: &[&str] = &["thread_store::global()", "thread_store_global()"];
         const SENDS: &[&str] = &[".send_call(", ".send_note("];
         // (file, pattern-family name, needles, frozen count)
@@ -143,7 +149,9 @@ mod tests {
                 "workspace/chips.rs",
                 "facade writes (U1/U6)",
                 FACADE_WRITE,
-                0,
+                // §二.7①: the receiver-form needle found these two — they
+                // predate the ratchet; frozen at the audited count.
+                2,
             ),
             (
                 "workspace/right_pane.rs",
@@ -161,13 +169,15 @@ mod tests {
                 "workspace/composer.rs",
                 "facade writes (U1/U6)",
                 FACADE_WRITE,
-                0,
+                // §二.7①: four receiver-form sites, pre-ratchet; frozen.
+                4,
             ),
             (
                 "workspace/plan_review.rs",
                 "facade writes (U1/U6)",
                 FACADE_WRITE,
-                0,
+                // §二.7①: one receiver-form site, pre-ratchet; frozen.
+                1,
             ),
             (
                 "workspace/attach.rs",
@@ -353,6 +363,7 @@ mod tests {
                 "thread_store_global()",
                 "with_mut(|s|",
                 "with_mut(|t|",
+                "with_mut(|thread|",
             ];
             if NEEDLES.iter().any(|n| prod.contains(n)) {
                 offenders.push(rel);

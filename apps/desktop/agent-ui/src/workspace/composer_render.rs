@@ -693,7 +693,7 @@ impl Workspace {
 
     /// The completion popover overlaid above the composer while a trigger token
     /// (`/` or `@`) is active at the caret. Uses [`gpui::anchored`] (the same
-    /// mechanism gpui-component's `Popover` and zed's completion menu use) so the
+    /// mechanism gpui-component's `Popover` uses for its floating menus) so the
     /// popover escapes ancestor `overflow_hidden` clipping and avoids window-edge
     /// overflow — `div().absolute().bottom_full()` inside `deferred` does not
     /// position correctly and gets clipped by the body wrapper's `overflow_hidden`.

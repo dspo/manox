@@ -1,11 +1,12 @@
 //! Context-free session orchestration core.
 //!
 //! Drives gpui-free `ThreadHandle`s through the `AgentServer` protocol gateway
-//! for any host — the napi/vscode shell or the WebUI bridge. The core owns no
-//! global state beyond the shared `agent` handles. `model_chat` is the
-//! stateless bare-model completion channel shared with the VS Code
-//! language-model provider; `translate` projects `ThreadEvent`s onto
-//! `ServerNote`s.
+//! for any host (the gpui desktop in-process, the napi binding, or a WS
+//! client). The core owns no global state beyond the shared `agent` handles.
+//! `model_chat` is the stateless bare-model completion channel (its original
+//! consumer, the VS Code language-model provider, was removed with the
+//! frontends — round 3 §二.10④; the channel stays as the declared dormant
+//! face); `translate` projects `ThreadEvent`s onto wire calls.
 
 pub mod agent_client;
 pub mod agent_server;

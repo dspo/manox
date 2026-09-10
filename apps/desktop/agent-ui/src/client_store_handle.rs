@@ -151,7 +151,8 @@ impl ClientStoreHandle {
             // (`SessionCreated`/`SessionDisposed`/`Error`) normalize into the
             // note path here — the host frames are the authority face, so
             // C4b can retire the wire notes with zero behavior change (the
-            // webui `onHostEvent` pattern; GW1 dual-emit makes the double
+            // former webui onHostEvent pattern (that host is gone — round 3 §二.10④);
+            // GW1 dual-emit makes the double
             // processing idempotent during the window).
             FromServer::Host { host } => {
                 use manox_protocol::stream::HostEvent;
@@ -166,7 +167,7 @@ impl ClientStoreHandle {
                         background_work,
                     } if session_id == self.session_id => {
                         // GW5: a focused session never lights up — the unread
-                        // rise is suppressed client-side (webui parity: its
+                        // rise is suppressed client-side (the deleted webui host did the same: its
                         // mirror gates `unread === true && !active`).
                         let unread = if self.active { None } else { unread };
                         self.store.apply_session_status(
@@ -1124,7 +1125,8 @@ mod tests {
     }
 
     /// C4a: the leaf normalizes the control HOST frames into its note path
-    /// (the webui onHostEvent pattern) — SessionCreated binds the empty
+    /// (the same host-event subscription shape the deleted webui host used) —
+    /// SessionCreated binds the empty
     /// store id and a scoped Error emits ThreadEvent::Error — so C4b can
     /// retire the wire notes with zero leaf-side change. A foreign
     /// session's frames stay silent (the fan-out reaches every leaf).

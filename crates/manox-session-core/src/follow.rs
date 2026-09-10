@@ -363,8 +363,11 @@ async fn forward_entries(
     reason: &Arc<StdMutex<Option<StreamEndReason>>>,
 ) -> StreamEndReason {
     // §D.7 bounded window: the per-stream Entry queue is the feed's
-    // broadcast capacity (the kernel sizes it to exactly
-    // [`manox_protocol::ENTRY_BACKPRESSURE_CAPACITY`]). While a client's
+    // broadcast capacity (the kernel's `JOURNAL_FEED_CAPACITY`, locked
+    // equal to [`manox_protocol::ENTRY_BACKPRESSURE_CAPACITY`] by
+    // `entry_window_capacity_matches_the_protocol_declaration` in the
+    // agent-server tests — layering forbids the kernel from referencing
+    // the protocol constant directly). While a client's
     // outbound channel is saturated the blocking send stalls this
     // forwarding, the feed backlog grows, and the kernel surfaces the
     // overflow as [`JournalFeed::Lagged`] — which maps to
