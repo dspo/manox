@@ -129,7 +129,14 @@ tray-icon = "0.24"
 # X11/Wayland event loop. The `blocking` feature gives the synchronous
 # spawn/update API used from the gpui main thread (the service loop moves to
 # its own thread after registration).
-ksni = { version = "0.3", features = ["blocking"] }
+# `default-features = false` + `async-io`: ksni's default `tokio` feature
+# turns on zbus's `tokio` feature, which makes every zbus connection call
+# `tokio::runtime::Handle::current()` from whichever thread polls it. gpui's
+# event-loop threads are outside our tokio runtime, so XDP/accesskit zbus
+# users panic with "there is no reactor running" (file dialogs on Linux die
+# with the main-thread panic). ksni's `async-io` executor keeps zbus on its
+# runtime-agnostic path, which also fixes ashpd and accesskit_unix.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 # rust-embed — embed SVG icons into the binary at compile time so manox stays a
 # single-binary deliverable; the ExtrasAssetSource overlays custom agent icons
 # (claude/codex/copilot) on top of gpui-component-assets.
