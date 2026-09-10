@@ -123,8 +123,12 @@ pub struct SessionSnapshot {
     pub session_id: String,
     /// Journal header (line 0) of the thread.
     pub header: ThreadHeader,
-    /// Cursor = number of active-chain entries; the snapshot window ends
-    /// exactly at `cursor` (§F.1 rule 1).
+    /// Cursor = seq of the LAST active-chain entry in the window
+    /// (INCLUSIVE — §F.1 rule 1, unified per review round 3 §二.8: the
+    /// engine's `journal_cursor` and the cold read's `window.last().seq`
+    /// mint the same value). An empty journal carries 0 — the u64 domain
+    /// has no `emptyCursor = -1`; consumers distinguish the empty window
+    /// by `records.is_empty()`.
     pub cursor: u64,
     /// Window records, dense seq, oldest first.
     pub records: Vec<JournalWireEntry>,

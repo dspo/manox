@@ -420,6 +420,22 @@ impl<E: JournalEntry + Clone> JournalStream<E> {
         if let Some(head) = accepted.first() {
             self.first_cursor = Some(head.first());
         }
+        // §二.8 invariant: `last_cursor` is None IFF the window is empty.
+        // A prepend that FILLS an empty window makes the page the whole
+        // window — its tail is the window tail, and the resume cursor
+        // follows it. Without this, the next live entry sees a non-empty
+        // window with `last = None`, takes the fresh-journal branch
+        // (first != 0 ⇒ a gap-repair read against a buffer that only the
+        // desktop's page-before-engine ordering happened to pre-fill),
+        // and the shared vector `prepend-into-empty-window-tails-the-page`
+        // reds with "journal ended while reading its replacement page".
+        if self.last_cursor.is_none()
+            && let Some(tail_entry) = accepted.last()
+        {
+            let tail = self.entry_range(tail_entry)?.1;
+            self.last_cursor = Some(tail);
+            self.set_resume_cursor(tail);
+        }
         (self.publish)(JournalChange::Prepend {
             entries: accepted,
             has_more,

@@ -766,7 +766,12 @@ pub fn snapshot_sample() -> SessionSnapshot {
     SessionSnapshot {
         session_id: "s1".into(),
         header: header_sample(),
-        cursor: 1,
+        // Inclusive tail seq (§F.1 rule 1, review round 3 §二.8): the
+        // single record below is seq 0, so the blessed cursor is 0. The
+        // old 1 was the exclusive "entry count" reading — feeding it to
+        // the engine's assertPageThrough is a violation, and a client
+        // implementing from this sample would Resync-loop.
+        cursor: 0,
         records: vec![JournalWireEntry {
             seq: 0,
             id: "e-0".into(),

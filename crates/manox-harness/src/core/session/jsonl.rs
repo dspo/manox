@@ -561,7 +561,18 @@ impl JsonlSessionStorage {
         let leaf_id = self.leaf_id.lock().await.clone();
         match leaf_id {
             None => 0,
-            Some(id) => self.seq_index.lock().await.get(&id).copied().unwrap_or(0),
+            Some(id) => {
+                let seq = self.seq_index.lock().await.get(&id).copied();
+                // A leaf the index does not know is an internal
+                // inconsistency (load builds both together, appends keep
+                // them in step); 0 keeps the old fallback but debug
+                // builds fail loud instead of masking it (round 1 P2-13).
+                debug_assert!(
+                    seq.is_some(),
+                    "journal_cursor: leaf {id} missing from the seq index"
+                );
+                seq.unwrap_or(0)
+            }
         }
     }
 

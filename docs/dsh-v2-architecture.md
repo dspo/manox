@@ -153,9 +153,9 @@ AgentServer 每会话持投影实例组；泵转发条目时 fold；变更 key �
 
 ## F. 客户端 SDK（L3 层）
 
-### F.1 JournalStream 引擎（Rust `crates/manox-protocol/src/journal.rs` + TS `webui .../state/journal.ts`，规则逐条等价）
+### F.1 JournalStream 引擎（Rust `crates/manox-protocol/src/journal_stream.rs`；原 TS 双胞胎 `webui .../state/journal.ts` 已随前端删除——仓库边界裁决,共享向量由 Rust 侧单独执行）
 泛型 `JournalStream<P,E>`（cursor=u64），注入代数：`entries(page)/hasMore/first/last/compare/follows/publish/failed`。规则（dsh journal-stream.ts:296-373 直译）：
-1. 打开：首帧必为 `Snapshot`，校验页内条目互相邻接、页尾=cursor；发布 `Replace{records, projections}`。（**cursor 语义 as-built**：wire `cursor` = 条目计数（dense 0-based ⇒ 排他端）；本规则的「页尾=cursor」指 inclusive 页尾 seq——非空窗口等于最后一条 record 的 seq，空快照保留 wire cursor（emptyCursor case）；两端在快照消费点显式换算。）
+1. 打开：首帧必为 `Snapshot`，校验页内条目互相邻接、页尾=cursor；发布 `Replace{records, projections}`。（**cursor 语义统一,review round 3 §二.8**：wire `cursor` = 活链尾条目的 inclusive seq——非空窗口 = 最后一条 record 的 seq;空 journal = 0（u64 域无 dsh 的 `-1` emptyCursor,消费方以 `records.is_empty()` 判空窗）。生产两端（engine `journal_cursor`、冷读 `window.last().seq`）、blessed 样本、fixtures、共享向量全部同形,无换算点。）
 2. Entry：`last<=已见` 丢弃（幂等）；部分重叠=协议违规（报 failed）；`follows` 不成立=缺口 → `PageHistory(through=缺口尾)` 补齐 + 期间到达条目按 seq 归并 + 整体 `Replace` 发布；补页尾仍不达=违规。
 3. 重开（连接换代）：`restart()` → 重新 follow → 新 Snapshot cursor 必须 ≥ lastCursor，否则违规；保留旧窗口直到新快照落地（无感重连）。
 4. `prepend(page)`：历史翻页，不连续=违规。
@@ -223,7 +223,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 - 门禁：J.1 全绿 + 覆盖 harness 绿+ 文档注释完整（每个 public 类型一句话语义 + 所属声明面）。
 
 **T3 JournalStream 双引擎（packet 现文）**
-- 范围：Rust `crates/manox-protocol/src/journal.rs`（泛型引擎 + 规则 F.1 全条 + `proptest` 属性测试：模型=随机事件序列+随机丢/重排/重连，断言 publish 流收敛等价理想 fold）；TS `apps/web/webui/src/sidebar/webview/state/journal.ts`（同规则）+ vitest（含消费 T2 fixtures 的帧级用例）。引擎不 import 会话领域类型（纯代数）。
+- 范围：Rust `crates/manox-protocol/src/journal_stream.rs`（泛型引擎 + 规则 F.1 全条 + `proptest` 属性测试：模型=随机事件序列+随机丢/重排/重连，断言 publish 流收敛等价理想 fold）；原 TS 双胞胎（webui `state/journal.ts` + vitest 帧级用例）已随前端删除——仓库边界裁决,共享向量与 fixtures 为 Rust 侧执行的契约面。引擎不 import 会话领域类型（纯代数）。
 - 门禁：J.1（Rust 侧）+ webui vitest 绿 + 双实现共用同一组 JSON 测试向量（`test-vectors/journal-cases.json` 双端加载，等价性硬保证）。
 
 **T1 journal 内核（主 agent 亲做，规格）**

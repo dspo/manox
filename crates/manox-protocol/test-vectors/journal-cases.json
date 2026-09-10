@@ -169,5 +169,33 @@
     ],
     "expectedPublish": [],
     "expectedFail": "journal entry has an inverted cursor range"
+  },
+  {
+    "name": "empty-open-then-live-head-appends",
+    "events": [
+      { "kind": "opened", "cursor": 0, "entries": [] },
+      { "kind": "entry", "seq": 0 },
+      { "kind": "entry", "seq": 1 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [], "hasMore": false },
+      { "type": "append", "seq": 0 },
+      { "type": "append", "seq": 1 }
+    ],
+    "expectedCursors": { "first": 0, "last": 1, "resume": 1 }
+  },
+  {
+    "name": "prepend-into-empty-window-tails-the-page",
+    "events": [
+      { "kind": "opened", "cursor": 0, "entries": [] },
+      { "kind": "prepend", "entries": [0, 1], "hasMore": false },
+      { "kind": "entry", "seq": 2 }
+    ],
+    "expectedPublish": [
+      { "type": "replace", "entries": [], "hasMore": false },
+      { "type": "prepend", "entries": [0, 1], "hasMore": false },
+      { "type": "append", "seq": 2 }
+    ],
+    "expectedCursors": { "first": 0, "last": 2, "resume": 2 }
   }
 ]
