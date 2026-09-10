@@ -7166,3 +7166,83 @@ fn page_history_cold_read_answers_corruption_loudly() {
         other => panic!("expected an error response (never a silent empty page), got {other:?}"),
     }
 }
+
+/// §二.3: the cold-open upgrade poll has a DEADLINE — a thread whose
+/// engine seam never answers ends the stream with a loud Failure instead
+/// of polling forever (pre-fix every such stream parked a task
+/// indefinitely, and the client could not distinguish "no journal yet"
+/// from "journal empty"). The dead-engine + seeded-chain setup is the
+/// `follow_stream_cold_opens_and_upgrades_on_materialization` idiom minus
+/// the materialization: nothing ever upgrades, so only the deadline ends
+/// the stream.
+#[test]
+fn follow_upgrade_poll_ends_at_the_deadline() {
+    let _g = lock_globals();
+    hermetic_home();
+    let sessions = manox_agent::paths::manox_config_dir()
+        .expect("config dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    init_globals();
+    manox_agent::thread_store::init();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "gw6-dl-1");
+    let (dead, dead_events) = FakeEngine::new();
+    dead.set_journal_unavailable();
+    server.set_session_engine_for_test("gw6-dl-1", dead, dead_events);
+    let path = seed_v4_chain(&sessions, "gw6-dl-1");
+    manox_agent::thread_store::global().with_mut(|s| s.note_session_path("gw6-dl-1", &path));
+
+    // Shrink the deadline; the Drop guard restores the default even if an
+    // assert below panics (a leaked small deadline would flake the
+    // in-place-upgrade test).
+    struct DeadlineGuard;
+    impl Drop for DeadlineGuard {
+        fn drop(&mut self) {
+            crate::follow::set_upgrade_deadline_for_test(120_000);
+        }
+    }
+    let _deadline_guard = DeadlineGuard;
+    crate::follow::set_upgrade_deadline_for_test(300);
+
+    client.send(FromClient::StreamOpen {
+        stream_id: StreamId::new("gw6-dl-st"),
+        stream_kind: StreamKind::FollowSession {
+            session_id: "gw6-dl-1".into(),
+            max_messages: None,
+        },
+    });
+    // The cold snapshot arrives first; the stream then ENDS with Failure
+    // at the deadline (nothing ever materializes).
+    let mut saw_snapshot = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stream never ended at the deadline"
+        );
+        match client.recv() {
+            FromServer::StreamItem { stream_id, frame } if stream_id.0 == "gw6-dl-st" => {
+                assert!(
+                    matches!(frame, manox_protocol::stream::StreamFrame::Snapshot(_)),
+                    "the cold snapshot is the only item frame, got {frame:?}"
+                );
+                saw_snapshot = true;
+            }
+            FromServer::StreamEnd {
+                stream_id, reason, ..
+            } if stream_id.0 == "gw6-dl-st" => {
+                assert!(
+                    saw_snapshot,
+                    "the cold snapshot precedes the deadline terminal"
+                );
+                assert!(
+                    matches!(reason, manox_protocol::StreamEndReason::Failure { .. }),
+                    "the deadline ends the stream with Failure, got {reason:?}"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+}

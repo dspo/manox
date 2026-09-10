@@ -77,6 +77,11 @@ pub struct ClientStoreHandle {
     /// it. Driven by [`Self::set_active`] (the multiplexer owns the
     /// transitions); activation also runs the focus clear.
     active: bool,
+    /// §二.3: consecutive Failure/Resync reopens since the last good
+    /// snapshot. Budgeted with an exponential backoff; past the cap the
+    /// leaf stops reopening (the view keeps its last window) instead of
+    /// spinning forever against a stream that keeps failing.
+    reopen_attempts: u32,
 }
 
 impl EventEmitter<ThreadEvent> for ClientStoreHandle {}
@@ -104,6 +109,7 @@ impl ClientStoreHandle {
             materialized_notified: false,
             info_debounce: None,
             active: false,
+            reopen_attempts: 0,
         }
     }
 
@@ -217,6 +223,8 @@ impl ClientStoreHandle {
                 if snap.session_id != self.session_id {
                     return;
                 }
+                // A good snapshot lands: the reopen budget resets (§二.3).
+                self.reopen_attempts = 0;
                 let outs = self.fold.snapshot(snap.cursor, snap.records.clone());
                 // The snapshot's full projection baseline (§D.1) seeds the
                 // P-face; merge it before folding so materialized fields are
@@ -477,16 +485,57 @@ impl ClientStoreHandle {
         }
     }
 
+    /// §二.3: the reopen budget policy — exponential backoff (500ms, 1s,
+    /// 2s, 4s, 8s), `None` past the cap (terminal: stop reopening, the
+    /// view keeps its last window). Pure so the policy is testable
+    /// without the gpui timer plumbing.
+    fn reopen_backoff(attempt: u32) -> Option<std::time::Duration> {
+        const CAP: u32 = 5;
+        if attempt == 0 || attempt > CAP {
+            return None;
+        }
+        Some(std::time::Duration::from_millis(500 << (attempt - 1)))
+    }
+
     fn request_reopen(&mut self, cx: &mut Context<Self>) {
+        self.reopen_attempts += 1;
+        let Some(delay) = Self::reopen_backoff(self.reopen_attempts) else {
+            // Terminal: a stream that keeps failing (corrupt journal, an
+            // engine that never materializes past the server-side
+            // deadline) must not spin reopens forever. The fold keeps the
+            // last good window; a manual thread switch builds a fresh
+            // leaf and retries from zero.
+            tracing::error!(
+                session = %self.session_id,
+                attempts = self.reopen_attempts,
+                "follow-stream reopen budget exhausted; the view stays on its last window"
+            );
+            cx.notify();
+            return;
+        };
         self.fold.generation();
         let Some(outbound) = self.outbound.clone() else {
             return;
         };
         let stream_id = StreamId::new(uuid::Uuid::new_v4().to_string());
-        let _ = outbound.try_send(LeafRequest::Reopen {
-            session_id: self.session_id.clone(),
-            stream_id,
-        });
+        let session_id = self.session_id.clone();
+        if delay.is_zero() {
+            let _ = outbound.try_send(LeafRequest::Reopen {
+                session_id,
+                stream_id,
+            });
+        } else {
+            // Backoff on the background executor (the info_debounce
+            // pattern); the reopen send needs no entity handle.
+            cx.spawn(async move |_this, cx: &mut gpui::AsyncApp| {
+                cx.background_executor().timer(delay).await;
+                let _ = outbound.try_send(LeafRequest::Reopen {
+                    session_id,
+                    stream_id,
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -571,6 +620,23 @@ fn plan_file_of(call: &manox_protocol::ServerCall) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// §二.3: the reopen budget — exponential backoff, terminal past the
+    /// cap. The pre-fix reopen was immediate and unbounded: a stream that
+    /// kept failing (corrupt journal, an engine that never materialized)
+    /// spun reopens forever with no backoff.
+    #[test]
+    fn reopen_backoff_is_bounded_and_terminal() {
+        let d = ClientStoreHandle::reopen_backoff;
+        assert_eq!(d(1), Some(std::time::Duration::from_millis(500)));
+        assert_eq!(d(2), Some(std::time::Duration::from_millis(1000)));
+        assert_eq!(d(3), Some(std::time::Duration::from_millis(2000)));
+        assert_eq!(d(4), Some(std::time::Duration::from_millis(4000)));
+        assert_eq!(d(5), Some(std::time::Duration::from_millis(8000)));
+        assert_eq!(d(6), None, "past the cap: terminal, no more reopens");
+        assert_eq!(d(0), None, "attempt 0 is not a reopen");
+    }
+
     use super::*;
     use gpui::{AppContext as _, Entity, TestAppContext};
     use manox_protocol::{

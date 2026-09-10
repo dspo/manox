@@ -21,6 +21,7 @@
 //! snapshot carries `projections: {}` and `StreamFrame::Projections` delta
 //! frames are only produced by T5's pump.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use manox_agent::engine::JournalFeed;
@@ -121,6 +122,22 @@ fn requested_reason(reason: &Arc<StdMutex<Option<StreamEndReason>>>) -> Option<S
     reason.lock().unwrap().clone()
 }
 
+/// §二.3: the cold-open upgrade poll is bounded. The pre-fix loop retried
+/// every 100ms FOREVER (one parked task per stream of a thread whose engine
+/// never materializes — a landing session nobody ever submits to), and the
+/// client could not distinguish "no journal yet" from "journal empty". At
+/// the deadline the stream ends with a loud `Failure`; the client's budgeted
+/// reopen (§二.3's desktop half) re-reads the cold snapshot and retries the
+/// upgrade, and past ITS cap the view stays on the last window instead of
+/// spinning. Default 120s; the test hook shrinks it.
+static UPGRADE_DEADLINE_MS: AtomicU64 = AtomicU64::new(120_000);
+
+/// Test hook: shrink the upgrade deadline (120s is untestable).
+#[cfg(test)]
+pub fn set_upgrade_deadline_for_test(ms: u64) {
+    UPGRADE_DEADLINE_MS.store(ms, Ordering::Relaxed);
+}
+
 async fn run_follow_stream(
     conn: Arc<dyn RpcConnection>,
     stream_id: StreamId,
@@ -182,10 +199,28 @@ async fn run_follow_stream(
         // forward from the live feed. The wait is a cheap server-side
         // poll: the client never spin-reopens against a thread that may
         // stay unmaterialized indefinitely.
+        let deadline_ms = UPGRADE_DEADLINE_MS.load(Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
         loop {
             if cancel.is_cancelled() {
                 let end = requested_reason(&reason).unwrap_or(StreamEndReason::Closed);
                 return finish(&conn, &stream_id, end);
+            }
+            if std::time::Instant::now() >= deadline {
+                // §二.3 terminal: the engine never materialized within the
+                // budget. A loud Failure (never an infinite poll): the cold
+                // snapshot already delivered stays the client's view, and
+                // its reopen is budgeted.
+                return finish(
+                    &conn,
+                    &stream_id,
+                    StreamEndReason::Failure {
+                        code: manox_protocol::msg::CODE_GATEWAY_INTERNAL.to_string(),
+                        message: format!(
+                            "session engine did not materialize within {deadline_ms}ms;                              the cold snapshot stays available on reopen"
+                        ),
+                    },
+                );
             }
             // Subscribe BEFORE the live read (the open's atomicity order):
             // the upgraded snapshot and its feed are consistent, and the
