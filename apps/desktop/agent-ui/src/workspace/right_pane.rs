@@ -414,14 +414,19 @@ impl Workspace {
         }
         self.close_launcher_menu();
         let cwd = self.launcher_thread_cwd(cx);
+        // The menu-build closure below runs EAGERLY inside the click
+        // handler's Workspace update lease (launcher_pick is still on
+        // the stack), so the models are read here, up front — reading
+        // the Workspace entity from inside the closure double-leases it
+        // and aborts the app (the launcher twin of the sidebar's
+        // acceptance-run crash; every CLI-agent row click was a hard
+        // crash until this hoist). The multiplexer is a separate entity,
+        // so this read is lease-clean.
+        let models: Vec<manox_protocol::ModelInfo> = self.multiplexer.read(cx).models().to_vec();
         let ws = cx.entity().downgrade();
         let menu = PopupMenu::build(window, cx, move |menu, window, cx| {
             // U2 cross-domain #4: the cascade projects the multiplexer's
             // wire models (the provider_glue direct read retired).
-            let models: Vec<manox_protocol::ModelInfo> = ws
-                .upgrade()
-                .map(|ws| ws.read(cx).multiplexer.read(cx).models().to_vec())
-                .unwrap_or_default();
             crate::views::model_cascade::build_model_cascade(
                 menu,
                 kind.agent_id(),

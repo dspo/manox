@@ -2263,3 +2263,73 @@ fn rail_store_rebinds_on_thread_attach(cx: &mut gpui::TestAppContext) {
     );
     let _ = std::fs::remove_file(&db_path);
 }
+
+/// The launcher cascade regression (2026-09-10 abort): clicking a
+/// CLI-agent row runs `launcher_pick` inside the click handler's
+/// `ws.update` lease, and `open_launcher_cascade`'s `PopupMenu::build`
+/// closure used to read the Workspace entity from inside that lease.
+/// gpui's double-lease panic cannot unwind past `handle_view_event`
+/// (`extern "C"`), so the app aborted on the spot — every click of a
+/// Claude Code / Codex / Copilot launcher row was a hard crash. The
+/// sidebar twin of this bug pinned its fix the same way
+/// (`new_session_menu_builds_inside_sidebar_update`): the models are
+/// read BEFORE the eager build, so opening the cascade inside an
+/// update must build cleanly.
+#[gpui::test]
+fn launcher_cascade_builds_inside_workspace_update(cx: &mut gpui::TestAppContext) {
+    use super::{LauncherPick, RightTab};
+    use gpui::AppContext as _;
+
+    let _g = GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _store = store_test_guard();
+    cx.update(gpui_component::init);
+    let db_path =
+        std::env::temp_dir().join(format!("manox-launcher-cascade-test-{}.db", uuid_like_id()));
+    let db = std::sync::Arc::new(
+        manox_agent::db::ThreadsDatabase::open(&db_path).expect("open temp threads db"),
+    );
+    cx.update(|_cx| {
+        manox_agent::runtime::init();
+        manox_agent::provider_glue::init();
+        manox_agent::thread_store::init_for_test(db.clone());
+    });
+
+    let captured: std::rc::Rc<std::cell::RefCell<Option<gpui::Entity<Workspace>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = captured.clone();
+    let window = cx.open_window(
+        gpui::size(gpui::px(960.), gpui::px(640.)),
+        move |window, cx| {
+            let workspace = cx.new(|cx| Workspace::new(window, cx));
+            *slot.borrow_mut() = Some(workspace.clone());
+            gpui_component::Root::new(workspace, window, cx)
+        },
+    );
+    cx.run_until_parked();
+    let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+    let ws = captured.borrow().clone().expect("workspace captured");
+
+    visual.update(|window, cx| {
+        ws.update(cx, |ws, cx| {
+            ws.right_tabs = vec![RightTab::Launcher];
+            ws.active_right_tab = 0;
+            // The crash shape: the very lease the launcher's on_pick
+            // click handler holds when it routes into the cascade.
+            ws.launcher_pick(
+                LauncherPick::Agent(crate::external_session::SessionKind::ClaudeCode),
+                0,
+                window,
+                cx,
+            );
+            assert!(
+                ws.launcher_menu.is_some(),
+                "the cascade menu must be built (not crashed)"
+            );
+            assert_eq!(
+                ws.launcher_menu_kind,
+                Some(crate::external_session::SessionKind::ClaudeCode)
+            );
+        });
+    });
+    let _ = std::fs::remove_file(&db_path);
+}
