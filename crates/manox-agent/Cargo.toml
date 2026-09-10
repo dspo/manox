@@ -46,7 +46,6 @@ xxhash-rust.workspace = true
 similar.workspace = true
 base64.workspace = true
 image.workspace = true
-rquickjs.workspace = true
 
 rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 supervisor.workspace = true
@@ -67,9 +66,6 @@ html2text = "0.17.1"
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
 # `chrome-use` keeps the chrome_use module and its live tests in the suite.
 manox-agent = { path = ".", features = ["test-support", "chrome-use"] }
-# Integration tests (`tests/`) use `gpui::TestAppContext` for the facade
-# layer; the library crate itself is gpui-free.
-gpui = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 
 [lints.clippy]

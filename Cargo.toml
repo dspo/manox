@@ -1,37 +1,32 @@
-# manox —— 进程内 native agent 工作台。
+# manox —— 自研 agent runtime 库仓（gpui-free）。
 #
-# workspace 根。三 crate：
-#   - agent:     agent 逻辑核心（Thread + LanguageModel + tools + db，gpui-native，不依赖 gpui-component）
-#   - agent-ui:  UI 层（Workspace + ConversationState + views，gpui + gpui-component）
-#   - manox:     薄 bin（窗口 + 主题 + 接线）
+# workspace 根。核心 crate（对外以 git 依赖形式提供给 host，如 dspo/manox-app）：
+#   - manox-harness:      agent 内核（pi 核心的 Rust 移植：agent loop、providers、
+#                         sessions、tools + ext 扩展）
+#   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
+#                         + MCP/LSP 接线）
+#   - manox-session-core: 无上下文会话编排（AgentServer/AgentClient 协议网关、
+#                         journal 查询、projections、waterfall、ws 网关）
+#   - manox-protocol:     传输无关双向 RPC + journal/protocol v2 词汇
+#   - manox-napi:         napi-rs 绑定（dormant，为未来 TS host 保留）
+#   - manox-providers:    ~/.manox/cx.providers.config.yaml 解析的单一事实来源
+#   - supervisor / lsp:   进程总线与 LSP 客户端（manox-agent 的基础设施）
 #
 # LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
-# cx / manox-providers —— 外部 agent CLI 启动器与 provider 配置解析，原为
-# github.com/dspo/cx 独立仓库，已并入本仓库树内维护（crates/cx、crates/manox-providers）。
-#
-# gpui 相关依赖严格对齐 gpui-component 锁定的 rev，保证 gpui 单一版本。
+# gpui 桌面应用、cx 启动器（ext-agents/terminal/hyperlinks）在独立仓库
+# dspo/manox-app 维护；拆分点为 tag pre-manox-app-split。
 [workspace]
 members = [
-	    "crates/manox-agent",
-	    "apps/desktop/agent-ui",
-	    "apps/desktop/manox",
-	    "crates/manox-harness",
-	    "crates/manox-terminal",
-	    "apps/desktop/terminal-ui",
-	    "apps/desktop/manox-components",
-	    "crates/supervisor",
-	    "crates/lsp",
-	    "apps/desktop/manox-webview",
-	    "apps/desktop/manox-webview-macros",
-	    "crates/cx",
-	    "crates/manox-providers",
-	    "crates/manox-session-core",
-	    "crates/manox-napi",
-	    "crates/manox-protocol",
-	    "crates/hyperlinks",
-	    "crates/manox-ext-agents",
-	]
+	"crates/manox-agent",
+	"crates/manox-harness",
+	"crates/supervisor",
+	"crates/lsp",
+	"crates/manox-providers",
+	"crates/manox-session-core",
+	"crates/manox-napi",
+	"crates/manox-protocol",
+]
 resolver = "2"
 
 [workspace.package]
@@ -43,31 +38,19 @@ publish = false
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
 manox-agent = { path = "crates/manox-agent" }
-agent-ui = { path = "apps/desktop/agent-ui" }
-manox = { path = "apps/desktop/manox" }
-manox-terminal = { path = "crates/manox-terminal" }
-terminal-ui = { path = "apps/desktop/terminal-ui" }
-manox-components = { path = "apps/desktop/manox-components" }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
-manox-webview = { path = "apps/desktop/manox-webview" }
-manox-webview-macros = { path = "apps/desktop/manox-webview-macros" }
-		manox-session-core = { path = "crates/manox-session-core" }
+manox-session-core = { path = "crates/manox-session-core" }
 manox-protocol = { path = "crates/manox-protocol" }
 manox-harness = { path = "crates/manox-harness" }
-hyperlinks = { path = "crates/hyperlinks" }
-	manox-ext-agents = { path = "crates/manox-ext-agents" }
-# cx —— 外部 agent CLI（claude/codex/copilot）启动器 + library；SessionHandle 暴露 PTY
-# 操作，manox 经 CxSessionSource 驱动 CLI TUI 渲染到 Terminal。manox-providers 为 provider
-# 配置解析的单一事实来源。两者原为 github.com/dspo/cx 独立仓库，已并入本仓库树内维护。
-cx = { path = "crates/cx" }
+# manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
+# 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
 manox-providers = { path = "crates/manox-providers" }
 
 anyhow = "1"
 async-channel = "2"
-futures-lite = "2"
-axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"
@@ -93,58 +76,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 regex = "1"
-# markdown-rs (mdast) — markdown 解析。经 gpui-component 已在 Cargo.lock,workspace 声明复用同一版本。
-markdown = "1"
-# ropey — SyntaxHighlighter::update 接收 &Rope;版本对齐 gpui-component 在 Cargo.lock 锁定的 2.0.0-beta.1。
-ropey = "2.0.0-beta.1"
-# vte — ANSI escape parser (alacritty/wezterm 的同款,仅解析器)。TerminalPanel 用其 Handler trait 解析工具输出着色。
-vte = { version = "0.13", default-features = false, features = ["ansi"] }
-# httparse — HTTP request/response parser for the in-process sandbox network proxy.
-# The proxy reads the first request line+headers off each client connection to
-# decide CONNECT vs HTTP forward and extract the destination host.
-httparse = "1"
-# idna — RFC 1035 / 3492 hostname canonicalization (Punycode) for the network
-# allowlist. Internationalized domain names entered as UTF-8 are converted to
-# the A-label form that TLS SNI and HTTP Host headers carry on the wire.
-idna = "1"
-# thiserror — derive Error (used by the now-removed http_proxy crate; kept
-# for any remaining thiserror usage in the workspace).
 thiserror = "1"
-# url — URL parsing. reqwest already pulls url in transitively; kept here
-# for crates that need a direct dependency.
-url = "2"
-# log — facade. The now-removed http_proxy crate used the simpler `log` facade
-# rather than `tracing`; kept for any remaining log usage.
-log = "0.4"
 base64 = "0.22"
 # image —— clipboard image resize + PNG re-encode before sending to the provider
 # (Anthropic long-edge cap 1568px / 5MB). CPU-bound work runs on the background executor.
 image = "0.25"
-# tray-icon —— macOS / Windows system tray (status item + menu). The tray keeps
-# manox reachable after the main window closes; menu events are drained by a
-# foreground polling task since gpui exposes no cross-thread wake primitive.
-tray-icon = "0.24"
-# ksni —— Linux system tray via the freedesktop StatusNotifierItem D-Bus spec.
-# Pure Rust (zbus), no GTK main loop required, so it coexists with gpui's own
-# X11/Wayland event loop. The `blocking` feature gives the synchronous
-# spawn/update API used from the gpui main thread (the service loop moves to
-# its own thread after registration).
-# `default-features = false` + `async-io`: ksni's default `tokio` feature
-# turns on zbus's `tokio` feature, which makes every zbus connection call
-# `tokio::runtime::Handle::current()` from whichever thread polls it. gpui's
-# event-loop threads are outside our tokio runtime, so XDP/accesskit zbus
-# users panic with "there is no reactor running" (file dialogs on Linux die
-# with the main-thread panic). ksni's `async-io` executor keeps zbus on its
-# runtime-agnostic path, which also fixes ashpd and accesskit_unix.
-ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
-# rust-embed — embed SVG icons into the binary at compile time so manox stays a
-# single-binary deliverable; the ExtrasAssetSource overlays custom agent icons
-# (claude/codex/copilot) on top of gpui-component-assets.
-rust-embed = "8"
-# Restricted JavaScript isolate for the optional hybrid Code orchestration tool.
-rquickjs = { version = "0.12.1", features = ["futures", "macro"] }
-
-tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
 
 rmcp = { version = "1.8", default-features = false }
 # lsp-types —— LSP protocol types (InitializeParams, Location, Hover, ...). The
@@ -153,28 +89,6 @@ rmcp = { version = "1.8", default-features = false }
 lsp-types = "0.97"
 toml = "0.8"
 http = "1"
-# sysinfo — process-tree enumeration for terminal teardown (descendant kill)
-# and the foreground-process indicator.
-sysinfo = "0.39"
-
-# wry stack — native webview embedded as a child of a gpui window. raw-window-handle
-# is already pulled transitively by gpui (0.6.x); pinned here so the webview crate
-# resolves the same major as the gpui WindowHandle it parents to.
-wry = "0.53"
-raw-window-handle = { version = "0.6", features = ["std"] }
-
-# webview crate extras — Tauri-style IPC layer + plugins ported from manos.
-# serialize-to-javascript embeds the Tauri IPC bundle + init scripts as
-# `&[u8]` JS literals; async-task backs the PlatformDispatcher main-thread
-# marshal; the rest are plugin backends (clipboard/dialog/opener) the
-# Trusted-mode webview can invoke.
-serialize-to-javascript = "0.1.2"
-mime_guess = "2.0"
-pollster = "0.4"
-async-task = "4.7.1"
-rfd = "0.15"
-arboard = "3"
-open = "5"
 
 # rustwright-core — ChromeUse's in-process Chromium CDP engine (Rust rewrite
 # of Playwright's automation core; no driver subprocess, fits the
@@ -182,42 +96,19 @@ open = "5"
 # feature (PyO3). The dep key carries the crate's Rust identifier: its lib
 # target is `_rustwright` (the PyO3 module name), so `rustwright-core` would
 # be unusable as a path prefix. Alpha crate: pinned by rev, upgraded
-# deliberately (same discipline as the gpui stack); switch back to the
-# crates.io index version once a release catches up with main.
+# deliberately; switch back to the crates.io index version once a release
+# catches up with main.
 rustwright_core = { package = "rustwright-core", git = "https://github.com/Skyvern-AI/rustwright.git", rev = "af71449ea25ad45b1028581edefab1f523f9550d", default-features = false }
 
-# i18n —— fluent + BCP47 LanguageIdentifier。仅 UI chrome 走 t!()；模型面向字符串一律英文，不经此栈。
+# i18n —— fluent + BCP47 LanguageIdentifier。agent 自身的 locales/*.ftl 模型
+# 面向字符串一律英文，不经此栈；此处仅供 host 侧 chrome 文案复用同一版本。
 fluent = "0.17"
 unic-langid = "0.9"
 
 # tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"
-unicode-linebreak = "0.1.5"
 
-# GPUI 栈 —— git 仓库地址（规则允许）。gpui-component 锁定 zed rev 1d217ee，三者必须一致。
-gpui = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "1d217ee39d381ac101b7cf49d3d22451ac1093fe", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-
-# gpui-component（longbridge）
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1", features = ["tree-sitter-languages"] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "1505b1487131adbb443f6c69e87847db35bfa2d1" }
-
-# Terminal emulator stack. alacritty_terminal provides the Term/Grid/Selection
-# data-structure layer (its own EventLoop/mio/tty are unused — manox drives the
-# PTY via portable-pty and feeds bytes to `Processor::advance(&mut term, ..)`
-# since `Term` itself implements `vte::ansi::Handler`). vte is not declared
-# separately; it is re-exported by alacritty_terminal, keeping a single version.
-alacritty_terminal = "0.24"
-portable-pty = "0.9"
 parking_lot = "0.12"
 
-# psm 用 stacker 的版本（对齐 gpui-component）
-[patch.crates-io]
-psm = { git = "https://github.com/rust-lang/stacker", branch = "master" }
-
-# gpui 在 debug 下也需要 opt-level 3，否则渲染极慢（对齐 gpui-component）
-[profile.dev.package]
-gpui = { opt-level = 3 }
-gpui_platform = { opt-level = 3 }
-
+tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
