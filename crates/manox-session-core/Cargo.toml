@@ -39,3 +39,6 @@ async-channel.workspace = true
 anyhow.workspace = true
 manox-agent = { workspace = true, features = ["test-support"] }
 async-channel = { workspace = true }
+# W7: the WS e2e test's client leg (same version axum's ws feature already
+# pulls into the graph — no new resolution).
+tokio-tungstenite.workspace = true
