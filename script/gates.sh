@@ -57,14 +57,14 @@ run_leg "fmt" cargo fmt --all -- --check
 # lesson: the local --all-targets unification can mask it).
 run_leg "prod-libs" cargo check \
     -p manox-agent -p manox-session-core -p manox-protocol \
-    -p manox-harness -p manox-napi -p cx --lib
+    -p manox-harness -p manox-napi --lib
 run_leg "clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_leg "test-real" cargo test --workspace --all-targets --no-fail-fast
 
 if [[ "$QUICK" -eq 0 ]]; then
     # SHORT path on purpose: macOS unix-socket binds cap at 104 chars, and
-    # `mktemp -d` under /var/folders/... pushes the ext-agents session
-    # socket (`<home>/.manox/sessions/<32-hex>.sock`) over the limit — a
+    # `mktemp -d` under /var/folders/... pushes the session socket
+    # (`<home>/.manox/sessions/<32-hex>.sock`) over the limit — a
     # platform artifact, not a hermeticity signal. /tmp keeps every
     # derived path short (CI's /home/runner is short for the same reason).
     CLEAN_HOME="/tmp/manox-gates-home-$$"
