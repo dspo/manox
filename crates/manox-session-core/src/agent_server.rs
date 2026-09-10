@@ -65,7 +65,10 @@ struct ServerSession {
     /// never re-enters the select.
     pump: tokio::task::JoinHandle<()>,
     turn_active: Arc<AtomicBool>,
-    pending_submits: Arc<StdMutex<Vec<QueuedSubmit>>>,
+    // parking_lot (round 4 §3.2): a panic inside a lock holder must not
+    // poison the queue into a permanent cascade — the std .unwrap() locks
+    // turned one panic into every subsequent submit/steer/drain panicking.
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
 }
 
 impl ServerSession {
@@ -1288,7 +1291,7 @@ async fn open_session(
         // write is gone — unread is client-owned (clients clear their
         // badge locally on focus); the server keeps no read-state.
         let turn_active = Arc::new(AtomicBool::new(false));
-        let pending_submits = Arc::new(StdMutex::new(Vec::new()));
+        let pending_submits = Arc::new(Mutex::new(Vec::new()));
         let pump_cancel = tokio_util::sync::CancellationToken::new();
         let pump = spawn_pump(
             Arc::clone(inner),
@@ -1703,7 +1706,7 @@ impl AgentServerInner {
             }
         });
         let turn_active = Arc::new(AtomicBool::new(false));
-        let pending_submits = Arc::new(StdMutex::new(Vec::new()));
+        let pending_submits = Arc::new(Mutex::new(Vec::new()));
         let pump_cancel = tokio_util::sync::CancellationToken::new();
         let pump = spawn_pump(
             Arc::clone(inner),
@@ -1907,7 +1910,7 @@ impl AgentServerInner {
                 approval_mode: Some(t.permission_mode().as_i64()),
                 ..Default::default()
             });
-            pending_submits.lock().unwrap().push(QueuedSubmit {
+            pending_submits.lock().push(QueuedSubmit {
                 client_id,
                 text,
                 images,
@@ -2062,10 +2065,7 @@ impl AgentServerInner {
         };
         // A steer removes its own parked follow-up so the turn-end drain does
         // not resend the same text as a plain follow-up.
-        pending_submits
-            .lock()
-            .unwrap()
-            .retain(|q| q.client_id != message_id);
+        pending_submits.lock().retain(|q| q.client_id != message_id);
         thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -2093,7 +2093,7 @@ impl AgentServerInner {
     fn drop_queued(&self, session_id: &str, client_id: String) {
         if let Some(session) = self.sessions.lock().get(session_id) {
             let pending = session.pending_submits.clone();
-            pending.lock().unwrap().retain(|q| q.client_id != client_id);
+            pending.lock().retain(|q| q.client_id != client_id);
         }
     }
 
@@ -2368,9 +2368,12 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         let clients = inner.clients.lock();
         owners
             .iter()
-            .filter(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
+            // One lookup carries both the eligibility filter and the entry
+            // (round 4 §3.4): the old filter + `expect("just checked")` pair
+            // indexed the map twice and panicked the moment the two views
+            // disagreed.
             .filter_map(|cid| {
-                let entry = clients.get(cid).expect("just checked");
+                let entry = clients.get(cid).filter(|e| e.hello.can(kind))?;
                 // Deterministic MsgId per kind so a client without bridge
                 // state can correlate its Reply: Approve/AskUser echo the
                 // auth_id the card carries; PlanVerdict uses the session id
@@ -2901,9 +2904,10 @@ async fn route_capability_call(
         let clients = inner.clients.lock();
         owners
             .iter()
-            .find(|cid| clients.get(*cid).is_some_and(|e| e.hello.can(kind)))
-            .and_then(|cid| {
-                let entry = clients.get(cid).expect("just checked");
+            // Same single-lookup shape as the fan-out site above (§3.4).
+            .filter_map(|cid| Some((cid, clients.get(cid).filter(|e| e.hello.can(kind))?)))
+            .next()
+            .and_then(|(cid, entry)| {
                 // GW2: a fresh `call-N` id cannot collide unless a previous
                 // waiter for it is still registered; refuse the delivery
                 // fail-closed rather than clobbering the earlier waiter.
@@ -3010,7 +3014,7 @@ fn spawn_pump(
     session_id: String,
     thread: ThreadHandle,
     turn_active: Arc<AtomicBool>,
-    pending_submits: Arc<StdMutex<Vec<QueuedSubmit>>>,
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     // Subscribe synchronously so the receiver is registered before any
@@ -3089,11 +3093,7 @@ fn spawn_pump(
                         f.unread = Some(true);
                     }));
                     if !*cancelled {
-                        let drained = pending_submits
-                            .lock()
-                            .unwrap()
-                            .drain(..)
-                            .collect::<Vec<_>>();
+                        let drained = pending_submits.lock().drain(..).collect::<Vec<_>>();
                         let drained_any = !drained.is_empty();
                         let mut batch_origin: Option<String> = None;
                         if drained_any {

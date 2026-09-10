@@ -328,6 +328,7 @@ loopback+token 沿用；credentials 永不下发浏览器（keychain/env/literal
 | §三.1 死面清单（round 3 复核）：~~Translated::Note + pump 臂~~ **已删（W6，b6e9989c）**；余项：`Waterfall::expire`/`cancelled_recipients`（waterfall.rs，零调用方）、`v2_backpressure_policy`（stream.rs，占位零调用，与 §二.1 出站上界同批定夺）、`_kind_marker`（journal_translate.rs:530，保 `UiNoteKind` 存活的死标记）、`store.echo`（client_store.rs:102，§F.2 echo/retire 面——originRpc 退休收口后可清）、ModelChat 侧流 / `Terminal*` 占位臂 / manox-napi（休眠保留裁决，CLAUDE.md 已记） | 认可债务 | C4b 大宗批 |
 | P0-2 余项（round 3）：测试 hermetic 化已堵代理环境泄漏面；生产 no_proxy 配置项属 settings 面 | 认可债务 | 另 PR |
 | OPEN-4（round 2 遗留，round 3 复核）：`session_paths` 陈旧性——CreateSession 冷探测**不读** store 缓存（直读 canonical sessions-dir 路径，GW11 注自证）；store 侧消费者随 list 扫描刷新、采纳点经 `note_session_path` 播种；网关 `load_thread` 经 registry 指针自读不落缓存。与 P0-4 同源担忧在冷决策面上不成立 | ✓ 答复关闭 | — |
+| round 4 复核余项：follow.rs（473 行 tokio 任务生命周期）/ journal_query.rs（306 行聚合）无直接单测——两路 real composition E2E 间接覆盖，边界条件（task 泄漏/并发 open/零窗口查询）未直接钉;ws/connection.rs 泵面无测试（listener/mod 已由 W7 e2e 覆盖）;CreateSession intent+callback 双写（attach/plan_review,语义差异大）为重构候选。round 4 §5.2-5.4 | 认可债务（测试补强归 C4 批） | follow-up |
 | OPEN-2 **已修（W7，bedfa5d4）**：WS 端到端测试落位（bind→publish→401→token upgrade + 0600 契约）+ gateway-ws.json 0600-at-create + `ws::start` 二次启动守卫（变异红）；CLAUDE.md 运行时清单补 `cx web` 与 gateway-ws.json | ✓ 修复索引 | — |
 
 ### K.7.2a U9 三层归属表（as-built，U9a 落定）

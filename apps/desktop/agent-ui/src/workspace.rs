@@ -94,14 +94,6 @@ mod chips;
 mod composer_render;
 mod render;
 
-/// Parse an `AskUserQuestion` tool input into a `PendingAsk`. The per-question
-/// `InputState` entities are allocated lazily on first render (they need a
-/// `Window`, which the event handler lacks). Returns `None` when the input is
-/// malformed (the generic question overlay then takes over as a fallback).
-/// Snapshot a thread's working directory as a `SharedString` for the
-/// `TerminalPanel` prompt line. Reads the `Thread` entity (not the `Workspace`)
-/// so it stays safe inside a `Workspace::update` closure, where reading the
-/// `Workspace` itself would double-lease. `None` only when the path is empty.
 /// One label/value row of the goal status popover.
 fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla) -> gpui::Div {
     h_flex()
@@ -124,6 +116,10 @@ fn goal_popover_row(label: &str, value: &str, fg: gpui::Hsla, muted: gpui::Hsla)
         )
 }
 
+/// Snapshot a thread's working directory as a `SharedString` for the
+/// `TerminalPanel` prompt line. Reads the `Thread` entity (not the `Workspace`)
+/// so it stays safe inside a `Workspace::update` closure, where reading the
+/// `Workspace` itself would double-lease. `None` only when the path is empty.
 fn thread_cwd(
     thread: &manox_agent::thread::ThreadHandle,
     store: &Option<gpui::Entity<ClientStoreHandle>>,
@@ -140,6 +136,10 @@ fn thread_cwd(
     }
 }
 
+/// Parse an `AskUserQuestion` tool input into a `PendingAsk`. The per-question
+/// `InputState` entities are allocated lazily on first render (they need a
+/// `Window`, which the event handler lacks). Returns `None` when the input is
+/// malformed (the generic question overlay then takes over as a fallback).
 fn parse_pending_ask(id: String, input: serde_json::Value) -> Option<PendingAsk> {
     let questions = input.get("questions")?.as_array()?;
     // Out-of-range counts violate the tool contract. No card is shown for

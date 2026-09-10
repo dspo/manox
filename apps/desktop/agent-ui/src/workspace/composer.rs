@@ -9,6 +9,28 @@
 
 use super::*;
 
+/// Decode one wire message content block into a protocol image attachment
+/// (round 4 §5.1): the base64 `Image { data, mime_type }` shape four call
+/// sites used to repeat verbatim. Non-image blocks are `None`; a failed
+/// decode is dropped (an undecodable attachment cannot ride the wire).
+fn wire_image_attachment(
+    c: &manox_agent::language_model::MessageContent,
+) -> Option<manox_protocol::ImageAttachment> {
+    use base64::Engine as _;
+    match c {
+        manox_agent::language_model::MessageContent::Image { data, mime_type } => {
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .ok()
+                .map(|bytes| manox_protocol::ImageAttachment {
+                    data: bytes,
+                    mime_type: mime_type.clone(),
+                })
+        }
+        _ => None,
+    }
+}
+
 impl Workspace {
     /// Flip the parked thread's `SteerPending` cards whose steers an aborted
     /// turn never drained to `Failed`, mirroring the foreground
@@ -45,14 +67,11 @@ impl Workspace {
     /// Drain the stashed `Queued` follow-ups of a parked thread whose turn
     /// just settled: the follow-up turn runs on the parked thread itself,
     /// mirroring the foreground flush without a conversation bubble (a
-    /// switch-back rebuild shows it through the thread mirror). `Queued`
-    /// items coalesce into one `run_turn`, matching the foreground flush;
-    /// `SteerPending`/`Failed` cards stay parked for the user.
-    /// Drain the stashed `Queued` follow-ups of a parked thread whose turn
-    /// just settled. U1-flush: the flush rides the gateway — all but the
-    /// last drain as `AppendUserMessage` notes (accept without a run) and
-    /// the last as the v2 `Submit` that starts the next turn, mirroring the
-    /// foreground flush's batching. The pre-migration direct facade write
+    /// switch-back rebuild shows it through the thread mirror). U1-flush:
+    /// the flush rides the gateway — all but the last drain as
+    /// `AppendUserMessage` notes (accept without a run) and the last as the
+    /// v2 `Submit` that starts the next turn, matching the foreground
+    /// flush's batching. The pre-migration direct facade write
     /// (`insert_user_message` + `run_turn`) bypassed the journal's
     /// accept-time persistence (K5) and the server's queue/drain merge; the
     /// parked thread has no optimistic bubble, so no echo is pushed — the
@@ -62,8 +81,6 @@ impl Workspace {
         let Some(queue) = self.queued_follow_ups_by_thread.get_mut(thread_id) else {
             return;
         };
-        use base64::Engine as _;
-        use manox_agent::language_model::MessageContent;
         let mut retain: std::collections::VecDeque<QueuedFollowUp> =
             std::collections::VecDeque::new();
         let mut drained: Vec<DeferredUserTurn> = Vec::new();
@@ -87,18 +104,7 @@ impl Workspace {
             let attachments: Vec<manox_protocol::ImageAttachment> = turn
                 .images
                 .iter()
-                .filter_map(|c| match c {
-                    MessageContent::Image { data, mime_type } => {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(data.as_bytes())
-                            .ok()
-                            .map(|bytes| manox_protocol::ImageAttachment {
-                                data: bytes,
-                                mime_type: mime_type.clone(),
-                            })
-                    }
-                    _ => None,
-                })
+                .filter_map(wire_image_attachment)
                 .collect();
             if i + 1 < n {
                 // All but the last: accept without starting a run.
@@ -485,8 +491,6 @@ impl Workspace {
         weak: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) {
-        use base64::Engine as _;
-        use manox_agent::language_model::MessageContent;
         // UI state tracking (always) — conversation bubble + list housekeeping.
         self.conversation.update(cx, |c, cx| {
             c.push_user(
@@ -503,18 +507,7 @@ impl Workspace {
         let attachments: Vec<manox_protocol::ImageAttachment> = turn
             .images
             .iter()
-            .filter_map(|c| match c {
-                MessageContent::Image { data, mime_type } => {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(data.as_bytes())
-                        .ok()
-                        .map(|bytes| manox_protocol::ImageAttachment {
-                            data: bytes,
-                            mime_type: mime_type.clone(),
-                        })
-                }
-                _ => None,
-            })
+            .filter_map(wire_image_attachment)
             .collect();
         let _ = self.send_submit_v2(turn.text.clone(), attachments, cx);
     }
@@ -528,8 +521,6 @@ impl Workspace {
         if self.queued_follow_ups.is_empty() {
             return;
         }
-        use base64::Engine as _;
-        use manox_agent::language_model::MessageContent;
         let weak = cx.weak_entity();
         let follow_tail = self.list_state.is_following_tail();
         let mut retain: Vec<QueuedFollowUp> = Vec::new();
@@ -565,18 +556,7 @@ impl Workspace {
             let attachments: Vec<manox_protocol::ImageAttachment> = turn
                 .images
                 .iter()
-                .filter_map(|c| match c {
-                    MessageContent::Image { data, mime_type } => {
-                        base64::engine::general_purpose::STANDARD
-                            .decode(data.as_bytes())
-                            .ok()
-                            .map(|bytes| manox_protocol::ImageAttachment {
-                                data: bytes,
-                                mime_type: mime_type.clone(),
-                            })
-                    }
-                    _ => None,
-                })
+                .filter_map(wire_image_attachment)
                 .collect();
             if i + 1 < n {
                 // All but the last: insert without running.
@@ -759,21 +739,15 @@ impl Workspace {
     pub(super) fn decode_user_images(
         images: &[manox_agent::language_model::MessageContent],
     ) -> Vec<UserImage> {
-        use base64::Engine as _;
-        use manox_agent::language_model::MessageContent;
         images
             .iter()
-            .filter_map(|c| match c {
-                MessageContent::Image { data, mime_type } => {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data.as_bytes())
-                        .ok()?;
-                    let fmt = gpui::ImageFormat::from_mime_type(mime_type.as_str())?;
-                    Some(UserImage(std::sync::Arc::new(gpui::Image::from_bytes(
-                        fmt, bytes,
-                    ))))
-                }
-                _ => None,
+            .filter_map(|c| {
+                let attachment = wire_image_attachment(c)?;
+                let fmt = gpui::ImageFormat::from_mime_type(attachment.mime_type.as_str())?;
+                Some(UserImage(std::sync::Arc::new(gpui::Image::from_bytes(
+                    fmt,
+                    attachment.data,
+                ))))
             })
             .collect()
     }

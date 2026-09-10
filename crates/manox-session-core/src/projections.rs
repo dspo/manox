@@ -301,6 +301,9 @@ impl ProjectionSet {
             // the contract: production folds drop it, debug builds fail
             // loud.
             debug_assert!(false, "projection set() on undeclared key {key:?}");
+            // Round 4 §4.5: the debug_assert is invisible in release —
+            // the silent drop must at least leave a trace there too.
+            tracing::warn!(projection_key = %key, "set() on undeclared key — dropping");
             return;
         };
         if slot.value != value {

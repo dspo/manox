@@ -157,8 +157,16 @@ impl SessionMultiplexer {
         let (leaf_tx, leaf_rx) = async_channel::unbounded::<LeafRequest>();
         let _leaf_pump = cx.spawn(async move |this, cx: &mut gpui::AsyncApp| {
             while let Ok(req) = leaf_rx.recv().await {
-                let _ = this.update(cx, |m, _| m.handle_leaf_request(req));
+                // Same discipline as the main pump above: a released entity
+                // is a normal teardown, but it must not be SILENT — the leaf
+                // requests carry reopen / page-history / conversation-info /
+                // list-refresh, and losing them without a trace leaves
+                // session-lifecycle debugging blind (round 4 §3.1).
+                if let Err(err) = this.update(cx, |m, _| m.handle_leaf_request(req)) {
+                    tracing::warn!(error = %err, "leaf pump update failed (entity released?)");
+                }
             }
+            tracing::error!("leaf pump exited (channel closed)");
         });
         Self {
             client,

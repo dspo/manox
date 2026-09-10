@@ -402,10 +402,6 @@ impl Workspace {
             self.session_id = Some(new_sid);
         }
 
-        // If the new thread was previously parked in the background, reclaim it
-        // so it becomes the foreground thread and is no longer double-held.
-        self.background_threads.retain(|b| b.id != new_id);
-
         // Persist the old thread's current state before switching away. The
         // spawned-task save backstop in `run_turn` will persist again when the
         // turn actually finishes, capturing the final assistant messages.
