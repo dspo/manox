@@ -183,22 +183,49 @@ impl AgentServerInner {
         self.pumps_spawned.load(Ordering::SeqCst) - self.pumps_finished.load(Ordering::SeqCst)
     }
 
-    /// Install a session entry, terminating the pump of any entry it
-    /// replaces (GW2: a replaced `ServerSession` must never leave its pump
-    /// subscribed to the same thread beside the replacement's).
-    fn insert_session(&self, session_id: String, session: ServerSession) {
-        let replaced = { self.sessions.lock().insert(session_id, session) };
-        if let Some(old) = replaced {
-            tracing::warn!("replaced a live session entry; terminating the superseded pump");
-            old.stop_pump();
+    /// Insert only when the key is absent, under ONE lock hold (§二.4③).
+    /// The create path's live-session check and its insert were two lock
+    /// acquisitions, so a racing same-id create/open could pass both checks
+    /// and mint two pumps — the old replace-and-stop_pump insert kept both
+    /// from running, but at the cost of CLOBBERING the winner's fresh state
+    /// (model / approval / effort seeds lost to the loser's). This recheck
+    /// adopts the entry that won the race; the loser is returned to its
+    /// caller for disposal (same shape as `open_session`'s phase-3).
+    fn insert_session_if_absent(
+        &self,
+        session_id: String,
+        session: ServerSession,
+    ) -> Option<ServerSession> {
+        let mut sessions = self.sessions.lock();
+        if sessions.contains_key(&session_id) {
+            return Some(session);
         }
+        sessions.insert(session_id, session);
+        None
     }
 
     /// Register a live stream and return its control handle.
+    ///
+    /// A key that is already live means the previous stream task is being
+    /// replaced while still running: `untrack_stream` is identity-guarded,
+    /// so an unconditionally overwritten handle would be unreachable from
+    /// BOTH ends forever (no end request, no unregister — a live orphan).
+    /// The superseded stream is therefore ENDED (`Closed`) under the same
+    /// insert (§二.4②) — its task sends its one `StreamEnd` and the
+    /// identity guard keeps the new entry intact.
     fn track_stream(&self, client_id: &str, stream_id: &StreamId, handle: StreamHandle) {
-        self.streams
+        let replaced = self
+            .streams
             .lock()
             .insert((client_id.to_string(), stream_id.clone()), handle);
+        if let Some(old) = replaced {
+            tracing::warn!(
+                client_id,
+                stream_id = stream_id.0,
+                "replaced a live stream entry; ending the superseded stream"
+            );
+            old.end(StreamEndReason::Closed);
+        }
     }
 
     /// Forget a stream after its task sent the terminal `StreamEnd`
@@ -730,20 +757,24 @@ impl AgentServerInner {
     }
 
     fn remove_client(&self, client_id: &str, generation: u64) {
-        // Generation guard: if the entry for this client_id has been replaced
-        // by a newer connection (same-client-id reconnect), do not delete it.
-        let should_remove = self
-            .clients
-            .lock()
-            .get(client_id)
-            .is_some_and(|e| e.generation == generation);
-        if !should_remove {
+        // Generation guard + removal under ONE lock hold (§二.4①). The old
+        // check-then-remove pair took the clients lock twice: a same-id
+        // reconnect landing in between installed a newer generation, and the
+        // unconditional remove then deleted the NEW entry. One hold closes
+        // the window — a stale generation never removes a fresher entry.
+        let removed = {
+            let mut clients = self.clients.lock();
+            match clients.get(client_id) {
+                Some(entry) if entry.generation == generation => clients.remove(client_id),
+                _ => None,
+            }
+        };
+        let Some(_entry) = removed else {
             return;
-        }
+        };
         // Disconnect clears this connection's live streams (§D.1 `Closed`;
         // the sends into the closed connection are no-ops by then).
         self.end_streams_for_client(client_id);
-        self.clients.lock().remove(client_id);
         let mut owners = self.session_owners.lock();
         let orphaned: Vec<String> = owners
             .iter_mut()
@@ -1682,11 +1713,12 @@ impl AgentServerInner {
             pending_submits.clone(),
             pump_cancel.clone(),
         );
-        // GW2: `insert_session` terminates the pump of any entry this
-        // replaces — the live-session check above and this insert are not
-        // one atomic step, so a racing create/open must not leave two pumps
-        // subscribed to the same thread.
-        inner.insert_session(
+        // GW2 + §二.4③: the insert is a single-lock recheck — if a racing
+        // same-id create/open won the race since the live check above, our
+        // freshly spawned pump is retired and the WINNER's entry is adopted
+        // (never clobbered: the loser's intent seeds must not overwrite the
+        // winner's).
+        let loser = inner.insert_session_if_absent(
             session_id.clone(),
             ServerSession {
                 thread: thread.clone(),
@@ -1696,6 +1728,15 @@ impl AgentServerInner {
                 pending_submits,
             },
         );
+        if let Some(loser) = loser {
+            tracing::warn!(
+                session_id,
+                "create lost a same-id race; adopting the winning entry and retiring this pump"
+            );
+            loser.stop_pump();
+            inner.add_owner(&session_id, owner);
+            return Ok(json!({ "session_id": session_id }));
+        }
         inner.add_owner(&session_id, owner);
         inner.route_note(
             &session_id,

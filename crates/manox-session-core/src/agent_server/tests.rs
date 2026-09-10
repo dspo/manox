@@ -7276,3 +7276,209 @@ fn entry_window_capacity_matches_the_protocol_declaration() {
          stay equal — the §D.7 overflow-resync semantics assume one number"
     );
 }
+
+/// §二.4① (contract pin): `remove_client`'s generation guard. A stale
+/// generation (the connection was superseded by a same-id reconnect) must
+/// never remove the newer entry; a current generation must remove its own.
+/// The interleaving itself (a reconnect landing exactly between the old
+/// check-then-remove's two lock holds) has no externally injectable seam —
+/// the fix is the single-lock-hold restructure this pins the guard for.
+#[test]
+fn remove_client_generation_guard_removes_only_its_own_generation() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+    let _client = connect_sessions(&server, "rg1", vec![], vec![]);
+    // connect_sessions already drained the Ready receipt.
+
+    // Superseded: the entry's generation moved past the caller's view.
+    let stale = server
+        .0
+        .clients
+        .lock()
+        .get("rg1")
+        .map(|e| e.generation - 1)
+        .expect("entry seated by the handshake");
+    server.0.remove_client("rg1", stale);
+    assert!(
+        server.0.clients.lock().contains_key("rg1"),
+        "a stale generation must not remove a fresher entry"
+    );
+
+    // Current: the entry goes away.
+    let current = server.0.clients.lock().get("rg1").unwrap().generation;
+    server.0.remove_client("rg1", current);
+    assert!(
+        !server.0.clients.lock().contains_key("rg1"),
+        "the current generation removes its own entry"
+    );
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §二.4② (deterministic): `track_stream` used to overwrite a live stream
+/// entry unconditionally — and `untrack_stream` is identity-guarded, so the
+/// overwritten handle was unreachable from BOTH ends forever (no end
+/// request, no unregister: a live orphan task). The superseded stream must
+/// be ENDED (`Closed`) under the same insert. Pre-fix red: the first
+/// handle's reason cell stays `None`.
+#[test]
+fn superseded_stream_entry_is_ended_not_orphaned() {
+    use crate::follow::StreamHandle;
+
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+
+    let stream_id = manox_protocol::StreamId::new("st-1");
+    let first = StreamHandle::new(
+        "s1".into(),
+        tokio_util::sync::CancellationToken::new(),
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+    );
+    let (first_cancel, first_reason) = first.parts();
+    server.0.track_stream("c1", &stream_id, first);
+
+    // The same key tracked again while the first task is still live.
+    let second = StreamHandle::new(
+        "s1".into(),
+        tokio_util::sync::CancellationToken::new(),
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+    );
+    server.0.track_stream("c1", &stream_id, second);
+
+    assert_eq!(
+        *first_reason.lock().unwrap(),
+        Some(manox_protocol::StreamEndReason::Closed),
+        "the superseded stream must be ended (Closed), never orphaned"
+    );
+    assert!(
+        first_cancel.is_cancelled(),
+        "the superseded stream's cancel token must fire"
+    );
+    // The registry now names the NEW stream (the winner of the re-track).
+    let live = server
+        .0
+        .streams
+        .lock()
+        .get(&("c1".to_string(), stream_id.clone()))
+        .cloned();
+    let Some(live) = live else {
+        panic!("the replacing stream must hold the registry slot");
+    };
+    assert!(live.is_same_handle(&live)); // slot present and queryable
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §二.4③ (deterministic, primitive leg): the create path's live check and
+/// its insert were two lock holds — a racing same-id create/open that won
+/// in between got CLOBBERED by the loser's replace-insert (the winner's
+/// fresh intent seeds lost; only stop_pump kept two pumps from running).
+/// The single-lock recheck primitive is pinned directly (the create path
+/// has no externally injectable seam between its check and its insert —
+/// the top fast-path sees a pre-seated winner and returns early):
+/// the loser comes back for disposal, the winner's entry and pump token
+/// are untouched. Pre-fix red: the winner's token comes back cancelled
+/// (the replace-insert stop_pump'd it).
+// The globals guard is the suite's test-serialization mutex (not a
+// production lock); the current-thread test runtime has no re-entrant
+// taker, so holding it across the test's own awaits is safe.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn create_race_insert_adopts_the_winning_entry() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+
+    let session = |prefix: &str| ServerSession {
+        thread: manox_agent::Thread::new_fresh(
+            manox_agent::ThreadId(format!("{prefix}-{}", uuid::Uuid::new_v4())),
+            PathBuf::from("/"),
+        ),
+        pump_cancel: tokio_util::sync::CancellationToken::new(),
+        pump: tokio::spawn(async {}),
+        turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_submits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+
+    // The race winner, already seated.
+    let winner = session("winner");
+    let winner_cancel = winner.pump_cancel.clone();
+    server.0.sessions.lock().insert("race-1".into(), winner);
+
+    // The loser's insert under the SAME single lock hold.
+    let loser = session("loser");
+    let loser_cancel = loser.pump_cancel.clone();
+    let returned = server.0.insert_session_if_absent("race-1".into(), loser);
+    let Some(returned) = returned else {
+        panic!("the loser must come back for disposal when the key is taken")
+    };
+    // The create path's disposal of the loser it got back.
+    returned.stop_pump();
+    assert!(
+        !winner_cancel.is_cancelled(),
+        "the winning entry is adopted, never clobbered (pre-fix: the \
+         replace-insert stop_pump'd the winner)"
+    );
+    assert!(
+        loser_cancel.is_cancelled(),
+        "the caller disposes the loser it got back (create retires its pump)"
+    );
+    // The slot still names the winner (same live token, uncancelled).
+    let live_cancel = {
+        let sessions = server.0.sessions.lock();
+        sessions.get("race-1").unwrap().pump_cancel.clone()
+    };
+    assert!(!live_cancel.is_cancelled());
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §二.4③ (path leg, smoke): a create whose id is ALREADY live answers
+/// idempotently and re-owns — never a second session.
+#[allow(clippy::await_holding_lock)] // same test-guard rationale as above
+#[tokio::test]
+async fn create_with_a_live_id_is_idempotent() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
+
+    let winner = ServerSession {
+        thread: manox_agent::Thread::new_fresh(
+            manox_agent::ThreadId("idem-winner".into()),
+            PathBuf::from("/"),
+        ),
+        pump_cancel: tokio_util::sync::CancellationToken::new(),
+        pump: tokio::spawn(async {}),
+        turn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        pending_submits: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let winner_cancel = winner.pump_cancel.clone();
+    server.0.sessions.lock().insert("idem-1".into(), winner);
+
+    let intent = SessionIntent {
+        session_id: Some("idem-1".into()),
+        cwd: Some("/".into()),
+        project: None,
+        initial_model: None,
+        approval_mode: None,
+        reasoning_effort: None,
+    };
+    let out = AgentServerInner::create_session_request(&server.0, "idem-client", intent)
+        .await
+        .expect("idempotent create answers");
+    assert_eq!(out["session_id"], json!("idem-1"));
+    assert!(!winner_cancel.is_cancelled());
+    assert_eq!(server.0.owners("idem-1"), vec!["idem-client".to_string()]);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
