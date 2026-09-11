@@ -841,7 +841,13 @@ impl FromStr for CxConfig {
 
 /// `$HOME/.manox` — the single root for all cx-family persistent state
 /// (shared with the manox app: provider config, `cx.db`, IPC sockets).
+///
+/// Honors the same `MANOX_HOME` override as `manox_agent::paths::manox_home`
+/// so embedders redirect both halves of the state root with one variable.
 pub fn cx_state_dir() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("MANOX_HOME").filter(|r| !r.is_empty()) {
+        return Ok(PathBuf::from(root));
+    }
     let home = dirs::home_dir().context("无法解析用户主目录")?;
     Ok(home.join(".manox"))
 }
