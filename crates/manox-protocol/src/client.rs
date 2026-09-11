@@ -67,6 +67,13 @@ pub enum ClientCall {
         initial_model: Option<crate::journal::ModelRef>,
         approval_mode: Option<String>,
         reasoning_effort: Option<String>,
+        /// Hidden context seeded into the new session before its first
+        /// turn: each block is a kernel content block, appended as a
+        /// non-displaying custom message (`embedder_seed`). Model-visible,
+        /// UI-hidden (the wire row carries `display: false`); one-shot —
+        /// re-injection per turn is a different mechanism. `None`/empty
+        /// seeds nothing.
+        seed: Option<Vec<serde_json::Value>>,
     },
     /// Submit a user message (starts a turn unless it is a slash command);
     /// the response is the receipt `{accepted, message_id?}` — the

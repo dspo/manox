@@ -304,3 +304,57 @@ struct ModelAgg {
     calls: u64,
     last_total: u64,
 }
+
+#[cfg(test)]
+mod cold_write_read_probe {
+    use super::*;
+    use manox_harness::session::SessionStorage;
+
+    #[test]
+    fn seeded_file_round_trips_through_cold_read() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            std::fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("probe-seed-1.jsonl");
+            let _ = std::fs::remove_file(&path);
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &path,
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "probe-seed-1".into(),
+                    cwd: "/".into(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    metadata: None,
+                },
+            )
+            .await
+            .unwrap();
+            let entry = manox_harness::session::SessionTreeEntry::CustomMessage {
+                id: "e0".into(),
+                parent_id: None,
+                timestamp: chrono::Utc::now(),
+                custom_type: "embedder_seed".into(),
+                content: vec![manox_harness::types::ContentBlock::Text {
+                    text: "probe".into(),
+                    signature: None,
+                }],
+                details: None,
+                display: false,
+            };
+            storage.append_entry(&entry).await.unwrap();
+            drop(storage);
+            match cold_read("probe-seed-1").await {
+                ColdRead::Data(data) => {
+                    assert_eq!(data.records.len(), 1);
+                    assert_eq!(data.cursor, 0);
+                }
+                ColdRead::NotFound => panic!("NotFound"),
+                ColdRead::Corrupt(e) => panic!("Corrupt: {e}"),
+            }
+            std::fs::remove_file(&path).unwrap();
+        })
+    }
+}
