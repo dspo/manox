@@ -70,6 +70,7 @@ pub const RPC_ERROR_CODES: &[&str] = &[
     "model/unresolvable",
     "feature/unavailable",
     "protocol/unsupported-epoch",
+    "client/reseated",
 ];
 
 /// `session/not-found` (§D.7).
@@ -96,6 +97,13 @@ pub const CODE_FEATURE_UNAVAILABLE: &str = "feature/unavailable";
 /// so a future client can distinguish "server speaks another epoch" from a
 /// generic failure and downgrade or prompt an upgrade.
 pub const CODE_PROTOCOL_UNSUPPORTED_EPOCH: &str = "protocol/unsupported-epoch";
+/// `client/reseated`: the gateway itself replaced this client's connection
+/// (a same-`client_id` handshake re-seat). Outstanding `ServerCall` waiters
+/// resolve with this error so the adjudication machinery can tell the
+/// server's own connection swap apart from a real delivery failure —
+/// re-seat is a settle-obligation hand-off to the §D.6 replay path, never
+/// an expiry.
+pub const CODE_CLIENT_RESEATED: &str = "client/reseated";
 
 impl RpcError {
     /// Builder: tag this error with a §D.7 stable code (stored in
@@ -105,6 +113,11 @@ impl RpcError {
             data: Some(serde_json::json!({ "code": code })),
             ..self
         }
+    }
+
+    /// The §D.7 stable code this error carries (`with_code`'s read face).
+    pub fn stable_code(&self) -> Option<&str> {
+        self.data.as_ref()?.get("code")?.as_str()
     }
 }
 
@@ -554,5 +567,16 @@ mod tests {
             err.data.as_ref().unwrap()["code"],
             "protocol/unsupported-epoch"
         );
+    }
+
+    /// §D.6 re-seat: the waiter-side classification hinges on reading a
+    /// stable code back off the wire error — `stable_code` is that read
+    /// face, and an untagged error must answer `None` (a client rejection
+    /// is never a hand-off).
+    #[test]
+    fn rpc_error_stable_code_round_trips() {
+        let err = RpcError::new(-1, "reconnected").with_code(CODE_CLIENT_RESEATED);
+        assert_eq!(err.stable_code(), Some(CODE_CLIENT_RESEATED));
+        assert_eq!(RpcError::new(-1, "user said no").stable_code(), None);
     }
 }

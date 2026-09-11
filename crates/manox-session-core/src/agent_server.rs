@@ -459,16 +459,31 @@ impl AgentServerInner {
                 // ServerCall waiters on the old peer, close the old channel so
                 // its serve_connection loop exits promptly, then re-seat the
                 // entry with a fresh generation.
+                let mut reseated = false;
                 if let Some(old) = self.clients.lock().get(&client_id) {
+                    // `client/reseated` is the waiter-side signal that the
+                    // settle obligation transfers to the §D.6 replay, not a
+                    // delivery failure: the waterfall abandons the old
+                    // recipient instead of fail-closing the adjudication.
                     old.peer.cancel_all(
                         RpcError::new(-1, "client reconnected")
-                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+                            .with_code(manox_protocol::msg::CODE_CLIENT_RESEATED),
                     );
                     old.conn.disconnect();
                     // §D.1: the replaced connection's streams die with it
                     // (`Closed`). Safe here — the new connection cannot have
                     // opened any stream yet (handshake is first).
                     self.end_streams_for_client(&client_id);
+                    reseated = true;
+                }
+                // A re-seat that drops a session declaration is the owner
+                // abandoning that session's parked calls: retire them
+                // fail-closed here, because the replay below will never
+                // re-deliver to a session this hello does not declare.
+                // Outside the `clients` lock — the retirement routes notes
+                // through the client registry.
+                if reseated {
+                    self.abandon_unredeclared_adjudications(&client_id, &sessions);
                 }
                 let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
                 let hello = ClientHello {
@@ -853,7 +868,9 @@ impl AgentServerInner {
     }
 
     /// A settled adjudication leaves the replay registry: no owner joining
-    /// afterwards is ever re-delivered it.
+    /// afterwards is ever re-delivered it. Keys only ever collide within one
+    /// session's list (`auth_id` is globally unique; a session parks at most
+    /// one plan review at a time, so `plan_file` is its session-local key).
     fn retire_pending_adjudication(&self, session_id: &str, key: &str) {
         let mut pending = self.pending_adjudications.lock();
         if let Some(list) = pending.get_mut(session_id) {
@@ -908,6 +925,13 @@ impl AgentServerInner {
             if !hello.can(rec.kind) {
                 continue;
             }
+            // The settle check and the `register`/`add_adjudication_target`
+            // below are separate lock acquisitions: a settle landing in that
+            // window retires the record while this replay still delivers a
+            // frame. Benign by construction — the retired record's gate
+            // already settled first-wins, so the fresh waiter's reply
+            // double-applies into the same idempotent gate, and the next
+            // join re-checks and finds the record gone.
             let gate_settled = matches!(rec.kind, HookKind::Approve | HookKind::AskUserQuestion)
                 && !live_auth_ids.contains(&rec.key);
             if gate_settled {
@@ -915,13 +939,20 @@ impl AgentServerInner {
                 continue;
             }
             let id = MsgId::new(rec.key.clone());
-            if rec.targets.iter().any(|cid| cid == client_id) {
+            if rec.targets.iter().any(|cid| cid == client_id) && peer.has_waiter(&id) {
+                // The owner's CURRENT connection still carries the live
+                // waiter: re-send the frame only (GW2 forbids a duplicate
+                // register; the reply flows through the open waiter).
                 conn.send_to_client(FromServer::Request {
                     id,
                     call: rec.call.clone(),
                 });
                 continue;
             }
+            // A target whose waiter died with a re-seated connection must
+            // re-mint here: the entry's peer is a fresh instance, so without
+            // this the client's eventual reply would resolve nothing and the
+            // call would strand until timeout.
             let Some(rx) = peer.register(id.clone()) else {
                 continue;
             };
@@ -930,31 +961,69 @@ impl AgentServerInner {
                 id,
                 call: rec.call.clone(),
             });
-            // GW3 tie-in: the settling waterfall cancels this token along
-            // with the original fan-out's, so a delivery superseded by
-            // another owner's reply exits promptly instead of parking on
-            // the timeout.
-            let token = tokio_util::sync::CancellationToken::new();
-            if let Some(delivery) = self.pending_deliveries.lock().get_mut(&rec.delivery_id) {
-                delivery.insert(client_id.to_string(), token.clone());
-            }
+            // Not registered under the delivery's GW3 cancel tokens: the
+            // settling waterfall's `DeliveryGuard` cancels the whole
+            // delivery id, which would mis-kill this owner's fresh waiter.
+            // A replayed delivery superseded elsewhere converges on
+            // CALL_TIMEOUT; the engine gate's first-wins idempotence absorbs
+            // the late double-apply.
             let inner = Arc::clone(self);
             let sid = session_id.to_string();
             manox_agent::runtime::handle().spawn(async move {
-                let outcome = tokio::select! {
-                    _ = token.cancelled() => Err(RpcError::new(
-                        -1,
-                        "replayed delivery superseded (adjudication settled elsewhere)",
-                    )
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-                    replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
-                        Ok(Ok(o)) => o,
-                        _ => Err(RpcError::new(-1, "replayed adjudication reply timed out")
-                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-                    },
+                let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
+                    Ok(Ok(o)) => o,
+                    _ => Err(RpcError::new(-1, "replayed adjudication reply timed out")
+                        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
                 };
                 apply_reply(&inner, &sid, rec.ctx, outcome, None);
             });
+        }
+    }
+
+    /// §D.6: an owner that re-seats WITHOUT re-declaring a session has
+    /// abandoned that session's parked calls — no future replay reaches it,
+    /// so a record whose targets empty out retires and fail-closes now.
+    /// (A record with other targets just loses this recipient from the
+    /// authoritative pending copy; their waterfalls learn of the hand-off
+    /// through the `client/reseated` funnel event.)
+    fn abandon_unredeclared_adjudications(self: &Arc<Self>, client_id: &str, declared: &[String]) {
+        let drained: Vec<(String, PendingAdjudication)> = {
+            let mut pending = self.pending_adjudications.lock();
+            let mut drained = Vec::new();
+            for (session_id, list) in pending.iter_mut() {
+                if declared.iter().any(|s| s == session_id) {
+                    continue;
+                }
+                let mut keep = Vec::new();
+                for mut rec in list.drain(..) {
+                    rec.targets.retain(|cid| cid != client_id);
+                    if rec.targets.is_empty() {
+                        drained.push((session_id.clone(), rec));
+                    } else {
+                        keep.push(rec);
+                    }
+                }
+                *list = keep;
+            }
+            pending.retain(|_, list| !list.is_empty());
+            drained
+        };
+        for (session_id, rec) in drained {
+            self.note_error(
+                &session_id,
+                "adjudication abandoned: owner re-seated without re-declaring the session",
+            );
+            apply_reply(
+                self,
+                &session_id,
+                rec.ctx,
+                Err(RpcError::new(
+                    -1,
+                    "adjudication abandoned: the answering owner re-seated without the session",
+                )
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
+                None,
+            );
         }
     }
 
@@ -2573,9 +2642,6 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                 kind,
                 ctx: ctx.clone(),
                 call: call.clone(),
-                delivery_id: delivery_id
-                    .clone()
-                    .expect("adjudication kinds are stamped above"),
                 targets: targets.iter().map(|(cid, ..)| cid.clone()).collect(),
             },
         );
@@ -2635,12 +2701,10 @@ struct PendingAdjudication {
     kind: HookKind,
     ctx: ReplyCtx,
     call: ServerCall,
-    /// GW3 identity of the original fan-out; replay waiters register their
-    /// cancel tokens under it so the settling waterfall also wakes them.
-    delivery_id: String,
     /// Owners holding a live reply waiter for this call (the fan-out
-    /// recipients plus every replay that minted a waiter). Replay re-sends
-    /// to these instead of re-registering the same MsgId (GW2).
+    /// recipients plus every replay that minted a waiter on their current
+    /// peer). Replay re-sends without registering only while that waiter is
+    /// still open on the owner's live connection (GW2 forbids duplicates).
     targets: Vec<String>,
 }
 
@@ -2712,6 +2776,20 @@ fn with_delivery_id(call: ServerCall, delivery_id: &str) -> ServerCall {
     }
 }
 
+/// One recipient's delivery lifecycle event, funneled from its waiter task.
+enum DeliveryEvent {
+    /// The client answered: `Ok` = answered next, `Err` = explicit rejection.
+    Reply(Result<Value, RpcError>),
+    /// The delivery lapsed without an answer (timeout, `CancelDelivery`, or
+    /// a closed channel) — kept distinct from a rejection so the GW9
+    /// PlanVerdict convergence can name the cause.
+    Expired(RpcError),
+    /// §D.6: the gateway replaced this owner's connection. The delivery's
+    /// settle obligation transfers to the replayed waiter on the new
+    /// connection — this waterfall drops the recipient without rejecting.
+    Reseated,
+}
+
 async fn route_waterfall(
     inner: &Arc<AgentServerInner>,
     session_id: &str,
@@ -2720,12 +2798,8 @@ async fn route_waterfall(
     targets: Vec<AdjudicationTarget>,
     delivery_id: String,
 ) {
-    // (client id, delivery expired, reply outcome): `expired` separates a
-    // delivery that timed out / closed / was WITHDRAWN (GW3
-    // `CancelDelivery`) from an explicit client rejection so the GW9
-    // PlanVerdict convergence can name the cause.
     let (funnel_tx, mut funnel_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, bool, Result<Value, RpcError>)>();
+        tokio::sync::mpsc::unbounded_channel::<(String, DeliveryEvent)>();
     let mut waterfall = crate::waterfall::Waterfall::new(session_id.to_string(), {
         let mut ids = targets
             .iter()
@@ -2762,17 +2836,24 @@ async fn route_waterfall(
             .expect("every target registered a token")
             .clone();
         manox_agent::runtime::handle().spawn(async move {
-            let (expired, outcome) = tokio::select! {
-                _ = token.cancelled() => (
-                    true,
-                    Err(RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
+            let event = tokio::select! {
+                _ = token.cancelled() => DeliveryEvent::Expired(
+                    RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                 ),
                 replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
-                    Ok(Ok(o)) => (false, o),
-                    _ => (true, Err(RpcError::new(-1, "adjudication reply timed out").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL))),
+                    // The re-seat cancel resolves this waiter with a coded
+                    // Err — the one Err outcome that is a hand-off, not a
+                    // delivery failure or a rejection.
+                    Ok(Ok(Err(e))) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
+                        DeliveryEvent::Reseated
+                    }
+                    Ok(Ok(o)) => DeliveryEvent::Reply(o),
+                    _ => DeliveryEvent::Expired(
+                        RpcError::new(-1, "adjudication reply timed out").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+                    ),
                 },
             };
-            let _ = tx.send((cid, expired, outcome));
+            let _ = tx.send((cid, event));
         });
     }
     drop(funnel_tx);
@@ -2780,8 +2861,32 @@ async fn route_waterfall(
     // The settling delivery when it settled the waterfall AGAINST the call:
     // (client id, expired).
     let mut settled_by: Option<(String, bool)> = None;
-    while let Some((cid, expired, outcome)) = funnel_rx.recv().await {
+    // The most recent answered-next payload: a re-seat that completes the
+    // all-next quorum settles with the surviving answer.
+    let mut last_ok: Option<Value> = None;
+    let mut reseat_seen = false;
+    while let Some((cid, event)) = funnel_rx.recv().await {
+        let (expired, outcome) = match event {
+            DeliveryEvent::Reseated => {
+                reseat_seen = true;
+                if waterfall.abandon(&cid).is_some() {
+                    // The only settle `abandon` produces is Allowed: this
+                    // removal completed the all-next quorum, so an answer
+                    // is already cached.
+                    settled = Some(Ok(
+                        last_ok.expect("an Allowed quorum holds an answered delivery")
+                    ));
+                    break;
+                }
+                continue;
+            }
+            DeliveryEvent::Reply(o) => (false, o),
+            DeliveryEvent::Expired(err) => (true, Err(err)),
+        };
         let next = outcome.is_ok();
+        if let Ok(value) = &outcome {
+            last_ok = Some(value.clone());
+        }
         if waterfall.reply(&cid, next).is_some() {
             if !next {
                 settled_by = Some((cid, expired));
@@ -2789,6 +2894,13 @@ async fn route_waterfall(
             settled = Some(outcome);
             break;
         }
+    }
+    // A re-seat hands the undecided deliveries to the §D.6 replay's fresh
+    // waiters: this waterfall must not settle them — an Err would deny a
+    // call the replay can still answer, and an Error note would report a
+    // hand-off as a failure.
+    if settled.is_none() && reseat_seen {
+        return;
     }
     let outcome = settled.unwrap_or_else(|| {
         Err(

@@ -2117,6 +2117,160 @@ fn reown_resends_the_parked_ask_through_the_live_waiter() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// §D.6 re-seat: a same-`client_id` reconnect (a desktop restart) swaps
+/// the connection out from under the parked card's waiter. The replay must
+/// re-mint the waiter on the FRESH peer — re-sending to a target whose
+/// waiter died would resolve the user's answer against nothing — and that
+/// answer must settle the gate. The abandoned waterfall settles nothing on
+/// its own: the settle obligation transferred with the connection.
+#[test]
+fn ask_survives_same_client_reseat() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+
+    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &["s1"]);
+    let replayed = loop {
+        match reseated.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        replayed.0, "q1",
+        "the re-minted waiter reuses the deterministic MsgId"
+    );
+    reseated.send(FromClient::Reply {
+        id: replayed,
+        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    std::thread::sleep(Duration::from_millis(200));
+    let held = engine.auth_responses.lock().unwrap();
+    assert!(
+        held.iter().any(|(id, r)| id == "q1"
+            && matches!(
+                r,
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
+                    if answers == &vec![("color".to_string(), "blue".to_string())]
+            )),
+        "the re-seated owner's answer reaches the gate: {held:?}"
+    );
+    assert_eq!(
+        held.iter().filter(|(id, _)| id == "q1").count(),
+        1,
+        "exactly one settle: the abandoned waterfall must not fail-close the call it handed off"
+    );
+    drop(held);
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "the replayed settle retires the registry record"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    expect_host_status(&reseated, "s1", |running, _, _, _| running == Some(false));
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §D.6: a re-seat that does NOT re-declare the parked session is the
+/// owner abandoning it — no future replay can reach it, so the registry
+/// retires the call fail-closed as an explicit non-answer. The old
+/// waterfall's hand-off and this retirement must not double-settle.
+#[test]
+fn ask_reseat_without_reclaim_retires_the_parked_call() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+
+    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &[]);
+    let mut frames = Vec::new();
+    loop {
+        let m = reseated.recv();
+        let done = matches!(&m, FromServer::Response { id, .. } if id.0 == "init-test");
+        frames.push(m);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !frames.iter().any(|m| matches!(
+            m,
+            FromServer::Request {
+                call: ServerCall::AskUserQuestion { .. },
+                ..
+            }
+        )),
+        "a session the re-seat dropped declares no replay: {frames:?}"
+    );
+    wait_for_auth_settle(&engine, "q1", true);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "q1")
+            .count(),
+        1,
+        "the abandonment fail-closes exactly once"
+    );
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "the retired record leaves the authoritative pending copy"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// R1: with no capable client the question fails closed as an explicit
 /// `Expired` non-answer — never the pre-fix empty `AskUserQuestion` the
 /// model could read as the user answering nothing on purpose. The
