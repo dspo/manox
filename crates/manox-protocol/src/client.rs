@@ -52,6 +52,18 @@ pub enum ClientCall {
         messages: serde_json::Value,
         tools: serde_json::Value,
     },
+    /// Register the embedding host's tools for a session — full
+    /// replacement per client, mirroring the host's active-client setter
+    /// semantics. The tools become visible to the model as
+    /// `client_<name>` and invocations round-trip back to the registering
+    /// client as [`crate::ServerCall::InvokeClientTool`]. Re-registering
+    /// replaces the previous set; disposing the session clears it.
+    /// Response: `{ "registered": <n> }`.
+    RegisterSessionTools {
+        session_id: String,
+        client_id: String,
+        tools: Vec<ClientToolSpec>,
+    },
     // ── v2 write calls (§D.2, L7: writes answer with receipts only) ───────
     /// Create a session with intent; the response is `{session_id}` (id on
     /// an idempotent re-open of an existing session). `initial_model` is a
@@ -123,6 +135,15 @@ pub enum ClientCall {
     CancelDelivery {
         delivery_id: String,
     },
+}
+
+/// One embedder-registered tool: the schema is a JSON Schema object the
+/// host owns; the server treats it as opaque and echoes it to the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
 }
 
 /// Client → server fire-and-forget commands.

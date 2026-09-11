@@ -40,7 +40,7 @@
 //! `tests/surface_coverage.rs` walk every list against serde: each sample
 //! must serialize with exactly its declared tag and round-trip.
 
-use crate::client::{ClientCall, ClientNote, ImageAttachment};
+use crate::client::{ClientCall, ClientNote, ClientToolSpec, ImageAttachment};
 use crate::handshake::{HookKind, Initialize};
 use crate::journal::{JournalWireEntry, JournalWireEvent, ModelRef, UsagePayload};
 use crate::server::{ServerCall, ServerNote};
@@ -433,6 +433,15 @@ wire_surface! {
         ClientCall::TerminalSnapshot { .. } => "terminalSnapshot" ~ ClientCall::TerminalSnapshot {
             terminal: "t1".into(),
         },
+        ClientCall::RegisterSessionTools { .. } => "registerSessionTools" ~ ClientCall::RegisterSessionTools {
+            session_id: "s1".into(),
+            client_id: "test".into(),
+            tools: vec![ClientToolSpec {
+                name: "get_selection".into(),
+                description: "The editor's active selection.".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }],
+        },
         ClientCall::ModelChat { .. } => "modelChat" ~ ClientCall::ModelChat {
             request_id: "r1".into(),
             model: "anthropic-main/claude-sonnet-4".into(),
@@ -646,6 +655,14 @@ wire_surface! {
         ServerCall::OpenExternal { .. } => "openExternal" ~ ServerCall::OpenExternal {
             session_id: "s1".into(),
             url: "https://x".into(),
+        },
+        ServerCall::InvokeClientTool { .. } => "invokeClientTool" ~ ServerCall::InvokeClientTool {
+            delivery_id: "dlv-s1-4".into(),
+            session_id: "s1".into(),
+            client_id: "test".into(),
+            tool_call_id: "tc-1".into(),
+            name: "get_selection".into(),
+            input: serde_json::json!({}),
         },
     ]
 }

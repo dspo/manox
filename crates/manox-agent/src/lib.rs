@@ -13,6 +13,7 @@ pub mod claude_md;
 pub mod collaboration_mode;
 pub mod command;
 pub mod db;
+pub mod embedder_tools;
 pub mod file_lock;
 pub mod frontmatter;
 pub mod goal;

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use manox_protocol::base64_bytes;
-use manox_protocol::client::ImageAttachment;
+use manox_protocol::client::{ClientToolSpec, ImageAttachment};
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
 use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
@@ -175,6 +175,11 @@ struct AgentServerInner {
     /// §E.3 Q-face cache: `(thread_id, cursor)` → the folded conversation
     /// info payload (recomputed only when the cursor advances).
     conversation_info_cache: Arc<StdMutex<journal_query::ConversationInfoCache>>,
+    /// Embedder tool registrations (RegisterSessionTools): session →
+    /// client → full-replacement tool set. Consulted by the
+    /// EmbedderToolProvider below each time the engine assembles a
+    /// session's tools.
+    embedder_tools: Mutex<HashMap<String, HashMap<String, Vec<ClientToolSpec>>>>,
     /// GW2 pump observability: every `spawn_pump` bumps `pumps_spawned`;
     /// every pump exit — token cancel, subscription close, or task abort
     /// (the [`PumpExitGuard`]'s Drop runs in all three) — bumps
@@ -332,6 +337,7 @@ impl AgentServer {
             conversation_info_cache: Arc::new(StdMutex::new(
                 journal_query::ConversationInfoCache::default(),
             )),
+            embedder_tools: Mutex::new(HashMap::new()),
             pumps_spawned: AtomicU64::new(0),
             pumps_finished: AtomicU64::new(0),
         });
@@ -1144,6 +1150,13 @@ impl AgentServerInner {
         }
     }
 
+    /// Drop one session's embedder tool registrations. Called wherever the
+    /// live session entry is removed — the registration is session-scoped
+    /// and must not outlive the session.
+    fn clear_embedder_tools(&self, session_id: &str) {
+        self.embedder_tools.lock().remove(session_id);
+    }
+
     fn note_error(&self, session_id: &str, message: &str) {
         // GW1 dual emit: the §D.5 `HostEvent::Error` mirror rides to the
         // SAME owner audience as the v1 note (a session-scoped error is not
@@ -1396,6 +1409,24 @@ async fn handle_call(
                 .await
         }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
+        ClientCall::RegisterSessionTools {
+            session_id,
+            client_id,
+            tools,
+        } => {
+            // Full replacement per client. An unknown session still
+            // registers — the registration is store-side state the next
+            // tool assembly of that session picks up (mirrors how the
+            // host's active-client setter lands regardless of turn state).
+            let count = tools.len();
+            inner
+                .embedder_tools
+                .lock()
+                .entry(session_id)
+                .or_default()
+                .insert(client_id, tools);
+            Ok(json!({ "registered": count }))
+        }
         ClientCall::ListThreads => {
             // Cross-domain #5: the rescan self-hold — answer from a FRESH
             // scan (awaited, not the fire-and-forget spawn) so no client
@@ -2035,6 +2066,9 @@ impl AgentServerInner {
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty() {
             let removed = { self.sessions.lock().remove(session_id) };
+            if removed.is_some() {
+                self.clear_embedder_tools(session_id);
+            }
             if let Some(session) = removed {
                 // GW2: terminate the pump BEFORE the entry goes away — the
                 // pre-fix removal only dropped the JoinHandle, which detaches
@@ -2095,6 +2129,9 @@ impl AgentServerInner {
                 .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
             if !running {
                 let removed = { self.sessions.lock().remove(session_id) };
+                if removed.is_some() {
+                    self.clear_embedder_tools(session_id);
+                }
                 if let Some(session) = removed {
                     session.stop_pump();
                 }
@@ -2812,6 +2849,21 @@ fn with_delivery_id(call: ServerCall, delivery_id: &str) -> ServerCall {
             auth_id,
             input,
         },
+        ServerCall::InvokeClientTool {
+            session_id,
+            client_id,
+            tool_call_id,
+            name,
+            input,
+            ..
+        } => ServerCall::InvokeClientTool {
+            delivery_id: delivery_id.to_string(),
+            session_id,
+            client_id,
+            tool_call_id,
+            name,
+            input,
+        },
         other => other,
     }
 }
@@ -3296,6 +3348,56 @@ async fn route_capability_call(
     }
 }
 
+/// [`route_capability_call`] pinned to ONE client: an embedder tool
+/// invocation must reach the client that registered the tool (its
+/// implementation lives host-side), not whichever capable owner answers
+/// first. Same registration/timeout contract as the general form.
+async fn route_capability_call_to(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    target_client: &str,
+    call: ServerCall,
+) -> Result<Value, RpcError> {
+    let kind = hook_kind_for(&call);
+    let id = inner.next_call_id();
+    let target = {
+        let owners = inner.owners(session_id);
+        if !owners.iter().any(|cid| cid == target_client) {
+            None
+        } else {
+            let clients = inner.clients.lock();
+            clients
+                .get(target_client)
+                .filter(|entry| entry.hello.can(kind))
+                .and_then(|entry| match entry.peer.register(id.clone()) {
+                    Some(rx) => Some((entry.conn.clone(), rx)),
+                    None => {
+                        tracing::error!(
+                            session = %session_id,
+                            client = %target_client,
+                            msg_id = %id.0,
+                            "duplicate capability-call registration for the same MsgId; failing closed"
+                        );
+                        None
+                    }
+                })
+        }
+    };
+    let Some((conn, rx)) = target else {
+        return Err(RpcError::new(
+            -1,
+            format!("client {target_client} cannot answer this capability call"),
+        )
+        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+    };
+    conn.send_to_client(FromServer::Request { id, call });
+    match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
+        Ok(Ok(o)) => o,
+        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
+    }
+}
+
 /// The AgentServer's `CapabilityClient` impl: the kernel's `browser_op` is
 /// routed as a `ServerCall::BrowserOp` to the owning ∩ BrowserOp-capable
 /// client; the reply (a serialized `BrowserReply`) is returned to the engine.
@@ -3485,6 +3587,7 @@ fn spawn_pump(
                     // the cancelled token at its next select.
                     if inner.owners(&session_id).is_empty() && !thread.read(|t| t.is_running()) {
                         inner.sessions.lock().remove(&session_id);
+                        inner.clear_embedder_tools(&session_id);
                     }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
@@ -3582,6 +3685,7 @@ fn hook_kind_for(call: &ServerCall) -> HookKind {
         ServerCall::BrowserOp { .. } => HookKind::BrowserOp,
         ServerCall::ClipboardRead { .. } => HookKind::ClipboardRead,
         ServerCall::OpenExternal { .. } => HookKind::OpenExternal,
+        ServerCall::InvokeClientTool { .. } => HookKind::ClientTool,
     }
 }
 
@@ -3645,3 +3749,117 @@ fn model_to_wire(model: &manox_harness::types::Model) -> ModelInfo {
 
 #[cfg(test)]
 mod tests;
+
+// ── Embedder tool bridge (dspo/manox-app#11): RegisterSessionTools store +
+// the engine-facing provider whose adapters round-trip executions to the
+// registering client as InvokeClientTool. ─────────────────────────────────
+
+/// The AgentServer's `EmbedderToolProvider` impl: hands the engine the
+/// session's registered embedder tools at tool-assembly time. The engine
+/// wraps each in the approval gate, exactly like MCP tools.
+pub struct AgentServerEmbedderTools(Arc<AgentServerInner>);
+
+impl AgentServerEmbedderTools {
+    /// Wrap an `AgentServer` so the engine's tool assembly consults its
+    /// registrations.
+    pub fn new(server: &AgentServer) -> Self {
+        Self(server.0.clone())
+    }
+}
+
+impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTools {
+    fn tools_for(
+        &self,
+        session_id: &str,
+    ) -> Vec<std::sync::Arc<dyn manox_harness::tool::AgentTool>> {
+        let registrations = self.0.embedder_tools.lock();
+        let Some(clients) = registrations.get(session_id) else {
+            return Vec::new();
+        };
+        clients
+            .iter()
+            .flat_map(|(client_id, tools)| {
+                tools.iter().map(move |spec| {
+                    std::sync::Arc::new(EmbedderToolAdapter {
+                        inner: self.0.clone(),
+                        session_id: session_id.to_string(),
+                        client_id: client_id.clone(),
+                        spec: spec.clone(),
+                    }) as std::sync::Arc<dyn manox_harness::tool::AgentTool>
+                })
+            })
+            .collect()
+    }
+}
+
+/// One registered embedder tool as the engine sees it: the schema is the
+/// host's verbatim; execution routes to the registering client and the
+/// reply's `{content, isError}` settles the call.
+struct EmbedderToolAdapter {
+    inner: Arc<AgentServerInner>,
+    session_id: String,
+    client_id: String,
+    spec: ClientToolSpec,
+}
+
+#[async_trait::async_trait]
+impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
+    fn name(&self) -> &str {
+        // Leaked once per adapter — the trait returns &str and the name is
+        // stable for the adapter's lifetime.
+        Box::leak(manox_agent::embedder_tools::client_tool_name(&self.spec.name).into_boxed_str())
+    }
+    fn description(&self) -> &str {
+        &self.spec.description
+    }
+    fn parameters_schema(&self) -> Value {
+        self.spec.input_schema.clone()
+    }
+    /// An embedder tool is a remote call into the host — mutating by
+    /// default, like MCP tools.
+    fn requires_approval(&self, _params: &Value) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _ctx: &dyn manox_harness::tool::ToolContext,
+    ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+        let call = with_delivery_id(
+            ServerCall::InvokeClientTool {
+                delivery_id: String::new(),
+                session_id: self.session_id.clone(),
+                client_id: self.client_id.clone(),
+                tool_call_id: tool_call_id.to_string(),
+                name: self.spec.name.clone(),
+                input: params,
+            },
+            &self.inner.next_delivery_id(&self.session_id),
+        );
+        let reply = route_capability_call_to(&self.inner, &self.session_id, &self.client_id, call)
+            .await
+            .map_err(|e| manox_harness::tool::ToolError::ExecutionFailed(e.message))?;
+        let content = reply
+            .get("content")
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| {
+                manox_harness::tool::ToolError::ExecutionFailed(
+                    "client tool reply missing content".into(),
+                )
+            })?;
+        if reply
+            .get("isError")
+            .and_then(|e| e.as_bool())
+            .unwrap_or(false)
+        {
+            return Err(manox_harness::tool::ToolError::ExecutionFailed(
+                content.to_string(),
+            ));
+        }
+        Ok(manox_harness::tool::AgentToolResult::text(
+            content.to_string(),
+        ))
+    }
+}
