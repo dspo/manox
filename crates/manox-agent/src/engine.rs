@@ -1161,6 +1161,12 @@ impl ThreadEngine for PiEngine {
     }
 
     fn set_permission_mode(&self, mode: PermissionMode) {
+        // The gate is the live authority every tool resolver reads per call,
+        // so the mode lands on it directly — a mid-turn switch governs the
+        // very next tool call. The queued command still serializes the
+        // durable half (sidecar persist + journal echo) on the actor and
+        // re-stamps the same value idempotently.
+        self.state.gate.set_mode(mode);
         let _ = self.cmd_tx.send(SessionCmd::SetPermissionMode(mode));
     }
 
@@ -9544,6 +9550,41 @@ mod tests {
             "the decision must land a permission_mode_change entry"
         );
         session.close().await.unwrap();
+    }
+
+    /// Hot-switch contract: `set_permission_mode` lands the mode on the live
+    /// gate before the actor ever drains its queue, so a mid-turn switch
+    /// governs the very next tool call (every resolver reads the gate per
+    /// call). The queued command below still carries the durable half.
+    #[tokio::test]
+    async fn set_permission_mode_writes_the_gate_before_the_actor_drains() {
+        let state = test_engine_state();
+        assert_eq!(state.gate.mode(), PermissionMode::default());
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let bus = crate::steer_bus::AgentBus::new("test-thread".into(), notice_tx);
+        let engine = PiEngine {
+            cmd_tx,
+            state: Arc::clone(&state),
+            bus,
+        };
+
+        ThreadEngine::set_permission_mode(&engine, PermissionMode::ReadOnly);
+
+        // The gate flipped with no actor running at all.
+        assert_eq!(state.gate.mode(), PermissionMode::ReadOnly);
+        // The durable command is still queued, in order, with the same value.
+        match cmd_rx.try_recv() {
+            Ok(SessionCmd::SetPermissionMode(mode)) => {
+                assert_eq!(mode, PermissionMode::ReadOnly)
+            }
+            Ok(_) => panic!("a different command rode the queue for one switch"),
+            Err(_) => panic!("the switch must still queue its durable command"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "nothing else may ride the queue for one switch"
+        );
     }
 
     /// K3 (L3) regression: the initial-title decision rides the same

@@ -148,9 +148,9 @@ settings-desc-work-mode-workday = Just as capable, with less technical detail
 settings-section-permissions = Permissions
 settings-row-permission-readonly = Read Only
 settings-desc-permission-readonly = Bash runs but cannot write files (network is unrestricted); reads stay open across the filesystem. Choose this for review and research sessions.
-settings-row-permission-workspaceread = Workspace Write
+settings-row-permission-workspaceread = Workspace Access
 settings-desc-permission-workspaceread = manox can write files inside its workspace and run sandboxed shell commands there. Writes outside the workspace are denied.
-settings-row-permission-dangerfullaccess = Danger Full Access
+settings-row-permission-dangerfullaccess = Full Access
 settings-desc-permission-dangerfullaccess = manox can edit any file on your computer and run commands outside the sandbox without restriction. This significantly increases the risk of data loss, leaks, or unintended actions.
 settings-link-learn-more = Learn more
 
@@ -384,20 +384,15 @@ pending-auth-waiting = waiting for your decision
 pending-auth-allow = Allow once
 pending-auth-deny = Deny
 workspace-mode-readonly-title = Read Only
-workspace-mode-readonly-desc = Bash runs but may not write files; fs mutations are refused
-workspace-mode-workspacewrite-title = Workspace Write
-workspace-mode-workspacewrite-desc = Writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the workspace-write seatbelt profile
-workspace-mode-dangerfullaccess-title = Danger Full Access
-workspace-mode-dangerfullaccess-desc = No sandbox: bash runs unsandboxed, fs mutations are unfenced
+workspace-mode-workspacewrite-title = Workspace Access
+workspace-mode-dangerfullaccess-title = Full Access
 workspace-chip-mode-readonly = Read Only
-workspace-chip-mode-workspacewrite = Workspace Write
-workspace-chip-mode-dangerfullaccess = Danger Full Access
-workspace-mode-title = What should manox be allowed to do?
-workspace-mode-learn-more = Learn more
+workspace-chip-mode-workspacewrite = Workspace Access
+workspace-chip-mode-dangerfullaccess = Full Access
 workspace-mode-notice = { $mode ->
     [readonly] Read Only: bash runs but writes are denied by the seatbelt; fs mutations are refused.
-    [workspacewrite] Workspace Write: writes under the workspace, the manox home (~/.manox), and temp areas run; out-of-workspace targets are refused. Escalate a denied call with sandbox_permissions + justification.
-   *[dangerfullaccess] Danger Full Access: no sandbox; bash runs unsandboxed, fs mutations are unfenced.
+    [workspacewrite] Workspace Access: writes under the workspace, the manox home (~/.manox), and temp areas run; out-of-workspace targets are refused. Escalate a denied call with sandbox_permissions + justification.
+   *[dangerfullaccess] Full Access: no sandbox; bash runs unsandboxed, fs mutations are unfenced.
 }
 workspace-project-choose = Choose project
 workspace-project-new = New project
@@ -430,7 +425,7 @@ turn-navigator-empty-message = Empty message
 turn-navigator-copied = Message copied to clipboard.
 
 ### slash_command.rs
-slash-mode-desc = Cycle the permission mode (Read Only → Workspace Write → Danger Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately
+slash-mode-desc = Cycle the permission mode (Read Only → Workspace Access → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately
 slash-mode-unknown = Unknown permission mode "{ $mode }" — expected read-only, workspace-write, or danger-full-access
 slash-exit-desc = Archive the current thread and start a fresh one
 slash-new-desc = Archive the current thread and start a fresh one that keeps the project, permission mode, and model
