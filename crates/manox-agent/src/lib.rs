@@ -43,6 +43,7 @@ pub mod replay;
 pub mod runtime;
 pub mod sandbox;
 pub mod settings;
+pub mod sidebar_order;
 pub mod skill;
 pub mod slash_builtins;
 pub mod steer_bus;

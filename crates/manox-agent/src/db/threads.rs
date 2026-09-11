@@ -30,8 +30,9 @@ pub struct ThreadSummary {
     pub depth: i32,
     pub parent_id: Option<String>,
     pub archived: bool,
-    /// Pinned flag toggled from the title bar menu. Pinned threads float to
-    /// the top of the sidebar list (sorted first by `pinned DESC`).
+    /// Pinned flag toggled from the title bar menu. A pinned row leads its
+    /// sidebar partition; the band is applied by `ThreadStore`'s order account,
+    /// not by this (unread) SQL list path.
     pub pinned: bool,
     /// User-assigned tag shown as a chip on the sidebar row. Persisted in
     /// the session sidecar (the sidebar's source of truth), not in SQL.
@@ -483,8 +484,9 @@ impl ThreadsDatabase {
         Ok(())
     }
 
-    /// Toggle the pinned flag on a thread. Pinned threads float to the top of
-    /// the sidebar list (SQL `ORDER BY pinned DESC, interacted_at DESC`).
+    /// Toggle the pinned flag on a thread. The sidebar's pinned band is applied
+    /// by `ThreadStore`'s order account; this SQL list path is not the sidebar's
+    /// source of truth.
     pub fn pin(&self, id: &str, pinned: bool) -> Result<()> {
         let conn = self.conn.lock().expect("db mutex poisoned");
         conn.execute(

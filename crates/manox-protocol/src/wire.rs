@@ -20,7 +20,10 @@ use serde::{Deserialize, Serialize};
 pub struct ThreadListItem {
     pub id: String,
     pub title: String,
-    /// Unix seconds of the last interaction.
+    /// Unix seconds of the last human prompt or steer — never a timestamp of
+    /// convenience: the sidebar ranks rows by it, so a tool result, an injected
+    /// agent turn or a metadata write must not move a row. The list's own order
+    /// is the durable manual account, not this column.
     pub updated_at: i32,
     pub running: bool,
     /// DEPRECATED (GW5): unread is client-owned — the server keeps no focus

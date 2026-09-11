@@ -571,6 +571,14 @@ wire_surface! {
             session_id: "s1".into(),
             pinned: true,
         },
+        ClientNote::InsertThreadBefore { .. } => "insertThreadBefore" ~ ClientNote::InsertThreadBefore {
+            thread_id: "t1".into(),
+            before_thread_id: Some("t2".into()),
+        },
+        ClientNote::InsertGroupBefore { .. } => "insertGroupBefore" ~ ClientNote::InsertGroupBefore {
+            path: "/p/a".into(),
+            before_path: None,
+        },
         ClientNote::TerminalInput { .. } => "terminalInput" ~ ClientNote::TerminalInput {
             terminal: "t1".into(),
             bytes: b"x".to_vec(),

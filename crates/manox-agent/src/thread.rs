@@ -1137,10 +1137,12 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
     ) {
         let ordinal = self.user_prompt_ordinal();
+        let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut message = Message::user(text.clone());
         message.ui = ui.clone();
         self.messages.push(message);
         self.persist_user_attribution(ordinal, &ui);
+        self.stamp_interaction(human);
         self.pending_prompts.push(text);
         self.last_user_ui = ui;
     }
@@ -1154,6 +1156,7 @@ impl Thread {
         // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
         // parity).
         let ordinal = self.user_prompt_ordinal();
+        let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut images = Vec::new();
         let text: String = content
             .iter()
@@ -1174,6 +1177,7 @@ impl Thread {
         message.ui = ui.clone();
         self.messages.push(message);
         self.persist_user_attribution(ordinal, &ui);
+        self.stamp_interaction(human);
         if !text.trim().is_empty() {
             self.pending_prompts.push(text);
         }
@@ -1188,6 +1192,9 @@ impl Thread {
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
     ) -> String {
+        // A steer is human interaction too: it advances the sidebar's recency
+        // key exactly like a prompt.
+        self.stamp_interaction(ui.as_ref().and_then(|u| u.author.as_ref()).is_none());
         let mut images = Vec::new();
         let text: String = content
             .iter()
@@ -2342,6 +2349,29 @@ impl Thread {
         persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
     }
 
+    /// Advance the session's interaction stamp — the sidebar's only recency
+    /// key. The stamp moves exactly when a human speaks to the thread (a
+    /// prompt or a steer), so assistant output, tool results, injected agent
+    /// turns and sidecar flags can never float the row on their own. A
+    /// user-role message with no `author` is human input by the
+    /// `MessageUiMetadata::author` contract. Fire-and-forget: the send path
+    /// already refreshes the list, so this write never rides a rescan.
+    fn stamp_interaction(&self, human: bool) {
+        if !human {
+            return;
+        }
+        let Some(sessions_dir) = crate::paths::manox_config_dir()
+            .ok()
+            .map(|dir| dir.join("sessions"))
+        else {
+            return;
+        };
+        let Some(session_path) = self.active_session_path() else {
+            return;
+        };
+        persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
+    }
+
     /// Whether the pi backend restored an existing session at startup.
     pub fn restored(&self) -> bool {
         self.restored
@@ -2407,6 +2437,26 @@ fn persist_user_attribution_spawn(
             .await
         {
             tracing::warn!(error = %err, "failed to persist user message attribution");
+        }
+    })
+}
+
+/// Stamp the session's last human interaction in the sidecar. The per-session
+/// write lock in `session_meta::update` keeps it race-free against the sibling
+/// sidecar writers (attribution, displays, flags).
+fn persist_interaction_spawn(
+    sessions_dir: PathBuf,
+    session_path: PathBuf,
+    at: i64,
+) -> tokio::task::JoinHandle<()> {
+    crate::runtime::handle().spawn(async move {
+        if let Err(err) =
+            manox_harness::session_meta::update(&sessions_dir, &session_path, |meta| {
+                meta.interacted_at = Some(at);
+            })
+            .await
+        {
+            tracing::warn!(error = %err, "failed to persist the interaction stamp");
         }
     })
 }

@@ -8,6 +8,12 @@
 //! `session_paths` so their sidecar remains addressable. The retired manox
 //! SQLite-backed implementation was removed; see git history (or the
 //! `origin/Manox` backup branch) for it.
+//!
+//! Two invariants hold the sidebar still. The row order is the durable manual
+//! account in [`crate::sidebar_order`] — never a timestamp sort — so an
+//! activity-driven rescan cannot move a row. And `interacted_at` is the last
+//! human prompt or steer (the sidecar's stamp), so no assistant output, tool
+//! result or metadata write advances it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -28,12 +34,19 @@ pub enum ThreadStoreEvent {
 
 pub struct ThreadStore {
     summaries: Vec<ThreadSummary>,
-    /// Archived rows kept addressable so a surface can list them behind a
-    /// "more" affordance; the main sidebar list renders `summaries` only.
+    /// Archived rows, partitioned out of `summaries` so the sidebar list
+    /// stays clean while surfaces can still render them on demand.
     archived_summaries: Vec<ThreadSummary>,
     /// Session file path per summary id, for sidecar writes and reopen.
     session_paths: HashMap<String, PathBuf>,
     known_projects: Vec<String>,
+    /// The durable sidebar order: folder sequence plus one thread account per
+    /// partition. Authoritative over `summaries`' order — see
+    /// [`crate::sidebar_order`].
+    order: crate::sidebar_order::SidebarOrder,
+    /// Set when `order` diverged from its persisted form; `with_mut`'s drain
+    /// writes and clears it outside the state lock.
+    order_dirty: bool,
     /// Host db handle persisting `known_projects` (shared threads.db,
     /// `projects` table only — thread rows remain the manox store's domain).
     db: std::sync::Arc<crate::db::ThreadsDatabase>,
@@ -111,19 +124,41 @@ impl StoreHandle {
     }
 
     /// Mutate under the write lock, then broadcast the buffered events and
-    /// dispatch the queued sidecar writes. Three-phase: lock -> mutate
-    /// (collecting `pending_events` / `pending_meta_writes`) -> unlock ->
-    /// emit. The closure must never await.
+    /// dispatch the queued sidecar writes and (when the account moved) the
+    /// sidebar order. Three-phase: lock -> mutate (collecting `pending_events`
+    /// / `pending_meta_writes` / the dirty order snapshot) -> unlock -> emit.
+    /// The closure must never await.
     pub fn with_mut<R>(&self, f: impl FnOnce(&mut ThreadStore) -> R) -> R {
-        let (r, events, writes) = {
+        let (r, events, writes, order_write) = {
             let mut state = self.0.state.write();
             let r = f(&mut state);
             let events = std::mem::take(&mut state.pending_events);
             let writes = std::mem::take(&mut state.pending_meta_writes);
-            (r, events, writes)
+            let order_write = if state.order_dirty {
+                state.order_dirty = false;
+                Some(state.order.clone())
+            } else {
+                None
+            };
+            (r, events, writes, order_write)
         };
         for write in writes {
             self.spawn_meta_write(write);
+        }
+        if let Some(order) = order_write {
+            // No runtime (a bare unit test, or teardown) drops the write rather
+            // than panicking: the account is best-effort UI truth, and the
+            // in-memory order stays correct for the running process.
+            if let Some(handle) = crate::runtime::try_handle() {
+                handle.spawn(async move {
+                    if let Err(error) = crate::sidebar_order::save(&order).await {
+                        tracing::warn!(
+                            error = %error,
+                            "failed to persist the sidebar order account"
+                        );
+                    }
+                });
+            }
         }
         self.broadcast(events);
         r
@@ -162,16 +197,26 @@ impl StoreHandle {
     /// return. The gateway's `ListThreads` self-hold (cross-domain #5)
     /// answers from a fresh scan, so no client needs an in-process rescan
     /// trigger or a store-event bridge to time its refetch.
+    ///
+    /// The durable order account is read outside the mutation closure (it is
+    /// awaited work; the closure never awaits), and the account's display
+    /// order replaces the scanned order before the rows are published.
     pub async fn refresh_now(&self) {
         let dir = self.read(|s| s.sessions_dir.clone());
         let rows = load_summaries(&dir).await;
         let registry = crate::thread_registry::load().await;
+        let order = crate::sidebar_order::load().await;
         self.with_mut(|s| {
-            let (session_paths, mut summaries, archived) = group_by_thread(rows, &registry);
+            let (session_paths, summaries, archived) = group_by_thread(rows, &registry);
+            let mut summaries = summaries;
             resolve_depths(&mut summaries);
             s.session_paths = session_paths;
             s.summaries = summaries;
             s.archived_summaries = archived;
+            // The persisted account is the authority over the row order; the
+            // scan's timestamp order is only ever an input to first-sight.
+            s.order = order;
+            s.rerank();
             s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         });
     }
@@ -231,6 +276,8 @@ pub fn init() {
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects,
+        order: crate::sidebar_order::SidebarOrder::default(),
+        order_dirty: false,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         pending_plan: HashSet::new(),
@@ -319,12 +366,143 @@ impl ThreadStore {
             .or_else(|| self.archived_summaries.iter().find(|s| s.id == id))
     }
 
-    /// All registered project paths. The sidebar renders a folder for every
-    /// path here.
+    /// The sidebar partition a row belongs to: its registered project, or the
+    /// loose Conversations account. An unregistered path (a removed folder, or
+    /// a cwd never bound as a project) is loose — the same partition rule the
+    /// client renders on, so both sides agree by construction.
+    fn partition_of<'a>(known_projects: &[String], project: &'a str) -> &'a str {
+        if project.is_empty() || !known_projects.iter().any(|p| p == project) {
+            crate::sidebar_order::LOOSE
+        } else {
+            project
+        }
+    }
+
+    /// Re-emit both partitions from the durable order account: reconcile every
+    /// account against live membership (first-seen ids prepend, dead ids and
+    /// emptied partitions drop), then lay the rows out as folder sequence →
+    /// pinned band → account rank.
+    ///
+    /// This is the one place the sidebar order is decided: a timestamp never
+    /// re-sorts a live row. `order_dirty` rises only when the account itself
+    /// moved — the emitted sequence is a pure function of the account, live
+    /// membership and the pinned flag (sidecar truth), so re-emitting it after a
+    /// rescan or a flag write persists nothing.
+    fn rerank(&mut self) {
+        let Self {
+            summaries,
+            archived_summaries,
+            known_projects,
+            order,
+            order_dirty,
+            ..
+        } = self;
+        let scanned = std::mem::take(summaries);
+        let groups = order.reconcile_groups(known_projects);
+        let rows: Vec<crate::sidebar_order::Row<'_>> = scanned
+            .iter()
+            .map(|s| crate::sidebar_order::Row {
+                id: s.id.as_str(),
+                partition: Self::partition_of(known_projects, &s.project),
+                pinned: s.pinned,
+                interacted_at: s.interacted_at,
+            })
+            .collect();
+        let before = order.clone();
+        let ordered = crate::sidebar_order::reconcile(order, &rows);
+        let index: HashMap<&str, usize> = scanned
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id.as_str(), i))
+            .collect();
+        let mut ranked: Vec<ThreadSummary> = Vec::with_capacity(scanned.len());
+        for partition in groups
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(crate::sidebar_order::LOOSE))
+        {
+            let Some(ids) = ordered.get(partition) else {
+                continue;
+            };
+            ranked.extend(
+                ids.iter()
+                    .filter_map(|id| index.get(*id).map(|&i| scanned[i].clone())),
+            );
+        }
+        if ranked.len() != scanned.len() {
+            // Every live row is claimed by exactly one partition, so a mismatch
+            // means the account lost a row: keep the scanned order rather than
+            // dropping it from the list.
+            tracing::warn!(
+                ranked = ranked.len(),
+                live = scanned.len(),
+                "sidebar order left rows unclaimed; keeping the scanned order"
+            );
+            ranked = scanned;
+        }
+        *summaries = ranked;
+        // The registry list is the folder account's projection, so the wire
+        // `Projects` mirror every client reads carries the committed sequence.
+        *known_projects = groups;
+        // The archived partition owns no account; a deterministic
+        // interaction-then-id sort keeps its list stable across refreshes.
+        archived_summaries.sort_by(|a, b| {
+            b.interacted_at
+                .cmp(&a.interacted_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        *order_dirty |= *order != before;
+    }
+
+    /// Move one thread inside its partition's durable account (DOM
+    /// `insertBefore`; `before = None` appends to the tail). A rejected move —
+    /// an unaccounted row or anchor — changes nothing at all: no mutation, no
+    /// event, no write.
+    pub fn insert_thread_before(&mut self, thread_id: &str, before: Option<&str>) {
+        let Some(row) = self.summary_by_id(thread_id) else {
+            tracing::warn!(thread = thread_id, "sidebar move rejected: unknown thread");
+            return;
+        };
+        let partition = Self::partition_of(&self.known_projects, &row.project).to_string();
+        match self.order.move_thread(&partition, thread_id, before) {
+            Ok(false) => {}
+            Ok(true) => {
+                // The account is already mutated here, so the dirty flag must be
+                // raised before the rerank (which diffs from this point).
+                self.order_dirty = true;
+                self.rerank();
+                self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, thread = thread_id, "sidebar move rejected");
+            }
+        }
+    }
+
+    /// Move one project folder inside the Projects section order. Same
+    /// rejection and no-op contract as [`Self::insert_thread_before`].
+    pub fn insert_group_before(&mut self, path: &str, before: Option<&str>) {
+        match self.order.move_group(path, before) {
+            Ok(false) => {}
+            Ok(true) => {
+                // The account is already mutated here, so the dirty flag must be
+                // raised before the rerank (which diffs from this point).
+                self.order_dirty = true;
+                self.rerank();
+                self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, project = path, "sidebar folder move rejected");
+            }
+        }
+    }
+
+    /// All registered project paths in committed folder order. The sidebar
+    /// renders a folder for every path here, and the wire registry mirror
+    /// broadcasts this exact sequence, so folder order is shared state.
     pub fn known_projects(&self) -> &[String] {
         &self.known_projects
     }
-
     /// Register a project path: in-memory list + persisted to the db
     /// `projects` table so sidebar folders survive restarts even when all
     /// their threads are archived.
@@ -336,6 +514,9 @@ impl ThreadStore {
         if let Err(e) = self.db.register_project(&path) {
             tracing::warn!(error = %e, "failed to persist project registration");
         }
+        // The folder account claims a committed tail position for the new
+        // folder, and the registry list is re-projected from it.
+        self.rerank();
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
@@ -351,6 +532,8 @@ impl ThreadStore {
         if let Err(e) = self.db.remove_project(path) {
             tracing::warn!(error = %e, "failed to persist project removal");
         }
+        // The folder leaves the account; its rows re-partition as loose.
+        self.rerank();
         self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
     }
 
@@ -605,6 +788,9 @@ impl ThreadStore {
                 );
             }
         }
+        // Membership moved between the two partitions, so the accounts gain or
+        // lose exactly the rows that just crossed.
+        self.rerank();
     }
 
     /// `id` plus every transitive child across both partitions, each parent
@@ -623,12 +809,28 @@ impl ThreadStore {
         out
     }
 
-    /// Toggle the pinned flag on a session (persisted in its sidecar).
+    /// Set the pinned flag on a session (persisted in its sidecar). A pin is an
+    /// explicit order action — like a drag — so the row floats to the head of
+    /// its partition and leads the pinned band; unpinning leaves the account
+    /// alone and the row drops into the unpinned band at its stored rank.
     pub fn pin_thread(&mut self, id: &str, pinned: bool) {
         let archived = self.summary_by_id(id).is_some_and(|s| s.archived);
         if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
+        if pinned {
+            let project = self
+                .summary_by_id(id)
+                .map(|s| s.project.clone())
+                .unwrap_or_default();
+            let known = self.known_projects.clone();
+            let partition = Self::partition_of(&known, &project).to_string();
+            if self.order.float_to_head(&partition, id) {
+                self.order_dirty = true;
+            }
+        }
+        // The band membership moved, so the emitted order is re-derived.
+        self.rerank();
         // K3 (L3): the flag decision journals a `pinned_archived` entry —
         // the entry is the authority (K2) and the sidecar write below is
         // the derived fast-list cache. The entry carries BOTH flags, so
@@ -749,6 +951,9 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
                 manox_harness::session_meta::SessionMeta::default()
             }
         };
+        if meta.interacted_at.is_none() {
+            seed_interaction_stamp(dir, &info);
+        }
         // The owning thread's id rides the header metadata (stamped at
         // creation, inherited by forks); absent on legacy files.
         let thread_key = info
@@ -765,6 +970,33 @@ async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
         });
     }
     out
+}
+/// Materialize a missing interaction stamp. Fire-and-forget and rescan-free
+/// (this write must never trigger another scan — it runs inside one), and
+/// idempotent: a concurrent human prompt that stamped the sidecar first wins,
+/// because the update refuses to overwrite a present value.
+fn seed_interaction_stamp(
+    dir: &std::path::Path,
+    info: &manox_harness::session::repository::SessionInfo,
+) {
+    let Some(handle) = crate::runtime::try_handle() else {
+        return;
+    };
+    let dir = dir.to_path_buf();
+    let path = info.path.clone();
+    let id = info.id.clone();
+    let at = info.modified_at.timestamp();
+    handle.spawn(async move {
+        let result = manox_harness::session_meta::update(&dir, &path, |meta| {
+            if meta.interacted_at.is_none() {
+                meta.interacted_at = Some(at);
+            }
+        })
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(session = %id, %error, "failed to seed the interaction stamp");
+        }
+    });
 }
 
 /// Maximum team nesting depth. One cap serves two roles: it bounds a legal
@@ -955,7 +1187,12 @@ fn session_info_to_summary(
         has_unread: meta.unread,
         errored: meta.errored,
         created_at: info.created_at.timestamp(),
-        interacted_at: info.modified_at.timestamp(),
+        // The interaction stamp is the sidebar's only recency key, and the host
+        // advances it exactly when a human prompt or steer lands. A session
+        // predating the stamp falls back to its last durable write — the value
+        // `seed_interaction_stamp` freezes into the sidecar on this scan, so no
+        // transcript growth floats the row thereafter.
+        interacted_at: meta.interacted_at.unwrap_or(info.modified_at.timestamp()),
         updated_at: info.modified_at.timestamp(),
         cumulative_total_tokens: 0,
     }
@@ -979,6 +1216,8 @@ pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         archived_summaries: Vec::new(),
         session_paths: HashMap::new(),
         known_projects: Vec::new(),
+        order: crate::sidebar_order::SidebarOrder::default(),
+        order_dirty: false,
         db,
         running: HashSet::new(),
         pending_auth: HashSet::new(),
@@ -1037,6 +1276,8 @@ mod tests {
             archived_summaries: Vec::new(),
             session_paths: HashMap::new(),
             known_projects,
+            order: crate::sidebar_order::SidebarOrder::default(),
+            order_dirty: false,
             db,
             running: HashSet::new(),
             pending_auth: HashSet::new(),
@@ -1840,5 +2081,212 @@ mod tests {
             );
         }
         std::fs::remove_file(db_path).ok();
+    }
+
+    // ── Durable order account ──────────────────────────────────────────────
+
+    /// A store seeded with rows: `(id, project, interacted_at, pinned)`. Every
+    /// project a row names is registered first, so partition assignment follows
+    /// the same rule production uses.
+    ///
+    /// Assertions read the in-memory account and the dirty flag inside the
+    /// mutation closure: without a runtime the drain cannot spawn a save, so no
+    /// test ever touches the real `~/.manox/sidebar.order.json`.
+    fn ordered_store(rows: &[(&str, &str, i64, bool)]) -> (StoreHandle, std::path::PathBuf) {
+        let (db, db_path) = temp_db();
+        let store = store_handle(db);
+        store.with_mut(|s| {
+            for (id, project, at, pinned) in rows {
+                s.insert_summary_with_times_for_test(
+                    id,
+                    None,
+                    *at,
+                    *at,
+                    project,
+                    None,
+                    PermissionMode::default().as_i64(),
+                );
+                if !project.is_empty() && !s.known_projects.iter().any(|p| p == project) {
+                    s.known_projects.push(project.to_string());
+                }
+                if let Some(sum) = s.summary_mut(id) {
+                    sum.pinned = *pinned;
+                }
+            }
+            s.rerank();
+            s.order_dirty = false;
+        });
+        (store, db_path)
+    }
+
+    fn ids(store: &StoreHandle) -> Vec<String> {
+        store.read(ranked_ids)
+    }
+
+    /// The same projection against a raw store handle (inside a mutation
+    /// closure, where the dirty-flag assertion belongs).
+    fn ranked_ids(store: &ThreadStore) -> Vec<String> {
+        store.summaries.iter().map(|x| x.id.clone()).collect()
+    }
+
+    #[test]
+    fn a_later_rescan_with_moved_timestamps_cannot_reorder_the_list() {
+        let (store, path) = ordered_store(&[
+            ("t1", "/p/a", 100, false),
+            ("t2", "/p/a", 200, false),
+            ("t3", "", 300, false),
+        ]);
+        let seeded = store.read(|s| s.order.clone());
+        // A background turn lands on every row and the next scan hands the rows
+        // over in the opposite arrival order: neither may move a row.
+        store.with_mut(|s| {
+            s.summaries.reverse();
+            for sum in s.summaries.iter_mut() {
+                sum.interacted_at += 10_000;
+                sum.updated_at += 10_000;
+            }
+            s.rerank();
+            assert!(
+                !s.order_dirty,
+                "a membership-preserving rescan persists nothing"
+            );
+        });
+        assert_eq!(ids(&store), vec!["t2", "t1", "t3"], "activity moved a row");
+        assert_eq!(
+            store.read(|s| s.order.clone()),
+            seeded,
+            "the account churned"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_thread_move_reorders_the_list_and_dirties_the_account() {
+        let (store, path) = ordered_store(&[
+            ("t1", "/p/a", 100, false),
+            ("t2", "/p/a", 200, false),
+            ("t3", "/p/a", 300, false),
+        ]);
+        assert_eq!(ids(&store), vec!["t3", "t2", "t1"]);
+        store.with_mut(|s| {
+            s.insert_thread_before("t1", Some("t3"));
+            assert!(s.order_dirty, "a real move must persist");
+        });
+        assert_eq!(ids(&store), vec!["t1", "t3", "t2"]);
+        assert_eq!(
+            store.read(|s| s.order.accounts["/p/a"].clone()),
+            vec!["t1".to_string(), "t3".to_string(), "t2".to_string()],
+            "the account must record the move"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_move_is_rejected_when_the_anchor_lives_elsewhere() {
+        let (store, path) =
+            ordered_store(&[("t1", "/p/a", 100, false), ("t2", "/p/b", 200, false)]);
+        let before = ids(&store);
+        store.with_mut(|s| {
+            s.insert_thread_before("t1", Some("t2"));
+            assert_eq!(
+                ranked_ids(s),
+                before,
+                "a cross-partition move must not apply"
+            );
+            assert!(!s.order_dirty, "a rejected move persists nothing");
+        });
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn pinning_floats_the_row_to_its_partition_head() {
+        // A pin journals its decision and persists the account, both of which
+        // need the runtime — so the account file goes to a scratch path.
+        crate::runtime::init_hermetic_for_test();
+        let scratch = std::env::temp_dir().join(format!("pi-order-{}.json", uuid::Uuid::new_v4()));
+        crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
+        let (store, path) = ordered_store(&[
+            ("t1", "/p/a", 300, false),
+            ("t2", "/p/a", 200, false),
+            ("t3", "/p/a", 100, true),
+        ]);
+        // A pinned row leads the partition even though it was the oldest row.
+        assert_eq!(ids(&store), vec!["t3", "t1", "t2"]);
+        store.with_mut(|s| {
+            s.pin_thread("t2", true);
+            assert!(s.order_dirty, "a pin is an explicit order action");
+        });
+        // The most recently pinned row leads: a pin floats, it does not merely
+        // re-band.
+        assert_eq!(ids(&store), vec!["t2", "t3", "t1"]);
+        // Unpinning drops the row back to its stored rank.
+        store.with_mut(|s| s.pin_thread("t2", false));
+        assert_eq!(ids(&store), vec!["t3", "t2", "t1"]);
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&scratch).ok();
+        crate::sidebar_order::set_order_path_for_test(None);
+    }
+
+    #[test]
+    fn a_new_row_surfaces_at_the_head_of_its_partition() {
+        let (store, path) = ordered_store(&[("t1", "/p/a", 100, false)]);
+        store.with_mut(|s| {
+            s.insert_summary_with_times_for_test(
+                "t9",
+                None,
+                900,
+                900,
+                "/p/a",
+                None,
+                PermissionMode::default().as_i64(),
+            );
+            s.rerank();
+        });
+        assert_eq!(ids(&store), vec!["t9", "t1"]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn folders_follow_the_committed_order_and_the_registry_projects_it() {
+        let (store, path) = ordered_store(&[
+            ("t1", "/p/a", 100, false),
+            ("t2", "/p/b", 200, false),
+            ("t3", "", 300, false),
+        ]);
+        assert_eq!(
+            store.read(|s| s.known_projects().to_vec()),
+            vec!["/p/a".to_string(), "/p/b".to_string()]
+        );
+        store.with_mut(|s| s.insert_group_before("/p/b", Some("/p/a")));
+        assert_eq!(
+            store.read(|s| s.known_projects().to_vec()),
+            vec!["/p/b".to_string(), "/p/a".to_string()]
+        );
+        // Loose rows stay last regardless of folder order.
+        assert_eq!(ids(&store), vec!["t2", "t1", "t3"]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn archiving_leaves_the_account_and_unarchiving_surfaces_at_the_head() {
+        // Archiving journals its decision and persists the account, both of
+        // which need the runtime — so the account file goes to a scratch path.
+        crate::runtime::init_hermetic_for_test();
+        let scratch = std::env::temp_dir().join(format!("pi-order-{}.json", uuid::Uuid::new_v4()));
+        crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
+        let (store, path) =
+            ordered_store(&[("t1", "/p/a", 100, false), ("t2", "/p/a", 200, false)]);
+        store.with_mut(|s| s.archive_thread("t1", true));
+        assert_eq!(ids(&store), vec!["t2"]);
+        assert!(
+            !store.read(|s| s.order.accounts["/p/a"].contains(&"t1".to_string())),
+            "an archived row leaves the account"
+        );
+        store.with_mut(|s| s.archive_thread("t1", false));
+        // A row that returns has no stored rank, so it surfaces at the head.
+        assert_eq!(ids(&store), vec!["t1", "t2"]);
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&scratch).ok();
+        crate::sidebar_order::set_order_path_for_test(None);
     }
 }

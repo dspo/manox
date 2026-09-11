@@ -61,6 +61,11 @@ pub struct SessionMeta {
     /// User-assigned tag shown as a chip on the sidebar row. Absent = no tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Unix seconds of the last human-authored prompt or steer. The sidebar's
+    /// recency key: no other write — assistant output, tool results, injected
+    /// agent turns, titles, flags — advances it. Absent = never stamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interacted_at: Option<i64>,
     /// Compact display forms for registry slash turns (`/name args`), keyed
     /// by the user message's ordinal (0-based among user-role prompt messages)
     /// in the pi transcript. The transcript stores only the expanded
@@ -335,5 +340,39 @@ mod tests {
             .unwrap();
         let meta = load(dir.path(), &session).await.unwrap();
         assert!(meta.archived);
+    }
+
+    /// The interaction stamp round-trips and stays absent until written: it is
+    /// the sidebar's only recency key, so a lost or defaulted read would
+    /// silently re-sort rows.
+    #[tokio::test]
+    async fn interacted_at_round_trips_and_defaults_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("abc.jsonl");
+        assert!(
+            load(dir.path(), &session)
+                .await
+                .unwrap()
+                .interacted_at
+                .is_none()
+        );
+
+        let mut meta = load(dir.path(), &session).await.unwrap();
+        meta.interacted_at = Some(1_700_000_500);
+        save(dir.path(), &session, &meta).await.unwrap();
+        assert_eq!(
+            load(dir.path(), &session).await.unwrap().interacted_at,
+            Some(1_700_000_500)
+        );
+
+        update(dir.path(), &session, |meta| meta.unread = true)
+            .await
+            .unwrap();
+        let settled = load(dir.path(), &session).await.unwrap();
+        assert_eq!(
+            settled.interacted_at,
+            Some(1_700_000_500),
+            "an unrelated flag write must not drop the interaction stamp"
+        );
     }
 }

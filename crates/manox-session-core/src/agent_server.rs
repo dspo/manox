@@ -1476,6 +1476,21 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::PinThread { session_id, pinned } => {
             manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
         }
+        // Sidebar order moves ride the same setter-note family: no receipt, the
+        // store's `SummariesUpdated` echo carries the new order to every
+        // connection as the §D.5 `ThreadsUpdated` snapshot. A rejected move
+        // (unaccounted row or anchor) changes nothing — the store warns.
+        ClientNote::InsertThreadBefore {
+            thread_id,
+            before_thread_id,
+        } => {
+            manox_agent::thread_store::global()
+                .with_mut(|s| s.insert_thread_before(&thread_id, before_thread_id.as_deref()));
+        }
+        ClientNote::InsertGroupBefore { path, before_path } => {
+            manox_agent::thread_store::global()
+                .with_mut(|s| s.insert_group_before(&path, before_path.as_deref()));
+        }
         // U6b①: the browser-suite toggle rides the gateway (the setter-note
         // family shape: a string suite name, fire-and-forget — the effect
         // returns via the facade's BrowserSuitesChanged echo). The desktop's
