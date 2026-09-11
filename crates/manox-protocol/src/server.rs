@@ -75,6 +75,20 @@ pub enum ServerCall {
     ClipboardRead { session_id: String },
     /// Open a URL / path in the OS default handler. Reply payload: `{}`.
     OpenExternal { session_id: String, url: String },
+    /// Execute one of the client's registered tools
+    /// ([`crate::ClientCall::RegisterSessionTools`]). Routed to the
+    /// registering client. Reply payload:
+    /// `{ "content": string, "isError": bool }` (or RPC `Err`).
+    InvokeClientTool {
+        /// Stable delivery identity — withdrawable via
+        /// [`crate::ClientCall::CancelDelivery`], like `Approve`.
+        delivery_id: String,
+        session_id: String,
+        client_id: String,
+        tool_call_id: String,
+        name: String,
+        input: serde_json::Value,
+    },
 }
 
 impl ServerCall {
@@ -87,7 +101,8 @@ impl ServerCall {
             | ServerCall::AskUserQuestion { session_id, .. }
             | ServerCall::BrowserOp { session_id, .. }
             | ServerCall::ClipboardRead { session_id, .. }
-            | ServerCall::OpenExternal { session_id, .. } => session_id,
+            | ServerCall::OpenExternal { session_id, .. }
+            | ServerCall::InvokeClientTool { session_id, .. } => session_id,
         }
     }
 
@@ -98,7 +113,8 @@ impl ServerCall {
         match self {
             ServerCall::Approve { delivery_id, .. }
             | ServerCall::PlanVerdict { delivery_id, .. }
-            | ServerCall::AskUserQuestion { delivery_id, .. } => Some(delivery_id),
+            | ServerCall::AskUserQuestion { delivery_id, .. }
+            | ServerCall::InvokeClientTool { delivery_id, .. } => Some(delivery_id),
             ServerCall::BrowserOp { .. }
             | ServerCall::ClipboardRead { .. }
             | ServerCall::OpenExternal { .. } => None,

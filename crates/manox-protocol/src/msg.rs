@@ -365,6 +365,18 @@ mod tests {
                     delivery_id: "dlv-s1-1".into(),
                 },
             },
+            FromClient::Request {
+                id: MsgId::new("r-5"),
+                call: crate::client::ClientCall::RegisterSessionTools {
+                    session_id: "s1".into(),
+                    client_id: "test".into(),
+                    tools: vec![crate::client::ClientToolSpec {
+                        name: "get_selection".into(),
+                        description: "The editor's active selection.".into(),
+                        input_schema: serde_json::json!({"type": "object"}),
+                    }],
+                },
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();
@@ -393,6 +405,17 @@ mod tests {
                     tool_name: "Bash".into(),
                     summary: "rm -rf".into(),
                     input: serde_json::json!({"command": "rm"}),
+                },
+            },
+            FromServer::Request {
+                id: MsgId::new("adj-4"),
+                call: crate::server::ServerCall::InvokeClientTool {
+                    delivery_id: "dlv-s1-4".into(),
+                    session_id: "s1".into(),
+                    client_id: "test".into(),
+                    tool_call_id: "tc-1".into(),
+                    name: "get_selection".into(),
+                    input: serde_json::json!({}),
                 },
             },
             FromServer::Request {

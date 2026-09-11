@@ -1538,6 +1538,7 @@ fn build_tools(
     cwd: &Path,
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
+    session_id: &str,
     gate: &Arc<ApprovalGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -1835,6 +1836,16 @@ fn build_tools(
                 ));
                 tools.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate))));
             }
+        }
+    }
+    // Embedder-registered tools (the hosting editor's contributions —
+    // RegisterSessionTools): the provider is the AgentServer's registry;
+    // each tool rides the same approval gate as MCP tools (an embedder
+    // tool is a remote call into the host, mutating by default). A context
+    // with no embedder provider contributes nothing.
+    if let Some(provider) = crate::embedder_tools::provider() {
+        for tool in provider.tools_for(session_id) {
+            tools.push(Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))));
         }
     }
     // Steer bus: engine-scoped (created in `spawn_engine`), registered here
@@ -3006,6 +3017,7 @@ fn session_builder(
         cwd,
         runtime,
         model,
+        thread_id,
         gate,
         plan,
         notice_tx,

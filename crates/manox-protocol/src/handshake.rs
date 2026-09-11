@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// and echoes the accepted epoch in `HostEvent::Ready`. Bumping this constant
 /// is a deliberate spec revision (L12: names are added at group tails with an
 /// epoch bump), never a silent drift.
-pub const PROTOCOL_EPOCH: u32 = 1;
+pub const PROTOCOL_EPOCH: u32 = 3;
 
 /// Capabilities a client can answer when the server issues a [`super::ServerCall`].
 /// Declared in [`ClientHello`] so the server routes each call only to clients
@@ -24,6 +24,7 @@ pub enum HookKind {
     BrowserOp,
     ClipboardRead,
     OpenExternal,
+    ClientTool,
 }
 
 /// First client→server request. Declares who the client is, which

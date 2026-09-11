@@ -5488,7 +5488,10 @@ fn handshake_ready_double_emits_host_epoch_echo() {
     match client.recv() {
         FromServer::Host {
             host: HostEvent::Ready { epoch },
-        } => assert_eq!(epoch, 1, "the Ready host event echoes the epoch"),
+        } => assert_eq!(
+            epoch, PROTOCOL_EPOCH,
+            "the Ready host event echoes the epoch"
+        ),
         other => panic!("expected the Host Ready epoch echo (C1/GW1), got {other:?}"),
     }
     drop(client);
@@ -6920,6 +6923,12 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
         ClientCall::CancelDelivery {
             delivery_id: "j1-nope".into(),
         },
+        // The embedder-tools arm answers too (empty registration → 0).
+        ClientCall::RegisterSessionTools {
+            session_id: "j1-s".into(),
+            client_id: "test".into(),
+            tools: vec![],
+        },
     ];
     let mut expected: HashMap<String, &'static str> = HashMap::new();
     for (i, call) in calls.into_iter().enumerate() {
@@ -8085,5 +8094,294 @@ async fn pending_submit_queue_survives_a_panicking_lock_holder() {
         "the queue is servicable after the panicking holder"
     );
     drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+// ── Embedder tools (dspo/manox-app#11): registration store, engine-facing
+// provider, and the InvokeClientTool execution round trip. ────────────────
+
+use manox_agent::embedder_tools::EmbedderToolProvider as _;
+
+fn client_tool_spec(name: &str) -> ClientToolSpec {
+    ClientToolSpec {
+        name: name.into(),
+        description: "test embedder tool".into(),
+        input_schema: serde_json::json!({"type": "object", "properties": {}}),
+    }
+}
+
+fn register_tools(client: &Client, session: &str, tools: Vec<ClientToolSpec>) -> Value {
+    client.send(FromClient::Request {
+        id: MsgId::new("reg-tools"),
+        call: ClientCall::RegisterSessionTools {
+            session_id: session.into(),
+            client_id: "test".into(),
+            tools,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "register never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "reg-tools"
+        {
+            return outcome.expect("register succeeds");
+        }
+    }
+}
+
+#[test]
+fn register_session_tools_replaces_and_feeds_the_provider() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
+    manox_agent::embedder_tools::set_provider(provider.clone());
+    create(&server, &client, "et-s");
+
+    assert_eq!(
+        register_tools(
+            &client,
+            "et-s",
+            vec![client_tool_spec("a"), client_tool_spec("b")]
+        )["registered"],
+        2
+    );
+    assert_eq!(
+        register_tools(&client, "et-s", vec![client_tool_spec("get_selection")])["registered"],
+        1,
+        "re-register replaces"
+    );
+
+    let tools = provider.tools_for("et-s");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(
+        tools[0].name(),
+        "client_get_selection",
+        "the model-facing name is sanitized+prefixed"
+    );
+    assert_eq!(tools[0].description(), "test embedder tool");
+    assert!(
+        provider.tools_for("other-session").is_empty(),
+        "registrations are session-scoped"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// Drive one adapter execution on a worker thread while the test thread
+/// answers the InvokeClientTool round trip. `reply` settles the host's
+/// answer; the adapter's mapped result comes back over std mpsc.
+fn execute_embedder_tool(
+    server: &AgentServer,
+    client: &Client,
+    session: &str,
+    reply: Result<Value, manox_protocol::RpcError>,
+) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+    let provider = AgentServerEmbedderTools::new(server);
+    let tool = provider
+        .tools_for(session)
+        .into_iter()
+        .next()
+        .expect("one registered tool");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = tx.send(rt.block_on(async {
+            tool.execute(
+                "tc-1",
+                serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+                &NullEmbedderCtx,
+            )
+            .await
+        }));
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "invoke never arrived");
+        if let FromServer::Request {
+            id,
+            call:
+                ServerCall::InvokeClientTool {
+                    session_id,
+                    client_id,
+                    name,
+                    tool_call_id,
+                    ..
+                },
+        } = client.recv()
+        {
+            assert_eq!(session_id, session);
+            assert_eq!(client_id, "test");
+            assert_eq!(name, "get_selection");
+            assert_eq!(tool_call_id, "tc-1");
+            client.send(FromClient::Reply {
+                id,
+                outcome: reply.clone(),
+            });
+            break;
+        }
+    }
+    rx.recv().unwrap()
+}
+
+struct NullEmbedderCtx;
+impl manox_harness::tool::ToolContext for NullEmbedderCtx {
+    fn env(&self) -> &dyn manox_harness::env::ExecutionEnv {
+        unreachable!("embedder tools never touch the env")
+    }
+    fn cwd(&self) -> &std::path::Path {
+        std::path::Path::new("/")
+    }
+    fn tool_state(&self) -> &manox_harness::tool::ToolState {
+        unreachable!("embedder tools never touch the tool state")
+    }
+}
+
+#[test]
+fn embedder_tool_invoke_round_trips() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+    let (server, client) = harness(vec![HookKind::ClientTool]);
+    manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
+        &server,
+    )));
+    create(&server, &client, "et-i");
+    register_tools(&client, "et-i", vec![client_tool_spec("get_selection")]);
+
+    // Ok reply with content settles as the tool result.
+    let result = execute_embedder_tool(
+        &server,
+        &client,
+        "et-i",
+        Ok(serde_json::json!({"content": "the selection", "isError": false})),
+    )
+    .expect("ok reply settles");
+    assert!(format!("{result:?}").contains("the selection"));
+
+    // isError content maps to a tool error naming the content.
+    let err = execute_embedder_tool(
+        &server,
+        &client,
+        "et-i",
+        Ok(serde_json::json!({"content": "boom", "isError": true})),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, manox_harness::tool::ToolError::ExecutionFailed(m) if m == "boom"),
+        "got {err:?}"
+    );
+
+    // An RPC Err maps to a tool error carrying the message.
+    let err = execute_embedder_tool(
+        &server,
+        &client,
+        "et-i",
+        Err(manox_protocol::RpcError::new(-1, "host exploded")),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, manox_harness::tool::ToolError::ExecutionFailed(m) if m == "host exploded"),
+        "got {err:?}"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn embedder_tool_without_capable_owner_fails_closed() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+    // The client declares NO ClientTool capability.
+    let (server, client) = harness(vec![]);
+    manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
+        &server,
+    )));
+    create(&server, &client, "et-f");
+    register_tools(&client, "et-f", vec![client_tool_spec("get_selection")]);
+
+    let provider = AgentServerEmbedderTools::new(&server);
+    let tool = provider.tools_for("et-f").into_iter().next().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt
+        .block_on(async {
+            tool.execute(
+                "tc-1",
+                serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+                &NullEmbedderCtx,
+            )
+            .await
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&err, manox_harness::tool::ToolError::ExecutionFailed(m) if m.contains("cannot answer")),
+        "the error names the routing failure: {err:?}"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn dispose_clears_embedder_registrations() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
+    manox_agent::embedder_tools::set_provider(provider.clone());
+    create(&server, &client, "et-d");
+    register_tools(&client, "et-d", vec![client_tool_spec("get_selection")]);
+    assert_eq!(provider.tools_for("et-d").len(), 1);
+
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-d".into(),
+        },
+    });
+    // The dispose note answers with a directed SessionDisposed; drain to it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dispose never settled"
+        );
+        match client.recv() {
+            FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id },
+            } if session_id == "et-d" => break,
+            _ => {}
+        }
+    }
+    assert!(
+        provider.tools_for("et-d").is_empty(),
+        "dispose clears the session's registrations"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
     manox_agent::thread_store::drop_global_for_test();
 }
