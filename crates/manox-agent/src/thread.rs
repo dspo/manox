@@ -2492,6 +2492,9 @@ pub(crate) mod tests {
         plan_persists: Mutex<Vec<Option<serde_json::Value>>>,
         /// Recorded `steer` calls (the mid-run injection texts).
         steers: Mutex<Vec<String>>,
+        /// The session file the facade reports as active — the stamp writes
+        /// need a real path to target.
+        session_path: Mutex<Option<PathBuf>>,
     }
 
     impl FakeEngine {
@@ -2506,7 +2509,12 @@ pub(crate) mod tests {
                 runs: Mutex::new(Vec::new()),
                 plan_persists: Mutex::new(Vec::new()),
                 steers: Mutex::new(Vec::new()),
+                session_path: Mutex::new(None),
             }
+        }
+
+        pub(crate) fn set_session_path(&self, path: PathBuf) {
+            *self.session_path.lock().unwrap() = Some(path);
         }
     }
     impl ThreadEngine for FakeEngine {
@@ -2564,7 +2572,7 @@ pub(crate) mod tests {
         fn set_cwd(&self, _path: PathBuf) {}
 
         fn active_session_path(&self) -> Option<PathBuf> {
-            None
+            self.session_path.lock().unwrap().clone()
         }
 
         fn session_list(&self) -> Vec<crate::db::ThreadSummary> {
@@ -2699,6 +2707,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         // Mid-run mirror refresh: the live partial lands in `messages`.
@@ -2739,6 +2748,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         // The prompt form enters plan mode and runs the turn with the
@@ -2802,6 +2812,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| {
@@ -2842,6 +2853,79 @@ pub(crate) mod tests {
         });
     }
 
+    /// The sidebar's recency key moves on a human prompt/steer and on nothing
+    /// else: an agent-authored user-role message (a peer delivery, a plan seed)
+    /// must leave the stamp untouched, or background traffic would float rows.
+    #[tokio::test]
+    async fn human_turns_stamp_the_interaction_key_and_agent_turns_do_not() {
+        crate::runtime::init_hermetic_for_test();
+        let sessions = crate::paths::manox_config_dir().unwrap().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let human_session = sessions.join("human-stamp.jsonl");
+        let agent_session = sessions.join("agent-stamp.jsonl");
+        std::fs::write(&human_session, "").unwrap();
+        std::fs::write(&agent_session, "").unwrap();
+
+        let engine = Arc::new(FakeEngine::new());
+        engine.set_session_path(human_session.clone());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| t.insert_user_message_with_ui_metadata("a human prompt".into(), None));
+        let stamped = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(at) = manox_harness::session_meta::load(&sessions, &human_session)
+                    .await
+                    .unwrap()
+                    .interacted_at
+                {
+                    return at;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a human prompt never stamped the interaction key");
+        assert!(stamped > 0, "the stamp must be a real timestamp");
+
+        // An agent-authored user turn: attributed, but never an interaction.
+        let engine = Arc::new(FakeEngine::new());
+        engine.set_session_path(agent_session.clone());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
+        thread.with_mut(|t| {
+            t.insert_user_message_with_ui_metadata(
+                "[from lead] report".into(),
+                Some(MessageUiMetadata {
+                    author: Some(crate::message::MessageAuthor::Lead),
+                    peer: true,
+                    ..Default::default()
+                }),
+            )
+        });
+        // The attribution write proves the seam ran; the stamp must not have.
+        let attributed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let meta = manox_harness::session_meta::load(&sessions, &agent_session)
+                    .await
+                    .unwrap();
+                if !meta.user_attributions.is_empty() {
+                    return meta;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an agent turn never recorded its attribution");
+        assert_eq!(
+            attributed.user_attributions.len(),
+            1,
+            "the peer turn must be attributed"
+        );
+        assert!(
+            attributed.interacted_at.is_none(),
+            "an agent-authored turn must not move the recency key"
+        );
+    }
+
     fn png_image(data: &str) -> MessageContent {
         MessageContent::Image {
             data: data.to_string(),
@@ -2863,6 +2947,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2972,6 +3057,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| {
@@ -2997,6 +3083,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.run_turn());
@@ -3018,6 +3105,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         // Simulate a preview batch that landed before the authoritative sync.
@@ -3074,6 +3162,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.with_mut(|t| {
@@ -3099,6 +3188,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_permission_mode(PermissionMode::ReadOnly));
@@ -3139,6 +3229,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let engine_ref = Arc::clone(&engine);
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
@@ -3195,6 +3286,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         let snapshot = crate::plan::PlanSnapshot {
@@ -3239,6 +3331,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine);
         thread.with_mut(|t| t.set_reasoning_effort(ReasoningEffort::Max));
@@ -3276,6 +3369,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Loading, engine);
         thread.handle_notice(BackendNotice::Ready(Box::new(ReadyInfo {
@@ -3390,6 +3484,7 @@ pub(crate) mod tests {
             runs: Mutex::new(Vec::new()),
             plan_persists: Mutex::new(Vec::new()),
             steers: Mutex::new(Vec::new()),
+            session_path: Mutex::new(None),
         });
         let thread = thread_with_engine(HistoryPhase::Ready, engine.clone());
         thread.with_mut(|t| t.cancel());
