@@ -60,6 +60,7 @@ browser-yield-hint = Control yielded to you (e.g. to sign in). Click when done.
 browser-yield-complete = Done
 browser-read-hint = Agent is reading this page — its logged-in content is exposed to the agent.
 right-pane-toggle = Toggle side panel
+sidebar-toggle = Toggle sidebar
 right-tab-new = New tab
 right-tab-launcher = New Tab
 launcher-open-browser = Open built-in browser
