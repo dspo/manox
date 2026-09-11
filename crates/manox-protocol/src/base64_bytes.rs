@@ -22,6 +22,14 @@ pub fn encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// Decode a base64 string to raw bytes — the inverse of [`encode`]. Used by
+/// capability bridges that receive host replies (e.g. `ClipboardRead`'s
+/// `{data: base64, mimeType}` payload) outside serde's path.
+pub fn decode(text: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(text)
+}
+
 #[cfg(test)]
 mod tests {
     use serde::{Deserialize, Serialize};

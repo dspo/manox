@@ -20,6 +20,7 @@ pub mod goal_driver;
 pub mod goal_tools;
 pub mod granted_roots;
 pub mod host;
+pub mod host_tools;
 pub mod i18n;
 pub mod image;
 pub mod language;
