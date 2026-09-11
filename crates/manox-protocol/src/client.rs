@@ -230,6 +230,25 @@ pub enum ClientNote {
         session_id: String,
         pinned: bool,
     },
+    /// Move one thread inside its sidebar partition's durable order account.
+    /// DOM `insertBefore` semantics: `before_thread_id` names the row to land
+    /// in front of, omitted appends to the end of the partition.
+    /// Fire-and-forget — the resulting order reaches every client through the
+    /// §D.5 `ThreadsUpdated` snapshot, and a rejected move (an unaccounted row
+    /// or anchor) changes nothing.
+    InsertThreadBefore {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_thread_id: Option<String>,
+    },
+    /// Move one project folder inside the sidebar's Projects section order.
+    /// Same `insertBefore` contract as [`ClientNote::InsertThreadBefore`]; the
+    /// resulting order reaches clients through the §D.5 `Projects` mirror.
+    InsertGroupBefore {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_path: Option<String>,
+    },
     TerminalInput {
         terminal: String,
         #[serde(with = "crate::base64_bytes")]

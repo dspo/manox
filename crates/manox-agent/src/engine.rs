@@ -5489,6 +5489,9 @@ fn session_info_to_summary(
         has_unread: false,
         errored: false,
         created_at: info.created_at.timestamp(),
+        // The mirror reads no sidecar, so it cannot know the human-interaction
+        // stamp: these two columns carry the last durable write. `ThreadStore`
+        // is the sidebar's ordering authority; nothing sorts off this mirror.
         interacted_at: info.modified_at.timestamp(),
         updated_at: info.modified_at.timestamp(),
         cumulative_total_tokens: 0,

@@ -31,6 +31,10 @@ plain-session-start-failed = Failed to start terminal session
 sidebar-empty-summary = (New chat)
 sidebar-copy-thread-id = Copy thread id
 sidebar-pending-auth = Waiting for approval
+sidebar-view-options = View options
+sidebar-order-manual = Manual
+sidebar-order-updated = Last updated
+sidebar-show-more = Show { $count } more
 sidebar-time-just-now = Just now
 sidebar-time-minutes = { $count ->
     [one] {$count} minute ago
