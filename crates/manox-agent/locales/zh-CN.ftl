@@ -47,6 +47,7 @@ browser-yield-hint = 已让出控制权（例如用于登录）。完成后请�
 browser-yield-complete = 完成
 browser-read-hint = Agent 正在读取本页 —— 页面中已登录的内容将暴露给 agent。
 right-pane-toggle = 切换右侧面板
+sidebar-toggle = 切换侧边栏
 right-tab-new = 新建标签页
 right-tab-launcher = 新标签页
 launcher-open-browser = 打开集成浏览器
