@@ -98,6 +98,7 @@ wire_surface! {
             content: vec![serde_json::json!({"type": "text", "text": "hello"})],
             usage: None,
             origin_rpc: Some("rpc-1".into()),
+            display: None,
         },
         JournalWireEvent::UiNote { .. } => "uiNote" ~ JournalWireEvent::UiNote {
             kind: "error".into(),
@@ -445,6 +446,7 @@ wire_surface! {
             initial_model: Some(ModelRef::new("DeepSeek-anthropic/deepseek-chat")),
             approval_mode: Some("workspace-write".into()),
             reasoning_effort: Some("high".into()),
+            seed: Some(vec![serde_json::json!({"type": "text", "text": "seed"})]),
         },
         ClientCall::Submit { .. } => "submit" ~ ClientCall::Submit {
             session_id: "s1".into(),
@@ -795,6 +797,7 @@ pub fn snapshot_sample() -> SessionSnapshot {
                     cache_write: 0,
                     reasoning: 0,
                 }),
+                display: None,
                 origin_rpc: Some("rpc-echo-1".into()),
             },
         }],

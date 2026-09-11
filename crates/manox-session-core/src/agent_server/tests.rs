@@ -4311,6 +4311,7 @@ fn create_session_with_project_intent() {
             )),
             approval_mode: Some("read-only".into()),
             reasoning_effort: Some("high".into()),
+            seed: None,
         },
     ));
     let sid = v["session_id"].as_str().expect("session id").to_string();
@@ -4347,6 +4348,7 @@ fn create_session_with_project_intent() {
             initial_model: Some(manox_protocol::ModelRef::new("prov/no-such-model")),
             approval_mode: None,
             reasoning_effort: None,
+            seed: None,
         },
     );
     match m {
@@ -5488,7 +5490,10 @@ fn handshake_ready_double_emits_host_epoch_echo() {
     match client.recv() {
         FromServer::Host {
             host: HostEvent::Ready { epoch },
-        } => assert_eq!(epoch, 1, "the Ready host event echoes the epoch"),
+        } => assert_eq!(
+            epoch, PROTOCOL_EPOCH,
+            "the Ready host event echoes the epoch"
+        ),
         other => panic!("expected the Host Ready epoch echo (C1/GW1), got {other:?}"),
     }
     drop(client);
@@ -6894,6 +6899,7 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
             initial_model: None,
             approval_mode: None,
             reasoning_effort: None,
+            seed: None,
         },
         ClientCall::Submit {
             session_id: "j1-s".into(),
@@ -8030,6 +8036,7 @@ async fn create_with_a_live_id_is_idempotent() {
         initial_model: None,
         approval_mode: None,
         reasoning_effort: None,
+        seed: None,
     };
     let out = AgentServerInner::create_session_request(&server.0, "idem-client", intent)
         .await
@@ -8086,4 +8093,162 @@ async fn pending_submit_queue_survives_a_panicking_lock_holder() {
     );
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
+}
+
+// ── Hidden-context seeding (dspo/manox-app#10): CreateSession.seed lands
+// as display:false custom rows; the wire carries the flag. ────────────────
+
+/// v2 CreateSession with a seed; drains to the Response. Returns the
+/// outcome.
+fn seeded_create(
+    client: &Client,
+    seed: Option<Vec<Value>>,
+) -> Result<Value, manox_protocol::RpcError> {
+    client.send(FromClient::Request {
+        id: MsgId::new("seed-create"),
+        call: ClientCall::CreateSession {
+            cwd: Some("/".into()),
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seeded create never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "seed-create"
+        {
+            return outcome;
+        }
+    }
+}
+
+#[test]
+fn create_session_seed_lands_hidden() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let created = seeded_create(
+        &client,
+        Some(vec![
+            serde_json::json!({"type": "text", "text": "side-chat source context"}),
+        ]),
+    )
+    .expect("seeded create succeeds");
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    // The durable guarantee: the seed rows are on disk BEFORE the create
+    // response returned (the seeded branch materializes the journal
+    // synchronously). Assert straight off the file.
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let contents = std::fs::read_to_string(sessions.join(format!("{session_id}.jsonl"))).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 2, "header + one seed row");
+    let header: Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(header["id"], session_id.as_str());
+    let row: Value = serde_json::from_str(lines[1]).unwrap();
+    // On-disk v4 rows carry the kernel's snake_case tag; the wire
+    // projection below carries the camelCase mirror.
+    assert_eq!(row["type"], "custom_message");
+    assert_eq!(row["customType"], "embedder_seed");
+    assert_eq!(row["display"], false, "the durable row is hidden");
+    assert!(
+        row["content"]
+            .to_string()
+            .contains("side-chat source context")
+    );
+
+    // The wire projection: the gateway's cold read carries the same shape
+    // (the hermetic full-server cold read is slow to wake — the deadline
+    // leaves generous margin; the mechanism itself is pinned by the
+    // file-level assertions above and journal_query's own probe test).
+    client.send(FromClient::Request {
+        id: MsgId::new("seed-page"),
+        call: ClientCall::PageHistory {
+            session_id: session_id.clone(),
+            through_seq: -1,
+            before_seq: None,
+            max_messages: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seed page never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "seed-page"
+        {
+            let page = outcome.expect("cold read succeeds");
+            let row = &page["records"].as_array().unwrap()[0];
+            assert_eq!(row["type"], "customMessage");
+            assert_eq!(row["display"], false, "the wire carries the hidden flag");
+            break;
+        }
+    }
+}
+
+#[test]
+fn create_session_without_seed_changes_nothing() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let created = seeded_create(&client, None).expect("unseeded create succeeds");
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+    // An unseeded session has an empty active chain (header only — no rows
+    // until the first turn); the absence is final, not eventual.
+    client.send(FromClient::Request {
+        id: MsgId::new("plain-page"),
+        call: ClientCall::PageHistory {
+            session_id,
+            through_seq: -1,
+            before_seq: None,
+            max_messages: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "page never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "plain-page"
+        {
+            let page = outcome.expect("cold read succeeds");
+            let rows = page["records"].as_array().unwrap();
+            assert!(
+                rows.iter().all(|r| r["type"] != "customMessage"),
+                "an unseeded create seeds nothing: {rows:?}"
+            );
+            break;
+        }
+    }
+}
+
+#[test]
+fn create_session_rejects_malformed_seed_before_creating_anything() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let outcome = seeded_create(&client, Some(vec![serde_json::json!({"type": "bogus"})]));
+    match outcome {
+        Err(e) => {
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(v["data"]["code"], "gateway/bad-request");
+            assert!(
+                e.message.contains("seed block 0"),
+                "names the block: {}",
+                e.message
+            );
+        }
+        other => panic!("expected bad-request, got {other:?}"),
+    }
 }

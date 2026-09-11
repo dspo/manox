@@ -106,6 +106,12 @@ pub enum JournalWireEvent {
         /// RPC id of the `Submit`/`Steer` call that created this message,
         /// when a client echo must be retired by it.
         origin_rpc: Option<String>,
+        /// Whether a `"custom"` role row renders in the UI. `None` on every
+        /// other role (and on display-intended custom rows) — the model
+        /// context is unaffected either way; clients filter hidden rows on
+        /// `display == Some(false)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<bool>,
     },
     /// A durable UI annotation card (error / notice / plan-review). Was the
     /// `AppendUiNote` client note; now a replayable journal entry.
@@ -306,6 +312,7 @@ mod tests {
                 reasoning: 5,
             }),
             origin_rpc: None,
+            display: None,
         }
     }
 
