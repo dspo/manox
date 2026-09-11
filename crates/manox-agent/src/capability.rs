@@ -39,6 +39,12 @@ pub trait CapabilityClient: Send + Sync {
     fn clipboard_read(&self) -> BoxFuture<'static, Result<Option<String>, String>> {
         Box::pin(async { Err("clipboard capability not provided".to_string()) })
     }
+    /// Ask the frontend to open a URL / file path in the OS default handler.
+    /// The default fails closed: a frontend that owns no opener never sees a
+    /// silent success.
+    fn open_external(&self, _url: String) -> BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Err("open capability not provided".to_string()) })
+    }
 }
 
 /// The process-wide capability provider. Mutable (not OnceLock) so the
@@ -105,5 +111,14 @@ mod tests {
         assert!(caps.clipboard_write("x".into()).is_err());
         let err = futures::executor::block_on(caps.clipboard_read()).unwrap_err();
         assert_eq!(err, "clipboard capability not provided");
+    }
+
+    // `open_external` defaults fail closed like the clipboard arms — a
+    // provider that owns no opener is an error, never a silent success.
+    #[test]
+    fn open_external_default_fails_closed() {
+        let caps: Arc<dyn CapabilityClient> = Arc::new(MockProvider);
+        let err = futures::executor::block_on(caps.open_external("https://x".into())).unwrap_err();
+        assert_eq!(err, "open capability not provided");
     }
 }

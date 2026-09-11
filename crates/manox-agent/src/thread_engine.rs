@@ -338,6 +338,19 @@ pub enum BackendNotice {
         op: BrowserOp,
         responder: async_channel::Sender<Result<BrowserReply, String>>,
     },
+    /// A host-capability tool's clipboard round trip: the tool (tokio) asks
+    /// for the host clipboard; the facade executes it against the capability
+    /// provider on its own thread and replies with the plain text (`None` =
+    /// empty / not text). Same round-trip architecture as `BrowserRequest`.
+    ClipboardRequest {
+        responder: async_channel::Sender<Result<Option<String>, String>>,
+    },
+    /// A host-capability tool's open-external round trip: the tool asks the
+    /// host to open a URL / file path in the OS default handler.
+    OpenExternalRequest {
+        url: String,
+        responder: async_channel::Sender<Result<(), String>>,
+    },
     /// A dispatched subagent finished. The facade delivers the final text to
     /// the Captain as a peer message and triggers a turn (generalizes the
     /// retired `SailorCompleted`).

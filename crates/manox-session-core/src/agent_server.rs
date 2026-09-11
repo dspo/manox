@@ -3334,6 +3334,73 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
             }
         })
     }
+
+    /// The kernel's clipboard read routed as a `ServerCall::ClipboardRead`
+    /// to the owning ∩ ClipboardRead-capable client. The reply carries
+    /// `{data: base64, mimeType}` (or `null` = empty / not text) per the
+    /// server-call contract; non-text content fails closed rather than
+    /// decoding garbage into the model's context.
+    fn clipboard_read(
+        &self,
+    ) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let session_id = manox_agent::capability::CURRENT_SESSION
+                .try_with(|c| c.clone())
+                .ok()
+                .flatten()
+                .ok_or_else(|| "no session context for clipboard read".to_string())?;
+            let call = ServerCall::ClipboardRead {
+                session_id: session_id.clone(),
+            };
+            let v = route_capability_call(&inner, &session_id, call)
+                .await
+                .map_err(|e| e.message)?;
+            if v.is_null() {
+                return Ok(None);
+            }
+            let data = v
+                .get("data")
+                .and_then(|d| d.as_str())
+                .ok_or_else(|| "clipboard reply missing data".to_string())?;
+            let mime = v
+                .get("mimeType")
+                .and_then(|m| m.as_str())
+                .unwrap_or("text/plain");
+            if !mime.starts_with("text/") {
+                return Err(format!("clipboard holds non-text content ({mime})"));
+            }
+            let bytes = manox_protocol::base64_bytes::decode(data).map_err(|e| e.to_string())?;
+            String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|e| format!("clipboard text is not valid UTF-8: {e}"))
+        })
+    }
+
+    /// The kernel's opener routed as a `ServerCall::OpenExternal` to the
+    /// owning ∩ OpenExternal-capable client. The host reply payload is `{}`
+    /// — the confirmation itself is the result.
+    fn open_external(
+        &self,
+        url: String,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let session_id = manox_agent::capability::CURRENT_SESSION
+                .try_with(|c| c.clone())
+                .ok()
+                .flatten()
+                .ok_or_else(|| "no session context for open external".to_string())?;
+            let call = ServerCall::OpenExternal {
+                session_id: session_id.clone(),
+                url,
+            };
+            route_capability_call(&inner, &session_id, call)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.message)
+        })
+    }
 }
 
 /// The settable subset of a `SessionStatus` delta (§D.5).
