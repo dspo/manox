@@ -914,12 +914,17 @@ impl AgentServerInner {
                 })
             })
             .unwrap_or_default();
-        let (conn, peer, hello) = {
+        let (conn, peer, hello, generation) = {
             let clients = self.clients.lock();
             let Some(entry) = clients.get(client_id) else {
                 return;
             };
-            (entry.conn.clone(), entry.peer.clone(), entry.hello.clone())
+            (
+                entry.conn.clone(),
+                entry.peer.clone(),
+                entry.hello.clone(),
+                entry.generation,
+            )
         };
         for rec in recs {
             if !hello.can(rec.kind) {
@@ -939,7 +944,12 @@ impl AgentServerInner {
                 continue;
             }
             let id = MsgId::new(rec.key.clone());
-            if rec.targets.iter().any(|cid| cid == client_id) && peer.has_waiter(&id) {
+            if rec
+                .targets
+                .iter()
+                .any(|(cid, target_gen)| cid == client_id && *target_gen == generation)
+                && peer.has_waiter(&id)
+            {
                 // The owner's CURRENT connection still carries the live
                 // waiter: re-send the frame only (GW2 forbids a duplicate
                 // register; the reply flows through the open waiter).
@@ -956,7 +966,7 @@ impl AgentServerInner {
             let Some(rx) = peer.register(id.clone()) else {
                 continue;
             };
-            self.add_adjudication_target(session_id, &rec.key, client_id);
+            self.add_adjudication_target(session_id, &rec.key, client_id, generation);
             conn.send_to_client(FromServer::Request {
                 id,
                 call: rec.call.clone(),
@@ -996,7 +1006,7 @@ impl AgentServerInner {
                 }
                 let mut keep = Vec::new();
                 for mut rec in list.drain(..) {
-                    rec.targets.retain(|cid| cid != client_id);
+                    rec.targets.retain(|(cid, _)| cid != client_id);
                     if rec.targets.is_empty() {
                         drained.push((session_id.clone(), rec));
                     } else {
@@ -1027,12 +1037,20 @@ impl AgentServerInner {
         }
     }
 
-    fn add_adjudication_target(&self, session_id: &str, key: &str, client_id: &str) {
+    fn add_adjudication_target(
+        &self,
+        session_id: &str,
+        key: &str,
+        client_id: &str,
+        generation: u64,
+    ) {
         if let Some(list) = self.pending_adjudications.lock().get_mut(session_id)
             && let Some(rec) = list.iter_mut().find(|rec| rec.key == key)
-            && !rec.targets.iter().any(|cid| cid == client_id)
         {
-            rec.targets.push(client_id.to_string());
+            // One row per owner: a re-mint on a newer connection replaces the
+            // owner's stale-generation row rather than stacking duplicates.
+            rec.targets.retain(|(cid, _)| cid != client_id);
+            rec.targets.push((client_id.to_string(), generation));
         }
     }
 
@@ -2609,7 +2627,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                 // this target: skip it; if every target is skipped the
                 // empty-targets path below denies/expires the call.
                 match entry.peer.register(id.clone()) {
-                    Some(rx) => Some((cid.clone(), entry.conn.clone(), rx, id)),
+                    Some(rx) => Some((cid.clone(), entry.generation, entry.conn.clone(), rx, id)),
                     None => {
                         tracing::error!(
                             session = %session_id,
@@ -2642,7 +2660,10 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                 kind,
                 ctx: ctx.clone(),
                 call: call.clone(),
-                targets: targets.iter().map(|(cid, ..)| cid.clone()).collect(),
+                targets: targets
+                    .iter()
+                    .map(|(cid, generation, ..)| (cid.clone(), *generation))
+                    .collect(),
             },
         );
         route_waterfall(
@@ -2658,7 +2679,7 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     }
 
     let (conn, rx, id) = {
-        let (_, conn, rx, id) = targets.into_iter().next().expect("non-empty checked");
+        let (_, _, conn, rx, id) = targets.into_iter().next().expect("non-empty checked");
         (conn, rx, id)
     };
     conn.send_to_client(FromServer::Request { id, call });
@@ -2681,10 +2702,11 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
 /// (the first rejection, or the final next). Recipients that never answered
 /// by settlement are owed a cancel in a future wire addition; until then
 /// the `pending_auth` projection is the truth clients reconcile against.
-/// One adjudication delivery: (client id, connection, reply receiver,
-/// deterministic MsgId).
+/// One adjudication delivery: (client id, connection generation, connection,
+/// reply receiver, deterministic MsgId).
 type AdjudicationTarget = (
     String,
+    u64,
     Arc<dyn RpcConnection>,
     async_channel::Receiver<Result<Value, RpcError>>,
     MsgId,
@@ -2701,11 +2723,14 @@ struct PendingAdjudication {
     kind: HookKind,
     ctx: ReplyCtx,
     call: ServerCall,
-    /// Owners holding a live reply waiter for this call (the fan-out
-    /// recipients plus every replay that minted a waiter on their current
-    /// peer). Replay re-sends without registering only while that waiter is
-    /// still open on the owner's live connection (GW2 forbids duplicates).
-    targets: Vec<String>,
+    /// Owners holding a live reply waiter for this call, as
+    /// (client id, connection generation). One row per owner at most: the
+    /// generation is the handshake that minted the waiter, so a re-seat's
+    /// replay cannot mistake a same-cid waiter belonging to another
+    /// connection's call for its own (GW2 forbids duplicates only within one
+    /// generation). Replay re-sends without registering only while that
+    /// exact waiter is open on the owner's current connection.
+    targets: Vec<(String, u64)>,
 }
 
 /// GW3: unregister a delivery when its waterfall settles — and cancel the
@@ -2825,7 +2850,7 @@ async fn route_waterfall(
         inner,
         delivery_id: delivery_id.clone(),
     };
-    for (cid, conn, rx, id) in targets {
+    for (cid, _generation, conn, rx, id) in targets {
         conn.send_to_client(FromServer::Request {
             id,
             call: call.clone(),
@@ -2898,7 +2923,9 @@ async fn route_waterfall(
     // A re-seat hands the undecided deliveries to the §D.6 replay's fresh
     // waiters: this waterfall must not settle them — an Err would deny a
     // call the replay can still answer, and an Error note would report a
-    // hand-off as a failure.
+    // hand-off as a failure. This exit's `DeliveryGuard` drop also cancels
+    // the surviving co-recipients' tokens: their deliveries are silently
+    // retired until they rejoin, where the replay re-mints their waiters.
     if settled.is_none() && reseat_seen {
         return;
     }

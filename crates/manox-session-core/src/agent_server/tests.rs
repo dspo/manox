@@ -1963,7 +1963,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     assert!(
         server.0.pending_adjudications.lock()["s1"]
             .iter()
-            .any(|rec| rec.targets.iter().any(|cid| cid == "test-b")),
+            .any(|rec| rec.targets.iter().any(|(cid, _)| cid == "test-b")),
         "the replayed owner joins the waiter set"
     );
     client_b.send(FromClient::Reply {
@@ -2148,6 +2148,23 @@ fn ask_survives_same_client_reseat() {
     assert_eq!(
         replayed.0, "q1",
         "the re-minted waiter reuses the deterministic MsgId"
+    );
+    // P2 guard: the re-minted owner row is stamped with the CURRENT
+    // connection generation. The resend branch only fires on a
+    // `(cid, generation)` exact match, so a stale-generation row (a waiter
+    // that died with a prior connection) can never satisfy it — even if the
+    // fresh peer happens to hold a live waiter under the same MsgId for an
+    // unrelated call, the answer cannot be mis-routed through it.
+    let cur_gen = server.0.clients.lock().get("test").unwrap().generation;
+    assert!(
+        server.0.pending_adjudications.lock()["s1"]
+            .iter()
+            .find(|rec| rec.key == "q1")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|(cid, target_gen)| cid == "test" && *target_gen == cur_gen),
+        "the re-minted target carries the current generation, not a stale one"
     );
     reseated.send(FromClient::Reply {
         id: replayed,
