@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Build the manox-napi cdylib and stage it as a Node addon (.node) for the
+# VS Code agent-host harness. The output path is what
+# VSCODE_AGENT_HOST_MANOX_SDK_ROOT should point at.
+#
+# Usage: script/build-napi [--debug]
+set -euo pipefail
+
+build_args=(--release)
+profile_dir="release"
+if [[ "${1:-}" == "--debug" ]]; then
+    build_args=()
+    profile_dir="debug"
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+cargo build -p manox-napi ${build_args[@]+"${build_args[@]}"}
+
+LIB=""
+for candidate in "target/${profile_dir}/libmanox_napi.dylib" "target/${profile_dir}/libmanox_napi.so" "target/${profile_dir}/manox_napi.dll"; do
+    if [[ -f "$candidate" ]]; then
+        LIB="$candidate"
+        break
+    fi
+done
+if [[ -z "$LIB" ]]; then
+    echo "napi cdylib not found under target/${profile_dir}" >&2
+    exit 1
+fi
+
+OUT_DIR="$ROOT/target/napi"
+mkdir -p "$OUT_DIR"
+cp "$LIB" "$OUT_DIR/manox_napi.node"
+# -S strips debug sections on GNU and Apple strip alike; plain strip rejects
+# macOS dylibs. The unstripped cdylib is ~0.5GB and slows addon load.
+strip -S "$OUT_DIR/manox_napi.node" 2>/dev/null || true
+
+echo "staged: $OUT_DIR/manox_napi.node"

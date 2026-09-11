@@ -10,7 +10,15 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 
 /// `$HOME/.manox` — the single root for all manox (and cx-family) persistent state.
+///
+/// `MANOX_HOME` overrides the root wholesale (env wins over `$HOME`). Used by
+/// embedders that must not contend for `~/.manox/runtime.lock` with a running
+/// app — e.g. the VS Code agent-host harness — and by tests wanting an
+/// isolated store.
 pub fn manox_home() -> Result<PathBuf> {
+    if let Some(root) = std::env::var_os("MANOX_HOME").filter(|r| !r.is_empty()) {
+        return Ok(PathBuf::from(root));
+    }
     Ok(dirs().join(".manox"))
 }
 
