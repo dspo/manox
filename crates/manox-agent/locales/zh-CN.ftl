@@ -135,9 +135,9 @@ settings-desc-work-mode-workday = 同样强大，技术细节更少
 settings-section-permissions = 权限
 settings-row-permission-readonly = 只读
 settings-desc-permission-readonly = bash 可运行但不可写文件（网络不受限）；读取对整个文件系统保持开放。适合审查与调研场景。
-settings-row-permission-workspaceread = 工作区写入
+settings-row-permission-workspaceread = 工作区访问
 settings-desc-permission-workspaceread = manox 可以在工作区内写入文件并运行沙箱内的 shell 命令；工作区之外的写入会被拒绝。
-settings-row-permission-dangerfullaccess = 危险完全访问
+settings-row-permission-dangerfullaccess = 完全访问
 settings-desc-permission-dangerfullaccess = manox 可以不受限制地编辑你电脑上的任何文件，并在沙箱外运行命令。这会显著增加数据丢失、泄露或意外行为的风险。
 settings-link-learn-more = 了解更多
 
@@ -370,20 +370,15 @@ pending-auth-waiting = 等待你的决定
 pending-auth-allow = 仅此一次允许
 pending-auth-deny = 拒绝
 workspace-mode-readonly-title = 只读
-workspace-mode-readonly-desc = bash 可运行但不可写文件；文件变更被拒绝
-workspace-mode-workspacewrite-title = 工作区写入
-workspace-mode-workspacewrite-desc = 工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；bash 受工作区写入 seatbelt 约束
-workspace-mode-dangerfullaccess-title = 危险完全访问
-workspace-mode-dangerfullaccess-desc = 无沙箱：bash 不受限运行，文件变更不受约束
+workspace-mode-workspacewrite-title = 工作区访问
+workspace-mode-dangerfullaccess-title = 完全访问
 workspace-chip-mode-readonly = 只读
-workspace-chip-mode-workspacewrite = 工作区写入
-workspace-chip-mode-dangerfullaccess = 危险完全访问
-workspace-mode-title = 允许 manox 做什么？
-workspace-mode-learn-more = 了解更多
+workspace-chip-mode-workspacewrite = 工作区访问
+workspace-chip-mode-dangerfullaccess = 完全访问
 workspace-mode-notice = { $mode ->
     [readonly] 只读模式：bash 可运行但写入被 seatbelt 拒绝；文件变更被拒绝。
-    [workspacewrite] 工作区写入：工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；工作区之外的目标被拒绝。被拒绝时可用 sandbox_permissions + justification 申请升级。
-   *[dangerfullaccess] 危险完全访问：无沙箱；bash 不受限运行，文件变更不受约束。
+    [workspacewrite] 工作区访问：工作区、manox 状态目录（~/.manox）与临时目录下的写入放行；工作区之外的目标被拒绝。被拒绝时可用 sandbox_permissions + justification 申请升级。
+   *[dangerfullaccess] 完全访问：无沙箱；bash 不受限运行，文件变更不受约束。
 }
 workspace-project-choose = 选择项目
 workspace-project-new = 新建项目
@@ -417,7 +412,7 @@ turn-navigator-copied = 消息已复制到剪贴板。
 
 ### slash_command.rs
 slash-compact-desc = 压缩对话：把较早的历史摘要成一份交接说明，让会话越过上下文上限继续进行
-slash-mode-desc = 循环切换权限模式（只读 → 工作区写入 → 危险完全访问）；`/mode <名称>` 指定模式，带提示词则切换后直接开工
+slash-mode-desc = 循环切换权限模式（只读 → 工作区访问 → 完全访问）；`/mode <名称>` 指定模式，带提示词则切换后直接开工
 slash-mode-unknown = 未知权限模式“{ $mode }”— 应为 read-only、workspace-write 或 danger-full-access
 slash-exit-desc = 归档当前会话并开始一个新会话
 slash-new-desc = 归档当前会话并开始新会话，保留项目、权限模式与模型
