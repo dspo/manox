@@ -1301,6 +1301,7 @@ async fn handle_call(
             initial_model,
             approval_mode,
             reasoning_effort,
+            seed,
         } => {
             AgentServerInner::create_session_request(
                 inner,
@@ -1312,6 +1313,7 @@ async fn handle_call(
                     initial_model,
                     approval_mode,
                     reasoning_effort,
+                    seed,
                 },
             )
             .await
@@ -1843,6 +1845,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 initial_model: None,
                 approval_mode: None,
                 reasoning_effort: None,
+                seed: None,
             };
             let _ = AgentServerInner::create_session_request(inner, owner, intent).await;
         }
@@ -2058,6 +2061,9 @@ struct SessionIntent {
     initial_model: Option<manox_protocol::ModelRef>,
     approval_mode: Option<String>,
     reasoning_effort: Option<String>,
+    /// Hidden context blocks appended as non-displaying custom messages
+    /// before the first turn (`CreateSession.seed`).
+    seed: Option<Vec<Value>>,
 }
 
 impl AgentServerInner {
@@ -2114,6 +2120,30 @@ impl AgentServerInner {
                 );
             }
         };
+        // Seed blocks are kernel content blocks: validate the vocabulary
+        // before anything is created, so a malformed seed cannot leave a
+        // half-seeded session behind.
+        let seed_blocks = match intent.seed.as_deref() {
+            None | Some([]) => Vec::new(),
+            Some(blocks) => {
+                let mut parsed = Vec::with_capacity(blocks.len());
+                for (i, block) in blocks.iter().enumerate() {
+                    match serde_json::from_value::<manox_harness::types::ContentBlock>(
+                        block.clone(),
+                    ) {
+                        Ok(b) => parsed.push(b),
+                        Err(e) => {
+                            return Err(RpcError::new(
+                                -1,
+                                format!("seed block {i} is not a valid content block: {e}"),
+                            )
+                            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+                        }
+                    }
+                }
+                parsed
+            }
+        };
         // Idempotent re-open of a live session (§D.2).
         if let Some(existing) = intent.session_id.as_deref()
             && inner.sessions.lock().contains_key(existing)
@@ -2144,6 +2174,94 @@ impl AgentServerInner {
             open_session(inner, owner, existing).await?;
             return Ok(json!({ "session_id": existing }));
         }
+        // Hidden-context seeding (`CreateSession.seed`): a seeded create
+        // materializes the journal synchronously — header plus one
+        // non-displaying `embedder_seed` custom row per block — and then
+        // opens through the cold-restore path, so the seeds are durable
+        // BEFORE the response returns (stronger than queueing appends on
+        // the engine actor, and independent of its boot). An unseeded
+        // create keeps the deferred-fresh flow untouched.
+        if !seed_blocks.is_empty() {
+            let session_id = uuid::Uuid::new_v4().to_string();
+            let Some(path) = persisted_session_file(&session_id) else {
+                return Err(RpcError::new(-1, "minted session id failed the path gate")
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+            };
+            let cwd = intent
+                .cwd
+                .clone()
+                .map(PathBuf::from)
+                .or_else(|| intent.project.clone().map(PathBuf::from))
+                .unwrap_or_else(|| inner.cwd.clone());
+            let storage = JsonlSessionStorage::create(
+                &path,
+                JsonlSessionMetadata {
+                    id: session_id.clone(),
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    metadata: Some(serde_json::json!({
+                        "host": manox_agent::host::current().slug(),
+                        "thread": session_id,
+                    })),
+                },
+            )
+            .await
+            .map_err(|err| {
+                RpcError::new(-1, format!("seeded session file creation failed: {err}"))
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            })?;
+            let seed_rows: Vec<manox_harness::session::SessionTreeEntry> = seed_blocks
+                .into_iter()
+                .scan(None::<String>, |parent, block| {
+                    let entry_id = uuid::Uuid::new_v4().to_string();
+                    let entry = manox_harness::session::SessionTreeEntry::CustomMessage {
+                        id: entry_id.clone(),
+                        parent_id: parent.clone(),
+                        timestamp: chrono::Utc::now(),
+                        custom_type: "embedder_seed".into(),
+                        content: vec![block],
+                        details: None,
+                        display: false,
+                    };
+                    *parent = Some(entry_id);
+                    Some(entry)
+                })
+                .collect();
+            storage.append_entries(&seed_rows).await.map_err(|err| {
+                RpcError::new(-1, format!("seed row append failed: {err}"))
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            })?;
+            drop(storage);
+            manox_agent::thread_store::global()
+                .with_mut(|store| store.note_session_path(&session_id, &path));
+            open_session(inner, owner, &session_id).await?;
+            // Explicit intent overrides on the opened thread (durable change
+            // rows); absent fields keep what the seeded journal restores.
+            let thread = inner
+                .sessions
+                .lock()
+                .get(&session_id)
+                .map(|entry| entry.thread.clone());
+            if let Some(thread) = thread {
+                thread.with_mut(|t| {
+                    if let Some(model) = model {
+                        t.set_model(model);
+                    }
+                    if let Some(mode) = approval {
+                        t.set_permission_mode(mode);
+                    }
+                    if let Some(effort) = effort {
+                        t.set_reasoning_effort(effort);
+                    }
+                    if let Some(project) = &intent.project {
+                        t.set_project(PathBuf::from(project));
+                    }
+                });
+            }
+            return Ok(json!({ "session_id": session_id }));
+        }
+
         let session_id = intent
             .session_id
             .clone()
@@ -2208,6 +2326,11 @@ impl AgentServerInner {
             return Ok(json!({ "session_id": session_id }));
         }
         inner.add_owner(&session_id, owner);
+        // Hidden-context seeding (`CreateSession.seed`): one non-displaying
+        // custom row per block, BEFORE the SessionCreated broadcast — the
+        // actor queue makes the seeds land before any subsequent Submit's
+        // user entry. Model-visible, UI-hidden (the wire row carries
+        // `display: false`).
         inner.route_note(
             &session_id,
             ServerNote::SessionCreated {
