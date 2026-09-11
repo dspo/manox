@@ -215,7 +215,9 @@ type PendingMap = HashMap<MsgId, Sender<Result<serde_json::Value, RpcError>>>;
 /// The responder side calls [`RpcPeer::complete`] when the matching
 /// reply/response arrives. [`RpcPeer::cancel`] resolves a waiter with an error
 /// (e.g. when the peer disconnects mid-call).
-#[derive(Default)]
+///
+/// The peer is a shared handle: clones observe the same waiter map.
+#[derive(Clone, Default)]
 pub struct RpcPeer {
     pending: Arc<Mutex<PendingMap>>,
 }

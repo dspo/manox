@@ -28,6 +28,10 @@ pub enum ToolAuthorizationResponse {
         /// `answers` is ignored.
         response: Option<String>,
     },
+    /// The question settled without any user input (adjudication timeout,
+    /// withdrawn delivery, or no capable client). Distinct from an empty
+    /// `AskUserQuestion` so the model never reads a non-answer as an answer.
+    AskUserQuestionExpired,
 }
 
 /// Metadata of a pending interaction, kept so the workspace can re-surface

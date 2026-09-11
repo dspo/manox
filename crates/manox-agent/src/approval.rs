@@ -141,7 +141,9 @@ impl ApprovalGate {
         }
     }
 
-    /// Deliver the user's answer. Unknown ids are ignored (already settled).
+    /// Settle a pending interaction: deliver the user's answer, or an
+    /// explicit non-answer (`AskUserQuestionExpired`). Unknown ids are
+    /// ignored (already settled) — the first settle wins.
     pub fn respond(&self, id: &str, response: ToolAuthorizationResponse) {
         if let Some(pending) = self.pending.lock().unwrap().remove(id) {
             // K3 (L3): the verdict is an observable state change — it
@@ -151,6 +153,7 @@ impl ApprovalGate {
                 ToolAuthorizationResponse::Decision(PermissionDecision::AllowOnce) => "allow_once",
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => "deny",
                 ToolAuthorizationResponse::AskUserQuestion { .. } => "answered",
+                ToolAuthorizationResponse::AskUserQuestionExpired => "expired",
             };
             self.journal_decision(id, &pending.meta.tool_name, verdict);
             let _ = pending.tx.send(response);
@@ -795,6 +798,16 @@ impl PiAgentTool for PiAskUserQuestionTool {
                 .expect("ask user questions render");
                 Ok(AgentToolResult::text(text))
             }
+            // The adjudication expired with no user input. This is NOT an
+            // empty answer: the text names that explicitly so the model
+            // re-asks or proceeds under stated assumptions instead of
+            // reading silence as consent.
+            ToolAuthorizationResponse::AskUserQuestionExpired => Ok(AgentToolResult::error(
+                "[no-answer] The user did not answer this question within the \
+                 adjudication window. Do not treat this as input or consent. \
+                 Re-ask with fewer, simpler questions or continue under \
+                 explicitly stated assumptions.",
+            )),
             // Any bare decision means the question never reached the user
             // (cancel or dismissed card): surface the denial as-is.
             _ => {
@@ -1061,6 +1074,45 @@ mod tests {
         let options = &questions["items"]["properties"]["options"];
         assert_eq!(options["minItems"], 2);
         assert_eq!(options["maxItems"], 3);
+    }
+
+    /// R1: an adjudication settled without user input (`Expired`) reaches
+    /// the model as an explicit `[no-answer]` error, not an empty answer
+    /// text that reads as consent.
+    #[tokio::test]
+    async fn ask_expired_adjudication_answers_no_answer() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let params = serde_json::json!({
+            "questions": [{
+                "question": "q", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "a", "description": ""},
+                    {"label": "b", "description": ""},
+                ],
+            }],
+        });
+        let settle = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                gate.respond("ask-1", ToolAuthorizationResponse::AskUserQuestionExpired);
+            })
+        };
+        let result = tool
+            .execute("ask-1", params, CancellationToken::new(), &ctx)
+            .await
+            .unwrap();
+        settle.await.unwrap();
+        assert!(result.is_error, "expired must not read as a plain answer");
+        let text = match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        assert!(text.contains("[no-answer]"), "expired verdict text: {text}");
     }
 
     #[tokio::test]
@@ -1604,7 +1656,7 @@ mod tests {
     /// K3 (L3): the user's verdict on a parked card journals as an
     /// `approval` decision entry through the actor's command queue —
     /// `respond` carries the verdict vocabulary (`allow_once` / `deny` /
-    /// `answered`), and `discard` (a cancelled turn) closes the card with
+    /// `answered` / `expired`), and `discard` (a cancelled turn) closes the card with
     /// a `cancelled` decision so the `pending_auth` fold never keeps a
     /// dead card alive. A settled card never journals twice.
     #[test]
@@ -1658,6 +1710,12 @@ mod tests {
             },
         );
         next_decision(&mut cmd_rx, "call-3", "answered");
+
+        // R1: an adjudication that settled with no user input journals
+        // `expired`, never a fake `answered`.
+        let _rx = gate.register("call-3b", meta());
+        gate.respond("call-3b", ToolAuthorizationResponse::AskUserQuestionExpired);
+        next_decision(&mut cmd_rx, "call-3b", "expired");
 
         let _rx = gate.register("call-4", meta());
         gate.discard("call-4");

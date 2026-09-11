@@ -158,6 +158,14 @@ struct AgentServerInner {
     /// covers a pump abort too).
     pending_deliveries:
         Mutex<HashMap<String, HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// §D.6 replay: in-flight adjudications per session — the authoritative
+    /// copy the gateway re-delivers to every owner that joins later (open /
+    /// re-own / handshake re-declaration), keyed by the deterministic
+    /// MsgId identity (`auth_id`, or `plan_file` for PlanVerdict). A record
+    /// lives until its adjudication settles at `apply_reply`; `targets`
+    /// holds the owners already holding a live waiter so a re-join of an
+    /// existing target never re-registers (GW2 duplicate guard).
+    pending_adjudications: Mutex<HashMap<String, Vec<PendingAdjudication>>>,
     /// In-flight bare-model completions by request id (the LanguageModelChat
     /// provider path); cancellation tokens shared with the spawned streams.
     model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
@@ -318,6 +326,7 @@ impl AgentServer {
             call_seq: AtomicU64::new(0),
             delivery_seq: Mutex::new(HashMap::new()),
             pending_deliveries: Mutex::new(HashMap::new()),
+            pending_adjudications: Mutex::new(HashMap::new()),
             model_chats: Arc::new(StdMutex::new(HashMap::new())),
             next_generation: AtomicU64::new(1),
             conversation_info_cache: Arc::new(StdMutex::new(
@@ -492,6 +501,14 @@ impl AgentServerInner {
                 });
                 for s in &hello.sessions {
                     self.add_owner(s, &client_id);
+                }
+                // §D.6: a handshake is a join — re-deliver every unsettled
+                // adjudication of the declared sessions to this owner. The
+                // gateway's pending registry is the authoritative copy, so a
+                // parked card resurfaces on reconnect without the client
+                // having to have seen the original fan-out.
+                for s in &hello.sessions {
+                    self.replay_pending_adjudications(&client_id, s);
                 }
                 conn.send_to_client(FromServer::Response {
                     id,
@@ -824,6 +841,130 @@ impl AgentServerInner {
             .iter()
             .filter_map(|cid| clients.get(cid).map(|e| e.conn.clone()))
             .collect()
+    }
+
+    // ── §D.6 adjudication replay. ──────────────────────────────────────────
+    fn register_pending_adjudication(&self, session_id: &str, rec: PendingAdjudication) {
+        self.pending_adjudications
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(rec);
+    }
+
+    /// A settled adjudication leaves the replay registry: no owner joining
+    /// afterwards is ever re-delivered it.
+    fn retire_pending_adjudication(&self, session_id: &str, key: &str) {
+        let mut pending = self.pending_adjudications.lock();
+        if let Some(list) = pending.get_mut(session_id) {
+            list.retain(|rec| rec.key != key);
+            if list.is_empty() {
+                pending.remove(session_id);
+            }
+        }
+    }
+
+    /// §D.6: re-deliver every unsettled adjudication of `session_id` to an
+    /// owner that just joined it (the gateway's authoritative pending copy).
+    /// A new waiter mints for owners that never received the fan-out; an
+    /// owner already holding a live waiter gets the same deterministic
+    /// `MsgId` frame re-sent WITHOUT re-registering (GW2 would refuse the
+    /// duplicate, and its reply still flows through the open waiter) — that
+    /// is the thread-switch-back path: the client lost its local card state,
+    /// the gate never did. The engine's pending set is the settle truth for
+    /// Approve/AskUser; the first delivery to settle answers wins
+    /// (`gate.respond` ignores late duplicates). Synchronous registration +
+    /// `send_to_client` only — the reply wait is a spawned task, so this is
+    /// safe to call from the dispatch loop.
+    fn replay_pending_adjudications(self: &Arc<Self>, client_id: &str, session_id: &str) {
+        let recs: Vec<PendingAdjudication> = self
+            .pending_adjudications
+            .lock()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        if recs.is_empty() {
+            return;
+        }
+        let live_auth_ids: std::collections::HashSet<String> = self
+            .session_thread(session_id)
+            .map(|t| {
+                t.read(|t| {
+                    t.pending_auth_entries()
+                        .into_iter()
+                        .map(|(id, _)| id)
+                        .collect()
+                })
+            })
+            .unwrap_or_default();
+        let (conn, peer, hello) = {
+            let clients = self.clients.lock();
+            let Some(entry) = clients.get(client_id) else {
+                return;
+            };
+            (entry.conn.clone(), entry.peer.clone(), entry.hello.clone())
+        };
+        for rec in recs {
+            if !hello.can(rec.kind) {
+                continue;
+            }
+            let gate_settled = matches!(rec.kind, HookKind::Approve | HookKind::AskUserQuestion)
+                && !live_auth_ids.contains(&rec.key);
+            if gate_settled {
+                self.retire_pending_adjudication(session_id, &rec.key);
+                continue;
+            }
+            let id = MsgId::new(rec.key.clone());
+            if rec.targets.iter().any(|cid| cid == client_id) {
+                conn.send_to_client(FromServer::Request {
+                    id,
+                    call: rec.call.clone(),
+                });
+                continue;
+            }
+            let Some(rx) = peer.register(id.clone()) else {
+                continue;
+            };
+            self.add_adjudication_target(session_id, &rec.key, client_id);
+            conn.send_to_client(FromServer::Request {
+                id,
+                call: rec.call.clone(),
+            });
+            // GW3 tie-in: the settling waterfall cancels this token along
+            // with the original fan-out's, so a delivery superseded by
+            // another owner's reply exits promptly instead of parking on
+            // the timeout.
+            let token = tokio_util::sync::CancellationToken::new();
+            if let Some(delivery) = self.pending_deliveries.lock().get_mut(&rec.delivery_id) {
+                delivery.insert(client_id.to_string(), token.clone());
+            }
+            let inner = Arc::clone(self);
+            let sid = session_id.to_string();
+            manox_agent::runtime::handle().spawn(async move {
+                let outcome = tokio::select! {
+                    _ = token.cancelled() => Err(RpcError::new(
+                        -1,
+                        "replayed delivery superseded (adjudication settled elsewhere)",
+                    )
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
+                    replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
+                        Ok(Ok(o)) => o,
+                        _ => Err(RpcError::new(-1, "replayed adjudication reply timed out")
+                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
+                    },
+                };
+                apply_reply(&inner, &sid, rec.ctx, outcome, None);
+            });
+        }
+    }
+
+    fn add_adjudication_target(&self, session_id: &str, key: &str, client_id: &str) {
+        if let Some(list) = self.pending_adjudications.lock().get_mut(session_id)
+            && let Some(rec) = list.iter_mut().find(|rec| rec.key == key)
+            && !rec.targets.iter().any(|cid| cid == client_id)
+        {
+            rec.targets.push(client_id.to_string());
+        }
     }
 
     // ── Note routing. ──────────────────────────────────────────────────────
@@ -1354,6 +1495,8 @@ fn reown_existing(
         },
     );
     inner.host_to_client(owner, session_created_event(session_id, &thread));
+    // §D.6: joining a live session re-delivers its unsettled adjudications.
+    inner.replay_pending_adjudications(owner, session_id);
     Ok(json!({ "restored": true }))
 }
 /// GW1 (§D.5): build the `SessionCreated` Host mirror — the wire note
@@ -1656,6 +1799,10 @@ impl AgentServerInner {
             && inner.sessions.lock().contains_key(existing)
         {
             inner.add_owner(existing, owner);
+            // §D.6: joining a live session re-delivers its unsettled
+            // adjudications (an orphaned-but-running session parked a card
+            // for this owner-to-be).
+            inner.replay_pending_adjudications(owner, existing);
             return Ok(json!({ "session_id": existing }));
         }
         // §D.2 idempotency on disk (GW11): an id whose journal file already
@@ -2414,6 +2561,24 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     }
 
     if adjudication {
+        // §D.6 replay registry: live from fan-out until `apply_reply`
+        // settles it — any owner joining this session in the window gets
+        // the same call re-delivered.
+        inner.register_pending_adjudication(
+            session_id,
+            PendingAdjudication {
+                key: ctx
+                    .settle_key()
+                    .expect("adjudication kinds all carry a settle key"),
+                kind,
+                ctx: ctx.clone(),
+                call: call.clone(),
+                delivery_id: delivery_id
+                    .clone()
+                    .expect("adjudication kinds are stamped above"),
+                targets: targets.iter().map(|(cid, ..)| cid.clone()).collect(),
+            },
+        );
         route_waterfall(
             inner,
             session_id,
@@ -2458,6 +2623,26 @@ type AdjudicationTarget = (
     async_channel::Receiver<Result<Value, RpcError>>,
     MsgId,
 );
+
+/// One unsettled adjudication, kept so every owner that joins the session
+/// later — re-open, re-own, or a handshake re-declaring the session —
+/// receives the same still-live call (§D.6 replay). `call` carries the
+/// original `delivery_id` (the client-side reply correlation is per
+/// delivery; the engine settle is per `auth_id` and first-wins).
+#[derive(Clone)]
+struct PendingAdjudication {
+    key: String,
+    kind: HookKind,
+    ctx: ReplyCtx,
+    call: ServerCall,
+    /// GW3 identity of the original fan-out; replay waiters register their
+    /// cancel tokens under it so the settling waterfall also wakes them.
+    delivery_id: String,
+    /// Owners holding a live reply waiter for this call (the fan-out
+    /// recipients plus every replay that minted a waiter). Replay re-sends
+    /// to these instead of re-registering the same MsgId (GW2).
+    targets: Vec<String>,
+}
 
 /// GW3: unregister a delivery when its waterfall settles — and cancel the
 /// tokens of any recipient that never answered, so their reply-waiter tasks
@@ -2629,11 +2814,25 @@ async fn route_waterfall(
 }
 
 /// Per-`ServerCall` context carried out of the lock to apply the reply.
+#[derive(Clone)]
 enum ReplyCtx {
     Approve { auth_id: String },
     AskUser { auth_id: String },
     PlanVerdict { plan_file: String },
     Other,
+}
+
+impl ReplyCtx {
+    /// Identity of the adjudication this context settles: the deterministic
+    /// reply MsgId minus its envelope. `None` for capability calls, which
+    /// have no re-routable identity.
+    fn settle_key(&self) -> Option<String> {
+        match self {
+            ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => Some(auth_id.clone()),
+            ReplyCtx::PlanVerdict { plan_file } => Some(plan_file.clone()),
+            ReplyCtx::Other => None,
+        }
+    }
 }
 
 fn fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, ctx: &ReplyCtx) {
@@ -2664,6 +2863,11 @@ fn apply_reply(
     outcome: Result<Value, RpcError>,
     verdict_failure: Option<String>,
 ) {
+    // Settlement retires the replay record first: a later owner joining
+    // after this point must not be re-delivered a settled call.
+    if let Some(key) = ctx.settle_key() {
+        inner.retire_pending_adjudication(session_id, &key);
+    }
     match ctx {
         ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
@@ -2737,10 +2941,11 @@ fn apply_ask_reply(
                 .unwrap_or_default(),
             response: v.get("response").and_then(Value::as_str).map(String::from),
         },
-        Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
-            answers: Vec::new(),
-            response: None,
-        },
+        // The reply never arrived as an answer (adjudication timeout,
+        // withdrawn delivery, disconnected peer): an explicit non-answer —
+        // an empty `AskUserQuestion` would read to the model as the user
+        // answering nothing on purpose.
+        Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
     };
     if let Some(thread) = inner.session_thread(session_id) {
         thread.with_mut(|t| t.respond_authorization(&auth_id, response));
@@ -2753,10 +2958,7 @@ fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth
         thread.with_mut(|t| {
             t.respond_authorization(
                 &auth_id,
-                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
-                    answers: Vec::new(),
-                    response: None,
-                },
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
             )
         });
     }
