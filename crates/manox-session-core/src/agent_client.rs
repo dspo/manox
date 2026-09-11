@@ -186,7 +186,9 @@ mod tests {
             matches!(
                 third,
                 FromServer::Host {
-                    host: manox_protocol::stream::HostEvent::Ready { epoch: 1 }
+                    host: manox_protocol::stream::HostEvent::Ready {
+                        epoch: PROTOCOL_EPOCH
+                    }
                 }
             ),
             "expected the Host Ready epoch echo (GW1/C1), got {third:?}"

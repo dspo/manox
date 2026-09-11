@@ -37,6 +37,8 @@ use manox_agent::language_model::{MessageContent, ReasoningEffort};
 use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
+use manox_harness::session::SessionStorage;
+use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
 use crate::follow::{self, StreamHandle};
 use crate::journal_query;
@@ -1396,6 +1398,30 @@ async fn handle_call(
                 .await
         }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
+        ClientCall::ForkSession {
+            source_session_id,
+            through_entry_id,
+            cwd,
+            project,
+            initial_model,
+            approval_mode,
+            reasoning_effort,
+        } => {
+            fork_session(
+                inner,
+                client_id,
+                ForkIntent {
+                    source_session_id,
+                    through_entry_id,
+                    cwd,
+                    project,
+                    initial_model,
+                    approval_mode,
+                    reasoning_effort,
+                },
+            )
+            .await
+        }
         ClientCall::ListThreads => {
             // Cross-domain #5: the rescan self-hold — answer from a FRESH
             // scan (awaited, not the fire-and-forget spawn) so no client
@@ -1552,6 +1578,192 @@ async fn open_session(
         inner.route_host(session_id, session_created_event(session_id, &thread));
         Ok(json!({ "restored": true }))
     }
+}
+
+/// `ClientCall::ForkSession` (dspo/manox-app#9): create a new session whose
+/// journal is the source's active chain up to (and including)
+/// `through_entry_id`.
+///
+/// The fork is a prefix copy, not a cross-file redirect — `Leaf` targets are
+/// file-local and the load-time chain validator rejects foreign parents — so
+/// a fork materializes a fresh journal file: new id, new `thread` header
+/// stamp (a copied stamp would collapse the fork into the source's sidebar
+/// row), `parentSession` pointing back at the source file. The source's
+/// active-chain rows are re-appended through the storage's own append path
+/// (ids and parent links preserved; seq re-derived along the chain, which
+/// for a dense prefix reproduces the source seqs exactly). Engine state
+/// carried by the journal — model, cwd, goal, plan review, the subagent
+/// rail — restores from the copied rows on load; nothing else is rewritten
+/// (threads.db is not on the session-creation path). The source is read
+/// straight off its persisted file (the cold path): appends are durable at
+/// write time, so this is correct for live and cold sources alike, and a
+/// deferred (never-materialized) source has no file and answers
+/// `session/not-found`.
+///
+/// The intent fields override the inherited state ONLY when explicitly
+/// given — absent fields inherit from the copied journal (unlike
+/// `CreateSession`, no global-default model is applied). Overrides land on
+/// the live thread after the open as durable change rows, exactly like the
+/// `CreateSession` path's seeds. Note: rows are re-appended one by one
+/// through the validated append path, so a fork costs O(chain²) duplicate
+/// checks — acceptable for v1, revisit if large chains fork slowly.
+struct ForkIntent {
+    source_session_id: String,
+    through_entry_id: String,
+    cwd: Option<String>,
+    project: Option<String>,
+    initial_model: Option<manox_protocol::journal::ModelRef>,
+    approval_mode: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+async fn fork_session(
+    inner: &Arc<AgentServerInner>,
+    owner: &str,
+    intent: ForkIntent,
+) -> Result<Value, RpcError> {
+    let ForkIntent {
+        source_session_id,
+        through_entry_id,
+        cwd,
+        project,
+        initial_model,
+        approval_mode,
+        reasoning_effort,
+    } = intent;
+    // Resolve every intent field that can fail before touching the
+    // filesystem (the same wire vocabularies CreateSession validates).
+    let model = match initial_model.as_ref() {
+        None => None,
+        Some(m) => {
+            let registry = manox_agent::provider_glue::global();
+            match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
+                Some(model) => Some(model),
+                None => {
+                    return Err(RpcError::new(-1, format!("unknown model: {}", m.0))
+                        .with_code(manox_protocol::msg::CODE_MODEL_UNRESOLVABLE));
+                }
+            }
+        }
+    };
+    let approval = match approval_mode.as_deref() {
+        None => None,
+        Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string())) {
+            Ok(mode) => Some(mode),
+            Err(_) => {
+                return Err(RpcError::new(-1, format!("unknown approval mode: {s}"))
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+            }
+        },
+    };
+    let effort = match reasoning_effort.as_deref() {
+        None => None,
+        Some("high") => Some(ReasoningEffort::High),
+        Some("max") => Some(ReasoningEffort::Max),
+        Some(other) => {
+            return Err(
+                RpcError::new(-1, format!("unknown reasoning effort: {other}"))
+                    .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST),
+            );
+        }
+    };
+
+    // Source: the persisted file (cold path — valid for live and cold
+    // sources; a deferred source has no file).
+    let Some(source_path) = persisted_session_file(&source_session_id) else {
+        return Err(RpcError::new(-1, "thread not found")
+            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+    };
+    if !source_path.exists() {
+        return Err(RpcError::new(-1, "thread not found")
+            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+    }
+    let source = JsonlSessionStorage::open(&source_path)
+        .await
+        .map_err(|err| {
+            RpcError::new(-1, format!("journal corrupt: {err}"))
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        })?;
+    let records = source.journal_range(0, u64::MAX).await.map_err(|err| {
+        RpcError::new(-1, format!("journal corrupt: {err}"))
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+    })?;
+    let through = records
+        .iter()
+        .position(|r| r.entry.id() == through_entry_id)
+        .ok_or_else(|| {
+            RpcError::new(
+                -1,
+                format!("entry {through_entry_id} is not on the source's active chain"),
+            )
+            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)
+        })?;
+
+    // Materialize the fork file immediately (never deferred — a non-empty
+    // prefix must be visible to `list` and loadable cold).
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let Some(target_path) = persisted_session_file(&session_id) else {
+        return Err(RpcError::new(-1, "minted fork id failed the path gate")
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+    };
+    let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
+    let target = JsonlSessionStorage::create(
+        &target_path,
+        JsonlSessionMetadata {
+            id: session_id.clone(),
+            cwd: fork_cwd,
+            created_at: chrono::Utc::now(),
+            parent_session_path: Some(source_path.to_string_lossy().into_owned()),
+            metadata: Some(serde_json::json!({
+                "host": manox_agent::host::current().slug(),
+                "thread": session_id,
+            })),
+        },
+    )
+    .await
+    .map_err(|err| {
+        RpcError::new(-1, format!("fork file creation failed: {err}"))
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+    })?;
+    for record in &records[..=through] {
+        target.append_entry(&record.entry).await.map_err(|err| {
+            RpcError::new(-1, format!("fork row copy failed: {err}"))
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        })?;
+    }
+    drop(target);
+
+    // Register + open through the same path OpenSession takes (load, pump,
+    // owner registration, SessionCreated note + Host mirror). The seed
+    // makes the unscanned id loadable before any list refresh runs.
+    manox_agent::thread_store::global()
+        .with_mut(|s| s.note_session_path(&session_id, &target_path));
+    open_session(inner, owner, &session_id).await?;
+
+    // Explicit intent overrides only — absent fields keep the state the
+    // copied journal restored (no global-default model here).
+    let thread = inner
+        .sessions
+        .lock()
+        .get(&session_id)
+        .map(|entry| entry.thread.clone());
+    if let Some(thread) = thread {
+        thread.with_mut(|t| {
+            if let Some(model) = model {
+                t.set_model(model);
+            }
+            if let Some(mode) = approval {
+                t.set_permission_mode(mode);
+            }
+            if let Some(effort) = effort {
+                t.set_reasoning_effort(effort);
+            }
+            if let Some(project) = project {
+                t.set_project(PathBuf::from(project));
+            }
+        });
+    }
+    Ok(json!({ "session_id": session_id }))
 }
 
 /// The idempotent re-own of a live session: the owner joins and the

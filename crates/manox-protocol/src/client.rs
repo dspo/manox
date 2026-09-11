@@ -123,6 +123,28 @@ pub enum ClientCall {
     CancelDelivery {
         delivery_id: String,
     },
+    /// Fork: create a new session whose journal is the source's active chain
+    /// up to (and including) `through_entry_id`. The fork is an independent
+    /// thread — fresh id, fresh `thread` header stamp, own sidecar; the
+    /// header's `parentSession` points back at the source file. Rows are
+    /// copied as a dense prefix (ids and parent links preserved, seq
+    /// re-derived along the chain), so engine state carried by the journal
+    /// (model, cwd, goal, plan review, the subagent rail) restores on load.
+    /// `through_entry_id` MUST lie on the source's active chain (rendered
+    /// history); entries on abandoned branches are not addressable. A
+    /// deferred (never-materialized) source has no file and answers
+    /// `session/not-found`. The intent fields override the inherited state
+    /// ONLY when explicitly given — absent fields inherit from the copied
+    /// journal, not the global defaults. Response: `{session_id}`.
+    ForkSession {
+        source_session_id: String,
+        through_entry_id: String,
+        cwd: Option<String>,
+        project: Option<String>,
+        initial_model: Option<crate::journal::ModelRef>,
+        approval_mode: Option<String>,
+        reasoning_effort: Option<String>,
+    },
 }
 
 /// Client → server fire-and-forget commands.
