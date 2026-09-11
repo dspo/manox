@@ -104,6 +104,28 @@ impl Waterfall {
         None
     }
 
+    /// Remove a recipient whose delivery was abandoned by the gateway
+    /// itself (the §D.6 re-seat hand-off: the owner's connection was
+    /// replaced, so this waterfall no longer owns that delivery's settle —
+    /// the replayed waiter does). Removing a recipient cannot itself fail
+    /// the adjudication; it settles `Allowed` only when it completes the
+    /// all-must-answer quorum of the recipients that remain.
+    pub fn abandon(&mut self, client_id: &str) -> Option<WaterfallOutcome> {
+        if self.settled.is_some() {
+            return None;
+        }
+        self.deliveries.remove(client_id)?;
+        if !self.deliveries.is_empty()
+            && self
+                .deliveries
+                .values()
+                .all(|s| matches!(s, DeliveryState::Next))
+        {
+            return Some(self.settle(WaterfallOutcome::Allowed));
+        }
+        None
+    }
+
     /// The recipients still owed a cancel frame after settlement (those
     /// still waiting when the waterfall settled — `settle` re-marks them
     /// `Cancelled`, which is exactly this set).
@@ -210,5 +232,30 @@ mod tests {
         let mut w2 = Waterfall::new("s1", vec!["a".into()]);
         w2.reply("a", true);
         assert_eq!(w2.expire("a"), None);
+    }
+
+    #[test]
+    fn abandon_drops_from_the_quorum_never_rejects() {
+        // Sole recipient abandoning: nothing to decide, no settle.
+        let mut w = Waterfall::new("s1", vec!["a".to_string()]);
+        assert_eq!(w.abandon("a"), None);
+        assert!(w.settled().is_none());
+        // Abandoning completes the quorum: the remaining Next answer
+        // settles Allowed (the abandoned delivery must not veto it).
+        let mut w = Waterfall::new("s1", vec!["a".to_string(), "b".to_string()]);
+        w.reply("a", true);
+        assert_eq!(w.abandon("b"), Some(WaterfallOutcome::Allowed));
+        // A still-waiting third recipient keeps the quorum open.
+        let mut w = Waterfall::new(
+            "s1",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        w.reply("a", true);
+        assert_eq!(w.abandon("b"), None);
+        assert!(w.settled().is_none());
+        assert_eq!(w.abandon("c"), Some(WaterfallOutcome::Allowed));
+        // Foreign/late abandons are inert.
+        assert_eq!(w.abandon("zzz"), None);
+        assert_eq!(w.abandon("a"), None, "already settled");
     }
 }

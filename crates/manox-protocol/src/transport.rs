@@ -215,7 +215,9 @@ type PendingMap = HashMap<MsgId, Sender<Result<serde_json::Value, RpcError>>>;
 /// The responder side calls [`RpcPeer::complete`] when the matching
 /// reply/response arrives. [`RpcPeer::cancel`] resolves a waiter with an error
 /// (e.g. when the peer disconnects mid-call).
-#[derive(Default)]
+///
+/// The peer is a shared handle: clones observe the same waiter map.
+#[derive(Clone, Default)]
 pub struct RpcPeer {
     pending: Arc<Mutex<PendingMap>>,
 }
@@ -262,7 +264,19 @@ impl RpcPeer {
         self.complete(id, Err(err))
     }
 
-    /// Drop all waiters, resolving each with `err` (peer disconnect).
+    /// Whether a live waiter is registered for `id`. §D.6 replay uses this
+    /// to tell "this owner's connection still carries the open waiter"
+    /// (re-send the frame; the reply flows through it) from a re-seated
+    /// owner whose waiter died with the old connection (must re-mint the
+    /// waiter on the new peer).
+    pub fn has_waiter(&self, id: &MsgId) -> bool {
+        self.pending.lock().contains_key(id)
+    }
+
+    /// Drop all waiters, resolving each with `err` (the only server-side
+    /// caller is the same-`client_id` handshake re-seat, which tags the
+    /// error `client/reseated` so waiters can tell a connection swap from
+    /// a delivery failure).
     pub fn cancel_all(&self, err: RpcError) {
         let ids: Vec<MsgId> = self.pending.lock().keys().cloned().collect();
         for id in ids {

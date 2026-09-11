@@ -1823,6 +1823,564 @@ fn ask_user_question_round_trips() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+// ── §D.6 replay of parked adjudications + R1 expired verdicts. ─────────────
+
+/// Seed the fake engine's pending set: the real engine's gate holds a
+/// parked interaction until it answers, and the replay settle-truth reads
+/// that same set.
+fn seed_pending_ask(engine: &std::sync::Arc<FakeEngine>, auth_id: &str) {
+    engine.pending_auth.lock().unwrap().push((
+        auth_id.into(),
+        manox_agent::permission::PendingAuthMeta {
+            tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+            summary: "pick a color".into(),
+            input: json!({"question": "color?"}),
+        },
+    ));
+}
+
+/// Drive a session into a parked AskUserQuestion: submit, wait for the
+/// turn edge, emit the authorization event, and take the fan-out
+/// request's MsgId (deterministic — the auth_id itself).
+fn park_ask(
+    client: &Client,
+    engine: &std::sync::Arc<FakeEngine>,
+    session_id: &str,
+    auth_id: &str,
+) -> MsgId {
+    client.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: session_id.into(),
+            text: "ask me".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    expect_host_status(client, session_id, |running, _, _, _| running == Some(true));
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: auth_id.into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a color".into(),
+                input: json!({"question": "color?"}),
+            },
+        )))
+        .unwrap();
+    loop {
+        match client.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id: a, .. },
+            } if a == auth_id => return id,
+            _ => {}
+        }
+    }
+}
+
+/// A second connection under its own `client_id`, handshaking with
+/// declared session ownership — the §D.6 join path.
+fn second_client(
+    server: &AgentServer,
+    client_id: &str,
+    caps: Vec<HookKind>,
+    sessions: &[&str],
+) -> Client {
+    let (conn, server_conn) = in_process_pair();
+    server.accept(std::sync::Arc::new(server_conn));
+    let client = Client { conn };
+    client.send(FromClient::Request {
+        id: MsgId::new(format!("init-{client_id}")),
+        call: ClientCall::Initialize(Initialize {
+            client_id: client_id.into(),
+            capabilities: caps,
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            protocol_epoch: PROTOCOL_EPOCH,
+        }),
+    });
+    client
+}
+
+/// Poll the fake engine until it records `auth_id`'s settle; `expired`
+/// selects which non-answer/answer shape.
+fn wait_for_auth_settle(engine: &std::sync::Arc<FakeEngine>, auth_id: &str, expired: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+            id == auth_id
+                && if expired {
+                    matches!(
+                        r,
+                        manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired
+                    )
+                } else {
+                    matches!(
+                        r,
+                        manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { .. }
+                    )
+                }
+        });
+        if got {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine never received the {auth_id} settle (expired={expired})"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// §D.6 replay: a parked question re-surfaces for owners joining AFTER
+/// the fan-out — the gateway registry is the authoritative pending copy.
+/// The late owner's answer settles the gate (first settle wins), and
+/// settlement retires the record: a further join is served nothing.
+#[test]
+fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let a_id = park_ask(&client_a, &engine, "s1", "q1");
+    assert_eq!(a_id.0, "q1", "the fan-out MsgId is the auth_id");
+
+    let client_b = second_client(&server, "test-b", vec![HookKind::AskUserQuestion], &["s1"]);
+    let b_id = loop {
+        match client_b.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    assert_eq!(b_id.0, "q1", "replay reuses the deterministic MsgId");
+    assert!(
+        server.0.pending_adjudications.lock()["s1"]
+            .iter()
+            .any(|rec| rec.targets.iter().any(|(cid, _)| cid == "test-b")),
+        "the replayed owner joins the waiter set"
+    );
+    client_b.send(FromClient::Reply {
+        id: b_id,
+        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    // Drain A's still-open waiter with a late reply so the original
+    // waterfall converges inside the test instead of lingering on the
+    // delivery timeout. At the REAL gate that second settle is ignored
+    // (already-settled ids are unknown to it — the agent-layer verdict
+    // tests cover the idempotency); the fake engine records every gateway
+    // settle it receives, in arrival order.
+    client_a.send(FromClient::Reply {
+        id: a_id,
+        outcome: Ok(json!({"answers": [["color", "red"]], "response": null})),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let held = engine.auth_responses.lock().unwrap();
+    let q1: Vec<_> = held
+        .iter()
+        .filter(|(id, _)| id == "q1")
+        .map(|(_, r)| r)
+        .collect();
+    assert!(
+        matches!(
+            q1[0],
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
+                if answers == &vec![("color".to_string(), "blue".to_string())]
+        ),
+        "the replayed owner's answer is the settle that reaches the gate first: {q1:?}"
+    );
+    drop(held);
+
+    let client_c = second_client(&server, "test-c", vec![HookKind::AskUserQuestion], &["s1"]);
+    let mut c_frames = Vec::new();
+    loop {
+        let m = client_c.recv();
+        let done = matches!(&m, FromServer::Response { id, .. } if id.0 == "init-test-c");
+        c_frames.push(m);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !c_frames.iter().any(|m| matches!(
+            m,
+            FromServer::Request {
+                call: ServerCall::AskUserQuestion { .. },
+                ..
+            }
+        )),
+        "a settled adjudication must never re-deliver: {c_frames:?}"
+    );
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "settlement retires the replay record"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    drop(client_a);
+    drop(client_b);
+    drop(client_c);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §D.6 replay, switch-back path: an owner that re-opens a session it
+/// already holds a live waiter for gets the card RE-SENT on the same
+/// deterministic MsgId without a second `register` (the GW2 duplicate
+/// guard must stay untripped); its answer settles exactly once.
+#[test]
+fn reown_resends_the_parked_ask_through_the_live_waiter() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+
+    client_a.send(FromClient::Request {
+        id: MsgId::new("reopen"),
+        call: ClientCall::OpenSession {
+            session_id: "s1".into(),
+        },
+    });
+    let resent = loop {
+        match client_a.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    assert_eq!(resent.0, "q1", "the re-sent card keeps the auth_id MsgId");
+    assert_eq!(
+        server.0.pending_adjudications.lock()["s1"]
+            .iter()
+            .find(|rec| rec.key == "q1")
+            .map(|rec| rec.targets.len()),
+        Some(1),
+        "re-send must not add a second waiter for the same owner"
+    );
+    client_a.send(FromClient::Reply {
+        id: resent,
+        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "q1")
+            .count(),
+        1,
+        "the re-sent card shares the one live waiter"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    expect_host_status(&client_a, "s1", |running, _, _, _| running == Some(false));
+    drop(client_a);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §D.6 re-seat: a same-`client_id` reconnect (a desktop restart) swaps
+/// the connection out from under the parked card's waiter. The replay must
+/// re-mint the waiter on the FRESH peer — re-sending to a target whose
+/// waiter died would resolve the user's answer against nothing — and that
+/// answer must settle the gate. The abandoned waterfall settles nothing on
+/// its own: the settle obligation transferred with the connection.
+#[test]
+fn ask_survives_same_client_reseat() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+
+    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &["s1"]);
+    let replayed = loop {
+        match reseated.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    assert_eq!(
+        replayed.0, "q1",
+        "the re-minted waiter reuses the deterministic MsgId"
+    );
+    // P2 guard: the re-minted owner row is stamped with the CURRENT
+    // connection generation. The resend branch only fires on a
+    // `(cid, generation)` exact match, so a stale-generation row (a waiter
+    // that died with a prior connection) can never satisfy it — even if the
+    // fresh peer happens to hold a live waiter under the same MsgId for an
+    // unrelated call, the answer cannot be mis-routed through it.
+    let cur_gen = server.0.clients.lock().get("test").unwrap().generation;
+    assert!(
+        server.0.pending_adjudications.lock()["s1"]
+            .iter()
+            .find(|rec| rec.key == "q1")
+            .unwrap()
+            .targets
+            .iter()
+            .any(|(cid, target_gen)| cid == "test" && *target_gen == cur_gen),
+        "the re-minted target carries the current generation, not a stale one"
+    );
+    reseated.send(FromClient::Reply {
+        id: replayed,
+        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    std::thread::sleep(Duration::from_millis(200));
+    let held = engine.auth_responses.lock().unwrap();
+    assert!(
+        held.iter().any(|(id, r)| id == "q1"
+            && matches!(
+                r,
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
+                    if answers == &vec![("color".to_string(), "blue".to_string())]
+            )),
+        "the re-seated owner's answer reaches the gate: {held:?}"
+    );
+    assert_eq!(
+        held.iter().filter(|(id, _)| id == "q1").count(),
+        1,
+        "exactly one settle: the abandoned waterfall must not fail-close the call it handed off"
+    );
+    drop(held);
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "the replayed settle retires the registry record"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    expect_host_status(&reseated, "s1", |running, _, _, _| running == Some(false));
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §D.6: a re-seat that does NOT re-declare the parked session is the
+/// owner abandoning it — no future replay can reach it, so the registry
+/// retires the call fail-closed as an explicit non-answer. The old
+/// waterfall's hand-off and this retirement must not double-settle.
+#[test]
+fn ask_reseat_without_reclaim_retires_the_parked_call() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+
+    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &[]);
+    let mut frames = Vec::new();
+    loop {
+        let m = reseated.recv();
+        let done = matches!(&m, FromServer::Response { id, .. } if id.0 == "init-test");
+        frames.push(m);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        !frames.iter().any(|m| matches!(
+            m,
+            FromServer::Request {
+                call: ServerCall::AskUserQuestion { .. },
+                ..
+            }
+        )),
+        "a session the re-seat dropped declares no replay: {frames:?}"
+    );
+    wait_for_auth_settle(&engine, "q1", true);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "q1")
+            .count(),
+        1,
+        "the abandonment fail-closes exactly once"
+    );
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "the retired record leaves the authoritative pending copy"
+    );
+
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// R1: with no capable client the question fails closed as an explicit
+/// `Expired` non-answer — never the pre-fix empty `AskUserQuestion` the
+/// model could read as the user answering nothing on purpose. The
+/// empty-targets path settles BEFORE the replay registry ever sees it.
+#[test]
+fn ask_without_capable_client_settles_expired() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![HookKind::Approve]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: "s1".into(),
+            text: "ask me".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "q1".into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a color".into(),
+                input: json!({"question": "color?"}),
+            },
+        )))
+        .unwrap();
+    wait_for_auth_settle(&engine, "q1", true);
+    assert!(
+        server.0.pending_adjudications.lock().get("s1").is_none(),
+        "the fail-closed path never registers a replay record"
+    );
+    // No ask delivery left the gateway.
+    let mut frames = Vec::new();
+    while let Ok(m) = client.conn.server_rx().try_recv() {
+        frames.push(m);
+    }
+    assert!(
+        !frames.iter().any(|m| matches!(
+            m,
+            FromServer::Request {
+                call: ServerCall::AskUserQuestion { .. },
+                ..
+            }
+        )),
+        "no question may be delivered to an incapable client: {frames:?}"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// R1: when the holding owner's connection dies, its waiter's closed
+/// channel folds into the fail-closed delivery expiry — the settle is the
+/// explicit `Expired` non-answer, and the replay record retires with it
+/// (nothing is re-deliverable after the call is dead).
+#[test]
+fn ask_expires_when_the_holding_owner_disconnects() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+    // Drop alone never closes the in-process pair: each end holds its own
+    // clone of BOTH senders, so `disconnect` is what ends the server-side
+    // dispatch loop (and with it the entry — whose peer's dropped senders
+    // fold A's open waiter into the fail-closed expiry).
+    client_a.conn.disconnect();
+    drop(client_a);
+    wait_for_auth_settle(&engine, "q1", true);
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.is_empty()),
+        "the expired settle retires the replay record"
+    );
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 #[test]
 fn plan_verdict_round_trips_and_seeds_execution() {
     let _g = lock_globals();
