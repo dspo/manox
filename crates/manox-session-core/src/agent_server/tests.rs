@@ -8963,3 +8963,38 @@ fn create_session_rejects_malformed_seed_before_creating_anything() {
         other => panic!("expected bad-request, got {other:?}"),
     }
 }
+
+// Image content blocks are valid seeds too (review #778): validation
+// accepts every kernel ContentBlock, so a side chat can carry a hidden
+// screenshot alongside its text — both land as separate hidden rows.
+#[test]
+fn create_session_seed_accepts_image_blocks() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let created = seeded_create(
+        &client,
+        Some(vec![
+            serde_json::json!({"type": "text", "text": "see this screenshot"}),
+            serde_json::json!({"type": "image", "data": "aGVsbG8=", "mimeType": "image/png"}),
+        ]),
+    )
+    .expect("mixed text+image seed validates");
+    let session_id = created["session_id"].as_str().unwrap().to_string();
+
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let contents = std::fs::read_to_string(sessions.join(format!("{session_id}.jsonl"))).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 3, "header + one row per seed block, in order");
+    let first: Value = serde_json::from_str(lines[1]).unwrap();
+    let second: Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(first["type"], "custom_message");
+    assert!(first["content"].to_string().contains("see this screenshot"));
+    assert_eq!(second["type"], "custom_message");
+    let image_json = second["content"].to_string();
+    assert!(
+        image_json.contains("image/png") && image_json.contains("aGVsbG8="),
+        "the image block lands verbatim: {image_json}"
+    );
+}

@@ -2233,6 +2233,13 @@ impl AgentServerInner {
                     .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
             })?;
             drop(storage);
+            // Path note + open are two steps, deliberately (review #778):
+            // the note only seeds the store's id→path map so `load_thread`
+            // can resolve the just-minted uuid before any list scan ran.
+            // A concurrent open of the SAME id would need to guess the
+            // fresh uuid (2^122 collision space) while holding this
+            // connection's FIFO dispatch — the uuid, not a lock, is the
+            // identity claim here, matching the deferred-fresh path.
             manox_agent::thread_store::global()
                 .with_mut(|store| store.note_session_path(&session_id, &path));
             open_session(inner, owner, &session_id).await?;
