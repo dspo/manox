@@ -8138,7 +8138,11 @@ fn seed_fork_source(id: &str, body: &[String]) -> std::path::PathBuf {
 
 /// Send a ForkSession and drain until its Response, returning (outcome,
 /// session_id). The open-path SessionCreated note + Host mirror arrive
-/// ahead of the response and are tolerated here.
+/// ahead of the response and are tolerated here. Not a busy-wait
+/// (review #775): `Client::recv` polls the async channel at a 10ms
+/// cadence with a 60s bounded deadline — the poll loop exists because the
+/// test thread cannot block on the async channel, and it parks between
+/// polls.
 fn fork_and_collect(
     client: &Client,
     source: &str,

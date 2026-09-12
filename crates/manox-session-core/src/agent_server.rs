@@ -1606,7 +1606,9 @@ async fn open_session(
 /// the live thread after the open as durable change rows, exactly like the
 /// `CreateSession` path's seeds. Note: rows are re-appended one by one
 /// through the validated append path, so a fork costs O(chain²) duplicate
-/// checks — acceptable for v1, revisit if large chains fork slowly.
+/// checks — acceptable for v1. If very deep chains (>10k entries) ever
+/// fork slowly, the fix is a batched `extend` on the storage face (one
+/// validation pass over the prefix, one file write), not per-row tuning.
 struct ForkIntent {
     source_session_id: String,
     through_entry_id: String,
@@ -1713,6 +1715,12 @@ async fn fork_session(
             id: session_id.clone(),
             cwd: fork_cwd,
             created_at: chrono::Utc::now(),
+            // `parentSession` is an informational sidebar link, not a
+            // resolved path: the sessions dir holds ASCII uuid filenames,
+            // so a non-UTF8 component here would have to come from a
+            // relocated MANOX_HOME — lossy replacement degrades the link's
+            // display, never the fork's content (the harness type is a
+            // String; widening it to PathBuf is a harness-side change).
             parent_session_path: Some(source_path.to_string_lossy().into_owned()),
             metadata: Some(serde_json::json!({
                 "host": manox_agent::host::current().slug(),
