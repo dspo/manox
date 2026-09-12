@@ -318,7 +318,13 @@ impl Drop for PtyHandle {
                 let _ = child.wait();
             }
         }
-        // Drop the join handles to detach the threads.
+        // Drop the join handles to detach the threads. Note the semantics
+        // (review #773): `JoinHandle::drop` does NOT join — it detaches —
+        // so this line is safe even while the reader / waiter threads are
+        // still running, and it intentionally mirrors the `detach` used on
+        // the spawn side: both threads exit on their own once the child
+        // dies (EOF / reap) and own every resource they touch, so the
+        // handle never waits on them.
         self.reader_thread.take();
         self.wait_thread.take();
     }
@@ -366,9 +372,11 @@ mod tests {
     }
 
     /// After drop, every pid in the snapshot (and the shell itself) must be
-    /// gone — kill(pid, 0) liveness, generous deadline for launchd reaping.
+    /// gone — kill(pid, 0) liveness. The deadline leaves heavy margin for
+    /// slow reapers: under load (CI runners, macOS launchd) a 5s window
+    /// flaked occasionally, so poll patiently instead (review #773).
     fn assert_tree_gone(shell_pid: libc::pid_t, tree: &[libc::pid_t]) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let survivors: Vec<_> = std::iter::once(shell_pid)
                 .chain(tree.iter().copied())

@@ -70,6 +70,13 @@ impl ShellKind {
     ///
     /// Nushell: `nu --commands "print $\"(char esc)]6973;manox-ready=<uuid>(char bel)\"; ^'<shell>'"`
     ///   - `^` spawns nested. Best-effort.
+    ///
+    /// `nonce` is interpolated verbatim into a single-quoted shell string
+    /// and, on PowerShell, a single-quoted .NET string — both inert for the
+    /// UUID charset (alphanumeric + `-`) this function is fed today. That
+    /// constraint is load-bearing (review #773): a future nonce containing
+    /// a quote, `$`, backtick, or `` ` `` would change the command's
+    /// meaning. Keep nonces alphanumeric, or escape per-shell here first.
     pub fn marker_command(
         &self,
         shell_path: &str,
