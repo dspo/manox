@@ -474,6 +474,15 @@ wire_surface! {
         ClientCall::CancelDelivery { .. } => "cancelDelivery" ~ ClientCall::CancelDelivery {
             delivery_id: "dlv-s1-1".into(),
         },
+        ClientCall::ForkSession { .. } => "forkSession" ~ ClientCall::ForkSession {
+            source_session_id: "s1".into(),
+            through_entry_id: "e-2".into(),
+            cwd: Some("/proj".into()),
+            project: None,
+            initial_model: Some(ModelRef::new("DeepSeek-anthropic/deepseek-chat")),
+            approval_mode: Some("workspace-write".into()),
+            reasoning_effort: Some("high".into()),
+        },
     ]
 }
 

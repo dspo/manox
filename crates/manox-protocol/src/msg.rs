@@ -365,6 +365,20 @@ mod tests {
                     delivery_id: "dlv-s1-1".into(),
                 },
             },
+            FromClient::Request {
+                id: MsgId::new("r-5"),
+                call: crate::client::ClientCall::ForkSession {
+                    source_session_id: "s1".into(),
+                    through_entry_id: "e-2".into(),
+                    cwd: Some("/proj".into()),
+                    project: None,
+                    initial_model: Some(crate::journal::ModelRef::new(
+                        "DeepSeek-anthropic/deepseek-chat",
+                    )),
+                    approval_mode: Some("workspace-write".into()),
+                    reasoning_effort: Some("high".into()),
+                },
+            },
         ];
         for msg in &msgs {
             let json = serde_json::to_string(msg).unwrap();
