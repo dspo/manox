@@ -4205,6 +4205,7 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
                         inner: self.0.clone(),
                         session_id: session_id.to_string(),
                         client_id: client_id.clone(),
+                        client_name: manox_agent::embedder_tools::client_tool_name(&spec.name),
                         spec: spec.clone(),
                     }) as std::sync::Arc<dyn manox_harness::tool::AgentTool>
                 })
@@ -4221,14 +4222,17 @@ struct EmbedderToolAdapter {
     session_id: String,
     client_id: String,
     spec: ClientToolSpec,
+    /// The sanitized model-facing name, computed once at construction —
+    /// `name()` borrows it, so nothing leaks (review #779 replaced a
+    /// `Box::leak` here; per-adapter Strings are bounded by the
+    /// registration set and die with it).
+    client_name: String,
 }
 
 #[async_trait::async_trait]
 impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
     fn name(&self) -> &str {
-        // Leaked once per adapter — the trait returns &str and the name is
-        // stable for the adapter's lifetime.
-        Box::leak(manox_agent::embedder_tools::client_tool_name(&self.spec.name).into_boxed_str())
+        &self.client_name
     }
     fn description(&self) -> &str {
         &self.spec.description
@@ -4238,8 +4242,11 @@ impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
     }
     /// An embedder tool is a remote call into the host — mutating by
     /// default, like MCP tools.
+    /// The registrant's advisory hint; the approval gate wrapping this
+    /// tool stays the authority (a read_only registration skips the
+    /// approval card, a mutating one surfaces it).
     fn requires_approval(&self, _params: &Value) -> bool {
-        true
+        !self.spec.read_only
     }
     async fn execute(
         &self,

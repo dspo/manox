@@ -441,6 +441,7 @@ wire_surface! {
                 name: "get_selection".into(),
                 description: "The editor's active selection.".into(),
                 input_schema: serde_json::json!({"type": "object", "properties": {}}),
+                read_only: true,
             }],
         },
         ClientCall::ModelChat { .. } => "modelChat" ~ ClientCall::ModelChat {

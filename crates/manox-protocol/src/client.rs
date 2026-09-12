@@ -173,6 +173,12 @@ pub struct ClientToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// The registrant's side-effect hint: `true` marks a read-only tool
+    /// (e.g. a selection reader) that need not surface an approval card.
+    /// Advisory only — the host's permission gate stays the authority;
+    /// absent (defaults `false`) means treat as mutating.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Client → server fire-and-forget commands.

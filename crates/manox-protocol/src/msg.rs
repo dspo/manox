@@ -388,6 +388,7 @@ mod tests {
                         name: "get_selection".into(),
                         description: "The editor's active selection.".into(),
                         input_schema: serde_json::json!({"type": "object"}),
+                        read_only: true,
                     }],
                 },
             },

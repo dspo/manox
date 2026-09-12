@@ -9015,6 +9015,7 @@ fn client_tool_spec(name: &str) -> ClientToolSpec {
         name: name.into(),
         description: "test embedder tool".into(),
         input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        read_only: false,
     }
 }
 
@@ -9075,8 +9076,31 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
     );
     assert_eq!(tools[0].description(), "test embedder tool");
     assert!(
+        tools[0].requires_approval(&serde_json::json!({})),
+        "a mutating registration (read_only=false) keeps the approval hint"
+    );
+    assert!(
         provider.tools_for("other-session").is_empty(),
         "registrations are session-scoped"
+    );
+
+    // The read-only hint (review #779): a get_selection-style registration
+    // skips the approval card while the gate itself stays authoritative.
+    register_tools(
+        &client,
+        "et-s",
+        vec![ClientToolSpec {
+            name: "get_selection".into(),
+            description: "read-only".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: true,
+        }],
+    );
+    let tools = provider.tools_for("et-s");
+    assert_eq!(tools.len(), 1);
+    assert!(
+        !tools[0].requires_approval(&serde_json::json!({})),
+        "a read_only registration drops the approval hint"
     );
     drop(client);
     drop(server);
