@@ -3294,6 +3294,28 @@ impl AgentServerCapabilityClient {
         Self(server.0.clone())
     }
 }
+/// The shared spine of every `CapabilityClient` method on
+/// [`AgentServerCapabilityClient``] (review #777): resolve the calling
+/// session from the `CURRENT_SESSION` task-local, build the session-scoped
+/// `ServerCall`, and route it — the caller only supplies the call builder
+/// and the reply mapping. `what` names the capability in the error when no
+/// session context exists.
+async fn route_session_capability(
+    inner: &Arc<AgentServerInner>,
+    what: &str,
+    call_for: impl FnOnce(String) -> ServerCall,
+) -> Result<Value, String> {
+    let session_id = manox_agent::capability::CURRENT_SESSION
+        .try_with(|c| c.clone())
+        .ok()
+        .flatten()
+        .ok_or_else(|| format!("no session context for {what}"))?;
+    let call = call_for(session_id.clone());
+    route_capability_call(inner, &session_id, call)
+        .await
+        .map_err(|e| e.message)
+}
+
 impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     fn browser_op(
         &self,
@@ -3302,21 +3324,16 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     {
         let inner = self.0.clone();
         Box::pin(async move {
-            let session_id = manox_agent::capability::CURRENT_SESSION
-                .try_with(|c| c.clone())
-                .ok()
-                .flatten()
-                .ok_or_else(|| "no session context for browser op".to_string())?;
-            let call = ServerCall::BrowserOp {
-                session_id: session_id.clone(),
-                op: serde_json::to_value(&op).map_err(|e| e.to_string())?,
-            };
-            let outcome = route_capability_call(&inner, &session_id, call).await;
-            match outcome {
-                Ok(v) => serde_json::from_value::<manox_agent::thread_engine::BrowserReply>(v)
-                    .map_err(|e| e.to_string()),
-                Err(e) => Err(e.message),
-            }
+            let op_value = serde_json::to_value(&op).map_err(|e| e.to_string())?;
+            let v = route_session_capability(&inner, "browser op", |session_id| {
+                ServerCall::BrowserOp {
+                    session_id,
+                    op: op_value.clone(),
+                }
+            })
+            .await?;
+            serde_json::from_value::<manox_agent::thread_engine::BrowserReply>(v)
+                .map_err(|e| e.to_string())
         })
     }
 
@@ -3324,23 +3341,20 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     /// to the owning ∩ ClipboardRead-capable client. The reply carries
     /// `{data: base64, mimeType}` (or `null` = empty / not text) per the
     /// server-call contract; non-text content fails closed rather than
-    /// decoding garbage into the model's context.
+    /// decoding garbage into the model's context. Note the deliberate v1
+    /// surface (review #777): an `image/png` clipboard surfaces as that
+    /// same fail-closed error, not as rendered image feedback — relaxing
+    /// this to decode image payloads (a base64 image content block) is a
+    /// future, explicitly-designed change, not an oversight.
     fn clipboard_read(
         &self,
     ) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            let session_id = manox_agent::capability::CURRENT_SESSION
-                .try_with(|c| c.clone())
-                .ok()
-                .flatten()
-                .ok_or_else(|| "no session context for clipboard read".to_string())?;
-            let call = ServerCall::ClipboardRead {
-                session_id: session_id.clone(),
-            };
-            let v = route_capability_call(&inner, &session_id, call)
-                .await
-                .map_err(|e| e.message)?;
+            let v = route_session_capability(&inner, "clipboard read", |session_id| {
+                ServerCall::ClipboardRead { session_id }
+            })
+            .await?;
             if v.is_null() {
                 return Ok(None);
             }
@@ -3371,19 +3385,11 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     ) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            let session_id = manox_agent::capability::CURRENT_SESSION
-                .try_with(|c| c.clone())
-                .ok()
-                .flatten()
-                .ok_or_else(|| "no session context for open external".to_string())?;
-            let call = ServerCall::OpenExternal {
-                session_id: session_id.clone(),
-                url,
-            };
-            route_capability_call(&inner, &session_id, call)
-                .await
-                .map(|_| ())
-                .map_err(|e| e.message)
+            route_session_capability(&inner, "open external", |session_id| {
+                ServerCall::OpenExternal { session_id, url }
+            })
+            .await
+            .map(|_| ())
         })
     }
 }
