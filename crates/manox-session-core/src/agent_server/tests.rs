@@ -9206,7 +9206,9 @@ impl manox_harness::tool::ToolContext for NullEmbedderCtx {
 
 #[test]
 fn embedder_tool_invoke_round_trips() {
-    if CI_PROBE2 { return; }
+    if CI_PROBE2 {
+        return;
+    }
     let _g = lock_globals();
     hermetic_home();
     init_globals();
@@ -9282,7 +9284,9 @@ fn embedder_tool_invoke_round_trips() {
 
 #[test]
 fn embedder_tool_without_capable_owner_fails_closed() {
-    if CI_PROBE2 { return; }
+    if CI_PROBE2 {
+        return;
+    }
     let _g = lock_globals();
     hermetic_home();
     init_globals();
@@ -9345,7 +9349,9 @@ fn embedder_tool_without_capable_owner_fails_closed() {
 
 #[test]
 fn dispose_clears_embedder_registrations() {
-    if CI_PROBE2 { return; }
+    if CI_PROBE2 {
+        return;
+    }
     let _g = lock_globals();
     hermetic_home();
     init_globals();
