@@ -8313,6 +8313,60 @@ fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
 }
 
 #[test]
+fn fork_of_a_long_chain_copies_the_exact_prefix() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    // A 60-row dense chain: the batch path must reproduce ids, parents,
+    // and re-derived seqs exactly, up to a mid-chain cut.
+    let mut body: Vec<String> = Vec::new();
+    for i in 0..60 {
+        let parent = if i == 0 {
+            None
+        } else {
+            Some(format!("L{:02?}", i - 1))
+        };
+        body.push(fork_msg_line(
+            &format!("L{i:02}"),
+            parent.as_deref(),
+            i,
+            "row {i}",
+        ));
+    }
+    seed_fork_source("fork-long", &body);
+
+    let (outcome, session_id) = fork_and_collect(&client, "fork-long", "L37");
+    let fork_id = session_id.expect("mid-chain fork succeeds");
+    assert!(outcome.is_ok());
+
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let fork_rows: Vec<serde_json::Value> =
+        std::fs::read_to_string(sessions.join(format!("{fork_id}.jsonl")))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(fork_rows.len(), 38, "header + rows 0..=37");
+    for (i, row) in fork_rows.iter().enumerate() {
+        assert_eq!(row["id"], format!("L{i:02}"));
+        assert_eq!(row["seq"], i, "seq is re-derived dense along the prefix");
+        let want_parent = if i == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(format!("L{:02?}", i - 1))
+        };
+        assert_eq!(
+            row["parentId"], want_parent,
+            "row {i} parent link preserved"
+        );
+    }
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
 fn fork_missing_source_answers_not_found() {
     let _g = lock_globals();
     hermetic_home();

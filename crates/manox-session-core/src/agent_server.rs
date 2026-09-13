@@ -37,7 +37,6 @@ use manox_agent::language_model::{MessageContent, ReasoningEffort};
 use manox_agent::thread::{PermissionMode, ThreadHandle};
 use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
-use manox_harness::session::SessionStorage;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
 use crate::follow::{self, StreamHandle};
@@ -1604,11 +1603,10 @@ async fn open_session(
 /// given — absent fields inherit from the copied journal (unlike
 /// `CreateSession`, no global-default model is applied). Overrides land on
 /// the live thread after the open as durable change rows, exactly like the
-/// `CreateSession` path's seeds. Note: rows are re-appended one by one
-/// through the validated append path, so a fork costs O(chain²) duplicate
-/// checks — acceptable for v1. If very deep chains (>10k entries) ever
-/// fork slowly, the fix is a batched `extend` on the storage face (one
-/// validation pass over the prefix, one file write), not per-row tuning.
+/// `CreateSession` path's seeds. The prefix copies through the storage's
+/// batched append (one lock hold, one validation pass, ONE file write):
+/// O(chain) total — a whole-prefix validation failure rejects the fork
+/// before any row touches disk.
 struct ForkIntent {
     source_session_id: String,
     through_entry_id: String,
@@ -1715,13 +1713,11 @@ async fn fork_session(
             id: session_id.clone(),
             cwd: fork_cwd,
             created_at: chrono::Utc::now(),
-            // `parentSession` is an informational sidebar link, not a
-            // resolved path: the sessions dir holds ASCII uuid filenames,
-            // so a non-UTF8 component here would have to come from a
-            // relocated MANOX_HOME — lossy replacement degrades the link's
-            // display, never the fork's content (the harness type is a
-            // String; widening it to PathBuf is a harness-side change).
-            parent_session_path: Some(source_path.to_string_lossy().into_owned()),
+            // `parentSession` stays a PathBuf to the JSON boundary
+            // (review #775): a non-UTF8 source path now fails the fork
+            // LOUDLY at header serialization instead of silently writing a
+            // lossy-mangled link.
+            parent_session_path: Some(source_path.clone()),
             metadata: Some(serde_json::json!({
                 "host": manox_agent::host::current().slug(),
                 "thread": session_id,
@@ -1733,12 +1729,14 @@ async fn fork_session(
         RpcError::new(-1, format!("fork file creation failed: {err}"))
             .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
     })?;
-    for record in &records[..=through] {
-        target.append_entry(&record.entry).await.map_err(|err| {
-            RpcError::new(-1, format!("fork row copy failed: {err}"))
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
-        })?;
-    }
+    let prefix: Vec<manox_harness::session::SessionTreeEntry> = records[..=through]
+        .iter()
+        .map(|r| r.entry.clone())
+        .collect();
+    target.append_entries(&prefix).await.map_err(|err| {
+        RpcError::new(-1, format!("fork row copy failed: {err}"))
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+    })?;
     drop(target);
 
     // Register + open through the same path OpenSession takes (load, pump,
