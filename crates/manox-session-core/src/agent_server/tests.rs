@@ -8200,6 +8200,8 @@ fn clipboard_read_routes_and_round_trips() {
     drop(client);
     drop(server);
     manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
 
 // ── ForkSession (dspo/manox-app#9): the prefix-copy fork. ──────────────────
 
@@ -8214,8 +8216,6 @@ fn fork_msg_line(id: &str, parent: Option<&str>, seq: u64, text: &str) -> String
     )
 }
 
-/// Seed a source session file under the hermetic sessions dir: header plus
-/// the given body lines verbatim.
 /// Test hygiene: remove this suite's seeded fork sources from the
 /// process-shared hermetic sessions dir — every leftover file costs the
 /// NEXT list/open test a parse on the slow CI runner.
@@ -8513,7 +8513,10 @@ fn clipboard_write_stays_fail_closed_on_the_bridge() {
     assert!(caps.clipboard_write("x".into()).is_err());
     drop(server);
     manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
 
+#[test]
 fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
     let _g = lock_globals();
     hermetic_home();
