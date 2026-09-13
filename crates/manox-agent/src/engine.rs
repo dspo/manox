@@ -1752,6 +1752,16 @@ fn build_tools(
     tools.push(Arc::new(crate::web_tools::WebExploreScreenshotTool::new(
         notice_tx.clone(),
     )));
+    // Host-capability tools (clipboard read / open external): registered
+    // only when a capability provider is present — a headless context with
+    // no host surface exposes neither tool. The clipboard read is a read;
+    // the opener rides the same approval gate as the browser write axis.
+    if let Some(opener) = crate::host_tools::append(&mut tools, notice_tx.clone()) {
+        tools.push(Arc::new(
+            ApprovalGatedTool::new(opener, Arc::clone(gate))
+                .with_plan_policy(Arc::clone(&plan_policy)),
+        ));
+    }
     for tool in [
         Arc::new(crate::web_tools::WebExploreOpenTool::new(notice_tx.clone()))
             as Arc<dyn PiAgentTool>,

@@ -551,6 +551,12 @@ impl ThreadHandle {
             BackendNotice::BrowserRequest { op, responder } => {
                 self.handle_browser_request(op, responder);
             }
+            BackendNotice::ClipboardRequest { responder } => {
+                self.handle_clipboard_request(responder);
+            }
+            BackendNotice::OpenExternalRequest { url, responder } => {
+                self.handle_open_external_request(url, responder);
+            }
             BackendNotice::SessionListDirty => {
                 if let Some(reg) = thread_registry() {
                     reg.refresh();
@@ -636,6 +642,45 @@ impl ThreadHandle {
         crate::runtime::handle().spawn(async move {
             let result = crate::capability::CURRENT_SESSION
                 .scope(Some(session_id), async { caps.browser_op(op).await })
+                .await;
+            let _ = responder.send(result).await;
+        });
+    }
+
+    /// The clipboard tool's half of the `ClipboardRequest` round trip:
+    /// same shape as the browser handler — provider missing fails closed,
+    /// the session-scoped task-local routes the capability call host-side.
+    fn handle_clipboard_request(
+        &self,
+        responder: async_channel::Sender<Result<Option<String>, String>>,
+    ) {
+        let Some(caps) = crate::capability::provider() else {
+            let _ = responder.try_send(Err("clipboard capability not available".to_string()));
+            return;
+        };
+        let session_id = self.read(|t| t.id.0.clone());
+        crate::runtime::handle().spawn(async move {
+            let result = crate::capability::CURRENT_SESSION
+                .scope(Some(session_id), caps.clipboard_read())
+                .await;
+            let _ = responder.send(result).await;
+        });
+    }
+
+    /// The open tool's half of the `OpenExternalRequest` round trip.
+    fn handle_open_external_request(
+        &self,
+        url: String,
+        responder: async_channel::Sender<Result<(), String>>,
+    ) {
+        let Some(caps) = crate::capability::provider() else {
+            let _ = responder.try_send(Err("open capability not available".to_string()));
+            return;
+        };
+        let session_id = self.read(|t| t.id.0.clone());
+        crate::runtime::handle().spawn(async move {
+            let result = crate::capability::CURRENT_SESSION
+                .scope(Some(session_id), caps.open_external(url))
                 .await;
             let _ = responder.send(result).await;
         });
@@ -1084,6 +1129,8 @@ impl Thread {
             // forces a decision here at compile time.
             BackendNotice::BusRequest { .. }
             | BackendNotice::BrowserRequest { .. }
+            | BackendNotice::ClipboardRequest { .. }
+            | BackendNotice::OpenExternalRequest { .. }
             | BackendNotice::SessionListDirty => {}
         }
     }

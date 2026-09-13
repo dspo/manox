@@ -8087,3 +8087,203 @@ async fn pending_submit_queue_survives_a_panicking_lock_holder() {
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
 }
+
+// ── Host-capability bridges (dspo/manox-app#12): ClipboardRead /
+// OpenExternal routing through the AgentServer's CapabilityClient. ────────
+
+/// The shared fixture: a live s1 + the AgentServer's capability provider
+/// registered, exactly like the browser routing test.
+fn capability_bridge_fixture(caps: Vec<HookKind>) -> (AgentServer, Client, Arc<FakeEngine>) {
+    manox_agent::thread_store::init();
+    manox_agent::capability::drop_provider_for_test();
+    let (server, client) = harness(caps);
+    manox_agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    (server, client, engine)
+}
+
+#[test]
+fn clipboard_read_routes_and_round_trips() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::ClipboardRead]);
+
+    // The clipboard tool's round trip: notice → facade → provider →
+    // ServerCall::ClipboardRead to the owning client.
+    let (tx, rx) = async_channel::bounded(1);
+    engine
+        .notices
+        .send(BackendNotice::ClipboardRequest { responder: tx })
+        .unwrap();
+    let call_id = loop {
+        match client.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::ClipboardRead { session_id },
+            } if session_id == "s1" => break id,
+            _ => {}
+        }
+    };
+    // Reply with base64 text.
+    client.send(FromClient::Reply {
+        id: call_id,
+        outcome: Ok(serde_json::json!({
+            "data": manox_protocol::base64_bytes::encode("clip text".as_bytes()),
+            "mimeType": "text/plain",
+        })),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(reply) = rx.try_recv() {
+            assert_eq!(
+                reply.expect("text clipboard round-trips"),
+                Some("clip text".to_string())
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clipboard reply never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A null reply decodes to Ok(None) (empty / not text), not an error.
+    let (tx, rx) = async_channel::bounded(1);
+    engine
+        .notices
+        .send(BackendNotice::ClipboardRequest { responder: tx })
+        .unwrap();
+    let call_id = loop {
+        if let FromServer::Request {
+            id,
+            call: ServerCall::ClipboardRead { .. },
+        } = client.recv()
+        {
+            break id;
+        }
+    };
+    client.send(FromClient::Reply {
+        id: call_id,
+        outcome: Ok(serde_json::Value::Null),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(reply) = rx.try_recv() {
+            assert_eq!(reply.expect("null clipboard is Ok(None)"), None);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "null clipboard reply never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn open_external_routes_to_capable_owner() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::OpenExternal]);
+
+    let (tx, rx) = async_channel::bounded(1);
+    engine
+        .notices
+        .send(BackendNotice::OpenExternalRequest {
+            url: "https://example.com".into(),
+            responder: tx,
+        })
+        .unwrap();
+    let call_id = loop {
+        match client.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::OpenExternal { session_id, url },
+            } if session_id == "s1" && url == "https://example.com" => break id,
+            _ => {}
+        }
+    };
+    client.send(FromClient::Reply {
+        id: call_id,
+        outcome: Ok(serde_json::json!({})),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(reply) = rx.try_recv() {
+            reply.expect("the {} confirmation settles the opener round trip");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "open reply never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn capability_call_without_capable_owner_fails_closed() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    // The client declares NO clipboard capability.
+    let (server, client, engine) = capability_bridge_fixture(vec![]);
+
+    let (tx, rx) = async_channel::bounded(1);
+    engine
+        .notices
+        .send(BackendNotice::ClipboardRequest { responder: tx })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(reply) = rx.try_recv() {
+            let err = reply.expect_err("no capable owner fails closed");
+            assert!(
+                err.contains("no client can answer"),
+                "the error names the routing failure: {err}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fail-closed reply never arrived"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+// The bridge deliberately leaves `clipboard_write` on the fail-closed
+// default — no wire format for it exists; a write must never silently
+// succeed against a provider that owns no clipboard.
+#[test]
+fn clipboard_write_stays_fail_closed_on_the_bridge() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::thread_store::init();
+    manox_agent::capability::drop_provider_for_test();
+    let (server, _client) = harness(vec![]);
+    let caps = Arc::new(AgentServerCapabilityClient::new(&server));
+    use manox_agent::capability::CapabilityClient as _;
+    assert!(caps.clipboard_write("x".into()).is_err());
+    drop(server);
+    manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
