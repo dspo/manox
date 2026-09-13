@@ -154,6 +154,7 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
                 // (T5b pending-origin middleware drain) — the echo-retirement
                 // correlation travels on the durable row itself (§F.2).
                 origin_rpc: origin.clone(),
+                display: None,
             },
             AgentMessage::Assistant { content, usage, .. } => W::Message {
                 role: "assistant".into(),
@@ -166,20 +167,26 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
                     reasoning: usage.reasoning_tokens.unwrap_or(0),
                 }),
                 origin_rpc: None,
+                display: None,
             },
             AgentMessage::ToolResult { .. } | AgentMessage::BashExecution { .. } => W::Message {
                 role: "tool".into(),
                 content: message_value(message),
                 usage: None,
                 origin_rpc: None,
+                display: None,
             },
             // Kernel-extension message roles ride the generic transcript row
             // with the kernel JSON shape verbatim (wire-opaque, §C.2).
-            AgentMessage::Custom { .. } => W::Message {
+            AgentMessage::Custom { display, .. } => W::Message {
                 role: "custom".into(),
                 content: message_value(message),
                 usage: None,
                 origin_rpc: None,
+                // The kernel's UI-visibility flag rides the wire so clients
+                // can filter hidden rows (the model context is unaffected —
+                // the projection includes them either way).
+                display: Some(*display),
             },
         },
         SessionTreeEntry::UiNote { note, .. } => W::UiNote {
