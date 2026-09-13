@@ -9048,10 +9048,10 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::ClientTool]);
-    let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
+    let (_server, client) = harness(vec![HookKind::ClientTool]);
+    let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&_server));
     manox_agent::embedder_tools::set_provider(provider.clone());
-    create(&server, &client, "et-s");
+    create(&_server, &client, "et-s");
 
     assert_eq!(
         register_tools(
@@ -9083,6 +9083,27 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
         provider.tools_for("other-session").is_empty(),
         "registrations are session-scoped"
     );
+    // Test hygiene: dispose the live session before teardown.
+    let (engine, events) = FakeEngine::new();
+    _server.set_session_engine_for_test("et-s", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-s".into(),
+        },
+    });
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "et-s never disposed");
+            if let FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id },
+            } = client.recv()
+            {
+                assert_eq!(session_id, "et-s");
+                break;
+            }
+        }
+    }
 
     // The read-only hint (review #779): a get_selection-style registration
     // skips the approval card while the gate itself stays authoritative.
@@ -9103,7 +9124,7 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
         "a read_only registration drops the approval hint"
     );
     drop(client);
-    drop(server);
+    drop(_server);
     manox_agent::embedder_tools::drop_provider_for_test();
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -9229,6 +9250,27 @@ fn embedder_tool_invoke_round_trips() {
         matches!(&err, manox_harness::tool::ToolError::ExecutionFailed(m) if m == "host exploded"),
         "got {err:?}"
     );
+    // Test hygiene: dispose the live session before teardown.
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("et-i", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-i".into(),
+        },
+    });
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "et-i never disposed");
+            if let FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id },
+            } = client.recv()
+            {
+                assert_eq!(session_id, "et-i");
+                break;
+            }
+        }
+    }
     drop(client);
     drop(server);
     manox_agent::embedder_tools::drop_provider_for_test();
@@ -9270,6 +9312,27 @@ fn embedder_tool_without_capable_owner_fails_closed() {
         matches!(&err, manox_harness::tool::ToolError::ExecutionFailed(m) if m.contains("cannot answer")),
         "the error names the routing failure: {err:?}"
     );
+    // Test hygiene: dispose the live session before teardown.
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("et-f", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-f".into(),
+        },
+    });
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "et-f never disposed");
+            if let FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id },
+            } = client.recv()
+            {
+                assert_eq!(session_id, "et-f");
+                break;
+            }
+        }
+    }
     drop(client);
     drop(server);
     manox_agent::embedder_tools::drop_provider_for_test();
