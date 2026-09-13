@@ -8216,6 +8216,21 @@ fn fork_msg_line(id: &str, parent: Option<&str>, seq: u64, text: &str) -> String
 
 /// Seed a source session file under the hermetic sessions dir: header plus
 /// the given body lines verbatim.
+/// Test hygiene: remove this suite's seeded fork sources from the
+/// process-shared hermetic sessions dir — every leftover file costs the
+/// NEXT list/open test a parse on the slow CI runner.
+fn cleanup_fork_sources() {
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("fork-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 fn seed_fork_source(id: &str, body: &[String]) -> std::path::PathBuf {
     let sessions = manox_agent::paths::sessions_dir().unwrap();
     std::fs::create_dir_all(&sessions).unwrap();
@@ -8242,6 +8257,7 @@ fn seed_fork_source(id: &str, body: &[String]) -> std::path::PathBuf {
 /// test thread cannot block on the async channel, and it parks between
 /// polls.
 fn fork_and_collect(
+    server: &AgentServer,
     client: &Client,
     source: &str,
     through: &str,
@@ -8270,6 +8286,35 @@ fn fork_and_collect(
                         .and_then(|s| s.as_str())
                         .map(str::to_string)
                 });
+                if let Some(fork_id) = &session_id {
+                    // Test hygiene: replace the actor the open spawned with
+                    // a no-op engine and dispose the forked session over the
+                    // wire, so nothing live (engine actor, pump) outlives
+                    // this test on the shared runtime — leftover async work
+                    // from the fork tests stalled later cold-open tests on
+                    // the slow CI runner.
+                    let (engine, events) = FakeEngine::new();
+                    server.set_session_engine_for_test(fork_id, engine, events);
+                    client.send(FromClient::Notification {
+                        note: ClientNote::DisposeSession {
+                            session_id: fork_id.clone(),
+                        },
+                    });
+                    let dispose_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        assert!(
+                            std::time::Instant::now() < dispose_deadline,
+                            "forked session never disposed"
+                        );
+                        if let FromServer::Notification {
+                            note: ServerNote::SessionDisposed { session_id },
+                        } = client.recv()
+                        {
+                            assert_eq!(session_id, *fork_id);
+                            break;
+                        }
+                    }
+                }
                 return (outcome, session_id);
             }
             _ => {}
@@ -8292,7 +8337,7 @@ fn fork_copies_active_chain_prefix_from_cold_source() {
         ],
     );
 
-    let (outcome, session_id) = fork_and_collect(&client, "fork-a", "f-e1");
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-a", "f-e1");
     let fork_id = session_id.expect("ok outcome carries a session_id");
     assert!(
         outcome.is_ok(),
@@ -8366,6 +8411,7 @@ fn fork_copies_active_chain_prefix_from_cold_source() {
             break;
         }
     }
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -8486,7 +8532,7 @@ fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
         ],
     );
 
-    let (outcome, _) = fork_and_collect(&client, "fork-b", "f-e2");
+    let (outcome, _) = fork_and_collect(&_server, &client, "fork-b", "f-e2");
     match outcome {
         Err(e) => {
             let v = serde_json::to_value(&e).unwrap();
@@ -8500,9 +8546,10 @@ fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
 
     // The branch tip IS on the active chain (it is the cursor): forking to
     // it succeeds.
-    let (outcome, session_id) = fork_and_collect(&client, "fork-b", "f-b1");
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-b", "f-b1");
     assert!(outcome.is_ok(), "the cursor entry is forkable: {outcome:?}");
     assert!(session_id.is_some());
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -8531,7 +8578,7 @@ fn fork_of_a_long_chain_copies_the_exact_prefix() {
     }
     seed_fork_source("fork-long", &body);
 
-    let (outcome, session_id) = fork_and_collect(&client, "fork-long", "L37");
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-long", "L37");
     let fork_id = session_id.expect("mid-chain fork succeeds");
     assert!(outcome.is_ok());
 
@@ -8557,6 +8604,7 @@ fn fork_of_a_long_chain_copies_the_exact_prefix() {
             "row {i} parent link preserved"
         );
     }
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -8567,7 +8615,7 @@ fn fork_missing_source_answers_not_found() {
     hermetic_home();
     init_globals();
     let (_server, client) = harness(vec![]);
-    let (outcome, _) = fork_and_collect(&client, "fork-nope-404", "any");
+    let (outcome, _) = fork_and_collect(&_server, &client, "fork-nope-404", "any");
     match outcome {
         Err(e) => {
             let v = serde_json::to_value(&e).unwrap();
@@ -8575,6 +8623,7 @@ fn fork_missing_source_answers_not_found() {
         }
         other => panic!("expected not-found, got {other:?}"),
     }
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -8625,6 +8674,7 @@ fn fork_intent_fields_validate_before_any_file_is_touched() {
         }
         other => panic!("expected bad-request, got {other:?}"),
     }
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -8744,6 +8794,7 @@ fn fork_lists_as_independent_thread_and_cwd_override_lands() {
             break;
         }
     }
+    cleanup_fork_sources();
     drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }
