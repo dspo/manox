@@ -249,6 +249,9 @@ impl ToolContext for LocalToolContext {
 #[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
     /// Unique tool name as exposed to the LLM.
+    /// Returns the model-facing tool name. The returned reference must be
+    /// stable for the lifetime of `self` (adapters typically return a
+    /// precomputed field) — callers may cache it per tool instance.
     fn name(&self) -> &str;
 
     /// Human-readable description for the LLM.
