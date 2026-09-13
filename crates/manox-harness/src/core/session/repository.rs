@@ -161,7 +161,15 @@ async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
         id: storage.metadata.id.clone(),
         cwd: storage.metadata.cwd.clone(),
         name,
-        parent_session_path: storage.metadata.parent_session_path.clone(),
+        // The summary keeps a String: its consumers treat the parent link
+        // as a display/grouping key. Files can only hold valid UTF8 here
+        // (the JSON boundary errored loudly at create time on non-UTF8
+        // paths), so this conversion is never lossy in practice.
+        parent_session_path: storage
+            .metadata
+            .parent_session_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned()),
         created_at: storage.metadata.created_at,
         modified_at,
         message_count,
