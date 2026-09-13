@@ -8183,7 +8183,9 @@ fn fork_and_collect(
 
 #[test]
 fn fork_copies_active_chain_prefix_from_cold_source() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
@@ -8278,7 +8280,9 @@ fn fork_copies_active_chain_prefix_from_cold_source() {
 
 #[test]
 fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
@@ -8320,7 +8324,9 @@ fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
 
 #[test]
 fn fork_of_a_long_chain_copies_the_exact_prefix() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
@@ -8376,7 +8382,9 @@ fn fork_of_a_long_chain_copies_the_exact_prefix() {
 
 #[test]
 fn fork_missing_source_answers_not_found() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
@@ -8396,7 +8404,9 @@ fn fork_missing_source_answers_not_found() {
 
 #[test]
 fn fork_intent_fields_validate_before_any_file_is_touched() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
@@ -8484,7 +8494,9 @@ fn fork_and_collect_with_approval(
 
 #[test]
 fn fork_lists_as_independent_thread_and_cwd_override_lands() {
-    if CI_PROBE_NEUTRALIZE_FORK_TESTS { return; }
+    if CI_PROBE_NEUTRALIZE_FORK_TESTS {
+        return;
+    }
 
     let _g = lock_globals();
     hermetic_home();
