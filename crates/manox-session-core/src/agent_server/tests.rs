@@ -237,6 +237,20 @@ struct Client {
     conn: manox_protocol::InProcessConnection,
 }
 
+/// `thread_store::init()` for tests whose next step opens a COLD session:
+/// init's directory scan is a BACKGROUND spawn on the shared runtime, and
+/// `load_thread` resolves ids only from the scan-indexed `session_paths`
+/// (its summary lookup also feeds the restored cwd). Relying on the
+/// background scan racing the open worked on fast machines but hangs the
+/// open deterministically on a loaded 2-core CI runner — the scan task
+/// starves behind the suite's leftover runtime work, `load_thread`
+/// returns None, and the test times out waiting for SessionCreated.
+/// Await the scan instead.
+fn init_thread_store_scanned() {
+    manox_agent::thread_store::init();
+    manox_agent::runtime::handle().block_on(manox_agent::thread_store::global().refresh_now());
+}
+
 impl Client {
     fn send(&self, msg: FromClient) {
         self.conn.send_to_server(msg);
@@ -293,7 +307,10 @@ impl Client {
 }
 
 fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
-    manox_agent::thread_store::init();
+    // init's directory scan is a background spawn; awaiting it here makes
+    // every subsequent cold open (load_thread reads the scan-indexed map)
+    // deterministic instead of a race the loaded CI runner loses.
+    init_thread_store_scanned();
     let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
     let (client_conn, server_conn) = in_process_pair();
     server.accept(Arc::new(server_conn));
@@ -1335,7 +1352,7 @@ fn open_session_replays_thread_history() {
     std::fs::create_dir_all(&sessions).unwrap();
     seed_session_file(&sessions, "s1", "/proj");
     init_globals();
-    manox_agent::thread_store::init();
+    init_thread_store_scanned();
     let (server, client) = harness(vec![]);
     client.send(FromClient::Request {
         id: MsgId::new("open"),
@@ -3252,7 +3269,7 @@ fn reinitialize_same_client_id_reseats_and_reopen_loads() {
     std::fs::create_dir_all(&sessions).unwrap();
     seed_session_file(&sessions, "s1", "/proj");
     init_globals();
-    manox_agent::thread_store::init();
+    init_thread_store_scanned();
     let (server, client) = harness(vec![]);
     // First open of s1: must succeed (ack + SessionCreated; T10: the v1
     // snapshot push is gone — history replays via the follow stream).
@@ -6210,7 +6227,7 @@ fn page_history_cold_reads_disk_for_opened_session_without_engine() {
     std::fs::create_dir_all(&sessions).unwrap();
     let path = seed_v4_chain(&sessions, "gw6-cold-1");
     init_globals();
-    manox_agent::thread_store::init();
+    init_thread_store_scanned();
     // Deterministic identity seed (the async init scan may not have
     // landed yet): the open must find the path map entry.
     manox_agent::thread_store::global().with_mut(|s| s.note_session_path("gw6-cold-1", &path));
