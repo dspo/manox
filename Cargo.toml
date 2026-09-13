@@ -14,8 +14,10 @@
 #
 # LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
-# gpui 桌面应用、cx 启动器（ext-agents/terminal/hyperlinks）在独立仓库
-# dspo/manox-app 维护；拆分点为 tag pre-manox-app-split。
+# gpui 桌面应用、cx 启动器（ext-agents）在独立仓库 dspo/manox-app 维护；
+# 拆分点为 tag pre-manox-app-split。终端仿真核心（manox-terminal）与
+# hyperlinks 已回流本仓（runtime 级基础设施）；GPUI 渲染层（terminal-ui）
+# 与 CxSessionSource 仍在 dspo/manox-app。
 [workspace]
 members = [
 	"crates/manox-agent",
@@ -26,6 +28,8 @@ members = [
 	"crates/manox-session-core",
 	"crates/manox-napi",
 	"crates/manox-protocol",
+	"crates/manox-terminal",
+	"crates/hyperlinks",
 ]
 resolver = "2"
 
@@ -46,6 +50,10 @@ manox-harness = { path = "crates/manox-harness" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
 manox-providers = { path = "crates/manox-providers" }
+# manox-terminal —— gpui-free 终端仿真核心（自 dspo/manox-app 回流；
+# PTY + alacritty Terminal 数据层）。渲染层留 app 侧。
+manox-terminal = { path = "crates/manox-terminal" }
+hyperlinks = { path = "crates/hyperlinks" }
 
 anyhow = "1"
 async-channel = "2"
@@ -110,5 +118,15 @@ unic-langid = "0.9"
 tera = "2"
 
 parking_lot = "0.12"
+
+# 终端仿真核心（manox-terminal）的依赖：alacritty_terminal 提供 Term/Grid/
+# Selection 数据层（其 EventLoop/mio/tty 不用，PTY 走 portable-pty，字节经
+# Processor::advance 喂给实现了 vte Handler 的 Term）；sysinfo 供 proctree
+# 进程树回收。版本与 dspo/manox-app 回流前保持一致。
+alacritty_terminal = "0.24"
+portable-pty = "0.9"
+sysinfo = "0.39"
+# std 默认开启——见 crates/manox-terminal/Cargo.toml 的 feature-unification shim 注释。
+rustix = "0.38"
 
 tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }

@@ -1,0 +1,10 @@
+[package]
+name = "hyperlinks"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints.clippy]
+dbg_macro = "deny"
