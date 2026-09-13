@@ -5488,7 +5488,10 @@ fn handshake_ready_double_emits_host_epoch_echo() {
     match client.recv() {
         FromServer::Host {
             host: HostEvent::Ready { epoch },
-        } => assert_eq!(epoch, 1, "the Ready host event echoes the epoch"),
+        } => assert_eq!(
+            epoch, PROTOCOL_EPOCH,
+            "the Ready host event echoes the epoch"
+        ),
         other => panic!("expected the Host Ready epoch echo (C1/GW1), got {other:?}"),
     }
     drop(client);
@@ -6920,6 +6923,18 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
         ClientCall::CancelDelivery {
             delivery_id: "j1-nope".into(),
         },
+        // The fork arm answers too — j1-s is FakeEngine-backed and has no
+        // persisted file under the hermetic home, so this deterministically
+        // resolves as a not-found Response (still an answer for J1).
+        ClientCall::ForkSession {
+            source_session_id: "j1-s".into(),
+            through_entry_id: "j1-nope-entry".into(),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+        },
     ];
     let mut expected: HashMap<String, &'static str> = HashMap::new();
     for (i, call) in calls.into_iter().enumerate() {
@@ -8188,6 +8203,219 @@ fn clipboard_read_routes_and_round_trips() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+// ── ForkSession (dspo/manox-app#9): the prefix-copy fork. ──────────────────
+
+/// A v4 user-message line, shape-identical to the cold-restore fixture.
+fn fork_msg_line(id: &str, parent: Option<&str>, seq: u64, text: &str) -> String {
+    format!(
+        r#"{{"type":"message","id":"{id}","parentId":{parent},"seq":{seq},"timestamp":"2026-05-28T07:14:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"{text}"}}],"timestamp":1779952440000}}}}"#,
+        parent = match parent {
+            Some(p) => format!(r#""{p}""#),
+            None => "null".to_string(),
+        },
+    )
+}
+
+/// Test hygiene: remove this suite's seeded fork sources from the
+/// process-shared hermetic sessions dir — every leftover file costs the
+/// NEXT list/open test a parse on the slow CI runner.
+fn cleanup_fork_sources() {
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("fork-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+fn seed_fork_source(id: &str, body: &[String]) -> std::path::PathBuf {
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    let cwd = sessions.parent().unwrap().to_string_lossy().into_owned();
+    let host = manox_agent::host::current().slug();
+    let header = format!(
+        r#"{{"type":"session","version":4,"id":"{id}","timestamp":"2026-05-28T07:13:46.608Z","cwd":"{cwd}","metadata":{{"host":"{host}","thread":"{id}"}}}}"#
+    );
+    let mut contents = header + "\n";
+    for line in body {
+        contents.push_str(line);
+        contents.push('\n');
+    }
+    let path = sessions.join(format!("{id}.jsonl"));
+    std::fs::write(&path, &contents).unwrap();
+    path
+}
+
+/// Send a ForkSession and drain until its Response, returning (outcome,
+/// session_id). The open-path SessionCreated note + Host mirror arrive
+/// ahead of the response and are tolerated here. Not a busy-wait
+/// (review #775): `Client::recv` polls the async channel at a 10ms
+/// cadence with a 60s bounded deadline — the poll loop exists because the
+/// test thread cannot block on the async channel, and it parks between
+/// polls.
+fn fork_and_collect(
+    server: &AgentServer,
+    client: &Client,
+    source: &str,
+    through: &str,
+) -> (Result<Value, manox_protocol::RpcError>, Option<String>) {
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-req"),
+        call: ClientCall::ForkSession {
+            source_session_id: source.into(),
+            through_entry_id: through.into(),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "fork never answered");
+        match client.recv() {
+            // The open path routes the SessionCreated note + Host mirror to
+            // the requesting owner ahead of the response — tolerated here.
+            FromServer::Response { id, outcome } if id.0 == "fork-req" => {
+                let session_id = outcome.as_ref().ok().and_then(|v| {
+                    v.get("session_id")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                });
+                if let Some(fork_id) = &session_id {
+                    // Test hygiene: replace the actor the open spawned with
+                    // a no-op engine and dispose the forked session over the
+                    // wire, so nothing live (engine actor, pump) outlives
+                    // this test on the shared runtime — leftover async work
+                    // from the fork tests stalled later cold-open tests on
+                    // the slow CI runner.
+                    let (engine, events) = FakeEngine::new();
+                    server.set_session_engine_for_test(fork_id, engine, events);
+                    client.send(FromClient::Notification {
+                        note: ClientNote::DisposeSession {
+                            session_id: fork_id.clone(),
+                        },
+                    });
+                    let dispose_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        assert!(
+                            std::time::Instant::now() < dispose_deadline,
+                            "forked session never disposed"
+                        );
+                        if let FromServer::Notification {
+                            note: ServerNote::SessionDisposed { session_id },
+                        } = client.recv()
+                        {
+                            assert_eq!(session_id, *fork_id);
+                            break;
+                        }
+                    }
+                }
+                return (outcome, session_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn fork_copies_active_chain_prefix_from_cold_source() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let source_path = seed_fork_source(
+        "fork-a",
+        &[
+            fork_msg_line("f-e0", None, 0, "one"),
+            fork_msg_line("f-e1", Some("f-e0"), 1, "two"),
+            fork_msg_line("f-e2", Some("f-e1"), 2, "three"),
+        ],
+    );
+
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-a", "f-e1");
+    let fork_id = session_id.expect("ok outcome carries a session_id");
+    assert!(
+        outcome.is_ok(),
+        "fork of a valid prefix must succeed: {outcome:?}"
+    );
+    assert_ne!(fork_id, "fork-a", "the fork mints a fresh id");
+
+    // The fork file: materialized (never deferred), fresh header, copied
+    // prefix body with re-derived dense seq.
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let fork_path = sessions.join(format!("{fork_id}.jsonl"));
+    let contents = std::fs::read_to_string(&fork_path).expect("fork file is materialized");
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines.len(), 3, "header + the two prefix rows");
+    let header: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(header["id"], fork_id.as_str());
+    assert_eq!(
+        header["parentSession"],
+        source_path.to_string_lossy().into_owned()
+    );
+    assert_eq!(
+        header["metadata"]["thread"],
+        fork_id.as_str(),
+        "a copied thread stamp would collapse the sidebar row"
+    );
+    assert_eq!(
+        header["cwd"],
+        manox_agent::paths::sessions_dir()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+        "absent cwd inherits the source header's cwd"
+    );
+    for (line, (want_id, want_seq)) in lines[1..].iter().zip([("f-e0", 0), ("f-e1", 1)]) {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(row["id"], want_id, "rows are copied verbatim");
+        assert_eq!(row["seq"], want_seq, "seq is dense along the copied prefix");
+    }
+
+    // The opened fork's history is exactly the prefix (cold read face).
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-page"),
+        call: ClientCall::PageHistory {
+            session_id: fork_id.clone(),
+            through_seq: -1,
+            before_seq: None,
+            max_messages: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "page never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-page"
+        {
+            let page = outcome.expect("the fork's chain reads cleanly");
+            let ids: Vec<&str> = page["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                ["f-e0", "f-e1"],
+                "the fork's active chain is the source prefix"
+            );
+            assert_eq!(page["cursor"], 1);
+            break;
+        }
+    }
+    cleanup_fork_sources();
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 #[test]
 fn open_external_routes_to_capable_owner() {
     let _g = lock_globals();
@@ -8285,5 +8513,291 @@ fn clipboard_write_stays_fail_closed_on_the_bridge() {
     assert!(caps.clipboard_write("x".into()).is_err());
     drop(server);
     manox_agent::capability::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn fork_rejects_entry_off_active_chain_and_accepts_a_branch_tip() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    // Chain e0→e1→e2 plus an abandoned-from-the-cursor-view branch b1
+    // (parent e1) appended last: the active chain is e0,e1,b1 — e2 hangs
+    // off it and is not addressable.
+    seed_fork_source(
+        "fork-b",
+        &[
+            fork_msg_line("f-e0", None, 0, "one"),
+            fork_msg_line("f-e1", Some("f-e0"), 1, "two"),
+            fork_msg_line("f-e2", Some("f-e1"), 2, "abandoned"),
+            fork_msg_line("f-b1", Some("f-e1"), 2, "branch tip"),
+        ],
+    );
+
+    let (outcome, _) = fork_and_collect(&_server, &client, "fork-b", "f-e2");
+    match outcome {
+        Err(e) => {
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(
+                v["data"]["code"], "gateway/bad-request",
+                "off-chain target is a client error"
+            );
+        }
+        other => panic!("expected bad-request, got {other:?}"),
+    }
+
+    // The branch tip IS on the active chain (it is the cursor): forking to
+    // it succeeds.
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-b", "f-b1");
+    assert!(outcome.is_ok(), "the cursor entry is forkable: {outcome:?}");
+    assert!(session_id.is_some());
+    cleanup_fork_sources();
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn fork_of_a_long_chain_copies_the_exact_prefix() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    // A 60-row dense chain: the batch path must reproduce ids, parents,
+    // and re-derived seqs exactly, up to a mid-chain cut.
+    let mut body: Vec<String> = Vec::new();
+    for i in 0..60 {
+        let parent = if i == 0 {
+            None
+        } else {
+            Some(format!("L{:02?}", i - 1))
+        };
+        body.push(fork_msg_line(
+            &format!("L{i:02}"),
+            parent.as_deref(),
+            i,
+            "row {i}",
+        ));
+    }
+    seed_fork_source("fork-long", &body);
+
+    let (outcome, session_id) = fork_and_collect(&_server, &client, "fork-long", "L37");
+    let fork_id = session_id.expect("mid-chain fork succeeds");
+    assert!(outcome.is_ok());
+
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let fork_rows: Vec<serde_json::Value> =
+        std::fs::read_to_string(sessions.join(format!("{fork_id}.jsonl")))
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+    assert_eq!(fork_rows.len(), 38, "header + rows 0..=37");
+    for (i, row) in fork_rows.iter().enumerate() {
+        assert_eq!(row["id"], format!("L{i:02}"));
+        assert_eq!(row["seq"], i, "seq is re-derived dense along the prefix");
+        let want_parent = if i == 0 {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(format!("L{:02?}", i - 1))
+        };
+        assert_eq!(
+            row["parentId"], want_parent,
+            "row {i} parent link preserved"
+        );
+    }
+    cleanup_fork_sources();
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn fork_missing_source_answers_not_found() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let (outcome, _) = fork_and_collect(&_server, &client, "fork-nope-404", "any");
+    match outcome {
+        Err(e) => {
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(v["data"]["code"], "session/not-found");
+        }
+        other => panic!("expected not-found, got {other:?}"),
+    }
+    cleanup_fork_sources();
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn fork_intent_fields_validate_before_any_file_is_touched() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    seed_fork_source("fork-c", &[fork_msg_line("f-e0", None, 0, "one")]);
+
+    // Unknown model vocabulary → model/unresolvable, before the fork file
+    // is created.
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-bad-model"),
+        call: ClientCall::ForkSession {
+            source_session_id: "fork-c".into(),
+            through_entry_id: "f-e0".into(),
+            cwd: None,
+            project: None,
+            initial_model: Some(manox_protocol::journal::ModelRef::new("nope/none")),
+            approval_mode: None,
+            reasoning_effort: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "model validation never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-bad-model"
+        {
+            let v = serde_json::to_value(outcome.expect_err("unresolvable model rejects")).unwrap();
+            assert_eq!(v["data"]["code"], "model/unresolvable");
+            break;
+        }
+    }
+
+    // Unknown approval-mode vocabulary → gateway/bad-request.
+    let (outcome, _) = fork_and_collect_with_approval(&client, "fork-c", "f-e0", "bogus-mode");
+    match outcome {
+        Err(e) => {
+            let v = serde_json::to_value(&e).unwrap();
+            assert_eq!(v["data"]["code"], "gateway/bad-request");
+        }
+        other => panic!("expected bad-request, got {other:?}"),
+    }
+    cleanup_fork_sources();
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// [fork_intent_fields_validate...] helper: fork with only an approval-mode
+/// override.
+fn fork_and_collect_with_approval(
+    client: &Client,
+    source: &str,
+    through: &str,
+    approval_mode: &str,
+) -> (Result<Value, manox_protocol::RpcError>, Option<String>) {
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-req"),
+        call: ClientCall::ForkSession {
+            source_session_id: source.into(),
+            through_entry_id: through.into(),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: Some(approval_mode.into()),
+            reasoning_effort: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "fork never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-req"
+        {
+            let session_id = outcome.as_ref().ok().and_then(|v| {
+                v.get("session_id")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            });
+            return (outcome, session_id);
+        }
+    }
+}
+
+#[test]
+fn fork_lists_as_independent_thread_and_cwd_override_lands() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    seed_fork_source(
+        "fork-d",
+        &[
+            fork_msg_line("f-e0", None, 0, "one"),
+            fork_msg_line("f-e1", Some("f-e0"), 1, "two"),
+        ],
+    );
+
+    // Fork with a cwd override: it must land in the fork header.
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-d-req"),
+        call: ClientCall::ForkSession {
+            source_session_id: "fork-d".into(),
+            through_entry_id: "f-e1".into(),
+            cwd: Some("/tmp".into()),
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+        },
+    });
+    let fork_id: String;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "fork never answered");
+        match client.recv() {
+            FromServer::Response { id, outcome } if id.0 == "fork-d-req" => {
+                fork_id = outcome
+                    .expect("cwd override fork succeeds")
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .unwrap()
+                    .to_string();
+                break;
+            }
+            _ => {}
+        }
+    }
+    let sessions = manox_agent::paths::sessions_dir().unwrap();
+    let header: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(sessions.join(format!("{fork_id}.jsonl")))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        header["cwd"], "/tmp",
+        "the explicit cwd override lands in the fork header"
+    );
+
+    // Both the source and the fork surface as distinct rows.
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-list"),
+        call: ClientCall::ListThreads,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "list never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-list"
+        {
+            let listing = outcome.expect("list succeeds");
+            let listing = serde_json::to_string(&listing).unwrap();
+            assert!(listing.contains("fork-d"), "the source row is listed");
+            assert!(
+                listing.contains(&fork_id),
+                "the fork row is listed independently"
+            );
+            break;
+        }
+    }
+    cleanup_fork_sources();
+    drop(_server);
     manox_agent::thread_store::drop_global_for_test();
 }

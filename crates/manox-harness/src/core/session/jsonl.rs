@@ -20,6 +20,7 @@
 // as its header; an existing file must begin with a valid v3 or v4 session
 // header, otherwise this errors rather than guessing at a repair.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -67,9 +68,12 @@ pub struct JsonlSessionMetadata {
     pub cwd: String,
     #[serde(default = "chrono::Utc::now")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Path of the session this one forked from, if any.
+    /// Path of the session this one forked from, if any. `PathBuf` up to
+    /// the JSON boundary (review #775): serialization of a non-UTF8 path
+    /// errors LOUDLY here instead of being silently lossy-mangled into
+    /// the header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_path: Option<String>,
+    pub parent_session_path: Option<PathBuf>,
     /// Free-form metadata carried in the header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<JsonValue>,
@@ -89,7 +93,7 @@ struct SessionHeader {
     timestamp: chrono::DateTime<chrono::Utc>,
     cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    parent_session: Option<String>,
+    parent_session: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     metadata: Option<JsonValue>,
 }
@@ -376,6 +380,86 @@ impl JsonlSessionStorage {
             .open(&self.jsonl_path)
             .await?;
         file.write_all(line.as_bytes()).await?;
+        Ok(())
+    }
+
+    /// Bulk-append a chain of entries under ONE lock hold with ONE disk
+    /// write (the fork-copy path). Ids are checked against the existing
+    /// set and the batch itself in a single pass (O(n + m) instead of the
+    /// per-row O(n·m) of repeated `append_entry`), seqs are derived from
+    /// the existing index plus the batch's own parents, and the WHOLE
+    /// batch is validated and serialized before anything touches disk —
+    /// an invalid entry anywhere (empty/duplicate id, unknown parent,
+    /// unserializable entry) rejects the entire batch with no partial
+    /// prefix written.
+    ///
+    /// Constraints (the fork path always satisfies them): the file must
+    /// be materialized and on the current format version — a deferred or
+    /// v3 file is rejected rather than silently materialized/migrated
+    /// mid-batch; route those through [`Self::append_entry`]. Index,
+    /// cursor, and journal-broadcast updates mirror `append_entry` per
+    /// entry, in batch order, under the same lock.
+    pub async fn append_entries(&self, entries: &[SessionTreeEntry]) -> Result<(), anyhow::Error> {
+        let _guard = self.append_lock.lock().await;
+        if *self.deferred.lock().await {
+            anyhow::bail!("append_entries requires a materialized session (file is deferred)");
+        }
+        if *self.file_version.lock().await < FORMAT_VERSION {
+            anyhow::bail!("append_entries requires a v4 session file (append once to migrate)");
+        }
+        let Some(last) = entries.last() else {
+            return Ok(());
+        };
+        // Phase 1 (no disk): one existing-id set + one depth map; validate
+        // and serialize the batch.
+        let existing_ids: HashSet<String> = {
+            let es = self.entries.lock().await;
+            es.iter().map(|e| e.id().to_string()).collect()
+        };
+        let mut depths: HashMap<String, u64> = self.seq_index.lock().await.clone();
+        let mut batch_ids: HashSet<String> = HashSet::new();
+        let mut lines = String::new();
+        let mut seqs = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let id = entry.id();
+            if id.is_empty() {
+                anyhow::bail!("refusing entry with empty id");
+            }
+            if existing_ids.contains(id) || batch_ids.contains(id) {
+                anyhow::bail!("duplicate entry id {id}");
+            }
+            let seq = match entry.parent_id() {
+                None => 0u64,
+                Some(parent) => match depths.get(parent) {
+                    Some(depth) => depth + 1,
+                    None => anyhow::bail!(
+                        "entry {id} references unknown parent {parent}: chain is broken"
+                    ),
+                },
+            };
+            lines.push_str(&v4_line(entry, seq)?);
+            batch_ids.insert(id.to_string());
+            depths.insert(id.to_string(), seq);
+            seqs.push(seq);
+        }
+        // Phase 2: ONE write; then index/cursor/broadcast under the same
+        // lock hold, mirroring append_entry_locked's post-write order.
+        self.append_line(&lines).await?;
+        {
+            let mut es = self.entries.lock().await;
+            let mut index = self.seq_index.lock().await;
+            for (entry, seq) in entries.iter().zip(&seqs) {
+                es.push(entry.clone());
+                index.insert(entry.id().to_string(), *seq);
+            }
+        }
+        *self.leaf_id.lock().await = last.leaf_cursor_after();
+        for (entry, seq) in entries.iter().zip(&seqs) {
+            let _ = self.journal_tx.send(JournalEvent {
+                seq: *seq,
+                entry: std::sync::Arc::new(entry.clone()),
+            });
+        }
         Ok(())
     }
 
@@ -1453,7 +1537,7 @@ mod tests {
             id: "fork".into(),
             cwd: "/proj".into(),
             created_at: chrono::Utc::now(),
-            parent_session_path: Some("/sessions/parent.jsonl".into()),
+            parent_session_path: Some(PathBuf::from("/sessions/parent.jsonl")),
             metadata: Some(serde_json::json!({ "origin": "forked" })),
         };
         let _storage = JsonlSessionStorage::create(&path, header_meta)
@@ -1486,7 +1570,7 @@ mod tests {
         assert_eq!(m.id, "fork");
         assert_eq!(
             m.parent_session_path.as_deref(),
-            Some("/sessions/parent.jsonl")
+            Some(Path::new("/sessions/parent.jsonl"))
         );
         assert_eq!(
             m.metadata.as_ref(),
@@ -3146,6 +3230,99 @@ mod deferred_probe_tests {
         assert!(
             !path.exists(),
             "a deferred session with only non-assistant rows must not materialize"
+        );
+    }
+}
+
+#[cfg(test)]
+mod append_entries_tests {
+    use super::*;
+
+    fn batch_meta() -> JsonlSessionMetadata {
+        JsonlSessionMetadata {
+            id: "batch".into(),
+            cwd: "/tmp".into(),
+            created_at: chrono::Utc::now(),
+            parent_session_path: None,
+            metadata: None,
+        }
+    }
+
+    fn chain_entry(id: &str, parent: Option<&str>) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+            message: crate::types::AgentMessage::user("batch"),
+            origin: None,
+        }
+    }
+
+    fn rows(path: &Path) -> String {
+        // Header timestamps differ across two create() instants — compare
+        // everything AFTER line 0.
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines().skip(1).collect::<Vec<_>>().join("\n") + "\n"
+    }
+
+    #[tokio::test]
+    async fn append_entries_matches_per_row_appends_row_for_row() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = JsonlSessionStorage::create(&dir_a.path().join("s.jsonl"), batch_meta())
+            .await
+            .unwrap();
+        let b = JsonlSessionStorage::create(&dir_b.path().join("s.jsonl"), batch_meta())
+            .await
+            .unwrap();
+        let chain = vec![chain_entry("e0", None), chain_entry("e1", Some("e0"))];
+
+        for e in &chain {
+            a.append_entry(e).await.unwrap();
+        }
+        b.append_entries(&chain).await.unwrap();
+
+        assert_eq!(
+            rows(&dir_a.path().join("s.jsonl")),
+            rows(&dir_b.path().join("s.jsonl")),
+            "batched and per-row appends write identical rows (seqs included)"
+        );
+        assert_eq!(
+            a.journal_cursor().await,
+            b.journal_cursor().await,
+            "the cursor lands on the same leaf"
+        );
+        let ra = a.journal_range(0, u64::MAX).await.unwrap();
+        let rb = b.journal_range(0, u64::MAX).await.unwrap();
+        assert_eq!(ra.len(), rb.len());
+        assert_eq!(ra.last().map(|r| r.seq), rb.last().map(|r| r.seq));
+    }
+
+    #[tokio::test]
+    async fn append_entries_rejects_the_whole_batch_atomically() {
+        // Duplicate id inside the batch → nothing touches disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let s = JsonlSessionStorage::create(&path, batch_meta())
+            .await
+            .unwrap();
+        let before = tokio::fs::read_to_string(&path).await.unwrap();
+        let dup = vec![chain_entry("e0", None), chain_entry("e0", None)];
+        let err = s.append_entries(&dup).await.unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(before, after, "a rejected batch writes nothing");
+
+        // Unknown parent mid-batch → still nothing touches disk.
+        let broken = vec![chain_entry("e0", None), chain_entry("e2", Some("nope"))];
+        let err = s.append_entries(&broken).await.unwrap_err();
+        assert!(err.to_string().contains("unknown parent"), "{err}");
+        let after = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            s.journal_cursor().await,
+            0,
+            "the in-memory state is untouched too"
         );
     }
 }
