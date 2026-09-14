@@ -1000,6 +1000,7 @@ fn make_monitor_message(task_id: &str, description: &str, text: &str) -> AgentMe
             signature: None,
         }],
         timestamp: chrono::Utc::now(),
+        id: None,
     }
 }
 

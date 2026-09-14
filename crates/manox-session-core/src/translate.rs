@@ -499,6 +499,7 @@ mod tests {
                     signature: None,
                 }],
                 timestamp: now,
+                id: None,
             },
         ];
         let entry = wire_entry(
@@ -574,6 +575,7 @@ mod tests {
                 message: AgentMessage::User {
                     content: vec![],
                     timestamp: now,
+                    id: None,
                 },
                 origin: None,
             },

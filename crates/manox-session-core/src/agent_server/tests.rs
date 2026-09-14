@@ -177,9 +177,14 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
             }
         })
     }
-    fn steer(&self, text: String, _: Vec<manox_harness::types::ContentBlock>) -> String {
+    fn steer(
+        &self,
+        text: String,
+        _: Vec<manox_harness::types::ContentBlock>,
+        message_id: Option<String>,
+    ) -> String {
         self.steer_calls.lock().unwrap().push(text);
-        String::new()
+        message_id.unwrap_or_default()
     }
     fn cancel_steer(&self, _: &str) -> bool {
         false
@@ -474,6 +479,7 @@ fn ent_message(id: String, parent_id: Option<String>) -> SessionTreeEntry {
                 signature: None,
             }],
             timestamp: fixed_ts(),
+            id: None,
         },
         origin: Some("j1-origin".into()),
     }
@@ -4312,6 +4318,7 @@ fn conversation_info_folds_usage() {
                             signature: None,
                         }],
                         timestamp: chrono::Utc::now(),
+                        id: None,
                     },
                 ),
             },

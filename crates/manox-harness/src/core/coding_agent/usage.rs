@@ -217,6 +217,7 @@ mod tests {
             message: AgentMessage::User {
                 content: vec![],
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             origin: None,
         }
