@@ -1455,25 +1455,19 @@ async fn handle_call(
             Ok(json!({ "registered": count }))
         }
         ClientCall::ListThreads => {
-            // Cross-domain #5: the rescan self-hold — answer from a FRESH
-            // scan (awaited, not the fire-and-forget spawn) so no client
-            // needs an in-process rescan trigger. The desktop's
-            // store-event bridge retires against this.
-            //
-            // The scan runs block-in-place on the dispatch worker: the
-            // answer keeps the same-poll timing profile it had before the
-            // self-hold (an `.await` gap let the response wake slip out of
-            // the gpui test scheduler's parked window — its determinism
-            // asserts tripped on the foreign-thread wake), and the dispatch
-            // loop never interleaves a half-scanned list. The agent runtime
-            // is multi-threaded, so one worker blocking on a millisecond
-            // scan is contained.
+            // Freshness without the self-hold: answer from the current
+            // snapshot immediately — the answer has no `.await` gap, so the
+            // gpui test scheduler's same-poll timing profile is preserved —
+            // then kick the fingerprinted reconcile in the background. The
+            // store watcher broadcasts ThreadsUpdated when the scan lands,
+            // so a cold file surfaces one broadcast later instead of every
+            // caller blocking behind a directory scan (the pre-reconcile
+            // self-hold parked the desktop's first frame on a full parse of
+            // every session).
             if !manox_agent::thread_store::test_override_active()
                 && let Some(store) = manox_agent::thread_store::try_global()
             {
-                tokio::task::block_in_place(|| {
-                    manox_agent::runtime::handle().block_on(store.refresh_now())
-                });
+                store.refresh();
             }
             serde_json::to_value(inner.threads_snapshot()).map_err(|_| {
                 RpcError::new(-1, "threads serialization failed")
