@@ -25,7 +25,9 @@ use manox_protocol::base64_bytes;
 use manox_protocol::client::{ClientToolSpec, ImageAttachment};
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame, StreamKind};
+#[cfg(feature = "terminal")]
+use manox_protocol::stream::StreamFrame;
+use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem,
@@ -76,8 +78,10 @@ struct ServerSession {
 /// PTY + grid; subscribers are the follow-terminal streams currently
 /// attached (each with its connection).
 /// One follow-terminal subscriber: (client_id, stream_id, connection).
+#[cfg(feature = "terminal")]
 type TerminalStreamSub = (String, StreamId, Arc<dyn RpcConnection>);
 
+#[cfg(feature = "terminal")]
 struct TerminalEntry {
     handle: manox_terminal::TerminalHandle,
     /// The session this terminal was attached for (cwd source + db row).
@@ -163,6 +167,7 @@ struct AgentServerInner {
     /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
     /// fed by per-stream forwarder tasks, mirrored into the threads db and
     /// the `TerminalsUpdated` host snapshot.
+    #[cfg(feature = "terminal")]
     terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
     call_seq: AtomicU64,
     /// GW3 (§D.4): per-session adjudication delivery counter — the `dlv-`
@@ -246,6 +251,7 @@ impl AgentServerInner {
     /// `TerminalAttach`: re-attach by id or spawn a fresh shell terminal
     /// bound to the session's cwd. Response carries the id + a text
     /// snapshot of the visible grid.
+    #[cfg(feature = "terminal")]
     fn attach_terminal(
         self: &Arc<Self>,
         session_id: &str,
@@ -296,11 +302,13 @@ impl AgentServerInner {
     }
 
     /// `TerminalSnapshot`: the visible grid as text lines + cursor.
+    #[cfg(feature = "terminal")]
     fn terminal_snapshot(&self, terminal_id: &str) -> Option<Value> {
         let entry = self.terminals.lock().get(terminal_id).cloned()?;
         Some(self.terminal_snapshot_value(&entry))
     }
 
+    #[cfg(feature = "terminal")]
     fn terminal_snapshot_value(&self, entry: &TerminalEntry) -> Value {
         let (lines, cursor_col, cursor_row) = entry.handle.read(|t| t.text_snapshot());
         let (cols, rows) = entry.handle.read(|t| (t.cols, t.rows));
@@ -312,6 +320,7 @@ impl AgentServerInner {
         })
     }
 
+    #[cfg(feature = "terminal")]
     fn terminal_attach_response(&self, entry: &TerminalEntry) -> Value {
         let id = entry.handle.read(|t| t.id.clone());
         serde_json::json!({
@@ -320,6 +329,7 @@ impl AgentServerInner {
         })
     }
 
+    #[cfg(feature = "terminal")]
     fn terminals_summary(&self) -> Vec<manox_protocol::stream::TerminalSummary> {
         self.terminals
             .lock()
@@ -341,6 +351,7 @@ impl AgentServerInner {
             .collect()
     }
 
+    #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
         let Ok(path) = manox_agent::db::default_db_path() else {
             return;
@@ -364,6 +375,7 @@ impl AgentServerInner {
 
     /// One watcher per terminal: title/exit edges update the db mirror and
     /// broadcast `TerminalsUpdated`.
+    #[cfg(feature = "terminal")]
     fn spawn_terminal_watcher(self: &Arc<Self>, entry: Arc<TerminalEntry>) {
         let rx = entry.handle.subscribe();
         let inner = Arc::clone(self);
@@ -398,6 +410,7 @@ impl AgentServerInner {
     /// `StreamOpen { FollowTerminal }`: one forwarder per stream relaying raw
     /// PTY chunks as base64 `TerminalOutput` frames; ends `Closed` on child
     /// exit / channel close, `Cancelled` on `StreamCancel`.
+    #[cfg(feature = "terminal")]
     fn open_terminal_stream(
         self: &Arc<Self>,
         client_id: &str,
@@ -601,6 +614,7 @@ impl AgentServer {
     fn new_inner(cwd: PathBuf, store_watcher: bool) -> Self {
         // #13: the terminal pumps need a runtime; first registration wins
         // and the agent runtime is already live here.
+        #[cfg(feature = "terminal")]
         manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
@@ -608,6 +622,7 @@ impl AgentServer {
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            #[cfg(feature = "terminal")]
             terminals: Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(0),
             delivery_seq: Mutex::new(HashMap::new()),
@@ -970,8 +985,22 @@ impl AgentServerInner {
         stream_id: StreamId,
         kind: StreamKind,
     ) {
+        #[cfg(feature = "terminal")]
         if let StreamKind::FollowTerminal { terminal_id } = kind {
             self.open_terminal_stream(client_id, conn, stream_id, terminal_id);
+            return;
+        }
+        #[cfg(not(feature = "terminal"))]
+        if let StreamKind::FollowTerminal { .. } = kind {
+            // GW7: the declared-but-unbuilt arm answers the stable code so
+            // clients distinguish "not built into this host" from a failure.
+            conn.send_to_client(FromServer::StreamEnd {
+                stream_id,
+                reason: StreamEndReason::Failure {
+                    code: manox_protocol::msg::CODE_FEATURE_UNAVAILABLE.into(),
+                    message: "terminal support not built into this host".into(),
+                },
+            });
             return;
         }
         let StreamKind::FollowSession {
@@ -1776,18 +1805,24 @@ async fn handle_call(
         // declared terminal support must be able to distinguish "feature
         // not built yet" from a generic failure (§D.7 code set, ratified
         // with the msg.rs constant + spec revision).
+        #[cfg(feature = "terminal")]
         ClientCall::TerminalAttach {
             session,
             cols,
             rows,
             terminal_id,
         } => inner.attach_terminal(&session, cols, rows, terminal_id),
+        #[cfg(not(feature = "terminal"))]
+        ClientCall::TerminalAttach { .. } => Err(unavailable("terminal")),
+        #[cfg(feature = "terminal")]
         ClientCall::TerminalSnapshot { terminal } => {
             inner.terminal_snapshot(&terminal).ok_or_else(|| {
                 RpcError::new(-1, format!("unknown terminal {terminal}"))
                     .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
             })
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientCall::TerminalSnapshot { .. } => Err(unavailable("terminal")),
         ClientCall::ModelChat {
             request_id,
             model,
@@ -2289,6 +2324,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             };
             thread.with_mut(|t| t.set_browser_suite(parsed, enable));
         }
+        #[cfg(feature = "terminal")]
         ClientNote::TerminalInput { terminal, bytes } => {
             // #13: keystroke-grade input into the terminal's PTY writer
             // (enqueue-only, never blocks the caller).
@@ -2328,6 +2364,25 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 );
             }
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientNote::TerminalInput { .. } => {
+            let message = "terminal support not built into this host".to_string();
+            inner.note_to_client(
+                owner,
+                ServerNote::Error {
+                    session_id: None,
+                    message: message.clone(),
+                },
+            );
+            inner.host_to_client(
+                owner,
+                HostEvent::Error {
+                    message,
+                    session_id: None,
+                },
+            );
+        }
+        #[cfg(feature = "terminal")]
         ClientNote::TerminalResize {
             terminal,
             cols,
@@ -2355,6 +2410,24 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 .handle
                 .with_mut(|t| t.resize(cols as usize, rows as usize));
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientNote::TerminalResize { terminal, .. } => {
+            let message = format!("terminal support not built into this host ({terminal})");
+            inner.note_to_client(
+                owner,
+                ServerNote::Error {
+                    session_id: None,
+                    message: message.clone(),
+                },
+            );
+            inner.host_to_client(
+                owner,
+                HostEvent::Error {
+                    message,
+                    session_id: None,
+                },
+            );
+        }
         ClientNote::AppendUserMessage {
             session_id,
             text,
@@ -2373,6 +2446,14 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             // per-note.
         }
     }
+}
+
+/// GW7 stable-code error for a declared-but-unbuilt capability arm (the lean
+/// napi edge builds session-core without the `terminal` feature).
+#[cfg(not(feature = "terminal"))]
+fn unavailable(what: &str) -> RpcError {
+    RpcError::new(-1, format!("{what} support not built into this host"))
+        .with_code(manox_protocol::msg::CODE_FEATURE_UNAVAILABLE)
 }
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────

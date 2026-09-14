@@ -14,8 +14,23 @@ napi = { version = "2", default-features = false, features = ["napi4"] }
 napi-derive = "2"
 manox-protocol.workspace = true
 manox-session-core.workspace = true
+# The workspace root declares manox-agent / manox-session-core with
+# default-features = false so the CHOICE lives at each consumer edge; this
+# crate re-exposes every subsystem as a passthrough feature below. Plain
+# builds (`cargo build -p manox-napi`) therefore get the full runtime — any
+# consumer (git dep or cargo flag) opts in/out per subsystem.
 manox-agent.workspace = true
 serde_json.workspace = true
 
 [build-dependencies]
 napi-build = "2"
+[features]
+# Full runtime by default — the same capability set as the gpui app. Embedders
+# that want a lean addon (the VS Code extension: no MCP, no LSP, no terminal
+# stack, no WS gateway) build with --no-default-features and re-enable only
+# what they need.
+default = ["lsp", "mcp", "terminal", "ws-gateway"]
+mcp = ["manox-agent/mcp"]
+lsp = ["manox-agent/lsp"]
+terminal = ["manox-session-core/terminal"]
+ws-gateway = ["manox-session-core/ws-gateway"]

@@ -16,6 +16,7 @@ pub mod model_chat;
 pub mod projections;
 pub mod translate;
 pub mod waterfall;
+#[cfg(feature = "ws-gateway")]
 pub mod ws;
 
 /// Suite-wide test scaffolding: session-creating tests mutate `HOME` and
