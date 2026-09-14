@@ -1159,8 +1159,13 @@ impl ThreadEngine for PiEngine {
         });
     }
 
-    fn steer(&self, text: String, images: Vec<manox_harness::types::ContentBlock>) -> String {
-        let id = uuid::Uuid::new_v4().to_string();
+    fn steer(
+        &self,
+        text: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        message_id: Option<String>,
+    ) -> String {
+        let id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let _ = self.cmd_tx.send(SessionCmd::Steer {
             id: id.clone(),
             text,
@@ -2099,7 +2104,7 @@ fn attach_orchestrators(session: &mut AgentSession, orch: &SessionOrchestrators)
     orch.monitor.attach(&handle);
     orch.background.attach(session);
 }
-fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
+fn steer_message(id: String, text: String, images: Vec<ContentBlock>) -> AgentMessage {
     let mut content = vec![ContentBlock::Text {
         text,
         signature: None,
@@ -2107,9 +2112,13 @@ fn steer_message(text: String, images: Vec<ContentBlock>) -> AgentMessage {
     // TS `createUserMessage(text, images)` parity: image blocks ride the
     // steered user message behind the text.
     content.extend(images);
+    // S3 stable-id: carry the client `Steer` message id as the durable row
+    // id so the injected `user` journal row is keyed by the id the client
+    // already correlates its echo against.
     AgentMessage::User {
         content,
         timestamp: chrono::Utc::now(),
+        id: Some(id),
     }
 }
 
@@ -2257,6 +2266,9 @@ fn prompt_user_message(text: &str, images: &[ContentBlock]) -> AgentMessage {
     AgentMessage::User {
         content,
         timestamp: chrono::Utc::now(),
+        // The prompt row's durable id is pinned via K5 `accepted_entry`
+        // (persist_prompt_user_entry), not carried on the message.
+        id: None,
     }
 }
 
@@ -2506,7 +2518,12 @@ where
                     handle.abort();
                 }
                 Some(SessionCmd::Steer { id, text, images }) => {
-                    handle.steer(steer_message(text, images));
+                    // S4: enqueue under the command id (== the client
+                    // message id post-S3) so a later `cancel_steer(&id)` can
+                    // retract this exact steer from the kernel queue if the
+                    // run aborts before draining it. S3: the same id rides the
+                    // injected `user` row as its durable identity.
+                    handle.steer_with_id(steer_message(id.clone(), text, images), id.clone());
                     run_steers.push(id);
                 }
                 Some(SessionCmd::CancelSteer(id)) => {
@@ -2815,6 +2832,111 @@ async fn chain_goal_rounds(
             return;
         }
         goal_housekeeping(&result, abort_requested, session, state).await;
+    }
+}
+
+/// S1/S2 shared continuation: run the kernel steering queue to empty from an
+/// idle position, one `continue_` round at a time.
+///
+/// `continue_` drains the surviving steering queue first (its first poll
+/// injects a message steered while idle and lands its durable `user` row —
+/// pinned by the harness's `steering_queued_before_run_is_injected_by_loop`),
+/// then settles + goal-chains exactly like a normal run. The loop is bounded
+/// by `steering_messages()` becoming empty (each round consumes at least one)
+/// and by shutdown/abort, so it can never spin: a queue that drains to one
+/// message per `OneAtATime` round exits after that round's run.
+///
+/// This is the single entry point the actor uses for BOTH the wake-driven
+/// resume (a monitor steered events while idle — old DSH parity) and the
+/// between-runs facade `Steer` (S1: an idle steer now starts its own run
+/// instead of waiting for the next turn), and it is called after every
+/// normal settle to drain a steer that landed in the run's final moments
+/// (S2).
+///
+/// Abort/failed discipline (S2 guard, omp `#drainStrandedQueuedMessages` /
+/// dsh `agent.ts` "never pour a steer into a dying or later run"): a round
+/// that aborted or errored stops the chain immediately — `settle_run` already
+/// retracted the not-yet-drained steers from the queue (S4), so a stranded
+/// steer is never silently injected by a later run.
+#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
+async fn resume_steering_queue(
+    session: &mut AgentSession,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+    run_steers: &mut Vec<String>,
+    shutdown_after_run: &mut bool,
+    live: Arc<Mutex<LiveTranscript>>,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    pi_model: &mut PiModel,
+    sessions_dir: &Path,
+    cwd: &Path,
+) {
+    while !session.steering_messages().is_empty() {
+        let handle = session.handle();
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+        // The facade learns the run started (`TurnStarted` sets its running
+        // flag) so a switch-away parks the thread instead of dropping it
+        // mid-run — identical to the wake branch this helper now subsumes.
+        state.running.store(true, Ordering::Relaxed);
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        let (result, abort_requested) = drive_run(
+            session.continue_(),
+            &handle,
+            cmd_rx,
+            run_steers,
+            shutdown_after_run,
+            Arc::clone(&live),
+            state,
+            notice_tx,
+            pi_model,
+            sessions_dir,
+            &active_session_path,
+            &journal_appender,
+        )
+        .await;
+        settle_run(
+            &result,
+            abort_requested,
+            session,
+            state,
+            sessions_dir,
+            cwd,
+            notice_tx,
+            run_steers,
+        )
+        .await;
+        if *shutdown_after_run {
+            return;
+        }
+        goal_housekeeping(&result, abort_requested, session, state).await;
+        if *shutdown_after_run {
+            return;
+        }
+        // Abort or run error: stop chaining. `settle_run` already retracted the
+        // not-yet-drained steers (S4) and reported them stranded; an aborted
+        // run must not auto-resume.
+        if abort_requested || result.is_err() {
+            return;
+        }
+        chain_goal_rounds(
+            session,
+            &handle,
+            cmd_rx,
+            run_steers,
+            shutdown_after_run,
+            Arc::clone(&live),
+            state,
+            notice_tx,
+            pi_model,
+            sessions_dir,
+            cwd,
+            &active_session_path,
+        )
+        .await;
+        if *shutdown_after_run {
+            return;
+        }
     }
 }
 
@@ -3588,77 +3710,25 @@ async fn run_actor(
             cmd = cmd_rx.recv() => cmd,
             _ = wakeup_rx.recv() => {
                 // Collapse wakeups queued while the actor was busy; the
-                // steering-queue check below decides whether a run is owed.
+                // steering-queue check inside the helper decides whether a
+                // run is owed. A monitor steered events while the session was
+                // idle — resume now (S1/DSH parity via the shared helper).
                 while wakeup_rx.try_recv().is_ok() {}
-                if !session.steering_messages().is_empty() {
-                    // Idle wakeup — the Rust equivalent of TS Pi's
-                    // `sendUserMessage` idle semantics: a monitor steered
-                    // events while the session was idle, so resume the run;
-                    // `continue_` drains the steering queue first. The
-                    // facade learns the run started (`TurnStarted` sets its
-                    // running flag) so a switch-away parks the thread instead
-                    // of dropping it mid-run.
-                    state.running.store(true, Ordering::Relaxed);
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                        ThreadEvent::TurnStarted,
-                    )));
-                    let handle = session.handle();
-                    let active_session_path = session.path().clone();
-                    let journal_appender = session.journal_appender();
-                    // One resume run for the steered events, then chain
-                    // automatic goal rounds until the goal stops or the user
-                    // interrupts (the gate re-checks after every settle).
-                    let (result, abort_requested) = drive_run(
-                        session.continue_(),
-                        &handle,
-                        &mut cmd_rx,
-                        &mut run_steers,
-                        &mut shutdown_after_run,
-                        Arc::clone(&live_mirror),
-                        &state,
-                        &notice_tx,
-                        &mut pi_model,
-                        &sessions_dir,
-                        &active_session_path,
-                        &journal_appender,
-                    )
-                    .await;
-                    settle_run(
-                        &result,
-                        abort_requested,
-                        &session,
-                        &state,
-                        &sessions_dir,
-                        &cwd,
-                        &notice_tx,
-                        &mut run_steers,
-                    )
-                    .await;
-                    if shutdown_after_run {
-                        break;
-                    }
-                    goal_housekeeping(&result, abort_requested, &session, &state).await;
-                    if shutdown_after_run {
-                        break;
-                    }
-                    chain_goal_rounds(
-                        &mut session,
-                        &handle,
-                        &mut cmd_rx,
-                        &mut run_steers,
-                        &mut shutdown_after_run,
-                        Arc::clone(&live_mirror),
-                        &state,
-                        &notice_tx,
-                        &mut pi_model,
-                        &sessions_dir,
-                        &cwd,
-                        &active_session_path,
-                    )
-                    .await;
-                    if shutdown_after_run {
-                        break;
-                    }
+                resume_steering_queue(
+                    &mut session,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
+                    &mut pi_model,
+                    &sessions_dir,
+                    &cwd,
+                )
+                .await;
+                if shutdown_after_run {
+                    break;
                 }
                 continue;
             }
@@ -3767,10 +3837,32 @@ async fn run_actor(
                 }
             }
             SessionCmd::Steer { id, text, images } => {
-                // A steer queued while idle is injected into the next turn;
-                // confirmation (SteerInjected) rides that turn's settlement.
-                session.handle().steer(steer_message(text, images));
+                // S1 (dsh `wakeDriver` idle-steer): a steer that arrives while
+                // the actor is idle no longer waits for an unrelated next turn.
+                // Enqueue it under its command id (S4 retractable; S3 the same
+                // id is the injected `user` row's durable identity), then
+                // resume immediately — `continue_` drains the queue on its
+                // first poll, injecting the steer and landing the row.
+                session
+                    .handle()
+                    .steer_with_id(steer_message(id.clone(), text, images), id.clone());
                 run_steers.push(id);
+                resume_steering_queue(
+                    &mut session,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
+                    &mut pi_model,
+                    &sessions_dir,
+                    &cwd,
+                )
+                .await;
+                if shutdown_after_run {
+                    break;
+                }
             }
             SessionCmd::CancelSteer(id) => {
                 session.handle().cancel_steer(&id);
@@ -6027,15 +6119,19 @@ mod tests {
     #[test]
     fn steer_message_carries_images_behind_text() {
         let msg = steer_message(
+            "client-minted-id".to_string(),
             "look at this".to_string(),
             vec![manox_harness::types::ContentBlock::Image {
                 data: "aW1hZ2U=".to_string(),
                 mime_type: "image/png".to_string(),
             }],
         );
-        let manox_harness::types::AgentMessage::User { content, .. } = &msg else {
+        let manox_harness::types::AgentMessage::User { content, id, .. } = &msg else {
             panic!("steer message must be a user message");
         };
+        // S3: the client's steer message id rides the message so the injected
+        // `user` journal row lands under it.
+        assert_eq!(id.as_deref(), Some("client-minted-id"));
         assert_eq!(content.len(), 2, "text first, then the image block");
         assert!(matches!(
             &content[0],
@@ -7325,6 +7421,7 @@ mod tests {
                         signature: None,
                     }],
                     timestamp: chrono::Utc::now(),
+                    id: None,
                 },
                 None,
             )
@@ -8463,12 +8560,14 @@ mod tests {
             AgentMessage::User {
                 content: Vec::new(),
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             assistant_request(u1.clone()),
             assistant_request(u2.clone()),
             AgentMessage::User {
                 content: Vec::new(),
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             assistant_request(u3.clone()),
         ];
@@ -8501,6 +8600,7 @@ mod tests {
             AgentMessage::User {
                 content: Vec::new(),
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             assistant_request(assistant_usage(100)),
         ];
@@ -8520,6 +8620,7 @@ mod tests {
             AgentMessage::User {
                 content: Vec::new(),
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             assistant_request(assistant_usage(100)),
         ];
