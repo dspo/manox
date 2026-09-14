@@ -69,12 +69,21 @@ impl SessionRepository {
 
     /// List every session file in the repository directory, newest activity
     /// first. A corrupt file surfaces as missing — callers that need it can
-    /// `open` and see the error.
+    /// `open` and see the error — but never SILENTLY: each skip warns with
+    /// the path and the reason, because a skipped file is a thread
+    /// vanishing from the sidebar.
     pub async fn list(&self) -> Result<Vec<SessionInfo>, anyhow::Error> {
         let mut out = Vec::new();
         for path in session_files(&self.dir).await? {
-            if let Ok(info) = build_session_info(&path).await {
-                out.push(info);
+            match build_session_info(&path).await {
+                Ok(info) => out.push(info),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "session file skipped by list(); open it directly for the full error"
+                    );
+                }
             }
         }
         out.sort_by_key(|s| std::cmp::Reverse(s.modified_at));
