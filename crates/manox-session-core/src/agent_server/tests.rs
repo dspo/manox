@@ -20,8 +20,9 @@ struct FakeEngine {
     steer_calls: StdMutex<Vec<String>>,
     cwds: StdMutex<Vec<PathBuf>>,
     /// Ordered facade trace of the session-swap family commands
-    /// (`new_session`, `set_cwd`): the establishment-before-set ordering
-    /// the engine-side `cwd_change` witness contract relies on.
+    /// (`new_session`, `set_cwd`): pins the bind's establishment-before-set
+    /// shape, the ordering under which the switch lands on the fresh
+    /// chain's witness tail and no-ops.
     session_cmds: StdMutex<Vec<String>>,
     /// Model ids the server pushed through `ThreadEngine::set_model`
     /// (T10: the v1 ThreadInfo mirror is gone — the engine-side wiring
@@ -1748,11 +1749,13 @@ fn set_cwd_after_interaction_moves_engine_not_project() {
 }
 
 /// The not-yet-interacted `SetCwd` note must reach the engine as the
-/// establishment command (`new_session`, which journals the fresh chain's
-/// `cwd_change` witness) BEFORE the working-directory switch (`set_cwd`) —
-/// the shared actor queue runs them in send order, and the no-op guard in
-/// the switch handler only dedups against the witness once it has landed.
-/// A shuffle would silently strand the new chain without a `cwd` publish.
+/// establishment command (`new_session`) BEFORE the working-directory
+/// switch (`set_cwd`): the fresh chain journals its one unconditional
+/// `cwd_change` witness at birth, so the switch that follows lands on the
+/// projected tail and no-ops. The facade methods and the actor queue share
+/// one `cmd_tx`, making send order consumption order; this trace pins the
+/// bind's shape, so a reorder or facade-side rewrite must consciously
+/// rewrite it rather than drift silently.
 #[test]
 fn set_cwd_note_drives_new_session_before_set_cwd() {
     let _g = lock_globals();
