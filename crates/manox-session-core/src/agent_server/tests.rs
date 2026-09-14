@@ -19,6 +19,11 @@ struct FakeEngine {
     runs: StdMutex<Vec<String>>,
     steer_calls: StdMutex<Vec<String>>,
     cwds: StdMutex<Vec<PathBuf>>,
+    /// Ordered facade trace of the session-swap family commands
+    /// (`new_session`, `set_cwd`): pins the bind's establishment-before-set
+    /// shape, the ordering under which the switch lands on the fresh
+    /// chain's witness tail and no-ops.
+    session_cmds: StdMutex<Vec<String>>,
     /// Model ids the server pushed through `ThreadEngine::set_model`
     /// (T10: the v1 ThreadInfo mirror is gone — the engine-side wiring
     /// is what the server half of a model switch can be held to; the
@@ -71,6 +76,7 @@ impl FakeEngine {
                 runs: StdMutex::new(Vec::new()),
                 steer_calls: StdMutex::new(Vec::new()),
                 cwds: StdMutex::new(Vec::new()),
+                session_cmds: StdMutex::new(Vec::new()),
                 model_switches: StdMutex::new(Vec::new()),
                 notices,
                 auth_responses: StdMutex::new(Vec::new()),
@@ -189,10 +195,25 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
     fn approve_plan(&self, _compact: bool, _instructions: Option<String>, seed_text: String) {
         self.plan_approvals.lock().unwrap().push(seed_text);
     }
-    fn open_session(&self, _: PathBuf) {}
-    fn new_session(&self, _: PathBuf, _: Option<PathBuf>) {}
+    fn open_session(&self, path: PathBuf) {
+        self.session_cmds
+            .lock()
+            .unwrap()
+            .push(format!("open_session:{}", path.display()));
+    }
+    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
+        self.session_cmds.lock().unwrap().push(format!(
+            "new_session:{}+{}",
+            cwd.display(),
+            project.map(|p| p.display().to_string()).unwrap_or_default()
+        ));
+    }
     fn set_cwd(&self, path: std::path::PathBuf) {
-        self.cwds.lock().unwrap().push(path);
+        self.cwds.lock().unwrap().push(path.clone());
+        self.session_cmds
+            .lock()
+            .unwrap()
+            .push(format!("set_cwd:{}", path.display()));
     }
 
     fn active_session_path(&self) -> Option<PathBuf> {
@@ -1721,6 +1742,44 @@ fn set_cwd_after_interaction_moves_engine_not_project() {
             .iter()
             .any(|p| p == std::path::Path::new("/moved")),
         "the working-directory switch must reach the engine"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// The not-yet-interacted `SetCwd` note must reach the engine as the
+/// establishment command (`new_session`) BEFORE the working-directory
+/// switch (`set_cwd`): the fresh chain journals its one unconditional
+/// `cwd_change` witness at birth, so the switch that follows lands on the
+/// projected tail and no-ops. The facade methods and the actor queue share
+/// one `cmd_tx`, making send order consumption order; this trace pins the
+/// bind's shape, so a reorder or facade-side rewrite must consciously
+/// rewrite it rather than drift silently.
+#[test]
+fn set_cwd_note_drives_new_session_before_set_cwd() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client.send(FromClient::Notification {
+        note: ClientNote::SetCwd {
+            session_id: "s1".into(),
+            cwd: "/proj".into(),
+        },
+    });
+    client.settle(); // FIFO: the note has been dispatched.
+    let cmds = engine.session_cmds.lock().unwrap().clone();
+    assert_eq!(
+        cmds,
+        vec![
+            "new_session:/proj+/proj".to_string(),
+            "set_cwd:/proj".to_string(),
+        ],
+        "the bind must reach the engine as establishment (new_session) then the switch (set_cwd)"
     );
     drop(client);
     drop(server);
