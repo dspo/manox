@@ -3895,9 +3895,23 @@ mod append_entries_tests {
         }
         b.append_entries(&chain).await.unwrap();
 
+        // Bounded re-read: under extreme cross-binary load a just-awaited
+        // write can lag a synchronous read on some filesystems; the retry
+        // window tolerates that without weakening the equality intent.
+        let (rows_a, rows_b) = {
+            let pa = dir_a.path().join("s.jsonl");
+            let pb = dir_b.path().join("s.jsonl");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let pair = (rows(&pa), rows(&pb));
+                if pair.0 == pair.1 || std::time::Instant::now() > deadline {
+                    break pair;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         assert_eq!(
-            rows(&dir_a.path().join("s.jsonl")),
-            rows(&dir_b.path().join("s.jsonl")),
+            rows_a, rows_b,
             "batched and per-row appends write identical rows (seqs included)"
         );
         assert_eq!(

@@ -25,7 +25,7 @@ use manox_protocol::base64_bytes;
 use manox_protocol::client::{ClientToolSpec, ImageAttachment};
 use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
+use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem,
@@ -70,6 +70,22 @@ struct ServerSession {
     // poison the queue into a permanent cascade — the std .unwrap() locks
     // turned one panic into every subsequent submit/steer/drain panicking.
     pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
+}
+
+/// One live wire terminal (#13). The gpui-free [`TerminalHandle`] owns the
+/// PTY + grid; subscribers are the follow-terminal streams currently
+/// attached (each with its connection).
+/// One follow-terminal subscriber: (client_id, stream_id, connection).
+type TerminalStreamSub = (String, StreamId, Arc<dyn RpcConnection>);
+
+struct TerminalEntry {
+    handle: manox_terminal::TerminalHandle,
+    /// The session this terminal was attached for (cwd source + db row).
+    #[allow(dead_code)] // reserved for per-session terminal scoping
+    session_id: String,
+    cwd: String,
+    streams: Mutex<Vec<TerminalStreamSub>>,
+    exited: StdMutex<Option<i32>>,
 }
 
 impl ServerSession {
@@ -144,6 +160,10 @@ struct AgentServerInner {
     /// Live §D.1 streams: `(client_id, stream_id)` → control handle. The
     /// key pair mirrors the stream id's per-connection uniqueness (§D.1).
     streams: Mutex<HashMap<(String, StreamId), StreamHandle>>,
+    /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
+    /// fed by per-stream forwarder tasks, mirrored into the threads db and
+    /// the `TerminalsUpdated` host snapshot.
+    terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
     call_seq: AtomicU64,
     /// GW3 (§D.4): per-session adjudication delivery counter — the `dlv-`
     /// id's monotonic suffix. Per-session (not per-server) so the two
@@ -221,6 +241,263 @@ impl AgentServerInner {
         None
     }
 
+    // ── #13 wire terminals. ─────────────────────────────────────────────────
+
+    /// `TerminalAttach`: re-attach by id or spawn a fresh shell terminal
+    /// bound to the session's cwd. Response carries the id + a text
+    /// snapshot of the visible grid.
+    fn attach_terminal(
+        self: &Arc<Self>,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        terminal_id: Option<String>,
+    ) -> Result<Value, RpcError> {
+        if let Some(id) = terminal_id.clone() {
+            let existing = self.terminals.lock().get(&id).cloned();
+            if let Some(entry) = existing {
+                return Ok(self.terminal_attach_response(&entry));
+            }
+        }
+        let id = terminal_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let cwd = self
+            .session_thread(session_id)
+            .map(|t| t.read(|t| t.cwd().to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let pty = manox_terminal::pty::open(&cwd, cols, rows, None, &[]).map_err(|e| {
+            RpcError::new(-1, format!("terminal spawn failed: {e}"))
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        })?;
+        let handle = manox_terminal::Terminal::spawn(
+            id.clone(),
+            cwd.clone(),
+            cols as usize,
+            rows as usize,
+            Box::new(pty),
+        )
+        .map_err(|e| {
+            RpcError::new(-1, format!("terminal spawn failed: {e}"))
+                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        })?;
+        let entry = Arc::new(TerminalEntry {
+            handle,
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            streams: Mutex::new(Vec::new()),
+            exited: StdMutex::new(None),
+        });
+        self.terminals.lock().insert(id.clone(), entry.clone());
+        self.upsert_terminal_db(&entry, None);
+        self.broadcast_host(HostEvent::TerminalsUpdated {
+            terminals: self.terminals_summary(),
+        });
+        self.spawn_terminal_watcher(entry.clone());
+        Ok(self.terminal_attach_response(&entry))
+    }
+
+    /// `TerminalSnapshot`: the visible grid as text lines + cursor.
+    fn terminal_snapshot(&self, terminal_id: &str) -> Option<Value> {
+        let entry = self.terminals.lock().get(terminal_id).cloned()?;
+        Some(self.terminal_snapshot_value(&entry))
+    }
+
+    fn terminal_snapshot_value(&self, entry: &TerminalEntry) -> Value {
+        let (lines, cursor_col, cursor_row) = entry.handle.read(|t| t.text_snapshot());
+        let (cols, rows) = entry.handle.read(|t| (t.cols, t.rows));
+        serde_json::json!({
+            "cols": cols,
+            "rows": rows,
+            "cursor": { "x": cursor_col, "y": cursor_row },
+            "lines": lines,
+        })
+    }
+
+    fn terminal_attach_response(&self, entry: &TerminalEntry) -> Value {
+        let id = entry.handle.read(|t| t.id.clone());
+        serde_json::json!({
+            "terminal_id": id,
+            "snapshot": self.terminal_snapshot_value(entry),
+        })
+    }
+
+    fn terminals_summary(&self) -> Vec<manox_protocol::stream::TerminalSummary> {
+        self.terminals
+            .lock()
+            .iter()
+            .map(|(id, entry)| {
+                let exited = *entry.exited.lock().unwrap();
+                manox_protocol::stream::TerminalSummary {
+                    id: id.clone(),
+                    title: entry.handle.read(|t| t.title.clone()),
+                    lifecycle: if exited.is_some() {
+                        "exited"
+                    } else {
+                        "running"
+                    }
+                    .into(),
+                    exit_code: exited,
+                }
+            })
+            .collect()
+    }
+
+    fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
+        let Ok(path) = manox_agent::db::default_db_path() else {
+            return;
+        };
+        let Ok(db) = manox_agent::db::ThreadsDatabase::open(&path) else {
+            return;
+        };
+        let id = entry.handle.read(|t| t.id.clone());
+        let title = entry.handle.read(|t| t.title.clone());
+        let now = chrono::Utc::now().timestamp_millis();
+        let _ = exit; // exit code rides the summary, not the row
+        let _ = db.upsert_terminal_session(&manox_agent::db::TerminalSession {
+            id,
+            cwd: entry.cwd.clone(),
+            env: Vec::new(),
+            title,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    /// One watcher per terminal: title/exit edges update the db mirror and
+    /// broadcast `TerminalsUpdated`.
+    fn spawn_terminal_watcher(self: &Arc<Self>, entry: Arc<TerminalEntry>) {
+        let rx = entry.handle.subscribe();
+        let inner = Arc::clone(self);
+        manox_agent::runtime::handle().spawn(async move {
+            while let Ok(ev) = rx.recv().await {
+                match &*ev {
+                    manox_terminal::event::TerminalEvent::Title(_) => {
+                        inner.upsert_terminal_db(&entry, None);
+                        inner.broadcast_host(HostEvent::TerminalsUpdated {
+                            terminals: inner.terminals_summary(),
+                        });
+                    }
+                    manox_terminal::event::TerminalEvent::ChildExit(_)
+                    | manox_terminal::event::TerminalEvent::Exit => {
+                        let code = match &*ev {
+                            manox_terminal::event::TerminalEvent::ChildExit(c) => Some(*c),
+                            _ => None,
+                        };
+                        *entry.exited.lock().unwrap() = code.or(Some(-1));
+                        inner.upsert_terminal_db(&entry, code);
+                        inner.broadcast_host(HostEvent::TerminalsUpdated {
+                            terminals: inner.terminals_summary(),
+                        });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// `StreamOpen { FollowTerminal }`: one forwarder per stream relaying raw
+    /// PTY chunks as base64 `TerminalOutput` frames; ends `Closed` on child
+    /// exit / channel close, `Cancelled` on `StreamCancel`.
+    fn open_terminal_stream(
+        self: &Arc<Self>,
+        client_id: &str,
+        conn: Arc<dyn RpcConnection>,
+        stream_id: StreamId,
+        terminal_id: String,
+    ) {
+        let Some(entry) = self.terminals.lock().get(&terminal_id).cloned() else {
+            conn.send_to_client(FromServer::StreamEnd {
+                stream_id,
+                reason: StreamEndReason::Failure {
+                    code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
+                    message: format!("unknown terminal {terminal_id}"),
+                },
+            });
+            return;
+        };
+        let handle = StreamHandle::new(
+            terminal_id.clone(),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(StdMutex::new(None)),
+        );
+        self.track_stream(client_id, &stream_id, handle.clone());
+        entry
+            .streams
+            .lock()
+            .push((client_id.to_string(), stream_id.clone(), conn.clone()));
+        let (cancel, _reason) = handle.parts();
+        // Raw byte tap for the relay; the lifecycle subscription carries the
+        // child-exit edge that ends the stream.
+        let mut raw_rx = entry.handle.subscribe_raw();
+        let life_rx = entry.handle.subscribe();
+        let client_id2 = client_id.to_string();
+        let stream_id2 = stream_id.clone();
+        manox_agent::runtime::handle().spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        conn.send_to_client(FromServer::StreamEnd {
+                            stream_id: stream_id.clone(),
+                            reason: StreamEndReason::Cancelled,
+                        });
+                        break;
+                    }
+                    ev = life_rx.recv() => {
+                        match ev {
+                            Ok(ev) => match &*ev {
+                                manox_terminal::event::TerminalEvent::ChildExit(_)
+                                | manox_terminal::event::TerminalEvent::Exit => {
+                                    conn.send_to_client(FromServer::StreamEnd {
+                                        stream_id: stream_id.clone(),
+                                        reason: StreamEndReason::Closed,
+                                    });
+                                    break;
+                                }
+                                _ => {}
+                            },
+                            Err(_) => {
+                                conn.send_to_client(FromServer::StreamEnd {
+                                    stream_id: stream_id.clone(),
+                                    reason: StreamEndReason::Closed,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    chunk = raw_rx.recv() => {
+                        match chunk {
+                            Ok(bytes) => {
+                                conn.send_to_client(FromServer::StreamItem {
+                                    stream_id: stream_id.clone(),
+                                    frame: StreamFrame::TerminalOutput {
+                                        data: manox_protocol::base64_bytes::encode(&bytes),
+                                    },
+                                });
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Bounded tap: a slow consumer drops chunks
+                                // rather than stalling the PTY pump; the
+                                // client re-snapshots on demand.
+                            }
+                            Err(_) => {
+                                conn.send_to_client(FromServer::StreamEnd {
+                                    stream_id: stream_id.clone(),
+                                    reason: StreamEndReason::Closed,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            entry
+                .streams
+                .lock()
+                .retain(|(c, s, _)| !(c == &client_id2 && s == &stream_id2));
+        });
+    }
+
+    /// insert (§二.4②) — its task sends its one `StreamEnd` and the
     /// Register a live stream and return its control handle.
     ///
     /// A key that is already live means the previous stream task is being
@@ -228,7 +505,6 @@ impl AgentServerInner {
     /// so an unconditionally overwritten handle would be unreachable from
     /// BOTH ends forever (no end request, no unregister — a live orphan).
     /// The superseded stream is therefore ENDED (`Closed`) under the same
-    /// insert (§二.4②) — its task sends its one `StreamEnd` and the
     /// identity guard keeps the new entry intact.
     fn track_stream(&self, client_id: &str, stream_id: &StreamId, handle: StreamHandle) {
         let replaced = self
@@ -323,12 +599,16 @@ impl AgentServer {
     }
 
     fn new_inner(cwd: PathBuf, store_watcher: bool) -> Self {
+        // #13: the terminal pumps need a runtime; first registration wins
+        // and the agent runtime is already live here.
+        manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            terminals: Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(0),
             delivery_seq: Mutex::new(HashMap::new()),
             pending_deliveries: Mutex::new(HashMap::new()),
@@ -690,10 +970,18 @@ impl AgentServerInner {
         stream_id: StreamId,
         kind: StreamKind,
     ) {
+        if let StreamKind::FollowTerminal { terminal_id } = kind {
+            self.open_terminal_stream(client_id, conn, stream_id, terminal_id);
+            return;
+        }
         let StreamKind::FollowSession {
             session_id,
             max_messages,
-        } = kind;
+        } = kind
+        else {
+            // FollowTerminal is handled above; no other kind exists.
+            return;
+        };
         let Some(thread) = self.session_thread(&session_id) else {
             // §D.7 `session/not-found` as a terminal failure frame.
             conn.send_to_client(FromServer::StreamEnd {
@@ -1489,9 +1777,17 @@ async fn handle_call(
         // declared terminal support must be able to distinguish "feature
         // not built yet" from a generic failure (§D.7 code set, ratified
         // with the msg.rs constant + spec revision).
-        ClientCall::TerminalAttach { .. } | ClientCall::TerminalSnapshot { .. } => {
-            Err(RpcError::new(-1, "terminal support lands in β-3b")
-                .with_code(manox_protocol::msg::CODE_FEATURE_UNAVAILABLE))
+        ClientCall::TerminalAttach {
+            session,
+            cols,
+            rows,
+            terminal_id,
+        } => inner.attach_terminal(&session, cols, rows, terminal_id),
+        ClientCall::TerminalSnapshot { terminal } => {
+            inner.terminal_snapshot(&terminal).ok_or_else(|| {
+                RpcError::new(-1, format!("unknown terminal {terminal}"))
+                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
+            })
         }
         ClientCall::ModelChat {
             request_id,
@@ -1993,31 +2289,71 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             };
             thread.with_mut(|t| t.set_browser_suite(parsed, enable));
         }
-        ClientNote::TerminalInput { .. } | ClientNote::TerminalResize { .. } => {
-            // β-3b: route to TerminalHandle. GW7: until then, an explicit
-            // Error note to the SENDING client — pre-fix the note was
-            // silently swallowed, which is data loss for a client that
-            // declared terminal support (session_id None: the drop is
-            // connection-scoped, not a session fact).
-            let message = "terminal input dropped: terminal support lands in β-3b";
-            inner.note_to_client(
-                owner,
-                ServerNote::Error {
-                    session_id: None,
-                    message: message.into(),
-                },
-            );
-            // GW1 dual emit: the §D.5 Host mirror, directed to the sending
-            // connection (the note's audience).
-            inner.host_to_client(
-                owner,
-                HostEvent::Error {
-                    message: message.into(),
-                    // Connection-scoped (the note's session_id is None):
-                    // no leaf owns it, consumers log.
-                    session_id: None,
-                },
-            );
+        ClientNote::TerminalInput { terminal, bytes } => {
+            // #13: keystroke-grade input into the terminal's PTY writer
+            // (enqueue-only, never blocks the caller).
+            let Some(entry) = inner.terminals.lock().get(&terminal).cloned() else {
+                let message = format!("unknown terminal {terminal}");
+                inner.note_to_client(
+                    owner,
+                    ServerNote::Error {
+                        session_id: None,
+                        message: message.clone(),
+                    },
+                );
+                inner.host_to_client(
+                    owner,
+                    HostEvent::Error {
+                        message,
+                        session_id: None,
+                    },
+                );
+                return;
+            };
+            if let Err(err) = entry.handle.read(|t| t.input(&bytes)) {
+                let message = format!("terminal input failed: {err}");
+                inner.note_to_client(
+                    owner,
+                    ServerNote::Error {
+                        session_id: None,
+                        message: message.clone(),
+                    },
+                );
+                inner.host_to_client(
+                    owner,
+                    HostEvent::Error {
+                        message,
+                        session_id: None,
+                    },
+                );
+            }
+        }
+        ClientNote::TerminalResize {
+            terminal,
+            cols,
+            rows,
+        } => {
+            let Some(entry) = inner.terminals.lock().get(&terminal).cloned() else {
+                let message = format!("unknown terminal {terminal}");
+                inner.note_to_client(
+                    owner,
+                    ServerNote::Error {
+                        session_id: None,
+                        message: message.clone(),
+                    },
+                );
+                inner.host_to_client(
+                    owner,
+                    HostEvent::Error {
+                        message,
+                        session_id: None,
+                    },
+                );
+                return;
+            };
+            entry
+                .handle
+                .with_mut(|t| t.resize(cols as usize, rows as usize));
         }
         ClientNote::AppendUserMessage {
             session_id,

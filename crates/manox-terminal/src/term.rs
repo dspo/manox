@@ -180,15 +180,28 @@ pub struct TerminalCore {
     /// `TerminalEvent` holds non-`Clone` alacritty callbacks (`ColorRequest`,
     /// `ClipboardLoad`); the `Arc` lets one event fan out to every subscriber.
     subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<TerminalEvent>>>>,
+    /// Raw PTY byte tap for wire consumers (#13): every `PtyOutput` chunk
+    /// fans out here BEFORE grid processing, so a follow-terminal stream
+    /// relays the unprocessed byte stream to its own emulator.
+    raw_subscribers: tokio::sync::broadcast::Sender<Arc<Vec<u8>>>,
 }
 
 impl TerminalHandle {
     /// Wrap a freshly built [`Terminal`].
     pub fn new(terminal: Terminal) -> Self {
+        let (raw_tx, _rx) = tokio::sync::broadcast::channel(256);
         Self(Arc::new(TerminalCore {
             state: parking_lot::RwLock::new(terminal),
             subscribers: parking_lot::Mutex::new(Vec::new()),
+            raw_subscribers: raw_tx,
         }))
+    }
+
+    /// Subscribe to the raw PTY byte stream (#13). Lagged subscribers are
+    /// dropped by broadcast semantics — a slow wire consumer loses chunks
+    /// rather than stalling the PTY pump.
+    pub fn subscribe_raw(&self) -> tokio::sync::broadcast::Receiver<Arc<Vec<u8>>> {
+        self.0.raw_subscribers.subscribe()
     }
 
     /// Downgrade to a weak reference so a long-lived pump (or a registry
@@ -353,7 +366,10 @@ impl TerminalHandle {
     /// arms go through the capability seam and never take the state lock.
     fn on_event(&self, ev: TerminalEvent) {
         match ev {
-            TerminalEvent::PtyOutput(bytes) => self.with_mut(|t| t.write_pty_output(&bytes)),
+            TerminalEvent::PtyOutput(bytes) => {
+                let _ = self.0.raw_subscribers.send(Arc::new(bytes.clone()));
+                self.with_mut(|t| t.write_pty_output(&bytes))
+            }
             TerminalEvent::ChildExit(code) => self.with_mut(|t| {
                 t.child_exited = Some(code);
                 t.pending_events.push(TerminalEvent::ChildExit(code));
@@ -642,6 +658,35 @@ impl Terminal {
     /// Apply a vi motion. Only meaningful while vi mode is on.
     pub fn vi_motion(&self, motion: ViMotion) {
         self.with_term_mut(|t| t.vi_motion(motion));
+    }
+
+    /// Wire snapshot of the visible grid: text lines (trailing spaces
+    /// trimmed) plus the cursor as (column, row) in grid coordinates — the
+    /// payload behind `TerminalSnapshot` and a follow-terminal stream's
+    /// opening frame. Display-line mapping mirrors `hyperlink_at`.
+    pub fn text_snapshot(&self) -> (Vec<String>, usize, usize) {
+        self.with_term(|t| {
+            let content = t.renderable_content();
+            let mut lines: Vec<String> = Vec::new();
+            let mut prev: Option<i32> = None;
+            for idx in content.display_iter {
+                let line = idx.point.line.0;
+                if prev != Some(line) {
+                    prev = Some(line);
+                    lines.push(String::new());
+                }
+                if let Some(cur) = lines.last_mut() {
+                    cur.push(idx.cell.c);
+                }
+            }
+            for l in lines.iter_mut() {
+                while l.ends_with(' ') {
+                    l.pop();
+                }
+            }
+            let point = t.grid().cursor.point;
+            (lines, point.column.0, point.line.0.max(0) as usize)
+        })
     }
 
     /// The OSC 8 hyperlink URI at `(row, col)`, if any.

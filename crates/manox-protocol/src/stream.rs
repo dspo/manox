@@ -45,6 +45,11 @@ pub enum StreamKind {
         session_id: String,
         max_messages: Option<u32>,
     },
+    /// Follow one terminal's raw PTY output: an opening text snapshot
+    /// frame, then base64 output chunks. Ends `Closed` when the child
+    /// exits, `Cancelled` on `StreamCancel`, `Resync` never (raw bytes
+    /// carry no journal gaps).
+    FollowTerminal { terminal_id: String },
 }
 
 /// One item delivered inside `FromServer::StreamItem { stream_id, frame }`
@@ -77,6 +82,10 @@ pub enum StreamFrame {
     /// Changed projection values since the previous frame (P face, §E.1);
     /// never dropped.
     Projections(ProjectionsFrame),
+    /// Raw PTY output chunk of a follow-terminal stream, base64-encoded.
+    /// The consumer feeds its own terminal emulator; the opening snapshot
+    /// rides the attach/snapshot response instead.
+    TerminalOutput { data: String },
 }
 
 impl StreamFrame {
@@ -90,6 +99,10 @@ impl StreamFrame {
         match self {
             StreamFrame::Snapshot(_) | StreamFrame::Projections(_) => BackpressurePolicy::NeverDrop,
             StreamFrame::Entry { .. } => BackpressurePolicy::BoundedResync,
+            // Raw PTY chunks: bounded like journal entries — on overflow the
+            // consumer re-snapshots via `TerminalSnapshot` instead of
+            // receiving a torn byte stream.
+            StreamFrame::TerminalOutput { .. } => BackpressurePolicy::BoundedResync,
         }
     }
 }
@@ -232,6 +245,20 @@ pub enum HostEvent {
     /// grouping reads it off the wire instead of the in-process store.
     /// Host-only: a new surface, no v1 consumer.
     Projects { known: Vec<String> },
+    /// The live terminal table changed (spawn / title / exit). Full
+    /// snapshot, same monotonic-snapshot discipline as `ThreadsUpdated`.
+    TerminalsUpdated { terminals: Vec<TerminalSummary> },
+}
+
+/// One row of the `TerminalsUpdated` snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSummary {
+    pub id: String,
+    pub title: Option<String>,
+    /// `"running"` or `"exited"`.
+    pub lifecycle: String,
+    pub exit_code: Option<i32>,
 }
 
 impl HostEvent {

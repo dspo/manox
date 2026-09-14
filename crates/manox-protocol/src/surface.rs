@@ -326,6 +326,14 @@ wire_surface! {
         HostEvent::Projects { .. } => "projects" ~ HostEvent::Projects {
             known: vec!["/proj".into()],
         },
+        HostEvent::TerminalsUpdated { .. } => "terminalsUpdated" ~ HostEvent::TerminalsUpdated {
+            terminals: vec![crate::stream::TerminalSummary {
+                id: "t1".into(),
+                title: Some("zsh".into()),
+                lifecycle: "running".into(),
+                exit_code: None,
+            }],
+        },
     ]
 }
 
@@ -341,6 +349,9 @@ wire_surface! {
         StreamKind::FollowSession { .. } => "followSession" ~ StreamKind::FollowSession {
             session_id: "s1".into(),
             max_messages: Some(64),
+        },
+        StreamKind::FollowTerminal { .. } => "followTerminal" ~ StreamKind::FollowTerminal {
+            terminal_id: "t1".into(),
         },
     ]
 }
@@ -370,6 +381,9 @@ wire_surface! {
                 serde_json::json!("v2 migration"),
             )]),
         }),
+        StreamFrame::TerminalOutput { .. } => "terminalOutput" ~ StreamFrame::TerminalOutput {
+            data: "aGk=".into(),
+        },
     ]
 }
 
@@ -430,7 +444,8 @@ wire_surface! {
             session: "s1".into(),
             cols: 80,
             rows: 24,
-        },
+
+            terminal_id: None,},
         ClientCall::TerminalSnapshot { .. } => "terminalSnapshot" ~ ClientCall::TerminalSnapshot {
             terminal: "t1".into(),
         },
@@ -781,6 +796,13 @@ pub fn stream_kind_follow(session_id: &str) -> StreamKind {
     }
 }
 
+/// The follow-terminal kind (#13): raw PTY relay.
+pub fn stream_kind_follow_terminal(terminal_id: &str) -> StreamKind {
+    StreamKind::FollowTerminal {
+        terminal_id: terminal_id.into(),
+    }
+}
+
 /// The scripted session's header.
 pub fn header_sample() -> crate::journal::ThreadHeader {
     crate::journal::ThreadHeader {
@@ -906,6 +928,15 @@ pub fn scripted_stream_open() -> FromClient {
     }
 }
 
+/// The scripted follow-terminal opening (#13) — the coverage walk asserts
+/// every declared stream kind appears in the scripted openings.
+pub fn scripted_terminal_stream_open() -> FromClient {
+    FromClient::StreamOpen {
+        stream_id: crate::journal::StreamId::new("stream-5"),
+        stream_kind: stream_kind_follow_terminal("t1"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -955,7 +986,7 @@ mod tests {
         want.extend_from_slice(STREAM_FRAMES);
         want.extend_from_slice(STREAM_END_REASONS);
         assert_eq!(frames(), want);
-        assert_eq!(frames().len(), 8);
+        assert_eq!(frames().len(), 10);
     }
 
     #[test]

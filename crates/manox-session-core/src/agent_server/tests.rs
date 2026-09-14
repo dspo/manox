@@ -5164,11 +5164,13 @@ fn rehandshake_same_client_id_keeps_one_owner_row_per_session() {
 /// terminal support). The code is a §D.7 addition candidate; the spec
 /// revision is proposed in the delivery report.
 #[test]
-fn terminal_calls_answer_feature_unavailable() {
+fn terminal_attach_and_snapshot_round_trip() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
     let (_server, client) = harness(vec![]);
+    // Attach now SPAWNS a shell terminal (β-3b landed): the response
+    // carries the minted id + a text snapshot of the visible grid.
     let m = request(
         &client,
         "term-attach",
@@ -5176,20 +5178,17 @@ fn terminal_calls_answer_feature_unavailable() {
             session: "s1".into(),
             cols: 80,
             rows: 24,
+            terminal_id: None,
         },
     );
-    match m {
-        FromServer::Response {
-            outcome: Err(e), ..
-        } => {
-            assert_eq!(
-                e.data.as_ref().expect("GW7: the error carries data.code")["code"],
-                "feature/unavailable"
-            );
-            assert!(e.message.contains("β-3b"));
+    let id = match m {
+        FromServer::Response { outcome: Ok(v), .. } => {
+            v["terminal_id"].as_str().unwrap().to_string()
         }
-        other => panic!("expected the terminal error, got {other:?}"),
-    }
+        other => panic!("expected an attach response, got {other:?}"),
+    };
+    assert!(!id.is_empty());
+    // An unknown terminal still answers session/not-found.
     let m = request(
         &client,
         "term-snapshot",
@@ -5201,9 +5200,12 @@ fn terminal_calls_answer_feature_unavailable() {
         FromServer::Response {
             outcome: Err(e), ..
         } => {
-            assert_eq!(e.data.unwrap()["code"], "feature/unavailable");
+            assert_eq!(
+                e.data.as_ref().expect("the error carries data.code")["code"],
+                "session/not-found"
+            );
         }
-        other => panic!("expected the terminal error, got {other:?}"),
+        other => panic!("expected the not-found error, got {other:?}"),
     }
     drop(client);
     drop(_server);
@@ -5236,7 +5238,7 @@ fn terminal_notes_answer_with_an_error_note() {
                 m,
                 FromServer::Notification {
                     note: ServerNote::Error { session_id: None, message }
-                } if message == "terminal input dropped: terminal support lands in β-3b"
+                } if message == "unknown terminal t1"
             )
         });
     }
@@ -6900,6 +6902,7 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
             session: "j1-s".into(),
             cols: 80,
             rows: 24,
+            terminal_id: None,
         },
         ClientCall::TerminalSnapshot {
             terminal: "t1".into(),
@@ -6955,6 +6958,14 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
             approval_mode: None,
             reasoning_effort: None,
         },
+        // #13: the terminal arm answers and its spawn broadcasts
+        // TerminalsUpdated, which the host-event walk below collects.
+        ClientCall::TerminalAttach {
+            session: "j1-s".into(),
+            cols: 80,
+            rows: 24,
+            terminal_id: None,
+        },
         // The embedder-tools arm answers too (empty registration → 0).
         ClientCall::RegisterSessionTools {
             session_id: "j1-s".into(),
@@ -7002,16 +7013,21 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
         if std::time::Instant::now() > deadline {
             break;
         }
-        match client.recv() {
-            FromServer::Host { host } => {
+        // Non-blocking drain: under parallel-suite load a blocking recv can
+        // starve for its whole timeout while the dispatch task is merely
+        // busy, turning load into a false negative. Poll instead; the
+        // deadline break above names any genuinely missing surface.
+        match client.conn.server_rx().try_recv() {
+            Ok(FromServer::Host { host }) => {
                 host_tags.insert(host_wire_tag(&host));
             }
-            FromServer::Response { id, .. } => {
+            Ok(FromServer::Response { id, .. }) => {
                 if let Some(tag) = expected.get(&id.0) {
                     answered.insert(tag);
                 }
             }
-            _ => {}
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
     let missing_calls: Vec<&&str> = CLIENT_CALLS
@@ -9396,4 +9412,199 @@ fn dispose_clears_embedder_registrations() {
     drop(server);
     manox_agent::embedder_tools::drop_provider_for_test();
     manox_agent::thread_store::drop_global_for_test();
+}
+
+// ── #13 wire terminals ────────────────────────────────────────────────────
+
+fn attach_terminal(client: &Client, session: &str, terminal_id: Option<&str>) -> Value {
+    client.send(FromClient::Request {
+        id: MsgId::new("term-attach"),
+        call: ClientCall::TerminalAttach {
+            session: session.into(),
+            cols: 80,
+            rows: 24,
+            terminal_id: terminal_id.map(str::to_string),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "attach never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "term-attach"
+        {
+            return outcome.expect("attach succeeds");
+        }
+    }
+}
+
+#[test]
+fn terminal_attach_spawns_and_snapshots() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let resp = attach_terminal(&client, "no-session-needed", None);
+    let id = resp["terminal_id"].as_str().unwrap().to_string();
+    assert!(!id.is_empty());
+    let snap = &resp["snapshot"];
+    assert_eq!(snap["cols"], 80);
+    assert_eq!(snap["rows"], 24);
+    assert!(snap["lines"].as_array().is_some());
+    assert!(snap["cursor"]["x"].is_u64());
+    // The snapshot arm answers for the same id.
+    client.send(FromClient::Request {
+        id: MsgId::new("term-snap"),
+        call: ClientCall::TerminalSnapshot {
+            terminal: id.clone(),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "snapshot never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "term-snap"
+        {
+            let snap = outcome.expect("snapshot succeeds");
+            assert_eq!(snap["cols"], 80);
+            break;
+        }
+    }
+    // Re-attach by id returns the SAME terminal.
+    let resp2 = attach_terminal(&client, "no-session-needed", Some(&id));
+    assert_eq!(resp2["terminal_id"].as_str().unwrap(), id);
+    // Unknown terminal snapshot → session/not-found code.
+    client.send(FromClient::Request {
+        id: MsgId::new("term-snap-bad"),
+        call: ClientCall::TerminalSnapshot {
+            terminal: "nope".into(),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bad snapshot never answered"
+        );
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "term-snap-bad"
+        {
+            let err = outcome.expect_err("unknown terminal errors");
+            let v = serde_json::to_value(&err).unwrap();
+            assert_eq!(v["data"]["code"], "session/not-found");
+            break;
+        }
+    }
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn terminal_input_streams_output_and_exit_closes() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let resp = attach_terminal(&client, "s-term", None);
+    let id = resp["terminal_id"].as_str().unwrap().to_string();
+
+    // Follow the terminal, then type a command; raw chunks must arrive as
+    // base64 TerminalOutput frames.
+    client.send(FromClient::StreamOpen {
+        stream_id: manox_protocol::StreamId::new("ts-1"),
+        stream_kind: manox_protocol::StreamKind::FollowTerminal {
+            terminal_id: id.clone(),
+        },
+    });
+    client.send(FromClient::Notification {
+        note: ClientNote::TerminalInput {
+            terminal: id.clone(),
+            bytes: b"echo MANOX_TERM_SMOKE\n".to_vec(),
+        },
+    });
+    let mut seen_marker = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !seen_marker {
+        assert!(std::time::Instant::now() < deadline, "no terminal output");
+        match client.recv() {
+            FromServer::StreamItem {
+                frame: manox_protocol::StreamFrame::TerminalOutput { data },
+                ..
+            } => {
+                let bytes = manox_protocol::base64_bytes::decode(&data).unwrap();
+                if String::from_utf8_lossy(&bytes).contains("MANOX_TERM_SMOKE") {
+                    seen_marker = true;
+                }
+            }
+            FromServer::StreamEnd { .. } => panic!("stream ended before output"),
+            _ => {}
+        }
+    }
+    // Exit the shell: the stream must end Closed and the summary flip.
+    client.send(FromClient::Notification {
+        note: ClientNote::TerminalInput {
+            terminal: id.clone(),
+            bytes: b"exit\n".to_vec(),
+        },
+    });
+    let mut ended = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !ended {
+        assert!(std::time::Instant::now() < deadline, "stream never closed");
+        if let FromServer::StreamEnd { reason, .. } = client.recv() {
+            assert!(matches!(reason, manox_protocol::StreamEndReason::Closed));
+            ended = true;
+        }
+    }
+    drop(_server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+#[test]
+fn terminal_resize_updates_snapshot_dims() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (_server, client) = harness(vec![]);
+    let resp = attach_terminal(&client, "s-resize", None);
+    let id = resp["terminal_id"].as_str().unwrap().to_string();
+    client.send(FromClient::Notification {
+        note: ClientNote::TerminalResize {
+            terminal: id.clone(),
+            cols: 120,
+            rows: 40,
+        },
+    });
+    // The resize lands asynchronously; poll the snapshot until dims flip.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "resize never landed");
+        client.send(FromClient::Request {
+            id: MsgId::new("term-snap-r"),
+            call: ClientCall::TerminalSnapshot {
+                terminal: id.clone(),
+            },
+        });
+        let inner = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < inner, "snapshot never answered");
+            if let FromServer::Response { id, outcome } = client.recv()
+                && id.0 == "term-snap-r"
+            {
+                let snap = outcome.expect("snapshot succeeds");
+                if snap["cols"] == 120 && snap["rows"] == 40 {
+                    drop(_server);
+                    manox_agent::thread_store::drop_global_for_test();
+                    return;
+                }
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

@@ -41,6 +41,10 @@ pub enum ClientCall {
         session: String,
         cols: u16,
         rows: u16,
+        /// Re-attach to an existing terminal instead of spawning one.
+        /// Absent (default) mints a fresh terminal id.
+        #[serde(default)]
+        terminal_id: Option<String>,
     },
     TerminalSnapshot {
         terminal: String,
