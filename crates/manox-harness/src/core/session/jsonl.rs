@@ -744,6 +744,28 @@ fn v4_line(entry: &SessionTreeEntry, seq: u64) -> Result<String, anyhow::Error> 
     Ok(serde_json::to_string(&value)? + "\n")
 }
 
+/// Parse and wire-validate one session header line (without touching any
+/// entry line). The shared header half of `load`, extracted for the
+/// repository's bounded scans: a host-membership check or a list row needs
+/// the header only, at microsecond cost. Returns the metadata plus the
+/// on-disk format version.
+pub fn parse_header_line(line: &[u8]) -> Result<(JsonlSessionMetadata, u32), anyhow::Error> {
+    let header: JsonValue =
+        serde_json::from_slice(line).map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
+    validate_header_wire(&header)?;
+    let header: SessionHeader = serde_json::from_value(header)
+        .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
+    let version = header.version;
+    let metadata = JsonlSessionMetadata {
+        id: header.id,
+        cwd: header.cwd,
+        created_at: header.timestamp,
+        parent_session_path: header.parent_session,
+        metadata: header.metadata,
+    };
+    Ok((metadata, version))
+}
+
 /// Everything [`JsonlSessionStorage::load`] derives from one file's bytes.
 struct ParsedFile {
     metadata: JsonlSessionMetadata,

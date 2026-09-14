@@ -108,13 +108,24 @@ pub fn meta_path(session_dir: &Path, session_path: &Path) -> PathBuf {
 }
 
 /// Read the sidecar; a missing file yields the default (fresh session).
+/// A (size, mtime) fingerprint cache fronts the read: an unchanged sidecar
+/// costs one `stat`, and every successful `save` refreshes the entry under
+/// the same path so this process never re-reads what it just wrote.
 pub async fn load(session_dir: &Path, session_path: &Path) -> Result<SessionMeta, anyhow::Error> {
     let path = meta_path(session_dir, session_path);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SessionMeta::default()),
-        Err(e) => Err(e.into()),
+    if let Some(hit) = cached(&path).await {
+        return Ok((*hit).clone());
     }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SessionMeta::default());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let meta: SessionMeta = serde_json::from_slice(&bytes)?;
+    remember(&path, bytes.len() as u64, mtime_of(&path).await, &meta);
+    Ok(meta)
 }
 
 /// Write the sidecar atomically (write temp + rename) so a crash cannot
@@ -136,7 +147,52 @@ pub async fn save(
     ));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
+    remember(&path, bytes.len() as u64, mtime_of(&path).await, meta);
     Ok(())
+}
+
+/// One cached sidecar: its (size, mtime_ns) fingerprint and parsed content.
+type SidecarCache = HashMap<PathBuf, (u64, i64, Arc<SessionMeta>)>;
+
+/// The sidecar fingerprint cache. Purely an accelerator — a stale entry
+/// self-heals on the next fingerprint mismatch, and correctness never
+/// depends on it.
+static FINGERPRINTS: OnceLock<StdMutex<SidecarCache>> = OnceLock::new();
+
+fn fingerprints() -> &'static StdMutex<SidecarCache> {
+    FINGERPRINTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// The cached sidecar when the file's (size, mtime) still matches.
+async fn cached(path: &Path) -> Option<Arc<SessionMeta>> {
+    let stat = tokio::fs::metadata(path).await.ok()?;
+    let (size, mtime) = (stat.len(), mtime_of(path).await);
+    let map = fingerprints().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(path) {
+        Some((cached_size, cached_mtime, meta))
+            if *cached_size == size && *cached_mtime == mtime =>
+        {
+            Some(Arc::clone(meta))
+        }
+        _ => None,
+    }
+}
+
+fn remember(path: &Path, size: u64, mtime: i64, meta: &SessionMeta) {
+    fingerprints()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), (size, mtime, Arc::new(meta.clone())));
+}
+
+async fn mtime_of(path: &Path) -> i64 {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|stat| stat.modified().ok())
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 /// Per-sidecar write lock keyed by sidecar path: every load→modify→save

@@ -3219,15 +3219,17 @@ async fn run_actor(
     let latest = if fresh {
         None
     } else if let Some(requested) = &initial_path {
-        // An explicit open reads only the requested transcript. The
-        // store-wide `repo.list()` walk reads and parses every session
-        // file — on a daily-use store that parked every thread switch
-        // behind a full-store scan (#765 symptom: clicking a sidebar
-        // thread never loads). The host filter is fail-closed as before.
-        repo.info(requested)
+        // An explicit open reads only the requested transcript's HEADER —
+        // one line, microsecond scale. The store-wide `repo.list()` scan
+        // walks every session file (bounded, but still O(store)); the
+        // header carries everything the host-membership check and the
+        // restore below need, and `builder.open` performs the one full
+        // parse. The host filter is fail-closed as before.
+        repo.header(requested)
             .await
             .ok()
-            .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()))
+            .filter(|header| crate::host::belongs_to_current_host(header.metadata.as_ref()))
+            .map(|header| (requested.clone(), header))
     } else {
         repo.list().await.ok().and_then(|list| {
             // Only this host's sessions are eligible for restore; an explicit
@@ -3235,15 +3237,26 @@ async fn run_actor(
             let mut list = list
                 .into_iter()
                 .filter(|info| crate::host::belongs_to_current_host(info.metadata.as_ref()));
-            list.find(|info| info.message_count > 0)
+            list.find(|info| info.has_messages).map(|info| {
+                (
+                    info.path.clone(),
+                    manox_harness::session::jsonl::JsonlSessionMetadata {
+                        id: info.id,
+                        cwd: info.cwd,
+                        created_at: info.created_at,
+                        parent_session_path: info.parent_session_path.map(PathBuf::from),
+                        metadata: info.metadata,
+                    },
+                )
+            })
         })
     };
     let mut restored = false;
     let mut session = None;
-    if let Some(info) = latest {
+    if let Some((session_path, header)) = latest {
         // Sessions created by a GUI launch (process cwd `/`) persisted a
         // useless cwd; heal them to this launch's default instead.
-        let mut tool_cwd = PathBuf::from(info.cwd.clone());
+        let mut tool_cwd = PathBuf::from(header.cwd.clone());
         if tool_cwd.as_os_str() == "/" {
             tool_cwd = cwd.clone();
         }
@@ -3265,7 +3278,7 @@ async fn run_actor(
             None,
             &bus,
         );
-        match builder.open(info.path).await {
+        match builder.open(session_path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
                 crate::monitor_bridge::spawn(
@@ -3279,7 +3292,7 @@ async fn run_actor(
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 // The restored file is the thread's active session.
-                crate::thread_registry::set_active(&thread_id, &info.id).await;
+                crate::thread_registry::set_active(&thread_id, &header.id).await;
                 session = Some(s);
             }
             Err(err) => {

@@ -9,6 +9,14 @@
 //! SQLite-backed implementation was removed; see git history (or the
 //! `origin/Manox` backup branch) for it.
 //!
+//! A refresh is a RECONCILE, not a scan: a `read_dir` + `stat` sweep
+//! fingerprints every session file (and its sidecar); files whose append-only
+//! coverage still holds reuse the cached bounded facts (`session_index` hot
+//! map + db table), and only the new or shrunk ones take a bounded read
+//! (header + first user message — never the transcript). Latency grows with
+//! CHANGES, not with history: a 40 MiB session being actively appended is
+//! never re-read.
+//!
 //! Two invariants hold the sidebar still. The row order is the durable manual
 //! account in [`crate::sidebar_order`] — never a timestamp sort — so an
 //! activity-driven rescan cannot move a row. And `interacted_at` is the last
@@ -69,6 +77,13 @@ pub struct ThreadStore {
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, std::sync::Weak<ThreadCore>>,
     sessions_dir: PathBuf,
+    /// Decisions newer than their sidecar write: id → (pinned, archived).
+    /// A flag decision flips the in-memory mirror immediately but persists
+    /// asynchronously (the queued write lands inside the next refresh
+    /// pass) — a pass that started scanning before the write landed must
+    /// not publish the pre-decision state. The overlay wins until a scan
+    /// OBSERVES the decided pair on disk, then drops (write confirmed).
+    decision_overlay: HashMap<String, (bool, bool)>,
     /// Events buffered under the state lock; [`StoreHandle::with_mut`]
     /// drains and broadcasts them once the mutation closure returns.
     pending_events: Vec<ThreadStoreEvent>,
@@ -99,6 +114,22 @@ pub struct StoreCore {
     /// the `ThreadHandle` channel shape; the event is `Clone`, so the `Arc`
     /// can come off once the consumers settle.
     subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadStoreEvent>>>>,
+    /// The session-scan cache (hot layer; the db `session_index` table is
+    /// the cold layer). A refresh reconciles stat fingerprints against it —
+    /// steady state reads NO session content, only `read_dir` + `stat`.
+    index: tokio::sync::Mutex<SessionIndex>,
+    /// Sidecar writes drained INSIDE the refresh pass, before the scan:
+    /// a burst of flag decisions lands in dispatch order and ONE reconcile
+    /// reads the settled sidecars — a scan can never publish the pre-write
+    /// state and revert a live in-memory decision mid-burst.
+    meta_queue: parking_lot::Mutex<Vec<MetaWrite>>,
+    /// Single-flight gate for scans; see [`StoreHandle::refresh`].
+    refresh_gate: tokio::sync::Mutex<()>,
+    /// Set while a runner task owns the gate loop — the spawn decision.
+    refresh_running: std::sync::atomic::AtomicBool,
+    /// Set by a caller that asked for a scan while the runner was in the
+    /// air; the runner's loop tail serves it with one more pass.
+    refresh_pending: std::sync::atomic::AtomicBool,
 }
 
 impl StoreHandle {
@@ -107,6 +138,11 @@ impl StoreHandle {
         Self(Arc::new(StoreCore {
             state: parking_lot::RwLock::new(thread_store),
             subscribers: parking_lot::Mutex::new(Vec::new()),
+            index: tokio::sync::Mutex::new(SessionIndex::default()),
+            meta_queue: parking_lot::Mutex::new(Vec::new()),
+            refresh_gate: tokio::sync::Mutex::new(()),
+            refresh_running: std::sync::atomic::AtomicBool::new(false),
+            refresh_pending: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -143,7 +179,7 @@ impl StoreHandle {
             (r, events, writes, order_write)
         };
         for write in writes {
-            self.spawn_meta_write(write);
+            self.queue_meta_write(write);
         }
         if let Some(order) = order_write {
             // No runtime (a bare unit test, or teardown) drops the write rather
@@ -185,27 +221,100 @@ impl StoreHandle {
 
     /// Re-read the session directory and refresh the summary list. Runs on
     /// the agent runtime so a large session folder cannot stall the caller;
-    /// `SummariesUpdated` broadcasts when the scan lands.
+    /// `SummariesUpdated` broadcasts when the scan lands. Single-flight
+    /// with trailing-edge coalescing: while a scan is in the air, later
+    /// callers only mark it pending — one reconcile serves the whole burst
+    /// (a sidecar-write storm asks once, not once per write).
     pub fn refresh(&self) {
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
-            this.refresh_now().await;
-        });
+        // Single-flight spawn with a Dekker handshake: write the ask
+        // (pending) BEFORE reading the gate (running). The runner's exit
+        // publishes quiescence in the mirrored order (store running=false,
+        // then re-read pending), so under SeqCst at least one side always
+        // sees the other's store — a caller that reads running=true is
+        // guaranteed the runner's trailing re-check sees its pending. The
+        // reverse order (read gate, then write ask) left a window where
+        // both sides walked away and the ask was lost.
+        self.0
+            .refresh_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .0
+            .refresh_running
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            // Claimed the gate: become the runner. The pass clears pending
+            // at its head, so our own ask rides this run.
+            let this = self.clone();
+            crate::runtime::handle().spawn(async move {
+                this.refresh_coalesced().await;
+            });
+        }
     }
 
-    /// The awaiting form of [`Self::refresh`]: the scan lands before the
-    /// return. The gateway's `ListThreads` self-hold (cross-domain #5)
-    /// answers from a fresh scan, so no client needs an in-process rescan
-    /// trigger or a store-event bridge to time its refetch.
+    /// The gate discipline: each pass lands every queued sidecar write (in
+    /// dispatch order) BEFORE the reconcile, so the scan always reads
+    /// settled sidecars; one more pass runs iff someone asked meanwhile;
+    /// stop when quiet. The trailing re-check closes the lost-wakeup window
+    /// between the loop exit and the quiescence publish.
+    async fn refresh_coalesced(&self) {
+        let _guard = self.0.refresh_gate.lock().await;
+        loop {
+            self.0
+                .refresh_pending
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let writes: Vec<MetaWrite> = std::mem::take(&mut *self.0.meta_queue.lock());
+            for write in writes {
+                let dir = write.dir.clone();
+                let path = write.path.clone();
+                if let Err(error) =
+                    manox_harness::session_meta::update(&dir, &path, write.update).await
+                {
+                    tracing::warn!(
+                        session = %path.display(),
+                        %error,
+                        "sidecar write failed"
+                    );
+                }
+            }
+            self.refresh_now().await;
+            if !self
+                .0
+                .refresh_pending
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+        self.0
+            .refresh_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .0
+            .refresh_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.refresh();
+        }
+    }
+
+    /// The awaiting form of [`Self::refresh`]: one reconcile lands before
+    /// the return. Freshness is fingerprint-driven — a stat sweep decides
+    /// which (if any) files need a bounded read — so the steady-state cost
+    /// is O(files), never O(bytes); a cold cache (first boot, wiped table)
+    /// degrades to bounded per-file scans, never a full parse.
     ///
     /// The durable order account is read outside the mutation closure (it is
     /// awaited work; the closure never awaits), and the account's display
     /// order replaces the scanned order before the rows are published.
     pub async fn refresh_now(&self) {
         let dir = self.read(|s| s.sessions_dir.clone());
-        let rows = load_summaries(&dir).await;
+        let db = self.read(|s| std::sync::Arc::clone(&s.db));
         let registry = crate::thread_registry::load().await;
         let order = crate::sidebar_order::load().await;
+        let rows = {
+            let mut index = self.0.index.lock().await;
+            reconcile_summaries(&dir, Some(&db), &mut index).await
+        };
         self.with_mut(|s| {
             let (session_paths, summaries, archived) = group_by_thread(rows, &registry);
             let mut summaries = summaries;
@@ -217,6 +326,7 @@ impl StoreHandle {
             // scan's timestamp order is only ever an input to first-sight.
             s.order = order;
             s.rerank();
+            s.apply_decision_overlay();
             s.pending_events.push(ThreadStoreEvent::SummariesUpdated);
         });
     }
@@ -231,19 +341,13 @@ impl StoreHandle {
         crate::engine::dispatch_store_journal_row(id.to_string(), path, kind.to_string(), payload);
     }
 
-    /// Persist one queued sidecar write on the agent runtime. The rescan
-    /// follows the write — a rescan racing the write would re-read stale
-    /// sidecar flags and revert the in-memory state.
-    fn spawn_meta_write(&self, write: MetaWrite) {
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
-            let saved = manox_harness::session_meta::update(&write.dir, &write.path, write.update)
-                .await
-                .is_ok();
-            if saved {
-                this.refresh();
-            }
-        });
+    /// Queue one sidecar write for the next refresh pass: it lands (in
+    /// dispatch order, alongside every other queued write) and the pass's
+    /// single reconcile reads the settled result. A queued write asks for
+    /// the pass itself.
+    fn queue_meta_write(&self, write: MetaWrite) {
+        self.0.meta_queue.lock().push(write);
+        self.refresh();
     }
 }
 
@@ -285,6 +389,7 @@ pub fn init() {
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
+        decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
     });
@@ -364,6 +469,17 @@ impl ThreadStore {
             .iter()
             .find(|s| s.id == id)
             .or_else(|| self.archived_summaries.iter().find(|s| s.id == id))
+    }
+
+    /// A row's effective (pinned, archived): the decision overlay wins
+    /// over the summary mirror while its sidecar write is still in flight
+    /// — the mirror is what a racing scan last published, which can predate
+    /// the decision.
+    fn decided_flags(&self, id: &str) -> Option<(bool, bool)> {
+        if let Some(flags) = self.decision_overlay.get(id) {
+            return Some(*flags);
+        }
+        self.summary_by_id(id).map(|s| (s.pinned, s.archived))
     }
 
     /// The sidebar partition a row belongs to: its registered project, or the
@@ -730,6 +846,50 @@ impl ThreadStore {
         summary.approval_mode = approval_mode;
     }
 
+    /// Fold the decision overlay into the freshly scanned partitions: a
+    /// row whose decision is still in flight keeps the DECIDED flags and
+    /// partition — never the pre-write scan state a racing pass read. A
+    /// scan that already shows the decided pair confirms the write landed;
+    /// the entry retires. A row absent from the scan keeps its entry until
+    /// it reappears.
+    fn apply_decision_overlay(&mut self) {
+        let decided: Vec<(String, (bool, bool))> = self.decision_overlay.drain().collect();
+        for (id, (pinned, archived)) in decided {
+            let observed = self.summary_by_id(&id).map(|s| (s.pinned, s.archived));
+            if observed == Some((pinned, archived)) {
+                continue; // the write landed and was observed: retire.
+            }
+            let moved = if let Some(pos) = self.summaries.iter().position(|s| s.id == id) {
+                let mut summary = self.summaries.remove(pos);
+                summary.pinned = pinned;
+                summary.archived = archived;
+                if archived {
+                    self.archived_summaries.push(summary);
+                } else {
+                    self.summaries.push(summary);
+                }
+                true
+            } else if let Some(pos) = self.archived_summaries.iter().position(|s| s.id == id) {
+                let mut summary = self.archived_summaries.remove(pos);
+                summary.pinned = pinned;
+                summary.archived = archived;
+                if archived {
+                    self.archived_summaries.push(summary);
+                } else {
+                    self.summaries.push(summary);
+                }
+                true
+            } else {
+                false
+            };
+            if !moved {
+                // The row is not in this scan (a vanished file mid-decision):
+                // keep the decision effective against its return.
+                self.decision_overlay.insert(id, (pinned, archived));
+            }
+        }
+    }
+
     /// Archive (or unarchive) a session. The row moves between the active
     /// and archived partitions immediately; the post-write refresh in
     /// `write_meta` re-syncs both partitions from disk. Archiving cascades
@@ -738,10 +898,7 @@ impl ThreadStore {
     /// Re-asserting the current state is a no-op: no partition move, meta
     /// write, or lifecycle hook.
     pub fn archive_thread(&mut self, id: &str, archived: bool) {
-        if self
-            .summary_by_id(id)
-            .is_some_and(|s| s.archived == archived)
-        {
+        if self.decided_flags(id).is_some_and(|(_, a)| a == archived) {
             return;
         }
         let ids = if archived {
@@ -752,11 +909,9 @@ impl ThreadStore {
         for tid in ids {
             // A row already at the target state (e.g. archived by the
             // caller's disband earlier) skips move + meta + hook: one
-            // SessionEnd per working life.
-            if self
-                .summary_by_id(&tid)
-                .is_some_and(|s| s.archived == archived)
-            {
+            // SessionEnd per working life. The overlay counts: a decision
+            // in flight IS the row's state.
+            if self.decided_flags(&tid).is_some_and(|(_, a)| a == archived) {
                 continue;
             }
             if archived {
@@ -775,6 +930,10 @@ impl ThreadStore {
             // skipped row already carries the target state and stays
             // silent, matching the no-op discipline of this method.
             let pinned = self.summary_by_id(&tid).is_some_and(|s| s.pinned);
+            // The decision is effective NOW (the mirror flip below) even
+            // though its sidecar write lands in the next refresh pass.
+            self.decision_overlay
+                .insert(tid.clone(), (pinned, archived));
             self.journal_pinned_archived(&tid, pinned, archived);
             self.write_meta(&tid, move |meta| meta.archived = archived);
             if archived {
@@ -818,6 +977,8 @@ impl ThreadStore {
         if let Some(s) = self.summary_mut(id) {
             s.pinned = pinned;
         }
+        self.decision_overlay
+            .insert(id.to_string(), (pinned, archived));
         if pinned {
             let project = self
                 .summary_by_id(id)
@@ -920,72 +1081,510 @@ struct SessionRow {
     thread_key: Option<String>,
 }
 
-/// Read every session plus its sidecar into raw rows; grouping into
-/// thread-level rows happens in [`group_by_thread`] and team depths in
-/// [`resolve_depths`] afterwards.
-async fn load_summaries(dir: &std::path::Path) -> Vec<SessionRow> {
-    let repo = manox_harness::session::repository::SessionRepository::new(dir);
-    let Ok(list) = repo.list().await else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for info in list {
-        // The sidebar renders only the current host's sessions; other hosts'
-        // files stay addressable on disk but never surface here.
-        if !crate::host::belongs_to_current_host(info.metadata.as_ref()) {
+/// The hot layer of the session-scan cache (the db `session_index` table is
+/// the cold layer). Facts are immutable in an append-only journal, so they
+/// are cached forever until a file SHRINKS; activity (mtime) refreshes from
+/// stat every scan. A never-seen file costs one bounded read.
+#[derive(Default)]
+struct SessionIndex {
+    /// `false` until the first seed from the db.
+    seeded: bool,
+    /// Anything moved since the last persist — a new or rescanned file, a
+    /// refreshed activity fingerprint, a reloaded sidecar. A pure-stat pass
+    /// over an idle store writes nothing.
+    dirty: bool,
+    rows: HashMap<PathBuf, IndexedSession>,
+}
+
+/// One cached session file's bounded list facts.
+#[derive(Clone)]
+struct IndexedSession {
+    /// File size when the facts were read — the FACT-layer fingerprint:
+    /// growth keeps the facts (appends never touch them), a shrink rescans.
+    size: u64,
+    /// The activity layer — refreshed from stat every scan, never a fact
+    /// invalidator.
+    mtime_ns: i64,
+    /// The last bounded scan FAILED while the file wore this fingerprint
+    /// (a headerless zombie from an old bug, a torn file). An unchanged
+    /// fingerprint skips the file silently — no re-read, no warn spam;
+    /// any change re-attempts once and re-warns.
+    failed: bool,
+    id: String,
+    cwd: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    parent_session_path: Option<String>,
+    metadata: Option<serde_json::Value>,
+    first_user_text: String,
+    has_messages: bool,
+    sidecar_size: u64,
+    sidecar_mtime_ns: i64,
+    sidecar: Option<manox_harness::session_meta::SessionMeta>,
+}
+
+/// One stat sweep result: the session file's fingerprints plus its
+/// sidecar's. The steady-state refresh touches NOTHING else.
+struct Stat {
+    path: PathBuf,
+    size: u64,
+    mtime_ns: i64,
+    sidecar_size: u64,
+    sidecar_mtime_ns: i64,
+}
+
+/// The refresh's reconcile: stat every session file, reuse cached facts
+/// whose (append-only) coverage still holds, bounded-read only the new or
+/// shrunk files, refresh sidecars whose fingerprint moved, and persist the
+/// index wholesale (best-effort). Returns the rows the sidebar renders —
+/// identical CONTENT to a full scan, at O(files) steady-state cost.
+async fn reconcile_summaries(
+    dir: &std::path::Path,
+    db: Option<&std::sync::Arc<crate::db::ThreadsDatabase>>,
+    index: &mut SessionIndex,
+) -> Vec<SessionRow> {
+    if !index.seeded {
+        if let Some(db) = db {
+            match db.load_session_index() {
+                Ok(rows) => {
+                    index.rows = rows
+                        .into_iter()
+                        .filter_map(IndexedSession::from_db)
+                        .collect();
+                }
+                Err(error) => {
+                    // A missing/corrupt table degrades to bounded scans —
+                    // the list's content never depends on the cache.
+                    tracing::warn!(%error, "session index unreadable; cold-scanning instead");
+                }
+            }
+        }
+        index.seeded = true;
+    }
+    let stats = stat_session_files(dir).await;
+    let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
+    let mut rows = Vec::with_capacity(stats.len());
+    for stat in stats {
+        // Negative-cache hit: the file failed its scan wearing exactly this
+        // fingerprint — skip silently until it changes.
+        if index.rows.get(&stat.path).is_some_and(|entry| {
+            entry.failed && entry.size == stat.size && entry.mtime_ns == stat.mtime_ns
+        }) {
             continue;
         }
-        // Subagent transcripts persist for usage accounting but never
-        // surface as threads.
-        if info
-            .metadata
-            .as_ref()
-            .is_some_and(|m| m.get("subagent").is_some())
+        // Fact layer: an unknown or SHRUNK file rescans (bounded); growth or
+        // an unchanged size reuses the cached facts untouched. A FAILED
+        // entry reaching here (its fingerprint changed — the skip arm above
+        // handled the unchanged case) has no facts to reuse and rescans
+        // whatever the size says.
+        let mut torn_tail = false;
+        if index
+            .rows
+            .get(&stat.path)
+            .is_none_or(|entry| entry.failed || stat.size < entry.size)
+        {
+            match manox_harness::session::repository::scan_session(&stat.path).await {
+                Ok(scanned) => {
+                    // A possibly-torn tail (facts read off an unterminated
+                    // last line — an append mid-write) renders this pass but
+                    // never caches: the fact layer would pin a half-written
+                    // first message until the file shrank, which an
+                    // append-only writer never does.
+                    torn_tail = scanned.torn_tail;
+                    let info = scanned.info;
+                    let entry = index
+                        .rows
+                        .entry(stat.path.clone())
+                        .or_insert(IndexedSession {
+                            size: 0,
+                            mtime_ns: 0,
+                            failed: false,
+                            id: String::new(),
+                            cwd: String::new(),
+                            created_at: chrono::Utc::now(),
+                            parent_session_path: None,
+                            metadata: None,
+                            first_user_text: String::new(),
+                            has_messages: false,
+                            sidecar_size: 0,
+                            sidecar_mtime_ns: 0,
+                            sidecar: None,
+                        });
+                    // A successful rescan clears any remembered failure —
+                    // the negative cache must never swallow a recovered
+                    // file — and the fresh facts are worth persisting.
+                    entry.failed = false;
+                    index.dirty = true;
+                    entry.id = info.id;
+                    entry.cwd = info.cwd;
+                    entry.created_at = info.created_at;
+                    entry.parent_session_path = info.parent_session_path;
+                    entry.metadata = info.metadata;
+                    entry.first_user_text = info.first_message;
+                    entry.has_messages = info.has_messages;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %stat.path.display(),
+                        %error,
+                        "session file skipped by the sidebar reconcile"
+                    );
+                    // Negative cache: the failure is fingerprinted, so an
+                    // unchanged file never re-reads (or re-warns) — a store
+                    // carrying legacy headerless zombies pays for them once.
+                    index.dirty = true;
+                    index.rows.insert(
+                        stat.path.clone(),
+                        IndexedSession {
+                            size: stat.size,
+                            mtime_ns: stat.mtime_ns,
+                            failed: true,
+                            id: String::new(),
+                            cwd: String::new(),
+                            created_at: chrono::Utc::now(),
+                            parent_session_path: None,
+                            metadata: None,
+                            first_user_text: String::new(),
+                            has_messages: false,
+                            sidecar_size: 0,
+                            sidecar_mtime_ns: 0,
+                            sidecar: None,
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
+        let Some(entry) = index.rows.get_mut(&stat.path) else {
+            continue;
+        };
+        // Activity layer: size/mtime follow the stat sweep; a change
+        // (a fresh append) marks the index for persistence.
+        if entry.size != stat.size || entry.mtime_ns != stat.mtime_ns {
+            entry.size = stat.size;
+            entry.mtime_ns = stat.mtime_ns;
+            index.dirty = true;
+        }
+        // Sidecar: fingerprint match skips the read entirely.
+        if stat.sidecar_size == 0 {
+            if entry.sidecar.is_some() {
+                index.dirty = true;
+            }
+            entry.sidecar = None;
+            entry.sidecar_size = 0;
+            entry.sidecar_mtime_ns = 0;
+        } else if entry.sidecar_size != stat.sidecar_size
+            || entry.sidecar_mtime_ns != stat.sidecar_mtime_ns
+            || entry.sidecar.is_none()
+        {
+            let loaded = manox_harness::session_meta::load(dir, &stat.path).await;
+            index.dirty = true;
+            entry.sidecar = Some(loaded.unwrap_or_else(|error| {
+                tracing::warn!(
+                    session = %stat.path.display(),
+                    %error,
+                    "session sidecar unreadable; rendering default flags"
+                );
+                manox_harness::session_meta::SessionMeta::default()
+            }));
+            entry.sidecar_size = stat.sidecar_size;
+            entry.sidecar_mtime_ns = stat.sidecar_mtime_ns;
+        }
+        // Borrowed sidecar — no per-row SessionMeta clone (a fat sidecar's
+        // plan snapshot would otherwise be deep-copied for every file on
+        // every refresh).
+        let default_meta = DEFAULT_SESSION_META.get_or_init(Default::default);
+        let meta = entry.sidecar.as_ref().unwrap_or(default_meta);
+        if meta.interacted_at.is_none() {
+            seed_interaction_stamp(dir, &stat.path, &entry.id, stat.mtime_ns / 1_000_000_000);
+        }
+        // The sidebar renders only the current host's sessions; subagent
+        // transcripts persist for usage accounting but never surface.
+        if !crate::host::belongs_to_current_host(entry.metadata.as_ref())
+            || entry
+                .metadata
+                .as_ref()
+                .is_some_and(|m| m.get("subagent").is_some())
         {
             continue;
         }
-        let meta = match manox_harness::session_meta::load(dir, &info.path).await {
-            Ok(meta) => meta,
-            Err(error) => {
-                tracing::warn!(session = %info.id, error = %error, "session sidecar unreadable; rendering default flags");
-                manox_harness::session_meta::SessionMeta::default()
-            }
-        };
-        if meta.interacted_at.is_none() {
-            seed_interaction_stamp(dir, &info);
-        }
-        // The owning thread's id rides the header metadata (stamped at
-        // creation, inherited by forks); absent on legacy files.
-        let thread_key = info
+        let modified_at = nanos_to_datetime(entry.mtime_ns).unwrap_or(entry.created_at);
+        let thread_key = entry
             .metadata
             .as_ref()
             .and_then(|m| m.get("thread"))
             .and_then(|t| t.as_str())
             .filter(|t| !t.is_empty())
             .map(str::to_string);
-        out.push(SessionRow {
-            summary: session_info_to_summary(&info, &meta),
-            path: info.path.clone(),
+        rows.push(SessionRow {
+            summary: summary_from_cached(entry, modified_at, meta),
+            path: stat.path.clone(),
             thread_key,
         });
+        if torn_tail {
+            index.rows.remove(&stat.path);
+            index.dirty = true;
+        }
     }
-    out
+    // Vanished files leave the cache; the persist below drops their rows
+    // from the cold layer with them.
+    let pruned = index.rows.len() != live.len();
+    index.rows.retain(|path, _| live.contains(path));
+    // Persist only when something moved (a new or rescanned file, a
+    // refreshed fingerprint, a reloaded sidecar, a prune): a pure-stat pass
+    // over an idle store writes nothing. Failed verdicts persist too — a
+    // restart must not re-attempt every legacy zombie the store carries.
+    if (pruned || index.dirty)
+        && let Some(db) = db
+    {
+        let persisted: Vec<crate::db::SessionIndexRow> = index
+            .rows
+            .iter()
+            .map(|(path, entry)| entry.to_db(path))
+            .collect();
+        if let Err(error) = db.replace_session_index(&persisted) {
+            tracing::warn!(%error, "failed to persist the session index");
+        }
+    }
+    index.dirty = false;
+    rows
 }
+
+/// The shared default sidecar for sessions without one (borrow target so
+/// cache-hit rows never clone a `SessionMeta`).
+static DEFAULT_SESSION_META: std::sync::OnceLock<manox_harness::session_meta::SessionMeta> =
+    std::sync::OnceLock::new();
+
+/// The cache-hit row's summary, built by borrowing: no `SessionInfo`
+/// roundtrip (that would deep-clone the header metadata JSON) and no
+/// full-`SessionMeta` clone — only the small fields the summary carries.
+/// Mirrors [`session_info_to_summary`] field for field.
+fn summary_from_cached(
+    entry: &IndexedSession,
+    modified_at: chrono::DateTime<chrono::Utc>,
+    meta: &manox_harness::session_meta::SessionMeta,
+) -> ThreadSummary {
+    let summary = if entry.first_user_text.trim().is_empty() {
+        "(no messages)".to_string()
+    } else {
+        entry.first_user_text.clone()
+    };
+    // Team affiliation over fork lineage (`team_parent_id`'s precedence).
+    let parent_id = entry
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("team"))
+        .and_then(|t| t.get("parent"))
+        .and_then(|p| p.as_str())
+        .map(str::to_string)
+        .or_else(|| entry.parent_session_path.clone());
+    ThreadSummary {
+        id: entry.id.clone(),
+        summary,
+        title: meta.title.clone(),
+        title_override: None,
+        model_id: String::new(),
+        provider_id: None,
+        approval_mode: PermissionMode::default().as_i64(),
+        // The bound project (sidecar) wins over the header cwd.
+        project: meta
+            .project
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| entry.cwd.clone()),
+        depth: 0,
+        parent_id,
+        archived: meta.archived,
+        pinned: meta.pinned,
+        tag: meta.tag.clone(),
+        has_unread: meta.unread,
+        errored: meta.errored,
+        created_at: entry.created_at.timestamp(),
+        interacted_at: meta.interacted_at.unwrap_or(modified_at.timestamp()),
+        updated_at: modified_at.timestamp(),
+        cumulative_total_tokens: 0,
+    }
+}
+
+/// The stat sweep: every session file's (size, mtime) plus its sidecar's.
+/// No content is read — this is the entire steady-state cost of a refresh.
+/// One blocking task with synchronous syscalls: a per-file async `stat`
+/// costs a thread-pool hop each, which dwarfs the stat itself on a
+/// thousands-file store.
+async fn stat_session_files(dir: &std::path::Path) -> Vec<Stat> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            let Ok(file_meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            if !file_meta.is_file() {
+                continue;
+            }
+            let sidecar =
+                std::fs::metadata(manox_harness::session_meta::meta_path(&dir, &path)).ok();
+            out.push(Stat {
+                path,
+                size: file_meta.len(),
+                mtime_ns: metadata_mtime_ns(&file_meta),
+                sidecar_size: sidecar.as_ref().map_or(0, |m| m.len()),
+                sidecar_mtime_ns: sidecar.as_ref().map_or(0, metadata_mtime_ns),
+            });
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Epoch nanoseconds of a file's mtime (0 when unknowable).
+fn metadata_mtime_ns(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+fn nanos_to_datetime(nanos: i64) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp(nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
+}
+
+impl IndexedSession {
+    fn from_db(row: crate::db::SessionIndexRow) -> Option<(PathBuf, IndexedSession)> {
+        let metadata = row.metadata_json.as_deref().and_then(|json| {
+            serde_json::from_str::<serde_json::Value>(json)
+                .map_err(|error| {
+                    tracing::warn!(
+                        path = %row.path.display(),
+                        %error,
+                        "cached session metadata corrupt; rescanning the file"
+                    );
+                    error
+                })
+                .ok()
+        });
+        // A FAILED row carries no facts by design — its fingerprint IS
+        // the content. A fact row whose identity columns cannot be trusted
+        // cannot rebuild a summary without the file; drop it and let the
+        // bounded scan re-establish the facts.
+        if row.failed {
+            return Some((
+                row.path,
+                IndexedSession {
+                    size: row.size,
+                    mtime_ns: row.mtime_ns,
+                    failed: true,
+                    id: String::new(),
+                    cwd: String::new(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    parent_session_path: None,
+                    metadata: None,
+                    first_user_text: String::new(),
+                    has_messages: false,
+                    sidecar_size: 0,
+                    sidecar_mtime_ns: 0,
+                    sidecar: None,
+                },
+            ));
+        }
+        if row.session_id.is_empty() || row.cwd.is_empty() {
+            return None;
+        }
+        let sidecar = row.sidecar_json.as_deref().and_then(|json| {
+            serde_json::from_str::<manox_harness::session_meta::SessionMeta>(json)
+                .map_err(|error| {
+                    tracing::warn!(
+                        path = %row.path.display(),
+                        %error,
+                        "cached sidecar corrupt; reloading it"
+                    );
+                    error
+                })
+                .ok()
+        });
+        Some((
+            row.path,
+            IndexedSession {
+                size: row.size,
+                mtime_ns: row.mtime_ns,
+                failed: false,
+                id: row.session_id,
+                cwd: row.cwd,
+                created_at: nanos_to_datetime(row.created_at_ns)?,
+                parent_session_path: row.parent_session,
+                metadata,
+                first_user_text: row.first_user_text,
+                has_messages: row.has_messages,
+                sidecar_size: row.sidecar_size,
+                sidecar_mtime_ns: row.sidecar_mtime_ns,
+                sidecar,
+            },
+        ))
+    }
+
+    fn to_db(&self, path: &std::path::Path) -> crate::db::SessionIndexRow {
+        if self.failed {
+            return crate::db::SessionIndexRow {
+                path: path.to_path_buf(),
+                size: self.size,
+                mtime_ns: self.mtime_ns,
+                session_id: String::new(),
+                cwd: String::new(),
+                created_at_ns: 0,
+                parent_session: None,
+                metadata_json: None,
+                first_user_text: String::new(),
+                has_messages: false,
+                failed: true,
+                sidecar_size: 0,
+                sidecar_mtime_ns: 0,
+                sidecar_json: None,
+            };
+        }
+        crate::db::SessionIndexRow {
+            path: path.to_path_buf(),
+            size: self.size,
+            mtime_ns: self.mtime_ns,
+            session_id: self.id.clone(),
+            cwd: self.cwd.clone(),
+            created_at_ns: self.created_at.timestamp_nanos_opt().unwrap_or_default(),
+            parent_session: self.parent_session_path.clone(),
+            metadata_json: self.metadata.as_ref().map(|value| value.to_string()),
+            first_user_text: self.first_user_text.clone(),
+            has_messages: self.has_messages,
+            failed: false,
+            sidecar_size: self.sidecar_size,
+            sidecar_mtime_ns: self.sidecar_mtime_ns,
+            sidecar_json: self
+                .sidecar
+                .as_ref()
+                .map(|meta| serde_json::to_string(meta).unwrap_or_default()),
+        }
+    }
+}
+
 /// Materialize a missing interaction stamp. Fire-and-forget and rescan-free
 /// (this write must never trigger another scan — it runs inside one), and
 /// idempotent: a concurrent human prompt that stamped the sidecar first wins,
 /// because the update refuses to overwrite a present value.
-fn seed_interaction_stamp(
-    dir: &std::path::Path,
-    info: &manox_harness::session::repository::SessionInfo,
-) {
+fn seed_interaction_stamp(dir: &std::path::Path, path: &std::path::Path, id: &str, at: i64) {
     let Some(handle) = crate::runtime::try_handle() else {
         return;
     };
     let dir = dir.to_path_buf();
-    let path = info.path.clone();
-    let id = info.id.clone();
-    let at = info.modified_at.timestamp();
+    let path = path.to_path_buf();
+    let id = id.to_string();
     handle.spawn(async move {
         let result = manox_harness::session_meta::update(&dir, &path, |meta| {
             if meta.interacted_at.is_none() {
@@ -1148,55 +1747,6 @@ pub(crate) fn team_parent_id(
         .and_then(|p| p.as_str())
         .map(str::to_string)
 }
-/// Map a pi session info + sidecar onto the sidebar summary shape.
-fn session_info_to_summary(
-    info: &manox_harness::session::repository::SessionInfo,
-    meta: &manox_harness::session_meta::SessionMeta,
-) -> ThreadSummary {
-    let summary = if info.first_message.trim().is_empty() {
-        "(no messages)".to_string()
-    } else {
-        info.first_message.clone()
-    };
-    ThreadSummary {
-        id: info.id.clone(),
-        summary: summary.clone(),
-        title: meta.title.clone(),
-        title_override: None,
-        model_id: String::new(),
-        provider_id: None,
-        approval_mode: PermissionMode::default().as_i64(),
-        // The bound project (sidecar) wins over the header cwd: a fork's
-        // header cwd may be another directory, but the thread stays under
-        // its source project; a `/` header cwd (GUI-launched bound session)
-        // classifies the same way.
-        project: meta
-            .project
-            .clone()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| info.cwd.clone()),
-        depth: 0,
-        // Team affiliation is the only rendered hierarchy edge: historical fork
-        // forks are a thread's internal sessions (`group_by_thread`
-        // collapses them), so their `parentSession` lineage stays raw
-        // metadata and never nests.
-        parent_id: team_parent_id(info).or_else(|| info.parent_session_path.clone()),
-        archived: meta.archived,
-        pinned: meta.pinned,
-        tag: meta.tag.clone(),
-        has_unread: meta.unread,
-        errored: meta.errored,
-        created_at: info.created_at.timestamp(),
-        // The interaction stamp is the sidebar's only recency key, and the host
-        // advances it exactly when a human prompt or steer lands. A session
-        // predating the stamp falls back to its last durable write — the value
-        // `seed_interaction_stamp` freezes into the sidecar on this scan, so no
-        // transcript growth floats the row thereafter.
-        interacted_at: meta.interacted_at.unwrap_or(info.modified_at.timestamp()),
-        updated_at: info.modified_at.timestamp(),
-        cumulative_total_tokens: 0,
-    }
-}
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn init_for_test(db: Arc<crate::db::ThreadsDatabase>) {
@@ -1225,6 +1775,7 @@ pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
+        decision_overlay: HashMap::new(),
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
     })
@@ -1285,9 +1836,190 @@ mod tests {
             background_work: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir: std::env::temp_dir(),
+            decision_overlay: HashMap::new(),
             pending_events: Vec::new(),
             pending_meta_writes: Vec::new(),
         })
+    }
+
+    /// A v4 session fixture: a host+thread-stamped header plus one user
+    /// message whose text length the test controls (the size lever for the
+    /// growth/shrink rules).
+    fn write_session_fixture(
+        dir: &std::path::Path,
+        id: &str,
+        first_user: &str,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{id}.jsonl"));
+        let content = format!(
+            "{{\"type\":\"session\",\"version\":4,\"id\":\"{id}\",\"timestamp\":\"2026-09-13T00:00:00Z\",\"cwd\":\"/proj\",\"metadata\":{{\"host\":\"manox\",\"thread\":\"{id}\"}}}}\n{{\"type\":\"message\",\"id\":\"m1\",\"parentId\":null,\"timestamp\":\"2026-09-13T00:00:01Z\",\"seq\":0,\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{first_user}\"}}],\"timestamp\":1770000000000}}}}\n",
+        );
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    fn first_summary_of(store: &StoreHandle, id: &str) -> String {
+        store.read(|s| {
+            s.summaries()
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.summary.clone())
+                .expect("the row is listed")
+        })
+    }
+
+    /// The fact-layer rule: append-only GROWTH never rescans a session's
+    /// bounded facts (the row keeps the cached first message even when the
+    /// prefix on disk moved underneath — an impossibility under real
+    /// appends, pinned here precisely because the cache must not care);
+    /// a SHRINK always rescans.
+    #[tokio::test]
+    async fn reconcile_reuses_facts_on_growth_and_rescans_on_shrink() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db.clone());
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "rule", "original");
+
+        store.refresh_now().await;
+        assert_eq!(first_summary_of(&store, "rule"), "original");
+
+        // Grow the file with a different prefix: the facts stay cached.
+        write_session_fixture(&dir, "rule", &format!("rewritten{}", " ".repeat(4096)));
+        store.refresh_now().await;
+        assert_eq!(
+            first_summary_of(&store, "rule"),
+            "original",
+            "growth keeps the cached facts — an active session is never re-read"
+        );
+
+        // Shrink below the covered size: the facts rescan.
+        write_session_fixture(&dir, "rule", "shrunk");
+        store.refresh_now().await;
+        assert_eq!(first_summary_of(&store, "rule"), "shrunk");
+    }
+
+    /// While a runner owns the gate loop, `refresh()` marks pending
+    /// instead of spawning — the burst is served by the runner's loop tail.
+    #[tokio::test]
+    async fn refresh_marks_pending_while_a_runner_is_in_flight() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db);
+        store
+            .0
+            .refresh_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..5 {
+            store.refresh();
+        }
+        assert!(
+            store
+                .0
+                .refresh_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the burst must mark pending, not spawn five runners"
+        );
+    }
+
+    /// Facts read off a torn (unterminated) first-user line are never
+    /// cached — the completing append may change the very text the row
+    /// shows, and the growth-keeps-facts rule would otherwise pin the
+    /// mid-write wording forever.
+    #[tokio::test]
+    async fn reconcile_does_not_cache_torn_tail_facts() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db.clone());
+        let dir = store.read(|s| s.sessions_dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = r#"{"type":"session","version":4,"id":"torn","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"torn"}}"#;
+        let torn_line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"mid-write"}],"timestamp":1770000000000}}"#;
+        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{torn_line}")).unwrap();
+
+        store.refresh_now().await;
+        assert_eq!(first_summary_of(&store, "torn"), "mid-write");
+
+        // The line completes with DIFFERENT text and padding (the file only
+        // grew — the case the fact layer would treat as append-only).
+        let completed = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"completed wording, settled"}],"timestamp":1770000000000}}"#;
+        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{completed}  \n")).unwrap();
+        store.refresh_now().await;
+        assert_eq!(
+            first_summary_of(&store, "torn"),
+            "completed wording, settled",
+            "a torn read must not have been pinned by the fact layer"
+        );
+    }
+
+    /// The negative cache: a file that fails its bounded scan (a
+    /// headerless zombie) is fingerprinted and skipped silently until it
+    /// changes — and a file that HEALS (a valid rewrite wearing a different
+    /// fingerprint) comes back. The failure never swallows the recovery.
+    #[tokio::test]
+    async fn reconcile_negative_cache_skips_zombies_until_they_heal() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db.clone());
+        let dir = store.read(|s| s.sessions_dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        // A headerless zombie (the shape a pre-fix bug left on real stores).
+        std::fs::write(dir.join("zombie.jsonl"), "not a session header\n").unwrap();
+        write_session_fixture(&dir, "alive", "hello");
+
+        store.refresh_now().await;
+        assert!(
+            !store.read(|s| s.summaries().iter().any(|r| r.id == "zombie")),
+            "the zombie yields no row"
+        );
+        assert_eq!(first_summary_of(&store, "alive"), "hello");
+
+        // The zombie heals into a valid session (different fingerprint): the
+        // next reconcile must scan it and surface the row.
+        write_session_fixture(&dir, "zombie", "recovered");
+        store.refresh_now().await;
+        assert_eq!(
+            first_summary_of(&store, "zombie"),
+            "recovered",
+            "a healed file must not stay swallowed by the negative cache"
+        );
+    }
+
+    /// The cold layer: a refresh persists the index to the db, and a fresh
+    /// store over the same directory + db rebuilds identical rows from the
+    /// seeded cache — a restart costs the stat sweep, not the scans.
+    #[tokio::test]
+    async fn reconcile_persists_the_index_and_seeds_a_restart() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db.clone());
+        let dir = store.read(|s| s.sessions_dir.clone());
+        write_session_fixture(&dir, "persist", "cold start prompt");
+
+        store.refresh_now().await;
+        let rows = db.load_session_index().unwrap();
+        assert!(
+            rows.iter().any(|row| row.session_id == "persist"),
+            "the index row landed in the db: {rows:?}"
+        );
+
+        // A "restarted" store: fresh handle, same sessions dir + db.
+        let restarted = StoreHandle::new(ThreadStore {
+            summaries: Vec::new(),
+            archived_summaries: Vec::new(),
+            session_paths: HashMap::new(),
+            known_projects: db.list_projects().unwrap_or_default(),
+            order: crate::sidebar_order::SidebarOrder::default(),
+            order_dirty: false,
+            db,
+            running: HashSet::new(),
+            pending_auth: HashSet::new(),
+            pending_plan: HashSet::new(),
+            background_work: HashSet::new(),
+            live_threads: HashMap::new(),
+            sessions_dir: dir,
+            decision_overlay: HashMap::new(),
+            pending_events: Vec::new(),
+            pending_meta_writes: Vec::new(),
+        });
+        restarted.refresh_now().await;
+        assert_eq!(first_summary_of(&restarted, "persist"), "cold start prompt");
     }
 
     #[test]
@@ -1588,7 +2320,8 @@ mod tests {
         .await
         .unwrap();
 
-        let rows = load_summaries(sessions).await;
+        let mut index = SessionIndex::default();
+        let rows = reconcile_summaries(sessions, None, &mut index).await;
         assert_eq!(rows.len(), 2);
 
         // Pointer on the fork (inside the worktree): one row, thread-keyed,
@@ -1611,59 +2344,62 @@ mod tests {
         assert_eq!(paths.get(thread_key).cloned(), Some(base_path));
     }
 
-    fn sample_info(
-        id: &str,
-        metadata: Option<serde_json::Value>,
-    ) -> manox_harness::session::repository::SessionInfo {
-        let now = chrono::Utc::now();
-        manox_harness::session::repository::SessionInfo {
-            path: PathBuf::from(format!("{id}.jsonl")),
+    fn sample_entry(id: &str, metadata: Option<serde_json::Value>) -> IndexedSession {
+        IndexedSession {
+            size: 10,
+            mtime_ns: 1,
+            failed: false,
             id: id.to_string(),
             cwd: "/p".to_string(),
-            name: None,
+            created_at: chrono::Utc::now(),
             parent_session_path: None,
-            created_at: now,
-            modified_at: now,
-            message_count: 1,
-            first_message: "hi".to_string(),
-            all_messages_text: "hi".to_string(),
             metadata,
+            first_user_text: "hi".to_string(),
+            has_messages: true,
+            sidecar_size: 0,
+            sidecar_mtime_ns: 0,
+            sidecar: None,
         }
+    }
+
+    fn cached_summary(
+        entry: &IndexedSession,
+        meta: &manox_harness::session_meta::SessionMeta,
+    ) -> ThreadSummary {
+        summary_from_cached(entry, entry.created_at, meta)
     }
 
     #[test]
     fn summary_prefers_team_parent_over_fork_lineage() {
-        let mut info = sample_info(
+        let mut entry = sample_entry(
             "member",
             Some(serde_json::json!({ "team": { "parent": "leader" } })),
         );
-        info.parent_session_path = Some("fork-source".to_string());
-        let summary =
-            session_info_to_summary(&info, &manox_harness::session_meta::SessionMeta::default());
+        entry.parent_session_path = Some("fork-source".to_string());
+        let summary = cached_summary(&entry, &manox_harness::session_meta::SessionMeta::default());
         assert_eq!(summary.parent_id.as_deref(), Some("leader"));
     }
 
     #[test]
     fn summary_falls_back_to_fork_parent_without_team_key() {
-        let mut info = sample_info("forked", Some(serde_json::json!({ "host": "manox" })));
-        info.parent_session_path = Some("source".to_string());
-        let summary =
-            session_info_to_summary(&info, &manox_harness::session_meta::SessionMeta::default());
+        let mut entry = sample_entry("forked", Some(serde_json::json!({ "host": "manox" })));
+        entry.parent_session_path = Some("source".to_string());
+        let summary = cached_summary(&entry, &manox_harness::session_meta::SessionMeta::default());
         assert_eq!(summary.parent_id.as_deref(), Some("source"));
     }
 
     #[test]
     fn summary_project_prefers_sidecar_over_cwd() {
-        let info = sample_info("s", None);
+        let entry = sample_entry("s", None);
         let meta = manox_harness::session_meta::SessionMeta {
             project: Some("/proj/a".into()),
             ..Default::default()
         };
-        let summary = session_info_to_summary(&info, &meta);
+        let summary = cached_summary(&entry, &meta);
         assert_eq!(summary.project, "/proj/a");
         // Without a bound project the header cwd classifies the row.
         let default = manox_harness::session_meta::SessionMeta::default();
-        let summary = session_info_to_summary(&info, &default);
+        let summary = cached_summary(&entry, &default);
         assert_eq!(summary.project, "/p");
     }
 

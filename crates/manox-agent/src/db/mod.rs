@@ -16,6 +16,8 @@
 //! - `thread_right_pane`: one opaque JSON snapshot per thread backing the
 //!   right pane's tab list / active tab / visibility (UI-layer owned shape).
 //! - `projects`: registered project roots retained independently of threads.
+//! - `session_index`: the sidebar scan's (size, mtime) → bounded-facts
+//!   cache — a disposable accelerator, never a source of truth.
 //!
 //! UI annotation cards (Error / Notice / PlanReview) are NOT stored here —
 //! they persist as `custom` entries in the session jsonl tree (see
@@ -27,6 +29,7 @@
 mod events;
 mod projects;
 mod right_pane;
+mod session_index;
 mod terminals;
 mod threads;
 mod token_usage;
@@ -40,6 +43,7 @@ use rusqlite::Connection;
 
 pub use crate::goal::{GoalActor, ThreadGoal};
 pub use events::{ThreadEventRecord, ThreadEventType};
+pub use session_index::SessionIndexRow;
 pub use terminals::TerminalSession;
 pub use threads::{ThreadRecord, ThreadSummary};
 pub use token_usage::TokenUsageRecord;
@@ -85,6 +89,7 @@ impl ThreadsDatabase {
         terminals::create_table(conn)?;
         projects::create_table(conn)?;
         right_pane::create_table(conn)?;
+        session_index::create_table(conn)?;
         Ok(())
     }
 }

@@ -7501,13 +7501,15 @@ fn list_threads_pushes_the_projects_registry() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-/// Cross-domain #5: ListThreads self-holds the rescan — a session file
-/// that landed on disk without any in-process store event (another
-/// writer's shape, or a deferred session materialized by its engine)
-/// shows up in the very next answer. The desktop's refresh_thread_list
-/// triggers and its store-event bridge retire against this.
+/// Cross-domain #5 (reconciled): ListThreads answers from the current
+/// snapshot WITHOUT self-holding a scan — a session file that landed on
+/// disk without any in-process store event (another writer's shape, or a
+/// deferred session materialized by its engine) surfaces via the
+/// background reconcile the call kicks, the store watcher's ThreadsUpdated
+/// broadcast, and therefore the very NEXT answer. No caller ever blocks
+/// behind a directory scan.
 #[test]
-fn list_threads_self_holds_the_rescan() {
+fn list_threads_answers_from_snapshot_and_converges_via_the_watcher() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
@@ -7519,7 +7521,9 @@ fn list_threads_self_holds_the_rescan() {
         id: MsgId::new("lt-cold"),
         call: ClientCall::ListThreads,
     });
-    let items = loop {
+    // The answer is immediate — it may or may not include the cold file
+    // yet (the reconcile it kicks runs behind the answer).
+    let _ = loop {
         match client.recv() {
             FromServer::Response { id, outcome } if id.0 == "lt-cold" => {
                 break serde_json::from_value::<Vec<manox_protocol::ThreadListItem>>(
@@ -7530,9 +7534,29 @@ fn list_threads_self_holds_the_rescan() {
             _ => {}
         }
     };
+    // Convergence: the kicked reconcile lands in the store.
+    poll_store(
+        "the cold session surfaces via the background reconcile",
+        |s| s.summaries().iter().any(|row| row.id == "s-cold-list"),
+    );
+    client.send(FromClient::Request {
+        id: MsgId::new("lt-cold-2"),
+        call: ClientCall::ListThreads,
+    });
+    let items = loop {
+        match client.recv() {
+            FromServer::Response { id, outcome } if id.0 == "lt-cold-2" => {
+                break serde_json::from_value::<Vec<manox_protocol::ThreadListItem>>(
+                    outcome.expect("ListThreads answered"),
+                )
+                .unwrap();
+            }
+            _ => {}
+        }
+    };
     assert!(
         items.iter().any(|i| i.id == "s-cold-list"),
-        "the self-held rescan surfaces the cold file without any client-side trigger"
+        "the converged answer surfaces the cold file"
     );
     std::fs::remove_file(sessions.join("s-cold-list.jsonl")).ok();
     drop(client);
@@ -8803,7 +8827,10 @@ fn fork_lists_as_independent_thread_and_cwd_override_lands() {
         "the explicit cwd override lands in the fork header"
     );
 
-    // Both the source and the fork surface as distinct rows.
+    // Both the source and the fork surface as distinct rows. ListThreads
+    // answers from the snapshot and kicks the background reconcile: the
+    // rows land in the store first (the watcher broadcasts
+    // ThreadsUpdated), and the NEXT answer carries them.
     client.send(FromClient::Request {
         id: MsgId::new("fork-list"),
         call: ClientCall::ListThreads,
@@ -8813,6 +8840,24 @@ fn fork_lists_as_independent_thread_and_cwd_override_lands() {
         assert!(std::time::Instant::now() < deadline, "list never answered");
         if let FromServer::Response { id, outcome } = client.recv()
             && id.0 == "fork-list"
+        {
+            outcome.expect("list succeeds");
+            break;
+        }
+    }
+    poll_store("the fork rows surface via the background reconcile", |s| {
+        s.summaries().iter().any(|r| r.id == "fork-d")
+            && s.summaries().iter().any(|r| r.id == fork_id)
+    });
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-list-2"),
+        call: ClientCall::ListThreads,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "list never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-list-2"
         {
             let listing = outcome.expect("list succeeds");
             let listing = serde_json::to_string(&listing).unwrap();
