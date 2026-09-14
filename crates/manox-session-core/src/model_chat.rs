@@ -151,6 +151,7 @@ pub fn build_context(model: &Model, messages: &Value, tools: &Value) -> AgentCon
                         agent_messages.push(AgentMessage::User {
                             content,
                             timestamp: Utc::now(),
+                            id: None,
                         });
                     }
                 }

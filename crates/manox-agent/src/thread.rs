@@ -1143,7 +1143,8 @@ impl Thread {
                     // follow-up if the run has already ended by then).
                     let report = format!("[{sender}] {}", payload.text);
                     if let Some(engine) = &self.engine {
-                        engine.steer(report, Vec::new());
+                        // Internal peer steer: no client message id, self-mints.
+                        engine.steer(report, Vec::new(), None);
                     } else {
                         self.deliver_peer_messages(vec![crate::team::PeerMessage {
                             from: sender,
@@ -1272,6 +1273,7 @@ impl Thread {
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
+        external_id: Option<String>,
     ) -> String {
         // A steer is human interaction too: it advances the sidebar's recency
         // key exactly like a prompt.
@@ -1294,10 +1296,17 @@ impl Thread {
             .join("\n");
         let mut message = Message::user_with_content(content);
         message.ui = ui;
+        // S3 stable-id: a client `Steer` carries its own message id. Adopt it
+        // as the facade's optimistic id so the canonical row, the engine's
+        // durable `user` journal row, and the client's echo all share one
+        // identity; absent an external id, keep the freshly minted one.
+        if let Some(id) = external_id {
+            message.id = id;
+        }
         let id = message.id.clone();
         self.pending_steers.push_back(id.clone());
         if let Some(engine) = &self.engine {
-            engine.steer(text, images);
+            engine.steer(text, images, Some(id.clone()));
         }
         // The canonical message joins history at the next refresh (pi owns the
         // transcript); the workspace renders the optimistic bubble until
@@ -2629,7 +2638,12 @@ pub(crate) mod tests {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+        fn steer(
+            &self,
+            text: String,
+            _images: Vec<manox_harness::types::ContentBlock>,
+            _message_id: Option<String>,
+        ) -> String {
             self.steers.lock().unwrap().push(text);
             String::new()
         }

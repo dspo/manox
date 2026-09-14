@@ -880,6 +880,7 @@ mod tests {
                 signature: None,
             }],
             timestamp: chrono::Utc::now(),
+            id: None,
         }
     }
 
@@ -1038,6 +1039,7 @@ mod tests {
                 mime_type: "image/png".into(),
             }],
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         assert_eq!(estimate_tokens(&image), 1200);
 

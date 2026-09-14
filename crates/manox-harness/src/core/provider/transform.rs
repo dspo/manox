@@ -47,6 +47,7 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
             } => Some(AgentMessage::User {
                 content: content.clone(),
                 timestamp: *timestamp,
+                id: None,
             }),
             AgentMessage::BashExecution {
                 exclude_from_context: Some(true),
@@ -58,6 +59,7 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                     signature: None,
                 }],
                 timestamp: *timestamp,
+                id: None,
             }),
             other => Some(other.clone()),
         })

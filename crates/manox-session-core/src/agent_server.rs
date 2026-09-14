@@ -3078,7 +3078,10 @@ impl AgentServerInner {
             };
             let content = to_message_content(text, images);
             if t.is_running() {
-                t.enqueue_steer(content, Some(ui));
+                // S3 stable-id: thread the client's `Steer` message id through
+                // the facade so the optimistic bubble, the injected `user`
+                // journal row, and the echo retirement share one identity.
+                t.enqueue_steer(content, Some(ui), Some(message_id.clone()));
             } else {
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();

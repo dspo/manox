@@ -663,6 +663,16 @@ pub struct CompactionAuthorship {
     pub from_hook: bool,
 }
 
+/// S3 stable-id helper: the caller-minted durable id a `user` message asks to
+/// land under, if any. Non-user messages (and `user` messages without an id)
+/// report `None` and keep the storage-generated id.
+fn user_entry_id(message: &AgentMessage) -> Option<String> {
+    match message {
+        AgentMessage::User { id, .. } => id.clone(),
+        _ => None,
+    }
+}
+
 impl<S: SessionStorage> Session<S> {
     pub fn new(storage: S) -> Self {
         Session {
@@ -731,7 +741,14 @@ impl<S: SessionStorage> Session<S> {
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
         let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
+        // S3 stable-id: a `user` message carrying a caller-minted id (a client
+        // `Steer` message id) lands under that id so the durable row's id is
+        // the id the client already correlates against; every other message
+        // (and a `user` without an id) keeps the storage-generated id.
+        let id = match user_entry_id(&message) {
+            Some(id) => id,
+            None => self.storage.create_entry_id().await?,
+        };
         let parent_id = self.storage.get_leaf_id().await?;
 
         let entry = SessionTreeEntry::Message {
@@ -750,14 +767,18 @@ impl<S: SessionStorage> Session<S> {
     /// receipt can never lose the text). A deferred session materializes
     /// here — header plus every buffered row plus this entry — instead of
     /// waiting for the first assistant message. Carries the optional
-    /// `origin` exactly like [`Self::append_message_with_origin`].
+    /// `origin` exactly like [`Self::append_message_with_origin`], and honors
+    /// a caller-minted `user` id the same way.
     pub async fn append_message_durable(
         &self,
         message: AgentMessage,
         origin: Option<String>,
     ) -> Result<String, anyhow::Error> {
         let _guard = self.append_lock.lock().await;
-        let id = self.storage.create_entry_id().await?;
+        let id = match user_entry_id(&message) {
+            Some(id) => id,
+            None => self.storage.create_entry_id().await?,
+        };
         let parent_id = self.storage.get_leaf_id().await?;
 
         let entry = SessionTreeEntry::Message {
@@ -1349,6 +1370,7 @@ pub fn compaction_summary_message(summary: &str, timestamp: DateTime<Utc>) -> Ag
             signature: None,
         }],
         timestamp,
+        id: None,
     }
 }
 
@@ -1360,6 +1382,7 @@ pub fn branch_summary_message(summary: &str, timestamp: DateTime<Utc>) -> AgentM
             signature: None,
         }],
         timestamp,
+        id: None,
     }
 }
 
@@ -1727,7 +1750,9 @@ mod tests {
         let projected = session_entry_to_context_messages(&entry);
         assert_eq!(projected.len(), 1);
         match &projected[0] {
-            AgentMessage::User { content, timestamp } => {
+            AgentMessage::User {
+                content, timestamp, ..
+            } => {
                 assert_eq!(*timestamp, entry.timestamp());
                 match &content[0] {
                     ContentBlock::Text { text, .. } => assert_eq!(
