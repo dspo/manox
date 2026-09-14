@@ -4321,6 +4321,7 @@ fn create_session_with_project_intent() {
         &client,
         "cs-1",
         ClientCall::CreateSession {
+            working_directories: Vec::new(),
             cwd: None,
             project: Some(project.to_string_lossy().into_owned()),
             initial_model: Some(manox_protocol::ModelRef::new(
@@ -4360,6 +4361,7 @@ fn create_session_with_project_intent() {
         &client,
         "cs-2",
         ClientCall::CreateSession {
+            working_directories: Vec::new(),
             cwd: None,
             project: None,
             initial_model: Some(manox_protocol::ModelRef::new("prov/no-such-model")),
@@ -6914,6 +6916,7 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
             tools: serde_json::json!([]),
         },
         ClientCall::CreateSession {
+            working_directories: Vec::new(),
             cwd: Some("/".into()),
             project: None,
             initial_model: None,
@@ -8105,6 +8108,7 @@ async fn create_with_a_live_id_is_idempotent() {
     server.0.sessions.lock().insert("idem-1".into(), winner);
 
     let intent = SessionIntent {
+        working_directories: Vec::new(),
         session_id: Some("idem-1".into()),
         cwd: Some("/".into()),
         project: None,
@@ -8902,6 +8906,7 @@ fn seeded_create(
     client.send(FromClient::Request {
         id: MsgId::new("seed-create"),
         call: ClientCall::CreateSession {
+            working_directories: Vec::new(),
             cwd: Some("/".into()),
             project: None,
             initial_model: None,
@@ -9652,4 +9657,165 @@ fn terminal_resize_updates_snapshot_dims() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+// ── Multi-working-dirs: CreateSession.workingDirectories joins the
+// session's granted-root fence at spawn, and a post-spawn grant widens
+// the same shared set immediately. ─────────────────────────────────────
+
+#[test]
+fn create_session_working_directories_join_granted_fence() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    let base = std::env::temp_dir().join(format!("manox-mwd-{}", uuid::Uuid::new_v4()));
+    let cwd = base.join("cwd");
+    let extra_a = base.join("a");
+    let extra_b = base.join("b");
+    let extra_c = base.join("c");
+    for dir in [&cwd, &extra_a, &extra_b, &extra_c] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    client.send(FromClient::Request {
+        id: MsgId::new("mwd-create"),
+        call: ClientCall::CreateSession {
+            working_directories: vec![
+                extra_a.to_string_lossy().into_owned(),
+                extra_b.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+        },
+    });
+    let session_id = loop {
+        match client.recv() {
+            FromServer::Response { id, outcome } if id.0 == "mwd-create" => {
+                break outcome.expect("create succeeds")["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+            }
+            _ => {}
+        }
+    };
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+    let thread = server.0.session_thread(&session_id).expect("live session");
+    thread.with_mut(|t| {
+        assert_eq!(
+            t.extra_working_directories(),
+            vec![extra_a.clone(), extra_b.clone()],
+            "the queued grant set mirrors the request order"
+        );
+        let granted = t.granted_working_directories();
+        assert!(
+            granted.contains(&canon(&extra_a)),
+            "extra A is inside the fence: {granted:?}"
+        );
+        assert!(
+            granted.contains(&canon(&extra_b)),
+            "extra B is inside the fence: {granted:?}"
+        );
+
+        // A post-spawn grant widens the same shared set immediately.
+        t.grant_working_directory(extra_c.clone());
+        let granted = t.granted_working_directories();
+        assert!(
+            granted.contains(&canon(&extra_c)),
+            "post-spawn grant widens the fence: {granted:?}"
+        );
+        assert_eq!(t.extra_working_directories().len(), 3);
+    });
+
+    // The create-time grants persist to the sidecar (queued on the agent
+    // runtime — bounded poll) so a cold restore can re-widen the fence.
+    let sessions = manox_agent::paths::sessions_dir().expect("sessions dir");
+    let meta = sessions.join(format!("{session_id}.meta.json"));
+    let needle = extra_a.to_string_lossy().into_owned();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(json) = std::fs::read_to_string(&meta)
+            && json.contains(&needle)
+            && json.contains("working_directories")
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sidecar grant never persisted (meta: {})",
+            meta.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(thread);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&base);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// Multi-root restore (multi-working-dirs): a cold session whose sidecar
+/// carries granted directories re-widens the engine fence on open — the
+/// grants survive a restart even though the engine spawns cwd-only.
+#[test]
+fn working_directories_survive_cold_restore() {
+    let _g = lock_globals();
+    hermetic_home();
+    let sessions = manox_agent::paths::sessions_dir().expect("sessions dir");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = seed_v4_chain(&sessions, "mwd-cold-1");
+    let base = std::env::temp_dir().join(format!("manox-mwd-cold-{}", uuid::Uuid::new_v4()));
+    let extra = base.join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(
+        sessions.join("mwd-cold-1.meta.json"),
+        serde_json::json!({
+            "working_directories": [extra.to_string_lossy()],
+        })
+        .to_string(),
+    )
+    .unwrap();
+    init_globals();
+    init_thread_store_scanned();
+    manox_agent::thread_store::global().with_mut(|s| s.note_session_path("mwd-cold-1", &path));
+    let (server, client) = harness(vec![]);
+    client.send(FromClient::Request {
+        id: MsgId::new("mwd-open"),
+        call: ClientCall::OpenSession {
+            session_id: "mwd-cold-1".into(),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match client.recv() {
+            FromServer::Response { id, outcome } if id.0 == "mwd-open" => {
+                outcome.expect("cold open succeeds");
+                break;
+            }
+            _ => {}
+        }
+        assert!(std::time::Instant::now() < deadline, "open never answered");
+    }
+    let canon_extra = std::fs::canonicalize(&extra).unwrap();
+    server
+        .0
+        .session_thread("mwd-cold-1")
+        .expect("live session")
+        .with_mut(|t| {
+            assert_eq!(t.extra_working_directories(), vec![extra.clone()]);
+            let granted = t.granted_working_directories();
+            assert!(
+                granted.contains(&canon_extra),
+                "the restored fence admits the sidecar grant: {granted:?}"
+            );
+        });
+    drop(server);
+    let _ = std::fs::remove_dir_all(&base);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(sessions.join("mwd-cold-1.meta.json"));
+    manox_agent::thread_store::drop_global_for_test();
 }

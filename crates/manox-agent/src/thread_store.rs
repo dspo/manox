@@ -685,6 +685,12 @@ impl ThreadStore {
         self.write_meta(id, move |meta| meta.unread = unread);
     }
 
+    /// Persist the session's granted extra working directories (multi-
+    /// root) so a cold restore re-widens the fence (multi-working-dirs).
+    pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {
+        self.write_meta(id, move |meta| meta.working_directories = dirs);
+    }
+
     /// Whether a thread has a tool authorization pending a user verdict.
     pub fn pending_auth_contains(&self, id: &str) -> bool {
         self.pending_auth.contains(id)
@@ -769,7 +775,7 @@ impl ThreadStore {
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path);
+        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone());
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
@@ -777,8 +783,33 @@ impl ThreadStore {
             let dir = PathBuf::from(&sum.project);
             handle.with_mut(|t| t.restore_project(dir));
         }
+        // Multi-root restore (multi-working-dirs): the sidecar's granted
+        // directories re-widen the restored engine's fence — `open`
+        // spawned it cwd-only.
+        for dir in self.persisted_working_directories(&path) {
+            handle.with_mut(|t| t.grant_working_directory(dir));
+        }
         self.live_threads.insert(id.to_string(), handle.downgrade());
         Some(handle)
+    }
+
+    /// The sidecar's granted working directories for a session file, read
+    /// synchronously (multi-root restore). The scan cache is not
+    /// consulted: a cold id seeded through `note_session_path` has no
+    /// indexed row yet, and one bounded read beats a refresh round-trip.
+    fn persisted_working_directories(&self, path: &std::path::Path) -> Vec<PathBuf> {
+        let meta = manox_harness::session_meta::meta_path(&self.sessions_dir, path);
+        let Ok(json) = std::fs::read_to_string(&meta) else {
+            return Vec::new();
+        };
+        serde_json::from_str::<manox_harness::session_meta::SessionMeta>(&json)
+            .map(|m| {
+                m.working_directories
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Seed one session path from an authoritative on-disk probe: a cold

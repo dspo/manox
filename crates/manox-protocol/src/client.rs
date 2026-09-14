@@ -90,6 +90,13 @@ pub enum ClientCall {
         /// re-injection per turn is a different mechanism. `None`/empty
         /// seeds nothing.
         seed: Option<Vec<serde_json::Value>>,
+        /// Ordered additional working directories granted to the session
+        /// (multi-root). Index 0 of the combined set (cwd first) is the
+        /// primary; every entry joins the session's granted-root set, so
+        /// `workspace-write` admits writes under all of them. Empty (the
+        /// default) keeps the single-cwd behavior.
+        #[serde(default)]
+        working_directories: Vec<String>,
     },
     /// Submit a user message (starts a turn unless it is a slash command);
     /// the response is the receipt `{accepted, message_id?}` — the
@@ -413,5 +420,46 @@ mod tests {
         let json = serde_json::to_value(&call).unwrap();
         assert_eq!(json["method"], "cancelDelivery");
         assert_eq!(json["deliveryId"], "dlv-s1-1");
+    }
+
+    /// Multi-root (multi-working-dirs): the ordered extra working
+    /// directories ride the createSession wire in camelCase and
+    /// round-trip; an absent field deserializes to the empty default so
+    /// pre-multi-root clients keep working.
+    #[test]
+    fn create_session_working_directories_round_trip() {
+        let call = ClientCall::CreateSession {
+            cwd: Some("/proj".into()),
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: vec!["/proj-a".into(), "/proj-b".into()],
+        };
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["method"], "createSession");
+        assert_eq!(
+            json["workingDirectories"],
+            serde_json::json!(["/proj-a", "/proj-b"])
+        );
+        let back: ClientCall = serde_json::from_value(json).unwrap();
+        assert_eq!(call, back);
+    }
+
+    #[test]
+    fn create_session_working_directories_default_when_absent() {
+        let call: ClientCall = serde_json::from_value(serde_json::json!({
+            "method": "createSession",
+            "cwd": "/proj",
+        }))
+        .expect("workingDirectories is optional on the wire");
+        match call {
+            ClientCall::CreateSession {
+                working_directories,
+                ..
+            } => assert!(working_directories.is_empty()),
+            other => panic!("expected createSession, got {other:?}"),
+        }
     }
 }

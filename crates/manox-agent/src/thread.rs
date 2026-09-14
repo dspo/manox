@@ -315,6 +315,9 @@ pub enum ThreadEvent {
 pub struct Thread {
     pub id: ThreadId,
     cwd: PathBuf,
+    /// Extra granted working directories (multi-root); seeded into the
+    /// engine's granted-root set at spawn (multi-working-dirs).
+    extra_working_dirs: Vec<PathBuf>,
     project: Option<PathBuf>,
     model: Option<PiModel>,
     permission_mode: PermissionMode,
@@ -705,6 +708,33 @@ impl ThreadHandle {
 }
 
 impl Thread {
+    /// Grant an additional working directory to the session (multi-root):
+    /// queued for the engine's granted-root set at spawn and, when the
+    /// engine already exists, approved into its shared set immediately —
+    /// `workspace-write` then admits writes under it exactly like the cwd.
+    pub fn grant_working_directory(&mut self, dir: PathBuf) {
+        self.extra_working_dirs.push(dir.clone());
+        if let Some(engine) = &self.engine {
+            engine.grant_working_directory(dir);
+        }
+    }
+
+    /// The session's extra granted working directories (insertion order) —
+    /// the multi-root grant set beyond the cwd.
+    pub fn extra_working_directories(&self) -> Vec<PathBuf> {
+        self.extra_working_dirs.clone()
+    }
+
+    /// The engine's granted roots beyond the workspace root, as the
+    /// sandbox fence sees them (empty before spawn / for fence-less
+    /// engines).
+    pub fn granted_working_directories(&self) -> Vec<PathBuf> {
+        self.engine
+            .as_ref()
+            .map(|e| e.granted_working_directories())
+            .unwrap_or_default()
+    }
+
     /// The startup landing state: a detached thread with no engine. No
     /// session is loaded at launch — the user picks a conversation from the
     /// sidebar (`open_existing` swaps in its engine) or starts typing
@@ -752,6 +782,7 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            extra_working_dirs: Vec::new(),
         })
     }
 
@@ -803,6 +834,7 @@ impl Thread {
             id.0.clone(),
             goal_bridge.clone(),
             None,
+            &[],
         );
 
         let handle = ThreadHandle::new(Self {
@@ -844,6 +876,7 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            extra_working_dirs: Vec::new(),
         });
         drain_engine_notices(handle.clone(), events);
         handle
@@ -878,6 +911,7 @@ impl Thread {
             self.id.0.clone(),
             self.goal_bridge.clone(),
             None,
+            &self.extra_working_dirs,
         );
         if self.permission_mode != PermissionMode::default() {
             engine.set_permission_mode(self.permission_mode);
@@ -1727,6 +1761,7 @@ impl Thread {
             id.0.clone(),
             None,
             Some(self.id.0.clone()),
+            &[],
         );
         if permission_mode != PermissionMode::default() {
             engine.set_permission_mode(permission_mode);
@@ -1771,6 +1806,7 @@ impl Thread {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            extra_working_dirs: Vec::new(),
         });
         drain_engine_notices(handle.clone(), events);
         handle
@@ -2677,6 +2713,7 @@ pub(crate) mod tests {
             cwd_path: None,
             pending_events: Vec::new(),
             pending_engine_events: None,
+            extra_working_dirs: Vec::new(),
         })
     }
 

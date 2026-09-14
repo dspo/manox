@@ -21,6 +21,16 @@ use manox_harness::types::Model as PiModel;
 /// Commands a facade can issue to its harness backend, plus the backend's
 /// authoritative state the facade mirrors after a settled run.
 pub trait ThreadEngine: Send + Sync {
+    /// Multi-root grant (multi-working-dirs): widen the session's granted
+    /// root set. Default no-op for engines without a sandbox fence.
+    fn grant_working_directory(&self, _dir: std::path::PathBuf) {}
+
+    /// The session's granted roots beyond the workspace root (insertion
+    /// order). Empty for engines without a sandbox fence.
+    fn granted_working_directories(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
     /// Whether a turn is currently in flight.
     fn is_running(&self) -> bool;
 

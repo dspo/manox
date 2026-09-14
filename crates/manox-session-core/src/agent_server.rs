@@ -1603,6 +1603,7 @@ async fn handle_call(
             approval_mode,
             reasoning_effort,
             seed,
+            working_directories,
         } => {
             AgentServerInner::create_session_request(
                 inner,
@@ -1615,6 +1616,7 @@ async fn handle_call(
                     approval_mode,
                     reasoning_effort,
                     seed,
+                    working_directories,
                 },
             )
             .await
@@ -2160,6 +2162,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             // `session_id` is passed through so the desktop ids stay
             // stable; the request path is idempotent on a live session.
             let intent = SessionIntent {
+                working_directories: Vec::new(),
                 session_id: Some(session_id),
                 cwd,
                 project: None,
@@ -2425,6 +2428,11 @@ struct SessionIntent {
     /// Hidden context blocks appended as non-displaying custom messages
     /// before the first turn (`CreateSession.seed`).
     seed: Option<Vec<Value>>,
+    /// Ordered extra working directories granted to the session
+    /// (multi-root); each joins the session's granted-root set before the
+    /// engine materializes, so `workspace-write` admits writes under all
+    /// of them. Empty keeps single-cwd behavior.
+    working_directories: Vec<String>,
 }
 
 impl AgentServerInner {
@@ -2612,6 +2620,11 @@ impl AgentServerInner {
                 .get(&session_id)
                 .map(|entry| entry.thread.clone());
             if let Some(thread) = thread {
+                // Multi-root grants on the restored engine (the cold-open
+                // fence started cwd-only; multi-working-dirs).
+                for dir in &intent.working_directories {
+                    thread.with_mut(|t| t.grant_working_directory(PathBuf::from(dir)));
+                }
                 thread.with_mut(|t| {
                     if let Some(model) = model {
                         t.set_model(model);
@@ -2626,6 +2639,11 @@ impl AgentServerInner {
                         t.set_project(PathBuf::from(project));
                     }
                 });
+            }
+            if !intent.working_directories.is_empty() {
+                let dirs = intent.working_directories.clone();
+                manox_agent::thread_store::global()
+                    .with_mut(|s| s.set_working_directories(&session_id, dirs));
             }
             return Ok(json!({ "session_id": session_id }));
         }
@@ -2644,6 +2662,25 @@ impl AgentServerInner {
             Some(p) => Thread::new_in_project(ThreadId(session_id.clone()), p.clone()),
             None => Thread::new_fresh(ThreadId(session_id.clone()), cwd),
         };
+        // Multi-root: grant the extra working directories before the engine
+        // materializes, so the gate's granted-root set admits them from the
+        // first tool call (multi-working-dirs).
+        for dir in &intent.working_directories {
+            thread.with_mut(|t| t.grant_working_directory(PathBuf::from(dir)));
+        }
+        // Persist the grants (multi-working-dirs): the sidecar keeps them
+        // for a cold restore. The path note seeds the id→path map first
+        // (the journal materializes lazily at the first turn) so the
+        // sidecar write is addressable.
+        if !intent.working_directories.is_empty()
+            && let Some(path) = persisted_session_file(&session_id)
+        {
+            let dirs = intent.working_directories.clone();
+            manox_agent::thread_store::global().with_mut(|s| {
+                s.note_session_path(&session_id, &path);
+                s.set_working_directories(&session_id, dirs);
+            });
+        }
         // Intent application: model (explicit canonical or the global
         // default), approval mode, reasoning effort.
         let initial = model.or_else(manox_agent::provider_glue::default_model);
