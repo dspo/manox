@@ -2711,8 +2711,25 @@ async fn settle_run(
     sync_history(session, sessions_dir, state).await;
     sync_usage(session, state).await;
     spawn_session_list_refresh(sessions_dir, state);
+    // S4: the kernel steering queue survives runs, so a steer that never
+    // drained during an aborted/failed run would silently inject into the
+    // NEXT run (a duplicated user message if the client retries). Retract
+    // each queued steer by its command id; a steer whose cancel fails was
+    // already drained by THIS run, so it is genuinely steered (its row is
+    // on disk), not stranded. `abort_requested || failed` only retracts the
+    // still-queued tail — DSH parity (a pending steer is discarded/failed,
+    // never poured into a dying or later run).
     let (steered, stranded) = if abort_requested || failed {
-        (Vec::new(), std::mem::take(run_steers))
+        let mut steered = Vec::new();
+        let mut stranded = Vec::new();
+        for id in std::mem::take(run_steers) {
+            if session.cancel_steer(&id) {
+                stranded.push(id);
+            } else {
+                steered.push(id);
+            }
+        }
+        (steered, stranded)
     } else {
         (std::mem::take(run_steers), Vec::new())
     };
@@ -3830,6 +3847,28 @@ async fn run_actor(
                     &sessions_dir,
                     &cwd,
                     &active_session_path,
+                )
+                .await;
+                if shutdown_after_run {
+                    break;
+                }
+                // S2 (pi `agent-loop` / omp settle-drain): a steer enqueued in
+                // this run's final moments — after the loop's last turn-boundary
+                // drain but before `Settled` — is still sitting in the surviving
+                // kernel queue. Drain it here (the helper no-ops when the queue
+                // is empty, so a normal prompt turn pays nothing) instead of
+                // leaving the user's input stranded to an unrelated later turn.
+                resume_steering_queue(
+                    &mut session,
+                    &mut cmd_rx,
+                    &mut run_steers,
+                    &mut shutdown_after_run,
+                    Arc::clone(&live_mirror),
+                    &state,
+                    &notice_tx,
+                    &mut pi_model,
+                    &sessions_dir,
+                    &cwd,
                 )
                 .await;
                 if shutdown_after_run {
@@ -6114,6 +6153,391 @@ mod tests {
         assert_eq!(loaded.title.as_deref(), Some("my thread"));
         assert_eq!(loaded.project.as_deref(), Some("/tmp/proj"));
         assert_eq!(loaded.approval_mode.as_deref(), Some("danger-full-access"));
+    }
+    /// Build an idle `AgentSession` backed by a stream that answers every
+    /// request with a terminal assistant turn, so a `continue_` round driven by
+    /// the actor's continuation helper runs to settle in the test.
+    async fn steer_test_session(dir: &tempfile::TempDir) -> AgentSession {
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap()
+    }
+
+    /// Collect `(id, user)` for every `user` message row currently in the
+    /// session journal, so a test can assert the durable row identity.
+    async fn user_row_ids(session: &AgentSession) -> Vec<String> {
+        let rows = session
+            .journal_appender()
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        rows.iter()
+            .filter_map(|r| match &r.entry {
+                manox_harness::session::SessionTreeEntry::Message {
+                    id,
+                    message: AgentMessage::User { .. },
+                    ..
+                } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// S1 (dsh `wakeDriver` idle-steer) + S3 (stable row id): a `Steer`
+    /// arriving while the actor is idle starts its OWN run immediately, and
+    /// the injected `user` journal row is keyed by the client message id.
+    #[tokio::test]
+    async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
+        // settle_run fires the detached plugin `Stop` hook through the global
+        // runtime handle; init it hermetically like every settle-exercising test.
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        // Seed one assistant turn so the session is genuinely mid-conversation:
+        // `continue_` refuses to run from an EMPTY transcript ("No messages to
+        // continue from"), and the idle-steer arm is only reached while a turn
+        // is in flight (a facade/actor race) — i.e. after at least one turn.
+        session
+            .append_message(AgentMessage::user("seed"))
+            .await
+            .unwrap();
+        session
+            .continue_()
+            .await
+            .expect("seed turn must stream under the test model");
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        // The between-runs `Steer` arm: enqueue under the client id (S3/S4) and
+        // remember the id for the settle confirmation.
+        let client_id = "client-steer-777".to_string();
+        session.handle().steer_with_id(
+            steer_message(client_id.clone(), "hello there".into(), Vec::new()),
+            client_id.clone(),
+        );
+        run_steers.push(client_id.clone());
+
+        // S1: the actor resumes the idle steer through the shared helper.
+        resume_steering_queue(
+            &mut session,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            Arc::clone(&live),
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_dir,
+            &cwd,
+        )
+        .await;
+
+        // The queue drained (the run consumed the steer) and no shutdown.
+        assert!(
+            session.steering_messages().is_empty(),
+            "S1: the resume must drain the steering queue"
+        );
+        assert!(!shutdown_after_run);
+        assert!(
+            !state.running.load(Ordering::Relaxed),
+            "the run settled back to idle"
+        );
+
+        // TurnStarted fired (a run actually started), then Settled confirms the
+        // steer on that run.
+        let mut saw_turn_started = false;
+        let mut settled: Option<(Vec<String>, Vec<String>, bool, bool)> = None;
+        while let Ok(notice) = notice_rx.try_recv() {
+            match notice {
+                BackendNotice::Event(event) => {
+                    if matches!(*event, ThreadEvent::TurnStarted) {
+                        saw_turn_started = true;
+                    }
+                }
+                BackendNotice::Settled {
+                    steered,
+                    stranded,
+                    cancelled,
+                    failed,
+                } => settled = Some((steered, stranded, cancelled, failed)),
+                _ => {}
+            }
+        }
+        assert!(
+            saw_turn_started,
+            "S1: an idle steer must start its own run (TurnStarted)"
+        );
+        let (steered, stranded, cancelled, failed) = settled.expect("the resume must settle");
+        assert_eq!(steered, vec![client_id.clone()]);
+        assert!(stranded.is_empty());
+        assert!(!cancelled && !failed);
+
+        // S3: the durable `user` row carries the client message id.
+        let ids = user_row_ids(&session).await;
+        assert!(
+            ids.iter().any(|id| id == &client_id),
+            "S3: the injected user row id must equal the client message id; got {ids:?}"
+        );
+        let _ = cmd_tx; // keep the sender alive for the run
+    }
+
+    /// S2 (pi `agent-loop` / omp settle-drain): a steer still queued when a
+    /// run settles is drained by the same continuation helper, so it is never
+    /// silently deferred to an unrelated later turn.
+    #[tokio::test]
+    async fn settle_drains_a_steer_left_queued_at_run_end() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        // Seed one assistant turn so a later `continue_` can run: `continue_`
+        // refuses to resume from an empty transcript.
+        session
+            .append_message(AgentMessage::user("seed"))
+            .await
+            .unwrap();
+        session
+            .continue_()
+            .await
+            .expect("seed turn must stream under the test model");
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        // A steer lands in the run's final moments: still in the queue after
+        // the settle point.
+        let late_id = "late-steer-1".to_string();
+        session.handle().steer_with_id(
+            steer_message(late_id.clone(), "one more thing".into(), Vec::new()),
+            late_id.clone(),
+        );
+        run_steers.push(late_id.clone());
+        assert!(!session.steering_messages().is_empty());
+
+        // The post-settle drain (S2) is the same helper — it sees a non-empty
+        // queue and runs it to empty.
+        resume_steering_queue(
+            &mut session,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            Arc::clone(&live),
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_dir,
+            &cwd,
+        )
+        .await;
+
+        assert!(
+            session.steering_messages().is_empty(),
+            "S2: the post-settle drain must empty the queue"
+        );
+        let ids = user_row_ids(&session).await;
+        assert!(
+            ids.iter().any(|id| id == &late_id),
+            "S2: the late steer is realized by a run before it idles; got {ids:?}"
+        );
+        // Settled confirmation with the late steer.
+        let mut confirmed = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Settled { steered, .. } = notice {
+                confirmed |= steered.iter().any(|s| s == &late_id);
+            }
+        }
+        assert!(confirmed, "S2: the drained steer confirms as injected");
+        let _ = cmd_tx;
+    }
+
+    /// S4 (omp `#drainStrandedQueuedMessages` `#abortInProgress` guard): an
+    /// aborted run must RETRACT its not-yet-drained steer from the surviving
+    /// kernel queue and report it as stranded (not injected), so it is never
+    /// silently re-injected into the next run and a client retry does not
+    /// duplicate the message.
+    #[tokio::test]
+    async fn aborted_run_retracts_stranded_steers_from_the_kernel_queue() {
+        // settle_run fires the Stop hook; init the hermetic runtime handle.
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        let state = test_engine_state();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        // A steer queued while a run was in flight but NOT drained by it
+        // (the loop parked the run and aborted before the injection boundary).
+        let stranded_id = "stranded-steer".to_string();
+        session.handle().steer_with_id(
+            steer_message(
+                stranded_id.clone(),
+                "never reached the model".into(),
+                Vec::new(),
+            ),
+            stranded_id.clone(),
+        );
+        assert!(
+            !session.steering_messages().is_empty(),
+            "setup: steer queued"
+        );
+        let mut run_steers = vec![stranded_id.clone()];
+
+        // Abort path: settle_run with abort_requested must retract every still-
+        // queued steer id and report the retracted ones as stranded.
+        settle_run(
+            &Ok(Vec::new()),
+            /* abort_requested */ true,
+            &session,
+            &state,
+            &sessions_dir,
+            &cwd,
+            &notice_tx,
+            &mut run_steers,
+        )
+        .await;
+
+        // The kernel queue is now empty: nothing can leak into the NEXT run.
+        assert!(
+            session.steering_messages().is_empty(),
+            "S4: an aborted settle must retract stranded steers from the queue"
+        );
+        // run_steers was consumed.
+        assert!(run_steers.is_empty(), "settle consumes the run's steer ids");
+        // The retracted steer is reported stranded (NOT steered), so the client
+        // sees a retryable Failed card rather than a phantom injection.
+        let mut stranded_seen = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Settled {
+                steered,
+                stranded,
+                cancelled,
+                ..
+            } = notice
+            {
+                assert!(cancelled);
+                stranded_seen |= stranded.iter().any(|s| s == &stranded_id);
+                assert!(
+                    !steered.iter().any(|s| s == &stranded_id),
+                    "a retracted steer must not be double-reported as injected"
+                );
+            }
+        }
+        assert!(
+            stranded_seen,
+            "S4: the aborted run reports the stranded steer as stranded"
+        );
+    }
+
+    /// S4 continuation: the retraction is what stops the stranded text from
+    /// re-injecting on the next `continue_` (guard against the double-message
+    /// regression). A retried steer (fresh id) is the ONLY thing the next run
+    /// injects.
+    #[tokio::test]
+    async fn retried_steer_injects_once_after_abort() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        // Seed one assistant turn so a later `continue_` can run: `continue_`
+        // refuses to resume from an empty transcript.
+        session
+            .append_message(AgentMessage::user("seed"))
+            .await
+            .unwrap();
+        session
+            .continue_()
+            .await
+            .expect("seed turn must stream under the test model");
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+
+        // Run 1 queues a steer, then aborts before draining it.
+        let aborted_id = "aborted-then-retracted".to_string();
+        session.handle().steer_with_id(
+            steer_message(aborted_id.clone(), "original text".into(), Vec::new()),
+            aborted_id.clone(),
+        );
+        settle_run(
+            &Ok(Vec::new()),
+            /* abort_requested */ true,
+            &session,
+            &state,
+            &sessions_dir,
+            &cwd,
+            &notice_tx,
+            &mut vec![aborted_id.clone()],
+        )
+        .await;
+        // The retraction left the queue empty.
+        assert!(session.steering_messages().is_empty());
+
+        // The user retries with a fresh id. Only that new steer exists.
+        let retry_id = "retry-fresh".to_string();
+        session.handle().steer_with_id(
+            steer_message(retry_id.clone(), "original text".into(), Vec::new()),
+            retry_id.clone(),
+        );
+        resume_steering_queue(
+            &mut session,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            Arc::clone(&live),
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_dir,
+            &cwd,
+        )
+        .await;
+
+        let ids = user_row_ids(&session).await;
+        assert!(
+            ids.contains(&retry_id),
+            "the retried steer injects under its own id; got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&aborted_id),
+            "S4: the retracted steer must NOT re-inject — a retry yields one message, not two"
+        );
+        let _ = cmd_tx;
     }
 
     #[test]
