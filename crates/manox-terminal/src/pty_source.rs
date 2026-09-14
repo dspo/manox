@@ -30,7 +30,15 @@ pub trait PtySource: Send + 'static {
     /// sender clones, so they are safe to outlive the `PtySource`.
     fn start(&mut self, event_tx: Sender<TerminalEvent>);
 
-    /// Write input bytes (keystrokes, paste) to the PTY master.
+    /// Hand input bytes (keystrokes, paste, mouse reports) to the PTY master.
+    ///
+    /// Trait invariant: enqueue-only — the call never blocks the caller, even
+    /// when the child has stopped reading stdin and the tty input buffer is
+    /// full. Implementations serialize the blocking writes on a dedicated
+    /// writer thread (FIFO); `Err` means the writer has exited (child gone).
+    /// A blocking write here would stall the calling thread — UI or event
+    /// pump — while terminal locks are held, and can deadlock against the
+    /// child's own stdout writes.
     fn write(&self, bytes: &[u8]) -> io::Result<()>;
 
     /// Resize the PTY to the given cols / rows.
