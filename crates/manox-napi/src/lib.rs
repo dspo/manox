@@ -103,12 +103,17 @@ pub fn start(client_id: String, event_cb: JsFunction) -> Result<()> {
         &server,
         client_id,
         // VS Code has approval UI (sidebar), AskUserQuestion (answer_question
-        // in sidebar), and PlanVerdict (plan_verdict in sidebar). No browser
-        // or clipboard capabilities.
+        // in sidebar), PlanVerdict (plan_verdict in sidebar), the OS clipboard
+        // (text-only bridging), the system external-link opener, and hosts
+        // client-contributed tools (registerSessionTools/invokeClientTool).
+        // No browser capability (no embedded browser surface).
         vec![
             HookKind::Approve,
             HookKind::AskUserQuestion,
             HookKind::PlanVerdict,
+            HookKind::ClipboardRead,
+            HookKind::OpenExternal,
+            HookKind::ClientTool,
         ],
         vec![],
     );
