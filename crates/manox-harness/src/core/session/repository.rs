@@ -261,24 +261,23 @@ async fn read_header(path: &Path) -> Result<(JsonlSessionMetadata, u32), anyhow:
     crate::session::jsonl::parse_header_line(&buffer[..line_end])
 }
 
-/// A JSON member test on the raw line: `"<key>"` , optional whitespace,
-/// `:`, optional whitespace, `"<value>"` — anywhere in the line. Key ORDER
-/// does not matter (serde's tagged enums put `type` first, but TS Pi's
-/// serializer or a hand-edited file may not); a single space around the
-/// colon is tolerated (compact writers emit none).
-fn json_member_is(line: &[u8], key: &str, value: &str) -> bool {
-    let mut key_pattern = Vec::with_capacity(key.len() + 2);
-    key_pattern.push(b'"');
-    key_pattern.extend_from_slice(key.as_bytes());
-    key_pattern.push(b'"');
-    let mut value_pattern = Vec::with_capacity(value.len() + 2);
-    value_pattern.push(b'"');
-    value_pattern.extend_from_slice(value.as_bytes());
-    value_pattern.push(b'"');
+/// The member patterns the scan tests, as const byte slices — the hot path
+/// runs them against every line of every scanned file, so no per-call
+/// pattern construction (two `Vec` allocations per line pre-fix).
+const KEY_TYPE: &[u8] = br#""type""#;
+const VALUE_MESSAGE: &[u8] = br#""message""#;
+const KEY_ROLE: &[u8] = br#""role""#;
+const VALUE_USER: &[u8] = br#""user""#;
 
+/// A JSON member test on the raw line: `<key pattern>`, optional
+/// whitespace, `:`, optional whitespace, `<value pattern>` — anywhere in
+/// the line. Key ORDER does not matter (serde's tagged enums put `type`
+/// first, but TS Pi's serializer or a hand-edited file may not); a single
+/// space around the colon is tolerated (compact writers emit none).
+fn json_member_is(line: &[u8], key: &[u8], value: &[u8]) -> bool {
     let mut from = 0usize;
-    while let Some(at) = find_from(line, &key_pattern, from) {
-        let rest = &line[at + key_pattern.len()..];
+    while let Some(at) = find_from(line, key, from) {
+        let rest = &line[at + key.len()..];
         let mut i = 0usize;
         while i < rest.len() && matches!(rest[i], b' ' | b'\t') {
             i += 1;
@@ -288,7 +287,7 @@ fn json_member_is(line: &[u8], key: &str, value: &str) -> bool {
             while i < rest.len() && matches!(rest[i], b' ' | b'\t') {
                 i += 1;
             }
-            if rest[i..].starts_with(&value_pattern) {
+            if rest[i..].starts_with(value) {
                 return true;
             }
         }
@@ -372,10 +371,10 @@ async fn scan_first_user_message(
 /// message entry whose text is empty or not user-authored (keep scanning);
 /// `Some(Some(text))` = the first user message's text.
 fn classify_line(line: &[u8]) -> Option<Option<String>> {
-    if !json_member_is(line, "type", "message") {
+    if !json_member_is(line, KEY_TYPE, VALUE_MESSAGE) {
         return None;
     }
-    if !json_member_is(line, "role", "user") {
+    if !json_member_is(line, KEY_ROLE, VALUE_USER) {
         return Some(None);
     }
     let value: serde_json::Value = match serde_json::from_slice(line) {

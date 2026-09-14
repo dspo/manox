@@ -226,24 +226,29 @@ impl StoreHandle {
     /// callers only mark it pending — one reconcile serves the whole burst
     /// (a sidecar-write storm asks once, not once per write).
     pub fn refresh(&self) {
-        // Single-flight spawn: while a runner owns the gate loop, later
-        // callers only mark pending — the runner's loop tail serves the
-        // whole burst with one more pass instead of each caller spawning
-        // its own.
-        if self
+        // Single-flight spawn with a Dekker handshake: write the ask
+        // (pending) BEFORE reading the gate (running). The runner's exit
+        // publishes quiescence in the mirrored order (store running=false,
+        // then re-read pending), so under SeqCst at least one side always
+        // sees the other's store — a caller that reads running=true is
+        // guaranteed the runner's trailing re-check sees its pending. The
+        // reverse order (read gate, then write ask) left a window where
+        // both sides walked away and the ask was lost.
+        self.0
+            .refresh_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if !self
             .0
             .refresh_running
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            self.0
-                .refresh_pending
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-            return;
+            // Claimed the gate: become the runner. The pass clears pending
+            // at its head, so our own ask rides this run.
+            let this = self.clone();
+            crate::runtime::handle().spawn(async move {
+                this.refresh_coalesced().await;
+            });
         }
-        let this = self.clone();
-        crate::runtime::handle().spawn(async move {
-            this.refresh_coalesced().await;
-        });
     }
 
     /// The gate discipline: each pass lands every queued sidecar write (in
