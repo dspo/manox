@@ -69,6 +69,26 @@ pub fn default_cwd() -> PathBuf {
     manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// One machine, one gateway: a second process's gateway would bind its own
+/// listener and publish over the first's `gateway-ws.json`, leaving an
+/// orphan listener no out-of-process client can discover (and pointing
+/// clients at a process they did not ask for). The guard is a
+/// non-blocking exclusive flock over `<config>/gateway.lock`, held for the
+/// process lifetime — the fd is intentionally leaked so the kernel releases
+/// it at exit, and the lock file is never unlinked. Contention is a loud
+/// no-op like the in-process second-start guard, never an exit.
+fn acquire_gateway_lease() -> std::io::Result<()> {
+    // Bounded, not single-shot: macOS can take a moment to propagate a
+    // flock release after the previous holder's close (see
+    // `manox_harness::fs_lock`); a genuinely owned gateway still times out.
+    const ACQUIRE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+    let dir = manox_agent::paths::manox_config_dir().map_err(std::io::Error::other)?;
+    std::fs::create_dir_all(&dir)?;
+    let lock = manox_harness::fs_lock::lock_exclusive(&dir.join("gateway.lock"), ACQUIRE_BUDGET)?;
+    std::mem::forget(lock);
+    Ok(())
+}
+
 /// Start the WS gateway on the global tokio runtime: adopt the process-wide
 /// `AgentServer` (get-or-init with `cwd`), bind `127.0.0.1:<port>` (0 →
 /// random), publish the endpoint via [`service_endpoint`] and persist it to
@@ -79,13 +99,22 @@ pub fn start(cwd: PathBuf, port: u16) {
     // Second-start guard (§三.2): the slot is RESERVED under one lock hold
     // before the bind is spawned, so neither a sequential nor a racing
     // second `start` can bind a second listener or overwrite the published
-    // endpoint — it warns and returns instead.
+    // endpoint — it warns and returns instead. The cross-process guard
+    // (gateway.lock) rides the same critical section: contention leaves the
+    // slot untouched (still `None`) so a later start may retry.
     {
         let mut slot = endpoint_slot().lock().unwrap();
         if slot.is_some() {
             tracing::warn!(
                 "gateway WS listener already started; ignoring the second start \
                  (the published endpoint stays the first bind's)"
+            );
+            return;
+        }
+        if let Err(error) = acquire_gateway_lease() {
+            tracing::error!(
+                %error,
+                "another gateway process owns the endpoint lock; not starting a second gateway"
             );
             return;
         }
@@ -265,6 +294,45 @@ mod tests {
             Some(ListenerState::Starting)
         ));
 
+        *endpoint_slot().lock().unwrap() = None;
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// The cross-process guard: with a foreign process holding
+    /// `gateway.lock`, `start` must neither bind nor publish nor consume
+    /// the slot (a later start may retry once the holder exits). The
+    /// foreign holder is a raw second fd — flock contention does not care
+    /// which process owns the conflicting open file description.
+    #[allow(clippy::await_holding_lock)] // same test-guard rationale as above
+    #[tokio::test]
+    async fn foreign_gateway_lock_makes_start_a_loud_noop() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::thread_store::init();
+        *endpoint_slot().lock().unwrap() = None;
+
+        let holder = manox_harness::fs_lock::lock_exclusive(
+            &manox_agent::paths::manox_config_dir()
+                .expect("config dir")
+                .join("gateway.lock"),
+            std::time::Duration::ZERO,
+        )
+        .expect("hold the gateway lock as a foreign process");
+
+        start(PathBuf::from("/"), 0);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            service_endpoint().is_none(),
+            "a start under a foreign gateway lock must not publish"
+        );
+        assert!(
+            endpoint_slot().lock().unwrap().is_none(),
+            "the slot must stay free for a retry after the holder exits"
+        );
+
+        drop(holder);
         *endpoint_slot().lock().unwrap() = None;
         manox_agent::thread_store::drop_global_for_test();
     }

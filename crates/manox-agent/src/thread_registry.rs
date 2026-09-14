@@ -59,12 +59,29 @@ pub async fn load() -> HashMap<String, ThreadRegistryEntry> {
 /// file stem (`<id>.jsonl`): a fresh session is created with its owning
 /// thread's id (`with_session_id`), so for non-forked sessions the thread
 /// id IS a valid session id and the pointer always resolves within the
-/// thread's group. Read-modify-write under a process-wide lock, atomic on
-/// disk (temp file + rename); failures warn without propagating — the
+/// thread's group. Read-modify-write under a process-wide lock plus a
+/// cross-process flock spanning load → merge → save (another manox
+/// process's entry must not be lost to a stale read, and the shared tmp
+/// sibling must not interleave); atomic on disk (temp file + rename).
+/// Lock contention or write failure warns without propagating — the
 /// sidebar falls back to the newest session.
 pub async fn set_active(thread_id: &str, session_id: &str) {
+    const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let _guard = LOCK.get_or_init(tokio::sync::Mutex::default).lock().await;
+    let path = registry_path();
+    let file_lock = match manox_harness::fs_lock::lock_exclusive_async(
+        &manox_harness::fs_lock::lock_path_for(&path),
+        LOCK_BUDGET,
+    )
+    .await
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(error = %error, "thread registry lock unavailable; skipping this pointer move");
+            return;
+        }
+    };
     let mut map = load().await;
     map.insert(
         thread_id.to_string(),
@@ -75,6 +92,7 @@ pub async fn set_active(thread_id: &str, session_id: &str) {
     if let Err(error) = save(&map).await {
         tracing::warn!(error = %error, "failed to persist the thread registry");
     }
+    drop(file_lock);
 }
 
 /// Atomic write (temp file + rename) so a crash cannot truncate the registry.
@@ -161,5 +179,35 @@ mod tests {
                 Some(format!("s{i}")).as_deref()
             );
         }
+    }
+
+    /// Cross-process contention: with a foreign holder on the registry's
+    /// lock file, `set_active` degrades (bounded wait → warn → skip) — the
+    /// existing entries stay intact and the caller never hangs. The holder
+    /// is a raw second fd standing in for the other process.
+    #[tokio::test]
+    async fn registry_write_degrades_under_a_foreign_lock() {
+        let (_guard, dir) = scratch().await;
+        let path = dir.path().join("threads.registry.json");
+        set_registry_path_for_test(Some(path.clone()));
+        set_active("seed", "s0").await;
+        let holder = manox_harness::fs_lock::lock_exclusive(
+            &manox_harness::fs_lock::lock_path_for(&path),
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        set_active("blocked", "s1").await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let map = load().await;
+        assert_eq!(map.len(), 1, "the skipped write landed nothing: {map:?}");
+        drop(holder);
+        set_active("after", "s2").await;
+        let map = load().await;
+        assert_eq!(
+            map.len(),
+            2,
+            "writes resume once the holder is gone: {map:?}"
+        );
     }
 }

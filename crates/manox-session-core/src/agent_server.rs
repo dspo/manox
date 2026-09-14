@@ -1852,6 +1852,14 @@ async fn open_session(
     // upgrade), and only phase 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
         .with_mut(|s| s.load_thread(session_id))
+        .map_err(|error| {
+            // Another process drives this session: its engine actor holds
+            // the per-session write lease. Fail fast — the client surfaces
+            // the stable code and can retry after the holder exits.
+            tracing::warn!(session_id, %error, "session open blocked by a foreign write lease");
+            RpcError::new(-1, error.to_string())
+                .with_code(manox_protocol::msg::CODE_SESSION_ALREADY_OWNED)
+        })?
         .ok_or_else(|| {
             RpcError::new(-1, "thread not found")
                 .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)

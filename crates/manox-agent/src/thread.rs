@@ -789,19 +789,27 @@ impl Thread {
     /// A genuinely empty thread (sidebar new-conversation): never restores
     /// the previous session.
     pub fn new_fresh(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
-        Self::open(id, cwd, None, None, true)
+        Self::open(id, cwd, None, None, true, None)
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
     /// the project as its cwd in one step (no recreate, no restore), so the
     /// sidebar never sees an orphaned pre-project session file.
     pub fn new_in_project(id: ThreadId, project: PathBuf) -> ThreadHandle {
-        Self::open(id, project.clone(), None, Some(project), true)
+        Self::open(id, project.clone(), None, Some(project), true, None)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
-    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf) -> ThreadHandle {
-        Self::open(id, cwd, Some(path), None, false)
+    /// `lease` is the session's write lease, acquired by the caller so a
+    /// cross-process contention surfaces at the store's synchronous
+    /// boundary instead of inside the spawned actor.
+    pub fn open_existing(
+        id: ThreadId,
+        cwd: PathBuf,
+        path: PathBuf,
+        lease: std::sync::Arc<crate::session_lease::LeaseEntry>,
+    ) -> ThreadHandle {
+        Self::open(id, cwd, Some(path), None, false, Some(lease))
     }
 
     fn open(
@@ -810,6 +818,7 @@ impl Thread {
         initial_path: Option<PathBuf>,
         project: Option<PathBuf>,
         fresh: bool,
+        lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
     ) -> ThreadHandle {
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
@@ -835,6 +844,7 @@ impl Thread {
             goal_bridge.clone(),
             None,
             &[],
+            lease,
         );
 
         let handle = ThreadHandle::new(Self {
@@ -912,6 +922,7 @@ impl Thread {
             self.goal_bridge.clone(),
             None,
             &self.extra_working_dirs,
+            None,
         );
         if self.permission_mode != PermissionMode::default() {
             engine.set_permission_mode(self.permission_mode);
@@ -1762,6 +1773,7 @@ impl Thread {
             None,
             Some(self.id.0.clone()),
             &[],
+            None,
         );
         if permission_mode != PermissionMode::default() {
             engine.set_permission_mode(permission_mode);

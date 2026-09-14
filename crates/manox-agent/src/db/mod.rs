@@ -58,6 +58,10 @@ pub struct ThreadsDatabase {
 
 impl ThreadsDatabase {
     /// Open (creating if needed) the database file and ensure the schema.
+    /// The store is shared by every manox process on the machine (the
+    /// runtime is multi-instance), so the connection runs in WAL with a
+    /// busy timeout: concurrent writers queue briefly instead of failing
+    /// with `SQLITE_BUSY`, and readers never block writers.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -65,6 +69,10 @@ impl ThreadsDatabase {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open threads db: {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("enable WAL journaling")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("set SQLite busy timeout")?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -423,5 +431,49 @@ mod tests {
         let list = db.list_projects().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0], "/home/user/project-b");
+    }
+
+    #[test]
+    fn open_enables_wal_on_file_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ThreadsDatabase::open(&dir.path().join("threads.db")).unwrap();
+        let mode: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        // WAL is persistent: a second open of the same file stays in WAL.
+        drop(db);
+        let second = ThreadsDatabase::open(&dir.path().join("threads.db")).unwrap();
+        let mode: String = second
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn two_connections_interleaved_writes_do_not_busy_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        let writer_a = ThreadsDatabase::open(&path).unwrap();
+        let writer_b = ThreadsDatabase::open(&path).unwrap();
+        // Interleave writes through both connections — the multi-instance
+        // shape (thread store global + terminal store + per-event opens).
+        // Under rollback-journal defaults with no busy timeout, crossing
+        // transactions surfaces SQLITE_BUSY; WAL queues them through.
+        for round in 0..10 {
+            let mut a = sample_record(&format!("a{round}"));
+            a.summary = "a".into();
+            writer_a.upsert(&a, true).unwrap();
+            let mut b = sample_record(&format!("b{round}"));
+            b.summary = "b".into();
+            writer_b.upsert(&b, true).unwrap();
+        }
+        assert_eq!(writer_a.list(true).unwrap().len(), 20);
     }
 }
