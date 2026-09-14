@@ -437,10 +437,17 @@ impl Terminal {
             }
         }
         self.readiness.on_output(Instant::now());
-        let mut term = self.term.lock();
-        for &b in bytes {
-            self.output_processor.advance(&mut *term, b);
+        {
+            let mut term = self.term.lock();
+            for &b in bytes {
+                self.output_processor.advance(&mut *term, b);
+            }
         }
+        // Plain output carries no alacritty listener event (its
+        // `Event::Wakeup` lives in the unused event_loop), so the redraw
+        // nudge comes from here: one Wakeup per PTY chunk, broadcast by
+        // `with_mut` and coalesced per frame by the view's notify.
+        self.pending_events.push(TerminalEvent::Wakeup);
     }
 
     /// Whether the shell finished init and accepts input — marker tap, quiet
@@ -1145,5 +1152,54 @@ mod tests {
         assert_eq!((target.start_col, target.end_col), (2, 10));
         assert_eq!(target.kind, HoverKind::Url);
         assert!(hyperlink_span(&term, Point::new(Line(0), Column(0))).is_none());
+    }
+
+    /// A PTY output chunk broadcasts exactly the redraw nudge the view
+    /// repaints from: `write_pty_output` buffers one `Wakeup` per chunk and
+    /// `with_mut` flushes it to subscribers.
+    #[test]
+    fn pty_output_broadcasts_wakeup() {
+        // `Terminal::spawn` starts its pumps on the registered runtime; a
+        // leaked one-worker runtime keeps the handle valid for the whole
+        // test process (first registration wins, later ones no-op).
+        static RT: std::sync::OnceLock<&'static tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        let rt = RT.get_or_init(|| {
+            Box::leak(Box::new(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("build test runtime"),
+            ))
+        });
+        crate::runtime::set_runtime(rt.handle().clone());
+
+        let pty = crate::pty::open(&PathBuf::from("/tmp"), 80, 24, Some("/bin/sh"), &[])
+            .expect("open pty");
+        let handle = Terminal::spawn(
+            "t-wakeup".into(),
+            PathBuf::from("/tmp"),
+            80,
+            24,
+            Box::new(pty),
+        )
+        .expect("spawn terminal");
+        let rx = handle.subscribe();
+        handle.with_mut(|t| t.write_pty_output(b"hello"));
+
+        // The pump concurrently broadcasts the shell's own startup output as
+        // Wakeups too, so assert presence within the deadline, not position.
+        let start = Instant::now();
+        let mut saw_wakeup = false;
+        while start.elapsed() < Duration::from_secs(8) && !saw_wakeup {
+            match rx.try_recv() {
+                Ok(ev) if matches!(*ev, TerminalEvent::Wakeup) => saw_wakeup = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(saw_wakeup, "no Wakeup broadcast for PTY output");
+        drop(handle);
     }
 }

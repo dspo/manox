@@ -1,12 +1,19 @@
 //! PTY bridge — `portable-pty` wrapper.
 //!
-//! `open` opens a PTY pair, spawns the user's default shell, and hands back a
-//! `PtyHandle` owning the master, writer, child-killer, and the not-yet-moved
-//! reader fd + child handle. The reader / waiter threads are not started here —
+//! `open` opens a PTY pair, spawns the user's default shell, starts the
+//! writer thread, and hands back a `PtyHandle` owning the master, the
+//! writer-queue send end, the child-killer, and the not-yet-moved reader fd +
+//! child handle. The reader / waiter threads are not started here —
 //! `PtySource::start` does, so the trait contract is uniform across the local
 //! shell and an agent-backed source (a future `CxSessionSource`).
 //!
-//! Once started, two `std::thread`s run:
+//! Three `std::thread`s serve the handle:
+//!   - **writer**: spawned by `open`, the exclusive owner of the master
+//!     writer fd. `write` enqueues onto an unbounded channel; the blocking
+//!     `write_all` happens only here, so a child that stalls on stdin (tty
+//!     input buffer full) stalls this thread alone — a blocking write on the
+//!     UI or event-pump thread would hold terminal locks while stalled and
+//!     can deadlock against the child's own stdout writes.
 //!   - **reader**: blocking `master.read` into an `async_channel` as
 //!     `TerminalEvent::PtyOutput`. A bare `std::thread` (not
 //!     `spawn_blocking`) so the 2-worker tokio pool is never starved by an
@@ -28,7 +35,6 @@ use std::path::Path;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context as _, Result};
-use parking_lot::Mutex;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::event::TerminalEvent;
@@ -53,9 +59,11 @@ pub struct PtyHandle {
     /// teardown action, never before the tree scan). `Option` so the move
     /// is possible out of `&mut self`.
     master: Option<MasterHolder>,
-    /// Taken into the teardown thread by `Drop`: it dups the master fd, so
-    /// no master-side fd of this handle may close before the tree scan.
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    /// Send end of the writer thread's unbounded queue; the writer fd itself
+    /// is owned by that thread exclusively. Taken into the teardown thread
+    /// by `Drop` and dropped there only after the tree kill, so no queued
+    /// byte races teardown and the writer fd closes past the tree scan.
+    writer_tx: Option<async_channel::Sender<Vec<u8>>>,
     /// Moved into the teardown thread by `Drop`; `Option` so the move is
     /// possible out of `&mut self`.
     killer: Option<Box<dyn ChildKiller + Send + Sync>>,
@@ -78,8 +86,8 @@ pub struct PtyHandle {
     wait_thread: Option<JoinHandle<()>>,
 }
 
-/// Open a PTY pair, spawn the shell, and take the master writer + child
-/// killer. The reader fd and child handle stay on the `PtyHandle` until
+/// Open a PTY pair, spawn the shell, start the writer thread, and take the
+/// child killer. The reader fd and child handle stay on the `PtyHandle` until
 /// `PtySource::start` moves them into its threads. `shell` overrides the
 /// default user program when `Some`.
 ///
@@ -150,12 +158,25 @@ pub fn open(
 
     let reader = pair.master.try_clone_reader().context("try_clone_reader")?;
     let writer = pair.master.take_writer().context("take_writer")?;
+    let (writer_tx, writer_rx) = async_channel::unbounded::<Vec<u8>>();
+    let _ = thread::Builder::new()
+        .name("manox-pty-writer".into())
+        .spawn(move || {
+            let mut writer = writer;
+            while let Ok(bytes) = writer_rx.recv_blocking() {
+                if writer.write_all(&bytes).is_err() {
+                    // Child gone (EIO): nothing left to write to.
+                    break;
+                }
+            }
+        })
+        .context("spawn writer thread")?;
     let killer = child.clone_killer();
     let master = MasterHolder(pair.master);
 
     Ok(PtyHandle {
         master: Some(master),
-        writer: Mutex::new(Some(writer)),
+        writer_tx: Some(writer_tx),
         killer: Some(killer),
         ready_nonce,
         #[cfg(unix)]
@@ -240,11 +261,11 @@ impl PtySource for PtyHandle {
     }
 
     fn write(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut guard = self.writer.lock();
-        guard
-            .as_mut()
-            .expect("writer lives until Drop")
-            .write_all(bytes)
+        self.writer_tx
+            .as_ref()
+            .expect("writer_tx lives until Drop")
+            .try_send(bytes.to_vec())
+            .map_err(|_| io::Error::other("pty writer closed"))
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
@@ -282,14 +303,16 @@ impl PtySource for PtyHandle {
 impl Drop for PtyHandle {
     fn drop(&mut self) {
         // Teardown must not block the dropping thread: the killer / child /
-        // master / writer move onto a detached thread that scans the tree,
-        // SIGTERMs it (plus the foreground process group), grants a short
-        // grace, and SIGKILLs survivors. Every master-side fd this handle
-        // owns travels with the thread, so the struct's own field drops
-        // close nothing that could disturb the tree before the scan. The
-        // reader / waiter threads exit on their own once the child dies
-        // (EOF / reap) — they own their reader fd / child handle and
-        // channel-sender clones, so they are safe to outlive this handle.
+        // master / writer-queue send end move onto a detached thread that
+        // scans the tree, SIGTERMs it (plus the foreground process group),
+        // grants a short grace, and SIGKILLs survivors. The writer fd lives
+        // on the writer thread and is dropped there once the queue closes
+        // after the kill (a `write_all` in flight already errored with the
+        // child dead), so no master-side fd of this handle disturbs the tree
+        // before the scan. The reader / waiter / writer threads exit on
+        // their own once the child dies (EOF / reap / EIO + closed queue) —
+        // they own their fds and channel endpoints, so they are safe to
+        // outlive this handle.
         #[cfg(unix)]
         {
             let fg_pgid = self.master.as_ref().and_then(|m| m.process_group_leader());
@@ -297,13 +320,13 @@ impl Drop for PtyHandle {
             let child = self.child.take();
             let shell_pid = self.child_pid;
             let master = self.master.take();
-            let writer = self.writer.get_mut().take();
+            let writer_tx = self.writer_tx.take();
             let _ = thread::Builder::new()
                 .name("manox-pty-teardown".into())
                 .spawn(move || {
                     crate::proctree::terminate(shell_pid, fg_pgid, killer, child);
+                    drop(writer_tx);
                     drop(master);
-                    drop(writer);
                 });
         }
         #[cfg(not(unix))]
@@ -433,5 +456,27 @@ mod tests {
         let tree = snapshot_tree(shell_pid);
         drop(pty);
         assert_tree_gone(shell_pid, &tree);
+    }
+
+    /// The writer never blocks the caller: a child that stopped reading stdin
+    /// fills the tty input buffer, and further writes must still return
+    /// immediately (queued for the writer thread). A caller-side blocking
+    /// `write_all` would wedge here forever.
+    #[test]
+    fn write_never_blocks_when_child_stalls() {
+        let (pty, _shell_pid, _rx) = spawn_shell(b"exec sleep 300\r");
+        // Let the exec land so nothing drains stdin anymore.
+        std::thread::sleep(Duration::from_millis(300));
+        let chunk = vec![b'x'; 4096];
+        let start = Instant::now();
+        for _ in 0..128 {
+            pty.write(&chunk).expect("write is enqueued");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "write blocked the caller for {:?}",
+            start.elapsed()
+        );
+        drop(pty);
     }
 }
