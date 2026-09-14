@@ -32,6 +32,14 @@ pub enum ToolAuthorizationResponse {
     /// withdrawn delivery, or no capable client). Distinct from an empty
     /// `AskUserQuestion` so the model never reads a non-answer as an answer.
     AskUserQuestionExpired,
+    /// The user CLOSED the question card to speak instead — an explicit
+    /// "not now, let me talk" that is neither an answer, a rejection, nor a
+    /// turn interrupt. The tool result tells the model to stop and wait for
+    /// the forthcoming message (dsh `ASK_CANCELLED`), so the model neither
+    /// treats silence as consent nor reads the close as a denial. Distinct
+    /// from `AskUserQuestionExpired` (a delivery that lapsed with no human
+    /// action) so the two causes surface different model guidance.
+    AskUserQuestionDismissed,
 }
 
 /// Metadata of a pending interaction, kept so the workspace can re-surface

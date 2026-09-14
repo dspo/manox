@@ -226,8 +226,18 @@ impl SubagentTool {
         } else {
             resolve_model_override(def, subagent_type, self.provider_registry.as_ref())?
         };
-        let mut selected = select_tools(&self.tools, def);
-        selected.extend(extra_tools);
+        // `never` approval boundary (dsh `subagent approval/policy = never`):
+        // the snapshot's mutating tools ride the auto-deny gate so a call the
+        // host would have parked on a human instead returns a model-facing
+        // rejection. `extra_tools` (the child's own limited Steer) is appended
+        // after — human-interaction names are stripped from it too, so the D5
+        // invariant never depends on what a future host injects here.
+        let mut selected = auto_deny_gated(select_tools(&self.tools, def));
+        selected.extend(
+            extra_tools
+                .into_iter()
+                .filter(|t| !HUMAN_INTERACTION_TOOLS.contains(&t.name())),
+        );
         let worktree = if isolation == Some("worktree") {
             Some(Worktree::prepare(ctx).await?)
         } else {
@@ -468,20 +478,155 @@ fn shell_quote(path: &Path) -> String {
 /// (`{"subagent_event": {...}}`). Only observer-relevant events are
 /// forwarded: assistant text/thinking deltas and tool start/end. Everything
 /// else returns `None` (no emit).
+/// Tools that reach a HUMAN — a subagent must never hold one. `AskUserQuestion`
+/// is the archetype: its whole run is a round trip to a person, which a
+/// background worker has no business interrupting. `select_tools` strips this
+/// set from every subagent snapshot (the D5 guard below), so even a
+/// user-authored `~/.manox/agents/*.md` that names the tool cannot buy a child
+/// the ability to ask.
+pub const HUMAN_INTERACTION_TOOLS: &[&str] = &["AskUserQuestion"];
+
+/// The model-facing reason a gated tool is rejected inside a subagent. Names
+/// the dsh boundary (`operations that require approval are rejected
+/// automatically`) and, unlike a silent refusal, tells the child what it CAN
+/// still do so it reframes instead of retrying the denied call.
+pub const SUBAGENT_APPROVAL_DENIED_REASON: &str = "This operation requires user approval, but a \
+    subagent runs without an approval channel: operations that require approval are rejected \
+    automatically. Read-only work (Read/Grep/Glob/Ls) and workspace-confined writes still run. \
+    Stay within those bounds, or surface the approval-requiring step in your final summary so \
+    the parent agent can perform it interactively.";
+
+/// Tool names the subagent gate is known to wrap even when `is_read_only`
+/// would not (defensive: a mutating tool that also, incorrectly, declares
+/// itself read-only still cannot bypass the `never` boundary). Bash is the
+/// salient case — its `requires_approval` is params-aware (escalated out-of-
+/// sandbox commands) while it must stay available for in-workspace commands.
+const SUBAGENT_APPROVAL_BEARING: &[&str] = &["Bash"];
+
+/// Wraps a snapshot tool with the subagent's `never` approval policy. A tool
+/// whose `requires_approval(params)` is `true` settles to an error the model
+/// sees instead of executing un-gated. This is the delegation-boundary gate the
+/// subagent session otherwise lacks: the host `ApprovalGatedTool` is composed
+/// only on the main assembly line, so a child session would otherwise run bare
+/// gated tools with nothing to consult.
+pub struct SubagentAutoDenyGate {
+    inner: Arc<dyn AgentTool>,
+}
+
+impl SubagentAutoDenyGate {
+    fn new(inner: Arc<dyn AgentTool>) -> Self {
+        Self { inner }
+    }
+    /// Whether a call to the wrapped tool must be rejected in a subagent.
+    pub fn must_deny(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTool for SubagentAutoDenyGate {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        // Preserve the declarative hint so introspection (and the invariant
+        // test) still sees that this tool is approval-bearing.
+        self.inner.requires_approval(params)
+    }
+    fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+    fn execution_mode(&self) -> crate::core::tool::ExecutionMode {
+        self.inner.execution_mode()
+    }
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+    ) -> Result<crate::core::tool::AgentToolResult, ToolError> {
+        if self.inner.requires_approval(&params) {
+            return Err(ToolError::ExecutionFailed(
+                SUBAGENT_APPROVAL_DENIED_REASON.to_string(),
+            ));
+        }
+        self.inner.execute(tool_call_id, params, signal, ctx).await
+    }
+    async fn execute_with_progress(
+        &self,
+        tool_call_id: &str,
+        params: serde_json::Value,
+        signal: CancellationToken,
+        ctx: &dyn ToolContext,
+        progress: &dyn crate::core::tool::ToolProgress,
+    ) -> Result<crate::core::tool::AgentToolResult, ToolError> {
+        if self.inner.requires_approval(&params) {
+            return Err(ToolError::ExecutionFailed(
+                SUBAGENT_APPROVAL_DENIED_REASON.to_string(),
+            ));
+        }
+        self.inner
+            .execute_with_progress(tool_call_id, params, signal, ctx, progress)
+            .await
+    }
+}
+
+/// Map a snapshot through the subagent `never` policy: wrap each tool that can
+/// require approval (any mutating tool, plus the names in
+/// [`SUBAGENT_APPROVAL_BEARING`]), pass pure reads through untouched. The
+/// wrapper consults `requires_approval` per call, so a workspace-confined write
+/// that answers `false` still runs while an approval-bearing call is rejected.
+pub fn auto_deny_gated(tools: Vec<Arc<dyn AgentTool>>) -> Vec<Arc<dyn AgentTool>> {
+    tools
+        .into_iter()
+        .map(|t| {
+            if !t.is_read_only() || SUBAGENT_APPROVAL_BEARING.contains(&t.name()) {
+                Arc::new(SubagentAutoDenyGate::new(t)) as Arc<dyn AgentTool>
+            } else {
+                t
+            }
+        })
+        .collect()
+}
+
 /// Resolve a definition's tool names against the caller's tool snapshot.
 /// An empty `tools` list means the full snapshot, minus the `Steer` tool
-/// itself: a subagent must not inherit the parent's full-privilege Steer
-/// (the host injects a limited `SteerTool(from=Subagent)` via `extra_tools`).
+/// itself (a subagent must not inherit the parent's full-privilege Steer — the
+/// host injects a limited `SteerTool(from=Subagent)` via `extra_tools`) and
+/// minus every [`HUMAN_INTERACTION_TOOLS`] name. The human-interaction strip
+/// is the D5 invariant enforced at assembly: a child session is never given a
+/// tool whose run is a round trip to a human, whether the definition opted into
+/// the full snapshot or named the tool explicitly.
 fn select_tools(tools: &[Arc<dyn AgentTool>], def: &AgentDef) -> Vec<Arc<dyn AgentTool>> {
     let selected: Vec<_> = tools
         .iter()
         .filter(|t| t.name() != "Steer")
+        .filter(|t| !HUMAN_INTERACTION_TOOLS.contains(&t.name()))
         .filter(|t| def.tools.is_empty() || def.tools.iter().any(|n| n == t.name()))
         .cloned()
         .collect();
     if !def.tools.is_empty() {
         for name in &def.tools {
             if !selected.iter().any(|t| t.name() == name) {
+                // A definition naming a human-interaction tool is the expected
+                // shape of a misconfigured child def — name the strip so the
+                // warning is not mistaken for a plain "not in snapshot" typo.
+                if HUMAN_INTERACTION_TOOLS.contains(&name.as_str()) {
+                    tracing::warn!(
+                        agent = %def.name,
+                        tool = %name,
+                        "agent definition names a human-interaction tool; subagents never \
+                         receive it (DELEGATED_CALLER guard)"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     agent = %def.name,
                     tool = %name,
@@ -552,6 +697,193 @@ mod tests {
             system_prompt: "p".into(),
         };
         assert_eq!(select_tools(&tools, &def).len(), 1);
+    }
+
+    /// A minimal mock whose `requires_approval` is driven by a `gate` param and
+    /// whose name/read-only flag are configurable — enough to exercise both the
+    /// D5 human-interaction strip and the D6 `never` gate without a real tool.
+    struct MockGateTool {
+        name: &'static str,
+        read_only: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for MockGateTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "mock"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn requires_approval(&self, params: &serde_json::Value) -> bool {
+            params
+                .get("gate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        }
+        fn is_read_only(&self) -> bool {
+            self.read_only
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            _ctx: &dyn ToolContext,
+        ) -> Result<crate::core::tool::AgentToolResult, ToolError> {
+            Ok(crate::core::tool::AgentToolResult::text(format!(
+                "RAN:{}",
+                self.name
+            )))
+        }
+    }
+
+    /// D5 invariant: a subagent never receives a human-interaction tool —
+    /// neither via the full-snapshot opt-in (`tools: []`) nor by a custom
+    /// definition naming it explicitly. `select_tools` is the assembly guard
+    /// that turns the current "the snapshot simply lacks AskUserQuestion"
+    /// accident into an enforced rule.
+    #[test]
+    fn select_tools_strips_human_interaction_even_when_named() {
+        let ask: Arc<dyn AgentTool> = Arc::new(MockGateTool {
+            name: "AskUserQuestion",
+            read_only: true,
+        });
+        let read: Arc<dyn AgentTool> = Arc::new(crate::core::tools::read::ReadTool);
+        let tools = vec![Arc::clone(&ask), Arc::clone(&read)];
+
+        // Full snapshot (`tools: []`) — the ask tool is stripped, read survives.
+        let def_all = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec![],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let selected = select_tools(&tools, &def_all);
+        assert_eq!(
+            selected.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["Read"],
+            "full-snapshot child must not get the ask tool"
+        );
+
+        // A custom def that explicitly names the ask tool still cannot get it.
+        let def_named = AgentDef {
+            name: "X".into(),
+            description: "d".into(),
+            tools: vec!["AskUserQuestion".into(), "Read".into()],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let selected = select_tools(&tools, &def_named);
+        assert_eq!(
+            selected.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["Read"],
+            "naming a human-interaction tool must not grant it to a child"
+        );
+    }
+
+    /// D6 invariant: the subagent `never` gate rejects an approval-bearing call
+    /// with the dsh reason (so the model learns, rather than a silent hang)
+    /// and passes an approval-free call straight through to the inner tool.
+    #[tokio::test]
+    async fn auto_deny_gate_rejects_gated_and_runs_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+
+        let wrapped = auto_deny_gated(vec![Arc::new(MockGateTool {
+            name: "Gated",
+            read_only: false,
+        })]);
+        assert_eq!(wrapped.len(), 1, "one tool in, one tool out");
+        assert_eq!(wrapped[0].name(), "Gated", "identity preserved");
+        // A mutating tool is wrapped; the gate preserves its read-only view.
+        assert!(
+            !wrapped[0].is_read_only(),
+            "wrapping preserves read-only=false"
+        );
+
+        // Approval-bearing call → rejected, not executed.
+        let gated = wrapped[0]
+            .execute(
+                "c1",
+                serde_json::json!({ "gate": true }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect_err("a gated call must not run in a subagent");
+        let msg = gated.to_string();
+        assert!(
+            msg.contains("rejected automatically"),
+            "the denial names the dsh boundary: {msg}"
+        );
+
+        // Approval-free call → delegates to the inner tool.
+        let free = wrapped[0]
+            .execute(
+                "c2",
+                serde_json::json!({ "gate": false }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("an approval-free call runs");
+        assert!(!free.is_error, "an approval-free call is not an error");
+        let text = match &free.content[0] {
+            crate::core::types::ContentBlock::Text { text, .. } => text.clone(),
+            _ => panic!("expected a text block"),
+        };
+        assert_eq!(text, "RAN:Gated", "the inner tool executed");
+    }
+
+    /// A pure read (not in `SUBAGENT_APPROVAL_BEARING`) passes straight
+    /// through `auto_deny_gated` unwrapped — so a `requires_approval`-bearing
+    /// param still runs (no gate consulted). A (wrongly) read-only Bash is
+    /// gated defensively by name and rejects the same param.
+    #[tokio::test]
+    async fn auto_deny_gate_leaves_reads_untouched_but_gates_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = spawn_ctx(dir.path());
+
+        // A read-only mock that is NOT Bash: passed through, so a gated param
+        // does not trigger a rejection (the tool simply runs).
+        let read_like = auto_deny_gated(vec![Arc::new(MockGateTool {
+            name: "Grep",
+            read_only: true,
+        })]);
+        let ran = read_like[0]
+            .execute(
+                "c1",
+                serde_json::json!({ "gate": true }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("an unwrapped read runs regardless of gate");
+        assert!(!ran.is_error, "unwrapped read-only tool executed");
+
+        // Bash is gated defensively by name even if it declares read-only.
+        let bash = auto_deny_gated(vec![Arc::new(MockGateTool {
+            name: "Bash",
+            read_only: true,
+        })]);
+        let denied = bash[0]
+            .execute(
+                "c2",
+                serde_json::json!({ "gate": true }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect_err("Bash rides the gate even when it claims read-only");
+        assert!(
+            denied.to_string().contains("rejected automatically"),
+            "Bash gated defensively: {denied}"
+        );
     }
 
     /// The host snapshot now carries Bash/Write/Edit alongside the read-only

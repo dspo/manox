@@ -71,6 +71,11 @@ pub struct ApprovalGate {
     /// decision has no notice vocabulary of its own). `None` on a
     /// standalone gate (tests): verdicts simply do not journal.
     journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
+    /// D5 marker: `true` on a gate handed to a *delegated* (subagent) tool.
+    /// The runtime root's gate is `false`. `PiAskUserQuestionTool` refuses a
+    /// call on a delegated gate (`DELEGATED_CALLER`) so only the root can ask
+    /// a human. Default `false` (main-line gate).
+    delegated: bool,
 }
 
 impl ApprovalGate {
@@ -84,7 +89,21 @@ impl ApprovalGate {
             notice_tx,
             model: model_slot,
             journal_sink: Mutex::new(None),
+            delegated: false,
         }
+    }
+
+    /// Mark this gate as belonging to a delegated (subagent) tool — the
+    /// `DELEGATED_CALLER` signal `PiAskUserQuestionTool` refuses on.
+    pub fn with_delegated(mut self, delegated: bool) -> Self {
+        self.delegated = delegated;
+        self
+    }
+
+    /// Whether this gate backs a delegated (subagent) caller rather than the
+    /// runtime root.
+    pub fn is_delegated(&self) -> bool {
+        self.delegated
     }
 
     /// Wire the actor command sender that carries verdict journaling (K3).
@@ -154,6 +173,7 @@ impl ApprovalGate {
                 ToolAuthorizationResponse::Decision(PermissionDecision::Deny) => "deny",
                 ToolAuthorizationResponse::AskUserQuestion { .. } => "answered",
                 ToolAuthorizationResponse::AskUserQuestionExpired => "expired",
+                ToolAuthorizationResponse::AskUserQuestionDismissed => "dismissed",
             };
             self.journal_decision(id, &pending.meta.tool_name, verdict);
             let _ = pending.tx.send(response);
@@ -703,11 +723,27 @@ impl PiAgentTool for ApprovalGatedTool {
 /// modes never touch it.
 pub struct PiAskUserQuestionTool {
     gate: Arc<ApprovalGate>,
+    /// Live plan-mode flag, so a dismissed question card can tell the model
+    /// to *stay in plan mode* when the user closes it mid-planning (dsh
+    /// `ASK_CANCELLED` under `intent:plan-review`) versus the plain stop-and-
+    /// wait line outside plan mode. `None` in bare test constructions → the
+    /// general wording.
+    plan: Option<Arc<crate::plan_mode::PlanSessionState>>,
 }
 
 impl PiAskUserQuestionTool {
     pub fn new(gate: Arc<ApprovalGate>) -> Self {
-        Self { gate }
+        Self { gate, plan: None }
+    }
+
+    /// Attach the session's live plan-mode state (host assembly).
+    pub fn with_plan_state(mut self, plan: Arc<crate::plan_mode::PlanSessionState>) -> Self {
+        self.plan = Some(plan);
+        self
+    }
+
+    fn plan_mode_active(&self) -> bool {
+        self.plan.as_ref().is_some_and(|p| p.enabled())
     }
 }
 
@@ -742,6 +778,22 @@ impl PiAgentTool for PiAskUserQuestionTool {
         signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
+        // D5 `DELEGATED_CALLER` (dsh L4: only the runtime root may ask a human).
+        // The approval gate is the host's human-facing service; a subagent runs
+        // with a synthetic fail-closed gate (see `engine`'s subagent build), so
+        // a bare `ApprovalGate` on the *main* line is the marker of the runtime
+        // root. Any caller that is not the root is rejected before its question
+        // can park on the human. This is defense-in-depth behind the
+        // `select_tools` assembly strip (D5): today the child snapshot already
+        // lacks this tool, so the guard closes the hole a future mis-assembly
+        // or a name-padded custom definition would open.
+        if self.gate.is_delegated() {
+            return Ok(AgentToolResult::error(
+                "[DELEGATED_CALLER] A delegated subagent cannot ask the user \
+                 questions. Include the open question in your final summary so \
+                 the parent agent — which can ask — resolves it.",
+            ));
+        }
         if let Err(err) = validate_ask_input(&params) {
             return Err(ToolError::InvalidArguments(err));
         }
@@ -798,18 +850,34 @@ impl PiAgentTool for PiAskUserQuestionTool {
                 .expect("ask user questions render");
                 Ok(AgentToolResult::text(text))
             }
-            // The adjudication expired with no user input. This is NOT an
-            // empty answer: the text names that explicitly so the model
-            // re-asks or proceeds under stated assumptions instead of
-            // reading silence as consent.
+            // A lapsed delivery (no client able to answer, or a withdrawn
+            // delivery) with NO human action. This is NOT an empty answer:
+            // the text names that explicitly so the model re-asks or proceeds
+            // under stated assumptions instead of reading silence as consent.
             ToolAuthorizationResponse::AskUserQuestionExpired => Ok(AgentToolResult::error(
-                "[no-answer] The user did not answer this question within the \
-                 adjudication window. Do not treat this as input or consent. \
-                 Re-ask with fewer, simpler questions or continue under \
-                 explicitly stated assumptions.",
+                "[no-answer] The user did not answer this question — no client was \
+                 available to answer it, or the pending question was withdrawn. Do not \
+                 treat this as input or consent. Re-ask with fewer, simpler questions \
+                 or continue under explicitly stated assumptions.",
             )),
-            // Any bare decision means the question never reached the user
-            // (cancel or dismissed card): surface the denial as-is.
+            // The user closed the card to speak instead (dsh `ASK_CANCELLED`):
+            // NOT an answer, NOT a rejection, NOT a turn interrupt. The model
+            // stops and waits for the forthcoming message. In plan mode the
+            // dsh line keeps the "stay in plan mode" clause; elsewhere the
+            // same guidance drops it. Never re-asked as a denial.
+            ToolAuthorizationResponse::AskUserQuestionDismissed => {
+                let text = if self.plan_mode_active() {
+                    "The user dismissed the review to speak instead; stay in plan mode, \
+                     stop here, and wait for their message."
+                } else {
+                    "The user dismissed your questions to speak instead; stop here and \
+                     wait for their message."
+                };
+                Ok(AgentToolResult::text(text))
+            }
+            // Any bare decision is a real rejection of the prompt — surface the
+            // tool-denied render. A card *close* is no longer routed here (it
+            // arrives as AskUserQuestionDismissed), so this arm is reject-only.
             _ => {
                 let text = crate::prompt::render_static(
                     crate::prompt::PromptTemplate::WrapperToolDenied,
@@ -1113,6 +1181,135 @@ mod tests {
             other => panic!("expected text content, got {other:?}"),
         };
         assert!(text.contains("[no-answer]"), "expired verdict text: {text}");
+    }
+
+    /// Extract the single text block of a tool result.
+    fn result_text(result: &AgentToolResult) -> String {
+        match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn ask_params() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "q", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "a", "description": ""},
+                    {"label": "b", "description": ""},
+                ],
+            }],
+        })
+    }
+
+    /// Drive the ask tool and settle its parked card with `response`.
+    async fn run_ask_settled(
+        tool: &PiAskUserQuestionTool,
+        gate: &Arc<ApprovalGate>,
+        ctx: &LocalToolContext,
+        response: ToolAuthorizationResponse,
+    ) -> AgentToolResult {
+        let settle = {
+            let gate = Arc::clone(gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                gate.respond("ask-1", response);
+            })
+        };
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), ctx)
+            .await
+            .expect("the ask tool returns a tool result, not a hard error");
+        settle.await.unwrap();
+        result
+    }
+
+    /// PR-0b: a card the user CLOSED to speak (`Dismissed`) is a distinct,
+    /// non-rejection, non-timeout outcome. Outside plan mode it tells the
+    /// model to stop and wait for the message — with no "plan mode" clause and
+    /// NOT the `[no-answer]`/denial text the old conflation produced.
+    #[tokio::test]
+    async fn ask_dismissed_outside_plan_mode_waits_for_message() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let result = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert!(!result.is_error, "a dismissal is guidance, not an error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("dismissed") && text.contains("wait for their message"),
+            "dismissal verdict text: {text}"
+        );
+        assert!(
+            !text.contains("plan mode"),
+            "general line has no plan clause: {text}"
+        );
+        assert!(
+            !text.contains("[no-answer]") && !text.contains("denied"),
+            "dismissal must not read as expiry or denial: {text}"
+        );
+    }
+
+    /// PR-0b: inside plan mode the dsh "stay in plan mode" clause is present,
+    /// so the model keeps drafting rather than exiting or re-asking.
+    #[tokio::test]
+    async fn ask_dismissed_in_plan_mode_keeps_plan_clause() {
+        let (gate, _rx) = gate_with_events();
+        let plan = crate::plan_mode::PlanSessionState::new();
+        plan.set(true, None);
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
+        let ctx = tool_ctx();
+        let result = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert!(!result.is_error);
+        let text = result_text(&result);
+        assert!(
+            text.contains("stay in plan mode") && text.contains("wait for their message"),
+            "plan-mode dismissal keeps the stay clause: {text}"
+        );
+    }
+
+    /// D5 `DELEGATED_CALLER`: the ask tool refuses to park a human when it is
+    /// handed a delegated (subagent) gate — it returns before registering any
+    /// pending interaction or emitting an authorization event.
+    #[tokio::test]
+    async fn ask_from_delegated_gate_is_rejected_as_delegated_caller() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let gate = Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))).with_delegated(true));
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
+            .await
+            .expect("returns a tool result, not a hard error");
+        assert!(result.is_error, "a delegated call is an error to the model");
+        let text = result_text(&result);
+        assert!(
+            text.contains("[DELEGATED_CALLER]"),
+            "names the dsh taxonomy code: {text}"
+        );
+        assert!(
+            gate.pending_entries().is_empty(),
+            "no human card was parked by a delegated caller"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no authorization round trip was emitted"
+        );
     }
 
     #[tokio::test]
