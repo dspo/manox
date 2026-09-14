@@ -1740,7 +1740,9 @@ fn build_tools(
             Arc::new(wrapper) as Arc<dyn PiAgentTool>
         })
         .collect();
-    tools.push(Arc::new(PiAskUserQuestionTool::new(Arc::clone(gate))));
+    tools.push(Arc::new(
+        PiAskUserQuestionTool::new(Arc::clone(gate)).with_plan_state(Arc::clone(plan)),
+    ));
     // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
     // the verdict request itself, not a side effect.
     tools.push(Arc::new(crate::plan_mode::ProposePlanTool::new(

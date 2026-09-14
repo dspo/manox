@@ -1269,15 +1269,18 @@ impl AgentServerInner {
             // Not registered under the delivery's GW3 cancel tokens: the
             // settling waterfall's `DeliveryGuard` cancels the whole
             // delivery id, which would mis-kill this owner's fresh waiter.
-            // A replayed delivery superseded elsewhere converges on
-            // CALL_TIMEOUT; the engine gate's first-wins idempotence absorbs
-            // the late double-apply.
+            // PR-0a: a replayed adjudication is the SAME human-facing card a
+            // newly-joined owner is re-delivered, so it awaits their answer
+            // with no wall-clock deadline too. A delivery superseded elsewhere
+            // is absorbed by the engine gate's first-wins idempotence when this
+            // waiter finally resolves (on the owner's reply or their connection
+            // closing); the pending record is retired on the next settle.
             let inner = Arc::clone(self);
             let sid = session_id.to_string();
             manox_agent::runtime::handle().spawn(async move {
-                let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-                    Ok(Ok(o)) => o,
-                    _ => Err(RpcError::new(-1, "replayed adjudication reply timed out")
+                let outcome = match rx.recv().await {
+                    Ok(o) => o,
+                    _ => Err(RpcError::new(-1, "replayed adjudication delivery closed")
                         .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
                 };
                 apply_reply(&inner, &sid, rec.ctx, outcome, None);
@@ -3643,20 +3646,30 @@ async fn route_waterfall(
             .expect("every target registered a token")
             .clone();
         manox_agent::runtime::handle().spawn(async move {
+            // PR-0a: a human answerer is awaited with NO wall-clock deadline
+            // (dsh semantics: a pending interaction lives until the human
+            // answers, the delivery is explicitly withdrawn, or the client
+            // channel closes). Convergence is event-driven — an answered reply,
+            // a `CancelDelivery` (the token below), or a re-seat / dead-
+            // connection resolving the waiter — never a clock. The engine gate
+            // remains first-wins, so a late answer after a hand-off is inert.
             let event = tokio::select! {
                 _ = token.cancelled() => DeliveryEvent::Expired(
                     RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                 ),
-                replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
+                replied = rx.recv() => match replied {
                     // The re-seat cancel resolves this waiter with a coded
                     // Err — the one Err outcome that is a hand-off, not a
                     // delivery failure or a rejection.
-                    Ok(Ok(Err(e))) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
+                    Ok(Err(e)) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
                         DeliveryEvent::Reseated
                     }
                     Ok(Ok(o)) => DeliveryEvent::Reply(o),
+                    // The waiter resolved with a non-reseat Err, or the channel
+                    // closed with the client gone: the delivery lapsed with no
+                    // human action — fail-closed, NOT a fabricated timeout.
                     _ => DeliveryEvent::Expired(
-                        RpcError::new(-1, "adjudication reply timed out").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+                        RpcError::new(-1, "adjudication delivery closed before an answer").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                     ),
                 },
             };
@@ -3729,7 +3742,7 @@ async fn route_waterfall(
         },
     );
     if outcome.is_err() && verdict_failure.is_none() {
-        inner.note_error(session_id, "adjudication rejected or timed out");
+        inner.note_error(session_id, "adjudication rejected or lapsed (no answer)");
     }
     apply_reply(inner, session_id, ctx, outcome, verdict_failure);
 }
@@ -3846,6 +3859,18 @@ fn apply_ask_reply(
     outcome: Result<Value, RpcError>,
 ) {
     let response = match outcome {
+        // PR-0b (server-first): a client that lets the user CLOSE the card to
+        // speak replies with an explicit `dismissed` marker (a top-level bool,
+        // or the report's canonical `outcome: "dismissed"`). A non-answer that
+        // is neither a rejection nor a lapse. Old clients never send it, so the
+        // answer/`response` path is byte-for-byte unchanged for them; the
+        // manox-app side of this marker is a coordinated batch-2 change.
+        Ok(v)
+            if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
+                || v.get("outcome").and_then(Value::as_str) == Some("dismissed") =>
+        {
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+        }
         Ok(v) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
             answers: v
                 .get("answers")
@@ -3862,10 +3887,11 @@ fn apply_ask_reply(
                 .unwrap_or_default(),
             response: v.get("response").and_then(Value::as_str).map(String::from),
         },
-        // The reply never arrived as an answer (adjudication timeout,
-        // withdrawn delivery, disconnected peer): an explicit non-answer —
-        // an empty `AskUserQuestion` would read to the model as the user
-        // answering nothing on purpose.
+        // The reply never arrived as an answer (a withdrawn delivery, a
+        // disconnected peer, or an abandoned replay waiter — NOT a wall-clock
+        // timeout, which PR-0a removed for human adjudications): an explicit
+        // non-answer. An empty `AskUserQuestion` would read to the model as the
+        // user answering nothing on purpose.
         Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
     };
     if let Some(thread) = inner.session_thread(session_id) {
