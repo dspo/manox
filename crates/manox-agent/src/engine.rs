@@ -307,9 +307,11 @@ struct EngineState {
     /// effective cwd (same-repo worktree auto-admission + escalation
     /// accumulation). Feeds both the fs fence and the bash seatbelt.
     granted_roots: crate::granted_roots::GrantedRoots,
-    /// The cwd last reported through a `CwdChanged` event. A settle emits
-    /// one event per durable move, so the UI's directory display tracks the
-    /// session tail without per-turn chatter.
+    /// The cwd last reported through a `CwdChanged` event. Writers: the
+    /// establishment announcement, the `SetCwd` handler, the post-`Ready`
+    /// seed, and each turn's settle — one event per durable move, so the
+    /// UI's directory display tracks the session tail without per-turn
+    /// chatter.
     last_cwd_note: Mutex<Option<String>>,
 }
 
@@ -3350,7 +3352,13 @@ async fn run_actor(
     if let Some(project) = &project {
         bind_project(&sessions_dir, &session, project, &state, &notice_tx).await;
     }
-    announce_established_cwd(&session, &state, &notice_tx).await;
+    // A fresh chain announces exactly one `cwd_change` witness for its
+    // effective cwd (the projection fold never reads the session header).
+    // A restore announces nothing: the reopened chain already carries (or
+    // truly lacks) its own moves.
+    if !restored {
+        announce_established_cwd(&session, &state, &notice_tx).await;
+    }
     spawn_session_list_refresh(&sessions_dir, &state);
 
     // Idle-wakeup channel: the harness listener signals when monitor events
@@ -3468,17 +3476,19 @@ async fn run_actor(
     if restored {
         state.session_start_fired.store(true, Ordering::SeqCst);
     }
-    // Seed the cwd display right after `Ready`: a resumed session may
+    // Seed the cwd display right after `Ready`: a restored session may
     // project an effective cwd (a `cwd_change` tail) that differs from the
-    // launch directory, and the facade mirror starts empty. Seeding here
-    // (and only here — settles handle the steady state) makes the first
-    // `thread_info` already carry the directory the session works in.
+    // launch directory, and the facade mirror starts empty. Change-gated —
+    // a fresh chain's establishment announcement (above) already reported
+    // the value; a restored chain's tail lands exactly once here.
     let projected = session.projected_cwd().await;
     let projected_str = projected.to_string_lossy().into_owned();
-    *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-        path: projected_str,
-    })));
+    if state.last_cwd_note.lock().unwrap().as_deref() != Some(projected_str.as_str()) {
+        *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+            path: projected_str,
+        })));
+    }
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
 
@@ -4073,37 +4083,7 @@ async fn run_actor(
                 spawn_session_list_refresh(&sessions_dir, &state);
             }
             SessionCmd::SetCwd { path } => {
-                if !path.is_dir() {
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!(
-                            "set_cwd: working directory does not exist: {}",
-                            path.display()
-                        ),
-                    ))));
-                    continue;
-                }
-                // A no-op switch (the projected cwd already matches) only
-                // refreshes the note — no duplicate `cwd_change` entry.
-                if session.projected_cwd().await == path {
-                    let path_str = path.to_string_lossy().into_owned();
-                    *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
-                    let _ =
-                        notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-                            path: path_str,
-                        })));
-                    continue;
-                }
-                if let Err(err) = session.set_session_cwd(path.clone()).await {
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!("set_cwd failed: {err:#}"),
-                    ))));
-                    continue;
-                }
-                let path_str = path.to_string_lossy().into_owned();
-                *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
-                let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-                    path: path_str,
-                })));
+                handle_set_cwd(&mut session, &state, &notice_tx, &path).await;
             }
             SessionCmd::NewSession { cwd, project } => {
                 let (builder, orchestrators, read_only_subagent) = session_builder(
@@ -5222,12 +5202,15 @@ async fn bind_project(
     }
 }
 
-/// Every fresh session establishment is a durable cwd move for whoever
-/// already follows the thread: the projection fold reads journal entries,
-/// never the session file's header, so the effective cwd gets one
-/// `cwd_change` witness whenever it differs from the last value reported
-/// to the facade. A restore needs no announcement — the reloaded chain
-/// already carries (or truly lacks) its own moves.
+/// Journal the fresh session chain's one `cwd_change` witness: the
+/// projection fold reads journal entries, never the session file's header,
+/// so every establishment (startup build, `NewSession` swap) records its
+/// effective cwd unconditionally — the witness count is per chain, not per
+/// actor. No value guard: a guard would couple the witness to command
+/// arrival order (`SetCwd` advances `last_cwd_note`; a swap-then-set or
+/// set-then-swap shuffle could silently swallow the new chain's entry),
+/// while duplicate publishes are already idempotent downstream — the fold
+/// re-derives the same value and the client merge stays higher-seq-wins.
 async fn announce_established_cwd(
     session: &AgentSession,
     state: &Arc<EngineState>,
@@ -5235,9 +5218,6 @@ async fn announce_established_cwd(
 ) {
     let projected = session.projected_cwd().await;
     let projected_str = projected.to_string_lossy().into_owned();
-    if state.last_cwd_note.lock().unwrap().as_deref() == Some(projected_str.as_str()) {
-        return;
-    }
     let appender = session.journal_appender();
     let payload = serde_json::json!({ "cwd": &projected_str });
     if let Err(err) = append_typed_resilient(&appender, "cwd_change", payload).await {
@@ -5253,6 +5233,46 @@ async fn announce_established_cwd(
     *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
     let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
         path: projected_str,
+    })));
+}
+
+/// The host-driven working-directory switch (`SetCwd`): a real move is
+/// durable through `set_session_cwd` (one `cwd_change` per move); a switch
+/// onto the projected tail only re-reports the facade note — the chain
+/// never gains a duplicate entry.
+async fn handle_set_cwd(
+    session: &mut AgentSession,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    path: &Path,
+) {
+    if !path.is_dir() {
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+            anyhow::anyhow!(
+                "set_cwd: working directory does not exist: {}",
+                path.display()
+            ),
+        ))));
+        return;
+    }
+    if session.projected_cwd().await == path {
+        let path_str = path.to_string_lossy().into_owned();
+        *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+            path: path_str,
+        })));
+        return;
+    }
+    if let Err(err) = session.set_session_cwd(path.to_path_buf()).await {
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+            anyhow::anyhow!("set_cwd failed: {err:#}"),
+        ))));
+        return;
+    }
+    let path_str = path.to_string_lossy().into_owned();
+    *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+        path: path_str,
     })));
 }
 
@@ -9613,13 +9633,12 @@ mod tests {
         session.close().await.unwrap();
     }
 
-    /// Fresh-session establishment is a durable cwd move: exactly one
+    /// A fresh session chain establishment journals exactly one
     /// `cwd_change` witness for the effective working directory (the
     /// follow stream's projection fold never sees the session file's
-    /// header), and one `CwdChanged` on the notice face. Re-establishing
-    /// onto the same directory stays silent.
+    /// header), plus one `CwdChanged` on the notice face.
     #[tokio::test]
-    async fn establishment_journals_the_effective_cwd_once() {
+    async fn establishment_journals_one_cwd_witness() {
         let dir = tempfile::tempdir().unwrap();
         let session = decision_rig_session(&dir).await;
         let state = test_engine_state();
@@ -9658,12 +9677,25 @@ mod tests {
             panic!("expected CwdChanged");
         };
         assert_eq!(path, projected_str);
+        session.close().await.unwrap();
+    }
 
+    /// The project-binding command sequence — the `NewSession` swap's
+    /// establishment announcement, then the facade's `SetCwd` onto the
+    /// same directory — leaves exactly one witness on the new chain: the
+    /// no-op switch must not stack atop it, and a later real move still
+    /// lands its own.
+    #[tokio::test]
+    async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = decision_rig_session(&dir).await;
+        let state = test_engine_state();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        let project = session.projected_cwd().await;
         announce_established_cwd(&session, &state, &notice_tx).await;
-        assert!(
-            notice_rx.try_recv().is_err(),
-            "an unchanged cwd announces nothing"
-        );
+        handle_set_cwd(&mut session, &state, &notice_tx, &project).await;
+
         let rows = session.journal_range(0, u64::MAX).await.unwrap();
         let witnesses = rows
             .iter()
@@ -9674,7 +9706,23 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(witnesses, 1, "the witness stays one per durable move");
+        assert_eq!(
+            witnesses, 1,
+            "the no-op switch must not stack atop the establishment witness"
+        );
+
+        let other = dir.path().to_path_buf();
+        handle_set_cwd(&mut session, &state, &notice_tx, &other).await;
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        let tail = rows.iter().rev().find_map(|record| match &record.entry {
+            manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. } => Some(cwd.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tail.as_deref(),
+            Some(other.to_string_lossy().as_ref()),
+            "a switch onto a different directory still lands its own durable move"
+        );
         session.close().await.unwrap();
     }
 
