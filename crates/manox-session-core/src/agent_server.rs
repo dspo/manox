@@ -3664,11 +3664,17 @@ async fn route_waterfall(
                     Ok(Err(e)) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
                         DeliveryEvent::Reseated
                     }
-                    Ok(Ok(o)) => DeliveryEvent::Reply(o),
-                    // The waiter resolved with a non-reseat Err, or the channel
-                    // closed with the client gone: the delivery lapsed with no
-                    // human action — fail-closed, NOT a fabricated timeout.
-                    _ => DeliveryEvent::Expired(
+                    // A delivered reply payload — an answer (`Ok`) or an
+                    // explicit rejection (`Err`). Both are a human acting on
+                    // the card; a rejection settles the waterfall against the
+                    // call (fail-closed), never as a lapse.
+                    Ok(o) => DeliveryEvent::Reply(o),
+                    // The channel closed with no reply (peer disconnected, or a
+                    // teardown resolved nothing): the delivery lapsed without a
+                    // human action — fail-closed, NOT a wall-clock timeout
+                    // (PR-0a removed the clock; this arm replaces the old
+                    // timeout-expiry).
+                    Err(_) => DeliveryEvent::Expired(
                         RpcError::new(-1, "adjudication delivery closed before an answer").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                     ),
                 },

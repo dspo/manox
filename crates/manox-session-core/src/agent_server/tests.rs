@@ -2120,6 +2120,120 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// PR-0b (server-first): a client reply carrying the `dismissed` marker —
+/// either a `dismissed: true` bool or an `outcome: "dismissed"` string —
+/// converges to `AskUserQuestionDismissed` at the gate, distinct from a
+/// rejection and from a lapsed delivery. Backward compatible: the marker is
+/// absent from old clients, which keep the answer / `response` path unchanged.
+#[test]
+fn ask_dismissed_marker_converges_as_dismissed() {
+    use manox_agent::permission::ToolAuthorizationResponse;
+    let _g = lock_globals();
+    for marker in [json!({"dismissed": true}), json!({"outcome": "dismissed"})] {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        seed_pending_ask(&engine, "q1");
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let id = park_ask(&client, &engine, "s1", "q1");
+        client.send(FromClient::Reply {
+            id,
+            outcome: Ok(marker.clone()),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+                id == "q1" && matches!(r, ToolAuthorizationResponse::AskUserQuestionDismissed)
+            });
+            if seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dismissal marker {marker} never reached the gate as Dismissed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A dismissal must NOT also be recorded as an answer or an expiry.
+        let held = engine.auth_responses.lock().unwrap();
+        assert!(
+            !held.iter().any(|(id, r)| id == "q1"
+                && matches!(
+                    r,
+                    ToolAuthorizationResponse::AskUserQuestion { .. }
+                        | ToolAuthorizationResponse::AskUserQuestionExpired
+                )),
+            "dismissal conflated with an answer/expiry: {held:?}"
+        );
+        drop(held);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
+/// PR-0a: with the 300s wall-clock removed from the adjudication wait, a
+/// parked ask whose owner is STILL connected and simply has not answered yet
+/// must NOT be settled as `Expired`. (Before PR-0a this converged to Expired
+/// after the clock; the disconnect case is covered by
+/// `ask_expires_when_the_holding_owner_disconnects`.) This pins the "no
+/// premature expiry" half of the no-deadline change deterministically.
+#[test]
+fn parked_ask_is_not_expired_while_the_owner_stays_connected() {
+    use manox_agent::permission::ToolAuthorizationResponse;
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client, &engine, "s1", "q1");
+    // Well inside the removed 300s window: nothing should have settled.
+    std::thread::sleep(Duration::from_millis(1500));
+    let settled = engine
+        .auth_responses
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(id, _)| id == "q1");
+    assert!(
+        !settled,
+        "a still-connected owner must not be expired prematurely (no-deadline PR-0a)"
+    );
+    // The parked call is still replay-live in §D.6's registry.
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_some_and(|v| v.iter().any(|rec| rec.key == "q1")),
+        "the pending ask stays parked for the owner to answer"
+    );
+    // A real answer still converges it as an answer, not an expiry.
+    let id = MsgId::new("q1".to_string());
+    client.send(FromClient::Reply {
+        id,
+        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    let held = engine.auth_responses.lock().unwrap();
+    assert!(
+        held.iter()
+            .any(|(id, r)| id == "q1"
+                && matches!(r, ToolAuthorizationResponse::AskUserQuestion { .. })),
+        "the late answer reaches the gate as an answer: {held:?}"
+    );
+    drop(held);
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// §D.6 replay, switch-back path: an owner that re-opens a session it
 /// already holds a live waiter for gets the card RE-SENT on the same
 /// deterministic MsgId without a second `register` (the GW2 duplicate

@@ -1183,6 +1183,135 @@ mod tests {
         assert!(text.contains("[no-answer]"), "expired verdict text: {text}");
     }
 
+    /// Extract the single text block of a tool result.
+    fn result_text(result: &AgentToolResult) -> String {
+        match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    fn ask_params() -> serde_json::Value {
+        serde_json::json!({
+            "questions": [{
+                "question": "q", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "a", "description": ""},
+                    {"label": "b", "description": ""},
+                ],
+            }],
+        })
+    }
+
+    /// Drive the ask tool and settle its parked card with `response`.
+    async fn run_ask_settled(
+        tool: &PiAskUserQuestionTool,
+        gate: &Arc<ApprovalGate>,
+        ctx: &LocalToolContext,
+        response: ToolAuthorizationResponse,
+    ) -> AgentToolResult {
+        let settle = {
+            let gate = Arc::clone(gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                gate.respond("ask-1", response);
+            })
+        };
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), ctx)
+            .await
+            .expect("the ask tool returns a tool result, not a hard error");
+        settle.await.unwrap();
+        result
+    }
+
+    /// PR-0b: a card the user CLOSED to speak (`Dismissed`) is a distinct,
+    /// non-rejection, non-timeout outcome. Outside plan mode it tells the
+    /// model to stop and wait for the message — with no "plan mode" clause and
+    /// NOT the `[no-answer]`/denial text the old conflation produced.
+    #[tokio::test]
+    async fn ask_dismissed_outside_plan_mode_waits_for_message() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let result = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert!(!result.is_error, "a dismissal is guidance, not an error");
+        let text = result_text(&result);
+        assert!(
+            text.contains("dismissed") && text.contains("wait for their message"),
+            "dismissal verdict text: {text}"
+        );
+        assert!(
+            !text.contains("plan mode"),
+            "general line has no plan clause: {text}"
+        );
+        assert!(
+            !text.contains("[no-answer]") && !text.contains("denied"),
+            "dismissal must not read as expiry or denial: {text}"
+        );
+    }
+
+    /// PR-0b: inside plan mode the dsh "stay in plan mode" clause is present,
+    /// so the model keeps drafting rather than exiting or re-asking.
+    #[tokio::test]
+    async fn ask_dismissed_in_plan_mode_keeps_plan_clause() {
+        let (gate, _rx) = gate_with_events();
+        let plan = crate::plan_mode::PlanSessionState::new();
+        plan.set(true, None);
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
+        let ctx = tool_ctx();
+        let result = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert!(!result.is_error);
+        let text = result_text(&result);
+        assert!(
+            text.contains("stay in plan mode") && text.contains("wait for their message"),
+            "plan-mode dismissal keeps the stay clause: {text}"
+        );
+    }
+
+    /// D5 `DELEGATED_CALLER`: the ask tool refuses to park a human when it is
+    /// handed a delegated (subagent) gate — it returns before registering any
+    /// pending interaction or emitting an authorization event.
+    #[tokio::test]
+    async fn ask_from_delegated_gate_is_rejected_as_delegated_caller() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let gate = Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))).with_delegated(true));
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
+            .await
+            .expect("returns a tool result, not a hard error");
+        assert!(result.is_error, "a delegated call is an error to the model");
+        let text = result_text(&result);
+        assert!(
+            text.contains("[DELEGATED_CALLER]"),
+            "names the dsh taxonomy code: {text}"
+        );
+        assert!(
+            gate.pending_entries().is_empty(),
+            "no human card was parked by a delegated caller"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no authorization round trip was emitted"
+        );
+    }
+
     #[tokio::test]
     async fn read_only_tools_pass_through_ungated() {
         let (gate, mut rx) = gate_with_events();

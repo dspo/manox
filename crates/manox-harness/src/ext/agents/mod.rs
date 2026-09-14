@@ -714,7 +714,10 @@ mod tests {
             serde_json::json!({})
         }
         fn requires_approval(&self, params: &serde_json::Value) -> bool {
-            params.get("gate").and_then(|v| v.as_bool()).unwrap_or(false)
+            params
+                .get("gate")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
         }
         fn is_read_only(&self) -> bool {
             self.read_only
@@ -793,7 +796,10 @@ mod tests {
         assert_eq!(wrapped.len(), 1, "one tool in, one tool out");
         assert_eq!(wrapped[0].name(), "Gated", "identity preserved");
         // A mutating tool is wrapped; the gate preserves its read-only view.
-        assert!(!wrapped[0].is_read_only(), "wrapping preserves read-only=false");
+        assert!(
+            !wrapped[0].is_read_only(),
+            "wrapping preserves read-only=false"
+        );
 
         // Approval-bearing call → rejected, not executed.
         let gated = wrapped[0]
