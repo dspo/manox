@@ -230,9 +230,14 @@ impl SubagentTool {
         // the snapshot's mutating tools ride the auto-deny gate so a call the
         // host would have parked on a human instead returns a model-facing
         // rejection. `extra_tools` (the child's own limited Steer) is appended
-        // after, untouched.
+        // after — human-interaction names are stripped from it too, so the D5
+        // invariant never depends on what a future host injects here.
         let mut selected = auto_deny_gated(select_tools(&self.tools, def));
-        selected.extend(extra_tools);
+        selected.extend(
+            extra_tools
+                .into_iter()
+                .filter(|t| !HUMAN_INTERACTION_TOOLS.contains(&t.name())),
+        );
         let worktree = if isolation == Some("worktree") {
             Some(Worktree::prepare(ctx).await?)
         } else {
