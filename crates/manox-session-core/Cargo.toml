@@ -19,6 +19,7 @@ chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 manox-protocol.workspace = true
+manox-terminal.workspace = true
 parking_lot.workspace = true
 # The WS gateway transport arm (`src/ws/`) — the network face of the
 # protocol gateway, kept per the frontend-removal decision ("keep the

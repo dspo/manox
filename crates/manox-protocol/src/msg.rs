@@ -356,6 +356,12 @@ mod tests {
                     max_messages: Some(64),
                 },
             },
+            FromClient::StreamOpen {
+                stream_id: crate::journal::StreamId::new("ts-1"),
+                stream_kind: crate::stream::StreamKind::FollowTerminal {
+                    terminal_id: "t1".into(),
+                },
+            },
             FromClient::StreamCancel {
                 stream_id: crate::journal::StreamId::new("stream-1"),
             },
@@ -511,6 +517,12 @@ mod tests {
                     parent_id: Some("e-2".into()),
                     timestamp: "2026-09-04T00:00:00Z".into(),
                     event: crate::journal::JournalWireEvent::AgentTextDelta { s: "tok".into() },
+                },
+            },
+            FromServer::StreamItem {
+                stream_id: crate::journal::StreamId::new("ts-1"),
+                frame: crate::stream::StreamFrame::TerminalOutput {
+                    data: "aGk=".into(),
                 },
             },
             FromServer::StreamItem {

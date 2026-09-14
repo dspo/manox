@@ -24,9 +24,9 @@ use manox_protocol::surface::{
     SERVER_NOTES, STREAM_END_REASONS, STREAM_FRAMES, STREAM_KINDS, client_call_samples,
     client_call_tag, client_note_samples, client_note_tag, frame_samples, frames, host_samples,
     host_wire_tag, journal_samples, journal_wire_tag, scripted_host_events, scripted_session,
-    scripted_stream_open, server_call_samples, server_call_tag, server_note_samples,
-    server_note_tag, stream_end_samples, stream_end_tag, stream_frame_tag, stream_kind_samples,
-    stream_kind_tag,
+    scripted_stream_open, scripted_terminal_stream_open, server_call_samples, server_call_tag,
+    server_note_samples, server_note_tag, stream_end_samples, stream_end_tag, stream_frame_tag,
+    stream_kind_samples, stream_kind_tag,
 };
 use manox_protocol::{ClientCall, ClientNote, RpcError, ServerCall, ServerNote};
 
@@ -238,7 +238,11 @@ fn every_declared_surface_name_appears_in_scripted_frames() {
         .iter()
         .map(|m| serde_json::to_string(m).unwrap())
         .collect();
-    let open = serde_json::to_string(&scripted_stream_open()).unwrap();
+    let open = format!(
+        "{}{}",
+        serde_json::to_string(&scripted_stream_open()).unwrap(),
+        serde_json::to_string(&scripted_terminal_stream_open()).unwrap()
+    );
 
     // The scripted host frames ride the real FromServer::Host envelope.
     assert!(
@@ -294,7 +298,7 @@ fn every_declared_surface_name_appears_in_scripted_frames() {
 fn backpressure_classes_and_resync_plumbing() {
     for f in frame_samples() {
         match &f {
-            StreamFrame::Entry { .. } => {
+            StreamFrame::Entry { .. } | StreamFrame::TerminalOutput { .. } => {
                 assert_eq!(
                     f.backpressure_policy(),
                     manox_protocol::transport::BackpressurePolicy::BoundedResync
