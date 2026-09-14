@@ -12,9 +12,20 @@
 //              cursor. The leaf cursor is `targetId` for a trailing leaf
 //              entry, otherwise the last entry's id. Appends are strictly
 //              additive — no field of an existing line is ever rewritten;
-//              the one whole-file replace is the v3→v4 lazy migration,
-//              which stamps the chain-dense v4 `seq` onto every line
-//              (§C.1) through the atomic temp+rename below.
+//              the two whole-file replaces are the v3→v4 lazy migration and
+//              the inversion heal, both laying the chain-dense order down
+//              through the atomic temp+rename below.
+//
+// Two storage instances over one file (the cold-append path, embedder
+// processes) each hold a private append lock — nothing serializes them
+// against each other but the write fence below. The fence (an exclusive
+// `flock` plus the stale-view reload in `append_entry_locked`) serializes
+// and linearizes those instances, and the loader tolerates the damage they
+// already produced: an entry line may sit before its parent as long as the
+// chain is globally intact — every parent exists somewhere in the file, no
+// cycle, and a v4 `seq` equals the chain depth. Memory is ordered by the
+// chain and the next append rewrites the file in chain order (the lazy
+// heal), so line order alone can never make a session unreadable.
 //
 // `open` takes the exact file path. A missing file is created with `metadata`
 // as its header; an existing file must begin with a valid v3 or v4 session
@@ -22,8 +33,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::session::{SessionStorage, SessionTreeEntry};
@@ -107,8 +118,9 @@ pub struct JsonlSessionStorage {
     /// otherwise it is the last appended entry's id.
     leaf_id: Mutex<Option<String>>,
     /// entry id → chain depth (§C.1 seq). Assigned at the single append point
-    /// under `append_lock` (L4); parents always precede children in file
-    /// order, so depths are computed incrementally on load.
+    /// under `append_lock` (L4); on load the depths come from a memoized
+    /// parent walk — order-independent, so a recoverable line-order inversion
+    /// changes nothing here.
     seq_index: Mutex<std::collections::HashMap<String, u64>>,
     /// The on-disk format version of the opened file (3 until the first
     /// append rewrites it to 4).
@@ -127,6 +139,16 @@ pub struct JsonlSessionStorage {
     /// message, matching the TS deferred-first-assistant contract. Until
     /// then the session is invisible to `list` and `open`.
     deferred: Mutex<bool>,
+    /// The file's line order diverges from the chain order — a recoverable
+    /// write-order inversion (two storage instances racing one file before
+    /// the fence existed). Set at load, cleared by the next append, which
+    /// rewrites the file in chain order (the lazy heal).
+    needs_rewrite: Mutex<bool>,
+    /// The file's byte length as this instance last saw it on disk. An
+    /// append under the write fence compares it against the live size: a
+    /// mismatch means another instance wrote since, and the in-memory view
+    /// reloads before this append parents onto a stale tail.
+    disk_size: Mutex<u64>,
 }
 
 impl JsonlSessionStorage {
@@ -169,6 +191,7 @@ impl JsonlSessionStorage {
         // same wire validator guards both paths.
         validate_header_wire(&serde_json::to_value(&header).expect("header serializes"))?;
         let line = serde_json::to_string(&header)? + "\n";
+        let header_len = line.len() as u64;
         tokio::fs::write(path, line).await?;
         let (journal_tx, _) = broadcast::channel(JOURNAL_BROADCAST_CAPACITY);
         Ok(JsonlSessionStorage {
@@ -181,6 +204,8 @@ impl JsonlSessionStorage {
             append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(false),
+            needs_rewrite: Mutex::new(false),
+            disk_size: Mutex::new(header_len),
         })
     }
 
@@ -225,6 +250,8 @@ impl JsonlSessionStorage {
             append_lock: Mutex::new(()),
             metadata,
             deferred: Mutex::new(true),
+            needs_rewrite: Mutex::new(false),
+            disk_size: Mutex::new(0),
         })
     }
 
@@ -239,147 +266,55 @@ impl JsonlSessionStorage {
     }
 
     async fn load(path: &Path) -> Result<Self, anyhow::Error> {
-        let mut file = File::open(path).await?;
-        // Torn-tail tolerance (§二.6): whether the file ends mid-line (no
-        // trailing '\n') is decided once, up front. An unparseable TAIL
-        // line in a file without the trailing newline is a torn append —
-        // the non-atomic `write_all` racing a crash or a concurrent
-        // reader — and is dropped with a warning instead of failing the
-        // whole chain (pre-fix, one bad byte made the session permanently
-        // unreadable, compounding with the cold read into a silent empty
-        // history). A parse failure on ANY earlier line — or on a
-        // newline-terminated tail — stays a hard error: committed history
-        // is never silently truncated.
-        let ends_with_newline = {
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let len = file.metadata().await?.len();
-            if len == 0 {
-                true
-            } else {
-                file.seek(std::io::SeekFrom::End(-1)).await?;
-                let mut last = [0u8; 1];
-                file.read_exact(&mut last).await?;
-                file.seek(std::io::SeekFrom::Start(0)).await?;
-                last[0] == b'\n'
-            }
+        // Read fence: a shared `flock` covering ONLY the byte read — the
+        // snapshot is stable once the bytes are in memory, and a concurrent
+        // append's exclusive fence waits no longer than that. The parse
+        // (CPU-bound; a 57k-entry file spends real time here) runs outside
+        // the lock so it never parks other instances' appends.
+        let bytes = {
+            let mut file = File::open(path).await?;
+            flock_shared(&file).await?;
+            let mut bytes = Vec::new();
+            bytes.reserve(file.metadata().await?.len() as usize);
+            file.read_to_end(&mut bytes).await?;
+            bytes
         };
-        let reader = BufReader::new(file);
-        let mut lines = reader.lines();
-        let header_line = lines
-            .next_line()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("session file is empty (no header line)"))?;
-        if header_line.trim().is_empty() {
-            anyhow::bail!("session file header is blank");
-        }
-        let header: JsonValue = serde_json::from_str(&header_line)
-            .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
-        validate_header_wire(&header)?;
-        let header: SessionHeader = serde_json::from_value(header)
-            .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
-
-        let metadata = JsonlSessionMetadata {
-            id: header.id,
-            cwd: header.cwd,
-            created_at: header.timestamp,
-            parent_session_path: header.parent_session,
-            metadata: header.metadata,
-        };
-
-        let mut entries = Vec::new();
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut seq_index = std::collections::HashMap::new();
-        let v4 = header.version >= FORMAT_VERSION;
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let value: JsonValue = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(err) => {
-                    if !ends_with_newline && lines.next_line().await?.is_none() {
-                        tracing::warn!(
-                            path = %path.display(),
-                            "dropping an unterminated unparseable tail line (torn append): {err}"
-                        );
-                        break;
-                    }
-                    return Err(anyhow::anyhow!(
-                        "unparseable session entry line in {}: {err}",
-                        path.display()
-                    ));
-                }
-            };
-            // Wire-level structural checks before deserializing: a missing
-            // required field must not be silently read as `null` (TS
-            // `parseEntryLine` treats a missing `parentId`/`targetId` as an
-            // invalid entry).
-            validate_entry_wire(&value)?;
-            let entry: SessionTreeEntry = serde_json::from_value(value.clone())?;
-            // A duplicate id would make the walk index silently overwrite one
-            // entry with the other — reject the file instead of restoring a
-            // wrong ancestry.
-            if entry.id().is_empty() {
-                anyhow::bail!("session file contains an entry with an empty id");
-            }
-            if !seen_ids.insert(entry.id().to_string()) {
-                anyhow::bail!("duplicate entry id {} in session file", entry.id());
-            }
-            // §C.1 seq: chain depth computed incrementally (parents always
-            // precede children in an append-only file). A v4 line must carry
-            // the same value — a mismatch is corruption, not a renumbering.
-            let depth = match entry.parent_id() {
-                None => 0u64,
-                Some(parent) => match seq_index.get(parent) {
-                    Some(parent_depth) => parent_depth + 1,
-                    // A parent that never appeared earlier in the file means
-                    // the chain is broken; get_path would fail the same way.
-                    None => anyhow::bail!(
-                        "session entry {} references unknown parent {parent}",
-                        entry.id()
-                    ),
-                },
-            };
-            if v4 {
-                match value.get("seq").and_then(JsonValue::as_u64) {
-                    Some(seq) if seq == depth => {}
-                    Some(seq) => anyhow::bail!(
-                        "session entry {} carries seq {seq} but its chain depth is {depth}",
-                        entry.id()
-                    ),
-                    None => {
-                        anyhow::bail!("v4 session entry {} is missing its seq field", entry.id())
-                    }
-                }
-            }
-            seq_index.insert(entry.id().to_string(), depth);
-            entries.push(entry);
-        }
-        // The cursor follows the last entry: a trailing `leaf` entry
-        // redirects to its `targetId`, otherwise the last entry's own id.
-        let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+        let parsed = parse_file(path, &bytes)?;
         let (journal_tx, _) = broadcast::channel(JOURNAL_BROADCAST_CAPACITY);
 
         Ok(JsonlSessionStorage {
             jsonl_path: path.to_path_buf(),
-            entries: Mutex::new(entries),
-            leaf_id: Mutex::new(leaf_id),
-            seq_index: Mutex::new(seq_index),
-            file_version: Mutex::new(header.version),
+            entries: Mutex::new(parsed.entries),
+            leaf_id: Mutex::new(parsed.leaf_id),
+            seq_index: Mutex::new(parsed.seq_index),
+            file_version: Mutex::new(parsed.header_version),
             journal_tx,
             append_lock: Mutex::new(()),
-            metadata,
+            metadata: parsed.metadata,
             deferred: Mutex::new(false),
+            needs_rewrite: Mutex::new(parsed.needs_rewrite),
+            disk_size: Mutex::new(bytes.len() as u64),
         })
     }
 
-    async fn append_line(&self, line: &str) -> Result<(), anyhow::Error> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.jsonl_path)
-            .await?;
-        file.write_all(line.as_bytes()).await?;
+    /// Re-read the whole file through the fenced fd and replace this
+    /// instance's in-memory view (entries, depths, cursor, heal flag, disk
+    /// size). Called only with the write fence held and only when the file
+    /// grew since this view was built — another instance appended. Journal
+    /// followers of THIS instance may now lag behind the reloaded view; the
+    /// L5 rule covers that: a lagging follower resynchronizes via a fresh
+    /// chain read.
+    async fn reload_under_fence(&self, fence: &mut WriteFence) -> Result<(), anyhow::Error> {
+        fence.file.seek(std::io::SeekFrom::Start(0)).await?;
+        let mut bytes = Vec::new();
+        fence.file.read_to_end(&mut bytes).await?;
+        let parsed = parse_file(&self.jsonl_path, &bytes)?;
+        *self.entries.lock().await = parsed.entries;
+        *self.seq_index.lock().await = parsed.seq_index;
+        *self.leaf_id.lock().await = parsed.leaf_id;
+        *self.file_version.lock().await = parsed.header_version;
+        *self.needs_rewrite.lock().await = parsed.needs_rewrite;
+        *self.disk_size.lock().await = bytes.len() as u64;
         Ok(())
     }
 
@@ -410,6 +345,37 @@ impl JsonlSessionStorage {
         let Some(last) = entries.last() else {
             return Ok(());
         };
+        // The write fence (B3), same contract as `append_entry_locked`: the
+        // batch's phase-1 validation must run against on-disk truth, so a
+        // file that grew since this view was built reloads first —
+        // otherwise the batch's seqs and parents derive from a stale tail
+        // and fork the chain.
+        let mut fence = WriteFence::acquire(&self.jsonl_path).await?;
+        if let Some(fenced) = fence.as_mut()
+            && fenced.file.metadata().await?.len() != *self.disk_size.lock().await
+        {
+            self.reload_under_fence(fenced).await?;
+            if *self.deferred.lock().await {
+                anyhow::bail!("append_entries requires a materialized session (file is deferred)");
+            }
+            if *self.file_version.lock().await < FORMAT_VERSION {
+                anyhow::bail!("append_entries requires a v4 session file (append once to migrate)");
+            }
+        }
+        if *self.needs_rewrite.lock().await {
+            // A line-order-inverted file heals through the per-entry path
+            // (each append may take the whole-file rewrite); the batch's
+            // single multi-line append cannot lay the healed order down.
+            // Drop the fence FIRST: `append_entry_locked` acquires its own,
+            // and flock counts per open file description — a second fd's
+            // blocking LOCK_EX out of this process would wait forever on
+            // the one still held here (self-deadlock).
+            drop(fence);
+            for entry in entries {
+                self.append_entry_locked(entry, false).await?;
+            }
+            return Ok(());
+        }
         // Phase 1 (no disk): one existing-id set + one depth map; validate
         // and serialize the batch.
         let existing_ids: HashSet<String> = {
@@ -429,7 +395,7 @@ impl JsonlSessionStorage {
                 anyhow::bail!("duplicate entry id {id}");
             }
             let seq = match entry.parent_id() {
-                None => 0u64,
+                None => 0,
                 Some(parent) => match depths.get(parent) {
                     Some(depth) => depth + 1,
                     None => anyhow::bail!(
@@ -442,9 +408,23 @@ impl JsonlSessionStorage {
             depths.insert(id.to_string(), seq);
             seqs.push(seq);
         }
-        // Phase 2: ONE write; then index/cursor/broadcast under the same
-        // lock hold, mirroring append_entry_locked's post-write order.
-        self.append_line(&lines).await?;
+        // Phase 2: ONE fenced write; then index/cursor/broadcast under the
+        // same lock hold, mirroring append_entry_locked's post-write order.
+        // A fence-less non-deferred append means the file vanished beneath
+        // a live session (external deletion): recover by whole-file rewrite
+        // — header + history + batch — exactly the single-entry path's
+        // degradation, never a panic and never a headerless zombie.
+        match fence.as_mut() {
+            Some(fenced) => {
+                fenced.file.write_all(lines.as_bytes()).await?;
+                *self.disk_size.lock().await += lines.len() as u64;
+            }
+            None => {
+                let written = self.rewrite_file_v4_locked(Some(&lines)).await?;
+                *self.needs_rewrite.lock().await = false;
+                *self.disk_size.lock().await = written;
+            }
+        }
         {
             let mut es = self.entries.lock().await;
             let mut index = self.seq_index.lock().await;
@@ -496,8 +476,48 @@ impl JsonlSessionStorage {
         if exists {
             anyhow::bail!("duplicate entry id {}", entry.id());
         }
-        // Single stamp point: parent must already be indexed (append-only
-        // files guarantee parents precede children).
+        // Cross-instance fence (B3): the per-instance lock held by the caller
+        // cannot see a SECOND storage object over the same file — the
+        // cold-append path and embedder processes open their own instances,
+        // and two private locks interleaving writes is how a child line once
+        // landed before its parent. The fence serializes this whole critical
+        // section at the OS level, and the stale-view guard below reloads
+        // on-disk truth when another instance appended since this view was
+        // built, so parents chain onto the CURRENT tail instead of forking a
+        // sibling branch from a stale one.
+        let mut fence = WriteFence::acquire(&self.jsonl_path).await?;
+        let mut entry = entry.clone();
+        if let Some(fence) = fence.as_mut()
+            && fence.file.metadata().await?.len() != *self.disk_size.lock().await
+        {
+            // The file moved since this view was built. Reload, then repair
+            // the caller's parent choice: an append onto what WAS the leaf
+            // re-points onto the CURRENT leaf. An append onto an explicit
+            // branch point (an older entry, never the leaf) keeps its
+            // parent — branch intent survives the recovery.
+            let pre_reload_leaf = self.leaf_id.lock().await.clone();
+            self.reload_under_fence(fence).await?;
+            let current_leaf = self.leaf_id.lock().await.clone();
+            if entry.parent_id() == pre_reload_leaf.as_deref()
+                && entry.parent_id() != current_leaf.as_deref()
+            {
+                entry = reparent_entry(&entry, current_leaf.as_deref())?;
+            }
+            // The reloaded file may already hold this id (another instance
+            // persisted the same row): refuse before anything touches disk.
+            if self
+                .entries
+                .lock()
+                .await
+                .iter()
+                .any(|e| e.id() == entry.id())
+            {
+                anyhow::bail!("duplicate entry id {}", entry.id());
+            }
+        }
+        // Single stamp point: the parent must already be indexed — in one
+        // instance's view by construction, across instances by the fence +
+        // reload above.
         let seq = match entry.parent_id() {
             None => 0u64,
             Some(parent) => {
@@ -511,7 +531,7 @@ impl JsonlSessionStorage {
                 }
             }
         };
-        let line = v4_line(entry, seq)?;
+        let line = v4_line(&entry, seq)?;
         // A deferred session materializes on the first assistant message: the
         // header plus every buffered entry are written in one shot, so the
         // on-disk order matches the in-memory index (TS `_persist`). Before
@@ -533,15 +553,27 @@ impl JsonlSessionStorage {
             // no zombie; the accepted text must be on disk before the
             // receipt's crash window opens).
             if is_assistant || force_materialize {
-                self.rewrite_file_v4_locked(Some(&line)).await?;
+                let written = self.rewrite_file_v4_locked(Some(&line)).await?;
                 *self.deferred.lock().await = false;
+                *self.disk_size.lock().await = written;
             }
-        } else if *self.file_version.lock().await < FORMAT_VERSION {
-            // Lazy v3 → v4 migration: rewrite the whole file with stamped
-            // lines, appending the new one in the same write.
-            self.rewrite_file_v4_locked(Some(&line)).await?;
+        } else if *self.file_version.lock().await < FORMAT_VERSION
+            || *self.needs_rewrite.lock().await
+            || fence.is_none()
+        {
+            // Lazy v3 → v4 migration, the inversion heal, or an externally
+            // deleted file: one atomic whole-file replace writes the header
+            // and the in-memory chain (plus this line) — only the layout
+            // changes, never the history.
+            let written = self.rewrite_file_v4_locked(Some(&line)).await?;
+            *self.needs_rewrite.lock().await = false;
+            *self.disk_size.lock().await = written;
         } else {
-            self.append_line(&line).await?;
+            let fenced = fence
+                .as_mut()
+                .expect("a fence-less non-deferred append takes the rewrite arm");
+            fenced.file.write_all(line.as_bytes()).await?;
+            *self.disk_size.lock().await += line.len() as u64;
         }
         // A buffered (pre-materialization) row needs no disk write: the index
         // below carries it until the flush rewrites the file wholesale.
@@ -569,7 +601,7 @@ impl JsonlSessionStorage {
     /// stamped seq, optionally plus one more line) in a single write. Used by
     /// deferred materialization and the lazy v3 migration, both under
     /// `append_lock`.
-    async fn rewrite_file_v4_locked(&self, extra_line: Option<&str>) -> Result<(), anyhow::Error> {
+    async fn rewrite_file_v4_locked(&self, extra_line: Option<&str>) -> Result<u64, anyhow::Error> {
         let header = SessionHeader {
             type_tag: "session".into(),
             version: FORMAT_VERSION,
@@ -627,7 +659,7 @@ impl JsonlSessionStorage {
             let _ = dir_file.sync_all();
         }
         *self.file_version.lock().await = FORMAT_VERSION;
-        Ok(())
+        Ok(content.len() as u64)
     }
 
     // ── v4 journal read face (§C.3) ────────────────────────────────────────
@@ -710,6 +742,318 @@ fn v4_line(entry: &SessionTreeEntry, seq: u64) -> Result<String, anyhow::Error> 
         obj.insert("seq".into(), JsonValue::from(seq));
     }
     Ok(serde_json::to_string(&value)? + "\n")
+}
+
+/// Everything [`JsonlSessionStorage::load`] derives from one file's bytes.
+struct ParsedFile {
+    metadata: JsonlSessionMetadata,
+    header_version: u32,
+    entries: Vec<SessionTreeEntry>,
+    seq_index: std::collections::HashMap<String, u64>,
+    leaf_id: Option<String>,
+    /// The file's line order diverges from the chain order (a recoverable
+    /// write-order inversion); the next append lays the chain order down.
+    needs_rewrite: bool,
+}
+
+/// Parse a session file's bytes: the header, then the two-pass entry
+/// validation. Shared by `load` (from disk, after the read fence) and the
+/// append-time stale-view reload (from the write fence's fd), so both
+/// enforce exactly one set of invariants.
+fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
+    // Torn-tail tolerance (§二.6): whether the file ends mid-line (no
+    // trailing '\n') is decided once, up front. An unparseable TAIL line in
+    // a file without the trailing newline is a torn append — the non-atomic
+    // `write_all` racing a crash or a concurrent reader — and is dropped
+    // with a warning instead of failing the whole chain (pre-fix, one bad
+    // byte made the session permanently unreadable, compounding with the
+    // cold read into a silent empty history). A parse failure on ANY
+    // earlier line — or on a newline-terminated tail — stays a hard error:
+    // committed history is never silently truncated.
+    let ends_with_newline = bytes.last() == Some(&b'\n');
+    // A zero-byte file is "empty"; a file whose first line exists but is
+    // blank is "blank" — two distinct rejections, exactly as before.
+    if bytes.is_empty() {
+        anyhow::bail!("session file is empty (no header line)");
+    }
+    let mut raw_lines = bytes.split(|&b| b == b'\n');
+    // The header is the FIRST line, blank or not — a blank first line is an
+    // explicit rejection (the file is not a session file), never skipped
+    // over in favor of the first non-empty line.
+    let header_line = raw_lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("session file is empty (no header line)"))?;
+    if header_line.trim_ascii().is_empty() {
+        anyhow::bail!("session file header is blank");
+    }
+    // Blank lines BETWEEN entries are skipped, as before.
+    let lines = raw_lines.filter(|line| !line.trim_ascii().is_empty());
+    let header: JsonValue = serde_json::from_slice(header_line)
+        .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
+    validate_header_wire(&header)?;
+    let header: SessionHeader = serde_json::from_value(header)
+        .map_err(|e| anyhow::anyhow!("invalid session header: {e}"))?;
+    let metadata = JsonlSessionMetadata {
+        id: header.id,
+        cwd: header.cwd,
+        created_at: header.timestamp,
+        parent_session_path: header.parent_session,
+        metadata: header.metadata,
+    };
+
+    // Pass 1 — line-level integrity: every line must parse, carry a
+    // well-formed wire shape, deserialize, and hold a unique non-empty id.
+    // Order-sensitive checks are deferred to pass 2 so a recoverable
+    // write-order inversion cannot condemn the whole session.
+    let entry_lines: Vec<&[u8]> = lines.collect();
+    let v4 = header.version >= FORMAT_VERSION;
+    let mut entries: Vec<SessionTreeEntry> = Vec::with_capacity(entry_lines.len());
+    let mut wire_seq: Vec<Option<u64>> = Vec::with_capacity(entry_lines.len());
+    let mut seen_ids = std::collections::HashSet::new();
+    for (index, line) in entry_lines.iter().enumerate() {
+        let value: JsonValue = match serde_json::from_slice(line) {
+            Ok(value) => value,
+            Err(err) => {
+                if !ends_with_newline && index + 1 == entry_lines.len() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "dropping an unterminated unparseable tail line (torn append): {err}"
+                    );
+                    break;
+                }
+                return Err(anyhow::anyhow!(
+                    "unparseable session entry line in {}: {err}",
+                    path.display()
+                ));
+            }
+        };
+        // Wire-level structural checks before deserializing: a missing
+        // required field must not be silently read as `null` (TS
+        // `parseEntryLine` treats a missing `parentId`/`targetId` as an
+        // invalid entry).
+        validate_entry_wire(&value)?;
+        let seq = value.get("seq").and_then(JsonValue::as_u64);
+        let entry: SessionTreeEntry = serde_json::from_value(value)?;
+        // A duplicate id would make the walk index silently overwrite one
+        // entry with the other — reject the file instead of restoring a
+        // wrong ancestry.
+        if entry.id().is_empty() {
+            anyhow::bail!("session file contains an entry with an empty id");
+        }
+        if !seen_ids.insert(entry.id().to_string()) {
+            anyhow::bail!("duplicate entry id {} in session file", entry.id());
+        }
+        wire_seq.push(seq);
+        entries.push(entry);
+    }
+
+    // Pass 2 — chain integrity, order-independent. Every parent must exist
+    // SOMEWHERE in the file; depths come from a memoized parent walk (a
+    // cycle is corruption, not a legal shape); a v4 line must carry its
+    // depth as `seq`. Line order is deliberately NOT part of these checks:
+    // two storage instances writing one file (each holds a private append
+    // lock) can land a child line before its parent while the seq values
+    // stay truthful. The loader reconciles against the seq values and
+    // orders memory by the chain; the next append heals the file.
+    let id_pos: std::collections::HashMap<&str, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| (entry.id(), i))
+        .collect();
+    let mut depth: Vec<u64> = vec![u64::MAX; entries.len()];
+    for start in 0..entries.len() {
+        if depth[start] != u64::MAX {
+            continue;
+        }
+        // Walk up the parent chain, stacking unvisited nodes, until a
+        // memoized ancestor or a root resolves; then unwind the stack.
+        let mut stack: Vec<usize> = Vec::new();
+        let mut cursor = start;
+        loop {
+            let Some(parent) = entries[cursor].parent_id() else {
+                depth[cursor] = 0;
+                break;
+            };
+            let Some(&parent_index) = id_pos.get(parent) else {
+                anyhow::bail!(
+                    "session entry {} references unknown parent {parent}",
+                    entries[cursor].id()
+                );
+            };
+            stack.push(cursor);
+            if depth[parent_index] != u64::MAX {
+                break;
+            }
+            // A cycle never reaches a memoized node or a root, so the stack
+            // outgrows the file — that is the cycle guard.
+            if stack.len() > entries.len() {
+                anyhow::bail!(
+                    "session entry chain contains a cycle at {}",
+                    entries[start].id()
+                );
+            }
+            cursor = parent_index;
+        }
+        while let Some(node) = stack.pop() {
+            let parent = entries[node]
+                .parent_id()
+                .expect("stacked nodes have parents");
+            depth[node] = depth[id_pos[parent]] + 1;
+        }
+    }
+
+    let mut needs_rewrite = false;
+    let mut seq_index = std::collections::HashMap::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        if v4 {
+            // A mismatch between the stamped seq and the chain depth is
+            // corruption, not a renumbering — same rule as before, now
+            // checked order-independently.
+            match wire_seq[i] {
+                Some(seq) if seq == depth[i] => {}
+                Some(seq) => anyhow::bail!(
+                    "session entry {} carries seq {seq} but its chain depth is {}",
+                    entry.id(),
+                    depth[i]
+                ),
+                None => {
+                    anyhow::bail!("v4 session entry {} is missing its seq field", entry.id())
+                }
+            }
+        }
+        // An entry whose parent sits LATER in the file is the inversion
+        // shape the pre-fence races left behind.
+        if entry.parent_id().is_some_and(|parent| id_pos[parent] > i) {
+            needs_rewrite = true;
+        }
+        seq_index.insert(entry.id().to_string(), depth[i]);
+    }
+    if needs_rewrite {
+        // Memory takes the chain's order (depth, then file position as the
+        // deterministic tie-break), so the cursor tail, `get_entries`
+        // windowing and any later whole-file rewrite all read the
+        // reconciled sequence.
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by_key(|&i| (depth[i], i));
+        entries = order.iter().map(|&i| entries[i].clone()).collect();
+    }
+    // The cursor follows the chain tail: a trailing `leaf` entry redirects
+    // to its `targetId`, otherwise the tail entry's own id. For a well
+    // ordered file the tail is the last line, exactly as before.
+    let leaf_id = entries.last().and_then(SessionTreeEntry::leaf_cursor_after);
+
+    Ok(ParsedFile {
+        metadata,
+        header_version: header.version,
+        entries,
+        seq_index,
+        leaf_id,
+        needs_rewrite,
+    })
+}
+
+/// The cross-instance write fence: an exclusive `flock` over the session
+/// file, acquired by path. The per-instance append lock cannot see a SECOND
+/// storage object over the same file — the cold-append path and embedder
+/// processes open their own instances — and two private locks interleaving
+/// `write_all` calls is exactly how a child line once landed before its
+/// parent. The fence serializes append critical sections across ALL
+/// instances of the file, process-wide and system-wide.
+struct WriteFence {
+    file: File,
+}
+
+impl WriteFence {
+    /// Acquire the fence, retrying a bounded number of times when the path
+    /// was renamed mid-acquire (the v3 migration and the inversion heal swap
+    /// the file with an atomic rename; an fd opened before the rename would
+    /// fence a replaced inode). `Ok(None)` when the file does not exist — a
+    /// deferred session has nothing on disk to fence, and no other instance
+    /// can contend for a file that is not there.
+    async fn acquire(path: &Path) -> Result<Option<Self>, anyhow::Error> {
+        for _ in 0..16 {
+            if !tokio::fs::try_exists(path).await? {
+                return Ok(None);
+            }
+            let owned_path = path.to_path_buf();
+            let attempt =
+                tokio::task::spawn_blocking(move || -> Result<Option<File>, anyhow::Error> {
+                    use std::os::unix::io::AsRawFd;
+                    let file = std::fs::OpenOptions::new()
+                        .append(true)
+                        .read(true)
+                        .open(&owned_path)?;
+                    let fd = file.as_raw_fd();
+                    // Blocking acquire: critical sections are one line long,
+                    // so waiters queue briefly; the blocking pool absorbs
+                    // the parked threads.
+                    if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+                        anyhow::bail!(
+                            "failed to fence {}: {}",
+                            owned_path.display(),
+                            std::io::Error::last_os_error()
+                        );
+                    }
+                    // The path must still resolve to the fenced inode: a
+                    // rename between open and lock leaves this fd fencing
+                    // the replaced file. `None` asks the caller to retry.
+                    let fenced = file.metadata()?;
+                    let current = std::fs::metadata(&owned_path)?;
+                    use std::os::unix::fs::MetadataExt;
+                    if fenced.dev() != current.dev() || fenced.ino() != current.ino() {
+                        return Ok(None);
+                    }
+                    Ok(Some(File::from_std(file)))
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("fence task failed: {e}"))?;
+            match attempt {
+                Ok(Some(file)) => return Ok(Some(Self { file })),
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        anyhow::bail!(
+            "session file {} kept swapping under the write fence",
+            path.display()
+        )
+    }
+}
+
+/// Take a shared `flock` on an already-open file — the read fence. Loads
+/// see a stable snapshot, never a mid-append tail; the lock lives with the
+/// file handle and releases when the caller drops it.
+async fn flock_shared(file: &File) -> Result<(), anyhow::Error> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    let rc = tokio::task::spawn_blocking(move || unsafe { libc::flock(fd, libc::LOCK_SH) })
+        .await
+        .map_err(|e| anyhow::anyhow!("flock task failed: {e}"))?;
+    if rc != 0 {
+        anyhow::bail!(
+            "failed to fence a session file for reading: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Re-point an entry at a new parent — the stale-leaf recovery of the
+/// fenced append. Round-trips through JSON so new entry variants need no
+/// case-by-case handling on this rare path.
+fn reparent_entry(
+    entry: &SessionTreeEntry,
+    parent: Option<&str>,
+) -> Result<SessionTreeEntry, anyhow::Error> {
+    let mut value = serde_json::to_value(entry)?;
+    if let Some(obj) = value.as_object_mut() {
+        let parent = match parent {
+            Some(id) => JsonValue::String(id.to_string()),
+            None => JsonValue::Null,
+        };
+        obj.insert("parentId".into(), parent);
+    }
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Wire-level header checks on the raw JSON, mirroring the TS
@@ -1598,6 +1942,20 @@ mod tests {
         assert!(err.contains("invalid session header"), "{err}");
     }
 
+    /// A blank FIRST line is an explicit rejection, not a skip to the next
+    /// non-empty line — the old loader's contract, restored.
+    #[tokio::test]
+    async fn test_open_rejects_blank_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let header = r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#;
+        tokio::fs::write(&path, format!("\n{header}\n"))
+            .await
+            .unwrap();
+        let err = open_err(&path).await;
+        assert!(err.contains("header is blank"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_open_rejects_wrong_type_tag() {
         let dir = tempfile::tempdir().unwrap();
@@ -2382,6 +2740,261 @@ mod tests {
             err.to_string().contains("ghost"),
             "the error names the missing parent: {err}"
         );
+    }
+
+    /// A user message entry for batch/heal tests.
+    fn message_entry(id: &str, parent: Option<&str>, text: &str) -> SessionTreeEntry {
+        SessionTreeEntry::Message {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            timestamp: chrono::Utc::now(),
+            message: AgentMessage::user(text),
+            origin: None,
+        }
+    }
+
+    /// append_entries on a line-order-inverted file routes through the
+    /// per-entry heal path — which must drop the fence first: flock counts
+    /// per open file description, so a second blocking LOCK_EX out of this
+    /// process on the still-held file self-deadlocks. The timeout turns a
+    /// regression back into a test failure instead of a hung suite.
+    #[tokio::test]
+    async fn append_entries_heals_an_inverted_file_without_self_deadlock() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        // The inverted fixture: a child line lands before its parent while
+        // every seq stays truthful.
+        let contents = concat!(
+            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"x","parentId":null,"timestamp":"2026-09-11T08:25:20.000Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"c1","parentId":"p","timestamp":"2026-09-11T08:41:34.789962Z","seq":2,"message":{"role":"user","content":[{"type":"text","text":"c1"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"p","parentId":"x","timestamp":"2026-09-11T08:41:34.789225Z","seq":1,"message":{"role":"user","content":[{"type":"text","text":"p"}],"timestamp":1770000000000}}"#,
+            "\n",
+        );
+        std::fs::write(&path, contents).unwrap();
+        let storage = JsonlSessionStorage::open(&path).await.unwrap();
+        // The batch chains onto the file's leaf (c1), the fork shape.
+        let batch = vec![
+            message_entry("b1", Some("c1"), "batch one"),
+            message_entry("b2", Some("b1"), "batch two"),
+        ];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.append_entries(&batch),
+        )
+        .await
+        .expect("the heal path must not self-deadlock on the fence")
+        .unwrap();
+
+        // The file healed to chain order and carries the batch linearly.
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let session = Session::new(reopened);
+        let branch = session.get_branch().await.unwrap();
+        let texts: Vec<&str> = branch.iter().map(user_text).collect();
+        assert_eq!(texts, vec!["x", "p", "c1", "batch one", "batch two"]);
+    }
+
+    /// A file deleted beneath a live session degrades the batch to a
+    /// whole-file rewrite (header + history + batch) — the single-entry
+    /// path's recovery, never a panic and never a headerless zombie.
+    #[tokio::test]
+    async fn append_entries_recovers_an_externally_deleted_file() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let storage = JsonlSessionStorage::create(&path, meta()).await.unwrap();
+        storage
+            .append_entry(&message_entry("m1", None, "history"))
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let batch = vec![
+            message_entry("b1", Some("m1"), "batch one"),
+            message_entry("b2", Some("b1"), "batch two"),
+        ];
+        storage.append_entries(&batch).await.unwrap();
+
+        // The rewrite recovered a complete file: header present, history
+        // and batch on one chain.
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let session = Session::new(reopened);
+        let branch = session.get_branch().await.unwrap();
+        let texts: Vec<&str> = branch.iter().map(user_text).collect();
+        assert_eq!(texts, vec!["history", "batch one", "batch two"]);
+    }
+
+    /// The text of a user message entry, for chain-order assertions.
+    fn user_text(entry: &SessionTreeEntry) -> &str {
+        match entry {
+            SessionTreeEntry::Message {
+                message: AgentMessage::User { content, .. },
+                ..
+            } => content
+                .iter()
+                .find_map(|b| match b {
+                    crate::types::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or(""),
+            _ => "",
+        }
+    }
+
+    /// The recoverable damage the pre-fence write race left behind (a real
+    /// session's shape: the seq-2 child line landed before the seq-1
+    /// parent, both timestamped within the same millisecond burst). Load
+    /// tolerates the inversion — memory takes the chain order, the cursor
+    /// is the chain tail — and the next append lays the chain order down on
+    /// disk (the lazy heal).
+    #[tokio::test]
+    async fn an_inverted_child_parent_pair_loads_and_self_heals_on_append() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-09-11T08:25:14.336062Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"x","parentId":null,"timestamp":"2026-09-11T08:25:20.000Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"c1","parentId":"p","timestamp":"2026-09-11T08:41:34.789962Z","seq":2,"message":{"role":"user","content":[{"type":"text","text":"c1"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"p","parentId":"x","timestamp":"2026-09-11T08:41:34.789225Z","seq":1,"message":{"role":"user","content":[{"type":"text","text":"p"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"c2","parentId":"c1","timestamp":"2026-09-11T08:41:34.827432Z","seq":3,"message":{"role":"user","content":[{"type":"text","text":"c2"}],"timestamp":1770000000000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        // The damaged file loads; the branch reads back in CHAIN order and
+        // the cursor is the chain tail.
+        let session = std::sync::Arc::new(Session::new(
+            JsonlSessionStorage::open(&path).await.unwrap(),
+        ));
+        let branch = session.get_branch().await.unwrap();
+        let texts: Vec<&str> = branch.iter().map(user_text).collect();
+        assert_eq!(texts, vec!["x", "p", "c1", "c2"], "{branch:?}");
+
+        // The lazy heal: the next append rewrites the file in chain order.
+        session
+            .append_message(AgentMessage::user("tail"))
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut positions: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut seqs: Vec<u64> = Vec::new();
+        for (index, line) in text.lines().enumerate().skip(1) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            positions.insert(value["id"].as_str().unwrap().to_string(), index);
+            seqs.push(value["seq"].as_u64().expect("healed file is v4"));
+        }
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4], "dense seqs along the chain");
+        for line in text.lines().skip(1) {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(parent) = value["parentId"].as_str() {
+                let own = positions[value["id"].as_str().unwrap()];
+                assert!(
+                    positions[parent] < own,
+                    "every parent precedes its child after the heal"
+                );
+            }
+        }
+        // The healed file reopens clean.
+        JsonlSessionStorage::open(&path).await.unwrap();
+    }
+
+    /// The same inversion tolerance on a v3 file (no seq on the wire — the
+    /// chain itself is the only truth, and it is intact).
+    #[tokio::test]
+    async fn a_v3_inverted_pair_loads() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-08-21T16:10:51.000Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"x","parentId":null,"timestamp":"2026-08-21T16:10:51.000Z","message":{"role":"user","content":[{"type":"text","text":"x"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"c","parentId":"p","timestamp":"2026-08-21T16:10:52.000Z","message":{"role":"user","content":[{"type":"text","text":"c"}],"timestamp":1770000000000}}"#,
+            "\n",
+            r#"{"type":"message","id":"p","parentId":"x","timestamp":"2026-08-21T16:10:51.900Z","message":{"role":"user","content":[{"type":"text","text":"p"}],"timestamp":1770000000000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+
+        let session = Session::new(JsonlSessionStorage::open(&path).await.unwrap());
+        let branch = session.get_branch().await.unwrap();
+        let texts: Vec<&str> = branch.iter().map(user_text).collect();
+        assert_eq!(texts, vec!["x", "p", "c"], "{branch:?}");
+    }
+
+    /// A parent cycle is corruption, not a recoverable ordering artifact —
+    /// the global depth walk must reject it rather than loop.
+    #[tokio::test]
+    async fn a_parent_cycle_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let contents = concat!(
+            r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
+            "\n",
+            r#"{"type":"message","id":"m1","parentId":"m2","timestamp":"2026-05-28T07:14:00.000Z","message":{"role":"user","content":[{"type":"text","text":"one"}],"timestamp":1779952440000}}"#,
+            "\n",
+            r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-05-28T07:14:10.000Z","message":{"role":"user","content":[{"type":"text","text":"two"}],"timestamp":1779952450000}}"#,
+            "\n",
+        );
+        tokio::fs::write(&path, contents).await.unwrap();
+        let err = open_err(&path).await;
+        assert!(err.contains("cycle"), "the error names the cycle: {err}");
+    }
+
+    /// Two storage instances over one file (the cold-append shape) append
+    /// through the write fence: each sees the other's growth (the
+    /// stale-view reload) and re-parents onto the CURRENT tail, so the file
+    /// holds one linear chain — no fork, no lost line, no child line before
+    /// its parent.
+    #[tokio::test]
+    async fn two_storage_instances_append_one_linear_chain_under_the_fence() {
+        use crate::session::Session;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let a = std::sync::Arc::new(Session::new(
+            JsonlSessionStorage::create(&path, meta()).await.unwrap(),
+        ));
+        let b = std::sync::Arc::new(Session::new(
+            JsonlSessionStorage::open(&path).await.unwrap(),
+        ));
+
+        a.append_message(AgentMessage::user("a1")).await.unwrap();
+        b.append_message(AgentMessage::user("b1")).await.unwrap();
+        a.append_message(AgentMessage::user("a2")).await.unwrap();
+        b.append_message(AgentMessage::user("b2")).await.unwrap();
+
+        let reopened = JsonlSessionStorage::open(&path).await.unwrap();
+        let session = Session::new(reopened);
+        let branch = session.get_branch().await.unwrap();
+        let texts: Vec<&str> = branch.iter().map(user_text).collect();
+        assert_eq!(
+            texts,
+            vec!["a1", "b1", "a2", "b2"],
+            "one linear chain in write order: {branch:?}"
+        );
+        for pair in branch.windows(2) {
+            assert_eq!(
+                pair[1].parent_id(),
+                Some(pair[0].id()),
+                "each entry parents onto its predecessor: {branch:?}"
+            );
+        }
     }
 
     /// Concurrent appends must chain onto each other, never fork sibling
