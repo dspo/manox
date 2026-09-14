@@ -157,6 +157,52 @@ impl SessionRepository {
     }
 }
 
+/// One bounded scan's outcome for a caching caller: the summary facts plus
+/// whether they were read off a possibly-TORN tail — the file's last line
+/// lacked its newline (an append mid-`write_all`). Torn facts must not be
+/// cached: the completing append changes the very bytes they came from.
+#[derive(Debug, Clone)]
+pub struct ScannedSession {
+    pub info: SessionInfo,
+    pub torn_tail: bool,
+}
+
+/// The bounded scan with its torn verdict, for callers that cache the
+/// facts (the sidebar store's reconcile). [`SessionRepository::info`] drops
+/// the verdict — a non-caching caller renders one pass and moves on.
+pub async fn scan_session(path: &Path) -> Result<ScannedSession, anyhow::Error> {
+    let (metadata, _version) = read_header(path).await?;
+    let file_metadata = tokio::fs::metadata(path).await?;
+    let modified_at = file_metadata
+        .modified()
+        .ok()
+        .map(chrono::DateTime::from)
+        .filter(|at: &chrono::DateTime<chrono::Utc>| *at > metadata.created_at)
+        .unwrap_or(metadata.created_at);
+    let (first_user, has_messages, torn_tail) = scan_first_user_message(path).await?;
+    Ok(ScannedSession {
+        info: SessionInfo {
+            path: path.to_path_buf(),
+            id: metadata.id,
+            cwd: metadata.cwd,
+            // The summary keeps a String: its consumers treat the parent link
+            // as a display/grouping key. Files can only hold valid UTF8 here
+            // (the JSON boundary errored loudly at create time on non-UTF8
+            // paths), so this conversion is never lossy in practice.
+            parent_session_path: metadata
+                .parent_session_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            created_at: metadata.created_at,
+            modified_at,
+            has_messages,
+            first_message: first_user.unwrap_or_else(|| "(no messages)".to_string()),
+            metadata: metadata.metadata,
+        },
+        torn_tail,
+    })
+}
+
 /// The canonical journal file name for a session id (`<id>.jsonl`) — the
 /// single source shared by creation, repository scans, and on-disk identity
 /// probes (a cold `CreateSession` must find and restore this file, never
@@ -177,39 +223,12 @@ async fn session_files(dir: &Path) -> Result<Vec<PathBuf>, anyhow::Error> {
     Ok(out)
 }
 
-/// Build the [`SessionInfo`] for one file from BOUNDED reads: the header
-/// line, the first user message (a raw-byte needle scan — see
-/// [`scan_first_user_message`]), and the file's mtime. Never parses the
-/// transcript; the full load stays `open`'s job. A corrupt file errors and
-/// is skipped by `list`.
+/// Build the [`SessionInfo`] for one file from BOUNDED reads (the
+/// torn-tail verdict is dropped here — a non-caching caller renders one
+/// pass and moves on). Never parses the transcript; the full load stays
+/// `open`'s job. A corrupt file errors and is skipped by `list`.
 async fn build_session_info(path: &Path) -> Result<SessionInfo, anyhow::Error> {
-    let (metadata, _version) = read_header(path).await?;
-    let file_metadata = tokio::fs::metadata(path).await?;
-    let modified_at = file_metadata
-        .modified()
-        .ok()
-        .map(chrono::DateTime::from)
-        .filter(|at: &chrono::DateTime<chrono::Utc>| *at > metadata.created_at)
-        .unwrap_or(metadata.created_at);
-    let (first_user, has_messages) = scan_first_user_message(path).await?;
-    Ok(SessionInfo {
-        path: path.to_path_buf(),
-        id: metadata.id,
-        cwd: metadata.cwd,
-        // The summary keeps a String: its consumers treat the parent link
-        // as a display/grouping key. Files can only hold valid UTF8 here
-        // (the JSON boundary errored loudly at create time on non-UTF8
-        // paths), so this conversion is never lossy in practice.
-        parent_session_path: metadata
-            .parent_session_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned()),
-        created_at: metadata.created_at,
-        modified_at,
-        has_messages,
-        first_message: first_user.unwrap_or_else(|| "(no messages)".to_string()),
-        metadata: metadata.metadata,
-    })
+    Ok(scan_session(path).await?.info)
 }
 
 /// Read and validate the first (header) line of a session file, growing the
@@ -242,30 +261,76 @@ async fn read_header(path: &Path) -> Result<(JsonlSessionMetadata, u32), anyhow:
     crate::session::jsonl::parse_header_line(&buffer[..line_end])
 }
 
-/// The entry-type prefix of a message line on the wire — serde's tagged
-/// enums serialize `type` first, so this filter rejects non-message lines
-/// without parsing them.
-const MESSAGE_LINE_PREFIX: &[u8] = br#"{"type":"message""#;
-/// The user-role needle, matched on the raw line before any parse.
-const USER_ROLE_NEEDLE: &[u8] = br#""role":"user""#;
+/// A JSON member test on the raw line: `"<key>"` , optional whitespace,
+/// `:`, optional whitespace, `"<value>"` — anywhere in the line. Key ORDER
+/// does not matter (serde's tagged enums put `type` first, but TS Pi's
+/// serializer or a hand-edited file may not); a single space around the
+/// colon is tolerated (compact writers emit none).
+fn json_member_is(line: &[u8], key: &str, value: &str) -> bool {
+    let mut key_pattern = Vec::with_capacity(key.len() + 2);
+    key_pattern.push(b'"');
+    key_pattern.extend_from_slice(key.as_bytes());
+    key_pattern.push(b'"');
+    let mut value_pattern = Vec::with_capacity(value.len() + 2);
+    value_pattern.push(b'"');
+    value_pattern.extend_from_slice(value.as_bytes());
+    value_pattern.push(b'"');
+
+    let mut from = 0usize;
+    while let Some(at) = find_from(line, &key_pattern, from) {
+        let rest = &line[at + key_pattern.len()..];
+        let mut i = 0usize;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t') {
+            i += 1;
+        }
+        if i < rest.len() && rest[i] == b':' {
+            i += 1;
+            while i < rest.len() && matches!(rest[i], b' ' | b'\t') {
+                i += 1;
+            }
+            if rest[i..].starts_with(&value_pattern) {
+                return true;
+            }
+        }
+        from = at + 1;
+    }
+    false
+}
+
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() || from > haystack.len() - needle.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|at| at + from)
+}
 
 /// Find the first user message's text with raw-byte scans: read a
 /// [`FIRST_USER_PREFIX`] window (then [`FIRST_USER_CHUNK`] windows) and, per
-/// complete line, check the `{"type":"message"` prefix and the
-/// `"role":"user"` needle; only the ONE hit line is deserialized. Returns
-/// `(first user text, any-message-seen)`; the text is `None` when no user
-/// message with non-empty text exists.
-async fn scan_first_user_message(path: &Path) -> Result<(Option<String>, bool), anyhow::Error> {
+/// complete line, check the `type`:`message` member and the `role`:`user`
+/// member; only the ONE hit line is deserialized. Returns
+/// `(first user text, any-message-seen, torn-tail)`; the text is `None`
+/// when no user message with non-empty text exists. `torn_tail` is set
+/// when the answer came off the file's unterminated last line (or no
+/// answer was found and the file may continue mid-line) — a caching caller
+/// must not pin such facts.
+async fn scan_first_user_message(
+    path: &Path,
+) -> Result<(Option<String>, bool, bool), anyhow::Error> {
     let mut file = File::open(path).await?;
     file.seek(std::io::SeekFrom::Start(0)).await?;
     let mut window = vec![0u8; FIRST_USER_PREFIX];
     let mut pending: Vec<u8> = Vec::new();
     let mut has_messages = false;
+    let mut ends_with_newline = true;
     loop {
         let read = file.read(&mut window).await?;
         if read == 0 {
             break;
         }
+        ends_with_newline = window[read - 1] == b'\n';
         pending.extend_from_slice(&window[..read]);
         // Consume every complete line in the pending bytes, keeping the
         // (at most one) trailing partial line for the next round.
@@ -274,7 +339,9 @@ async fn scan_first_user_message(path: &Path) -> Result<(Option<String>, bool), 
             let line = &pending[consumed..consumed + rel];
             if let Some(text) = classify_line(line) {
                 if let Some(text) = text {
-                    return Ok((Some(text), true));
+                    // The hit line was newline-terminated: its bytes are
+                    // complete regardless of what follows.
+                    return Ok((Some(text), true, false));
                 }
                 has_messages = true;
             }
@@ -287,26 +354,28 @@ async fn scan_first_user_message(path: &Path) -> Result<(Option<String>, bool), 
             window.resize(FIRST_USER_CHUNK, 0);
         }
     }
-    if !pending.is_empty()
-        && let Some(text) = classify_line(&pending)
-    {
-        if let Some(text) = text {
-            return Ok((Some(text), true));
+    if !pending.is_empty() {
+        // The file's unterminated tail: any hit (or any absence verdict)
+        // here may change when the completing append lands.
+        if let Some(text) = classify_line(&pending) {
+            if let Some(text) = text {
+                return Ok((Some(text), true, true));
+            }
+            has_messages = true;
         }
-        has_messages = true;
+        return Ok((None, has_messages, true));
     }
-    Ok((None, has_messages))
+    Ok((None, has_messages, !ends_with_newline))
 }
 
 /// One raw line's verdict: `None` = not a message entry; `Some(None)` = a
 /// message entry whose text is empty or not user-authored (keep scanning);
 /// `Some(Some(text))` = the first user message's text.
 fn classify_line(line: &[u8]) -> Option<Option<String>> {
-    if !line.starts_with(MESSAGE_LINE_PREFIX) {
+    if !json_member_is(line, "type", "message") {
         return None;
     }
-    let is_user = contains_subslice(line, USER_ROLE_NEEDLE);
-    if !is_user {
+    if !json_member_is(line, "role", "user") {
         return Some(None);
     }
     let value: serde_json::Value = match serde_json::from_slice(line) {
@@ -334,14 +403,6 @@ fn classify_line(line: &[u8]) -> Option<Option<String>> {
     } else {
         Some(Some(text))
     }
-}
-
-/// Slice-contains for byte patterns (`[u8]::windows` would allocate nothing
-/// but is slower than a simple scan; std has no `contains` for subslices).
-fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -513,6 +574,49 @@ mod tests {
 
         repo.delete(&listed[0].path).await.unwrap();
         assert!(repo.list().await.unwrap().is_empty());
+    }
+
+    /// The member matcher is key-order-insensitive and tolerates a space
+    /// around the colon: a message line written by TS Pi (or a hand edit)
+    /// with `type` NOT first, and with spaced members, still surfaces.
+    #[tokio::test]
+    async fn scan_finds_messages_regardless_of_key_order_and_spacing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let contents = concat!(
+            r#"{"cwd":"/p","version":4,"id":"s1","type":"session","timestamp":"2026-09-13T00:00:00Z"}"#,
+            "\n",
+            r#"{"id":"m1","parentId":null,"message": {"role": "user","content": [{"type": "text","text": "reordered and spaced"}]},"timestamp":"2026-09-13T00:00:01Z","seq":0,"type": "message"}"#,
+            "\n",
+        );
+        std::fs::write(&path, contents.replace("\\n", "\n")).unwrap();
+        let scanned = scan_session(&path).await.unwrap();
+        assert_eq!(scanned.info.first_message, "reordered and spaced");
+        assert!(scanned.info.has_messages);
+        assert!(!scanned.torn_tail, "the file ends with a newline");
+    }
+
+    /// Facts read off an unterminated last line are flagged torn — a
+    /// caching caller must not pin them. Completing the line clears the
+    /// verdict.
+    #[tokio::test]
+    async fn scan_flags_torn_tail_facts_until_the_line_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        let header = r#"{"type":"session","version":4,"id":"s1","timestamp":"2026-09-13T00:00:00Z","cwd":"/p"}"#;
+        let line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"mid-write"}],"timestamp":1770000000000}}"#;
+        // Header terminated; the message line torn (no trailing newline).
+        std::fs::write(&path, format!("{header}\n{line}")).unwrap();
+        let scanned = scan_session(&path).await.unwrap();
+        assert_eq!(scanned.info.first_message, "mid-write");
+        assert!(scanned.torn_tail, "the first-user line is the torn tail");
+
+        // The append completes the line: the same bytes are now a settled
+        // fact.
+        std::fs::write(&path, format!("{header}\n{line}\n")).unwrap();
+        let scanned = scan_session(&path).await.unwrap();
+        assert!(!scanned.torn_tail);
+        assert_eq!(scanned.info.first_message, "mid-write");
     }
 
     fn meta_with(metadata: serde_json::Value) -> JsonlSessionMetadata {

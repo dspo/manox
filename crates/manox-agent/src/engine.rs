@@ -3244,7 +3244,7 @@ async fn run_actor(
                         id: info.id,
                         cwd: info.cwd,
                         created_at: info.created_at,
-                        parent_session_path: info.parent_session_path,
+                        parent_session_path: info.parent_session_path.map(PathBuf::from),
                         metadata: info.metadata,
                     },
                 )

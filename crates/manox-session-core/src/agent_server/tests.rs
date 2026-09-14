@@ -8827,7 +8827,10 @@ fn fork_lists_as_independent_thread_and_cwd_override_lands() {
         "the explicit cwd override lands in the fork header"
     );
 
-    // Both the source and the fork surface as distinct rows.
+    // Both the source and the fork surface as distinct rows. ListThreads
+    // answers from the snapshot and kicks the background reconcile: the
+    // rows land in the store first (the watcher broadcasts
+    // ThreadsUpdated), and the NEXT answer carries them.
     client.send(FromClient::Request {
         id: MsgId::new("fork-list"),
         call: ClientCall::ListThreads,
@@ -8837,6 +8840,24 @@ fn fork_lists_as_independent_thread_and_cwd_override_lands() {
         assert!(std::time::Instant::now() < deadline, "list never answered");
         if let FromServer::Response { id, outcome } = client.recv()
             && id.0 == "fork-list"
+        {
+            outcome.expect("list succeeds");
+            break;
+        }
+    }
+    poll_store("the fork rows surface via the background reconcile", |s| {
+        s.summaries().iter().any(|r| r.id == "fork-d")
+            && s.summaries().iter().any(|r| r.id == fork_id)
+    });
+    client.send(FromClient::Request {
+        id: MsgId::new("fork-list-2"),
+        call: ClientCall::ListThreads,
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(std::time::Instant::now() < deadline, "list never answered");
+        if let FromServer::Response { id, outcome } = client.recv()
+            && id.0 == "fork-list-2"
         {
             let listing = outcome.expect("list succeeds");
             let listing = serde_json::to_string(&listing).unwrap();

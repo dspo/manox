@@ -125,7 +125,10 @@ pub struct StoreCore {
     meta_queue: parking_lot::Mutex<Vec<MetaWrite>>,
     /// Single-flight gate for scans; see [`StoreHandle::refresh`].
     refresh_gate: tokio::sync::Mutex<()>,
-    /// Set by a caller that asked for a scan while one was in the air.
+    /// Set while a runner task owns the gate loop — the spawn decision.
+    refresh_running: std::sync::atomic::AtomicBool,
+    /// Set by a caller that asked for a scan while the runner was in the
+    /// air; the runner's loop tail serves it with one more pass.
     refresh_pending: std::sync::atomic::AtomicBool,
 }
 
@@ -138,6 +141,7 @@ impl StoreHandle {
             index: tokio::sync::Mutex::new(SessionIndex::default()),
             meta_queue: parking_lot::Mutex::new(Vec::new()),
             refresh_gate: tokio::sync::Mutex::new(()),
+            refresh_running: std::sync::atomic::AtomicBool::new(false),
             refresh_pending: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -222,16 +226,31 @@ impl StoreHandle {
     /// callers only mark it pending — one reconcile serves the whole burst
     /// (a sidecar-write storm asks once, not once per write).
     pub fn refresh(&self) {
+        // Single-flight spawn: while a runner owns the gate loop, later
+        // callers only mark pending — the runner's loop tail serves the
+        // whole burst with one more pass instead of each caller spawning
+        // its own.
+        if self
+            .0
+            .refresh_running
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.0
+                .refresh_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let this = self.clone();
         crate::runtime::handle().spawn(async move {
             this.refresh_coalesced().await;
         });
     }
 
-    /// The gate discipline: wait for the in-flight pass, run one more pass
-    /// iff someone asked meanwhile, stop when quiet. Each pass lands every
-    /// queued sidecar write (in dispatch order) BEFORE the reconcile, so
-    /// the scan always reads settled sidecars.
+    /// The gate discipline: each pass lands every queued sidecar write (in
+    /// dispatch order) BEFORE the reconcile, so the scan always reads
+    /// settled sidecars; one more pass runs iff someone asked meanwhile;
+    /// stop when quiet. The trailing re-check closes the lost-wakeup window
+    /// between the loop exit and the quiescence publish.
     async fn refresh_coalesced(&self) {
         let _guard = self.0.refresh_gate.lock().await;
         loop {
@@ -260,6 +279,16 @@ impl StoreHandle {
             {
                 break;
             }
+        }
+        self.0
+            .refresh_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .0
+            .refresh_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.refresh();
         }
     }
 
@@ -1128,7 +1157,6 @@ async fn reconcile_summaries(
     }
     let stats = stat_session_files(dir).await;
     let live: std::collections::HashSet<PathBuf> = stats.iter().map(|s| s.path.clone()).collect();
-    let repo = manox_harness::session::repository::SessionRepository::new(dir);
     let mut rows = Vec::with_capacity(stats.len());
     for stat in stats {
         // Negative-cache hit: the file failed its scan wearing exactly this
@@ -1143,13 +1171,21 @@ async fn reconcile_summaries(
         // entry reaching here (its fingerprint changed — the skip arm above
         // handled the unchanged case) has no facts to reuse and rescans
         // whatever the size says.
+        let mut torn_tail = false;
         if index
             .rows
             .get(&stat.path)
             .is_none_or(|entry| entry.failed || stat.size < entry.size)
         {
-            match repo.info(&stat.path).await {
-                Ok(info) => {
+            match manox_harness::session::repository::scan_session(&stat.path).await {
+                Ok(scanned) => {
+                    // A possibly-torn tail (facts read off an unterminated
+                    // last line — an append mid-write) renders this pass but
+                    // never caches: the fact layer would pin a half-written
+                    // first message until the file shrank, which an
+                    // append-only writer never does.
+                    torn_tail = scanned.torn_tail;
+                    let info = scanned.info;
                     let entry = index
                         .rows
                         .entry(stat.path.clone())
@@ -1276,9 +1312,13 @@ async fn reconcile_summaries(
             .map(str::to_string);
         rows.push(SessionRow {
             summary: summary_from_cached(entry, modified_at, meta),
-            path: stat.path,
+            path: stat.path.clone(),
             thread_key,
         });
+        if torn_tail {
+            index.rows.remove(&stat.path);
+            index.dirty = true;
+        }
     }
     // Vanished files leave the cache; the persist below drops their rows
     // from the cold layer with them.
@@ -1852,6 +1892,57 @@ mod tests {
         write_session_fixture(&dir, "rule", "shrunk");
         store.refresh_now().await;
         assert_eq!(first_summary_of(&store, "rule"), "shrunk");
+    }
+
+    /// While a runner owns the gate loop, `refresh()` marks pending
+    /// instead of spawning — the burst is served by the runner's loop tail.
+    #[tokio::test]
+    async fn refresh_marks_pending_while_a_runner_is_in_flight() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db);
+        store
+            .0
+            .refresh_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..5 {
+            store.refresh();
+        }
+        assert!(
+            store
+                .0
+                .refresh_pending
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the burst must mark pending, not spawn five runners"
+        );
+    }
+
+    /// Facts read off a torn (unterminated) first-user line are never
+    /// cached — the completing append may change the very text the row
+    /// shows, and the growth-keeps-facts rule would otherwise pin the
+    /// mid-write wording forever.
+    #[tokio::test]
+    async fn reconcile_does_not_cache_torn_tail_facts() {
+        let (db, _db_path) = temp_db();
+        let store = standalone_for_test(db.clone());
+        let dir = store.read(|s| s.sessions_dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = r#"{"type":"session","version":4,"id":"torn","timestamp":"2026-09-13T00:00:00Z","cwd":"/proj","metadata":{"host":"manox","thread":"torn"}}"#;
+        let torn_line = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"mid-write"}],"timestamp":1770000000000}}"#;
+        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{torn_line}")).unwrap();
+
+        store.refresh_now().await;
+        assert_eq!(first_summary_of(&store, "torn"), "mid-write");
+
+        // The line completes with DIFFERENT text and padding (the file only
+        // grew — the case the fact layer would treat as append-only).
+        let completed = r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-13T00:00:01Z","seq":0,"message":{"role":"user","content":[{"type":"text","text":"completed wording, settled"}],"timestamp":1770000000000}}"#;
+        std::fs::write(dir.join("torn.jsonl"), format!("{header}\n{completed}  \n")).unwrap();
+        store.refresh_now().await;
+        assert_eq!(
+            first_summary_of(&store, "torn"),
+            "completed wording, settled",
+            "a torn read must not have been pinned by the fact layer"
+        );
     }
 
     /// The negative cache: a file that fails its bounded scan (a
