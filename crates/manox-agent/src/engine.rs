@@ -333,6 +333,20 @@ pub struct PiEngine {
     bus: Arc<crate::steer_bus::AgentBus>,
 }
 
+impl PiEngine {
+    /// Multi-root grant: approve an extra working directory into the
+    /// session's shared granted-root set (the fs fence + seatbelt widen
+    /// through the shared Arc, pre- or post-materialize).
+    pub fn grant_working_directory(&self, dir: PathBuf) {
+        self.state.granted_roots.approve(dir);
+    }
+
+    /// The session's granted roots beyond the workspace root.
+    pub fn granted_working_directories(&self) -> Vec<PathBuf> {
+        self.state.granted_roots.approved_roots()
+    }
+}
+
 /// Map a facade event to its durable journal entry (§C.2): `(wire kind,
 /// payload)`. `None` means the event is not journaled — because it is
 /// already persisted by its owning flow (`model_change`, `thinking_level`,
@@ -847,6 +861,7 @@ pub fn spawn_engine(
     thread_id: String,
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
     parent_session: Option<String>,
+    extra_granted_roots: &[PathBuf],
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // K3: expose this engine's actor queue to the store-level decision
@@ -915,7 +930,13 @@ pub fn spawn_engine(
         goal_continuation_reserved: AtomicBool::new(false),
         goal_continuation_round: Mutex::new(None),
         session_start_fired: AtomicBool::new(false),
-        granted_roots: crate::granted_roots::GrantedRoots::new(cwd.clone()),
+        granted_roots: {
+            let granted = crate::granted_roots::GrantedRoots::new(cwd.clone());
+            for extra in extra_granted_roots {
+                granted.approve(extra.clone());
+            }
+            granted
+        },
         last_cwd_note: Mutex::new(None),
     });
     // The registry entry lives exactly as long as the actor: its exit
@@ -1018,6 +1039,12 @@ fn spawn_history_preview(
 }
 
 impl ThreadEngine for PiEngine {
+    fn grant_working_directory(&self, dir: PathBuf) {
+        PiEngine::grant_working_directory(self, dir);
+    }
+    fn granted_working_directories(&self) -> Vec<PathBuf> {
+        PiEngine::granted_working_directories(self)
+    }
     fn run_with_origin(
         &self,
         prompt: String,

@@ -65,6 +65,16 @@ impl GrantedRoots {
         }
     }
 
+    /// The escalation/grant-approved roots, canonical and deduplicated
+    /// (the multi-root grant set without the cwd-relative worktree roots).
+    pub fn approved_roots(&self) -> Vec<PathBuf> {
+        self.0
+            .approved
+            .lock()
+            .expect("granted roots poisoned")
+            .clone()
+    }
+
     /// Every extra root in force for a call running in `cwd`: the
     /// escalation-approved roots (session-wide) plus the same-repo worktree
     /// roots for `cwd` (directory-relative).

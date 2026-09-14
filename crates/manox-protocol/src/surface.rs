@@ -472,6 +472,7 @@ wire_surface! {
             approval_mode: Some("workspace-write".into()),
             reasoning_effort: Some("high".into()),
             seed: Some(vec![serde_json::json!({"type": "text", "text": "seed"})]),
+            working_directories: vec!["/proj".into(), "/proj-worktree".into()],
         },
         ClientCall::Submit { .. } => "submit" ~ ClientCall::Submit {
             session_id: "s1".into(),

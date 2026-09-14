@@ -21,6 +21,11 @@ pub struct SessionMeta {
     /// sessions — the session cwd is a working directory, not a project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Additional working directories granted to this session (multi-
+    /// root). Restored on thread load so a resumed session's sandbox
+    /// fence keeps admitting them. Empty (the default) = single-cwd.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub working_directories: Vec<String>,
     /// The permission gate policy the session runs under (`"read-only"`,
     /// `"workspace-write"`, or `"danger-full-access"`), as chosen in the access
     /// chip. Absent = the harness default. Stored as the mode's wire string
@@ -136,6 +141,10 @@ pub async fn save(
     meta: &SessionMeta,
 ) -> Result<(), anyhow::Error> {
     let path = meta_path(session_dir, session_path);
+    // A deferred-fresh session's transcript directory may not exist yet
+    // (the journal materializes at the first turn) while its sidecar is
+    // already addressable — create the dir so the write cannot ENOENT.
+    tokio::fs::create_dir_all(session_dir).await?;
     let bytes = serde_json::to_vec_pretty(meta)?;
     // `<id>.meta.json.tmp`: `with_extension` would only replace the last
     // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
