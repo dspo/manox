@@ -3350,6 +3350,7 @@ async fn run_actor(
     if let Some(project) = &project {
         bind_project(&sessions_dir, &session, project, &state, &notice_tx).await;
     }
+    announce_established_cwd(&session, &state, &notice_tx).await;
     spawn_session_list_refresh(&sessions_dir, &state);
 
     // Idle-wakeup channel: the harness listener signals when monitor events
@@ -4183,6 +4184,7 @@ async fn run_actor(
                             bind_project(&sessions_dir, &session, project, &state, &notice_tx)
                                 .await;
                         }
+                        announce_established_cwd(&session, &state, &notice_tx).await;
                         resync_approval_mode(&restored_state, &state, &notice_tx);
                         sync_history(&session, &sessions_dir, &state).await;
                         sync_usage(&session, &state).await;
@@ -5218,6 +5220,40 @@ async fn bind_project(
             )),
         )));
     }
+}
+
+/// Every fresh session establishment is a durable cwd move for whoever
+/// already follows the thread: the projection fold reads journal entries,
+/// never the session file's header, so the effective cwd gets one
+/// `cwd_change` witness whenever it differs from the last value reported
+/// to the facade. A restore needs no announcement — the reloaded chain
+/// already carries (or truly lacks) its own moves.
+async fn announce_established_cwd(
+    session: &AgentSession,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let projected = session.projected_cwd().await;
+    let projected_str = projected.to_string_lossy().into_owned();
+    if state.last_cwd_note.lock().unwrap().as_deref() == Some(projected_str.as_str()) {
+        return;
+    }
+    let appender = session.journal_appender();
+    let payload = serde_json::json!({ "cwd": &projected_str });
+    if let Err(err) = append_typed_resilient(&appender, "cwd_change", payload).await {
+        if let Some(row) = record_journal_loss(&appender, "cwd_change", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+            anyhow::anyhow!(
+                "journal append permanently failed for `cwd_change`: {err:#}; the entry was dropped"
+            ),
+        ))));
+    }
+    *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+        path: projected_str,
+    })));
 }
 
 /// Apply the user's permission-mode decision (K3): gate + sidecar cache +
@@ -9574,6 +9610,71 @@ mod tests {
             )),
             "the decision must land a permission_mode_change entry"
         );
+        session.close().await.unwrap();
+    }
+
+    /// Fresh-session establishment is a durable cwd move: exactly one
+    /// `cwd_change` witness for the effective working directory (the
+    /// follow stream's projection fold never sees the session file's
+    /// header), and one `CwdChanged` on the notice face. Re-establishing
+    /// onto the same directory stays silent.
+    #[tokio::test]
+    async fn establishment_journals_the_effective_cwd_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = decision_rig_session(&dir).await;
+        let state = test_engine_state();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        announce_established_cwd(&session, &state, &notice_tx).await;
+
+        let projected_str = session.projected_cwd().await.to_string_lossy().into_owned();
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        let witnesses = rows
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.entry,
+                    manox_harness::session::SessionTreeEntry::CwdChange { cwd, .. }
+                        if *cwd == projected_str
+                )
+            })
+            .count();
+        assert_eq!(
+            witnesses,
+            1,
+            "establishment journals exactly one cwd_change witness; chain kinds: {:?}",
+            rows.iter()
+                .map(|record| entry_type_tag(&record.entry))
+                .collect::<Vec<_>>()
+        );
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notice_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the establishment must reach the notice face"))
+            .expect("the notice channel must stay open");
+        let BackendNotice::Event(event) = notice else {
+            panic!("the establishment must ride a ThreadEvent notice");
+        };
+        let ThreadEvent::CwdChanged { path } = *event else {
+            panic!("expected CwdChanged");
+        };
+        assert_eq!(path, projected_str);
+
+        announce_established_cwd(&session, &state, &notice_tx).await;
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "an unchanged cwd announces nothing"
+        );
+        let rows = session.journal_range(0, u64::MAX).await.unwrap();
+        let witnesses = rows
+            .iter()
+            .filter(|record| {
+                matches!(
+                    &record.entry,
+                    manox_harness::session::SessionTreeEntry::CwdChange { .. }
+                )
+            })
+            .count();
+        assert_eq!(witnesses, 1, "the witness stays one per durable move");
         session.close().await.unwrap();
     }
 
