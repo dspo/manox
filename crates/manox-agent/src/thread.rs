@@ -291,6 +291,15 @@ pub enum ThreadEvent {
     SteerInjected {
         message_id: String,
     },
+    /// A `user` `message` journal row just landed on the client's fold —
+    /// `message_id` is that row's entry id. Synthesized by the CLIENT fold
+    /// at row-arrival time so an injected steer card retires the instant
+    /// its durable row appears (before the turn settles); the SERVER never
+    /// emits it. Shared vocabulary only: v2 never carries it on the wire
+    /// (`translate` skips it), and it joins no journal payload.
+    UserRowLanded {
+        message_id: String,
+    },
     /// A background task's state changed.
     BackgroundTaskUpdated {
         snapshot: TaskSnapshot,

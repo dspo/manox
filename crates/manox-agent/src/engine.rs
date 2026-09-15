@@ -582,6 +582,7 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
         | ThreadEvent::HistoryProgress
         | ThreadEvent::HistoryRestored
         | ThreadEvent::SteerInjected { .. }
+        | ThreadEvent::UserRowLanded { .. }
         | ThreadEvent::PeerMessage { .. } => return None,
     })
 }
@@ -2762,6 +2763,31 @@ async fn settle_run(
     } else {
         (std::mem::take(run_steers), Vec::new())
     };
+    // §C.2 `turn_finish`: the settle verdict must ride the journal, not
+    // just the notice plane — v2 clients fold lifecycle facts from durable
+    // rows (the `ThreadEvent::TurnFinished` notice is `Skip`ped by
+    // translate), and the app's steer-card retirement keys off this row.
+    // Appended through the shared writer at the session's single append
+    // point (id/parent/timestamp assigned under the append lock, so the
+    // chain stays dense and the seq is the natural next one). The K4
+    // fail-loud discipline mirrors the parked drain above: bounded retry,
+    // durable loss record, one facade notice on permanent failure.
+    let turn_finish = serde_json::json!({
+        "cancelled": abort_requested,
+        "failed": failed,
+        "strandedSteerIds": stranded.clone(),
+    });
+    let appender = session.journal_appender();
+    if let Err(err) = append_typed_resilient(&appender, "turn_finish", turn_finish).await {
+        if let Some(row) = record_journal_loss(&appender, "turn_finish", &err).await {
+            state.pending_journal.lock().unwrap().push(row);
+        }
+        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+            anyhow::anyhow!(
+                "journal append permanently failed for `turn_finish` at settle: {err:#}; the entry was dropped"
+            ),
+        ))));
+    }
     let _ = notice_tx.send(BackendNotice::Settled {
         cancelled: abort_requested,
         failed,
@@ -6490,6 +6516,148 @@ mod tests {
             stranded_seen,
             "S4: the aborted run reports the stranded steer as stranded"
         );
+    }
+
+    /// The last `turn_finish` journal row (settle delivery probe): the entry
+    /// id, parent id, and the §C.2 flags, as `settle_run` appended them.
+    async fn turn_finish_row(
+        session: &AgentSession,
+    ) -> (String, Option<String>, bool, bool, Vec<String>) {
+        let rows = session
+            .journal_appender()
+            .storage()
+            .journal_range(0, u64::MAX)
+            .await
+            .unwrap();
+        let (_, entry) = rows
+            .iter()
+            .rev()
+            .find_map(|r| match &r.entry {
+                manox_harness::session::SessionTreeEntry::TurnFinish {
+                    id,
+                    parent_id,
+                    cancelled,
+                    failed,
+                    stranded_steer_ids,
+                    ..
+                } => Some((
+                    r.seq,
+                    (
+                        id.clone(),
+                        parent_id.clone(),
+                        *cancelled,
+                        *failed,
+                        stranded_steer_ids.clone(),
+                    ),
+                )),
+                _ => None,
+            })
+            .expect("settle must append a `turn_finish` journal row");
+        // The row is the journal's tail: settle appends after every other
+        // write of the run, so the seq stays chain-dense without renumbering.
+        assert_eq!(
+            rows.last().expect("journal non-empty").seq,
+            rows.iter()
+                .rev()
+                .find_map(|r| match r.entry {
+                    manox_harness::session::SessionTreeEntry::TurnFinish { .. } => Some(r.seq),
+                    _ => None,
+                })
+                .expect("turn_finish row present"),
+            "the `turn_finish` row must be the journal tail (dense seq)"
+        );
+        entry
+    }
+
+    /// Settle delivery (v2 wire): a normal settle appends a durable
+    /// `turn_finish` row — clean exit, no stranded steers, a fresh entry id
+    /// chained onto the session leaf.
+    #[tokio::test]
+    async fn settle_appends_a_turn_finish_row_on_normal_completion() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        let state = test_engine_state();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        // A steer drained by the run confirms as injected (not stranded).
+        let mut run_steers = vec!["injected-steer".to_string()];
+        let pre_leaf = session.journal_appender().leaf_id().await.unwrap();
+        settle_run(
+            &Ok(Vec::new()),
+            /* abort_requested */ false,
+            &session,
+            &state,
+            &sessions_dir,
+            &cwd,
+            &notice_tx,
+            &mut run_steers,
+        )
+        .await;
+
+        let (id, parent_id, cancelled, failed, stranded) = turn_finish_row(&session).await;
+        assert!(!id.is_empty(), "the row carries a fresh entry id");
+        // `append_typed` chains onto the session leaf and advances the
+        // cursor: the row's parent is the pre-settle leaf (None on a fresh
+        // journal) and the row itself is now the leaf.
+        assert_eq!(parent_id, pre_leaf, "the row chains onto the leaf");
+        assert_eq!(
+            session
+                .journal_appender()
+                .leaf_id()
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(id.as_str()),
+            "the append moves the leaf cursor to the row"
+        );
+        assert!(!cancelled);
+        assert!(!failed);
+        assert!(stranded.is_empty(), "a clean settle strands nothing");
+    }
+
+    /// Settle delivery, abort path: the retracted steers of the
+    /// `Settled{stranded}` notice ride the same durable row, so a v2 client
+    /// retires its cards from the journal fold alone.
+    #[tokio::test]
+    async fn settle_appends_a_turn_finish_row_with_stranded_steers_on_abort() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let session = steer_test_session(&dir).await;
+        let sessions_dir = dir.path().join("sessions");
+        let state = test_engine_state();
+        let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+
+        let stranded_id = "stranded-steer".to_string();
+        session.handle().steer_with_id(
+            steer_message(
+                stranded_id.clone(),
+                "never reached the model".into(),
+                Vec::new(),
+            ),
+            stranded_id.clone(),
+        );
+        let mut run_steers = vec![stranded_id.clone()];
+        settle_run(
+            &Ok(Vec::new()),
+            /* abort_requested */ true,
+            &session,
+            &state,
+            &sessions_dir,
+            &cwd,
+            &notice_tx,
+            &mut run_steers,
+        )
+        .await;
+
+        let (_id, _parent, cancelled, failed, stranded) = turn_finish_row(&session).await;
+        assert!(cancelled, "the abort verdict rides the row");
+        assert!(!failed);
+        assert_eq!(stranded, vec![stranded_id], "retracted steers are listed");
     }
 
     /// S4 continuation: the retraction is what stops the stranded text from
