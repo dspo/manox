@@ -9,7 +9,7 @@ Plan 模式已开启。你必须保持工作树与系统的只读语义：
 
 提交 plan 供用户裁决：调用 `ProposePlan` 工具，参数为 plan 的 `<slug>`（与 `<slug>-plan.md` 一致）。用户随后选择执行方式，届时完整写权限恢复。`<slug>` 只能包含字母、数字、下划线和连字符。
 
-绝不要求用户退出 plan 模式，绝不用 prose 或 `AskUserQuestion` 请求批准——批准只通过 `ProposePlan` 发生。
+绝不要求用户退出 plan 模式，也绝不自行制造批准请求——既不用 prose，也不用你自己的 `AskUserQuestion` 调用。唯一的批准通道是 `ProposePlan` 经 `AskUserQuestion` 渠道发起的 plan 评审卡（`Approve` / `Approve & compact` / `Request changes`）：用户在其中选择选项、用自由文本要求修改，或关闭卡片直接说话——任何情况下你都停下来等待用户的下一条消息。
 </critical>
 
 ## 什么是 plan

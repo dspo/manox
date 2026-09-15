@@ -1523,11 +1523,7 @@ mod tests {
                 gate.respond(
                     "ask-1",
                     ToolAuthorizationResponse::AskUserQuestion {
-                        answers: vec![AskAnswer::new(
-                            "shape-q".into(),
-                            vec!["round".into()],
-                            None,
-                        )],
+                        answers: vec![AskAnswer::new("shape-q".into(), vec!["round".into()], None)],
                     },
                 );
             })

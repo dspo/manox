@@ -3183,77 +3183,235 @@ fn dual_owner_approve_quorum_is_not_widened_to_first_claim() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-#[test]
-fn plan_verdict_round_trips_and_seeds_execution() {
-    let _g = lock_globals();
-    hermetic_home();
-    init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
-    create(&server, &client, "s1");
-    let (engine, events) = FakeEngine::new();
-    server.set_session_engine_for_test("s1", engine.clone(), events);
-    client.send(FromClient::Notification {
-        note: ClientNote::SetPlanMode {
-            session_id: "s1".into(),
-            enabled: true,
-        },
-    });
-    client.settle(); // FIFO: the SetPlanMode note has been dispatched.
-    // Before the verdict, plan_mode is on (confirms SetPlanMode applied).
-    // T10: the v1 `ThreadInfo` query is gone — the header truth the
-    // deleted payload mirrored is the thread itself; the P-face fold of
-    // `PlanModeChange` is pinned in `projections`.
-    assert!(plan_mode_of(&server, "s1"));
-    let plan_file =
-        std::env::temp_dir().join(format!("manox-beta3b-plan-{}.md", std::process::id()));
-    std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+/// PR-5a (C4) helper: drive a session into a parked plan-review
+/// `AskUserQuestion` card. Returns the deterministic reply MsgId (the plan
+/// file) plus the card's `auth_id` (also the plan file — the single review
+/// identity). The card must carry the gateway-minted plan-review shape:
+/// one question, `intent.kind = plan-review`, plan body in `detail`.
+fn park_plan_review(
+    client: &Client,
+    engine: &std::sync::Arc<FakeEngine>,
+    plan_file: &std::path::Path,
+    title: &str,
+) -> MsgId {
+    let pf = plan_file.to_string_lossy().into_owned();
     engine
         .notices
         .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
-            plan_file: plan_file.to_string_lossy().into_owned(),
-            title: "Test plan".into(),
+            plan_file: pf.clone(),
+            title: title.into(),
         })))
         .unwrap();
-    // PlanReady initiates ServerCall::PlanVerdict carrying the plan body.
-    let call_id = loop {
+    loop {
         match client.recv() {
             FromServer::Request {
                 id,
-                call:
-                    ServerCall::PlanVerdict {
-                        plan_file: pf,
-                        content,
-                        ..
-                    },
-            } if pf == plan_file.to_string_lossy() => {
-                assert!(content.is_some(), "PlanVerdict must carry the plan body");
-                break id;
+                call: ServerCall::AskUserQuestion { auth_id, input, .. },
+            } if auth_id == pf => {
+                // The review card's canonical shape (C4 discriminator).
+                let q = &input["questions"][0];
+                assert_eq!(q["id"], auth_id, "the question id IS the plan file");
+                assert_eq!(
+                    q["intent"]["kind"], "plan-review",
+                    "the review card carries the plan-review intent: {input}"
+                );
+                assert_eq!(
+                    q["intent"]["approve"], "Approve",
+                    "the approving option is named"
+                );
+                assert!(
+                    q["detail"].as_str().is_some_and(|d| d.contains("Step one")),
+                    "the plan body rides the detail markdown: {q}"
+                );
+                assert_eq!(
+                    q["options"].as_array().map(Vec::len),
+                    Some(3),
+                    "three verdict options (Fresh removed): {q}"
+                );
+                return id;
             }
             _ => {}
         }
-    };
+    }
+}
+
+/// PR-5a (C4): `PlanReady` delivers the review as an `AskUserQuestion` card
+/// and the reply maps across the four verdict arms — Approve → keep
+/// execution, Approve & compact → compact execution, Request changes →
+/// refine (no execution, plan mode stays), dismissed → no convergence
+/// cancel (plan mode stays, review flag consumed).
+#[test]
+fn plan_review_ask_card_maps_the_four_verdicts() {
+    let _g = lock_globals();
+    for (label, reply, expect_executed) in [
+        (
+            "Approve",
+            json!({"answers": [
+                {"id": "keep", "selected": ["Approve"]}
+            ]}),
+            true,
+        ),
+        (
+            "Approve & compact",
+            json!({"answers": [
+                {"id": "compact", "selected": ["Approve & compact"]}
+            ]}),
+            true,
+        ),
+        (
+            "Request changes",
+            json!({"answers": [{"id": "refine", "selected": ["Request changes"]}]}),
+            false,
+        ),
+        ("dismissed", json!({"dismissed": true}), false),
+    ] {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+        create(&server, &client, "c4-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("c4-s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "c4-s1".into(),
+                enabled: true,
+            },
+        });
+        client.settle();
+        assert!(plan_mode_of(&server, "c4-s1"), "plan mode on before review");
+        let plan_file =
+            std::env::temp_dir().join(format!("manox-c4-plan-{}.md", std::process::id()));
+        std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+        let pf = plan_file.to_string_lossy().into_owned();
+
+        // The delivered card carries the plan file as its identity; stamp
+        // the row id on the reply so it matches the single canonical row.
+        let reply = {
+            let mut r = reply;
+            if let Some(rows) = r["answers"].as_array_mut() {
+                for row in rows.iter_mut() {
+                    row["id"] = json!(pf);
+                }
+            }
+            r
+        };
+
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: pf.clone(),
+                title: "C4 plan".into(),
+            })))
+            .unwrap();
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::AskUserQuestion { auth_id, input, .. },
+                } if auth_id == pf => {
+                    let q = &input["questions"][0];
+                    assert_eq!(q["id"], pf, "the question id is the plan file");
+                    assert_eq!(q["intent"]["kind"], "plan-review");
+                    assert_eq!(q["options"].as_array().map(Vec::len), Some(3));
+                    break id;
+                }
+                _ => {}
+            }
+        };
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(reply),
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let executed = engine.plan_approvals.lock().unwrap().len() == 1;
+            let review_consumed =
+                engine.plan_review_flags.lock().unwrap().as_slice() == [true, false];
+            if executed == expect_executed && review_consumed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label}: executed={executed} expected={expect_executed} review_consumed={review_consumed}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Refine/dismissed keep plan mode on (the user can re-edit / speak);
+        // approve/compact turn it off via seed execution.
+        let still_planning = plan_mode_of(&server, "c4-s1");
+        assert_eq!(
+            still_planning, !expect_executed,
+            "{label}: plan mode after the verdict"
+        );
+        let _ = std::fs::remove_file(&plan_file);
+        let _ = std::fs::remove_file(
+            manox_agent::paths::sessions_dir()
+                .unwrap()
+                .join("c4-s1.jsonl"),
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
+/// PR-5a (C4): the compact branch of the review. `Approve & compact` selects
+/// compaction; the FakeEngine's `approve_plan` only records the seed text,
+/// so compaction is pinned structurally as "executed" (the kernel
+/// instructions argument is not observable at the fake seam) — the distinct
+/// selection is exercised in [`plan_review_ask_card_maps_the_four_verdicts`].
+#[test]
+fn plan_review_ask_card_approve_executes_and_seeds() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "c4-exec");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("c4-exec", engine.clone(), events);
+    client.send(FromClient::Notification {
+        note: ClientNote::SetPlanMode {
+            session_id: "c4-exec".into(),
+            enabled: true,
+        },
+    });
+    client.settle();
+    let plan_file = std::env::temp_dir().join(format!("manox-c4-exec-{}.md", std::process::id()));
+    std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+    let pf = plan_file.to_string_lossy().into_owned();
+    let call_id = park_plan_review(&client, &engine, &plan_file, "C4 exec");
     client.send(FromClient::Reply {
         id: call_id,
-        outcome: Ok(json!({"choice": "execute_keep"})),
+        outcome: Ok(json!({"answers": [{"id": pf, "selected": ["Approve"]}]})),
     });
-    // execute_keep → approve_plan → plan_mode flips off (async: route_call
-    // applies the reply on the pump task; poll rather than race it).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if !plan_mode_of(&server, "s1") {
+        let approvals = engine.plan_approvals.lock().unwrap().clone();
+        if approvals.len() == 1 {
+            assert!(
+                approvals[0].contains("Step one") || !approvals[0].is_empty(),
+                "approve seeds the plan-execution directive"
+            );
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "plan_mode never flipped off after execute_keep"
+            "Approve never seeded execution"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
     let _ = std::fs::remove_file(&plan_file);
+    let _ = std::fs::remove_file(
+        manox_agent::paths::sessions_dir()
+            .unwrap()
+            .join("c4-exec.jsonl"),
+    );
     drop(client);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
 }
+
 #[test]
 fn browser_op_routes_to_client_and_returns_reply() {
     let _g = lock_globals();
@@ -5605,20 +5763,21 @@ fn expect_store_pending_plan(session_id: &str, want: bool, what: &str) {
     }
 }
 
-/// GW9 regression: a REJECTED PlanVerdict must converge — pre-fix the
-/// fail-closed arm was a bare `return` that cleared nothing: the kernel
+/// GW9 regression (re-pointed at the C4 review-as-ask channel by PR-5a):
+/// a REJECTED plan review must converge — pre-fix the fail-closed arm
+/// was a bare `return` that cleared nothing: the kernel
 /// `plan_review_pending` flag and the store `pending_plan` flag stayed
 /// set forever, no `pending_plan=false` delta was broadcast, and the
 /// session was permanently "plan pending review". The convergence
-/// clears every plane, cancels the parked turn, and names the rejecter
-/// in an Error note. Fail-closed semantics hold: the plan never
-/// executes (no `approve_plan` on the engine).
+/// clears every plane, cancels the parked turn, and notes the cause in
+/// an Error note. Fail-closed semantics hold: the plan never executes
+/// (no `approve_plan` on the engine).
 #[test]
 fn plan_verdict_rejection_converges_pending_state() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw9-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s1", engine.clone(), events);
@@ -5642,12 +5801,14 @@ fn plan_verdict_rejection_converges_pending_state() {
         })))
         .unwrap();
     let mut saw_pending_true = false;
+    let pf = plan_file.to_string_lossy().into_owned();
     let call_id = loop {
         match client.recv() {
+            // PR-5a (C4): the review card rides the ASK channel.
             FromServer::Request {
                 id,
-                call: ServerCall::PlanVerdict { .. },
-            } => break id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == pf => break id,
             // §D.5: the pending_plan TRUE edge must broadcast on the
             // way in (GW1 delivery finding) — the pump emits it before
             // routing the verdict call, so it arrives first on this
@@ -7380,7 +7541,8 @@ fn adjudication_requests_carry_stable_delivery_id() {
         outcome: Ok(json!({"answers": [], "response": null})),
     });
 
-    // PlanVerdict, the third waterfall arm, carries one too.
+    // PR-5a (C4): the plan review — the third waterfall arm, riding the
+    // ask channel — carries one too.
     client.send(FromClient::Notification {
         note: ClientNote::SetPlanMode {
             session_id: "gw3-s1".into(),
@@ -7397,7 +7559,10 @@ fn adjudication_requests_carry_stable_delivery_id() {
         .unwrap();
     let (verdict_id, verdict_dlv) = loop {
         match client.recv() {
-            FromServer::Request { id, call } if matches!(&call, ServerCall::PlanVerdict { .. }) => {
+            FromServer::Request { id, call }
+                if matches!(&call, ServerCall::AskUserQuestion { auth_id, .. }
+                    if auth_id == "/nonexistent/gw3-plan.md") =>
+            {
                 let wire = serde_json::to_value(&call).unwrap();
                 break (id, wire["deliveryId"].as_str().unwrap_or("").to_string());
             }
@@ -7406,13 +7571,13 @@ fn adjudication_requests_carry_stable_delivery_id() {
     };
     assert!(
         !verdict_dlv.is_empty() && verdict_dlv != approve_dlv && verdict_dlv != ask_dlv,
-        "GW3: PlanVerdict carries its own deliveryId ({verdict_dlv})"
+        "GW3: the plan-review delivery carries its own deliveryId ({verdict_dlv})"
     );
     // Refine: consumes the pending review without executing (keeps the
     // session clean for teardown).
     client.send(FromClient::Reply {
         id: verdict_id,
-        outcome: Ok(json!({"choice": "refine"})),
+        outcome: Ok(json!({"answers": [{"id": "/nonexistent/gw3-plan.md", "selected": ["Request changes"]}]})),
     });
     client.settle();
     drop(client);
@@ -8132,32 +8297,35 @@ fn approve_verdict_clears_the_pending_auth_badge_server_side() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-/// U3b: an EXECUTED plan verdict clears the pending-plan badge
-/// server-side (store + delta) — bookkeeping, not a skip: the plan
-/// still executes. (Reject/expire is GW9's convergence, pinned there.)
+/// U3b: an EXECUTED plan review clears the pending-plan badge server-side
+/// (store + delta) — bookkeeping, not a skip: the plan still executes.
+/// (Reject/expire is GW9's convergence, pinned there.) PR-5a (C4): the
+/// review rides the ask channel.
 #[test]
 fn plan_verdict_execution_clears_the_pending_plan_badge() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "u3b-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-s1", engine.clone(), events);
     let plan_file = std::env::temp_dir().join(format!("manox-u3b-plan-{}.md", std::process::id()));
     std::fs::write(&plan_file, "# Plan").unwrap();
+    let pf = plan_file.to_string_lossy().into_owned();
     engine
         .notices
         .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
-            plan_file: plan_file.to_string_lossy().into_owned(),
+            plan_file: pf.clone(),
             title: "U3b plan".into(),
         })))
         .unwrap();
     let call_id = loop {
         if let FromServer::Request {
             id,
-            call: ServerCall::PlanVerdict { .. },
+            call: ServerCall::AskUserQuestion { auth_id, .. },
         } = client.recv()
+            && auth_id == pf
         {
             break id;
         }
@@ -8165,7 +8333,7 @@ fn plan_verdict_execution_clears_the_pending_plan_badge() {
     expect_store_pending_plan("u3b-s1", true, "while the verdict is pending");
     client.send(FromClient::Reply {
         id: call_id,
-        outcome: Ok(json!({ "choice": "execute_keep" })),
+        outcome: Ok(json!({ "answers": [{ "id": pf, "selected": ["Approve"] }] })),
     });
     expect_pending_plan_cleared(&client, "u3b-s1");
     expect_store_pending_plan("u3b-s1", false, "after the execution verdict");

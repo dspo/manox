@@ -1271,8 +1271,13 @@ impl AgentServerInner {
             // already settled first-wins, so the fresh waiter's reply
             // double-applies into the same idempotent gate, and the next
             // join re-checks and finds the record gone.
+            // PR-5a (C4): the ctx test excludes the plan-review ask — a
+            // pump-initiated review is not a gate interaction (the engine's
+            // pending-auth set can never contain it); its truth is the
+            // kernel's pending-review flag.
             let gate_settled =
                 matches!(rec.kind, AnswerKind::Approve | AnswerKind::AskUserQuestion)
+                    && matches!(rec.ctx, ReplyCtx::Approve { .. } | ReplyCtx::AskUser { .. })
                     && !live_auth_ids.contains(&rec.key);
             if gate_settled {
                 self.retire_pending_adjudication(session_id, &rec.key);
@@ -3478,9 +3483,22 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         ServerCall::Approve { auth_id, .. } => ReplyCtx::Approve {
             auth_id: auth_id.clone(),
         },
-        ServerCall::AskUserQuestion { auth_id, .. } => ReplyCtx::AskUser {
-            auth_id: auth_id.clone(),
-        },
+        ServerCall::AskUserQuestion { auth_id, input, .. } => {
+            // PR-5a (C4): the plan review rides the ASK channel — the
+            // gateway-minted single-question shape (question id +
+            // `intent.kind` `plan-review`, `auth_id` = the plan file) is
+            // the discriminator. A model-issued ask never carries it (the
+            // ask tool contract forbids model-side plan approval asks).
+            if is_plan_review_input(input) {
+                ReplyCtx::PlanReview {
+                    plan_file: auth_id.clone(),
+                }
+            } else {
+                ReplyCtx::AskUser {
+                    auth_id: auth_id.clone(),
+                }
+            }
+        }
         ServerCall::PlanVerdict { plan_file, .. } => ReplyCtx::PlanVerdict {
             plan_file: plan_file.clone(),
         },
@@ -3495,7 +3513,10 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     // (BrowserOp/...) stay single-target.
     let adjudication = matches!(
         ctx,
-        ReplyCtx::Approve { .. } | ReplyCtx::AskUser { .. } | ReplyCtx::PlanVerdict { .. }
+        ReplyCtx::Approve { .. }
+            | ReplyCtx::AskUser { .. }
+            | ReplyCtx::PlanReview { .. }
+            | ReplyCtx::PlanVerdict { .. }
     );
 
     // Register a waiter per eligible owner under the clients lock (brief —
@@ -3513,13 +3534,14 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                 let entry = clients.get(cid).filter(|e| e.hello.can(kind))?;
                 // Deterministic MsgId per kind so a client without bridge
                 // state can correlate its Reply: Approve/AskUser echo the
-                // auth_id the card carries; PlanVerdict uses the session id
-                // (one pending review per session); capability calls mint a
-                // fresh opaque id.
+                // auth_id the card carries (for the plan-review ask the
+                // auth_id IS the plan file); PlanVerdict uses the session
+                // id (one pending review per session); capability calls
+                // mint a fresh opaque id.
                 let id = match &ctx {
-                    ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => {
-                        MsgId::new(auth_id.clone())
-                    }
+                    ReplyCtx::Approve { auth_id }
+                    | ReplyCtx::AskUser { auth_id }
+                    | ReplyCtx::PlanReview { plan_file: auth_id } => MsgId::new(auth_id.clone()),
                     ReplyCtx::PlanVerdict { .. } => MsgId::new(session_id.to_string()),
                     ReplyCtx::Other => inner.next_call_id(),
                 };
@@ -3963,9 +3985,23 @@ fn sorted_ids(targets: &[AdjudicationTarget]) -> Vec<String> {
 /// Per-`ServerCall` context carried out of the lock to apply the reply.
 #[derive(Clone)]
 enum ReplyCtx {
-    Approve { auth_id: String },
-    AskUser { auth_id: String },
-    PlanVerdict { plan_file: String },
+    Approve {
+        auth_id: String,
+    },
+    AskUser {
+        auth_id: String,
+    },
+    /// PR-5a (C4): the plan review delivered as an `AskUserQuestion` card.
+    /// The settle identity stays the plan file (one pending review per
+    /// session, the key PlanVerdict used); the `auth_id` the card carries
+    /// IS the plan file, so the deterministic MsgId, the replay key, and
+    /// the verdict target coincide.
+    PlanReview {
+        plan_file: String,
+    },
+    PlanVerdict {
+        plan_file: String,
+    },
     Other,
 }
 
@@ -3976,7 +4012,9 @@ impl ReplyCtx {
     fn settle_key(&self) -> Option<String> {
         match self {
             ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => Some(auth_id.clone()),
-            ReplyCtx::PlanVerdict { plan_file } => Some(plan_file.clone()),
+            ReplyCtx::PlanReview { plan_file } | ReplyCtx::PlanVerdict { plan_file } => {
+                Some(plan_file.clone())
+            }
             ReplyCtx::Other => None,
         }
     }
@@ -3999,6 +4037,12 @@ fn fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, ctx: &ReplyCtx) 
             session_id,
             "no client can review this plan".to_string(),
         ),
+        // PR-5a (C4): the same convergence for the review-as-ask channel.
+        ReplyCtx::PlanReview { .. } => converge_plan_rejected(
+            inner,
+            session_id,
+            "no client can review this plan".to_string(),
+        ),
         ReplyCtx::Other => {}
     }
 }
@@ -4017,6 +4061,9 @@ fn apply_reply(
     match ctx {
         ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
+        ReplyCtx::PlanReview { plan_file } => {
+            apply_plan_review(inner, session_id, plan_file, outcome)
+        }
         ReplyCtx::PlanVerdict { plan_file } => {
             apply_plan_verdict(inner, session_id, plan_file, outcome)
         }
@@ -4265,6 +4312,170 @@ fn clear_pending_plan_flags(inner: &Arc<AgentServerInner>, session_id: &str) {
     inner.broadcast_host(host_status(session_id, |f| {
         f.pending_plan = Some(false);
     }));
+}
+
+/// PR-5a (C4): the three plan-review options — the approval verdict
+/// vocabulary the review card offers (Fresh is gone: the gateway never
+/// carried an execute-fresh arm, and re-asking from a clean slate is a
+/// client-local action, not a server verdict). Model-facing English.
+const PLAN_REVIEW_APPROVE: &str = "Approve";
+const PLAN_REVIEW_APPROVE_COMPACT: &str = "Approve & compact";
+const PLAN_REVIEW_REFINE: &str = "Request changes";
+
+/// PR-5a (C4): the gateway-minted plan-review card. One `AskUserQuestion`
+/// question: `question` is the plan title, `detail` the plan body (the
+/// markdown the client renders), `intent.kind = plan-review` with
+/// `approve = "Approve"` — the vocabulary that marks the card as a plan
+/// review for both the discriminator below and any client surface.
+/// The reply maps through [`apply_plan_review`].
+fn plan_review_ask_input(plan_file: &str, title: &str, content: Option<String>) -> Value {
+    json!({
+        "questions": [{
+            "id": plan_file,
+            "question": title,
+            "header": "plan-review",
+            "multiSelect": false,
+            "detail": content.unwrap_or_default(),
+            "intent": { "kind": "plan-review", "approve": PLAN_REVIEW_APPROVE },
+            "options": [
+                { "label": PLAN_REVIEW_APPROVE, "description": "Execute the plan as written." },
+                { "label": PLAN_REVIEW_APPROVE_COMPACT, "description": "Execute, then compact the conversation." },
+                { "label": PLAN_REVIEW_REFINE, "description": "Stay in plan mode and revise the plan." },
+            ],
+        }]
+    })
+}
+
+/// PR-5a (C4): the discriminator between a plan-review card and a
+/// model-issued question — the gateway-minted single question carries the
+/// plan file as its `id` AND `intent.kind = plan-review`. A model ask
+/// never matches both (its ids are uuid-minted or model-chosen, and the
+/// ask contract forbids model-side approval asks).
+fn is_plan_review_input(input: &Value) -> bool {
+    let Some(question) = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .and_then(|q| q.first())
+    else {
+        return false;
+    };
+    question.get("id").and_then(Value::as_str).is_some()
+        && question
+            .get("intent")
+            .and_then(|i| i.get("kind"))
+            .and_then(Value::as_str)
+            == Some("plan-review")
+}
+
+/// PR-5a (C4): map the canonical tri-state reply of a plan-review card to
+/// the semantic verdict. Returns `None` when the reply carries no
+/// well-formed canonical row (the caller treats that as a rejection —
+/// never a silent no-decision):
+/// - `"Approve & compact"` selected → `"compact"`,
+/// - `"Approve"` selected → `"keep"`,
+/// - `"Request changes"`, free-text custom, or an explicit skip
+///   (`selected: []`, no custom) → `"refine"` (plan mode stays, the
+///   review flag retires).
+fn parse_plan_verdict(v: &Value) -> Option<&'static str> {
+    let row = v.get("answers").and_then(Value::as_array).and_then(|arr| {
+        arr.iter().find(|p| {
+            p.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+                && p.get("selected").is_some_and(Value::is_array)
+        })
+    })?;
+    let selected = row["selected"].as_array()?;
+    let pick = |label: &str| selected.iter().any(|s| s.as_str() == Some(label));
+    if pick(PLAN_REVIEW_APPROVE_COMPACT) {
+        Some("compact")
+    } else if pick(PLAN_REVIEW_APPROVE) {
+        Some("keep")
+    } else {
+        Some("refine") // "Request changes" / custom / skip
+    }
+}
+
+/// PR-5a (C4): settle a plan review delivered as an `AskUserQuestion`
+/// card. The verdict arms mirror the retired PlanVerdict semantics —
+/// approve keeps, approve-&-compact compacts, anything else the user
+/// answered with refines (flag consumed, plan mode stays on) — except
+/// DISMISSED: closing the card to speak is not a rejection (dsh
+/// `ASK_CANCELLED`); the review flag retires, plan mode stays on, the
+/// turn already ended at `ProposePlan`, and the session simply waits for
+/// the user's next message. Only a LAPSE (withdrawn delivery, dead
+/// connection, abandoned replay waiter — no human action) keeps GW9's
+/// fail-closed convergence.
+fn apply_plan_review(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+    plan_file: String,
+    outcome: Result<Value, RpcError>,
+) {
+    let dismissed = matches!(&outcome, Ok(v)
+        if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
+            || v.get("outcome").and_then(Value::as_str) == Some("dismissed"));
+    let verdict: String = match (
+        dismissed,
+        outcome.as_ref().ok().and_then(|v| parse_plan_verdict(v)),
+    ) {
+        (true, _) => "dismissed",
+        (false, Some(v)) => v,
+        // No canonical row at all: an RPC-level rejection or a lapse —
+        // both fail closed (GW9 convergence).
+        (false, None) => "rejected",
+    }
+    .to_string();
+    if verdict == "rejected" {
+        // `converge_plan_rejected` owns EVERY plane (kernel flag, store,
+        // §D.5 delta, Error note) and the parked-turn cancel — clear not
+        // twice, converge here.
+        return converge_plan_rejected(
+            inner,
+            session_id,
+            "plan review rejected or expired".to_string(),
+        );
+    }
+    // Every human action (verdict or dismissal) consumes the review:
+    // kernel flag off, store mirror + delta off.
+    if let Some(thread) = inner.session_thread(session_id) {
+        thread.with_mut(|t| t.set_plan_review_pending(false));
+    }
+    clear_pending_plan_flags(inner, session_id);
+    match verdict.as_str() {
+        "dismissed" | "refine" => {
+            // Both keep plan mode; the model waits for the next message.
+        }
+        keep_or_compact @ ("keep" | "compact") => {
+            let Some(thread) = inner.session_thread(session_id) else {
+                return;
+            };
+            let compact = keep_or_compact == "compact";
+            let lang = thread.read(|t| t.agent_language());
+            let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(
+                lang, &plan_file,
+            ) {
+                Ok(text) => text,
+                Err(e) => {
+                    thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+                    return;
+                }
+            };
+            let compact_instructions = compact.then(|| {
+                manox_agent::collaboration_mode::plan_compact_instructions(lang, &plan_file)
+            });
+            thread.with_mut(|t| {
+                let ui = MessageUiMetadata {
+                    model_id: t.model().map(|m| m.id.clone()),
+                    approval_mode: Some(t.permission_mode().as_i64()),
+                    author: Some(t.self_author()),
+                    ..Default::default()
+                };
+                t.approve_plan(compact, compact_instructions, seed_text, Some(ui));
+            });
+        }
+        _ => {}
+    }
 }
 
 fn apply_plan_verdict(
@@ -4773,20 +4984,24 @@ fn spawn_pump(
                     inner.broadcast_host(host_status(&session_id, |f| {
                         f.pending_plan = Some(true);
                     }));
-                    // β-3b: initiate PlanVerdict (carries the plan body) and
-                    // skip translate's bare PlanReady note — the call is the
-                    // actionable review card; the bare note would duplicate.
-                    // GW3: `delivery_id` is stamped at the single routing
+                    // PR-5a (C4): the review rides the ASK channel — the
+                    // plan body becomes the card's `detail` (markdown),
+                    // the three verdict options are server-minted, and the
+                    // `intent` marks it as a plan review. GW3:
+                    // `delivery_id` is stamped at the single routing
                     // point (`route_call`), never at construction.
                     route_call(
                         &inner,
                         &session_id,
-                        ServerCall::PlanVerdict {
+                        ServerCall::AskUserQuestion {
                             delivery_id: String::new(),
                             session_id: session_id.clone(),
-                            plan_file: plan_file.clone(),
-                            title: title.clone(),
-                            content: std::fs::read_to_string(plan_file).ok(),
+                            auth_id: plan_file.clone(),
+                            input: plan_review_ask_input(
+                                plan_file,
+                                title,
+                                std::fs::read_to_string(plan_file).ok(),
+                            ),
                         },
                     )
                     .await;
