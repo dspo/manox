@@ -2699,6 +2699,215 @@ fn ask_expires_when_the_holding_owner_disconnects() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+// ── §0: the adjudication await runs off the pump (batch-2 C1). ─────────────
+
+/// §0 (C1): a parked ask must not stall the pump. Pre-fix, `route_call`
+/// awaited the whole waterfall on the pump's stack, so every later pump
+/// event queued behind the human window — the turn-settle edges never
+/// broadcast and a second authorization never reached the wire. Both are
+/// pinned here: they flow while q1 stays parked.
+#[test]
+fn parked_ask_does_not_block_the_pump() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _q1_id = park_ask(&client, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the parked delivery is registered (register-before-spawn, on the pump)"
+    );
+
+    // A turn settle while q1 is parked: the pump's bookkeeping still runs.
+    engine
+        .notices
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
+        .unwrap();
+    expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
+    // And a second adjudication fans out on its own task.
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "q2".into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a shape".into(),
+                input: seeded_ask_input(),
+            },
+        )))
+        .unwrap();
+    loop {
+        match client.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q2" => {
+                assert_eq!(id.0, "q2", "the second card is MsgId-auth-routed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    // q1 was never answered and converges on nothing: the pump kept moving
+    // with the ask parked.
+    assert!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(id, _)| id != "q1"),
+        "parking must not settle q1"
+    );
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "q1's delivery stays parked while the pump processes events"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §0 (C1): session dispose no longer terminates the waterfall by pump
+/// abort (the await lives on its own task) — the teardown sweep must
+/// cancel the parked waiters, and the waterfall's own fail-closed exit
+/// must unregister the delivery and retire the replay record.
+#[test]
+fn dispose_session_cancels_the_spawned_waterfall_and_unregisters() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the parked delivery is registered"
+    );
+
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "s1".into(),
+        },
+    });
+    expect(&client, |m| {
+        matches!(
+            m,
+            FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id }
+            } if session_id == "s1"
+        )
+    });
+    // The sweep's wakeups converge the spawned waterfall without any
+    // client reply and without the pump: guard unregister + record retire.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let deliveries_gone = !server.0.pending_deliveries.lock().contains_key("dlv-s1-1");
+        let record_gone = server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.iter().all(|rec| rec.key != "q1"));
+        if deliveries_gone && record_gone {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dispose sweep never converged the parked waterfall: \
+             deliveries_gone={deliveries_gone} record_gone={record_gone}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §0 (C1): the `DeliveryGuard` is now held by the spawned waterfall task
+/// (Arc-based), so EVERY non-settle exit still unregisters + cancels the
+/// delivery. The re-seat hand-off is the settled exit that never calls
+/// `apply_reply` — its guard drop is the unregister being pinned: the
+/// original delivery leaves the registry while the replayed waiter (not
+/// under the retired entry's tokens) answers on and settles exactly once.
+#[test]
+fn reseat_abandonment_still_unregisters_the_delivery() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the original delivery is registered"
+    );
+
+    let reseated = second_client(
+        &server,
+        "test",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
+    let replayed = loop {
+        match reseated.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !server.0.pending_deliveries.lock().contains_key("dlv-s1-1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned waterfall never unregistered its delivery (guard Drop)"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The replayed waiter answers on the retired delivery's card:
+    reseated.send(FromClient::Reply {
+        id: replayed,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["blue"]}]})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "q1")
+            .count(),
+        1,
+        "exactly one settle: the abandoned guard exit must not fail-close the call it handed off"
+    );
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 #[test]
 fn plan_verdict_round_trips_and_seeds_execution() {
     let _g = lock_globals();

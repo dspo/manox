@@ -177,14 +177,20 @@ struct AgentServerInner {
     /// for identical scripts after session-id normalization.
     delivery_seq: Mutex<HashMap<String, u64>>,
     /// GW3 (§D.4): in-flight waterfall deliveries — `delivery_id` →
-    /// (recipient client_id → cancel token). A `CancelDelivery` call flips
-    /// the sender's token; the delivery's reply waiter folds that into the
-    /// funnel as an expired reply, converging the waterfall fail-closed
-    /// through the existing expire path. Registered for the fan-out window
-    /// only (the [`DeliveryGuard`] removes the entry at settlement — Drop
-    /// covers a pump abort too).
-    pending_deliveries:
-        Mutex<HashMap<String, HashMap<String, tokio_util::sync::CancellationToken>>>,
+    /// (owning session, recipient client_id → cancel token). A
+    /// `CancelDelivery` call flips the sender's token; the delivery's
+    /// reply waiter folds that into the funnel as an expired reply,
+    /// converging the waterfall fail-closed through the existing expire
+    /// path. Registered for the fan-out window only (the [`DeliveryGuard`]
+    /// removes the entry at settlement — Drop covers the waiter task's
+    /// teardown in every exit shape). The owning session is what the
+    /// dispose sweep (`cancel_deliveries_for_session`) scans: with the
+    /// adjudication await off-pump (§0), pump termination alone no longer
+    /// reaches the waiter, so session teardown cancels the tokens by
+    /// session tag instead — never by parsing the id (session ids may
+    /// contain dashes, which makes the `dlv-{session}-{n}` prefix not
+    /// uniquely reversible).
+    pending_deliveries: Mutex<HashMap<String, PendingDelivery>>,
     /// §D.6 replay: in-flight adjudications per session — the authoritative
     /// copy the gateway re-delivers to every owner that joins later (open /
     /// re-own / handshake re-declaration), keyed by the deterministic
@@ -1167,6 +1173,9 @@ impl AgentServerInner {
                 .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
             if !running && let Some(session) = sessions.remove(&sid) {
                 session.stop_pump();
+                // §0: the spawned waterfall outlives the pump alone — the
+                // orphan's deliveries must converge fail-closed now.
+                self.cancel_deliveries_for_session(&sid);
             }
         }
     }
@@ -2884,6 +2893,12 @@ impl AgentServerInner {
                 // (the pump kept its ThreadHandle and ran forever), so a
                 // reopen of the same id spawned a second pump.
                 session.stop_pump();
+                // §0: with the adjudication await on its own task, the pump
+                // abort alone no longer reaches a parked waterfall — the
+                // dispose sweep cancels its deliveries, converging the
+                // parked cards fail-closed (and unregistering them via the
+                // `DeliveryGuard`).
+                self.cancel_deliveries_for_session(session_id);
                 // Disposal closes every live stream of the session (§D.1
                 // `Closed`).
                 self.end_streams_for_session(session_id, StreamEndReason::Closed);
@@ -2943,6 +2958,9 @@ impl AgentServerInner {
                 }
                 if let Some(session) = removed {
                     session.stop_pump();
+                    // §0: the idle-orphan detach terminates the session —
+                    // sweep its in-flight deliveries off-pump.
+                    self.cancel_deliveries_for_session(session_id);
                 }
             }
         }
@@ -3407,13 +3425,33 @@ impl AgentServerInner {
         let deliveries = self.pending_deliveries.lock();
         match deliveries
             .get(delivery_id)
-            .and_then(|tokens| tokens.get(client_id))
+            .and_then(|entry| entry.tokens.get(client_id))
         {
             Some(token) => {
                 token.cancel();
                 true
             }
             None => false,
+        }
+    }
+
+    /// §0: session teardown sweeps every in-flight delivery of THIS session
+    /// — flips every recipient's cancel token, which the per-recipient
+    /// waiters fold into the waterfall funnel as expired replies (the same
+    /// path a `CancelDelivery` takes). With the adjudication await spawned
+    /// off the pump, a disposed session's parked waiters must not rely on
+    /// the pump abort reaching them: this sweep is their termination path,
+    /// and the waterfall's fail-closed settle (`apply_reply` → expired
+    /// verdict + `DeliveryGuard` unregister) stays intact.
+    fn cancel_deliveries_for_session(&self, session_id: &str) {
+        let deliveries = self.pending_deliveries.lock();
+        for entry in deliveries.values() {
+            if entry.session_id != session_id {
+                continue;
+            }
+            for token in entry.tokens.values() {
+                token.cancel();
+            }
         }
     }
 }
@@ -3514,7 +3552,9 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
     if adjudication {
         // §D.6 replay registry: live from fan-out until `apply_reply`
         // settles it — any owner joining this session in the window gets
-        // the same call re-delivered.
+        // the same call re-delivered. Registration stays synchronous on
+        // the pump (register-before-join): a later join can never miss a
+        // call whose waterfall has already started.
         inner.register_pending_adjudication(
             session_id,
             PendingAdjudication {
@@ -3530,15 +3570,38 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
                     .collect(),
             },
         );
-        route_waterfall(
-            inner,
-            session_id,
-            ctx,
-            call,
-            targets,
-            delivery_id.expect("stamped above for exactly the adjudication kinds"),
-        )
-        .await;
+        // GW3: one cancel token per recipient. The registry entry is
+        // inserted HERE, synchronously on the pump (alongside the replay
+        // registration) — never from the spawned task — so a dispose
+        // sweeping `pending_deliveries` can never race past a delivery that
+        // has been routed but not yet started: the tokens exist the moment
+        // the call is live, and the sweep's cancels fold into the
+        // waterfall's first funnel recv as expired replies.
+        let tokens: HashMap<String, tokio_util::sync::CancellationToken> = targets
+            .iter()
+            .map(|(cid, ..)| (cid.clone(), tokio_util::sync::CancellationToken::new()))
+            .collect();
+        let delivery_id = delivery_id.expect("stamped above for exactly the adjudication kinds");
+        inner.pending_deliveries.lock().insert(
+            delivery_id.clone(),
+            PendingDelivery {
+                session_id: session_id.to_string(),
+                tokens: tokens.clone(),
+            },
+        );
+        // §0: the waterfall await is the human-facing wait — it runs on its
+        // own runtime task (the replay's spawned waiter is the precedent),
+        // never on the pump's stack. A parked adjudication therefore cannot
+        // stall the session's event bookkeeping (turn settle, queued-submit
+        // drain, deferred reap). Termination is structural either way: the
+        // `DeliveryGuard` unregisters on settle, and session teardown
+        // sweeps the delivery's tokens
+        // (`cancel_deliveries_for_session`).
+        let inner = Arc::clone(inner);
+        let session_id = session_id.to_string();
+        manox_agent::runtime::handle().spawn(async move {
+            route_waterfall(inner, session_id, ctx, call, targets, delivery_id, tokens).await;
+        });
         return;
     }
 
@@ -3597,20 +3660,32 @@ struct PendingAdjudication {
     targets: Vec<(String, u64)>,
 }
 
+/// GW3: one registered in-flight delivery — the owning session (the
+/// dispose-sweep key, see [`AgentServerInner::cancel_deliveries_for_session`])
+/// and the per-recipient cancel tokens.
+struct PendingDelivery {
+    session_id: String,
+    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
+}
+
 /// GW3: unregister a delivery when its waterfall settles — and cancel the
 /// tokens of any recipient that never answered, so their reply-waiter tasks
-/// exit promptly instead of parking on the 300s timeout. Drop-based (the
-/// [`PumpExitGuard`] pattern): a pump aborted mid-waterfall still unregisters.
-struct DeliveryGuard<'a> {
-    inner: &'a AgentServerInner,
+/// exit promptly instead of parking forever. Drop-based (the
+/// [`PumpExitGuard`] pattern): the spawned waterfall task's teardown in any
+/// exit shape (settle, panic unwind, runtime shutdown) still unregisters.
+/// §0: the guard holds the `Arc` (not a pump-stack borrow) precisely
+/// because the waterfall no longer runs on the pump's stack — its Drop can
+/// outlive every pump.
+struct DeliveryGuard {
+    inner: Arc<AgentServerInner>,
     delivery_id: String,
 }
 
-impl Drop for DeliveryGuard<'_> {
+impl Drop for DeliveryGuard {
     fn drop(&mut self) {
         let mut deliveries = self.inner.pending_deliveries.lock();
-        if let Some(tokens) = deliveries.remove(&self.delivery_id) {
-            for token in tokens.values() {
+        if let Some(entry) = deliveries.remove(&self.delivery_id) {
+            for token in entry.tokens.values() {
                 token.cancel();
             }
         }
@@ -3695,16 +3770,17 @@ enum DeliveryEvent {
 }
 
 async fn route_waterfall(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
+    inner: Arc<AgentServerInner>,
+    session_id: String,
     ctx: ReplyCtx,
     call: ServerCall,
     targets: Vec<AdjudicationTarget>,
     delivery_id: String,
+    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
 ) {
     let (funnel_tx, mut funnel_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, DeliveryEvent)>();
-    let mut waterfall = crate::waterfall::Waterfall::new(session_id.to_string(), {
+    let mut waterfall = crate::waterfall::Waterfall::new(session_id.clone(), {
         let mut ids = targets
             .iter()
             .map(|(cid, ..)| cid.clone())
@@ -3712,21 +3788,15 @@ async fn route_waterfall(
         ids.sort();
         ids
     });
-    // GW3: one cancel token per recipient, registered under the delivery id
-    // for the fan-out window. A `CancelDelivery` from a recipient flips its
-    // token; the waiter below folds that into the funnel as an expired
-    // reply, converging the waterfall fail-closed through the SAME path a
-    // timeout takes (no parallel cancellation semantics).
-    let tokens: HashMap<String, tokio_util::sync::CancellationToken> = targets
-        .iter()
-        .map(|(cid, ..)| (cid.clone(), tokio_util::sync::CancellationToken::new()))
-        .collect();
-    inner
-        .pending_deliveries
-        .lock()
-        .insert(delivery_id.clone(), tokens.clone());
+    // GW3: `tokens` were minted and registered by `route_call` before this
+    // task was spawned (the dispose sweep must never race a routed-but-
+    // unregistered delivery). A `CancelDelivery` from a recipient — or the
+    // session's dispose sweep — flips a token; the waiter below folds that
+    // into the funnel as an expired reply, converging the waterfall
+    // fail-closed through the SAME path a lapse takes (no parallel
+    // cancellation semantics).
     let _delivery_guard = DeliveryGuard {
-        inner,
+        inner: Arc::clone(&inner),
         delivery_id: delivery_id.clone(),
     };
     for (cid, _generation, conn, rx, id) in targets {
@@ -3842,9 +3912,9 @@ async fn route_waterfall(
         },
     );
     if outcome.is_err() && verdict_failure.is_none() {
-        inner.note_error(session_id, "adjudication rejected or lapsed (no answer)");
+        inner.note_error(&session_id, "adjudication rejected or lapsed (no answer)");
     }
-    apply_reply(inner, session_id, ctx, outcome, verdict_failure);
+    apply_reply(&inner, &session_id, ctx, outcome, verdict_failure);
 }
 
 /// Per-`ServerCall` context carried out of the lock to apply the reply.
@@ -4613,6 +4683,11 @@ fn spawn_pump(
                     if inner.owners(&session_id).is_empty() && !thread.read(|t| t.is_running()) {
                         inner.sessions.lock().remove(&session_id);
                         inner.clear_embedder_tools(&session_id);
+                        // §0: the deferred reap terminates the session —
+                        // sweep any still-parked adjudication so its
+                        // waterfall converges fail-closed instead of
+                        // outliving the session on its own task.
+                        inner.cancel_deliveries_for_session(&session_id);
                     }
                 }
                 ThreadEvent::ToolCallAuthorization { .. } => {
