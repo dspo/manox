@@ -1859,6 +1859,7 @@ fn build_tools(
     // LSP code-intel tools: read-only, ride ungated. Registered once the
     // registry probe landed and at least one server spec is available;
     // otherwise the agent degrades to grep/glob (no LSP on PATH).
+    #[cfg(feature = "lsp")]
     if let Some(reg) = lsp::registry::try_global()
         && !reg.available_specs().is_empty()
     {
@@ -1872,6 +1873,7 @@ fn build_tools(
     // behind the same permission gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`manox_agent::init`
     // tests) contributes nothing.
+    #[cfg(feature = "mcp")]
     if let Some(registry) = crate::mcp::try_global() {
         for server in registry.servers() {
             for tool in &server.tools {
@@ -3226,14 +3228,18 @@ fn session_builder(
                     // list for the system prompt's LSP ready line. Empty
                     // when no servers are available (the template omits the
                     // line entirely).
-                    lsp::registry::try_global()
+                    #[cfg(feature = "lsp")]
+                    let specs = lsp::registry::try_global()
                         .map(|reg| {
                             let ids: Vec<&str> =
                                 reg.available_specs().iter().map(|s| s.id).collect();
                             ids.join(", ")
                         })
                         .filter(|s| !s.is_empty())
-                        .unwrap_or_default()
+                        .unwrap_or_default();
+                    #[cfg(not(feature = "lsp"))]
+                    let specs = String::new();
+                    specs
                 },
             },
         ))
@@ -3359,6 +3365,7 @@ async fn run_actor(
     crate::provider_glue::wait_ready().await;
     // Bound the LSP registry probe wait: a missing/slow probe must never
     // stall session assembly (tools register without LSP when it misses).
+    #[cfg(feature = "lsp")]
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         crate::lsp_tools::wait_ready(),

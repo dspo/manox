@@ -3,11 +3,19 @@
 # VS Code agent-host harness. The output path is what
 # VSCODE_AGENT_HOST_MANOX_SDK_ROOT should point at.
 #
-# Usage: script/build-napi [--debug]
+# Usage: script/build-napi [--debug] [--full]
+#   --full    build the complete runtime (MCP + LSP + terminal + WS gateway);
+#             the default stages the lean VS Code-harness addon (the engine's
+#             documented no-MCP/no-LSP fallbacks and the GW7 feature/
+#             unavailable arms cover the omitted subsystems).
 set -euo pipefail
 
 build_args=(--release)
 profile_dir="release"
+FULL=0
+if [[ "${1:-}" == "--full" ]]; then
+    FULL=1
+fi
 if [[ "${1:-}" == "--debug" ]]; then
     build_args=()
     profile_dir="debug"
@@ -16,7 +24,12 @@ fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -p manox-napi ${build_args[@]+"${build_args[@]}"}
+feature_args=(--no-default-features)
+if [[ "$FULL" == "1" ]]; then
+    feature_args=()
+fi
+
+cargo build -p manox-napi ${build_args[@]+"${build_args[@]}"} ${feature_args[@]+"${feature_args[@]}"}
 
 LIB=""
 for candidate in "target/${profile_dir}/libmanox_napi.dylib" "target/${profile_dir}/libmanox_napi.so" "target/${profile_dir}/manox_napi.dll"; do

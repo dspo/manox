@@ -19,13 +19,13 @@ chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 manox-protocol.workspace = true
-manox-terminal.workspace = true
+manox-terminal = { workspace = true, optional = true }
 parking_lot.workspace = true
 # The WS gateway transport arm (`src/ws/`) — the network face of the
 # protocol gateway, kept per the frontend-removal decision ("keep the
 # implemented http/ws interfaces"); `cx web` starts it headless.
 # (async-channel is already a dependency below.)
-axum.workspace = true
+axum = { workspace = true, optional = true }
 tracing.workspace = true
 # §D.2 `CreateSession` mints session ids server-side for v2 clients.
 uuid.workspace = true
@@ -43,3 +43,14 @@ async-channel = { workspace = true }
 # W7: the WS e2e test's client leg (same version axum's ws feature already
 # pulls into the graph — no new resolution).
 tokio-tungstenite.workspace = true
+
+[features]
+default = ["terminal", "ws-gateway"]
+# In-process PTY + grid terminals (#13): the follow-terminal streams, attach/
+# snapshot/input/resize arms, and the TerminalsUpdated host mirror. Lean
+# embedders (the VS Code napi edge) opt out; the arms then answer GW7's
+# `feature/unavailable` stable code.
+terminal = ["dep:manox-terminal"]
+# The `cx web` loopback WS gateway (axum). The in-process hosts (gpui, napi)
+# never serve HTTP; opting out drops the axum/hyper server stack.
+ws-gateway = ["dep:axum"]
