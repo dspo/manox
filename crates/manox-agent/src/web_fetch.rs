@@ -330,6 +330,7 @@ async fn extract(content: &str, prompt: &str, timeout_secs: u64) -> Result<Strin
                 signature: None,
             }],
             timestamp: chrono::Utc::now(),
+            id: None,
         }],
         tools: vec![].into(),
         model: model.clone(),

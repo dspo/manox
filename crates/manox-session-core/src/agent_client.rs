@@ -14,7 +14,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use manox_protocol::handshake::{HookKind, Initialize, PROTOCOL_EPOCH};
+use manox_protocol::answer_kind::AnswerKind;
+use manox_protocol::handshake::{Initialize, PROTOCOL_EPOCH};
 use manox_protocol::transport::{InProcessConnection, RpcConnection, in_process_pair};
 use manox_protocol::{ClientCall, ClientNote, FromClient, MsgId, RpcError};
 
@@ -39,7 +40,7 @@ impl AgentClient {
     pub fn connect(
         server: &AgentServer,
         client_id: impl Into<String>,
-        capabilities: Vec<HookKind>,
+        capabilities: Vec<AnswerKind>,
         sessions: Vec<String>,
     ) -> Self {
         let (client_conn, server_conn) = in_process_pair();
@@ -156,9 +157,9 @@ mod tests {
             &server,
             "ta-test",
             vec![
-                HookKind::Approve,
-                HookKind::PlanVerdict,
-                HookKind::AskUserQuestion,
+                AnswerKind::Approve,
+                AnswerKind::PlanVerdict,
+                AnswerKind::AskUserQuestion,
             ],
             vec![],
         );

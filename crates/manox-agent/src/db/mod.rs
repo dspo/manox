@@ -58,6 +58,10 @@ pub struct ThreadsDatabase {
 
 impl ThreadsDatabase {
     /// Open (creating if needed) the database file and ensure the schema.
+    /// The store is shared by every manox process on the machine (the
+    /// runtime is multi-instance), so the connection runs in WAL with a
+    /// busy timeout: concurrent writers queue briefly instead of failing
+    /// with `SQLITE_BUSY`, and readers never block writers.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -65,6 +69,10 @@ impl ThreadsDatabase {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("open threads db: {}", path.display()))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("enable WAL journaling")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .context("set SQLite busy timeout")?;
         Self::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -423,5 +431,61 @@ mod tests {
         let list = db.list_projects().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0], "/home/user/project-b");
+    }
+
+    #[test]
+    fn open_enables_wal_on_file_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ThreadsDatabase::open(&dir.path().join("threads.db")).unwrap();
+        let mode: String = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        // WAL is persistent: a second open of the same file stays in WAL.
+        drop(db);
+        let second = ThreadsDatabase::open(&dir.path().join("threads.db")).unwrap();
+        let mode: String = second
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    /// The multi-instance shape: several manox processes hold their own
+    /// connections and hammer `upsert` (a read-then-write transaction).
+    /// WAL + busy_timeout + the IMMEDIATE upsert transaction make the
+    /// writers queue; a deferred read-then-write transaction would fail
+    /// with SQLITE_BUSY_SNAPSHOT, which no busy handler retries (red under
+    /// the pre-fix DEFERRED begin — verified by temporarily reverting the
+    /// behavior).
+    #[test]
+    fn concurrent_upserts_through_separate_connections_queue_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.db");
+        ThreadsDatabase::open(&path).unwrap(); // create + schema
+
+        let workers = 4u64;
+        let rounds = 25u64;
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let db = ThreadsDatabase::open(&path).unwrap();
+                    for round in 0..rounds {
+                        let mut rec = sample_record(&format!("t{worker}"));
+                        rec.revision = round * workers + worker;
+                        db.upsert(&rec, true).unwrap();
+                    }
+                });
+            }
+        });
+        let db = ThreadsDatabase::open(&path).unwrap();
+        let all = db.list(true).unwrap();
+        assert_eq!(all.len(), workers as usize, "{all:?}");
     }
 }

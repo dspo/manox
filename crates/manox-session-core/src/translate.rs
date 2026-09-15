@@ -94,6 +94,10 @@ pub fn translate(ev: &manox_agent::thread::ThreadEvent, session_id: &str) -> Tra
         | ThreadEvent::SubagentChild { .. }
         | ThreadEvent::BackgroundTaskUpdated { .. }
         | ThreadEvent::SteerInjected { .. }
+        // Client-fold vocabulary: the SERVER never emits it, so nothing can
+        // arrive here to translate — the arm only keeps the match exhaustive
+        // (v2 never carries it on the wire).
+        | ThreadEvent::UserRowLanded { .. }
         | ThreadEvent::PeerMessage { .. }
         | ThreadEvent::HistoryProgress
         | ThreadEvent::HistoryRestored
@@ -499,6 +503,7 @@ mod tests {
                     signature: None,
                 }],
                 timestamp: now,
+                id: None,
             },
         ];
         let entry = wire_entry(
@@ -574,6 +579,7 @@ mod tests {
                 message: AgentMessage::User {
                     content: vec![],
                     timestamp: now,
+                    id: None,
                 },
                 origin: None,
             },

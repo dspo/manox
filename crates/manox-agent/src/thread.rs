@@ -291,6 +291,15 @@ pub enum ThreadEvent {
     SteerInjected {
         message_id: String,
     },
+    /// A `user` `message` journal row just landed on the client's fold —
+    /// `message_id` is that row's entry id. Synthesized by the CLIENT fold
+    /// at row-arrival time so an injected steer card retires the instant
+    /// its durable row appears (before the turn settles); the SERVER never
+    /// emits it. Shared vocabulary only: v2 never carries it on the wire
+    /// (`translate` skips it), and it joins no journal payload.
+    UserRowLanded {
+        message_id: String,
+    },
     /// A background task's state changed.
     BackgroundTaskUpdated {
         snapshot: TaskSnapshot,
@@ -789,19 +798,27 @@ impl Thread {
     /// A genuinely empty thread (sidebar new-conversation): never restores
     /// the previous session.
     pub fn new_fresh(id: ThreadId, cwd: PathBuf) -> ThreadHandle {
-        Self::open(id, cwd, None, None, true)
+        Self::open(id, cwd, None, None, true, None)
     }
 
     /// Construct a thread bound to a project directory: a fresh session with
     /// the project as its cwd in one step (no recreate, no restore), so the
     /// sidebar never sees an orphaned pre-project session file.
     pub fn new_in_project(id: ThreadId, project: PathBuf) -> ThreadHandle {
-        Self::open(id, project.clone(), None, Some(project), true)
+        Self::open(id, project.clone(), None, Some(project), true, None)
     }
 
     /// Construct a thread backed by a specific session file (sidebar open).
-    pub fn open_existing(id: ThreadId, cwd: PathBuf, path: PathBuf) -> ThreadHandle {
-        Self::open(id, cwd, Some(path), None, false)
+    /// `lease` is the session's write lease, acquired by the caller so a
+    /// cross-process contention surfaces at the store's synchronous
+    /// boundary instead of inside the spawned actor.
+    pub fn open_existing(
+        id: ThreadId,
+        cwd: PathBuf,
+        path: PathBuf,
+        lease: std::sync::Arc<crate::session_lease::LeaseEntry>,
+    ) -> ThreadHandle {
+        Self::open(id, cwd, Some(path), None, false, Some(lease))
     }
 
     fn open(
@@ -810,6 +827,7 @@ impl Thread {
         initial_path: Option<PathBuf>,
         project: Option<PathBuf>,
         fresh: bool,
+        lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
     ) -> ThreadHandle {
         // A concrete session file means an authoritative restore is pending;
         // the facade reports `Loading` until `Ready` so the workspace can
@@ -835,6 +853,7 @@ impl Thread {
             goal_bridge.clone(),
             None,
             &[],
+            lease,
         );
 
         let handle = ThreadHandle::new(Self {
@@ -912,6 +931,7 @@ impl Thread {
             self.goal_bridge.clone(),
             None,
             &self.extra_working_dirs,
+            None,
         );
         if self.permission_mode != PermissionMode::default() {
             engine.set_permission_mode(self.permission_mode);
@@ -1143,7 +1163,8 @@ impl Thread {
                     // follow-up if the run has already ended by then).
                     let report = format!("[{sender}] {}", payload.text);
                     if let Some(engine) = &self.engine {
-                        engine.steer(report, Vec::new());
+                        // Internal peer steer: no client message id, self-mints.
+                        engine.steer(report, Vec::new(), None);
                     } else {
                         self.deliver_peer_messages(vec![crate::team::PeerMessage {
                             from: sender,
@@ -1272,6 +1293,7 @@ impl Thread {
         &mut self,
         content: Vec<MessageContent>,
         ui: Option<MessageUiMetadata>,
+        external_id: Option<String>,
     ) -> String {
         // A steer is human interaction too: it advances the sidebar's recency
         // key exactly like a prompt.
@@ -1294,10 +1316,17 @@ impl Thread {
             .join("\n");
         let mut message = Message::user_with_content(content);
         message.ui = ui;
+        // S3 stable-id: a client `Steer` carries its own message id. Adopt it
+        // as the facade's optimistic id so the canonical row, the engine's
+        // durable `user` journal row, and the client's echo all share one
+        // identity; absent an external id, keep the freshly minted one.
+        if let Some(id) = external_id {
+            message.id = id;
+        }
         let id = message.id.clone();
         self.pending_steers.push_back(id.clone());
         if let Some(engine) = &self.engine {
-            engine.steer(text, images);
+            engine.steer(text, images, Some(id.clone()));
         }
         // The canonical message joins history at the next refresh (pi owns the
         // transcript); the workspace renders the optimistic bubble until
@@ -1762,6 +1791,7 @@ impl Thread {
             None,
             Some(self.id.0.clone()),
             &[],
+            None,
         );
         if permission_mode != PermissionMode::default() {
             engine.set_permission_mode(permission_mode);
@@ -2629,7 +2659,12 @@ pub(crate) mod tests {
             self.runs.lock().unwrap().push((prompt, images));
         }
 
-        fn steer(&self, text: String, _images: Vec<manox_harness::types::ContentBlock>) -> String {
+        fn steer(
+            &self,
+            text: String,
+            _images: Vec<manox_harness::types::ContentBlock>,
+            _message_id: Option<String>,
+        ) -> String {
             self.steers.lock().unwrap().push(text);
             String::new()
         }

@@ -5,7 +5,15 @@ version.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["lsp", "mcp"]
+# MCP client (~/.manox/mcp.toml + plugin .mcp.json servers). The gpui app and
+# the cx CLI keep it; lean embedders (the VS Code napi edge) may opt out —
+# sessions then run without MCP tools (the registry simply never initializes).
+mcp = ["dep:rmcp"]
+# LSP integration (registry probe + read-only code-intel tools). Opting out
+# degrades the agent to grep/glob search — the same fallback the engine uses
+# when no LSP server is on PATH.
+lsp = ["dep:lsp", "dep:lsp-types"]
 # ChromeUse: the in-process rustwright CDP engine + ChromeUse* tools. The
 # gpui app enables it; the VS Code host (manox-napi) builds without it so the
 # engine never links into the shipped extension.
@@ -18,6 +26,7 @@ test-support = []
 [dependencies]
 manox-harness.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 async-trait = "0.1"
 async-channel.workspace = true
 parking_lot.workspace = true
@@ -27,7 +36,7 @@ tokio-util = { workspace = true }
 libc = { workspace = true }
 brush-core = { workspace = true }
 brush-builtins = { workspace = true }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
 schemars.workspace = true
@@ -47,10 +56,10 @@ similar.workspace = true
 base64.workspace = true
 image.workspace = true
 
-rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+rmcp = { workspace = true, optional = true, features = ["client", "transport-async-rw", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 supervisor.workspace = true
-lsp.workspace = true
-lsp-types.workspace = true
+lsp = { workspace = true, optional = true }
+lsp-types = { workspace = true, optional = true }
 toml.workspace = true
 http.workspace = true
 fluent.workspace = true

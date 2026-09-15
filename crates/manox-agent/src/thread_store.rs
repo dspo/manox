@@ -764,18 +764,26 @@ impl ThreadStore {
     }
 
     /// Load and restore a `Thread` by id (model resolved from the registry).
-    pub fn load_thread(&mut self, id: &str) -> Option<ThreadHandle> {
+    /// `Err` when another process holds the session's write lease — driving
+    /// a session is exclusive across processes, never queued.
+    pub fn load_thread(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<ThreadHandle>, crate::session_lease::LeaseError> {
         if let Some(weak) = self.live_threads.get(id)
             && let Some(handle) = ThreadHandle::upgrade(weak)
         {
-            return Some(handle);
+            return Ok(Some(handle));
         }
-        let path = self.session_paths.get(id)?.clone();
+        let Some(path) = self.session_paths.get(id).cloned() else {
+            return Ok(None);
+        };
+        let lease = crate::session_lease::acquire(&path)?;
         let cwd = self
             .summary_by_id(id)
             .map(|s| PathBuf::from(s.project.clone()))
             .unwrap_or_else(|| PathBuf::from("."));
-        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone());
+        let handle = Thread::open_existing(ThreadId(id.to_string()), cwd, path.clone(), lease);
         // Re-surface the bound project from the sidecar so the chip shows it.
         if let Some(sum) = self.summary_by_id(id)
             && !sum.project.is_empty()
@@ -790,7 +798,7 @@ impl ThreadStore {
             handle.with_mut(|t| t.grant_working_directory(dir));
         }
         self.live_threads.insert(id.to_string(), handle.downgrade());
-        Some(handle)
+        Ok(Some(handle))
     }
 
     /// The sidecar's granted working directories for a session file, read

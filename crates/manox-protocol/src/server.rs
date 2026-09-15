@@ -21,7 +21,7 @@ use crate::wire::{ModelInfo, ThreadListItem};
 
 /// Server → client adjudication / capability calls; the client answers with a
 /// [`crate::FromClient::Reply`]. Routed by session ownership ∩ declared
-/// [`crate::HookKind`] capability; no capable owner fails closed.
+/// [`crate::AnswerKind`] capability; no capable owner fails closed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",
@@ -56,8 +56,15 @@ pub enum ServerCall {
         title: String,
         content: Option<String>,
     },
-    /// Interactive question. Reply payload: `{ "answers": [[q, a], ...],
-    /// "response": string | null }`.
+    /// Interactive question. The `input` carries the canonical request
+    /// vocabulary (per question `id` — server-minted when the model omits it —
+    /// optional `detail` markdown, optional `intent {kind, approve}`, and
+    /// unbounded question/option counts). Reply payload (B2-PR-1 canonical):
+    /// `{ "answers": [ { "id", "selected": [label…], "custom"?: string } ] }`
+    /// — tri-state (skip = empty `selected` with no `custom`), routed by `id`,
+    /// with NO card-level `response` override. A transitional server also
+    /// still reads the legacy `{ "answers": [[q, a], …], "response": … }`
+    /// shape for one release; clients must write the canonical shape only.
     AskUserQuestion {
         /// GW3 (§D.4): stable delivery identity — see [`Self::Approve`].
         delivery_id: String,

@@ -699,6 +699,7 @@ mod tests {
                 },
             ],
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
         let content = &v["input"][1]["content"];

@@ -105,7 +105,19 @@ pub trait ThreadEngine: Send + Sync {
     /// Inject a steer (text + optional image attachments) into the running
     /// turn. Returns the steer id, which `cancel_steer` accepts to retract it
     /// before the loop drains it.
-    fn steer(&self, text: String, images: Vec<manox_harness::types::ContentBlock>) -> String;
+    ///
+    /// S3 stable-id: when `message_id` is `Some`, it is used as the steer's
+    /// durable identity end-to-end — the injected `user` journal row lands
+    /// under this id and the returned id equals it, so the client that minted
+    /// the id (via `ClientCall::Steer`) can correlate the injection and, on an
+    /// aborted run, retract exactly this steer. `None` (internal steers such
+    /// as the monitor bridge) self-mints a fresh id as before.
+    fn steer(
+        &self,
+        text: String,
+        images: Vec<manox_harness::types::ContentBlock>,
+        message_id: Option<String>,
+    ) -> String;
 
     /// Retract a queued steer by id. False when it already drained.
     fn cancel_steer(&self, id: &str) -> bool;

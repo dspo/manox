@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
-use manox_protocol::handshake::HookKind;
+use manox_protocol::AnswerKind;
 use manox_protocol::msg::FromClient;
 use manox_protocol::transport::{InProcessConnection, RpcConnection};
 use manox_session_core::agent_client::AgentClient;
@@ -108,12 +108,12 @@ pub fn start(client_id: String, event_cb: JsFunction) -> Result<()> {
         // client-contributed tools (registerSessionTools/invokeClientTool).
         // No browser capability (no embedded browser surface).
         vec![
-            HookKind::Approve,
-            HookKind::AskUserQuestion,
-            HookKind::PlanVerdict,
-            HookKind::ClipboardRead,
-            HookKind::OpenExternal,
-            HookKind::ClientTool,
+            AnswerKind::Approve,
+            AnswerKind::AskUserQuestion,
+            AnswerKind::PlanVerdict,
+            AnswerKind::ClipboardRead,
+            AnswerKind::OpenExternal,
+            AnswerKind::ClientTool,
         ],
         vec![],
     );

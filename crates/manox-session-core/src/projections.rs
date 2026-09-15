@@ -516,6 +516,7 @@ mod tests {
                         signature: None,
                     }],
                     timestamp: ts,
+                    id: None,
                 },
                 origin: None,
             },

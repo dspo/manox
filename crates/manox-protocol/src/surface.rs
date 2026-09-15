@@ -40,8 +40,9 @@
 //! `tests/surface_coverage.rs` walk every list against serde: each sample
 //! must serialize with exactly its declared tag and round-trip.
 
+use crate::answer_kind::AnswerKind;
 use crate::client::{ClientCall, ClientNote, ClientToolSpec, ImageAttachment};
-use crate::handshake::{HookKind, Initialize};
+use crate::handshake::Initialize;
 use crate::journal::{JournalWireEntry, JournalWireEvent, ModelRef, UsagePayload};
 use crate::server::{ServerCall, ServerNote};
 use crate::stream::{
@@ -430,7 +431,7 @@ wire_surface! {
     [
         ClientCall::Initialize(_) => "initialize" ~ ClientCall::Initialize(Initialize {
             client_id: "test".into(),
-            capabilities: vec![HookKind::Approve],
+            capabilities: vec![AnswerKind::Approve],
             sessions: vec![],
             protocol_epoch: crate::handshake::PROTOCOL_EPOCH,
         }),

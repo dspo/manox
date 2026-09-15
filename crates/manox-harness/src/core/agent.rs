@@ -58,6 +58,15 @@ impl PendingMessageQueue {
         id
     }
 
+    /// S4: enqueue a steer under a caller-minted cancel id. The host's
+    /// between-runs / mid-run steer path passes the facade command id so
+    /// `cancel(id)` (used to retract a stranded steer on an aborted run) and
+    /// the durable row id share one source.
+    fn enqueue_with_id(&mut self, message: AgentMessage, id: String) -> String {
+        self.messages.push((id.clone(), message));
+        id
+    }
+
     /// Retract the message with the given id. False when it already drained.
     fn cancel(&mut self, id: &str) -> bool {
         let before = self.messages.len();
@@ -607,6 +616,7 @@ impl Agent {
         let user_message = AgentMessage::User {
             content,
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         self.run_prompt_messages(&[user_message]).await
     }
@@ -910,6 +920,16 @@ impl RunHandle {
     /// Returns the queue-local id, which `cancel_steer` accepts to retract it.
     pub fn steer(&self, message: AgentMessage) -> String {
         self.steering_queue.lock().unwrap().enqueue(message)
+    }
+
+    /// Queue a steering message under a caller-minted cancel id (S4). Returns
+    /// the same id, which `cancel_steer` accepts to retract the steer before
+    /// the loop drains it.
+    pub fn steer_with_id(&self, message: AgentMessage, id: String) -> String {
+        self.steering_queue
+            .lock()
+            .unwrap()
+            .enqueue_with_id(message, id)
     }
 
     /// Queue a follow-up message that resumes a run that would otherwise stop.

@@ -89,6 +89,17 @@ pub enum AgentMessage {
         content: Vec<ContentBlock>,
         #[serde(default = "chrono::Utc::now", with = "ts_millis")]
         timestamp: DateTime<Utc>,
+        /// Caller-minted durable identity for the journal `user` row this
+        /// message lands as (S3 stable-id: a client `Steer` message id). The
+        /// persistence middleware appends the row under this id when present
+        /// instead of the storage-generated one, so the injected row's id is
+        /// the id the client already correlates its echo against. `None` (and
+        /// every message built without it) keeps the storage-generated id.
+        /// Never crosses the wire — the row id lives on `SessionTreeEntry`,
+        /// so the serialized `user` shape is byte-identical to the pre-S3
+        /// form (§ D.2 "旧 client 对新 server 无 wire 破坏").
+        #[serde(skip, default)]
+        id: Option<String>,
     },
     #[serde(rename = "assistant", rename_all = "camelCase")]
     Assistant {
@@ -209,6 +220,20 @@ impl AgentMessage {
                 signature: None,
             }],
             timestamp: Utc::now(),
+            id: None,
+        }
+    }
+
+    /// Create a user message from plain text with a caller-minted durable
+    /// journal row id (S3 stable-id for steered messages).
+    pub fn user_with_id(text: impl Into<String>, id: Option<String>) -> Self {
+        AgentMessage::User {
+            content: vec![ContentBlock::Text {
+                text: text.into(),
+                signature: None,
+            }],
+            timestamp: Utc::now(),
+            id,
         }
     }
 

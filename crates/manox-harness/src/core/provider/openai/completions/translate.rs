@@ -642,6 +642,7 @@ mod tests {
                 },
             ],
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         let v = request(&ctx(vec![msg], ThinkingKind::None, None));
         let content = &v["messages"][1]["content"];

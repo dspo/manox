@@ -177,9 +177,14 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
             }
         })
     }
-    fn steer(&self, text: String, _: Vec<manox_harness::types::ContentBlock>) -> String {
+    fn steer(
+        &self,
+        text: String,
+        _: Vec<manox_harness::types::ContentBlock>,
+        message_id: Option<String>,
+    ) -> String {
         self.steer_calls.lock().unwrap().push(text);
-        String::new()
+        message_id.unwrap_or_default()
     }
     fn cancel_steer(&self, _: &str) -> bool {
         false
@@ -327,7 +332,7 @@ impl Client {
     }
 }
 
-fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
+fn harness(caps: Vec<AnswerKind>) -> (AgentServer, Client) {
     // init's directory scan is a background spawn; awaiting it here makes
     // every subsequent cold open (load_thread reads the scan-indexed map)
     // deterministic instead of a race the loaded CI runner loses.
@@ -377,7 +382,7 @@ fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
 /// The harness with the U6a store watcher ENABLED (the production
 /// constructor): only the broadcast regression uses it — every other
 /// test keeps the watcher off for deterministic frame streams.
-fn harness_with_store_watcher(caps: Vec<HookKind>) -> (AgentServer, Client) {
+fn harness_with_store_watcher(caps: Vec<AnswerKind>) -> (AgentServer, Client) {
     manox_agent::thread_store::init();
     let server = AgentServer::new(PathBuf::from("/"));
     let (client_conn, server_conn) = in_process_pair();
@@ -474,6 +479,7 @@ fn ent_message(id: String, parent_id: Option<String>) -> SessionTreeEntry {
                 signature: None,
             }],
             timestamp: fixed_ts(),
+            id: None,
         },
         origin: Some("j1-origin".into()),
     }
@@ -1443,7 +1449,7 @@ fn approve_call_round_trips_and_unparks() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -1826,7 +1832,7 @@ fn ask_user_question_round_trips() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -1863,7 +1869,7 @@ fn ask_user_question_round_trips() {
     };
     client.send(FromClient::Reply {
         id: call_id,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     // The engine received the structured answers (not a bare Deny).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1901,6 +1907,30 @@ fn ask_user_question_round_trips() {
 
 // ── §D.6 replay of parked adjudications + R1 expired verdicts. ─────────────
 
+/// The canonical parked-card input for the ask tests: one single-select
+/// question with the B2-PR-1 vocabulary (stable `id`, question text the
+/// legacy reply shape joins by).
+fn seeded_ask_input() -> Value {
+    json!({"questions": [{
+        "id": "color-q",
+        "question": "color?",
+        "header": "color",
+        "multiSelect": false,
+        "options": [
+            {"label": "blue", "description": ""},
+            {"label": "red", "description": ""}
+        ]
+    }]})
+}
+
+/// The canonical settle the transitional reader produces for a LEGACY
+/// positional reply `[["color?", <text>]]` against `seeded_ask_input()`:
+/// the old free text arrives as the answer's `custom` (the legacy shape has
+/// no way to say "selection"), routed by the parked question's id.
+fn legacy_answer(text: &str) -> manox_agent::permission::AskAnswer {
+    manox_agent::permission::AskAnswer::new("color-q".into(), vec![], Some(text.into()))
+}
+
 /// Seed the fake engine's pending set: the real engine's gate holds a
 /// parked interaction until it answers, and the replay settle-truth reads
 /// that same set.
@@ -1910,7 +1940,7 @@ fn seed_pending_ask(engine: &std::sync::Arc<FakeEngine>, auth_id: &str) {
         manox_agent::permission::PendingAuthMeta {
             tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
             summary: "pick a color".into(),
-            input: json!({"question": "color?"}),
+            input: seeded_ask_input(),
         },
     ));
 }
@@ -1940,7 +1970,7 @@ fn park_ask(
                 id: auth_id.into(),
                 tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
                 summary: "pick a color".into(),
-                input: json!({"question": "color?"}),
+                input: seeded_ask_input(),
             },
         )))
         .unwrap();
@@ -1960,7 +1990,7 @@ fn park_ask(
 fn second_client(
     server: &AgentServer,
     client_id: &str,
-    caps: Vec<HookKind>,
+    caps: Vec<AnswerKind>,
     sessions: &[&str],
 ) -> Client {
     let (conn, server_conn) = in_process_pair();
@@ -2017,7 +2047,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2025,7 +2055,12 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     let a_id = park_ask(&client_a, &engine, "s1", "q1");
     assert_eq!(a_id.0, "q1", "the fan-out MsgId is the auth_id");
 
-    let client_b = second_client(&server, "test-b", vec![HookKind::AskUserQuestion], &["s1"]);
+    let client_b = second_client(
+        &server,
+        "test-b",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
     let b_id = loop {
         match client_b.recv() {
             FromServer::Request {
@@ -2044,7 +2079,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     );
     client_b.send(FromClient::Reply {
         id: b_id,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     // Drain A's still-open waiter with a late reply so the original
@@ -2055,7 +2090,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     // settle it receives, in arrival order.
     client_a.send(FromClient::Reply {
         id: a_id,
-        outcome: Ok(json!({"answers": [["color", "red"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "red"]], "response": null})),
     });
     std::thread::sleep(Duration::from_millis(200));
     let held = engine.auth_responses.lock().unwrap();
@@ -2067,14 +2102,19 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     assert!(
         matches!(
             q1[0],
-            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
-                if answers == &vec![("color".to_string(), "blue".to_string())]
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                if answers == &vec![legacy_answer("blue")]
         ),
         "the replayed owner's answer is the settle that reaches the gate first: {q1:?}"
     );
     drop(held);
 
-    let client_c = second_client(&server, "test-c", vec![HookKind::AskUserQuestion], &["s1"]);
+    let client_c = second_client(
+        &server,
+        "test-c",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
     let mut c_frames = Vec::new();
     loop {
         let m = client_c.recv();
@@ -2120,6 +2160,208 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// PR-0b (server-first): a client reply carrying the `dismissed` marker —
+/// either a `dismissed: true` bool or an `outcome: "dismissed"` string —
+/// converges to `AskUserQuestionDismissed` at the gate, distinct from a
+/// rejection and from a lapsed delivery. Backward compatible: the marker is
+/// absent from old clients, which keep the answer / `response` path unchanged.
+#[test]
+fn ask_dismissed_marker_converges_as_dismissed() {
+    use manox_agent::permission::ToolAuthorizationResponse;
+    let _g = lock_globals();
+    for marker in [json!({"dismissed": true}), json!({"outcome": "dismissed"})] {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        seed_pending_ask(&engine, "q1");
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let id = park_ask(&client, &engine, "s1", "q1");
+        client.send(FromClient::Reply {
+            id,
+            outcome: Ok(marker.clone()),
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let seen = engine.auth_responses.lock().unwrap().iter().any(|(id, r)| {
+                id == "q1" && matches!(r, ToolAuthorizationResponse::AskUserQuestionDismissed)
+            });
+            if seen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dismissal marker {marker} never reached the gate as Dismissed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A dismissal must NOT also be recorded as an answer or an expiry.
+        let held = engine.auth_responses.lock().unwrap();
+        assert!(
+            !held.iter().any(|(id, r)| id == "q1"
+                && matches!(
+                    r,
+                    ToolAuthorizationResponse::AskUserQuestion { .. }
+                        | ToolAuthorizationResponse::AskUserQuestionExpired
+                )),
+            "dismissal conflated with an answer/expiry: {held:?}"
+        );
+        drop(held);
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
+/// B2-PR-1 (transitional both-read, single write): the LEGACY positional
+/// reply shape — including the removed card-level `response` override, mapped
+/// into the canonical supplement vocabulary — and the NEW id-routed
+/// tri-state shape both converge to the SAME canonical
+/// `ToolAuthorizationResponse::AskUserQuestion` at the gate. This is the
+/// end-to-end shape-mismatch guard the plan demands before the paired
+/// manox-app PR lands.
+#[test]
+fn legacy_and_canonical_ask_replies_converge_to_one_canonical() {
+    use manox_agent::permission::{AskAnswer, ToolAuthorizationResponse};
+    let _g = lock_globals();
+    let cases: Vec<(&str, Value, Vec<AskAnswer>)> = vec![
+        (
+            "legacy positional answer",
+            json!({"answers": [["color?", "blue"]], "response": null}),
+            // The legacy text has no selection/supplement distinction: it
+            // arrives as the answer's `custom` under the parked question's id.
+            vec![AskAnswer::new(
+                "color-q".into(),
+                vec![],
+                Some("blue".into()),
+            )],
+        ),
+        (
+            "legacy card-level response only (old free-text dismissal of the card)",
+            json!({"answers": [], "response": "let me type instead"}),
+            vec![AskAnswer::new(
+                "color-q".into(),
+                vec![],
+                Some("let me type instead".into()),
+            )],
+        ),
+        (
+            "canonical id-routed selection",
+            json!({"answers": [{"id": "color-q", "selected": ["blue"]}]}),
+            vec![AskAnswer::new("color-q".into(), vec!["blue".into()], None)],
+        ),
+        (
+            "canonical explicit skip",
+            json!({"answers": [{"id": "color-q", "selected": [], "custom": "  "}]}),
+            // A blank custom normalises away: skip is `{[], None}`.
+            vec![AskAnswer::new("color-q".into(), vec![], None)],
+        ),
+    ];
+    for (name, payload, expected) in cases {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        seed_pending_ask(&engine, "q1");
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let id = park_ask(&client, &engine, "s1", "q1");
+        client.send(FromClient::Reply {
+            id,
+            outcome: Ok(payload.clone()),
+        });
+        wait_for_auth_settle(&engine, "q1", false);
+        let got = engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(aid, _)| aid == "q1")
+            .find_map(|(_, r)| match r {
+                ToolAuthorizationResponse::AskUserQuestion { answers } => Some(answers.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: never converged to a canonical answer: {payload}"));
+        assert_eq!(
+            got, expected,
+            "{name} must normalise to the canonical answers"
+        );
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
+/// PR-0a: with the 300s wall-clock removed from the adjudication wait, a
+/// parked ask whose owner is STILL connected and simply has not answered yet
+/// must NOT be settled as `Expired`. (Before PR-0a this converged to Expired
+/// after the clock; the disconnect case is covered by
+/// `ask_expires_when_the_holding_owner_disconnects`.) This pins the "no
+/// premature expiry" half of the no-deadline change deterministically.
+#[test]
+fn parked_ask_is_not_expired_while_the_owner_stays_connected() {
+    use manox_agent::permission::ToolAuthorizationResponse;
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client, &engine, "s1", "q1");
+    // Well inside the removed 300s window: nothing should have settled.
+    std::thread::sleep(Duration::from_millis(1500));
+    let settled = engine
+        .auth_responses
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(id, _)| id == "q1");
+    assert!(
+        !settled,
+        "a still-connected owner must not be expired prematurely (no-deadline PR-0a)"
+    );
+    // The parked call is still replay-live in §D.6's registry.
+    assert!(
+        server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_some_and(|v| v.iter().any(|rec| rec.key == "q1")),
+        "the pending ask stays parked for the owner to answer"
+    );
+    // A real answer still converges it as an answer, not an expiry.
+    let id = MsgId::new("q1".to_string());
+    client.send(FromClient::Reply {
+        id,
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    let held = engine.auth_responses.lock().unwrap();
+    assert!(
+        held.iter()
+            .any(|(id, r)| id == "q1"
+                && matches!(r, ToolAuthorizationResponse::AskUserQuestion { .. })),
+        "the late answer reaches the gate as an answer: {held:?}"
+    );
+    drop(held);
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// §D.6 replay, switch-back path: an owner that re-opens a session it
 /// already holds a live waiter for gets the card RE-SENT on the same
 /// deterministic MsgId without a second `register` (the GW2 duplicate
@@ -2129,7 +2371,7 @@ fn reown_resends_the_parked_ask_through_the_live_waiter() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2162,7 +2404,7 @@ fn reown_resends_the_parked_ask_through_the_live_waiter() {
     );
     client_a.send(FromClient::Reply {
         id: resent,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     std::thread::sleep(Duration::from_millis(200));
@@ -2204,14 +2446,14 @@ fn ask_survives_same_client_reseat() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
     server.set_session_engine_for_test("s1", engine.clone(), events);
     let _ = park_ask(&client_a, &engine, "s1", "q1");
 
-    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &["s1"]);
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &["s1"]);
     let replayed = loop {
         match reseated.recv() {
             FromServer::Request {
@@ -2244,7 +2486,7 @@ fn ask_survives_same_client_reseat() {
     );
     reseated.send(FromClient::Reply {
         id: replayed,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     std::thread::sleep(Duration::from_millis(200));
@@ -2253,8 +2495,8 @@ fn ask_survives_same_client_reseat() {
         held.iter().any(|(id, r)| id == "q1"
             && matches!(
                 r,
-                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
-                    if answers == &vec![("color".to_string(), "blue".to_string())]
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                    if answers == &vec![legacy_answer("blue")]
             )),
         "the re-seated owner's answer reaches the gate: {held:?}"
     );
@@ -2299,14 +2541,14 @@ fn ask_reseat_without_reclaim_retires_the_parked_call() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
     server.set_session_engine_for_test("s1", engine.clone(), events);
     let _ = park_ask(&client_a, &engine, "s1", "q1");
 
-    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &[]);
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &[]);
     let mut frames = Vec::new();
     loop {
         let m = reseated.recv();
@@ -2373,7 +2615,7 @@ fn ask_without_capable_client_settles_expired() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2431,7 +2673,7 @@ fn ask_expires_when_the_holding_owner_disconnects() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2462,7 +2704,7 @@ fn plan_verdict_round_trips_and_seeds_execution() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -2535,7 +2777,7 @@ fn browser_op_routes_to_client_and_returns_reply() {
     init_globals();
     manox_agent::thread_store::init();
     manox_agent::capability::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::BrowserOp]);
+    let (server, client) = harness(vec![AnswerKind::BrowserOp]);
     manox_agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
@@ -2787,7 +3029,7 @@ fn dual_path_transport_consistency() {
     init_globals();
 
     // ── Path 1: in-process pair ──
-    let (server, client_ip) = harness(vec![HookKind::Approve]);
+    let (server, client_ip) = harness(vec![AnswerKind::Approve]);
     let (engine_ip, events_ip) = FakeEngine::new();
     create(&server, &client_ip, "sess-inproc");
     server.set_session_engine_for_test("sess-inproc", engine_ip.clone(), events_ip);
@@ -2802,7 +3044,7 @@ fn dual_path_transport_consistency() {
         id: MsgId::new("init"),
         call: ClientCall::Initialize(Initialize {
             client_id: "serde-test".into(),
-            capabilities: vec![HookKind::Approve],
+            capabilities: vec![AnswerKind::Approve],
             sessions: vec![],
             protocol_epoch: PROTOCOL_EPOCH,
         }),
@@ -4198,6 +4440,7 @@ fn conversation_info_folds_usage() {
                             signature: None,
                         }],
                         timestamp: chrono::Utc::now(),
+                        id: None,
                     },
                 ),
             },
@@ -4459,7 +4702,7 @@ fn create_session_with_project_intent() {
 fn connect_sessions(
     server: &AgentServer,
     client_id: &str,
-    caps: Vec<HookKind>,
+    caps: Vec<AnswerKind>,
     sessions: Vec<String>,
 ) -> Client {
     let (client_conn, server_conn) = in_process_pair();
@@ -4563,7 +4806,7 @@ fn dispose_then_reopen_keeps_exactly_one_pump() {
     seed_session_file(&sessions, "gw2-reopen-1", "/proj");
     init_globals();
     manox_agent::thread_store::init();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
 
     // First open: one pump.
     client.send(FromClient::Request {
@@ -4719,8 +4962,8 @@ fn concurrent_open_session_yields_one_entry_one_pump() {
     init_globals();
     manox_agent::thread_store::init();
     let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
-    let client_a = connect_sessions(&server, "racer-a", vec![HookKind::Approve], vec![]);
-    let client_b = connect_sessions(&server, "racer-b", vec![HookKind::Approve], vec![]);
+    let client_a = connect_sessions(&server, "racer-a", vec![AnswerKind::Approve], vec![]);
+    let client_b = connect_sessions(&server, "racer-b", vec![AnswerKind::Approve], vec![]);
 
     // Fire both opens back-to-back, then read both answers: the
     // check-load-insert window (if any) is where the race lives.
@@ -4891,7 +5134,7 @@ fn plan_verdict_rejection_converges_pending_state() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "gw9-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s1", engine.clone(), events);
@@ -5097,7 +5340,7 @@ fn converge_plan_rejected_clears_every_plane_directly() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "gw9-s3");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s3", engine.clone(), events);
@@ -6408,6 +6651,52 @@ fn page_history_unknown_session_still_answers_not_found() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// The multi-instance gate: opening a session whose write lease is held by
+/// another process answers `session/already-owned` — fail-fast, never a
+/// silent second driver over the same journal. The foreign holder is a
+/// raw second fd standing in for the other process (flock contention does
+/// not care which process owns the conflicting open file description).
+#[test]
+fn open_session_under_a_foreign_write_lease_answers_already_owned() {
+    let _g = lock_globals();
+    hermetic_home();
+    let sessions = manox_agent::paths::manox_config_dir()
+        .expect("config dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = seed_v4_chain(&sessions, "lease-foreign-1");
+    init_globals();
+    manox_agent::thread_store::init();
+    let (server, client) = harness(vec![]);
+    let holder = manox_harness::fs_lock::lock_exclusive(
+        &manox_harness::fs_lock::lock_path_for(&path),
+        std::time::Duration::ZERO,
+    )
+    .expect("hold the session's write lease as a foreign process");
+    match request(
+        &client,
+        "lease-open-1",
+        ClientCall::OpenSession {
+            session_id: "lease-foreign-1".into(),
+        },
+    ) {
+        FromServer::Response {
+            outcome: Err(e), ..
+        } => {
+            assert_eq!(
+                e.data.as_ref().expect("coded error")["code"],
+                manox_protocol::msg::CODE_SESSION_ALREADY_OWNED
+            );
+        }
+        other => panic!("expected session/already-owned, got {other:?}"),
+    }
+    drop(holder);
+    drop(client);
+    drop(server);
+    let _ = std::fs::remove_file(&path);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// GW6 resume singleflight: concurrent compat CreateSession notes and an
 /// OpenSession request racing the SAME cold id converge on exactly one
 /// sessions entry and one pump — the argument: the cold-file probe
@@ -6503,9 +6792,9 @@ fn adjudication_requests_carry_stable_delivery_id() {
     hermetic_home();
     init_globals();
     let (server, client) = harness(vec![
-        HookKind::Approve,
-        HookKind::AskUserQuestion,
-        HookKind::PlanVerdict,
+        AnswerKind::Approve,
+        AnswerKind::AskUserQuestion,
+        AnswerKind::PlanVerdict,
     ]);
     create(&server, &client, "gw3-s1");
     let (engine, events) = FakeEngine::new();
@@ -6657,8 +6946,8 @@ fn cancel_delivery_converges_pending_adjudication() {
     init_globals();
     manox_agent::thread_store::init();
     let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
-    let a = connect_sessions(&server, "gw3-a", vec![HookKind::Approve], vec![]);
-    let b = connect_sessions(&server, "gw3-b", vec![HookKind::Approve], vec![]);
+    let a = connect_sessions(&server, "gw3-a", vec![AnswerKind::Approve], vec![]);
+    let b = connect_sessions(&server, "gw3-b", vec![AnswerKind::Approve], vec![]);
     create(&server, &a, "gw3-s2");
     // b joins the owner set (the §D.4 fan-out audience).
     b.send(FromClient::Request {
@@ -7295,7 +7584,7 @@ fn approve_verdict_clears_the_pending_auth_badge_server_side() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "u3b-auth");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-auth", engine.clone(), events);
@@ -7363,7 +7652,7 @@ fn plan_verdict_execution_clears_the_pending_plan_badge() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "u3b-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-s1", engine.clone(), events);
@@ -8238,7 +8527,7 @@ async fn pending_submit_queue_survives_a_panicking_lock_holder() {
 
 /// The shared fixture: a live s1 + the AgentServer's capability provider
 /// registered, exactly like the browser routing test.
-fn capability_bridge_fixture(caps: Vec<HookKind>) -> (AgentServer, Client, Arc<FakeEngine>) {
+fn capability_bridge_fixture(caps: Vec<AnswerKind>) -> (AgentServer, Client, Arc<FakeEngine>) {
     manox_agent::thread_store::init();
     manox_agent::capability::drop_provider_for_test();
     let (server, client) = harness(caps);
@@ -8254,7 +8543,7 @@ fn clipboard_read_routes_and_round_trips() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::ClipboardRead]);
+    let (server, client, engine) = capability_bridge_fixture(vec![AnswerKind::ClipboardRead]);
 
     // The clipboard tool's round trip: notice → facade → provider →
     // ServerCall::ClipboardRead to the owning client.
@@ -8551,7 +8840,7 @@ fn open_external_routes_to_capable_owner() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::OpenExternal]);
+    let (server, client, engine) = capability_bridge_fixture(vec![AnswerKind::OpenExternal]);
 
     let (tx, rx) = async_channel::bounded(1);
     engine
@@ -9190,7 +9479,7 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (_server, client) = harness(vec![HookKind::ClientTool]);
+    let (_server, client) = harness(vec![AnswerKind::ClientTool]);
     let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&_server));
     manox_agent::embedder_tools::set_provider(provider.clone());
     create(&_server, &client, "et-s");
@@ -9350,7 +9639,7 @@ fn embedder_tool_invoke_round_trips() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let (server, client) = harness(vec![AnswerKind::ClientTool]);
     manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
         &server,
     )));
@@ -9487,7 +9776,7 @@ fn dispose_clears_embedder_registrations() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let (server, client) = harness(vec![AnswerKind::ClientTool]);
     let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
     manox_agent::embedder_tools::set_provider(provider.clone());
     create(&server, &client, "et-d");

@@ -21,11 +21,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use manox_protocol::answer_kind::AnswerKind;
 use manox_protocol::base64_bytes;
 use manox_protocol::client::{ClientToolSpec, ImageAttachment};
-use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
+use manox_protocol::handshake::{ClientHello, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamFrame, StreamKind};
+#[cfg(feature = "terminal")]
+use manox_protocol::stream::StreamFrame;
+use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
 use manox_protocol::{
     ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
     RpcPeer, ServerCall, ServerNote, ThreadListItem,
@@ -76,8 +79,10 @@ struct ServerSession {
 /// PTY + grid; subscribers are the follow-terminal streams currently
 /// attached (each with its connection).
 /// One follow-terminal subscriber: (client_id, stream_id, connection).
+#[cfg(feature = "terminal")]
 type TerminalStreamSub = (String, StreamId, Arc<dyn RpcConnection>);
 
+#[cfg(feature = "terminal")]
 struct TerminalEntry {
     handle: manox_terminal::TerminalHandle,
     /// The session this terminal was attached for (cwd source + db row).
@@ -163,6 +168,7 @@ struct AgentServerInner {
     /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
     /// fed by per-stream forwarder tasks, mirrored into the threads db and
     /// the `TerminalsUpdated` host snapshot.
+    #[cfg(feature = "terminal")]
     terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
     call_seq: AtomicU64,
     /// GW3 (§D.4): per-session adjudication delivery counter — the `dlv-`
@@ -246,6 +252,7 @@ impl AgentServerInner {
     /// `TerminalAttach`: re-attach by id or spawn a fresh shell terminal
     /// bound to the session's cwd. Response carries the id + a text
     /// snapshot of the visible grid.
+    #[cfg(feature = "terminal")]
     fn attach_terminal(
         self: &Arc<Self>,
         session_id: &str,
@@ -296,11 +303,13 @@ impl AgentServerInner {
     }
 
     /// `TerminalSnapshot`: the visible grid as text lines + cursor.
+    #[cfg(feature = "terminal")]
     fn terminal_snapshot(&self, terminal_id: &str) -> Option<Value> {
         let entry = self.terminals.lock().get(terminal_id).cloned()?;
         Some(self.terminal_snapshot_value(&entry))
     }
 
+    #[cfg(feature = "terminal")]
     fn terminal_snapshot_value(&self, entry: &TerminalEntry) -> Value {
         let (lines, cursor_col, cursor_row) = entry.handle.read(|t| t.text_snapshot());
         let (cols, rows) = entry.handle.read(|t| (t.cols, t.rows));
@@ -312,6 +321,7 @@ impl AgentServerInner {
         })
     }
 
+    #[cfg(feature = "terminal")]
     fn terminal_attach_response(&self, entry: &TerminalEntry) -> Value {
         let id = entry.handle.read(|t| t.id.clone());
         serde_json::json!({
@@ -320,6 +330,7 @@ impl AgentServerInner {
         })
     }
 
+    #[cfg(feature = "terminal")]
     fn terminals_summary(&self) -> Vec<manox_protocol::stream::TerminalSummary> {
         self.terminals
             .lock()
@@ -341,6 +352,7 @@ impl AgentServerInner {
             .collect()
     }
 
+    #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
         let Ok(path) = manox_agent::db::default_db_path() else {
             return;
@@ -364,6 +376,7 @@ impl AgentServerInner {
 
     /// One watcher per terminal: title/exit edges update the db mirror and
     /// broadcast `TerminalsUpdated`.
+    #[cfg(feature = "terminal")]
     fn spawn_terminal_watcher(self: &Arc<Self>, entry: Arc<TerminalEntry>) {
         let rx = entry.handle.subscribe();
         let inner = Arc::clone(self);
@@ -398,6 +411,7 @@ impl AgentServerInner {
     /// `StreamOpen { FollowTerminal }`: one forwarder per stream relaying raw
     /// PTY chunks as base64 `TerminalOutput` frames; ends `Closed` on child
     /// exit / channel close, `Cancelled` on `StreamCancel`.
+    #[cfg(feature = "terminal")]
     fn open_terminal_stream(
         self: &Arc<Self>,
         client_id: &str,
@@ -601,6 +615,7 @@ impl AgentServer {
     fn new_inner(cwd: PathBuf, store_watcher: bool) -> Self {
         // #13: the terminal pumps need a runtime; first registration wins
         // and the agent runtime is already live here.
+        #[cfg(feature = "terminal")]
         manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
@@ -608,6 +623,7 @@ impl AgentServer {
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
             streams: Mutex::new(HashMap::new()),
+            #[cfg(feature = "terminal")]
             terminals: Mutex::new(HashMap::new()),
             call_seq: AtomicU64::new(0),
             delivery_seq: Mutex::new(HashMap::new()),
@@ -970,8 +986,22 @@ impl AgentServerInner {
         stream_id: StreamId,
         kind: StreamKind,
     ) {
+        #[cfg(feature = "terminal")]
         if let StreamKind::FollowTerminal { terminal_id } = kind {
             self.open_terminal_stream(client_id, conn, stream_id, terminal_id);
+            return;
+        }
+        #[cfg(not(feature = "terminal"))]
+        if let StreamKind::FollowTerminal { .. } = kind {
+            // GW7: the declared-but-unbuilt arm answers the stable code so
+            // clients distinguish "not built into this host" from a failure.
+            conn.send_to_client(FromServer::StreamEnd {
+                stream_id,
+                reason: StreamEndReason::Failure {
+                    code: manox_protocol::msg::CODE_FEATURE_UNAVAILABLE.into(),
+                    message: "terminal support not built into this host".into(),
+                },
+            });
             return;
         }
         let StreamKind::FollowSession {
@@ -1232,8 +1262,9 @@ impl AgentServerInner {
             // already settled first-wins, so the fresh waiter's reply
             // double-applies into the same idempotent gate, and the next
             // join re-checks and finds the record gone.
-            let gate_settled = matches!(rec.kind, HookKind::Approve | HookKind::AskUserQuestion)
-                && !live_auth_ids.contains(&rec.key);
+            let gate_settled =
+                matches!(rec.kind, AnswerKind::Approve | AnswerKind::AskUserQuestion)
+                    && !live_auth_ids.contains(&rec.key);
             if gate_settled {
                 self.retire_pending_adjudication(session_id, &rec.key);
                 continue;
@@ -1269,15 +1300,18 @@ impl AgentServerInner {
             // Not registered under the delivery's GW3 cancel tokens: the
             // settling waterfall's `DeliveryGuard` cancels the whole
             // delivery id, which would mis-kill this owner's fresh waiter.
-            // A replayed delivery superseded elsewhere converges on
-            // CALL_TIMEOUT; the engine gate's first-wins idempotence absorbs
-            // the late double-apply.
+            // PR-0a: a replayed adjudication is the SAME human-facing card a
+            // newly-joined owner is re-delivered, so it awaits their answer
+            // with no wall-clock deadline too. A delivery superseded elsewhere
+            // is absorbed by the engine gate's first-wins idempotence when this
+            // waiter finally resolves (on the owner's reply or their connection
+            // closing); the pending record is retired on the next settle.
             let inner = Arc::clone(self);
             let sid = session_id.to_string();
             manox_agent::runtime::handle().spawn(async move {
-                let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-                    Ok(Ok(o)) => o,
-                    _ => Err(RpcError::new(-1, "replayed adjudication reply timed out")
+                let outcome = match rx.recv().await {
+                    Ok(o) => o,
+                    _ => Err(RpcError::new(-1, "replayed adjudication delivery closed")
                         .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
                 };
                 apply_reply(&inner, &sid, rec.ctx, outcome, None);
@@ -1773,18 +1807,24 @@ async fn handle_call(
         // declared terminal support must be able to distinguish "feature
         // not built yet" from a generic failure (§D.7 code set, ratified
         // with the msg.rs constant + spec revision).
+        #[cfg(feature = "terminal")]
         ClientCall::TerminalAttach {
             session,
             cols,
             rows,
             terminal_id,
         } => inner.attach_terminal(&session, cols, rows, terminal_id),
+        #[cfg(not(feature = "terminal"))]
+        ClientCall::TerminalAttach { .. } => Err(unavailable("terminal")),
+        #[cfg(feature = "terminal")]
         ClientCall::TerminalSnapshot { terminal } => {
             inner.terminal_snapshot(&terminal).ok_or_else(|| {
                 RpcError::new(-1, format!("unknown terminal {terminal}"))
                     .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
             })
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientCall::TerminalSnapshot { .. } => Err(unavailable("terminal")),
         ClientCall::ModelChat {
             request_id,
             model,
@@ -1849,6 +1889,14 @@ async fn open_session(
     // upgrade), and only phase 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
         .with_mut(|s| s.load_thread(session_id))
+        .map_err(|error| {
+            // Another process drives this session: its engine actor holds
+            // the per-session write lease. Fail fast — the client surfaces
+            // the stable code and can retry after the holder exits.
+            tracing::warn!(session_id, %error, "session open blocked by a foreign write lease");
+            RpcError::new(-1, error.to_string())
+                .with_code(manox_protocol::msg::CODE_SESSION_ALREADY_OWNED)
+        })?
         .ok_or_else(|| {
             RpcError::new(-1, "thread not found")
                 .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
@@ -2286,6 +2334,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             };
             thread.with_mut(|t| t.set_browser_suite(parsed, enable));
         }
+        #[cfg(feature = "terminal")]
         ClientNote::TerminalInput { terminal, bytes } => {
             // #13: keystroke-grade input into the terminal's PTY writer
             // (enqueue-only, never blocks the caller).
@@ -2325,6 +2374,25 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 );
             }
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientNote::TerminalInput { .. } => {
+            let message = "terminal support not built into this host".to_string();
+            inner.note_to_client(
+                owner,
+                ServerNote::Error {
+                    session_id: None,
+                    message: message.clone(),
+                },
+            );
+            inner.host_to_client(
+                owner,
+                HostEvent::Error {
+                    message,
+                    session_id: None,
+                },
+            );
+        }
+        #[cfg(feature = "terminal")]
         ClientNote::TerminalResize {
             terminal,
             cols,
@@ -2352,6 +2420,24 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
                 .handle
                 .with_mut(|t| t.resize(cols as usize, rows as usize));
         }
+        #[cfg(not(feature = "terminal"))]
+        ClientNote::TerminalResize { terminal, .. } => {
+            let message = format!("terminal support not built into this host ({terminal})");
+            inner.note_to_client(
+                owner,
+                ServerNote::Error {
+                    session_id: None,
+                    message: message.clone(),
+                },
+            );
+            inner.host_to_client(
+                owner,
+                HostEvent::Error {
+                    message,
+                    session_id: None,
+                },
+            );
+        }
         ClientNote::AppendUserMessage {
             session_id,
             text,
@@ -2370,6 +2456,14 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
             // per-note.
         }
     }
+}
+
+/// GW7 stable-code error for a declared-but-unbuilt capability arm (the lean
+/// napi edge builds session-core without the `terminal` feature).
+#[cfg(not(feature = "terminal"))]
+fn unavailable(what: &str) -> RpcError {
+    RpcError::new(-1, format!("{what} support not built into this host"))
+        .with_code(manox_protocol::msg::CODE_FEATURE_UNAVAILABLE)
 }
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
@@ -3075,7 +3169,10 @@ impl AgentServerInner {
             };
             let content = to_message_content(text, images);
             if t.is_running() {
-                t.enqueue_steer(content, Some(ui));
+                // S3 stable-id: thread the client's `Steer` message id through
+                // the facade so the optimistic bubble, the injected `user`
+                // journal row, and the echo retirement share one identity.
+                t.enqueue_steer(content, Some(ui), Some(message_id.clone()));
             } else {
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();
@@ -3323,7 +3420,7 @@ impl AgentServerInner {
 
 // ── ServerCall routing (β-3b: Approve / AskUserQuestion / PlanVerdict). ─────
 async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: ServerCall) {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     // GW3 (§D.4): the gateway is the SINGLE stamping point for delivery
     // identity — translate/pump construct the trio with an empty
     // `delivery_id` (they are pure), and every adjudication passes through
@@ -3487,7 +3584,7 @@ type AdjudicationTarget = (
 #[derive(Clone)]
 struct PendingAdjudication {
     key: String,
-    kind: HookKind,
+    kind: AnswerKind,
     ctx: ReplyCtx,
     call: ServerCall,
     /// Owners holding a live reply waiter for this call, as
@@ -3643,20 +3740,36 @@ async fn route_waterfall(
             .expect("every target registered a token")
             .clone();
         manox_agent::runtime::handle().spawn(async move {
+            // PR-0a: a human answerer is awaited with NO wall-clock deadline
+            // (dsh semantics: a pending interaction lives until the human
+            // answers, the delivery is explicitly withdrawn, or the client
+            // channel closes). Convergence is event-driven — an answered reply,
+            // a `CancelDelivery` (the token below), or a re-seat / dead-
+            // connection resolving the waiter — never a clock. The engine gate
+            // remains first-wins, so a late answer after a hand-off is inert.
             let event = tokio::select! {
                 _ = token.cancelled() => DeliveryEvent::Expired(
                     RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                 ),
-                replied = tokio::time::timeout(CALL_TIMEOUT, rx.recv()) => match replied {
+                replied = rx.recv() => match replied {
                     // The re-seat cancel resolves this waiter with a coded
                     // Err — the one Err outcome that is a hand-off, not a
                     // delivery failure or a rejection.
-                    Ok(Ok(Err(e))) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
+                    Ok(Err(e)) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
                         DeliveryEvent::Reseated
                     }
-                    Ok(Ok(o)) => DeliveryEvent::Reply(o),
-                    _ => DeliveryEvent::Expired(
-                        RpcError::new(-1, "adjudication reply timed out").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
+                    // A delivered reply payload — an answer (`Ok`) or an
+                    // explicit rejection (`Err`). Both are a human acting on
+                    // the card; a rejection settles the waterfall against the
+                    // call (fail-closed), never as a lapse.
+                    Ok(o) => DeliveryEvent::Reply(o),
+                    // The channel closed with no reply (peer disconnected, or a
+                    // teardown resolved nothing): the delivery lapsed without a
+                    // human action — fail-closed, NOT a wall-clock timeout
+                    // (PR-0a removed the clock; this arm replaces the old
+                    // timeout-expiry).
+                    Err(_) => DeliveryEvent::Expired(
+                        RpcError::new(-1, "adjudication delivery closed before an answer").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
                     ),
                 },
             };
@@ -3729,7 +3842,7 @@ async fn route_waterfall(
         },
     );
     if outcome.is_err() && verdict_failure.is_none() {
-        inner.note_error(session_id, "adjudication rejected or timed out");
+        inner.note_error(session_id, "adjudication rejected or lapsed (no answer)");
     }
     apply_reply(inner, session_id, ctx, outcome, verdict_failure);
 }
@@ -3839,6 +3952,111 @@ fn apply_approve_reply(
     clear_pending_auth_if_settled(inner, session_id);
 }
 
+/// B2-PR-1 **transitional reply reader** for `apply_ask_reply`.
+///
+/// Accepts BOTH shapes and converges them to the canonical variant
+/// (`manox_agent::permission::AskAnswer`), so a pre-L1 client keeps working
+/// for exactly one release while paired clients ship the new shape:
+/// - NEW canonical: `{"answers": [{"id", "selected": [labels], "custom"?}]}`
+///   — id-routed tri-state (skip = empty `selected` with no `custom`).
+/// - OLD positional: `{"answers": [["question text", "answer text"], …]}`
+///   — joined by the question TEXT against the parked card's input; an
+///   answer whose question text is unknown is dropped. The old CARD-LEVEL
+///   `response: string` override is mapped into the canonical supplement
+///   vocabulary: it folds as a `custom` on the FIRST parked question (it
+///   always dismissed the whole card for the model, and the model-facing
+///   renderer reads `custom` as a supplemental note), and a non-empty old
+///   `response` also converts the old empty-answers default into one
+///   synthesized row instead of silently dropping the user's free text.
+///
+/// RETIREMENT: delete this both-read — accept ONLY the canonical shape — once
+/// the paired manox-app PR (canonical reply writer) is merged AND one
+/// manox-server release has shipped (the same no-lockstep window the plan's
+/// "transitional both-read, single write" calls for).
+fn parse_ask_answers(
+    parked_input: Option<&serde_json::Value>,
+    v: &serde_json::Value,
+) -> Vec<manox_agent::permission::AskAnswer> {
+    use manox_agent::permission::AskAnswer;
+    fn question_text(q: &serde_json::Value) -> &str {
+        q.get("question").and_then(Value::as_str).unwrap_or("")
+    }
+    let questions = parked_input
+        .and_then(|i| i.get("questions"))
+        .and_then(|q| q.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let parse_canonical = |arr: &[Value]| -> Vec<AskAnswer> {
+        arr.iter()
+            .filter_map(|p| {
+                let id = p.get("id").and_then(Value::as_str)?;
+                if id.trim().is_empty() || !p.get("selected").is_some_and(Value::is_array) {
+                    return None; // not a canonical row — drop, never guess
+                }
+                let selected: Vec<String> = p["selected"]
+                    .as_array()
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(AskAnswer::new(
+                    id.to_string(),
+                    selected,
+                    p.get("custom").and_then(Value::as_str).map(String::from),
+                ))
+            })
+            .collect()
+    };
+    let parse_legacy = |arr: &[Value]| -> Vec<AskAnswer> {
+        arr.iter()
+            .filter_map(|p| {
+                let q = p.get(0).and_then(Value::as_str)?;
+                let a = p.get(1).and_then(Value::as_str).unwrap_or("");
+                let id = questions
+                    .iter()
+                    .find(|it| question_text(it) == q)
+                    .and_then(|it| it.get("id"))
+                    .and_then(Value::as_str)?;
+                Some(AskAnswer::new(
+                    id.to_string(),
+                    Vec::new(),
+                    (!a.is_empty()).then(|| a.to_string()),
+                ))
+            })
+            .collect()
+    };
+    let mut answers = match v.get("answers").and_then(Value::as_array) {
+        Some(arr) if arr.iter().all(|p| p.is_array()) => parse_legacy(arr),
+        Some(arr) => parse_canonical(arr),
+        None => Vec::new(),
+    };
+    // Transitional mapping of the removed card-level `response` override
+    // (old clients only — canonical replies never carry the key).
+    if let Some(legacy_response) = v.get("response").and_then(Value::as_str)
+        && !legacy_response.trim().is_empty()
+    {
+        if let Some(first) = answers.iter_mut().find(|a| a.custom.is_none()) {
+            first.custom = Some(legacy_response.to_string());
+        } else if let Some(first_q) = questions
+            .first()
+            .and_then(|q| q.get("id"))
+            .and_then(Value::as_str)
+        {
+            answers.insert(
+                0,
+                AskAnswer::new(
+                    first_q.to_string(),
+                    Vec::new(),
+                    Some(legacy_response.to_string()),
+                ),
+            );
+        }
+    }
+    answers
+}
+
 fn apply_ask_reply(
     inner: &Arc<AgentServerInner>,
     session_id: &str,
@@ -3846,26 +4064,45 @@ fn apply_ask_reply(
     outcome: Result<Value, RpcError>,
 ) {
     let response = match outcome {
-        Ok(v) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
-            answers: v
-                .get("answers")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            let q = p.get(0).and_then(Value::as_str)?.to_string();
-                            let a = p.get(1).and_then(Value::as_str).unwrap_or("").to_string();
-                            Some((q, a))
-                        })
-                        .collect()
+        // PR-0b (server-first): a client that lets the user CLOSE the card to
+        // speak replies with an explicit `dismissed` marker (a top-level bool,
+        // or the report's canonical `outcome: "dismissed"`). A non-answer that
+        // is neither a rejection nor a lapse. Old clients never send it, so the
+        // answer path is byte-for-byte unchanged for them; the manox-app side
+        // of this marker is a coordinated batch-2 change.
+        Ok(v)
+            if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
+                || v.get("outcome").and_then(Value::as_str) == Some("dismissed") =>
+        {
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+        }
+        Ok(v) => {
+            // B2-PR-1: the reply is parsed through the transitional
+            // both-read, single-write reader above; everything the gate
+            // receives is canonical, id-routed tri-state. The parked card's
+            // input is read from the SAME session-thread borrow as the
+            // settle, so the question-text → id map for old-shape replies
+            // always describes THIS auth_id's card.
+            let answers = inner
+                .session_thread(session_id)
+                .map(|thread| {
+                    thread.with_mut(|t| {
+                        let parked = t
+                            .pending_auth_entries()
+                            .into_iter()
+                            .find(|(id, _)| id == &auth_id)
+                            .map(|(_, meta)| meta.input);
+                        parse_ask_answers(parked.as_ref(), &v)
+                    })
                 })
-                .unwrap_or_default(),
-            response: v.get("response").and_then(Value::as_str).map(String::from),
-        },
-        // The reply never arrived as an answer (adjudication timeout,
-        // withdrawn delivery, disconnected peer): an explicit non-answer —
-        // an empty `AskUserQuestion` would read to the model as the user
-        // answering nothing on purpose.
+                .unwrap_or_default();
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+        }
+        // The reply never arrived as an answer (a withdrawn delivery, a
+        // disconnected peer, or an abandoned replay waiter — NOT a wall-clock
+        // timeout, which PR-0a removed for human adjudications): an explicit
+        // non-answer. An empty `AskUserQuestion` would read to the model as the
+        // user answering nothing on purpose.
         Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
     };
     if let Some(thread) = inner.session_thread(session_id) {
@@ -4020,7 +4257,7 @@ async fn route_capability_call(
     session_id: &str,
     call: ServerCall,
 ) -> Result<Value, RpcError> {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     let id = inner.next_call_id();
     let target = {
         let owners = inner.owners(session_id);
@@ -4073,7 +4310,7 @@ async fn route_capability_call_to(
     target_client: &str,
     call: ServerCall,
 ) -> Result<Value, RpcError> {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     let id = inner.next_call_id();
     let target = {
         let owners = inner.owners(session_id);
@@ -4464,16 +4701,16 @@ fn spawn_pump(
     })
 }
 
-/// Map a `ServerCall` to the `HookKind` its answerer must declare.
-fn hook_kind_for(call: &ServerCall) -> HookKind {
+/// Map a `ServerCall` to the `AnswerKind` its answerer must declare.
+fn answer_kind_for(call: &ServerCall) -> AnswerKind {
     match call {
-        ServerCall::Approve { .. } => HookKind::Approve,
-        ServerCall::PlanVerdict { .. } => HookKind::PlanVerdict,
-        ServerCall::AskUserQuestion { .. } => HookKind::AskUserQuestion,
-        ServerCall::BrowserOp { .. } => HookKind::BrowserOp,
-        ServerCall::ClipboardRead { .. } => HookKind::ClipboardRead,
-        ServerCall::OpenExternal { .. } => HookKind::OpenExternal,
-        ServerCall::InvokeClientTool { .. } => HookKind::ClientTool,
+        ServerCall::Approve { .. } => AnswerKind::Approve,
+        ServerCall::PlanVerdict { .. } => AnswerKind::PlanVerdict,
+        ServerCall::AskUserQuestion { .. } => AnswerKind::AskUserQuestion,
+        ServerCall::BrowserOp { .. } => AnswerKind::BrowserOp,
+        ServerCall::ClipboardRead { .. } => AnswerKind::ClipboardRead,
+        ServerCall::OpenExternal { .. } => AnswerKind::OpenExternal,
+        ServerCall::InvokeClientTool { .. } => AnswerKind::ClientTool,
     }
 }
 

@@ -7,12 +7,16 @@
 # legs mirror CI plus the one thing CI cannot see on a developer machine:
 #
 #   1. fmt        — cargo fmt --all -- --check
-#   2. clippy     — cargo clippy --workspace --all-targets -- -D warnings
-#   3. test-real  — cargo test --workspace --all-targets --no-fail-fast
+#   2. prod-libs  — cargo check of the production lib units (no dev-deps,
+#                   no reverse-dependency feature enablement)
+#   3. lean-libs  — the lean napi edge (--no-default-features): the compile
+#                   gate for every cfg-gated-off production arm
+#   4. clippy     — cargo clippy --workspace --all-targets -- -D warnings
+#   5. test-real  — cargo test --workspace --all-targets --no-fail-fast
 #                   under the developer's real HOME
-#   4. test-clean — the same under a pristine temp HOME (the CI-equivalent
+#   6. test-clean — the same under a pristine temp HOME (the CI-equivalent
 #                   hermeticity leg: no ~/.manox config, no provider
-#                   registry, no runtime.lock contention with a live app)
+#                   registry, no session journals)
 #
 # Usage: script/gates.sh [--quick]
 #   --quick  fmt + clippy + test-real only (iteration; a commit gate still
@@ -58,6 +62,10 @@ run_leg "fmt" cargo fmt --all -- --check
 run_leg "prod-libs" cargo check \
     -p manox-agent -p manox-session-core -p manox-protocol \
     -p manox-harness -p manox-napi --lib
+# The lean napi edge: the #[cfg(not(feature = "terminal"))] production arms
+# (and every other gated-off path) never compile under the full-configuration
+# legs above — this leg is their compile gate (review #790).
+run_leg "lean-libs" cargo check -p manox-napi --no-default-features --lib
 run_leg "clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_leg "test-real" cargo test --workspace --all-targets --no-fail-fast
 
@@ -71,7 +79,7 @@ if [[ "$QUICK" -eq 0 ]]; then
     rm -rf "$CLEAN_HOME"
     mkdir -p "$CLEAN_HOME"
     # The clean leg must not inherit the developer's ~/.manox (provider
-    # config, runtime.lock, session journals) — that is exactly the
+    # config, session journals) — that is exactly the
     # hermeticity the CI runner enforces and the P0-1 regressions hid from.
     run_leg "test-clean" env HOME="$CLEAN_HOME" \
         cargo test --workspace --all-targets --no-fail-fast

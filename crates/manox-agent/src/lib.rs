@@ -26,7 +26,9 @@ pub mod i18n;
 pub mod image;
 pub mod language;
 pub mod language_model;
+#[cfg(feature = "lsp")]
 pub mod lsp_tools;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod message;
 pub mod path_env;
@@ -44,6 +46,7 @@ pub mod provider_glue;
 pub mod replay;
 pub mod runtime;
 pub mod sandbox;
+pub mod session_lease;
 pub mod settings;
 pub mod sidebar_order;
 pub mod skill;
@@ -70,7 +73,7 @@ pub mod monitor_bridge;
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use message::{Message, MessageAuthor, MessageProvenance, MessageUiMetadata};
-pub use permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
+pub use permission::{AskAnswer, PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{
     SideCallMetric, SubagentChildEvent, Thread, ThreadEvent, ThreadId, ToolCallStatus,
@@ -97,9 +100,11 @@ pub fn init() {
     provider_glue::init();
     // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
     // connections settle (per-server timeout); failures are isolated.
+    #[cfg(feature = "mcp")]
     mcp::init();
     // LSP registry PATH probe on a background thread (sessions await it
     // bounded before registering the read-only LSP tools).
+    #[cfg(feature = "lsp")]
     lsp_tools::init_background();
     // Skill/command definition registries (markdown files from plugins and
     // the user config dir) — consumed by the slash-command dispatch and the

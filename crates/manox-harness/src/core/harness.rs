@@ -378,6 +378,18 @@ impl HarnessHandle {
         id
     }
 
+    /// Queue a steering message under a caller-minted cancel id (S4). Returns
+    /// the same id, accepted by [`Self::cancel_steer`].
+    pub fn steer_with_id(&self, message: AgentMessage, id: String) -> String {
+        let id = self.run.steer_with_id(message, id);
+        self.control.emit_queue_counts(
+            self.run.queued_steering_count(),
+            self.run.queued_follow_up_count(),
+            self.control.next_turn_queue.lock().unwrap().len(),
+        );
+        id
+    }
+
     /// Queue a follow-up message that resumes a run that would otherwise stop.
     pub fn follow_up(&self, message: AgentMessage) -> String {
         let id = self.run.follow_up(message);
@@ -537,6 +549,7 @@ impl HarnessHandle {
             .push(AgentMessage::User {
                 content,
                 timestamp: chrono::Utc::now(),
+                id: None,
             });
     }
 
@@ -1239,6 +1252,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .push(AgentMessage::User {
                 content,
                 timestamp: chrono::Utc::now(),
+                id: None,
             });
         self.emit_queue_update();
     }
@@ -2086,6 +2100,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         let user_message = AgentMessage::User {
             content,
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         let mut batch = Vec::new();
         // pi-agent-core semantics: the harness's own next-turn queue runs

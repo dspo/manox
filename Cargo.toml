@@ -41,10 +41,15 @@ publish = false
 [workspace.dependencies]
 # Workspace members — declared here so sub-crates reference them via
 # `foo.workspace = true` instead of relative `path = "../foo"`.
-manox-agent = { path = "crates/manox-agent" }
+# default-features = false on the two gated members moves the subsystem choice
+# to each consumer edge (manox-napi re-exposes passthrough features; members
+# that consume these crates as libraries need none of the gated subsystems).
+# External git consumers (manox-app) control features through their own dep
+# declarations and keep the defaults.
+manox-agent = { path = "crates/manox-agent", default-features = false }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
-manox-session-core = { path = "crates/manox-session-core" }
+manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
 manox-protocol = { path = "crates/manox-protocol" }
 manox-harness = { path = "crates/manox-harness" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx

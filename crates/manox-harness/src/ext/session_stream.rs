@@ -104,6 +104,7 @@ mod tests {
                     signature: None,
                 }],
                 timestamp: chrono::Utc::now(),
+                id: None,
             },
             origin: None,
         }

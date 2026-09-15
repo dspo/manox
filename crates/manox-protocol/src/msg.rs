@@ -64,6 +64,7 @@ impl std::error::Error for RpcError {}
 /// `RpcError::new(-1, msg).with_code(CODE_MODEL_UNRESOLVABLE)`).
 pub const RPC_ERROR_CODES: &[&str] = &[
     "session/not-found",
+    "session/already-owned",
     "gateway/bad-request",
     "gateway/internal",
     "resync-required",
@@ -75,6 +76,12 @@ pub const RPC_ERROR_CODES: &[&str] = &[
 
 /// `session/not-found` (§D.7).
 pub const CODE_SESSION_NOT_FOUND: &str = "session/not-found";
+/// `session/already-owned`: another process holds this session's write
+/// lease — a per-session exclusive `flock` over `<id>.jsonl.lock`, acquired
+/// non-blocking when a process starts driving the session. The holder's
+/// death releases the lease, so a retry after the other process exits
+/// succeeds; read-only access never needs the lease.
+pub const CODE_SESSION_ALREADY_OWNED: &str = "session/already-owned";
 /// `gateway/bad-request` (§D.7).
 pub const CODE_GATEWAY_BAD_REQUEST: &str = "gateway/bad-request";
 /// `gateway/internal` (§D.7).
@@ -259,7 +266,7 @@ mod tests {
                 id: MsgId::new("r-1"),
                 call: crate::client::ClientCall::Initialize(crate::handshake::Initialize {
                     client_id: "test".into(),
-                    capabilities: vec![crate::handshake::HookKind::Approve],
+                    capabilities: vec![crate::answer_kind::AnswerKind::Approve],
                     sessions: vec![],
                     protocol_epoch: crate::handshake::PROTOCOL_EPOCH,
                 }),

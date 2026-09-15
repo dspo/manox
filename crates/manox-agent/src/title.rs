@@ -448,6 +448,7 @@ mod tests {
                 signature: None,
             }],
             timestamp: chrono::Utc::now(),
+            id: None,
         }
     }
 
@@ -532,6 +533,7 @@ mod tests {
                 mime_type: "image/png".into(),
             }],
             timestamp: chrono::Utc::now(),
+            id: None,
         };
         let thinking_only = assistant_with_blocks(vec![ContentBlock::Thinking {
             thinking: "private reasoning".into(),
