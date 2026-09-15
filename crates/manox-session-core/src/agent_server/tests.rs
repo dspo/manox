@@ -5727,7 +5727,7 @@ fn concurrent_open_session_yields_one_entry_one_pump() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-// ── GW9: rejected/expired PlanVerdict convergence. ────────────────────
+// ── GW9: rejected/expired plan-review convergence. ───────────────
 
 /// Drain until a `SessionStatus` delta for `session_id` clears
 /// `pending_plan` (§D.5 — `expect_host_status` pins the other fields).
@@ -5773,7 +5773,7 @@ fn expect_store_pending_plan(session_id: &str, want: bool, what: &str) {
 /// an Error note. Fail-closed semantics hold: the plan never executes
 /// (no `approve_plan` on the engine).
 #[test]
-fn plan_verdict_rejection_converges_pending_state() {
+fn plan_review_rejection_converges_pending_state() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
@@ -5903,14 +5903,15 @@ fn plan_verdict_rejection_converges_pending_state() {
 }
 
 /// GW9 regression: an UNREVIEWABLE plan (no owner declared the
-/// PlanVerdict capability) is the fail_closed arm of the same deadlock —
-/// pre-fix it noted an Error and left every pending-review plane set.
+/// AskUserQuestion capability the review card needs) is the fail_closed
+/// arm of the same deadlock — pre-fix it noted an Error and left every
+/// pending-review plane set.
 #[test]
-fn plan_verdict_without_reviewer_converges() {
+fn plan_review_without_reviewer_converges() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    // No PlanVerdict capability: route_call finds no target.
+    // No ask capability: route_call finds no target.
     let (server, client) = harness(vec![]);
     create(&server, &client, "gw9-s2");
     let (engine, events) = FakeEngine::new();
@@ -5989,7 +5990,7 @@ fn converge_plan_rejected_clears_every_plane_directly() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw9-s3");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s3", engine.clone(), events);
@@ -6002,8 +6003,8 @@ fn converge_plan_rejected_clears_every_plane_directly() {
         .expect("live session")
         .with_mut(|t| t.set_plan_review_pending(true));
 
-    // The expiry convergence, exactly as the timed-out waterfall arm
-    // calls it.
+    // The lapse convergence, exactly as the review's fail-closed arms
+    // call it.
     converge_plan_rejected(
         &server.0,
         "gw9-s3",
@@ -6355,7 +6356,7 @@ fn handshake_rejects_unknown_protocol_epoch() {
             "clientId": "epoch-probe",
             "capabilities": [],
             "sessions": [],
-            "protocolEpoch": 7,
+            "protocolEpoch": 8,
         }
     }))
     .expect("the epoch-bearing Initialize frame parses");
@@ -6372,7 +6373,7 @@ fn handshake_rejects_unknown_protocol_epoch() {
                 "protocol/unsupported-epoch"
             );
             assert!(
-                e.message.contains('7'),
+                e.message.contains('8'),
                 "the rejection names the offending epoch: {}",
                 e.message
             );
@@ -7440,11 +7441,7 @@ fn adjudication_requests_carry_stable_delivery_id() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![
-        AnswerKind::Approve,
-        AnswerKind::AskUserQuestion,
-        AnswerKind::PlanVerdict,
-    ]);
+    let (server, client) = harness(vec![AnswerKind::Approve, AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw3-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw3-s1", engine.clone(), events);
@@ -8302,7 +8299,7 @@ fn approve_verdict_clears_the_pending_auth_badge_server_side() {
 /// (Reject/expire is GW9's convergence, pinned there.) PR-5a (C4): the
 /// review rides the ask channel.
 #[test]
-fn plan_verdict_execution_clears_the_pending_plan_badge() {
+fn plan_review_execution_clears_the_pending_plan_badge() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();

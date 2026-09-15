@@ -12,7 +12,7 @@ use crate::answer_kind::AnswerKind;
 /// and echoes the accepted epoch in `HostEvent::Ready`. Bumping this constant
 /// is a deliberate spec revision (L12: names are added at group tails with an
 /// epoch bump), never a silent drift.
-pub const PROTOCOL_EPOCH: u32 = 6;
+pub const PROTOCOL_EPOCH: u32 = 7;
 
 /// First client→server request. Declares who the client is, which
 /// [`AnswerKind`]s it can answer, and which sessions it initially owns.
@@ -58,11 +58,12 @@ mod tests {
     fn hello_capability_and_ownership() {
         let hello = ClientHello {
             client_id: "gpui-desktop".into(),
-            capabilities: vec![AnswerKind::Approve, AnswerKind::PlanVerdict],
+            capabilities: vec![AnswerKind::Approve, AnswerKind::AskUserQuestion],
             sessions: vec!["t1".into()],
         };
         assert!(hello.can(AnswerKind::Approve));
         assert!(!hello.can(AnswerKind::BrowserOp));
+        assert!(hello.can(AnswerKind::AskUserQuestion));
         assert!(hello.owns("t1"));
         assert!(!hello.owns("t2"));
     }

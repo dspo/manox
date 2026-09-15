@@ -95,7 +95,8 @@ impl AgentClient {
         self.conn.send_to_server(FromClient::Notification { note });
     }
 
-    /// Answer a server-originated `ServerCall` (Approve / PlanVerdict / ...).
+    /// Answer a server-originated `ServerCall` (Approve / AskUserQuestion /
+    /// ...).
     pub fn send_reply(&self, id: MsgId, outcome: Result<serde_json::Value, RpcError>) {
         self.conn.send_to_server(FromClient::Reply { id, outcome });
     }
@@ -156,11 +157,7 @@ mod tests {
         let client = AgentClient::connect(
             &server,
             "ta-test",
-            vec![
-                AnswerKind::Approve,
-                AnswerKind::PlanVerdict,
-                AnswerKind::AskUserQuestion,
-            ],
+            vec![AnswerKind::Approve, AnswerKind::AskUserQuestion],
             vec![],
         );
         assert_eq!(client.client_id(), "ta-test");

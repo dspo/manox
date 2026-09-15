@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub enum AnswerKind {
     Approve,
-    PlanVerdict,
     AskUserQuestion,
     BrowserOp,
     ClipboardRead,
@@ -32,7 +31,6 @@ mod tests {
     fn answer_kind_wire_tags_are_pinned() {
         let cases = [
             (AnswerKind::Approve, "approve"),
-            (AnswerKind::PlanVerdict, "planVerdict"),
             (AnswerKind::AskUserQuestion, "askUserQuestion"),
             (AnswerKind::BrowserOp, "browserOp"),
             (AnswerKind::ClipboardRead, "clipboardRead"),

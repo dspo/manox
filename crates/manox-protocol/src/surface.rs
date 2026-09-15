@@ -644,7 +644,7 @@ wire_surface! {
 }
 
 wire_surface! {
-    /// `ServerCall` wire methods (§D.4: waterfall trio + directed capability
+    /// `ServerCall` wire methods (§D.4: waterfall adjudications + directed
     /// calls).
     table: SERVER_CALLS,
     /// Exhaustive wire-method match for [`ServerCall`] (compile-time gate).
@@ -661,15 +661,8 @@ wire_surface! {
             summary: "ls".into(),
             input: serde_json::json!({"command": "ls"}),
         },
-        ServerCall::PlanVerdict { .. } => "planVerdict" ~ ServerCall::PlanVerdict {
-            delivery_id: "dlv-s1-2".into(),
-            session_id: "s1".into(),
-            plan_file: "/p.md".into(),
-            title: "P".into(),
-            content: Some("# P".into()),
-        },
         ServerCall::AskUserQuestion { .. } => "askUserQuestion" ~ ServerCall::AskUserQuestion {
-            delivery_id: "dlv-s1-3".into(),
+            delivery_id: "dlv-s1-2".into(),
             session_id: "s1".into(),
             auth_id: "a2".into(),
             input: serde_json::json!({}),

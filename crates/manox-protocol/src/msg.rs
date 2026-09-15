@@ -456,16 +456,6 @@ mod tests {
                     input: serde_json::json!({}),
                 },
             },
-            FromServer::Request {
-                id: MsgId::new("adj-3"),
-                call: crate::server::ServerCall::PlanVerdict {
-                    delivery_id: "dlv-s1-3".into(),
-                    session_id: "s1".into(),
-                    plan_file: "/plan.md".into(),
-                    title: "Plan".into(),
-                    content: Some("# Plan".into()),
-                },
-            },
             FromServer::Notification {
                 note: crate::server::ServerNote::Ready,
             },
