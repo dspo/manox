@@ -17,7 +17,10 @@
 //!   stable;
 //! - reentrant per process: a second acquire of a live lease returns the
 //!   same entry (reconnects and co-viewing clients within one process are
-//!   legal);
+//!   legal). Joins are keyed by path but validated by inode: the invariant
+//!   above binds manox code only — a user wiping `sessions/` under a live
+//!   lease leaves its flock on an unlinked inode, and a join must detect
+//!   that instead of silently handing out a no-op lease;
 //! - read-only paths (cold reads, fork sources) never take it.
 //!
 //! Within one append the journal's `WriteFence` still serializes bytes on
@@ -41,10 +44,23 @@ pub enum LeaseError {
 }
 
 /// One held lease. The flock lives until the last `Arc<LeaseEntry>`
-/// drops; the field is a pure guard, never read.
+/// drops. `lock_file_id` is the identity of the inode this entry fenced:
+/// joins compare it against the lock file currently on disk so an entry
+/// whose directory was replaced mid-hold (flock on an unlinked inode) is
+/// never handed out again.
 #[derive(Debug)]
 pub struct LeaseEntry {
     _lock: manox_harness::fs_lock::FileLock,
+    lock_file_id: (u64, u64),
+}
+
+/// The (dev, ino) identity of the lock file on disk right now, if it is
+/// addressable.
+fn current_lock_file_id(lock_path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(lock_path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 /// Process-wide lease registry. Values are `Weak`: the map never keeps a
@@ -69,29 +85,46 @@ const ACQUIRE_BUDGET: Duration = Duration::from_millis(250);
 /// one. The double-check dance below keeps same-process acquires correct
 /// without that coupling.
 fn join_live(session_path: &Path) -> Option<Arc<LeaseEntry>> {
-    let map = leases().lock().unwrap_or_else(|e| e.into_inner());
-    map.get(session_path).and_then(Weak::upgrade)
+    let lock_path = manox_harness::fs_lock::lock_path_for(session_path);
+    let on_disk = current_lock_file_id(&lock_path);
+    let mut map = leases().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(session_path).and_then(Weak::upgrade) {
+        // Live AND fencing the inode currently behind the path: join.
+        Some(entry) if Some(entry.lock_file_id) == on_disk => Some(entry),
+        // Live but stale — the lock file's directory was replaced while
+        // the entry held it (its flock guards an unlinked inode, so the
+        // lease is a silent no-op against every other process). Retire it
+        // so a fresh acquire flocks the current inode.
+        Some(_) => {
+            map.remove(session_path);
+            None
+        }
+        None => None,
+    }
 }
 
 /// Acquire (or join) this process's write lease for the session file.
 /// Contention with another process is fail-fast (bounded well under a
 /// second) and never queued. Synchronous — callers that hold a lock worth
 /// not pinning (e.g. async contexts) use [`acquire_async`]; note
-/// `ThreadStore::load_thread` runs this under the store's write lock, so a
-/// contended open pins that store for at most one budget.
+/// `ThreadStore::load_thread` runs this under the store's write lock, and
+/// the 250ms pin is CROSS-process: whenever another manox process is
+/// driving the same session, every open of it here waits out the full
+/// budget.
 pub fn acquire(session_path: &Path) -> Result<Arc<LeaseEntry>, LeaseError> {
     if let Some(entry) = join_live(session_path) {
         return Ok(entry);
     }
     let lock_path = manox_harness::fs_lock::lock_path_for(session_path);
-    let attempt = manox_harness::fs_lock::lock_exclusive(&lock_path, ACQUIRE_BUDGET);
-    let _lock = match attempt {
+    let lock = match manox_harness::fs_lock::lock_exclusive(&lock_path, ACQUIRE_BUDGET) {
         Ok(lock) => lock,
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
             // Not ours to take. The one benign explanation left: a twin
             // acquire in THIS process flocked first and has not inserted
             // its registry entry yet — re-check once before declaring a
-            // foreign holder.
+            // foreign holder. (The window between the twin's flock and
+            // its insert is a few instructions; the 250ms budget already
+            // spent dwarfs it.)
             if let Some(entry) = join_live(session_path) {
                 return Ok(entry);
             }
@@ -106,15 +139,18 @@ pub fn acquire(session_path: &Path) -> Result<Arc<LeaseEntry>, LeaseError> {
             });
         }
     };
-    let entry = Arc::new(LeaseEntry { _lock });
-    let mut map = leases().lock().unwrap_or_else(|e| e.into_inner());
-    // A twin may have won the race while we flocked: join its entry and
-    // let our fd close (releasing our flock — at most one of us holds it,
-    // so no other process is affected).
-    if let Some(existing) = map.get(session_path).and_then(Weak::upgrade) {
-        return Ok(existing);
-    }
-    map.insert(session_path.to_path_buf(), Arc::downgrade(&entry));
+    // We hold the flock on the CURRENT inode (join_live retired any stale
+    // entry, and a live one would have kept the flock from us), so the
+    // insert below cannot clobber a joinable entry.
+    let entry = Arc::new(LeaseEntry {
+        _lock: lock,
+        lock_file_id: current_lock_file_id(&lock_path)
+            .expect("the lock file exists: the flock just opened it"),
+    });
+    leases()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(session_path.to_path_buf(), Arc::downgrade(&entry));
     Ok(entry)
 }
 
@@ -180,9 +216,39 @@ mod tests {
         drop(entry);
         // The registry's Weak died with the holder: a raw flock now
         // succeeds (another process could take over) — bounded, not ZERO,
-        // for the macOS close-release quirk — and the lock file stays on
-        // disk: never unlinked, its inode is the lock identity.
+        // so a transient contention is never misread as a live lease (see
+        // `manox_harness::fs_lock`) — and the lock file stays on disk:
+        // never unlinked, its inode is the lock identity.
         assert!(manox_harness::fs_lock::lock_exclusive(&lock_path, Duration::from_secs(1)).is_ok());
         assert!(lock_path.exists());
+    }
+
+    /// The join is validated by inode: wiping the lock directory under a
+    /// live lease leaves the entry's flock on an unlinked inode — a join
+    /// would hand out a lease that no longer excludes ANYONE. The next
+    /// acquire must detect the replacement and flock the new inode.
+    #[test]
+    fn a_replaced_lock_directory_is_not_joined() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        let lock_path = manox_harness::fs_lock::lock_path_for(&session);
+        let stale = acquire(&session).unwrap();
+        // Simulate the user wiping `sessions/`: the lock file is unlinked
+        // while the entry still nominally holds it.
+        std::fs::remove_file(&lock_path).unwrap();
+        let fresh = acquire(&session).unwrap();
+        assert!(
+            !Arc::ptr_eq(&stale, &fresh),
+            "a stale lease over an unlinked inode must not be joined"
+        );
+        // And the fresh entry is a REAL lease: a foreign fd contends with
+        // it on the new inode.
+        assert!(
+            manox_harness::fs_lock::lock_exclusive(&lock_path, Duration::ZERO)
+                .unwrap_err()
+                .kind()
+                == std::io::ErrorKind::WouldBlock
+        );
     }
 }

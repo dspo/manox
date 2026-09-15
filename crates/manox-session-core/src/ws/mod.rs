@@ -398,6 +398,12 @@ mod tests {
         }
 
         drop(squatter);
+        // The retry's listener keeps serving on the process runtime after
+        // this test (start returns no abort handle) and GATEWAY_LEASE is
+        // cleared above, so "lease alive ⇔ listener alive" does NOT hold
+        // inside this test. Harmless today only because lock_globals()
+        // serializes the suite; if that serialization ever goes away, give
+        // `start` an abort handle instead of relying on this comment.
         *endpoint_slot().lock().unwrap() = None;
         release_gateway_lease();
         manox_agent::thread_store::drop_global_for_test();
