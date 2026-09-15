@@ -9708,6 +9708,133 @@ fn embedder_tool_invoke_round_trips() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// The gate's read-only seam end to end (the client-tool approval defect):
+/// the engine wraps embedder tools in [`manox_agent::approval::ApprovalGatedTool`]
+/// exactly as below, and its `needs_gate` is
+/// `requires_approval() || !is_read_only()` — without the adapter's
+/// `is_read_only` override the trait default (`false`) gates a read_only
+/// registration, which then hits the fail-closed workspace-write deny arm
+/// (only danger-full-access ever ran it). A registration's read_only hint
+/// must therefore carry it through the DEFAULT permission mode.
+#[test]
+fn embedder_read_only_tool_clears_the_workspace_write_gate() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+    let (server, client) = harness(vec![AnswerKind::ClientTool]);
+    let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
+    manox_agent::embedder_tools::set_provider(provider.clone());
+    create(&server, &client, "et-g");
+    register_tools(
+        &client,
+        "et-g",
+        vec![ClientToolSpec {
+            name: "get_selection".into(),
+            description: "read-only".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: true,
+        }],
+    );
+
+    let tool = provider
+        .tools_for("et-g")
+        .into_iter()
+        .next()
+        .expect("one registered tool");
+    assert!(tool.is_read_only(), "the read_only hint is visible");
+    // The gate stands at the default mode — WorkspaceWrite.
+    let gate = std::sync::Arc::new(manox_agent::approval::ApprovalGate::new(
+        tokio::sync::mpsc::unbounded_channel::<BackendNotice>().0,
+        std::sync::Arc::new(StdMutex::new(None::<manox_harness::types::Model>)),
+    ));
+    gate.set_mode(PermissionMode::WorkspaceWrite);
+    let gated: std::sync::Arc<dyn manox_harness::tool::AgentTool> =
+        std::sync::Arc::new(manox_agent::approval::ApprovalGatedTool::new(tool, gate));
+    assert!(
+        !gated.requires_approval(&serde_json::json!({})),
+        "a read_only client tool must not need the gate"
+    );
+
+    // Execute the GATED tool on a worker thread; this thread answers the
+    // InvokeClientTool round trip and the reply settles the call.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _ = tx.send(rt.block_on(async {
+            gated
+                .execute(
+                    "tc-1",
+                    serde_json::json!({}),
+                    tokio_util::sync::CancellationToken::new(),
+                    &NullEmbedderCtx,
+                )
+                .await
+        }));
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the gated invoke never arrived"
+        );
+        if let FromServer::Request {
+            id,
+            call: ServerCall::InvokeClientTool { name, .. },
+        } = client.recv()
+        {
+            assert_eq!(name, "get_selection");
+            client.send(FromClient::Reply {
+                id,
+                outcome: Ok(serde_json::json!({"content": "the selection", "isError": false})),
+            });
+            break;
+        }
+    }
+    let result = rx.recv().unwrap().expect("the gated call is not denied");
+    assert!(format!("{result:?}").contains("the selection"));
+    // The mutating side keeps the gated semantics (unchanged): its hint
+    // still asks for approval — under WorkspaceWrite the gate's fail-closed
+    // deny arm would refuse it (only danger-full-access runs it).
+    register_tools(&client, "et-g", vec![client_tool_spec("apply_patch")]);
+    let mutating = provider
+        .tools_for("et-g")
+        .into_iter()
+        .next()
+        .expect("one registered tool");
+    assert!(!mutating.is_read_only());
+    assert!(mutating.requires_approval(&serde_json::json!({})));
+
+    // Test hygiene: dispose the live session before teardown.
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("et-g", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-g".into(),
+        },
+    });
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "et-g never disposed");
+            if let FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id },
+            } = client.recv()
+            {
+                assert_eq!(session_id, "et-g");
+                break;
+            }
+        }
+    }
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 #[test]
 fn embedder_tool_without_capable_owner_fails_closed() {
     let _g = lock_globals();

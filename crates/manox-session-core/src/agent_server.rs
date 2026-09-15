@@ -4852,6 +4852,13 @@ impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
     fn requires_approval(&self, _params: &Value) -> bool {
         !self.spec.read_only
     }
+    /// Mirror of the registrant's read_only hint: the approval gate's
+    /// `needs_gate` is `requires_approval() || !is_read_only()`, so without
+    /// this override a read_only registration still fell through the gate
+    /// and — outside danger-full-access — into its fail-closed deny arm.
+    fn is_read_only(&self) -> bool {
+        self.spec.read_only
+    }
     async fn execute(
         &self,
         tool_call_id: &str,
