@@ -332,7 +332,7 @@ impl Client {
     }
 }
 
-fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
+fn harness(caps: Vec<AnswerKind>) -> (AgentServer, Client) {
     // init's directory scan is a background spawn; awaiting it here makes
     // every subsequent cold open (load_thread reads the scan-indexed map)
     // deterministic instead of a race the loaded CI runner loses.
@@ -382,7 +382,7 @@ fn harness(caps: Vec<HookKind>) -> (AgentServer, Client) {
 /// The harness with the U6a store watcher ENABLED (the production
 /// constructor): only the broadcast regression uses it — every other
 /// test keeps the watcher off for deterministic frame streams.
-fn harness_with_store_watcher(caps: Vec<HookKind>) -> (AgentServer, Client) {
+fn harness_with_store_watcher(caps: Vec<AnswerKind>) -> (AgentServer, Client) {
     manox_agent::thread_store::init();
     let server = AgentServer::new(PathBuf::from("/"));
     let (client_conn, server_conn) = in_process_pair();
@@ -1449,7 +1449,7 @@ fn approve_call_round_trips_and_unparks() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -1832,7 +1832,7 @@ fn ask_user_question_round_trips() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -1966,7 +1966,7 @@ fn park_ask(
 fn second_client(
     server: &AgentServer,
     client_id: &str,
-    caps: Vec<HookKind>,
+    caps: Vec<AnswerKind>,
     sessions: &[&str],
 ) -> Client {
     let (conn, server_conn) = in_process_pair();
@@ -2023,7 +2023,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2031,7 +2031,12 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     let a_id = park_ask(&client_a, &engine, "s1", "q1");
     assert_eq!(a_id.0, "q1", "the fan-out MsgId is the auth_id");
 
-    let client_b = second_client(&server, "test-b", vec![HookKind::AskUserQuestion], &["s1"]);
+    let client_b = second_client(
+        &server,
+        "test-b",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
     let b_id = loop {
         match client_b.recv() {
             FromServer::Request {
@@ -2080,7 +2085,12 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     );
     drop(held);
 
-    let client_c = second_client(&server, "test-c", vec![HookKind::AskUserQuestion], &["s1"]);
+    let client_c = second_client(
+        &server,
+        "test-c",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
     let mut c_frames = Vec::new();
     loop {
         let m = client_c.recv();
@@ -2138,7 +2148,7 @@ fn ask_dismissed_marker_converges_as_dismissed() {
     for marker in [json!({"dismissed": true}), json!({"outcome": "dismissed"})] {
         hermetic_home();
         init_globals();
-        let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
         create(&server, &client, "s1");
         let (engine, events) = FakeEngine::new();
         seed_pending_ask(&engine, "q1");
@@ -2192,7 +2202,7 @@ fn parked_ask_is_not_expired_while_the_owner_stays_connected() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2249,7 +2259,7 @@ fn reown_resends_the_parked_ask_through_the_live_waiter() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2324,14 +2334,14 @@ fn ask_survives_same_client_reseat() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
     server.set_session_engine_for_test("s1", engine.clone(), events);
     let _ = park_ask(&client_a, &engine, "s1", "q1");
 
-    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &["s1"]);
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &["s1"]);
     let replayed = loop {
         match reseated.recv() {
             FromServer::Request {
@@ -2419,14 +2429,14 @@ fn ask_reseat_without_reclaim_retires_the_parked_call() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
     server.set_session_engine_for_test("s1", engine.clone(), events);
     let _ = park_ask(&client_a, &engine, "s1", "q1");
 
-    let reseated = second_client(&server, "test", vec![HookKind::AskUserQuestion], &[]);
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &[]);
     let mut frames = Vec::new();
     loop {
         let m = reseated.recv();
@@ -2493,7 +2503,7 @@ fn ask_without_capable_client_settles_expired() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2551,7 +2561,7 @@ fn ask_expires_when_the_holding_owner_disconnects() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client_a) = harness(vec![HookKind::AskUserQuestion]);
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client_a, "s1");
     let (engine, events) = FakeEngine::new();
     seed_pending_ask(&engine, "q1");
@@ -2582,7 +2592,7 @@ fn plan_verdict_round_trips_and_seeds_execution() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("s1", engine.clone(), events);
@@ -2655,7 +2665,7 @@ fn browser_op_routes_to_client_and_returns_reply() {
     init_globals();
     manox_agent::thread_store::init();
     manox_agent::capability::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::BrowserOp]);
+    let (server, client) = harness(vec![AnswerKind::BrowserOp]);
     manox_agent::capability::set_provider(Arc::new(AgentServerCapabilityClient::new(&server)));
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
@@ -2907,7 +2917,7 @@ fn dual_path_transport_consistency() {
     init_globals();
 
     // ── Path 1: in-process pair ──
-    let (server, client_ip) = harness(vec![HookKind::Approve]);
+    let (server, client_ip) = harness(vec![AnswerKind::Approve]);
     let (engine_ip, events_ip) = FakeEngine::new();
     create(&server, &client_ip, "sess-inproc");
     server.set_session_engine_for_test("sess-inproc", engine_ip.clone(), events_ip);
@@ -2922,7 +2932,7 @@ fn dual_path_transport_consistency() {
         id: MsgId::new("init"),
         call: ClientCall::Initialize(Initialize {
             client_id: "serde-test".into(),
-            capabilities: vec![HookKind::Approve],
+            capabilities: vec![AnswerKind::Approve],
             sessions: vec![],
             protocol_epoch: PROTOCOL_EPOCH,
         }),
@@ -4580,7 +4590,7 @@ fn create_session_with_project_intent() {
 fn connect_sessions(
     server: &AgentServer,
     client_id: &str,
-    caps: Vec<HookKind>,
+    caps: Vec<AnswerKind>,
     sessions: Vec<String>,
 ) -> Client {
     let (client_conn, server_conn) = in_process_pair();
@@ -4684,7 +4694,7 @@ fn dispose_then_reopen_keeps_exactly_one_pump() {
     seed_session_file(&sessions, "gw2-reopen-1", "/proj");
     init_globals();
     manox_agent::thread_store::init();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
 
     // First open: one pump.
     client.send(FromClient::Request {
@@ -4840,8 +4850,8 @@ fn concurrent_open_session_yields_one_entry_one_pump() {
     init_globals();
     manox_agent::thread_store::init();
     let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
-    let client_a = connect_sessions(&server, "racer-a", vec![HookKind::Approve], vec![]);
-    let client_b = connect_sessions(&server, "racer-b", vec![HookKind::Approve], vec![]);
+    let client_a = connect_sessions(&server, "racer-a", vec![AnswerKind::Approve], vec![]);
+    let client_b = connect_sessions(&server, "racer-b", vec![AnswerKind::Approve], vec![]);
 
     // Fire both opens back-to-back, then read both answers: the
     // check-load-insert window (if any) is where the race lives.
@@ -5012,7 +5022,7 @@ fn plan_verdict_rejection_converges_pending_state() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "gw9-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s1", engine.clone(), events);
@@ -5218,7 +5228,7 @@ fn converge_plan_rejected_clears_every_plane_directly() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "gw9-s3");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s3", engine.clone(), events);
@@ -6624,9 +6634,9 @@ fn adjudication_requests_carry_stable_delivery_id() {
     hermetic_home();
     init_globals();
     let (server, client) = harness(vec![
-        HookKind::Approve,
-        HookKind::AskUserQuestion,
-        HookKind::PlanVerdict,
+        AnswerKind::Approve,
+        AnswerKind::AskUserQuestion,
+        AnswerKind::PlanVerdict,
     ]);
     create(&server, &client, "gw3-s1");
     let (engine, events) = FakeEngine::new();
@@ -6778,8 +6788,8 @@ fn cancel_delivery_converges_pending_adjudication() {
     init_globals();
     manox_agent::thread_store::init();
     let server = AgentServer::new_without_store_watcher(PathBuf::from("/"));
-    let a = connect_sessions(&server, "gw3-a", vec![HookKind::Approve], vec![]);
-    let b = connect_sessions(&server, "gw3-b", vec![HookKind::Approve], vec![]);
+    let a = connect_sessions(&server, "gw3-a", vec![AnswerKind::Approve], vec![]);
+    let b = connect_sessions(&server, "gw3-b", vec![AnswerKind::Approve], vec![]);
     create(&server, &a, "gw3-s2");
     // b joins the owner set (the §D.4 fan-out audience).
     b.send(FromClient::Request {
@@ -7416,7 +7426,7 @@ fn approve_verdict_clears_the_pending_auth_badge_server_side() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::Approve]);
+    let (server, client) = harness(vec![AnswerKind::Approve]);
     create(&server, &client, "u3b-auth");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-auth", engine.clone(), events);
@@ -7484,7 +7494,7 @@ fn plan_verdict_execution_clears_the_pending_plan_badge() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![HookKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
     create(&server, &client, "u3b-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-s1", engine.clone(), events);
@@ -8359,7 +8369,7 @@ async fn pending_submit_queue_survives_a_panicking_lock_holder() {
 
 /// The shared fixture: a live s1 + the AgentServer's capability provider
 /// registered, exactly like the browser routing test.
-fn capability_bridge_fixture(caps: Vec<HookKind>) -> (AgentServer, Client, Arc<FakeEngine>) {
+fn capability_bridge_fixture(caps: Vec<AnswerKind>) -> (AgentServer, Client, Arc<FakeEngine>) {
     manox_agent::thread_store::init();
     manox_agent::capability::drop_provider_for_test();
     let (server, client) = harness(caps);
@@ -8375,7 +8385,7 @@ fn clipboard_read_routes_and_round_trips() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::ClipboardRead]);
+    let (server, client, engine) = capability_bridge_fixture(vec![AnswerKind::ClipboardRead]);
 
     // The clipboard tool's round trip: notice → facade → provider →
     // ServerCall::ClipboardRead to the owning client.
@@ -8672,7 +8682,7 @@ fn open_external_routes_to_capable_owner() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client, engine) = capability_bridge_fixture(vec![HookKind::OpenExternal]);
+    let (server, client, engine) = capability_bridge_fixture(vec![AnswerKind::OpenExternal]);
 
     let (tx, rx) = async_channel::bounded(1);
     engine
@@ -9311,7 +9321,7 @@ fn register_session_tools_replaces_and_feeds_the_provider() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (_server, client) = harness(vec![HookKind::ClientTool]);
+    let (_server, client) = harness(vec![AnswerKind::ClientTool]);
     let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&_server));
     manox_agent::embedder_tools::set_provider(provider.clone());
     create(&_server, &client, "et-s");
@@ -9471,7 +9481,7 @@ fn embedder_tool_invoke_round_trips() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let (server, client) = harness(vec![AnswerKind::ClientTool]);
     manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
         &server,
     )));
@@ -9608,7 +9618,7 @@ fn dispose_clears_embedder_registrations() {
     hermetic_home();
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
-    let (server, client) = harness(vec![HookKind::ClientTool]);
+    let (server, client) = harness(vec![AnswerKind::ClientTool]);
     let provider = std::sync::Arc::new(AgentServerEmbedderTools::new(&server));
     manox_agent::embedder_tools::set_provider(provider.clone());
     create(&server, &client, "et-d");

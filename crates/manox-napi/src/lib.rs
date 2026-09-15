@@ -20,7 +20,7 @@ use std::sync::Mutex;
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
-use manox_protocol::handshake::HookKind;
+use manox_protocol::AnswerKind;
 use manox_protocol::msg::FromClient;
 use manox_protocol::transport::{InProcessConnection, RpcConnection};
 use manox_session_core::agent_client::AgentClient;
@@ -106,9 +106,9 @@ pub fn start(client_id: String, event_cb: JsFunction) -> Result<()> {
         // in sidebar), and PlanVerdict (plan_verdict in sidebar). No browser
         // or clipboard capabilities.
         vec![
-            HookKind::Approve,
-            HookKind::AskUserQuestion,
-            HookKind::PlanVerdict,
+            AnswerKind::Approve,
+            AnswerKind::AskUserQuestion,
+            AnswerKind::PlanVerdict,
         ],
         vec![],
     );

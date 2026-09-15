@@ -29,6 +29,7 @@
 //! dual-protocol); their stream/host upgrades land with the T4/T5 consumer
 //! migration.
 
+pub mod answer_kind;
 pub mod base64_bytes;
 pub mod client;
 pub mod handshake;
@@ -41,8 +42,9 @@ pub mod surface;
 pub mod transport;
 pub mod wire;
 
+pub use answer_kind::AnswerKind;
 pub use client::{ClientCall, ClientNote, ImageAttachment};
-pub use handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
+pub use handshake::{ClientHello, Initialize, PROTOCOL_EPOCH};
 pub use journal::{
     JournalWireEntry, JournalWireEvent, ModelRef, StreamId, ThreadHeader, UsagePayload,
 };
