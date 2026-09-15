@@ -45,137 +45,21 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             tool_call_id,
             tool_name,
             arguments,
+            ..
         } => {
-            let mut events = vec![ThreadEvent::ToolCall {
+            vec![ThreadEvent::ToolCall {
                 id: tool_call_id.clone(),
                 name: tool_name.clone(),
                 title: tool_title(tool_name, arguments),
                 status: ToolCallStatus::Running,
                 input: Some(arguments.clone()),
-            }];
-            // A spawned sub-agent also lands as a rail observation row
-            // (the conversation shows the Agent tool call card; the rail
-            // tracks the nested session's lifecycle).
-            if tool_name == crate::tools::AGENT {
-                events.push(ThreadEvent::SubagentProgress {
-                    id: tool_call_id.clone(),
-                    subagent_type: arguments
-                        .get("subagent_type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_uses: 0,
-                    token_usage: crate::language_model::TokenUsage::default(),
-                    latest_activity: arguments
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .map(crate::tools::subagent_topic),
-                    status: ToolCallStatus::Running,
-                    health: None,
-                });
-            }
-            events
+            }]
         }
         AgentEvent::ToolExecutionUpdate {
             tool_call_id,
-            tool_name,
             partial_result,
             ..
         } => {
-            // The Agent tool bridges its child session's streamed events
-            // as `{"subagent_event": {...}}` progress: surface them as
-            // drill-down transcript events + live rail activity.
-            if tool_name == crate::tools::AGENT
-                && let Some(ev) = partial_result.get("subagent_event")
-            {
-                let mut events = Vec::new();
-                let kind = ev.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
-                let activity = |text: String| ThreadEvent::SubagentProgress {
-                    id: tool_call_id.clone(),
-                    subagent_type: String::new(),
-                    tool_uses: 0,
-                    token_usage: crate::language_model::TokenUsage::default(),
-                    latest_activity: Some(text),
-                    status: ToolCallStatus::Running,
-                    health: None,
-                };
-                match kind {
-                    "text" => {
-                        if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
-                            events.push(ThreadEvent::SubagentChild {
-                                id: tool_call_id.clone(),
-                                child: crate::thread::SubagentChildEvent::Text(text.to_string()),
-                            });
-                        }
-                    }
-                    "thinking" => {
-                        if let Some(text) = ev.get("text").and_then(|v| v.as_str()) {
-                            events.push(ThreadEvent::SubagentChild {
-                                id: tool_call_id.clone(),
-                                child: crate::thread::SubagentChildEvent::Thinking(
-                                    text.to_string(),
-                                ),
-                            });
-                        }
-                    }
-                    "tool_start" => {
-                        let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-                        let child_id = ev
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let hint = ev
-                            .get("summary_key")
-                            .and_then(|v| v.as_str())
-                            .map(|k| k.to_string())
-                            .zip(
-                                ev.get("summary")
-                                    .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string()),
-                            );
-                        events.push(ThreadEvent::SubagentChild {
-                            id: tool_call_id.clone(),
-                            child: crate::thread::SubagentChildEvent::ToolStart {
-                                id: child_id,
-                                name: name.to_string(),
-                                hint: hint.clone(),
-                            },
-                        });
-                        events.push(activity(match hint {
-                            Some((_, s)) => format!("▸ {name} {s}"),
-                            None => format!("▸ {name}"),
-                        }));
-                    }
-                    "tool_end" => {
-                        let name = ev.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-                        let child_id = ev
-                            .get("id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let is_error = ev
-                            .get("is_error")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        events.push(ThreadEvent::SubagentChild {
-                            id: tool_call_id.clone(),
-                            child: crate::thread::SubagentChildEvent::ToolEnd {
-                                id: child_id,
-                                name: name.to_string(),
-                                is_error,
-                                output: String::new(),
-                            },
-                        });
-                        events.push(activity(format!(
-                            "{} {name}",
-                            if is_error { "✗" } else { "✓" }
-                        )));
-                    }
-                    _ => {}
-                }
-                return events;
-            }
             // The pi-extensions bash tool streams `{"output": chunk}`
             // partials; surface them as live tool output. Other partial
             // shapes carry no renderable text.
@@ -198,7 +82,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             } else {
                 ToolCallStatus::Success
             };
-            let mut events = vec![
+            vec![
                 ThreadEvent::ToolCall {
                     id: tool_call_id.clone(),
                     name: tool_name.clone(),
@@ -211,22 +95,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
                     output: tool_result_text(result),
                     is_error: *is_error,
                 },
-            ];
-            // Close the sub-agent's rail observation row (the row itself
-            // was created by the start event; empty type here is fine —
-            // the upsert keeps the existing entry's fields).
-            if tool_name == crate::tools::AGENT {
-                events.push(ThreadEvent::SubagentProgress {
-                    id: tool_call_id.clone(),
-                    subagent_type: String::new(),
-                    tool_uses: 0,
-                    token_usage: crate::language_model::TokenUsage::default(),
-                    latest_activity: None,
-                    status,
-                    health: None,
-                });
-            }
-            events
+            ]
         }
         AgentEvent::Retry {
             attempt,
@@ -541,10 +410,15 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
                 (None, None) => "Steer".to_string(),
             }
         }
-        "Agent" => match arg("subagent_type") {
-            Some(kind) => format!("Agent {kind}"),
-            None => "Agent".to_string(),
-        },
+        // Delegation tools are named after their definitions; the label
+        // carries the task description so the card shows what was asked.
+        "Explore" | "Sailor" => {
+            let label = args.get("description").and_then(|v| v.as_str());
+            match label {
+                Some(label) => format!("{name} {label}"),
+                None => name.to_string(),
+            }
+        }
         "Skill" => match arg("skill").or_else(|| arg("name")) {
             Some(skill) => format!("Skill {skill}"),
             None => "Skill".to_string(),
@@ -669,7 +543,7 @@ fn first_string_arg(args: &serde_json::Value) -> Option<String> {
 /// workspace accumulates for the sub-agent panel: `SubagentChild` (transcript
 /// deltas + tool lifecycle) plus a running `SubagentProgress` for rail rows.
 /// Mirrors the retired JSON bridge's kind mapping but reads the child session's
-/// events directly instead of a `{"subagent_event": ...}` progress payload.
+/// events directly; the run loop bridges them through the observer seam.
 pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
     let activity = |text: String| ThreadEvent::SubagentProgress {
         id: id.to_string(),
@@ -703,6 +577,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
             tool_call_id,
             tool_name,
             arguments,
+            ..
         } => {
             let hint = arg_hint(arguments);
             let mut events = vec![ThreadEvent::SubagentChild {

@@ -53,9 +53,7 @@ pub enum PromptTemplate {
     /// Execution seed after a plan is approved: read the plan file and
     /// implement it top to bottom.
     ModePlanApproved,
-
     // --- tool descriptions ---
-    AgentToolDescription,
 }
 
 impl PromptTemplate {
@@ -81,7 +79,6 @@ impl PromptTemplate {
             Self::SkillBody => "wrapper/skill_body.tera.md",
             Self::ModePlanActive => "mode/plan_mode_active.tera.md",
             Self::ModePlanApproved => "mode/plan_mode_approved.tera.md",
-            Self::AgentToolDescription => "tools/agent_tool.tera.md",
         }
     }
 }
@@ -90,7 +87,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 17] = [
+pub const ALL: [PromptTemplate; 16] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,
@@ -107,5 +104,4 @@ pub const ALL: [PromptTemplate; 17] = [
     PromptTemplate::SkillBody,
     PromptTemplate::ModePlanActive,
     PromptTemplate::ModePlanApproved,
-    PromptTemplate::AgentToolDescription,
 ];

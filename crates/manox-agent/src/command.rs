@@ -219,7 +219,6 @@ fn tool_id_from_spec(spec: &str) -> Option<String> {
         "glob" => crate::tools::GLOB.to_string(),
         "ls" | "list" | "list_directory" => "Ls".to_string(),
         "askuserquestion" | "ask_user" => crate::tools::ASK_USER_QUESTION.to_string(),
-        "agent" | "task" => crate::tools::AGENT.to_string(),
         "skill" => crate::tools::SKILL.to_string(),
         "monitor" => crate::tools::MONITOR.to_string(),
         other => other.to_string(),
@@ -297,7 +296,6 @@ allowed-tools: Bash(node:*), AskUserQuestion, Read\n\
             tool_id_from_spec("AskUserQuestion"),
             Some("AskUserQuestion".to_string())
         );
-        assert_eq!(tool_id_from_spec("Agent"), Some("Agent".to_string()));
         assert_eq!(tool_id_from_spec(""), None);
     }
 

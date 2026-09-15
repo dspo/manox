@@ -8,9 +8,11 @@ use serde::{Deserialize, Serialize};
 
 /// The identity of the agent sending or being addressed by a Steer.
 /// `Captain` is per-thread (each thread's root agent); a member thread's
-/// root agent is also `Captain` (of that thread). `Subagent` carries the
-/// in-thread coroutine's address. Members (real threads) are addressed by
-/// their thread id via `ToSpec::agent_address`, not by an `AgentId`
+/// root agent is also `Captain` (of that thread). `Subagent` carries a
+/// settled subagent run's id on the completion notice only — in-thread
+/// subagent dispatch moved to the `subagent` module's delegation tools, so
+/// the bus itself never routes to one. Members (real threads) are addressed
+/// by their thread id via `ToSpec::agent_address`, not by an `AgentId`
 /// variant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentId {
@@ -30,39 +32,14 @@ pub enum SteerReason {
     Abort,
 }
 
-/// The target specification: an address (subagent coroutine or thread id)
-/// plus an optional spawn request.
+/// The target specification: an address (member thread id) plus an optional
+/// spawn request. Subagent run budgets live on
+/// `subagent::types::StartRequest`, not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToSpec {
     pub agent_address: String,
     pub spawn: Option<String>,
     pub isolation: Option<String>,
-    /// Wall-clock budget for a spawned subagent coroutine, in milliseconds.
-    /// `None` leaves the run unbounded; the bus rejects budgets below its
-    /// minimum and budgets attached to non-coroutine spawns.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-    /// Idle budget for a spawned subagent coroutine, in milliseconds: the
-    /// longest stretch with no child event and no tool in flight before the
-    /// run is terminated as stalled. `None` leaves stall detection
-    /// report-only. Same minimum and spawn restrictions as `timeout_ms`.
-    /// Enforcement granularity is the watchdog tick (~5s), not the exact
-    /// millisecond value.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub idle_timeout_ms: Option<u64>,
-}
-
-/// The armed time budgets of one subagent dispatch, bundled so the bus and
-/// its run task thread them as a single value. `None` on an axis leaves the
-/// run unbounded there.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DispatchBudgets {
-    /// Wall-clock budget (ms): the run is terminated at this elapsed time.
-    pub timeout_ms: Option<u64>,
-    /// Idle budget (ms): the run is terminated as stalled once it goes this
-    /// long with no child event and no tool in flight. `None` leaves stall
-    /// detection report-only.
-    pub idle_timeout_ms: Option<u64>,
 }
 
 /// The message payload. v1 carries text only (no images).

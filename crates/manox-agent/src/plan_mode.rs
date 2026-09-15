@@ -39,6 +39,7 @@ const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "Glob",
     "Ls",
     "BashOutput",
+    crate::subagent::ListAgentsTool::NAME,
     crate::tools::ASK_USER_QUESTION,
     PROPOSE_PLAN,
 ];
@@ -264,28 +265,28 @@ impl PlanGatePolicy {
     }
 }
 
-/// Whether an `Agent` tool call targets a read-only subagent eligible to run
-/// under plan mode. Requires an explicit `subagent_type` that the resolver
-/// resolves read-only, and rejects `isolation: "worktree"` (materializing a
-/// working tree is a working-tree write, blocked under plan mode's read-only
-/// guarantee).
+/// Whether a delegation tool call targets a read-only definition eligible to
+/// run under plan mode. The delegation shape is `description` + `prompt`
+/// addressed to a tool named after the definition; the resolver resolves the
+/// tool name's capability (non-delegation names resolve false, so Bash &
+/// friends never slip through this arm), and `isolation: "worktree"` is
+/// rejected (materializing a working tree is a working-tree write, blocked
+/// under plan mode's read-only guarantee).
 fn is_read_only_subagent_dispatch(
+    tool_name: &str,
     args: &serde_json::Value,
     is_read_only_subagent: &ReadOnlySubagentResolver,
 ) -> bool {
-    let Some(to) = args.get("to") else {
+    if args.get("description").is_none() || args.get("prompt").is_none() {
         return false;
-    };
-    let Some(spawn) = to.get("spawn").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    if args.get("reason").and_then(|v| v.as_str()) != Some("Dispatch") {
+    }
+    if args.get("to").is_some() || args.get("reason").is_some() {
         return false;
     }
     if args.get("isolation").and_then(|v| v.as_str()) == Some("worktree") {
         return false;
     }
-    is_read_only_subagent(spawn)
+    is_read_only_subagent(tool_name)
 }
 
 /// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
@@ -312,14 +313,13 @@ pub fn gate_handler(
         let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
             || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
                 && is_plan_mode_writable_param(tool_name, &ctx.data["args"], &plans_dir, &cwd))
-            || (tool_name == "Steer"
-                && is_read_only_subagent_dispatch(&ctx.data["args"], &is_read_only_subagent));
+            || is_read_only_subagent_dispatch(tool_name, &ctx.data["args"], &is_read_only_subagent);
         if !allowed {
             ctx.block_reason = Some(format!(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} and temp scratch (/tmp, /private/tmp) may be \
                  written (Write/Edit); research with Read/Grep/Glob/Ls or a read-only \
-                 read-only subagent via Steer (no worktree isolation), ask with AskUserQuestion, \
+                 subagent (no worktree isolation), ask with AskUserQuestion, \
                  and submit the plan with {PROPOSE_PLAN}.",
                 plans_dir.display()
             ));
@@ -927,33 +927,43 @@ mod tests {
                 .is_some()
         );
         // Read-only subagent (Explore) passes; write/bash (Sailor) and
-        // worktree-isolated dispatch are blocked.
+        // worktree-isolated dispatch are blocked. The resolver is name-based:
+        // a delegation tool is named after its definition.
         assert!(
             run(
-                "Steer",
-                serde_json::json!({"to": {"agent_address": "e1", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x"})
+                "Explore",
+                serde_json::json!({"description": "survey", "prompt": "x"})
             )
             .block_reason
             .is_none()
         );
         assert!(
             run(
-                "Steer",
-                serde_json::json!({"to": {"agent_address": "s1", "spawn": "Sailor"}, "reason": "Dispatch", "prompt": "x"})
+                "Sailor",
+                serde_json::json!({"description": "work", "prompt": "x"})
             )
             .block_reason
             .is_some()
         );
         assert!(
             run(
+                "Explore",
+                serde_json::json!({"description": "survey", "prompt": "x", "isolation": "worktree"})
+            )
+            .block_reason
+            .is_some()
+        );
+        // The retired Steer envelope shape never passes the delegation arm.
+        assert!(
+            run(
                 "Steer",
-                serde_json::json!({"to": {"agent_address": "e2", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x", "isolation": "worktree"})
+                serde_json::json!({"to": {"agent_address": "e1", "spawn": "Explore"}, "reason": "Dispatch", "prompt": "x"})
             )
             .block_reason
             .is_some()
         );
         assert!(
-            run("Steer", serde_json::json!({"prompt": "x"}))
+            run("Explore", serde_json::json!({"prompt": "x"}))
                 .block_reason
                 .is_some()
         );
