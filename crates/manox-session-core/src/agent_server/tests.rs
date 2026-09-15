@@ -6539,6 +6539,52 @@ fn page_history_unknown_session_still_answers_not_found() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// The multi-instance gate: opening a session whose write lease is held by
+/// another process answers `session/already-owned` — fail-fast, never a
+/// silent second driver over the same journal. The foreign holder is a
+/// raw second fd standing in for the other process (flock contention does
+/// not care which process owns the conflicting open file description).
+#[test]
+fn open_session_under_a_foreign_write_lease_answers_already_owned() {
+    let _g = lock_globals();
+    hermetic_home();
+    let sessions = manox_agent::paths::manox_config_dir()
+        .expect("config dir")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let path = seed_v4_chain(&sessions, "lease-foreign-1");
+    init_globals();
+    manox_agent::thread_store::init();
+    let (server, client) = harness(vec![]);
+    let holder = manox_harness::fs_lock::lock_exclusive(
+        &manox_harness::fs_lock::lock_path_for(&path),
+        std::time::Duration::ZERO,
+    )
+    .expect("hold the session's write lease as a foreign process");
+    match request(
+        &client,
+        "lease-open-1",
+        ClientCall::OpenSession {
+            session_id: "lease-foreign-1".into(),
+        },
+    ) {
+        FromServer::Response {
+            outcome: Err(e), ..
+        } => {
+            assert_eq!(
+                e.data.as_ref().expect("coded error")["code"],
+                manox_protocol::msg::CODE_SESSION_ALREADY_OWNED
+            );
+        }
+        other => panic!("expected session/already-owned, got {other:?}"),
+    }
+    drop(holder);
+    drop(client);
+    drop(server);
+    let _ = std::fs::remove_file(&path);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// GW6 resume singleflight: concurrent compat CreateSession notes and an
 /// OpenSession request racing the SAME cold id converge on exactly one
 /// sessions entry and one pump — the argument: the cold-file probe

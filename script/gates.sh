@@ -16,7 +16,7 @@
 #                   under the developer's real HOME
 #   6. test-clean — the same under a pristine temp HOME (the CI-equivalent
 #                   hermeticity leg: no ~/.manox config, no provider
-#                   registry, no runtime.lock contention with a live app)
+#                   registry, no session journals)
 #
 # Usage: script/gates.sh [--quick]
 #   --quick  fmt + clippy + test-real only (iteration; a commit gate still
@@ -79,7 +79,7 @@ if [[ "$QUICK" -eq 0 ]]; then
     rm -rf "$CLEAN_HOME"
     mkdir -p "$CLEAN_HOME"
     # The clean leg must not inherit the developer's ~/.manox (provider
-    # config, runtime.lock, session journals) — that is exactly the
+    # config, session journals) — that is exactly the
     # hermeticity the CI runner enforces and the P0-1 regressions hid from.
     run_leg "test-clean" env HOME="$CLEAN_HOME" \
         cargo test --workspace --all-targets --no-fail-fast

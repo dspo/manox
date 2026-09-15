@@ -294,11 +294,23 @@ pub async fn load() -> SidebarOrder {
     }
 }
 
-/// Atomic write (temp file + rename) so a crash cannot truncate the account.
+/// Atomic write (temp file + rename) so a crash cannot truncate the
+/// account. Serialized cross-process under a bounded flock: two manox
+/// processes saving at once would otherwise interleave on the shared tmp
+/// sibling; lock contention surfaces as the returned error (ordering is
+/// UI state — the next reorder rewrites it). The deliberate counterpart
+/// policy is `thread_registry::set_active`'s warn-and-skip: this caller
+/// owns an error path, that one is fire-and-forget.
 pub async fn save(order: &SidebarOrder) -> Result<(), anyhow::Error> {
+    const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     let _guard = LOCK.get_or_init(tokio::sync::Mutex::default).lock().await;
     let path = order_path();
+    let _file_lock = manox_harness::fs_lock::lock_exclusive_async(
+        &manox_harness::fs_lock::lock_path_for(&path),
+        LOCK_BUDGET,
+    )
+    .await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }

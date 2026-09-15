@@ -134,17 +134,26 @@ pub async fn load(session_dir: &Path, session_path: &Path) -> Result<SessionMeta
 }
 
 /// Write the sidecar atomically (write temp + rename) so a crash cannot
-/// leave a truncated file behind.
+/// leave a truncated file behind. Serialized cross-process: two manox
+/// processes saving the same sidecar would otherwise interleave on the
+/// shared tmp sibling.
 pub async fn save(
     session_dir: &Path,
     session_path: &Path,
     meta: &SessionMeta,
 ) -> Result<(), anyhow::Error> {
     let path = meta_path(session_dir, session_path);
-    // A deferred-fresh session's transcript directory may not exist yet
-    // (the journal materializes at the first turn) while its sidecar is
-    // already addressable — create the dir so the write cannot ENOENT.
-    tokio::fs::create_dir_all(session_dir).await?;
+    let _file_lock = acquire_sidecar_lock(&path).await?;
+    save_unlocked(&path, meta).await
+}
+
+/// The lock-free write core — callers must already hold the sidecar's
+/// cross-process flock (flock is per open file description: re-locking
+/// from the same process self-deadlocks). The lock acquire has already
+/// materialized the directory: a deferred-fresh session's transcript dir
+/// may not exist yet (the journal materializes at the first turn) while
+/// its sidecar is already addressable.
+async fn save_unlocked(path: &Path, meta: &SessionMeta) -> Result<(), anyhow::Error> {
     let bytes = serde_json::to_vec_pretty(meta)?;
     // `<id>.meta.json.tmp`: `with_extension` would only replace the last
     // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
@@ -156,8 +165,20 @@ pub async fn save(
     ));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
-    remember(&path, bytes.len() as u64, mtime_of(&path).await, meta);
+    remember(path, bytes.len() as u64, mtime_of(path).await, meta);
     Ok(())
+}
+
+/// Bounded exclusive flock over the sidecar's sibling `<name>.lock` —
+/// spans a whole read-modify-write cycle so a concurrent process's fields
+/// cannot be lost to a stale read.
+async fn acquire_sidecar_lock(path: &Path) -> Result<crate::fs_lock::FileLock, anyhow::Error> {
+    crate::fs_lock::lock_exclusive_async(
+        &crate::fs_lock::lock_path_for(path),
+        std::time::Duration::from_secs(2),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("sidecar lock unavailable ({}): {error}", path.display()))
 }
 
 /// One cached sidecar: its (size, mtime_ns) fingerprint and parsed content.
@@ -227,7 +248,9 @@ fn write_lock_for(session_dir: &Path, session_path: &Path) -> Arc<tokio::sync::M
 /// (load error) is treated as fresh and overwritten: the sidecar is
 /// best-effort UI state and the transcript is authoritative, so the write
 /// repairs the file while persisting the mutation. A missing file loads as
-/// the fresh-session default and materializes on first write.
+/// the fresh-session default and materializes on first write. The
+/// cross-process flock spans the whole cycle (another manox process's
+/// fields must not be lost to a stale read).
 pub async fn update<F>(
     session_dir: &Path,
     session_path: &Path,
@@ -238,6 +261,8 @@ where
 {
     let lock = write_lock_for(session_dir, session_path);
     let _guard = lock.lock().await;
+    let path = meta_path(session_dir, session_path);
+    let _file_lock = acquire_sidecar_lock(&path).await?;
     // Self-heal: a corrupt sidecar loads as fresh and is overwritten by the
     // save below (the sidecar is best-effort UI state, the transcript is
     // authoritative). Logged so a self-heal is observable in production.
@@ -248,7 +273,7 @@ where
             SessionMeta::default()
         });
     mutate(&mut meta);
-    save(session_dir, session_path, &meta).await
+    save_unlocked(&path, &meta).await
 }
 #[cfg(test)]
 mod tests {
@@ -260,6 +285,30 @@ mod tests {
         let session = dir.path().join("abc.jsonl");
         let meta = load(dir.path(), &session).await.unwrap();
         assert!(meta.title.is_none() && !meta.pinned && !meta.archived);
+    }
+
+    /// A deferred-fresh session's sidecar is addressable BEFORE its
+    /// journal directory materializes — both `save` and `update` must
+    /// create the directory themselves (a017e77f; the lock acquire must
+    /// not ENOENT on the missing parent).
+    #[tokio::test]
+    async fn save_into_a_missing_directory_materializes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = sessions.join("abc.jsonl");
+
+        save(&sessions, &session, &SessionMeta::default())
+            .await
+            .unwrap();
+        let loaded = load(&sessions, &session).await.unwrap();
+        assert!(loaded.title.is_none() && !loaded.pinned && !loaded.archived);
+
+        let missing_sub = dir.path().join("sessions/subagents");
+        let sub_session = missing_sub.join("def.jsonl");
+        update(&missing_sub, &sub_session, |meta| meta.pinned = true)
+            .await
+            .unwrap();
+        assert!(load(&missing_sub, &sub_session).await.unwrap().pinned);
     }
 
     #[tokio::test]

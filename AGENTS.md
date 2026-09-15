@@ -60,17 +60,17 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 **所有持久化内容统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）。路径清单：
 
-- 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）
+- 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，`sessions/<id>.jsonl.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、threads.db 走 SQLite WAL、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
-- SQLite：`~/.manox/threads.db`（`threads.db-shm` / `threads.db-wal` 随行）
-- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
+- SQLite：`~/.manox/threads.db`（WAL 模式；`threads.db-shm` / `threads.db-wal` 随行）
+- 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
 - pi 会话（.jsonl）：`~/.manox/sessions/`
 - 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
 - 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
-- WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）
+- WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
 - cx CLI 状态：`~/.manox/cx.db`、IPC socket `~/.manox/sessions/`、codex 注入目录 `~/.manox/.codex/`、`~/.manox/.patch_source`（CLI 本体在 manox-app，状态目录与本仓库共享）
 - API key 源：macOS Keychain（`keychain:SERVICE`）/ env（`env:VAR`）/ 字面量（`literal:...`）/ shell（`$(shell ...)`）

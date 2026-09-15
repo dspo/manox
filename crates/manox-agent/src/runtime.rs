@@ -5,12 +5,12 @@
 //! tasks to run reqwest streaming HTTP, forwarding events back to the gpui side
 //! via `async_channel` (executor-agnostic, pollable on the gpui executor).
 //!
-//! `init()` also acquires a process-exclusive flock on `~/.manox/runtime.lock`
-//! to prevent multiple manox instances from concurrently accessing the same
-//! store.
+//! Multiple manox processes may share one state root: cross-process
+//! coordination lives at resource granularity (per-session write leases in
+//! [`crate::session_lease`], SQLite WAL for threads.db, per-file locks for
+//! the shared state files, the gateway lock in session-core), never at
+//! process startup.
 
-use std::fs::File;
-use std::os::fd::AsRawFd;
 use std::sync::{Once, OnceLock};
 
 use tokio::runtime::Runtime;
@@ -18,65 +18,12 @@ use tokio::runtime::Runtime;
 static HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
 static INIT: Once = Once::new();
 
-/// Path to the runtime lock file under `~/.manox/`.
-fn lock_path() -> std::path::PathBuf {
-    crate::paths::manox_config_dir()
-        .unwrap_or_else(|_| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        })
-        .join("runtime.lock")
-}
-
-/// Try to acquire an exclusive process-level lock on `~/.manox/runtime.lock`.
-/// Exits the process with an error message if another instance already holds it.
-fn acquire_runtime_lock() {
-    let path = lock_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .unwrap_or_else(|e| {
-            eprintln!("无法创建 runtime.lock ({}): {e:#}", path.display());
-            std::process::exit(1);
-        });
-    // SAFETY: `flock` is a standard POSIX operation; the fd is valid and owned
-    // by this process. We leak the File so the lock is held for the lifetime.
-    let fd = file.as_raw_fd();
-    let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        let is_contended = err
-            .raw_os_error()
-            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN);
-        if is_contended {
-            eprintln!(
-                "错误: 另一个 manox 实例已持有此 store (lock: {})",
-                path.display()
-            );
-            std::process::exit(1);
-        }
-        eprintln!("警告: runtime.lock 加锁失败 ({}): {}", err, path.display());
-    }
-    // Leak the File so the fd stays open and the lock is held for the process
-    // lifetime.
-    std::mem::forget(file);
-}
-
 /// Build a 2-worker multi-threaded tokio runtime and register its global `Handle`. Call at App startup.
 ///
-/// Idempotent: the runtime, the lock, and the handle are process-lifetime
-/// resources, so a second `init()` (e.g. a later test in the same process)
-/// is a no-op instead of re-acquiring the flock — re-acquiring a lock the
-/// process already holds opens a second file description that `flock` denies,
-/// which previously exited the whole test binary.
+/// Idempotent: the runtime and the handle are process-lifetime resources,
+/// so a second `init()` (e.g. a later test in the same process) is a no-op.
 pub fn init() {
     INIT.call_once(|| {
-        acquire_runtime_lock();
         let runtime = Runtime::new().expect("failed to build tokio runtime");
         let _ = HANDLE.set(runtime.handle().clone());
         // The runtime is intentionally forgotten: it lives for the process lifetime, with worker threads driving IO.
@@ -84,13 +31,11 @@ pub fn init() {
     });
 }
 
-/// Throwaway HOME for test processes (review round 3, P0-2): the
-/// single-instance flock lives at `$HOME/.manox/runtime.lock`, so a
-/// developer's live app turns every test binary that calls [`init`] into a
-/// silent mid-suite `exit(1)` — no failures list, no panic location, and
-/// every later test in the binary never runs. Redirecting HOME once per
-/// process (before the first `init`) sends the flock, the provider-config
-/// lookup, and the session paths to a temp dir. Never restored: the test
+/// Throwaway HOME for test processes: the provider-config lookup and the
+/// session/threads.db paths all resolve under `$HOME`, and a test process
+/// must never read or write the developer's real store. Redirecting HOME
+/// once per process (before the first `init`) sends the provider-config
+/// lookup and the session paths to a temp dir. Never restored: the test
 /// process is disposable.
 #[cfg(any(test, feature = "test-support"))]
 static TEST_HOME: OnceLock<std::path::PathBuf> = OnceLock::new();

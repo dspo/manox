@@ -46,6 +46,7 @@ pub mod provider_glue;
 pub mod replay;
 pub mod runtime;
 pub mod sandbox;
+pub mod session_lease;
 pub mod settings;
 pub mod sidebar_order;
 pub mod skill;

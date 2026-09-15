@@ -16,6 +16,7 @@ pub mod compaction;
 pub mod env;
 pub mod ext_point_agent;
 pub mod ext_point_background;
+pub mod fs_lock;
 pub mod harness;
 pub mod hashline;
 pub mod output_guard;

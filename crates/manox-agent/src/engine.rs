@@ -815,6 +815,13 @@ fn cold_append_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
 /// A thread whose journal never materialized has no file: the row is
 /// skipped loudly at debug — the sidecar carries the flag until the journal
 /// exists (the K2 fallback).
+///
+/// Cross-process, the file may still have a live writer: another process's
+/// actor holding the write lease. The lease is taken here too (short-held:
+/// released with this function's return — the row-level serialization is
+/// the storage's own `WriteFence`), and contention degrades exactly like
+/// the K2 fallback: the row is skipped loudly and the sidecar keeps the
+/// flag until this process or the other re-lands it.
 async fn cold_journal_append(
     session_path: Option<PathBuf>,
     kind: String,
@@ -831,6 +838,17 @@ async fn cold_journal_append(
         tracing::debug!(kind, path = %path.display(), "session file does not exist; the sidecar carries the flag");
         return;
     }
+    // Short-held write lease, spanning the whole append (released when
+    // this function returns — the `_lease` binding lives to scope end). If
+    // the session's live actor exists in THIS process, the registry join
+    // makes this a no-op.
+    let _lease = match crate::session_lease::acquire_async(&path).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::error!(%error, kind, path = %path.display(), "cold journal append skipped: the session is driven by another process; the sidecar carries the flag");
+            return;
+        }
+    };
     // B3: the file-level serialization the per-instance append_lock cannot
     // give — held across the open (leaf/seq view) AND the append (stamp +
     // write + the v3 lazy migration), so concurrent cold appends to one
@@ -852,6 +870,10 @@ async fn cold_journal_append(
 /// Spawn the pi actor and return the engine handle plus its notice receiver.
 /// The facade drains the receiver on the gpui thread. `initial_path`, when
 /// given, opens that session file instead of restoring the newest one.
+/// `lease` is the driven session's write lease (None for fresh sessions —
+/// a new id has no contender); the ACTOR holds it, not the facade: final
+/// rows settle after the facade drops, and a lease outliving the actor
+/// would keep a closed session locked against other processes.
 #[allow(clippy::too_many_arguments)] // engine spawn: startup options stay explicit
 pub fn spawn_engine(
     cwd: PathBuf,
@@ -864,6 +886,7 @@ pub fn spawn_engine(
     goal_bridge: Option<Arc<crate::goal_tools::GoalBridge>>,
     parent_session: Option<String>,
     extra_granted_roots: &[PathBuf],
+    lease: Option<std::sync::Arc<crate::session_lease::LeaseEntry>>,
 ) -> SpawnedEngine {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     // K3: expose this engine's actor queue to the store-level decision
@@ -952,6 +975,10 @@ pub fn spawn_engine(
     let actor_bus = Arc::clone(&bus);
     let actor_initial_path = initial_path.clone();
     crate::runtime::handle().spawn(async move {
+        // Held for the whole actor lifetime — through run_actor's settle —
+        // and released here, after the route is gone and the last row has
+        // landed: only then may another process take the session over.
+        let _lease = lease;
         run_actor(
             cwd,
             model,

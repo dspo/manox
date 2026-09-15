@@ -21,6 +21,7 @@ pub use core::compaction;
 pub use core::env;
 pub use core::ext_point_agent;
 pub use core::ext_point_background;
+pub use core::fs_lock;
 pub use core::harness;
 pub use core::hashline;
 pub use core::output_guard;

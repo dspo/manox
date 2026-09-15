@@ -2,7 +2,7 @@
 //! zstd-compressed message BLOB.
 
 use anyhow::{Context as _, Result};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::language_model::TokenUsage;
@@ -199,14 +199,23 @@ impl ThreadsDatabase {
         // Atomicity: the threads row, the BLOB, and the token_usage mirror must
         // land together or not at all — a partial write would leave a sidebar
         // entry that fails to load. One transaction wraps all three.
-        let tx = conn.transaction().context("begin upsert transaction")?;
+        // IMMEDIATE, not DEFERRED: the store is shared by multiple manox
+        // processes (the process-local Mutex no longer serializes writers
+        // across them), and a deferred read-then-write transaction that
+        // upgrades its lock after another connection committed fails with
+        // SQLITE_BUSY_SNAPSHOT, which the busy handler never retries.
+        // IMMEDIATE takes the write lock up front, so concurrent writers
+        // queue through busy_timeout instead.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin upsert transaction")?;
         // Stale-snapshot guard: `refresh_thread_list` is fire-and-forget, so an older
         // snapshot (e.g. taken at submit, before the turn produced any assistant
         // content) can commit after a newer snapshot (taken at turn end) if the
         // background executor reorders them. Without this guard the older write
         // would clobber the newer one — silently deleting assistant messages and
-        // the token_usage mirror. The Mutex serializes upserts, so a
-        // within-transaction SELECT-then-UPDATE is atomic: if this record's
+        // the token_usage mirror. The IMMEDIATE transaction makes the
+        // within-transaction SELECT-then-UPDATE atomic: if this record's
         // revision is not newer than the row's, abandon the write entirely.
         let existing_revision: Option<i64> = tx
             .query_row(
