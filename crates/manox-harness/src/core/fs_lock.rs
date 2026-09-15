@@ -14,13 +14,11 @@
 //! releases it when the holder's last fd closes, so a crashed process can
 //! never leave a lock behind.
 //!
-//! macOS quirk: the release that follows a `close()` can take a moment to
-//! propagate, so an immediate `LOCK_EX | LOCK_NB` on a fresh fd may
-//! transiently report `EWOULDBLOCK` with no real holder. Callers that must
-//! not misread that as contention (the session lease, the gateway lock)
-//! pass a small non-zero budget instead of [`Duration::ZERO`]; the retry
-//! cadence absorbs the transient while a genuinely held lock still times
-//! out.
+//! Budgets exist so a TRANSIENT contention is never misread as ownership:
+//! fail-fast callers (the session lease, the gateway lock) pass a small
+//! non-zero budget instead of [`Duration::ZERO`]. A genuinely held lock —
+//! including one leaked by a bug in the holding process — still times out
+//! into `WouldBlock`, which is the correct answer for it.
 
 use std::fs::File;
 use std::io;
@@ -77,11 +75,17 @@ fn try_once(lock_path: &Path) -> io::Result<FileLock> {
 }
 
 /// Acquire the exclusive lock, retrying contention until `budget` elapses.
-/// `budget == ZERO` is a single attempt. Contention that outlives the
-/// budget returns `WouldBlock`; other IO errors propagate as-is. Callers
-/// with degrade semantics (best-effort state files) treat any error as
+/// `budget == ZERO` is a single attempt. The lock file's parent directory
+/// is created first — a lock file must be addressable wherever the
+/// guarded file will be, including a deferred-fresh session whose journal
+/// directory does not exist yet. Contention that outlives the budget
+/// returns `WouldBlock`; other IO errors propagate as-is. Callers with
+/// degrade semantics (best-effort state files) treat any error as
 /// skip-this-write, never as a hang.
 pub fn lock_exclusive(lock_path: &Path, budget: Duration) -> io::Result<FileLock> {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let start = Instant::now();
     loop {
         match try_once(lock_path) {

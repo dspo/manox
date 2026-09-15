@@ -64,7 +64,9 @@ pub async fn load() -> HashMap<String, ThreadRegistryEntry> {
 /// process's entry must not be lost to a stale read, and the shared tmp
 /// sibling must not interleave); atomic on disk (temp file + rename).
 /// Lock contention or write failure warns without propagating — the
-/// sidebar falls back to the newest session.
+/// sidebar falls back to the newest session. (Deliberate counterpart:
+/// `sidebar_order::save` propagates lock errors to its caller; the split
+/// is call-site ergonomics — this writer is fire-and-forget.)
 pub async fn set_active(thread_id: &str, session_id: &str) {
     const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();

@@ -59,36 +59,75 @@ fn leases() -> &'static Mutex<HashMap<PathBuf, Weak<LeaseEntry>>> {
     LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The per-attempt flock budget: fail-fast for callers, but long enough
+/// that a transient contention is never misread as a foreign owner (see
+/// `manox_harness::fs_lock`).
+const ACQUIRE_BUDGET: Duration = Duration::from_millis(250);
+
+/// The registry lock is NOT held across the flock attempt (its retry
+/// sleeps): an unrelated session's acquire must never queue behind this
+/// one. The double-check dance below keeps same-process acquires correct
+/// without that coupling.
+fn join_live(session_path: &Path) -> Option<Arc<LeaseEntry>> {
+    let map = leases().lock().unwrap_or_else(|e| e.into_inner());
+    map.get(session_path).and_then(Weak::upgrade)
+}
+
 /// Acquire (or join) this process's write lease for the session file.
-/// Contention with another process is fail-fast but not literally
-/// single-shot: the budget is a fraction of a second so the macOS
-/// close-release propagation quirk (see `manox_harness::fs_lock`) can
-/// never surface as a phantom `HeldElsewhere` — a genuinely driven
-/// session still times out into the error. Driving is exclusive, never
-/// queued.
+/// Contention with another process is fail-fast (bounded well under a
+/// second) and never queued. Synchronous — callers that hold a lock worth
+/// not pinning (e.g. async contexts) use [`acquire_async`]; note
+/// `ThreadStore::load_thread` runs this under the store's write lock, so a
+/// contended open pins that store for at most one budget.
 pub fn acquire(session_path: &Path) -> Result<Arc<LeaseEntry>, LeaseError> {
-    const ACQUIRE_BUDGET: Duration = Duration::from_millis(250);
-    let mut map = leases().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = map.get(session_path).and_then(Weak::upgrade) {
+    if let Some(entry) = join_live(session_path) {
         return Ok(entry);
     }
     let lock_path = manox_harness::fs_lock::lock_path_for(session_path);
-    let _lock =
-        manox_harness::fs_lock::lock_exclusive(&lock_path, ACQUIRE_BUDGET).map_err(|err| {
-            if err.kind() == std::io::ErrorKind::WouldBlock {
-                LeaseError::HeldElsewhere {
-                    path: session_path.to_path_buf(),
-                }
-            } else {
-                LeaseError::Io {
-                    path: session_path.to_path_buf(),
-                    source: err,
-                }
+    let attempt = manox_harness::fs_lock::lock_exclusive(&lock_path, ACQUIRE_BUDGET);
+    let _lock = match attempt {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+            // Not ours to take. The one benign explanation left: a twin
+            // acquire in THIS process flocked first and has not inserted
+            // its registry entry yet — re-check once before declaring a
+            // foreign holder.
+            if let Some(entry) = join_live(session_path) {
+                return Ok(entry);
             }
-        })?;
+            return Err(LeaseError::HeldElsewhere {
+                path: session_path.to_path_buf(),
+            });
+        }
+        Err(source) => {
+            return Err(LeaseError::Io {
+                path: session_path.to_path_buf(),
+                source,
+            });
+        }
+    };
     let entry = Arc::new(LeaseEntry { _lock });
+    let mut map = leases().lock().unwrap_or_else(|e| e.into_inner());
+    // A twin may have won the race while we flocked: join its entry and
+    // let our fd close (releasing our flock — at most one of us holds it,
+    // so no other process is affected).
+    if let Some(existing) = map.get(session_path).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
     map.insert(session_path.to_path_buf(), Arc::downgrade(&entry));
     Ok(entry)
+}
+
+/// The async flavor of [`acquire`] — the flock retry parks on the blocking
+/// pool instead of an async worker thread.
+pub async fn acquire_async(session_path: &Path) -> Result<Arc<LeaseEntry>, LeaseError> {
+    let owned = session_path.to_path_buf();
+    tokio::task::spawn_blocking(move || acquire(&owned))
+        .await
+        .map_err(|e| LeaseError::Io {
+            path: session_path.to_path_buf(),
+            source: std::io::Error::other(format!("lease task failed: {e}")),
+        })?
 }
 
 #[cfg(test)]

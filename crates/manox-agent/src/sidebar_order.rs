@@ -298,7 +298,9 @@ pub async fn load() -> SidebarOrder {
 /// account. Serialized cross-process under a bounded flock: two manox
 /// processes saving at once would otherwise interleave on the shared tmp
 /// sibling; lock contention surfaces as the returned error (ordering is
-/// UI state — the next reorder rewrites it).
+/// UI state — the next reorder rewrites it). The deliberate counterpart
+/// policy is `thread_registry::set_active`'s warn-and-skip: this caller
+/// owns an error path, that one is fire-and-forget.
 pub async fn save(order: &SidebarOrder) -> Result<(), anyhow::Error> {
     const LOCK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();

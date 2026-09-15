@@ -144,21 +144,16 @@ pub async fn save(
 ) -> Result<(), anyhow::Error> {
     let path = meta_path(session_dir, session_path);
     let _file_lock = acquire_sidecar_lock(&path).await?;
-    save_unlocked(&path, session_dir, meta).await
+    save_unlocked(&path, meta).await
 }
 
 /// The lock-free write core — callers must already hold the sidecar's
 /// cross-process flock (flock is per open file description: re-locking
-/// from the same process self-deadlocks).
-async fn save_unlocked(
-    path: &Path,
-    session_dir: &Path,
-    meta: &SessionMeta,
-) -> Result<(), anyhow::Error> {
-    // A deferred-fresh session's transcript directory may not exist yet
-    // (the journal materializes at the first turn) while its sidecar is
-    // already addressable — create the dir so the write cannot ENOENT.
-    tokio::fs::create_dir_all(session_dir).await?;
+/// from the same process self-deadlocks). The lock acquire has already
+/// materialized the directory: a deferred-fresh session's transcript dir
+/// may not exist yet (the journal materializes at the first turn) while
+/// its sidecar is already addressable.
+async fn save_unlocked(path: &Path, meta: &SessionMeta) -> Result<(), anyhow::Error> {
     let bytes = serde_json::to_vec_pretty(meta)?;
     // `<id>.meta.json.tmp`: `with_extension` would only replace the last
     // extension (`json`), yielding a surprising `<id>.meta.meta.json.tmp`.
@@ -278,7 +273,7 @@ where
             SessionMeta::default()
         });
     mutate(&mut meta);
-    save_unlocked(&path, session_dir, &meta).await
+    save_unlocked(&path, &meta).await
 }
 #[cfg(test)]
 mod tests {
@@ -290,6 +285,30 @@ mod tests {
         let session = dir.path().join("abc.jsonl");
         let meta = load(dir.path(), &session).await.unwrap();
         assert!(meta.title.is_none() && !meta.pinned && !meta.archived);
+    }
+
+    /// A deferred-fresh session's sidecar is addressable BEFORE its
+    /// journal directory materializes — both `save` and `update` must
+    /// create the directory themselves (a017e77f; the lock acquire must
+    /// not ENOENT on the missing parent).
+    #[tokio::test]
+    async fn save_into_a_missing_directory_materializes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = sessions.join("abc.jsonl");
+
+        save(&sessions, &session, &SessionMeta::default())
+            .await
+            .unwrap();
+        let loaded = load(&sessions, &session).await.unwrap();
+        assert!(loaded.title.is_none() && !loaded.pinned && !loaded.archived);
+
+        let missing_sub = dir.path().join("sessions/subagents");
+        let sub_session = missing_sub.join("def.jsonl");
+        update(&missing_sub, &sub_session, |meta| meta.pinned = true)
+            .await
+            .unwrap();
+        assert!(load(&missing_sub, &sub_session).await.unwrap().pinned);
     }
 
     #[tokio::test]

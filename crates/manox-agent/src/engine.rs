@@ -842,7 +842,7 @@ async fn cold_journal_append(
     // this function returns — the `_lease` binding lives to scope end). If
     // the session's live actor exists in THIS process, the registry join
     // makes this a no-op.
-    let _lease = match crate::session_lease::acquire(&path) {
+    let _lease = match crate::session_lease::acquire_async(&path).await {
         Ok(lease) => lease,
         Err(error) => {
             tracing::error!(%error, kind, path = %path.display(), "cold journal append skipped: the session is driven by another process; the sidecar carries the flag");

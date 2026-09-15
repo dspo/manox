@@ -456,24 +456,36 @@ mod tests {
         assert_eq!(mode.to_lowercase(), "wal");
     }
 
+    /// The multi-instance shape: several manox processes hold their own
+    /// connections and hammer `upsert` (a read-then-write transaction).
+    /// WAL + busy_timeout + the IMMEDIATE upsert transaction make the
+    /// writers queue; a deferred read-then-write transaction would fail
+    /// with SQLITE_BUSY_SNAPSHOT, which no busy handler retries (red under
+    /// the pre-fix DEFERRED begin — verified by temporarily reverting the
+    /// behavior).
     #[test]
-    fn two_connections_interleaved_writes_do_not_busy_out() {
+    fn concurrent_upserts_through_separate_connections_queue_instead_of_failing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("threads.db");
-        let writer_a = ThreadsDatabase::open(&path).unwrap();
-        let writer_b = ThreadsDatabase::open(&path).unwrap();
-        // Interleave writes through both connections — the multi-instance
-        // shape (thread store global + terminal store + per-event opens).
-        // Under rollback-journal defaults with no busy timeout, crossing
-        // transactions surfaces SQLITE_BUSY; WAL queues them through.
-        for round in 0..10 {
-            let mut a = sample_record(&format!("a{round}"));
-            a.summary = "a".into();
-            writer_a.upsert(&a, true).unwrap();
-            let mut b = sample_record(&format!("b{round}"));
-            b.summary = "b".into();
-            writer_b.upsert(&b, true).unwrap();
-        }
-        assert_eq!(writer_a.list(true).unwrap().len(), 20);
+        ThreadsDatabase::open(&path).unwrap(); // create + schema
+
+        let workers = 4u64;
+        let rounds = 25u64;
+        std::thread::scope(|scope| {
+            for worker in 0..workers {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let db = ThreadsDatabase::open(&path).unwrap();
+                    for round in 0..rounds {
+                        let mut rec = sample_record(&format!("t{worker}"));
+                        rec.revision = round * workers + worker;
+                        db.upsert(&rec, true).unwrap();
+                    }
+                });
+            }
+        });
+        let db = ThreadsDatabase::open(&path).unwrap();
+        let all = db.list(true).unwrap();
+        assert_eq!(all.len(), workers as usize, "{all:?}");
     }
 }

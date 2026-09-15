@@ -72,29 +72,40 @@ pub fn default_cwd() -> PathBuf {
 /// One machine, one gateway: a second process's gateway would bind its own
 /// listener and publish over the first's `gateway-ws.json`, leaving an
 /// orphan listener no out-of-process client can discover (and pointing
-/// clients at a process they did not ask for). The guard is a
-/// non-blocking exclusive flock over `<config>/gateway.lock`, held for the
-/// process lifetime — the fd is intentionally leaked so the kernel releases
-/// it at exit, and the lock file is never unlinked. Contention is a loud
-/// no-op like the in-process second-start guard, never an exit.
-fn acquire_gateway_lease() -> std::io::Result<()> {
-    // Bounded, not single-shot: macOS can take a moment to propagate a
-    // flock release after the previous holder's close (see
-    // `manox_harness::fs_lock`); a genuinely owned gateway still times out.
+/// clients at a process they did not ask for). The guard is an exclusive
+/// flock over `<config>/gateway.lock`, stored in [`GATEWAY_LEASE`] — the
+/// guard lives exactly as long as the listener reservation: released on a
+/// failed bind so the same process may retry, held until process exit
+/// once up (the kernel releases it then; the lock file is never unlinked).
+/// Contention is a loud no-op like the in-process second-start guard,
+/// never an exit.
+static GATEWAY_LEASE: std::sync::Mutex<Option<manox_harness::fs_lock::FileLock>> =
+    std::sync::Mutex::new(None);
+
+/// Bounded, not single-shot, so a transient contention is never misread
+/// as a foreign owner (see `manox_harness::fs_lock`); a genuinely owned
+/// gateway still times out.
+fn acquire_gateway_lease() -> std::io::Result<manox_harness::fs_lock::FileLock> {
     const ACQUIRE_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
     let dir = manox_agent::paths::manox_config_dir().map_err(std::io::Error::other)?;
     std::fs::create_dir_all(&dir)?;
-    let lock = manox_harness::fs_lock::lock_exclusive(&dir.join("gateway.lock"), ACQUIRE_BUDGET)?;
-    std::mem::forget(lock);
-    Ok(())
+    manox_harness::fs_lock::lock_exclusive(&dir.join("gateway.lock"), ACQUIRE_BUDGET)
+}
+
+/// Drop the gateway lease — the failed-bind branch of [`start`], so a
+/// retry in this process does not contend with its own leftover flock
+/// (flock counts per open file description: a leaked fd locks out the
+/// same process forever).
+fn release_gateway_lease() {
+    *GATEWAY_LEASE.lock().unwrap() = None;
 }
 
 /// Start the WS gateway on the global tokio runtime: adopt the process-wide
 /// `AgentServer` (get-or-init with `cwd`), bind `127.0.0.1:<port>` (0 →
 /// random), publish the endpoint via [`service_endpoint`] and persist it to
 /// `<config>/gateway-ws.json`. Fire-and-forget: a bind failure surfaces as a
-/// tracing error and a permanently-`None` endpoint (callers waiting on
-/// [`service_endpoint`] should bound their wait).
+/// tracing error and a `None` endpoint until a later `start` retries
+/// (callers waiting on [`service_endpoint`] should bound their wait).
 pub fn start(cwd: PathBuf, port: u16) {
     // Second-start guard (§三.2): the slot is RESERVED under one lock hold
     // before the bind is spawned, so neither a sequential nor a racing
@@ -111,13 +122,17 @@ pub fn start(cwd: PathBuf, port: u16) {
             );
             return;
         }
-        if let Err(error) = acquire_gateway_lease() {
-            tracing::error!(
-                %error,
-                "another gateway process owns the endpoint lock; not starting a second gateway"
-            );
-            return;
-        }
+        let lease = match acquire_gateway_lease() {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "another gateway process owns the endpoint lock; not starting a second gateway"
+                );
+                return;
+            }
+        };
+        *GATEWAY_LEASE.lock().unwrap() = Some(lease);
         *slot = Some(ListenerState::Starting);
     }
     let server = crate::agent_server::global(cwd);
@@ -125,7 +140,9 @@ pub fn start(cwd: PathBuf, port: u16) {
         if let Err(e) = listener::bind_and_serve(server, port).await {
             tracing::error!(error = %e, "gateway WS listener failed to start");
             // A failed bind leaves the reservation pointing at nothing —
-            // release the slot so a later start can retry.
+            // release the slot AND the lease so a later start can retry
+            // without contending with this process's own leftover flock.
+            release_gateway_lease();
             let mut slot = endpoint_slot().lock().unwrap();
             if matches!(*slot, Some(ListenerState::Starting)) {
                 *slot = None;
@@ -334,6 +351,55 @@ mod tests {
 
         drop(holder);
         *endpoint_slot().lock().unwrap() = None;
+        manox_agent::thread_store::drop_global_for_test();
+    }
+
+    /// The failed-bind contract: a bind failure must release BOTH the slot
+    /// and the gateway lease — a leftover flock of this process's own
+    /// first attempt (flock counts per open file description) would lock
+    /// every retry in the same process out forever.
+    #[allow(clippy::await_holding_lock)] // same test-guard rationale as above
+    #[tokio::test]
+    async fn failed_bind_releases_the_lease_so_a_retry_can_start() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::thread_store::init();
+        *endpoint_slot().lock().unwrap() = None;
+        release_gateway_lease();
+
+        // Squat a port so the first start's bind fails with EADDRINUSE —
+        // deterministic, no privileges involved.
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = squatter.local_addr().unwrap().port();
+        start(PathBuf::from("/"), taken);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while endpoint_slot().lock().unwrap().is_some() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            endpoint_slot().lock().unwrap().is_none(),
+            "a failed bind must reset the slot for the retry"
+        );
+
+        // The retry (ephemeral port) must not contend with the first
+        // attempt's leftover flock: it binds and publishes.
+        start(PathBuf::from("/"), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if service_endpoint().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the retry after a failed bind never published"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        drop(squatter);
+        *endpoint_slot().lock().unwrap() = None;
+        release_gateway_lease();
         manox_agent::thread_store::drop_global_for_test();
     }
 }
