@@ -644,7 +644,7 @@ wire_surface! {
 }
 
 wire_surface! {
-    /// `ServerCall` wire methods (§D.4: waterfall trio + directed capability
+    /// `ServerCall` wire methods (§D.4: waterfall adjudications + directed
     /// calls).
     table: SERVER_CALLS,
     /// Exhaustive wire-method match for [`ServerCall`] (compile-time gate).
@@ -661,15 +661,8 @@ wire_surface! {
             summary: "ls".into(),
             input: serde_json::json!({"command": "ls"}),
         },
-        ServerCall::PlanVerdict { .. } => "planVerdict" ~ ServerCall::PlanVerdict {
-            delivery_id: "dlv-s1-2".into(),
-            session_id: "s1".into(),
-            plan_file: "/p.md".into(),
-            title: "P".into(),
-            content: Some("# P".into()),
-        },
         ServerCall::AskUserQuestion { .. } => "askUserQuestion" ~ ServerCall::AskUserQuestion {
-            delivery_id: "dlv-s1-3".into(),
+            delivery_id: "dlv-s1-2".into(),
             session_id: "s1".into(),
             auth_id: "a2".into(),
             input: serde_json::json!({}),
@@ -699,6 +692,8 @@ wire_surface! {
 wire_surface! {
     /// The retained `ServerNote` method vocabulary (post-T10 §D.6 removal
     /// pass): owner control (`ready` / `sessionCreated` / `sessionDisposed`),
+    /// the §D.4 delivery-control frame (`deliveryCancelled` — PR-4's
+    /// "settled elsewhere" notice for a still-open adjudication waiter),
     /// the transitional registry-push list channel (`threadsUpdated` /
     /// `models` / `commands`), the server-originated `error`, and the
     /// `model_chat` side-stream (`modelText` / `modelThinking` /
@@ -718,6 +713,9 @@ wire_surface! {
         },
         ServerNote::SessionDisposed { .. } => "sessionDisposed" ~ ServerNote::SessionDisposed {
             session_id: "s1".into(),
+        },
+        ServerNote::DeliveryCancelled { .. } => "deliveryCancelled" ~ ServerNote::DeliveryCancelled {
+            delivery_id: "dlv-s1-1".into(),
         },
         ServerNote::ThreadsUpdated { .. } => "threadsUpdated" ~ ServerNote::ThreadsUpdated {
             threads: vec![thread_stub()],

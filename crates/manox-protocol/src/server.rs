@@ -46,16 +46,6 @@ pub enum ServerCall {
         summary: String,
         input: serde_json::Value,
     },
-    /// Plan review verdict. Reply payload: `{ "choice": "execute_keep" |
-    /// "execute_compact" | "refine" }`.
-    PlanVerdict {
-        /// GW3 (§D.4): stable delivery identity — see [`Self::Approve`].
-        delivery_id: String,
-        session_id: String,
-        plan_file: String,
-        title: String,
-        content: Option<String>,
-    },
     /// Interactive question. The `input` carries the canonical request
     /// vocabulary (per question `id` — server-minted when the model omits it —
     /// optional `detail` markdown, optional `intent {kind, approve}`, and
@@ -104,7 +94,6 @@ impl ServerCall {
     pub fn session_id(&self) -> &str {
         match self {
             ServerCall::Approve { session_id, .. }
-            | ServerCall::PlanVerdict { session_id, .. }
             | ServerCall::AskUserQuestion { session_id, .. }
             | ServerCall::BrowserOp { session_id, .. }
             | ServerCall::ClipboardRead { session_id, .. }
@@ -113,13 +102,13 @@ impl ServerCall {
         }
     }
 
-    /// GW3 (§D.4): the withdrawable-delivery identity of the waterfall trio;
+    /// GW3 (§D.4): the withdrawable-delivery identity of the adjudication
+    /// fan-out;
     /// `None` for the directed capability calls (they are single-target RPCs
     /// with a timeout, not cancellable fan-out deliveries).
     pub fn delivery_id(&self) -> Option<&str> {
         match self {
             ServerCall::Approve { delivery_id, .. }
-            | ServerCall::PlanVerdict { delivery_id, .. }
             | ServerCall::AskUserQuestion { delivery_id, .. }
             | ServerCall::InvokeClientTool { delivery_id, .. } => Some(delivery_id),
             ServerCall::BrowserOp { .. }
@@ -144,6 +133,18 @@ pub enum ServerNote {
     },
     SessionDisposed {
         session_id: String,
+    },
+    /// PR-4 (§D.4): one of THIS client's in-flight adjudication deliveries
+    /// was settled by a different owner (first-claim-wins answers, or the
+    /// quorum failed on another client's rejection). The card behind
+    /// `delivery_id` is terminal — the client must retire it locally
+    /// (surface "handled on another client") and its own
+    /// [`CancelDelivery`](crate::ClientCall::CancelDelivery) for that id
+    /// would be inert. A transport-level notification, not a turn-domain
+    /// journal event: like `Error`, it is connection-routed control, not
+    /// transcript content.
+    DeliveryCancelled {
+        delivery_id: String,
     },
     /// Transitional list channel (§D.5 mirror): registry snapshots also ride
     /// `HostEvent::{ThreadsUpdated, Models, Commands}`; clients fold both
@@ -226,6 +227,20 @@ mod tests {
         assert_eq!(note, back);
     }
 
+    /// PR-4 (§D.4): the "answered elsewhere" frame is keyed by the stable
+    /// GW3 delivery id, camelCase on the wire.
+    #[test]
+    fn delivery_cancelled_note_round_trips() {
+        let note = ServerNote::DeliveryCancelled {
+            delivery_id: "dlv-t1-1".into(),
+        };
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(json["method"], "deliveryCancelled");
+        assert_eq!(json["deliveryId"], "dlv-t1-1");
+        let back: ServerNote = serde_json::from_value(json).unwrap();
+        assert_eq!(note, back);
+    }
+
     #[test]
     fn error_note_allows_null_session() {
         let note = ServerNote::Error {
@@ -253,7 +268,7 @@ mod tests {
         assert_eq!(note, back);
     }
 
-    /// GW3 (§D.4): the adjudication trio carries a stable `deliveryId` on the
+    /// GW3 (§D.4): the adjudication fan-out carries a stable `deliveryId` on the
     /// wire — the handle a client's `cancelDelivery` call references to
     /// withdraw a pending delivery. Parsed from wire JSON so the pin holds
     /// against pre-GW3 enums too (they ignore the unknown field, and the
@@ -277,21 +292,6 @@ mod tests {
         );
         assert_eq!(approve.delivery_id(), Some("dlv-s1-1"));
 
-        let verdict: ServerCall = serde_json::from_value(serde_json::json!({
-            "method": "planVerdict",
-            "sessionId": "s1",
-            "deliveryId": "dlv-s1-2",
-            "planFile": "/p.md",
-            "title": "P",
-            "content": null,
-        }))
-        .expect("PlanVerdict with deliveryId parses");
-        assert_eq!(
-            serde_json::to_value(&verdict).unwrap()["deliveryId"],
-            serde_json::json!("dlv-s1-2"),
-            "GW3: PlanVerdict carries deliveryId"
-        );
-
         let ask: ServerCall = serde_json::from_value(serde_json::json!({
             "method": "askUserQuestion",
             "sessionId": "s1",
@@ -307,7 +307,7 @@ mod tests {
         );
 
         // Directed capability calls carry no delivery identity (§D.4: only
-        // the waterfall trio is withdrawable).
+        // the waterfall adjudications are withdrawable).
         let browser: ServerCall = serde_json::from_value(serde_json::json!({
             "method": "browserOp",
             "sessionId": "s1",

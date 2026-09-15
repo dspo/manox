@@ -63,10 +63,6 @@ const TPL_WRAPPER_DENIAL_BREAKER_DIRECTIVE_ZH_CN: &str =
 const TPL_WRAPPER_PEER_MESSAGE_EN: &str = include_str!("templates/en/wrapper/peer_message.tera.md");
 const TPL_WRAPPER_PEER_MESSAGE_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/peer_message.tera.md");
-const TPL_WRAPPER_ASK_USER_QUESTIONS_EN: &str =
-    include_str!("templates/en/wrapper/ask_user_questions.tera.md");
-const TPL_WRAPPER_ASK_USER_QUESTIONS_ZH_CN: &str =
-    include_str!("templates/zh-CN/wrapper/ask_user_questions.tera.md");
 const TPL_WRAPPER_TOOL_DENIED_EN: &str = include_str!("templates/en/wrapper/tool_denied.tera.md");
 const TPL_WRAPPER_TOOL_DENIED_ZH_CN: &str =
     include_str!("templates/zh-CN/wrapper/tool_denied.tera.md");
@@ -134,11 +130,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::WrapperPeerMessage,
         TPL_WRAPPER_PEER_MESSAGE_EN,
         TPL_WRAPPER_PEER_MESSAGE_ZH_CN,
-    ),
-    (
-        PromptTemplate::WrapperAskUserQuestions,
-        TPL_WRAPPER_ASK_USER_QUESTIONS_EN,
-        TPL_WRAPPER_ASK_USER_QUESTIONS_ZH_CN,
     ),
     (
         PromptTemplate::WrapperToolDenied,
@@ -401,8 +392,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 17);
-        assert_eq!(REGISTRATIONS.len(), 17);
+        assert_eq!(template::ALL.len(), 16);
+        assert_eq!(REGISTRATIONS.len(), 16);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set
@@ -558,22 +549,6 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::WrapperPeerMessage,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::WrapperAskUserQuestions,
-                    lang,
-                    &crate::prompt::AskUserQuestionsData {
-                        answers: vec![crate::prompt::AskUserQa {
-                            question: "q".to_string(),
-                            answer: "a".to_string(),
-                        }],
-                        response: Some("extra context".to_string()),
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::WrapperAskUserQuestions,
                 lang,
             );
             // Title topic-shift (uses a sentinel literal in data).

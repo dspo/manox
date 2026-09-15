@@ -2699,77 +2699,719 @@ fn ask_expires_when_the_holding_owner_disconnects() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+// ── §0: the adjudication await runs off the pump (batch-2 C1). ─────────────
+
+/// §0 (C1): a parked ask must not stall the pump. Pre-fix, `route_call`
+/// awaited the whole waterfall on the pump's stack, so every later pump
+/// event queued behind the human window — the turn-settle edges never
+/// broadcast and a second authorization never reached the wire. Both are
+/// pinned here: they flow while q1 stays parked.
 #[test]
-fn plan_verdict_round_trips_and_seeds_execution() {
+fn parked_ask_does_not_block_the_pump() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "s1");
     let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
     server.set_session_engine_for_test("s1", engine.clone(), events);
-    client.send(FromClient::Notification {
-        note: ClientNote::SetPlanMode {
-            session_id: "s1".into(),
-            enabled: true,
-        },
-    });
-    client.settle(); // FIFO: the SetPlanMode note has been dispatched.
-    // Before the verdict, plan_mode is on (confirms SetPlanMode applied).
-    // T10: the v1 `ThreadInfo` query is gone — the header truth the
-    // deleted payload mirrored is the thread itself; the P-face fold of
-    // `PlanModeChange` is pinned in `projections`.
-    assert!(plan_mode_of(&server, "s1"));
-    let plan_file =
-        std::env::temp_dir().join(format!("manox-beta3b-plan-{}.md", std::process::id()));
-    std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+    let _q1_id = park_ask(&client, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the parked delivery is registered (register-before-spawn, on the pump)"
+    );
+
+    // A turn settle while q1 is parked: the pump's bookkeeping still runs.
     engine
         .notices
-        .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
-            plan_file: plan_file.to_string_lossy().into_owned(),
-            title: "Test plan".into(),
-        })))
+        .send(BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        })
         .unwrap();
-    // PlanReady initiates ServerCall::PlanVerdict carrying the plan body.
-    let call_id = loop {
+    expect_host_status(&client, "s1", |running, _, _, _| running == Some(false));
+    // And a second adjudication fans out on its own task.
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "q2".into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a shape".into(),
+                input: seeded_ask_input(),
+            },
+        )))
+        .unwrap();
+    loop {
         match client.recv() {
             FromServer::Request {
                 id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q2" => {
+                assert_eq!(id.0, "q2", "the second card is MsgId-auth-routed");
+                break;
+            }
+            _ => {}
+        }
+    }
+    // q1 was never answered and converges on nothing: the pump kept moving
+    // with the ask parked.
+    assert!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(id, _)| id != "q1"),
+        "parking must not settle q1"
+    );
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "q1's delivery stays parked while the pump processes events"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §0 (C1): session dispose no longer terminates the waterfall by pump
+/// abort (the await lives on its own task) — the teardown sweep must
+/// cancel the parked waiters, and the waterfall's own fail-closed exit
+/// must unregister the delivery and retire the replay record.
+#[test]
+fn dispose_session_cancels_the_spawned_waterfall_and_unregisters() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the parked delivery is registered"
+    );
+
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "s1".into(),
+        },
+    });
+    expect(&client, |m| {
+        matches!(
+            m,
+            FromServer::Notification {
+                note: ServerNote::SessionDisposed { session_id }
+            } if session_id == "s1"
+        )
+    });
+    // The sweep's wakeups converge the spawned waterfall without any
+    // client reply and without the pump: guard unregister + record retire.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let deliveries_gone = !server.0.pending_deliveries.lock().contains_key("dlv-s1-1");
+        let record_gone = server
+            .0
+            .pending_adjudications
+            .lock()
+            .get("s1")
+            .is_none_or(|v| v.iter().all(|rec| rec.key != "q1"));
+        if deliveries_gone && record_gone {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the dispose sweep never converged the parked waterfall: \
+             deliveries_gone={deliveries_gone} record_gone={record_gone}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// §0 (C1): the `DeliveryGuard` is now held by the spawned waterfall task
+/// (Arc-based), so EVERY non-settle exit still unregisters + cancels the
+/// delivery. The re-seat hand-off is the settled exit that never calls
+/// `apply_reply` — its guard drop is the unregister being pinned: the
+/// original delivery leaves the registry while the replayed waiter (not
+/// under the retired entry's tokens) answers on and settles exactly once.
+#[test]
+fn reseat_abandonment_still_unregisters_the_delivery() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let _ = park_ask(&client_a, &engine, "s1", "q1");
+    assert!(
+        server.0.pending_deliveries.lock().contains_key("dlv-s1-1"),
+        "the original delivery is registered"
+    );
+
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &["s1"]);
+    let replayed = loop {
+        match reseated.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == "q1" => break id,
+            _ => {}
+        }
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if !server.0.pending_deliveries.lock().contains_key("dlv-s1-1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the abandoned waterfall never unregistered its delivery (guard Drop)"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The replayed waiter answers on the retired delivery's card:
+    reseated.send(FromClient::Reply {
+        id: replayed,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["blue"]}]})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| id == "q1")
+            .count(),
+        1,
+        "exactly one settle: the abandoned guard exit must not fail-close the call it handed off"
+    );
+    drop(client_a);
+    drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+// ── PR-4 (C2): kind-scoped first-claim-wins + the cancel frame. ────────────
+
+/// Drain `client`'s queue for `window`, returning how many drained frames
+/// matched `check`. Every drained frame is CONSUMED — callers assert on
+/// frames they do not otherwise need.
+fn count_frames_in_window<F>(client: &Client, window: Duration, check: F) -> usize
+where
+    F: Fn(&FromServer) -> bool,
+{
+    let rx = client.conn.server_rx();
+    let settle = std::time::Instant::now() + window;
+    let mut count = 0usize;
+    loop {
+        match rx.try_recv() {
+            Ok(m) => {
+                if check(&m) {
+                    count += 1;
+                }
+            }
+            Err(_) if std::time::Instant::now() < settle => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return count,
+        }
+    }
+}
+
+/// PR-4 (C2) e2e, two owners on one session: `AskUserQuestion` settles on
+/// the FIRST claim — the first owner's answer reaches the gate, the
+/// non-claiming co-owner is handed a `DeliveryCancelled` frame naming the
+/// very delivery it was shown (its card is terminal — "handled on another
+/// client", never a lapse), and its late reply is inert.
+#[test]
+fn dual_owner_ask_first_claim_settles_and_cancels_the_other_owner() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let client_b = second_client(
+        &server,
+        "test-b",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
+    expect(
+        &client_b,
+        |m| matches!(m, FromServer::Response { id, .. } if id.0 == "init-test-b"),
+    );
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client_a.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: "s1".into(),
+            text: "ask me".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    expect_host_status(&client_a, "s1", |running, _, _, _| running == Some(true));
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "q1".into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a color".into(),
+                input: seeded_ask_input(),
+            },
+        )))
+        .unwrap();
+    // The fan-out delivers the SAME delivery identity to both owners.
+    let (a_id, a_delivery) = loop {
+        match client_a.recv() {
+            FromServer::Request {
+                id,
                 call:
-                    ServerCall::PlanVerdict {
-                        plan_file: pf,
-                        content,
+                    ServerCall::AskUserQuestion {
+                        auth_id,
+                        delivery_id,
                         ..
                     },
-            } if pf == plan_file.to_string_lossy() => {
-                assert!(content.is_some(), "PlanVerdict must carry the plan body");
+            } if auth_id == "q1" => break (id, delivery_id),
+            _ => {}
+        }
+    };
+    let b_id = loop {
+        match client_b.recv() {
+            FromServer::Request {
+                id,
+                call:
+                    ServerCall::AskUserQuestion {
+                        auth_id,
+                        delivery_id,
+                        ..
+                    },
+            } if auth_id == "q1" => {
+                assert_eq!(
+                    delivery_id, a_delivery,
+                    "one fan-out, one delivery identity"
+                );
                 break id;
             }
             _ => {}
         }
     };
-    client.send(FromClient::Reply {
-        id: call_id,
-        outcome: Ok(json!({"choice": "execute_keep"})),
+    // A claims first: the answer reaches the gate on the first claim — the
+    // quorum (pre-fix) would still be waiting on B.
+    client_a.send(FromClient::Reply {
+        id: a_id,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["blue"]}]})),
     });
-    // execute_keep → approve_plan → plan_mode flips off (async: route_call
-    // applies the reply on the pump task; poll rather than race it).
+    wait_for_auth_settle(&engine, "q1", false);
+    expect(&client_b, |m| {
+        matches!(
+            m,
+            FromServer::Notification {
+                note: ServerNote::DeliveryCancelled { delivery_id }
+            } if delivery_id == &a_delivery
+        )
+    });
+    // B's late reply is inert: exactly one settle, the claimer's.
+    client_b.send(FromClient::Reply {
+        id: b_id,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["red"]}]})),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let held = engine.auth_responses.lock().unwrap();
+    let q1: Vec<_> = held
+        .iter()
+        .filter(|(id, _)| id == "q1")
+        .map(|(_, r)| r)
+        .collect();
+    assert_eq!(q1.len(), 1, "first-claim settles exactly once: {held:?}");
+    assert!(
+        matches!(
+            q1[0],
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                if answers == &vec![manox_agent::permission::AskAnswer::new(
+                    "color-q".into(),
+                    vec!["blue".into()],
+                    None,
+                )]
+        ),
+        "the claimer's answer is the settle that reached the gate: {q1:?}"
+    );
+    drop(held);
+    drop(client_a);
+    drop(client_b);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// PR-4 (C2) regression: `Approve` keeps the all-next quorum — a single
+/// next answer settles NOTHING and cancels nobody (the co-owner still
+/// holds a live card); the second next is the settle.
+#[test]
+fn dual_owner_approve_quorum_is_not_widened_to_first_claim() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::Approve]);
+    create(&server, &client_a, "s1");
+    let client_b = second_client(&server, "test-b", vec![AnswerKind::Approve], &["s1"]);
+    expect(
+        &client_b,
+        |m| matches!(m, FromServer::Response { id, .. } if id.0 == "init-test-b"),
+    );
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client_a.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: "s1".into(),
+            text: "do work".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    expect_host_status(&client_a, "s1", |running, _, _, _| running == Some(true));
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "a1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                input: json!({}),
+            },
+        )))
+        .unwrap();
+    let (_, _delivery) = loop {
+        match client_a.recv() {
+            FromServer::Request {
+                id,
+                call:
+                    ServerCall::Approve {
+                        auth_id,
+                        delivery_id,
+                        ..
+                    },
+            } if auth_id == "a1" => break (id, delivery_id),
+            _ => {}
+        }
+    };
+    loop {
+        match client_b.recv() {
+            FromServer::Request {
+                call: ServerCall::Approve { auth_id, .. },
+                ..
+            } if auth_id == "a1" => break,
+            _ => {}
+        }
+    }
+    // A answers next: no settle, and B receives NO cancel frame for it —
+    // the delivery is still B's to answer.
+    client_a.send(FromClient::Reply {
+        id: MsgId::new("a1"),
+        outcome: Ok(json!({"allow": true})),
+    });
+    assert_eq!(
+        count_frames_in_window(&client_b, Duration::from_millis(400), |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::DeliveryCancelled { .. }
+                }
+            )
+        }),
+        0,
+        "a lone next answer may not cancel the co-owner's Approve delivery"
+    );
+    assert!(
+        engine.auth_responses.lock().unwrap().is_empty(),
+        "the quorum stays open on one answer"
+    );
+    // B answers next: the all-next quorum settles — exactly one AllowOnce,
+    // no cancel frame for either side.
+    client_b.send(FromClient::Reply {
+        id: MsgId::new("a1"),
+        outcome: Ok(json!({"allow": true})),
+    });
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if !plan_mode_of(&server, "s1") {
+        let responses = engine.auth_responses.lock().unwrap();
+        if responses.len() == 1
+            && matches!(
+                responses[0].1,
+                manox_agent::permission::ToolAuthorizationResponse::Decision(
+                    manox_agent::permission::PermissionDecision::AllowOnce
+                )
+            )
+        {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "plan_mode never flipped off after execute_keep"
+            "the two-owner quorum never settled as exactly one AllowOnce: {responses:?}"
+        );
+        drop(responses);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        count_frames_in_window(&client_b, Duration::from_millis(400), |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::DeliveryCancelled { .. }
+                }
+            )
+        }),
+        0,
+        "an all-next Allowed settle owes no cancel frame"
+    );
+    drop(client_a);
+    drop(client_b);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// PR-5a (C4) helper: drive a session into a parked plan-review
+/// `AskUserQuestion` card. Returns the deterministic reply MsgId (the plan
+/// file) plus the card's `auth_id` (also the plan file — the single review
+/// identity). The card must carry the gateway-minted plan-review shape:
+/// one question, `intent.kind = plan-review`, plan body in `detail`.
+fn park_plan_review(
+    client: &Client,
+    engine: &std::sync::Arc<FakeEngine>,
+    plan_file: &std::path::Path,
+    title: &str,
+) -> MsgId {
+    let pf = plan_file.to_string_lossy().into_owned();
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+            plan_file: pf.clone(),
+            title: title.into(),
+        })))
+        .unwrap();
+    loop {
+        match client.recv() {
+            FromServer::Request {
+                id,
+                call: ServerCall::AskUserQuestion { auth_id, input, .. },
+            } if auth_id == pf => {
+                // The review card's canonical shape (C4 discriminator).
+                let q = &input["questions"][0];
+                assert_eq!(q["id"], auth_id, "the question id IS the plan file");
+                assert_eq!(
+                    q["intent"]["kind"], "plan-review",
+                    "the review card carries the plan-review intent: {input}"
+                );
+                assert_eq!(
+                    q["intent"]["approve"], "Approve",
+                    "the approving option is named"
+                );
+                assert!(
+                    q["detail"].as_str().is_some_and(|d| d.contains("Step one")),
+                    "the plan body rides the detail markdown: {q}"
+                );
+                assert_eq!(
+                    q["options"].as_array().map(Vec::len),
+                    Some(3),
+                    "three verdict options (Fresh removed): {q}"
+                );
+                return id;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// PR-5a (C4): `PlanReady` delivers the review as an `AskUserQuestion` card
+/// and the reply maps across the four verdict arms — Approve → keep
+/// execution, Approve & compact → compact execution, Request changes →
+/// refine (no execution, plan mode stays), dismissed → no convergence
+/// cancel (plan mode stays, review flag consumed).
+#[test]
+fn plan_review_ask_card_maps_the_four_verdicts() {
+    let _g = lock_globals();
+    for (label, reply, expect_executed) in [
+        (
+            "Approve",
+            json!({"answers": [
+                {"id": "keep", "selected": ["Approve"]}
+            ]}),
+            true,
+        ),
+        (
+            "Approve & compact",
+            json!({"answers": [
+                {"id": "compact", "selected": ["Approve & compact"]}
+            ]}),
+            true,
+        ),
+        (
+            "Request changes",
+            json!({"answers": [{"id": "refine", "selected": ["Request changes"]}]}),
+            false,
+        ),
+        ("dismissed", json!({"dismissed": true}), false),
+    ] {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+        create(&server, &client, "c4-s1");
+        let (engine, events) = FakeEngine::new();
+        server.set_session_engine_for_test("c4-s1", engine.clone(), events);
+        client.send(FromClient::Notification {
+            note: ClientNote::SetPlanMode {
+                session_id: "c4-s1".into(),
+                enabled: true,
+            },
+        });
+        client.settle();
+        assert!(plan_mode_of(&server, "c4-s1"), "plan mode on before review");
+        let plan_file =
+            std::env::temp_dir().join(format!("manox-c4-plan-{}.md", std::process::id()));
+        std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+        let pf = plan_file.to_string_lossy().into_owned();
+
+        // The delivered card carries the plan file as its identity; stamp
+        // the row id on the reply so it matches the single canonical row.
+        let reply = {
+            let mut r = reply;
+            if let Some(rows) = r["answers"].as_array_mut() {
+                for row in rows.iter_mut() {
+                    row["id"] = json!(pf);
+                }
+            }
+            r
+        };
+
+        engine
+            .notices
+            .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
+                plan_file: pf.clone(),
+                title: "C4 plan".into(),
+            })))
+            .unwrap();
+        let call_id = loop {
+            match client.recv() {
+                FromServer::Request {
+                    id,
+                    call: ServerCall::AskUserQuestion { auth_id, input, .. },
+                } if auth_id == pf => {
+                    let q = &input["questions"][0];
+                    assert_eq!(q["id"], pf, "the question id is the plan file");
+                    assert_eq!(q["intent"]["kind"], "plan-review");
+                    assert_eq!(q["options"].as_array().map(Vec::len), Some(3));
+                    break id;
+                }
+                _ => {}
+            }
+        };
+        client.send(FromClient::Reply {
+            id: call_id,
+            outcome: Ok(reply),
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let executed = engine.plan_approvals.lock().unwrap().len() == 1;
+            let review_consumed =
+                engine.plan_review_flags.lock().unwrap().as_slice() == [true, false];
+            if executed == expect_executed && review_consumed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{label}: executed={executed} expected={expect_executed} review_consumed={review_consumed}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Refine/dismissed keep plan mode on (the user can re-edit / speak);
+        // approve/compact turn it off via seed execution.
+        let still_planning = plan_mode_of(&server, "c4-s1");
+        assert_eq!(
+            still_planning, !expect_executed,
+            "{label}: plan mode after the verdict"
+        );
+        let _ = std::fs::remove_file(&plan_file);
+        let _ = std::fs::remove_file(
+            manox_agent::paths::sessions_dir()
+                .unwrap()
+                .join("c4-s1.jsonl"),
+        );
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
+/// PR-5a (C4): the compact branch of the review. `Approve & compact` selects
+/// compaction; the FakeEngine's `approve_plan` only records the seed text,
+/// so compaction is pinned structurally as "executed" (the kernel
+/// instructions argument is not observable at the fake seam) — the distinct
+/// selection is exercised in [`plan_review_ask_card_maps_the_four_verdicts`].
+#[test]
+fn plan_review_ask_card_approve_executes_and_seeds() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client, "c4-exec");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("c4-exec", engine.clone(), events);
+    client.send(FromClient::Notification {
+        note: ClientNote::SetPlanMode {
+            session_id: "c4-exec".into(),
+            enabled: true,
+        },
+    });
+    client.settle();
+    let plan_file = std::env::temp_dir().join(format!("manox-c4-exec-{}.md", std::process::id()));
+    std::fs::write(&plan_file, "# Plan\n\n1. Step one\n").unwrap();
+    let pf = plan_file.to_string_lossy().into_owned();
+    let call_id = park_plan_review(&client, &engine, &plan_file, "C4 exec");
+    client.send(FromClient::Reply {
+        id: call_id,
+        outcome: Ok(json!({"answers": [{"id": pf, "selected": ["Approve"]}]})),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let approvals = engine.plan_approvals.lock().unwrap().clone();
+        if approvals.len() == 1 {
+            assert!(
+                approvals[0].contains("Step one") || !approvals[0].is_empty(),
+                "approve seeds the plan-execution directive"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Approve never seeded execution"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
     let _ = std::fs::remove_file(&plan_file);
+    let _ = std::fs::remove_file(
+        manox_agent::paths::sessions_dir()
+            .unwrap()
+            .join("c4-exec.jsonl"),
+    );
     drop(client);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
 }
+
 #[test]
 fn browser_op_routes_to_client_and_returns_reply() {
     let _g = lock_globals();
@@ -5085,7 +5727,7 @@ fn concurrent_open_session_yields_one_entry_one_pump() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-// ── GW9: rejected/expired PlanVerdict convergence. ────────────────────
+// ── GW9: rejected/expired plan-review convergence. ───────────────
 
 /// Drain until a `SessionStatus` delta for `session_id` clears
 /// `pending_plan` (§D.5 — `expect_host_status` pins the other fields).
@@ -5121,20 +5763,21 @@ fn expect_store_pending_plan(session_id: &str, want: bool, what: &str) {
     }
 }
 
-/// GW9 regression: a REJECTED PlanVerdict must converge — pre-fix the
-/// fail-closed arm was a bare `return` that cleared nothing: the kernel
+/// GW9 regression (re-pointed at the C4 review-as-ask channel by PR-5a):
+/// a REJECTED plan review must converge — pre-fix the fail-closed arm
+/// was a bare `return` that cleared nothing: the kernel
 /// `plan_review_pending` flag and the store `pending_plan` flag stayed
 /// set forever, no `pending_plan=false` delta was broadcast, and the
 /// session was permanently "plan pending review". The convergence
-/// clears every plane, cancels the parked turn, and names the rejecter
-/// in an Error note. Fail-closed semantics hold: the plan never
-/// executes (no `approve_plan` on the engine).
+/// clears every plane, cancels the parked turn, and notes the cause in
+/// an Error note. Fail-closed semantics hold: the plan never executes
+/// (no `approve_plan` on the engine).
 #[test]
-fn plan_verdict_rejection_converges_pending_state() {
+fn plan_review_rejection_converges_pending_state() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw9-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s1", engine.clone(), events);
@@ -5158,12 +5801,14 @@ fn plan_verdict_rejection_converges_pending_state() {
         })))
         .unwrap();
     let mut saw_pending_true = false;
+    let pf = plan_file.to_string_lossy().into_owned();
     let call_id = loop {
         match client.recv() {
+            // PR-5a (C4): the review card rides the ASK channel.
             FromServer::Request {
                 id,
-                call: ServerCall::PlanVerdict { .. },
-            } => break id,
+                call: ServerCall::AskUserQuestion { auth_id, .. },
+            } if auth_id == pf => break id,
             // §D.5: the pending_plan TRUE edge must broadcast on the
             // way in (GW1 delivery finding) — the pump emits it before
             // routing the verdict call, so it arrives first on this
@@ -5210,13 +5855,17 @@ fn plan_verdict_rejection_converges_pending_state() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    // 4. The Error note names the rejecter.
+    // 4. The Error note fires. PR-4 (C2): the GW9 "rejected by {cid}"
+    //    per-recipient naming is retired — a lone rejecter is the settling
+    //    delivery (not a still-waiting co-recipient), so no
+    //    `DeliveryCancelled` frame is owed; the convergence Error note now
+    //    carries the generic fail-closed cause.
     expect(&client, |m| {
         matches!(
             m,
             FromServer::Notification {
                 note: ServerNote::Error { session_id: Some(sid), message }
-            } if sid == "gw9-s1" && message.contains("rejected by test")
+            } if sid == "gw9-s1" && message.contains("rejected or expired")
         )
     });
     // 5. Fail-closed: the plan never executes and plan mode stays on
@@ -5254,14 +5903,15 @@ fn plan_verdict_rejection_converges_pending_state() {
 }
 
 /// GW9 regression: an UNREVIEWABLE plan (no owner declared the
-/// PlanVerdict capability) is the fail_closed arm of the same deadlock —
-/// pre-fix it noted an Error and left every pending-review plane set.
+/// AskUserQuestion capability the review card needs) is the fail_closed
+/// arm of the same deadlock — pre-fix it noted an Error and left every
+/// pending-review plane set.
 #[test]
-fn plan_verdict_without_reviewer_converges() {
+fn plan_review_without_reviewer_converges() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    // No PlanVerdict capability: route_call finds no target.
+    // No ask capability: route_call finds no target.
     let (server, client) = harness(vec![]);
     create(&server, &client, "gw9-s2");
     let (engine, events) = FakeEngine::new();
@@ -5340,7 +5990,7 @@ fn converge_plan_rejected_clears_every_plane_directly() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw9-s3");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw9-s3", engine.clone(), events);
@@ -5353,8 +6003,8 @@ fn converge_plan_rejected_clears_every_plane_directly() {
         .expect("live session")
         .with_mut(|t| t.set_plan_review_pending(true));
 
-    // The expiry convergence, exactly as the timed-out waterfall arm
-    // calls it.
+    // The lapse convergence, exactly as the review's fail-closed arms
+    // call it.
     converge_plan_rejected(
         &server.0,
         "gw9-s3",
@@ -5706,7 +6356,7 @@ fn handshake_rejects_unknown_protocol_epoch() {
             "clientId": "epoch-probe",
             "capabilities": [],
             "sessions": [],
-            "protocolEpoch": 7,
+            "protocolEpoch": 8,
         }
     }))
     .expect("the epoch-bearing Initialize frame parses");
@@ -5723,7 +6373,7 @@ fn handshake_rejects_unknown_protocol_epoch() {
                 "protocol/unsupported-epoch"
             );
             assert!(
-                e.message.contains('7'),
+                e.message.contains('8'),
                 "the rejection names the offending epoch: {}",
                 e.message
             );
@@ -6791,11 +7441,7 @@ fn adjudication_requests_carry_stable_delivery_id() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![
-        AnswerKind::Approve,
-        AnswerKind::AskUserQuestion,
-        AnswerKind::PlanVerdict,
-    ]);
+    let (server, client) = harness(vec![AnswerKind::Approve, AnswerKind::AskUserQuestion]);
     create(&server, &client, "gw3-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("gw3-s1", engine.clone(), events);
@@ -6892,7 +7538,8 @@ fn adjudication_requests_carry_stable_delivery_id() {
         outcome: Ok(json!({"answers": [], "response": null})),
     });
 
-    // PlanVerdict, the third waterfall arm, carries one too.
+    // PR-5a (C4): the plan review — the third waterfall arm, riding the
+    // ask channel — carries one too.
     client.send(FromClient::Notification {
         note: ClientNote::SetPlanMode {
             session_id: "gw3-s1".into(),
@@ -6909,7 +7556,10 @@ fn adjudication_requests_carry_stable_delivery_id() {
         .unwrap();
     let (verdict_id, verdict_dlv) = loop {
         match client.recv() {
-            FromServer::Request { id, call } if matches!(&call, ServerCall::PlanVerdict { .. }) => {
+            FromServer::Request { id, call }
+                if matches!(&call, ServerCall::AskUserQuestion { auth_id, .. }
+                    if auth_id == "/nonexistent/gw3-plan.md") =>
+            {
                 let wire = serde_json::to_value(&call).unwrap();
                 break (id, wire["deliveryId"].as_str().unwrap_or("").to_string());
             }
@@ -6918,13 +7568,13 @@ fn adjudication_requests_carry_stable_delivery_id() {
     };
     assert!(
         !verdict_dlv.is_empty() && verdict_dlv != approve_dlv && verdict_dlv != ask_dlv,
-        "GW3: PlanVerdict carries its own deliveryId ({verdict_dlv})"
+        "GW3: the plan-review delivery carries its own deliveryId ({verdict_dlv})"
     );
     // Refine: consumes the pending review without executing (keeps the
     // session clean for teardown).
     client.send(FromClient::Reply {
         id: verdict_id,
-        outcome: Ok(json!({"choice": "refine"})),
+        outcome: Ok(json!({"answers": [{"id": "/nonexistent/gw3-plan.md", "selected": ["Request changes"]}]})),
     });
     client.settle();
     drop(client);
@@ -7644,32 +8294,35 @@ fn approve_verdict_clears_the_pending_auth_badge_server_side() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-/// U3b: an EXECUTED plan verdict clears the pending-plan badge
-/// server-side (store + delta) — bookkeeping, not a skip: the plan
-/// still executes. (Reject/expire is GW9's convergence, pinned there.)
+/// U3b: an EXECUTED plan review clears the pending-plan badge server-side
+/// (store + delta) — bookkeeping, not a skip: the plan still executes.
+/// (Reject/expire is GW9's convergence, pinned there.) PR-5a (C4): the
+/// review rides the ask channel.
 #[test]
-fn plan_verdict_execution_clears_the_pending_plan_badge() {
+fn plan_review_execution_clears_the_pending_plan_badge() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
-    let (server, client) = harness(vec![AnswerKind::PlanVerdict]);
+    let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
     create(&server, &client, "u3b-s1");
     let (engine, events) = FakeEngine::new();
     server.set_session_engine_for_test("u3b-s1", engine.clone(), events);
     let plan_file = std::env::temp_dir().join(format!("manox-u3b-plan-{}.md", std::process::id()));
     std::fs::write(&plan_file, "# Plan").unwrap();
+    let pf = plan_file.to_string_lossy().into_owned();
     engine
         .notices
         .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
-            plan_file: plan_file.to_string_lossy().into_owned(),
+            plan_file: pf.clone(),
             title: "U3b plan".into(),
         })))
         .unwrap();
     let call_id = loop {
         if let FromServer::Request {
             id,
-            call: ServerCall::PlanVerdict { .. },
+            call: ServerCall::AskUserQuestion { auth_id, .. },
         } = client.recv()
+            && auth_id == pf
         {
             break id;
         }
@@ -7677,7 +8330,7 @@ fn plan_verdict_execution_clears_the_pending_plan_badge() {
     expect_store_pending_plan("u3b-s1", true, "while the verdict is pending");
     client.send(FromClient::Reply {
         id: call_id,
-        outcome: Ok(json!({ "choice": "execute_keep" })),
+        outcome: Ok(json!({ "answers": [{ "id": pf, "selected": ["Approve"] }] })),
     });
     expect_pending_plan_cleared(&client, "u3b-s1");
     expect_store_pending_plan("u3b-s1", false, "after the execution verdict");

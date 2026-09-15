@@ -90,6 +90,7 @@ impl ServerNote {
             | Models { .. }
             | ThreadsUpdated { .. }
             | Commands { .. }
+            | DeliveryCancelled { .. }
             | ModelText { .. }
             | ModelThinking { .. }
             | ModelToolCall { .. }

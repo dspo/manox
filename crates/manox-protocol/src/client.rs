@@ -143,7 +143,7 @@ pub enum ClientCall {
     },
     /// Withdraw a pending adjudication delivery (GW3, §D.4): references the
     /// `deliveryId` of a received [`ServerCall::Approve` /
-    /// `PlanVerdict` / `AskUserQuestion`](crate::ServerCall) the client will
+    /// `AskUserQuestion`](crate::ServerCall) the client will
     /// not answer (e.g. it navigated away from the session). The server
     /// settles that delivery through the existing expire/converge path —
     /// fail-closed for a waterfall — instead of waiting out the 300s call
