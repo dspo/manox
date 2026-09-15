@@ -12,13 +12,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use manox_harness::agents::{SubagentTool, register_defaults};
+use crate::subagent::SubagentRunObserver;
 use manox_harness::bash::BashTool;
 use manox_harness::bash::orchestration::BackgroundManager;
 use manox_harness::bash::persistent::PersistentShellOperations;
 use manox_harness::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use manox_harness::ext_point_agent::AgentRegistry;
 use manox_harness::monitor::{MonitorManager, MonitorTool};
+use manox_harness::subagent::spawn::register_defaults;
+use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
 use manox_harness::tool::AgentTool as PiAgentTool;
 use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiModel};
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
@@ -1320,7 +1322,7 @@ impl ThreadEngine for PiEngine {
 /// Infer a capability tag for an agent definition from its declared tool
 /// allowlist. The host snapshot carries Read/Grep/Glob/Ls (read),
 /// Write/Edit (write), and Bash (exec); `tools: []` means the full
-/// snapshot. The tag rides the `AgentToolDescription` template so the model
+/// snapshot. The tag rides the delegation tool's description so the model
 /// knows what each subagent can do before dispatching.
 fn subagent_capability(def: &manox_harness::ext_point_agent::AgentDef) -> &'static str {
     if def.tools.is_empty() {
@@ -1924,50 +1926,138 @@ fn build_tools(
             tools.push(Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))));
         }
     }
-    // Steer bus: engine-scoped (created in `spawn_engine`), registered here
-    // before the model-gated subagent block so the SteerTool is always
-    // present (Dispatch returns an error until set_subagent_tool is called).
+    // Steer bus: engine-scoped (created in `spawn_engine`), mounted here so
+    // the model always has the TeamMember messaging + spawn tool.
     tools.push(Arc::new(crate::steer_bus::SteerTool::new(
         Arc::clone(bus),
         manox_harness::steer_bus::AgentId::Captain,
     )));
-    // The watchdog's pull surface: the Captain queries live subagent health
-    // (working / tool running / stalled / looping) before deciding to
-    // Inject, Abort, or re-dispatch. Read-only; always live with the bus.
-    tools.push(Arc::new(crate::steer_bus::SubagentStatusTool::new(
-        Arc::clone(bus),
-    )));
-    // Plan-mode gate resolver: whether a subagent type is read-only. The
-    // resolver shares the `AgentRegistry` Arc built below so the gate's
-    // read-only notion can never diverge from the registry's capability
-    // routing; it is model-independent and always live. The `SubagentTool`
-    // itself needs a concrete model: wired eagerly when one is resolved at
-    // assembly, otherwise on first Steer dispatch via the bus's late
-    // configurator (resume-at-launch resolves the model shortly after).
-    // Registry, plan-mode resolver, and sailor tool context are
-    // model-independent: build them unconditionally so a session assembled
-    // before a model resolved (resume-at-launch) still gets a live resolver.
-    // The model-bound `SubagentTool` is wired eagerly when a model is present
-    // and lazily on first Steer dispatch otherwise.
+    // The dsh-isomorphic delegation surface: one runtime + spawn provider
+    // per session assembly; one delegation tool per registered definition
+    // (Explore, Sailor, user/plugin manifests); the control pair. Child
+    // snapshots strip every registered delegation-surface name (nesting is
+    // structurally disabled this iteration).
+    let subagent_runtime = SubagentRuntime::new();
     let mut registry = AgentRegistry::new();
     register_defaults(&mut registry);
     // User-authored (~/.manox/agents) + plugin-provided
     // (`<plugin>/agents/`, namespaced) definitions layer over the
     // built-ins; same-name user files override built-ins.
     crate::agent_defs::register_user_and_plugin(&mut registry);
-    // Render the Agent tool description against the live registry so the
-    // model sees the available `subagent_type` values (Explore, Sailor,
-    // user/plugin defs) with capability tags — no filesystem probing.
-    // Tool descriptions are model-facing English, so always `Language::En`.
-    let subagent_descriptions: Vec<crate::prompt::SubagentTypeData> = registry
-        .all()
-        .iter()
-        .map(|def| crate::prompt::SubagentTypeData {
+    for def in registry.all() {
+        subagent_runtime.register_delegation_tool(&def.name);
+    }
+    subagent_runtime.register_delegation_tool(crate::subagent::ListAgentsTool::NAME);
+    subagent_runtime.register_delegation_tool(crate::subagent::InterruptAgentTool::NAME);
+    // Dedicated per-definition models from the cx providers config's
+    // `subagents:` map; an unreadable config warns and leaves subagents
+    // inheriting the thread model.
+    let overrides: HashMap<String, String> = manox_harness::provider::load_subagent_models(
+        manox_harness::provider::default_config_path(),
+    )
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            "subagent model config unreadable; subagents inherit the thread model"
+        );
+        HashMap::new()
+    });
+    for key in overrides.keys() {
+        if registry.get(key).is_none() {
+            tracing::warn!(
+                subagent_type = %key,
+                "subagent model config names an unknown subagent type"
+            );
+        }
+    }
+    let subagent_observer =
+        SubagentRunObserver::new(bus.owner_thread_id().to_string(), notice_tx.clone());
+    let provider_registry = crate::provider_glue::global();
+    let model_slot = gate.model_slot();
+    // Child snapshot: the same seatbelt backend as the Captain (B4: no
+    // ungated bypass); Write/Edit carry the process write lock so parallel
+    // workers clobbering the same path surface a named-holder conflict
+    // instead of silently racing.
+    let spawn_provider = SpawnProvider::new(vec![
+        Arc::new(manox_harness::read::SelectorReadTool::new()),
+        Arc::new(manox_harness::tools::grep::GrepTool),
+        Arc::new(manox_harness::tools::glob::GlobTool),
+        Arc::new(manox_harness::tools::ls::LsTool),
+        Arc::new(SubagentBashTool {
+            inner: Arc::new(
+                manox_harness::bash::BashTool::new(
+                    Arc::clone(&subagent_bash_ops),
+                    subagent_background.clone(),
+                )
+                .with_sandbox_available(sandbox_available),
+            ),
+        }),
+        Arc::new(crate::file_lock::FileLockedTool::new(
+            Arc::new(manox_harness::tools::write::WriteTool),
+            "sailor",
+        )),
+        Arc::new(crate::file_lock::FileLockedTool::new(
+            Arc::new(
+                manox_harness::tools::edit::EditTool::default()
+                    .with_enforce_seen_lines(crate::settings::edit().enforce_seen_lines),
+            ),
+            "sailor",
+        )),
+    ])
+    .with_model_runtime(runtime.clone())
+    .with_model_slot(Arc::clone(&model_slot))
+    .with_delegation_names(subagent_runtime.delegation_tool_names())
+    // Subagent transcripts persist under the host session root (a
+    // subdirectory the sidebar's non-recursive listing never surfaces) so
+    // their usage stays accountable.
+    .with_session_dir(crate::thread_store::sessions_dir().join("subagents"))
+    .with_observer(Arc::clone(&subagent_observer) as Arc<dyn manox_harness::subagent::RunObserver>);
+    let spawn_provider = match model {
+        Some(model) => spawn_provider.with_model(model.clone()),
+        None => spawn_provider,
+    };
+    subagent_runtime.register_provider_permanent(Arc::new(spawn_provider));
+    let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
+        manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
+    );
+    for def in registry.all() {
+        let capability = subagent_capability(def);
+        let config = DelegationToolConfig {
+            provider: "spawn".into(),
             name: def.name.clone(),
-            capability: subagent_capability(def),
-            description: def.description.clone(),
-        })
-        .collect();
+            capability: capability.to_string(),
+            rendered_description: crate::subagent::delegation_description(
+                &def.description,
+                capability,
+                &def.name,
+            ),
+            persona: def.system_prompt.clone(),
+            default_tools: def.tools.clone(),
+            frontmatter_model_spec: def.model.clone(),
+            config_model_spec: overrides.get(&def.name).cloned(),
+            max_depth: 1,
+        };
+        tools.push(Arc::new(crate::subagent::DelegationTool::new(
+            Arc::clone(&subagent_runtime),
+            Arc::clone(&subagent_observer),
+            config,
+            Some(Arc::clone(&provider_registry)),
+            0,
+            Some(bus.owner_thread_id().to_string()),
+            Arc::clone(&subagent_env),
+            cwd.to_path_buf(),
+        )));
+    }
+    tools.push(Arc::new(crate::subagent::ListAgentsTool::new(
+        Arc::clone(&subagent_runtime),
+        Arc::clone(&subagent_observer),
+    )));
+    tools.push(Arc::new(crate::subagent::InterruptAgentTool::new(
+        Arc::clone(&subagent_runtime),
+    )));
+    // Plan-mode gate resolver: whether a delegation tool name targets a
+    // read-only definition. The resolver shares the registry Arc so the
+    // gate's read-only notion can never diverge from the capability routing.
     let registry = Arc::new(registry);
     let read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver = {
         let r = Arc::clone(&registry);
@@ -1977,140 +2067,6 @@ fn build_tools(
                 .is_some_and(|c| c == "read-only")
         })
     };
-    let sailor_ctx: Arc<dyn manox_harness::tool::ToolContext> =
-        Arc::new(manox_harness::tool::LocalToolContext::new(
-            Arc::new(manox_harness::env::TokioExecutionEnv::new(
-                cwd.to_path_buf(),
-            )),
-            cwd.to_path_buf(),
-            Arc::new(manox_harness::tool::ToolState::new()),
-        ));
-    let subagent_description = match crate::prompt::render(
-        crate::prompt::PromptTemplate::AgentToolDescription,
-        crate::language::Language::En,
-        &crate::prompt::AgentToolDescriptionData {
-            subagents: subagent_descriptions,
-        },
-    ) {
-        Ok(desc) => Some(desc),
-        Err(e) => {
-            tracing::warn!("Agent tool description render failed: {e}");
-            None
-        }
-    };
-    let model_slot = gate.model_slot();
-    let build_subagent = {
-        let registry = Arc::clone(&registry);
-        let runtime = runtime.clone();
-        let model_slot = Arc::clone(&model_slot);
-        let provider_registry = crate::provider_glue::global();
-        let subagent_bash_ops = Arc::clone(&subagent_bash_ops);
-        let subagent_background = subagent_background.clone();
-        let subagent_description = subagent_description.clone();
-        move |model: &PiModel| {
-            // Dedicated per-type models from the cx providers config's
-            // `subagents:` map; an unreadable config warns and leaves
-            // subagents inheriting the thread model.
-            let overrides = manox_harness::provider::load_subagent_models(
-                manox_harness::provider::default_config_path(),
-            )
-            .unwrap_or_else(|e| {
-                tracing::warn!(
-                    error = %e,
-                    "subagent model config unreadable; subagents inherit the thread model"
-                );
-                HashMap::new()
-            });
-            for key in overrides.keys() {
-                if registry.get(key).is_none() {
-                    tracing::warn!(
-                        subagent_type = %key,
-                        "subagent model config names an unknown subagent type"
-                    );
-                }
-            }
-            let subagent = SubagentTool::new(
-                registry.clone(),
-                vec![
-                    Arc::new(manox_harness::read::SelectorReadTool::new()),
-                    Arc::new(manox_harness::tools::grep::GrepTool),
-                    Arc::new(manox_harness::tools::glob::GlobTool),
-                    Arc::new(manox_harness::tools::ls::LsTool),
-                    // Write/exec axis: definitions that opt into the full
-                    // snapshot (e.g. Sailor, `tools: []`) get these; read-only
-                    // definitions (Explore) name an explicit allowlist that
-                    // `select_tools` filters against, so they never reach a
-                    // read-only subagent. Bash inherits the Captain's seatbelt
-                    // backend (no ungated bypass); Write/Edit carry the process
-                    // write lock so parallel Sailors clobbering the same path
-                    // surface a named-holder conflict instead of silently racing.
-                    Arc::new(SubagentBashTool {
-                        inner: Arc::new(
-                            manox_harness::bash::BashTool::new(
-                                Arc::clone(&subagent_bash_ops),
-                                subagent_background.clone(),
-                            )
-                            .with_sandbox_available(sandbox_available),
-                        ),
-                    }),
-                    Arc::new(crate::file_lock::FileLockedTool::new(
-                        Arc::new(manox_harness::tools::write::WriteTool),
-                        "sailor",
-                    )),
-                    Arc::new(crate::file_lock::FileLockedTool::new(
-                        Arc::new(
-                            manox_harness::tools::edit::EditTool::default()
-                                .with_enforce_seen_lines(
-                                    crate::settings::edit().enforce_seen_lines,
-                                ),
-                        ),
-                        "sailor",
-                    )),
-                ],
-            )
-            .with_model_runtime(runtime.clone())
-            .with_model(model.clone())
-            // Inherit the Captain's live model at dispatch time (a mid-thread
-            // model switch is honored instead of falling back to the default).
-            .with_model_slot(Arc::clone(&model_slot))
-            // Resolve agent-definition `model` overrides against the live
-            // registry (registration has landed before session assembly).
-            .with_provider_registry(provider_registry.clone())
-            // Resolve dedicated per-type model specs from the config map.
-            .with_model_overrides(overrides)
-            // Subagent transcripts persist under the host session root (a
-            // subdirectory the sidebar's non-recursive listing never
-            // surfaces) so their usage stays accountable.
-            .with_session_dir(crate::thread_store::sessions_dir().join("subagents"));
-            let subagent = match subagent_description.clone() {
-                Some(desc) => subagent.with_description(desc),
-                None => subagent,
-            };
-            Arc::new(subagent)
-        }
-    };
-    bus.set_tool_ctx(sailor_ctx);
-    match model {
-        Some(model) => bus.set_subagent_tool(build_subagent(model)),
-        None => {
-            // Launch-time resume assembles the session before the provider
-            // catalog resolves a model; the model slot fills in shortly via
-            // `SetModel`, so wire on first dispatch instead of dropping
-            // subagent support for the session's lifetime. The configurator
-            // returns the tool; the dispatch path caches it (writing back
-            // into the bus from here would re-enter its locks).
-            let configure: crate::steer_bus::LateConfigure = Arc::new(move || {
-                let model = model_slot
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone()?;
-                let tool = build_subagent(&model);
-                tracing::info!("steer bus: subagent tool late-wired from live model slot");
-                Some(tool)
-            });
-            bus.set_late_configure(configure);
-        }
-    }
     (
         tools,
         SessionOrchestrators {
@@ -6770,143 +6726,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_start_maps_to_subagent_progress_row() {
-        let events = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionStart {
-                tool_call_id: "call-1".into(),
-                tool_name: crate::tools::AGENT.into(),
-                arguments: serde_json::json!({
-                    "subagent_type": "Explore",
-                    "prompt": "find the auth module and summarize its structure",
-                }),
-            },
-        );
-        assert_eq!(events.len(), 2, "tool card + rail observation row");
-        match &events[1] {
-            crate::thread::ThreadEvent::SubagentProgress {
-                id,
-                subagent_type,
-                latest_activity,
-                status,
-                ..
-            } => {
-                assert_eq!(id, "call-1");
-                assert_eq!(subagent_type, "Explore");
-                assert_eq!(
-                    latest_activity.as_deref(),
-                    Some("find the auth module and summarize its structure")
-                );
-                assert_eq!(*status, crate::thread::ToolCallStatus::Running);
-            }
-            other => panic!("expected SubagentProgress, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_tool_end_closes_subagent_progress_row() {
-        let events = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionEnd {
-                tool_call_id: "call-1".into(),
-                tool_name: crate::tools::AGENT.into(),
-                result: manox_harness::tool::AgentToolResult::text("done"),
-                is_error: false,
-            },
-        );
-        assert_eq!(events.len(), 3, "tool card + result + rail row");
-        match &events[2] {
-            crate::thread::ThreadEvent::SubagentProgress { id, status, .. } => {
-                assert_eq!(id, "call-1");
-                assert_eq!(*status, crate::thread::ToolCallStatus::Success);
-            }
-            other => panic!("expected SubagentProgress, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn non_agent_tools_emit_no_subagent_progress() {
-        let events = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionStart {
-                tool_call_id: "call-2".into(),
-                tool_name: "Read".into(),
-                arguments: serde_json::json!({"path": "src/main.rs"}),
-            },
-        );
-        assert_eq!(events.len(), 1, "plain tools keep a single tool card");
-    }
-
-    #[test]
-    fn agent_child_text_delta_maps_to_subagent_child() {
-        let events = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
-                tool_call_id: "call-1".into(),
-                tool_name: crate::tools::AGENT.into(),
-                arguments: serde_json::json!({}),
-                partial_result: serde_json::json!({
-                    "subagent_event": { "kind": "text", "text": "found it" }
-                }),
-            },
-        );
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            crate::thread::ThreadEvent::SubagentChild { id, child } => {
-                assert_eq!(id, "call-1");
-                assert_eq!(
-                    child,
-                    &crate::thread::SubagentChildEvent::Text("found it".into())
-                );
-            }
-            other => panic!("expected SubagentChild, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn agent_child_tool_lifecycle_maps_to_child_and_rail_activity() {
-        let start = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
-                tool_call_id: "call-1".into(),
-                tool_name: crate::tools::AGENT.into(),
-                arguments: serde_json::json!({}),
-                partial_result: serde_json::json!({
-                    "subagent_event": { "kind": "tool_start", "id": "child-1", "tool": "Read", "summary_key": "path", "summary": "src/main.rs" }
-                }),
-            },
-        );
-        assert_eq!(start.len(), 2, "drill-down event + rail activity");
-        assert!(matches!(
-            &start[0],
-            crate::thread::ThreadEvent::SubagentChild {
-                child: crate::thread::SubagentChildEvent::ToolStart { .. },
-                ..
-            }
-        ));
-        match &start[1] {
-            crate::thread::ThreadEvent::SubagentProgress {
-                latest_activity, ..
-            } => assert_eq!(latest_activity.as_deref(), Some("▸ Read src/main.rs")),
-            other => panic!("expected SubagentProgress, got {other:?}"),
-        }
-
-        let end = adapt::agent_event_to_thread_events(
-            &manox_harness::types::AgentEvent::ToolExecutionUpdate {
-                tool_call_id: "call-1".into(),
-                tool_name: crate::tools::AGENT.into(),
-                arguments: serde_json::json!({}),
-                partial_result: serde_json::json!({
-                    "subagent_event": { "kind": "tool_end", "id": "child-1", "tool": "Read", "is_error": true }
-                }),
-            },
-        );
-        assert_eq!(end.len(), 2);
-        assert!(matches!(
-            &end[0],
-            crate::thread::ThreadEvent::SubagentChild {
-                child: crate::thread::SubagentChildEvent::ToolEnd { is_error: true, .. },
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn bash_output_update_still_maps_to_tool_output() {
         let events = adapt::agent_event_to_thread_events(
             &manox_harness::types::AgentEvent::ToolExecutionUpdate {
@@ -9260,39 +9079,31 @@ mod tests {
     }
 
     #[test]
-    fn agent_tool_description_lists_built_in_subagents_with_capability() {
-        let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();
-        manox_harness::agents::register_defaults(&mut registry);
-        let subagents: Vec<crate::prompt::SubagentTypeData> = registry
-            .all()
-            .iter()
-            .map(|def| crate::prompt::SubagentTypeData {
-                name: def.name.clone(),
-                capability: subagent_capability(def),
-                description: def.description.clone(),
-            })
-            .collect();
-        let rendered = crate::prompt::render(
-            crate::prompt::PromptTemplate::AgentToolDescription,
-            crate::language::Language::En,
-            &crate::prompt::AgentToolDescriptionData { subagents },
-        )
-        .expect("AgentToolDescription renders");
-        assert!(
-            rendered.contains("Explore (read-only)"),
-            "Explore read-only tag present: {rendered}"
+    fn delegation_tool_description_carries_definition_and_contract() {
+        let rendered = crate::subagent::delegation_description(
+            "Read-only codebase exploration",
+            "read-only",
+            "Explore",
         );
         assert!(
-            rendered.contains("Sailor (write+bash)"),
-            "Sailor write+bash tag present: {rendered}"
+            rendered.contains("[capability: read-only]"),
+            "capability tag present: {rendered}"
         );
         assert!(
-            rendered.contains("synchronously"),
-            "template declares synchronous read-only subagents: {rendered}"
+            rendered.contains("`Explore`"),
+            "definition name present: {rendered}"
         );
         assert!(
-            rendered.contains("asynchronously"),
-            "template declares asynchronous write+bash subagents: {rendered}"
+            rendered.contains("fresh-context"),
+            "description declares the fresh-context boundary: {rendered}"
+        );
+        assert!(
+            rendered.contains("run_in_background"),
+            "description declares the background mode: {rendered}"
+        );
+        assert!(
+            rendered.contains("auto-rejected"),
+            "description declares the never-approval boundary: {rendered}"
         );
     }
 
@@ -9303,7 +9114,7 @@ mod tests {
     #[test]
     fn subagent_capability_tags_write_bash_vs_read_only() {
         let mut registry = manox_harness::ext_point_agent::AgentRegistry::new();
-        manox_harness::agents::register_defaults(&mut registry);
+        manox_harness::subagent::spawn::register_defaults(&mut registry);
         let sailor = registry.get("Sailor").expect("Sailor registered");
         let explore = registry.get("Explore").expect("Explore registered");
         assert_eq!(subagent_capability(sailor), "write+bash");
@@ -9455,76 +9266,69 @@ mod tests {
         assert!(props.contains_key("command"), "command still advertised");
     }
 
-    /// A dispatched subagent session persists under the host-injected session
-    /// directory with its dispatch lineage in the header metadata; without an
-    /// injected directory the transcript stays in a tempdir whose guard the
-    /// caller must hold (examples/tests lifecycle).
+    /// A dispatched subagent session persists under the provider's
+    /// host-injected session directory, and the header carries the dispatch
+    /// lineage (definition name + parent) from the descriptor. Without an
+    /// injected directory the transcript lives in a provider-internal
+    /// tempdir removed at settle — the lifecycle is no longer the caller's
+    /// to manage.
     #[tokio::test]
     async fn subagent_session_persists_under_host_dir_with_metadata() {
+        use manox_harness::subagent::{SpawnProvider, SubagentRuntime};
+
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-
         let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
             Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
         });
         let runtime = ModelRuntime::new(resolver);
 
-        let mut registry = AgentRegistry::new();
-        register_defaults(&mut registry);
-        let registry = Arc::new(registry);
         let tools: Vec<Arc<dyn manox_harness::tool::AgentTool>> = vec![
             Arc::new(manox_harness::tools::read::ReadTool),
             Arc::new(manox_harness::tools::grep::GrepTool),
             Arc::new(manox_harness::tools::glob::GlobTool),
             Arc::new(manox_harness::tools::ls::LsTool),
         ];
-        let ctx = manox_harness::tool::LocalToolContext::new(
-            Arc::new(manox_harness::env::TokioExecutionEnv::new(cwd.clone())),
-            cwd.clone(),
-            Arc::new(manox_harness::tool::ToolState::new()),
-        );
 
         // Host-injected directory: the transcript persists there and the
         // header carries the dispatch lineage.
         let subagents = dir.path().join("subagents");
-        let tool = SubagentTool::new(Arc::clone(&registry), tools.clone())
+        let subagent_runtime = SubagentRuntime::new();
+        let provider = SpawnProvider::new(tools.clone())
             .with_model_runtime(runtime.clone())
             .with_model(test_model())
             .with_session_dir(subagents.clone());
-        let (mut session, guard, worktree) = tool
-            .spawn_subagent_session("Explore", None, &ctx, vec![], Some("thread-parent"))
+        subagent_runtime.register_provider_permanent(Arc::new(provider));
+        let mut request = manox_harness::subagent::test_request("explore the manifest", "hi");
+        request.kind = "Explore".into();
+        request.persona = Some("read-only codebase explorer".into());
+        request.parent_session = Some("thread-parent".into());
+        request.cwd = cwd.clone();
+        request.env = Arc::new(manox_harness::env::TokioExecutionEnv::new(cwd.clone()));
+        let run = subagent_runtime
+            .start("spawn", request)
             .await
-            .unwrap();
-        assert!(guard.is_none(), "persistent dir spawns no tempdir guard");
-        assert!(worktree.is_none());
-        let _ = session.prompt("hi").await.unwrap();
-        let path = session.path().clone();
-        assert_eq!(path.parent().unwrap(), subagents);
-        let header = tokio::fs::read_to_string(&path)
-            .await
-            .unwrap()
-            .lines()
-            .next()
-            .unwrap()
-            .to_string();
+            .expect("dispatch starts");
+        let result = run.result().await;
+        assert_eq!(
+            result.stop_reason,
+            manox_harness::subagent::StopReason::Completed,
+            "the child completes: {result:?}"
+        );
+        let mut entries = tokio::fs::read_dir(&subagents).await.unwrap();
+        let mut header = None;
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let content = tokio::fs::read_to_string(entry.path()).await.unwrap();
+            header = Some(content.lines().next().unwrap().to_string());
+        }
+        let header = header.expect("one transcript under the host dir");
         assert!(
             header.contains("\"metadata\":{\"subagent\":{")
                 && header.contains("\"type\":\"Explore\"")
                 && header.contains("\"parent\":\"thread-parent\""),
             "header must carry the subagent lineage: {header}"
         );
-
-        // No injected directory: the throwaway tempdir lifecycle stays, and
-        // the guard is the caller's only handle to the transcript.
-        let tool = SubagentTool::new(Arc::clone(&registry), tools)
-            .with_model_runtime(runtime)
-            .with_model(test_model());
-        let (_session, guard, _worktree) = tool
-            .spawn_subagent_session("Explore", None, &ctx, vec![], None)
-            .await
-            .unwrap();
-        assert!(guard.is_some(), "uninjected spawn keeps the tempdir guard");
     }
 
     // ── K3/K2/K1: decision-point entries, journal authority, replay gate ──

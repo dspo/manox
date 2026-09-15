@@ -5,7 +5,6 @@
 // no dynamic loading, no out-of-process runtime — and assembles the
 // product-level bash tool on top.
 
-pub mod agents;
 pub mod bash;
 pub mod model_ref;
 pub mod monitor;
@@ -17,8 +16,9 @@ pub mod sandbox;
 pub mod session_meta;
 pub mod session_stream;
 pub mod steer_bus;
+pub mod subagent;
 
-pub use agents::SubagentTool;
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use bash::persistent::PersistentShellOperations;
 pub use monitor::MonitorTool;
+pub use subagent::SubagentRuntime;

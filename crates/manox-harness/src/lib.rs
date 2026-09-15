@@ -37,7 +37,6 @@ pub use core::types;
 // Re-export ext modules (except `provider` which conflicts with core::provider).
 // We explicitly re-export each module so `manox_harness::bash::BashTool` etc.
 // remain reachable without the `ext::` prefix.
-pub use ext::agents;
 pub use ext::bash;
 pub use ext::model_ref;
 pub use ext::monitor;
@@ -48,6 +47,7 @@ pub use ext::sandbox;
 pub use ext::session_meta;
 pub use ext::session_stream;
 pub use ext::steer_bus;
+pub use ext::subagent;
 
 // `provider` exists in both core and ext. Route `manox_harness::provider` to
 // ext::provider (the provider-registration extension) since that's what
@@ -81,7 +81,6 @@ pub use core::tools::bash::{BashExecRequest, BashOperations};
 pub use core::types::{AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentState};
 
 // Re-export ext's top-level `pub use` items.
-pub use ext::agents::SubagentTool;
 pub use ext::bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use ext::bash::persistent::PersistentShellOperations;
 pub use ext::monitor::MonitorTool;

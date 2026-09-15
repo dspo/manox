@@ -52,9 +52,7 @@ pub enum PromptTemplate {
     /// Execution seed after a plan is approved: read the plan file and
     /// implement it top to bottom.
     ModePlanApproved,
-
     // --- tool descriptions ---
-    AgentToolDescription,
 }
 
 impl PromptTemplate {
@@ -79,7 +77,6 @@ impl PromptTemplate {
             Self::SkillBody => "wrapper/skill_body.tera.md",
             Self::ModePlanActive => "mode/plan_mode_active.tera.md",
             Self::ModePlanApproved => "mode/plan_mode_approved.tera.md",
-            Self::AgentToolDescription => "tools/agent_tool.tera.md",
         }
     }
 }
@@ -104,5 +101,4 @@ pub const ALL: [PromptTemplate; 16] = [
     PromptTemplate::SkillBody,
     PromptTemplate::ModePlanActive,
     PromptTemplate::ModePlanApproved,
-    PromptTemplate::AgentToolDescription,
 ];
