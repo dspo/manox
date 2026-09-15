@@ -1323,7 +1323,7 @@ impl AgentServerInner {
                     _ => Err(RpcError::new(-1, "replayed adjudication delivery closed")
                         .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
                 };
-                apply_reply(&inner, &sid, rec.ctx, outcome, None);
+                apply_reply(&inner, &sid, rec.ctx, outcome);
             });
         }
     }
@@ -1370,7 +1370,6 @@ impl AgentServerInner {
                     "adjudication abandoned: the answering owner re-seated without the session",
                 )
                 .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-                None,
             );
         }
     }
@@ -3487,10 +3486,12 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         },
         _ => ReplyCtx::Other, // β-3b-ii: BrowserOp/ClipboardRead/OpenExternal (capability seam).
     };
-    // §D.4: adjudication kinds (Approve / AskUserQuestion / PlanVerdict)
-    // fan out to EVERY owner that declared the capability — all must answer
-    // next to proceed, any rejection (or per-delivery timeout) settles
-    // fail-closed (see [`crate::waterfall`]). Capability calls
+    // §D.4 + PR-4: adjudication kinds (Approve / AskUserQuestion /
+    // PlanVerdict) fan out to EVERY owner that declared the capability —
+    // the settle policy is kind-scoped: an `AskUserQuestion` answers on
+    // the FIRST claim (the rest are cancelled with a terminal frame),
+    // `Approve` (and the retiring `PlanVerdict`) keeps all-next /
+    // any-deny, fail-closed (see [`crate::waterfall`]). Capability calls
     // (BrowserOp/...) stay single-target.
     let adjudication = matches!(
         ctx,
@@ -3598,9 +3599,17 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         // sweeps the delivery's tokens
         // (`cancel_deliveries_for_session`).
         let inner = Arc::clone(inner);
-        let session_id = session_id.to_string();
+        let adjudication = Adjudication {
+            session_id: session_id.to_string(),
+            kind,
+            ctx,
+            call,
+            targets,
+            delivery_id,
+            tokens,
+        };
         manox_agent::runtime::handle().spawn(async move {
-            route_waterfall(inner, session_id, ctx, call, targets, delivery_id, tokens).await;
+            route_waterfall(inner, adjudication).await;
         });
         return;
     }
@@ -3620,15 +3629,18 @@ async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: Serve
         // mirroring the no-owner fail-closed path.
         inner.note_error(session_id, "capability call timed out or cancelled");
     }
-    apply_reply(inner, session_id, ctx, outcome, None);
+    apply_reply(inner, session_id, ctx, outcome);
 }
 
 /// §D.4 fan-out/fan-in: deliver the adjudication Request to every target,
-/// funnel their replies (each bounded by [`CALL_TIMEOUT`]) into a
-/// [`crate::waterfall::Waterfall`], and apply the SETTLING reply's payload
-/// (the first rejection, or the final next). Recipients that never answered
-/// by settlement are owed a cancel in a future wire addition; until then
-/// the `pending_auth` projection is the truth clients reconcile against.
+/// funnel their replies into a [`crate::waterfall::Waterfall`], and apply
+/// the SETTLING reply's payload (the first rejection / lapse, the first
+/// claim under `AskUserQuestion`, or the final next under the quorum).
+/// Every recipient still waiting at settlement gets a
+/// [`ServerNote::DeliveryCancelled`] frame (PR-4) on its current
+/// connection — the card it holds is terminal, "handled on another
+/// client" is the convergence, not a lapse.
+///
 /// One adjudication delivery: (client id, connection generation, connection,
 /// reply receiver, deterministic MsgId).
 type AdjudicationTarget = (
@@ -3638,6 +3650,19 @@ type AdjudicationTarget = (
     async_channel::Receiver<Result<Value, RpcError>>,
     MsgId,
 );
+
+/// §0: one fully prepared adjudication delivery — `route_call` registers
+/// the replay record and the GW3 delivery synchronously, then hands this
+/// bundle to the spawned waterfall task.
+struct Adjudication {
+    session_id: String,
+    kind: AnswerKind,
+    ctx: ReplyCtx,
+    call: ServerCall,
+    targets: Vec<AdjudicationTarget>,
+    delivery_id: String,
+    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
+}
 
 /// One unsettled adjudication, kept so every owner that joins the session
 /// later — re-open, re-own, or a handshake re-declaring the session —
@@ -3759,9 +3784,10 @@ fn with_delivery_id(call: ServerCall, delivery_id: &str) -> ServerCall {
 enum DeliveryEvent {
     /// The client answered: `Ok` = answered next, `Err` = explicit rejection.
     Reply(Result<Value, RpcError>),
-    /// The delivery lapsed without an answer (timeout, `CancelDelivery`, or
-    /// a closed channel) — kept distinct from a rejection so the GW9
-    /// PlanVerdict convergence can name the cause.
+    /// The delivery lapsed without a human action (`CancelDelivery`, a
+    /// dispose sweep, or a closed channel) — kept distinct from a rejection
+    /// because the policies converge differently: a lapse fails a Unanimous
+    /// quorum immediately but only removes a FirstClaim claimant.
     Expired(RpcError),
     /// §D.6: the gateway replaced this owner's connection. The delivery's
     /// settle obligation transfers to the replayed waiter on the new
@@ -3769,25 +3795,34 @@ enum DeliveryEvent {
     Reseated,
 }
 
-async fn route_waterfall(
-    inner: Arc<AgentServerInner>,
-    session_id: String,
-    ctx: ReplyCtx,
-    call: ServerCall,
-    targets: Vec<AdjudicationTarget>,
-    delivery_id: String,
-    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
-) {
+async fn route_waterfall(inner: Arc<AgentServerInner>, a: Adjudication) {
+    let Adjudication {
+        session_id,
+        kind,
+        ctx,
+        call,
+        targets,
+        delivery_id,
+        tokens,
+    } = a;
     let (funnel_tx, mut funnel_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, DeliveryEvent)>();
-    let mut waterfall = crate::waterfall::Waterfall::new(session_id.clone(), {
-        let mut ids = targets
-            .iter()
-            .map(|(cid, ..)| cid.clone())
-            .collect::<Vec<_>>();
-        ids.sort();
-        ids
-    });
+    // PR-4 (C2): the settle policy is kind-scoped — an `AskUserQuestion`
+    // is one truth so the FIRST claim settles; `Approve` (and, until its
+    // retirement, `PlanVerdict`) keeps the all-next / any-deny quorum.
+    let mut waterfall = match kind {
+        AnswerKind::AskUserQuestion => {
+            crate::waterfall::Waterfall::first_claim(session_id.clone(), sorted_ids(&targets))
+        }
+        _ => crate::waterfall::Waterfall::new(session_id.clone(), sorted_ids(&targets)),
+    };
+    // PR-4: the cancel frames owed at settlement ride each recipient's
+    // CURRENT connection (a mid-window re-seat is served by the replay
+    // funnel, never by this map).
+    let conns: HashMap<String, Arc<dyn RpcConnection>> = targets
+        .iter()
+        .map(|(cid, _, conn, ..)| (cid.clone(), conn.clone()))
+        .collect();
     // GW3: `tokens` were minted and registered by `route_call` before this
     // task was spawned (the dispose sweep must never race a routed-but-
     // unregistered delivery). A `CancelDelivery` from a recipient — or the
@@ -3848,21 +3883,18 @@ async fn route_waterfall(
     }
     drop(funnel_tx);
     let mut settled: Option<Result<Value, RpcError>> = None;
-    // The settling delivery when it settled the waterfall AGAINST the call:
-    // (client id, expired).
-    let mut settled_by: Option<(String, bool)> = None;
     // The most recent answered-next payload: a re-seat that completes the
     // all-next quorum settles with the surviving answer.
     let mut last_ok: Option<Value> = None;
     let mut reseat_seen = false;
     while let Some((cid, event)) = funnel_rx.recv().await {
-        let (expired, outcome) = match event {
+        let outcome = match event {
             DeliveryEvent::Reseated => {
                 reseat_seen = true;
+                // The only settle `abandon` produces is Unanimous Allowed
+                // (this removal completed the all-next quorum, so an answer
+                // is already cached); FirstClaim never settles on hand-off.
                 if waterfall.abandon(&cid).is_some() {
-                    // The only settle `abandon` produces is Allowed: this
-                    // removal completed the all-next quorum, so an answer
-                    // is already cached.
                     settled = Some(Ok(
                         last_ok.expect("an Allowed quorum holds an answered delivery")
                     ));
@@ -3870,17 +3902,14 @@ async fn route_waterfall(
                 }
                 continue;
             }
-            DeliveryEvent::Reply(o) => (false, o),
-            DeliveryEvent::Expired(err) => (true, Err(err)),
+            DeliveryEvent::Reply(o) => o,
+            DeliveryEvent::Expired(err) => Err(err),
         };
         let next = outcome.is_ok();
         if let Ok(value) = &outcome {
             last_ok = Some(value.clone());
         }
         if waterfall.reply(&cid, next).is_some() {
-            if !next {
-                settled_by = Some((cid, expired));
-            }
             settled = Some(outcome);
             break;
         }
@@ -3890,7 +3919,8 @@ async fn route_waterfall(
     // call the replay can still answer, and an Error note would report a
     // hand-off as a failure. This exit's `DeliveryGuard` drop also cancels
     // the surviving co-recipients' tokens: their deliveries are silently
-    // retired until they rejoin, where the replay re-mints their waiters.
+    // retired until they rejoin, where the replay re-mints their waiters —
+    // no cancel frame is owed on a hand-off, and none is sent.
     if settled.is_none() && reseat_seen {
         return;
     }
@@ -3900,21 +3930,34 @@ async fn route_waterfall(
                 .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
         )
     });
-    // GW9: a PlanVerdict that settles against the call converges through
-    // `apply_plan_verdict`'s fail-closed arm, which sends the kind-specific
-    // Error note (naming who rejected / expired) — the generic note below is
-    // skipped for it to keep exactly one Error per rejection.
-    let verdict_failure = (outcome.is_err() && matches!(ctx, ReplyCtx::PlanVerdict { .. })).then(
-        || match &settled_by {
-            Some((cid, true)) => format!("plan verdict expired: no reply from {cid}"),
-            Some((cid, false)) => format!("plan verdict rejected by {cid}"),
-            None => "plan verdict unsettled: every delivery expired".to_string(),
-        },
-    );
-    if outcome.is_err() && verdict_failure.is_none() {
+    if outcome.is_err() {
         inner.note_error(&session_id, "adjudication rejected or lapsed (no answer)");
     }
-    apply_reply(&inner, &session_id, ctx, outcome, verdict_failure);
+    // PR-4: every recipient still holding the card when the waterfall
+    // settled is owed the terminal frame — an answer elsewhere (or the
+    // quorum's failure) is not a lapse on THEIR side. This replaces the
+    // GW9 `verdict_failure` Error-note naming (the per-client view is
+    // exactly "this delivery is over"), retired with the PlanVerdict kind
+    // itself in the same batch.
+    for cid in waterfall.cancelled_recipients() {
+        if let Some(conn) = conns.get(&cid) {
+            conn.send_to_client(FromServer::Notification {
+                note: ServerNote::DeliveryCancelled {
+                    delivery_id: delivery_id.clone(),
+                },
+            });
+        }
+    }
+    apply_reply(&inner, &session_id, ctx, outcome);
+}
+
+fn sorted_ids(targets: &[AdjudicationTarget]) -> Vec<String> {
+    let mut ids = targets
+        .iter()
+        .map(|(cid, ..)| cid.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 /// Per-`ServerCall` context carried out of the lock to apply the reply.
@@ -3965,7 +4008,6 @@ fn apply_reply(
     session_id: &str,
     ctx: ReplyCtx,
     outcome: Result<Value, RpcError>,
-    verdict_failure: Option<String>,
 ) {
     // Settlement retires the replay record first: a later owner joining
     // after this point must not be re-delivered a settled call.
@@ -3976,7 +4018,7 @@ fn apply_reply(
         ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
         ReplyCtx::PlanVerdict { plan_file } => {
-            apply_plan_verdict(inner, session_id, plan_file, outcome, verdict_failure)
+            apply_plan_verdict(inner, session_id, plan_file, outcome)
         }
         ReplyCtx::Other => {}
     }
@@ -4230,7 +4272,6 @@ fn apply_plan_verdict(
     session_id: &str,
     plan_file: String,
     outcome: Result<Value, RpcError>,
-    verdict_failure: Option<String>,
 ) {
     let choice = match outcome {
         Ok(v) => v
@@ -4248,7 +4289,7 @@ fn apply_plan_verdict(
             converge_plan_rejected(
                 inner,
                 session_id,
-                verdict_failure.unwrap_or_else(|| "plan verdict rejected or expired".to_string()),
+                "plan verdict rejected or expired".to_string(),
             );
             return;
         }

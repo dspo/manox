@@ -145,6 +145,18 @@ pub enum ServerNote {
     SessionDisposed {
         session_id: String,
     },
+    /// PR-4 (§D.4): one of THIS client's in-flight adjudication deliveries
+    /// was settled by a different owner (first-claim-wins answers, or the
+    /// quorum failed on another client's rejection). The card behind
+    /// `delivery_id` is terminal — the client must retire it locally
+    /// (surface "handled on another client") and its own
+    /// [`CancelDelivery`](crate::ClientCall::CancelDelivery) for that id
+    /// would be inert. A transport-level notification, not a turn-domain
+    /// journal event: like `Error`, it is connection-routed control, not
+    /// transcript content.
+    DeliveryCancelled {
+        delivery_id: String,
+    },
     /// Transitional list channel (§D.5 mirror): registry snapshots also ride
     /// `HostEvent::{ThreadsUpdated, Models, Commands}`; clients fold both
     /// envelopes until the note arms retire with the §K.5 closeout.
@@ -222,6 +234,20 @@ mod tests {
         let json = serde_json::to_value(&note).unwrap();
         assert_eq!(json["method"], "sessionCreated");
         assert_eq!(json["sessionId"], "t1");
+        let back: ServerNote = serde_json::from_value(json).unwrap();
+        assert_eq!(note, back);
+    }
+
+    /// PR-4 (§D.4): the "answered elsewhere" frame is keyed by the stable
+    /// GW3 delivery id, camelCase on the wire.
+    #[test]
+    fn delivery_cancelled_note_round_trips() {
+        let note = ServerNote::DeliveryCancelled {
+            delivery_id: "dlv-t1-1".into(),
+        };
+        let json = serde_json::to_value(&note).unwrap();
+        assert_eq!(json["method"], "deliveryCancelled");
+        assert_eq!(json["deliveryId"], "dlv-t1-1");
         let back: ServerNote = serde_json::from_value(json).unwrap();
         assert_eq!(note, back);
     }

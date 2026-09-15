@@ -2858,12 +2858,7 @@ fn reseat_abandonment_still_unregisters_the_delivery() {
         "the original delivery is registered"
     );
 
-    let reseated = second_client(
-        &server,
-        "test",
-        vec![AnswerKind::AskUserQuestion],
-        &["s1"],
-    );
+    let reseated = second_client(&server, "test", vec![AnswerKind::AskUserQuestion], &["s1"]);
     let replayed = loop {
         match reseated.recv() {
             FromServer::Request {
@@ -2904,6 +2899,286 @@ fn reseat_abandonment_still_unregisters_the_delivery() {
     );
     drop(client_a);
     drop(reseated);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+// ── PR-4 (C2): kind-scoped first-claim-wins + the cancel frame. ────────────
+
+/// Drain `client`'s queue for `window`, returning how many drained frames
+/// matched `check`. Every drained frame is CONSUMED — callers assert on
+/// frames they do not otherwise need.
+fn count_frames_in_window<F>(client: &Client, window: Duration, check: F) -> usize
+where
+    F: Fn(&FromServer) -> bool,
+{
+    let rx = client.conn.server_rx();
+    let settle = std::time::Instant::now() + window;
+    let mut count = 0usize;
+    loop {
+        match rx.try_recv() {
+            Ok(m) => {
+                if check(&m) {
+                    count += 1;
+                }
+            }
+            Err(_) if std::time::Instant::now() < settle => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return count,
+        }
+    }
+}
+
+/// PR-4 (C2) e2e, two owners on one session: `AskUserQuestion` settles on
+/// the FIRST claim — the first owner's answer reaches the gate, the
+/// non-claiming co-owner is handed a `DeliveryCancelled` frame naming the
+/// very delivery it was shown (its card is terminal — "handled on another
+/// client", never a lapse), and its late reply is inert.
+#[test]
+fn dual_owner_ask_first_claim_settles_and_cancels_the_other_owner() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::AskUserQuestion]);
+    create(&server, &client_a, "s1");
+    let client_b = second_client(
+        &server,
+        "test-b",
+        vec![AnswerKind::AskUserQuestion],
+        &["s1"],
+    );
+    expect(
+        &client_b,
+        |m| matches!(m, FromServer::Response { id, .. } if id.0 == "init-test-b"),
+    );
+    let (engine, events) = FakeEngine::new();
+    seed_pending_ask(&engine, "q1");
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client_a.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: "s1".into(),
+            text: "ask me".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    expect_host_status(&client_a, "s1", |running, _, _, _| running == Some(true));
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "q1".into(),
+                tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
+                summary: "pick a color".into(),
+                input: seeded_ask_input(),
+            },
+        )))
+        .unwrap();
+    // The fan-out delivers the SAME delivery identity to both owners.
+    let (a_id, a_delivery) = loop {
+        match client_a.recv() {
+            FromServer::Request {
+                id,
+                call:
+                    ServerCall::AskUserQuestion {
+                        auth_id,
+                        delivery_id,
+                        ..
+                    },
+            } if auth_id == "q1" => break (id, delivery_id),
+            _ => {}
+        }
+    };
+    let b_id = loop {
+        match client_b.recv() {
+            FromServer::Request {
+                id,
+                call:
+                    ServerCall::AskUserQuestion {
+                        auth_id,
+                        delivery_id,
+                        ..
+                    },
+            } if auth_id == "q1" => {
+                assert_eq!(
+                    delivery_id, a_delivery,
+                    "one fan-out, one delivery identity"
+                );
+                break id;
+            }
+            _ => {}
+        }
+    };
+    // A claims first: the answer reaches the gate on the first claim — the
+    // quorum (pre-fix) would still be waiting on B.
+    client_a.send(FromClient::Reply {
+        id: a_id,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["blue"]}]})),
+    });
+    wait_for_auth_settle(&engine, "q1", false);
+    expect(&client_b, |m| {
+        matches!(
+            m,
+            FromServer::Notification {
+                note: ServerNote::DeliveryCancelled { delivery_id }
+            } if delivery_id == &a_delivery
+        )
+    });
+    // B's late reply is inert: exactly one settle, the claimer's.
+    client_b.send(FromClient::Reply {
+        id: b_id,
+        outcome: Ok(json!({"answers": [{"id": "color-q", "selected": ["red"]}]})),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let held = engine.auth_responses.lock().unwrap();
+    let q1: Vec<_> = held
+        .iter()
+        .filter(|(id, _)| id == "q1")
+        .map(|(_, r)| r)
+        .collect();
+    assert_eq!(q1.len(), 1, "first-claim settles exactly once: {held:?}");
+    assert!(
+        matches!(
+            q1[0],
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                if answers == &vec![manox_agent::permission::AskAnswer::new(
+                    "color-q".into(),
+                    vec!["blue".into()],
+                    None,
+                )]
+        ),
+        "the claimer's answer is the settle that reached the gate: {q1:?}"
+    );
+    drop(held);
+    drop(client_a);
+    drop(client_b);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// PR-4 (C2) regression: `Approve` keeps the all-next quorum — a single
+/// next answer settles NOTHING and cancels nobody (the co-owner still
+/// holds a live card); the second next is the settle.
+#[test]
+fn dual_owner_approve_quorum_is_not_widened_to_first_claim() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client_a) = harness(vec![AnswerKind::Approve]);
+    create(&server, &client_a, "s1");
+    let client_b = second_client(&server, "test-b", vec![AnswerKind::Approve], &["s1"]);
+    expect(
+        &client_b,
+        |m| matches!(m, FromServer::Response { id, .. } if id.0 == "init-test-b"),
+    );
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    client_a.send(FromClient::Notification {
+        note: ClientNote::Submit {
+            session_id: "s1".into(),
+            text: "do work".into(),
+            images: vec![],
+            client_id: None,
+        },
+    });
+    expect_host_status(&client_a, "s1", |running, _, _, _| running == Some(true));
+    engine
+        .notices
+        .send(BackendNotice::Event(Box::new(
+            ThreadEvent::ToolCallAuthorization {
+                id: "a1".into(),
+                tool_name: "Bash".into(),
+                summary: "run ls".into(),
+                input: json!({}),
+            },
+        )))
+        .unwrap();
+    let (_, _delivery) = loop {
+        match client_a.recv() {
+            FromServer::Request {
+                id,
+                call:
+                    ServerCall::Approve {
+                        auth_id,
+                        delivery_id,
+                        ..
+                    },
+            } if auth_id == "a1" => break (id, delivery_id),
+            _ => {}
+        }
+    };
+    loop {
+        match client_b.recv() {
+            FromServer::Request {
+                call: ServerCall::Approve { auth_id, .. },
+                ..
+            } if auth_id == "a1" => break,
+            _ => {}
+        }
+    }
+    // A answers next: no settle, and B receives NO cancel frame for it —
+    // the delivery is still B's to answer.
+    client_a.send(FromClient::Reply {
+        id: MsgId::new("a1"),
+        outcome: Ok(json!({"allow": true})),
+    });
+    assert_eq!(
+        count_frames_in_window(&client_b, Duration::from_millis(400), |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::DeliveryCancelled { .. }
+                }
+            )
+        }),
+        0,
+        "a lone next answer may not cancel the co-owner's Approve delivery"
+    );
+    assert!(
+        engine.auth_responses.lock().unwrap().is_empty(),
+        "the quorum stays open on one answer"
+    );
+    // B answers next: the all-next quorum settles — exactly one AllowOnce,
+    // no cancel frame for either side.
+    client_b.send(FromClient::Reply {
+        id: MsgId::new("a1"),
+        outcome: Ok(json!({"allow": true})),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let responses = engine.auth_responses.lock().unwrap();
+        if responses.len() == 1
+            && matches!(
+                responses[0].1,
+                manox_agent::permission::ToolAuthorizationResponse::Decision(
+                    manox_agent::permission::PermissionDecision::AllowOnce
+                )
+            )
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the two-owner quorum never settled as exactly one AllowOnce: {responses:?}"
+        );
+        drop(responses);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        count_frames_in_window(&client_b, Duration::from_millis(400), |m| {
+            matches!(
+                m,
+                FromServer::Notification {
+                    note: ServerNote::DeliveryCancelled { .. }
+                }
+            )
+        }),
+        0,
+        "an all-next Allowed settle owes no cancel frame"
+    );
+    drop(client_a);
+    drop(client_b);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
 }
@@ -5419,13 +5694,17 @@ fn plan_verdict_rejection_converges_pending_state() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    // 4. The Error note names the rejecter.
+    // 4. The Error note fires. PR-4 (C2): the GW9 "rejected by {cid}"
+    //    per-recipient naming is retired — a lone rejecter is the settling
+    //    delivery (not a still-waiting co-recipient), so no
+    //    `DeliveryCancelled` frame is owed; the convergence Error note now
+    //    carries the generic fail-closed cause.
     expect(&client, |m| {
         matches!(
             m,
             FromServer::Notification {
                 note: ServerNote::Error { session_id: Some(sid), message }
-            } if sid == "gw9-s1" && message.contains("rejected by test")
+            } if sid == "gw9-s1" && message.contains("rejected or expired")
         )
     });
     // 5. Fail-closed: the plan never executes and plan mode stays on

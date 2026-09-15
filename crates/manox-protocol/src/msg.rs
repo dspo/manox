@@ -475,6 +475,11 @@ mod tests {
                 },
             },
             FromServer::Notification {
+                note: crate::server::ServerNote::DeliveryCancelled {
+                    delivery_id: "dlv-s1-1".into(),
+                },
+            },
+            FromServer::Notification {
                 note: crate::server::ServerNote::ThreadsUpdated { threads: vec![] },
             },
             FromServer::Notification {
