@@ -21,7 +21,7 @@ use crate::wire::{ModelInfo, ThreadListItem};
 
 /// Server → client adjudication / capability calls; the client answers with a
 /// [`crate::FromClient::Reply`]. Routed by session ownership ∩ declared
-/// [`crate::HookKind`] capability; no capable owner fails closed.
+/// [`crate::AnswerKind`] capability; no capable owner fails closed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(
     tag = "method",

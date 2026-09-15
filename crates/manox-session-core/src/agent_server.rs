@@ -21,9 +21,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use manox_protocol::answer_kind::AnswerKind;
 use manox_protocol::base64_bytes;
 use manox_protocol::client::{ClientToolSpec, ImageAttachment};
-use manox_protocol::handshake::{ClientHello, HookKind, Initialize, PROTOCOL_EPOCH};
+use manox_protocol::handshake::{ClientHello, Initialize, PROTOCOL_EPOCH};
 use manox_protocol::journal::StreamId;
 #[cfg(feature = "terminal")]
 use manox_protocol::stream::StreamFrame;
@@ -1261,8 +1262,9 @@ impl AgentServerInner {
             // already settled first-wins, so the fresh waiter's reply
             // double-applies into the same idempotent gate, and the next
             // join re-checks and finds the record gone.
-            let gate_settled = matches!(rec.kind, HookKind::Approve | HookKind::AskUserQuestion)
-                && !live_auth_ids.contains(&rec.key);
+            let gate_settled =
+                matches!(rec.kind, AnswerKind::Approve | AnswerKind::AskUserQuestion)
+                    && !live_auth_ids.contains(&rec.key);
             if gate_settled {
                 self.retire_pending_adjudication(session_id, &rec.key);
                 continue;
@@ -3410,7 +3412,7 @@ impl AgentServerInner {
 
 // ── ServerCall routing (β-3b: Approve / AskUserQuestion / PlanVerdict). ─────
 async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: ServerCall) {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     // GW3 (§D.4): the gateway is the SINGLE stamping point for delivery
     // identity — translate/pump construct the trio with an empty
     // `delivery_id` (they are pure), and every adjudication passes through
@@ -3574,7 +3576,7 @@ type AdjudicationTarget = (
 #[derive(Clone)]
 struct PendingAdjudication {
     key: String,
-    kind: HookKind,
+    kind: AnswerKind,
     ctx: ReplyCtx,
     call: ServerCall,
     /// Owners holding a live reply waiter for this call, as
@@ -4136,7 +4138,7 @@ async fn route_capability_call(
     session_id: &str,
     call: ServerCall,
 ) -> Result<Value, RpcError> {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     let id = inner.next_call_id();
     let target = {
         let owners = inner.owners(session_id);
@@ -4189,7 +4191,7 @@ async fn route_capability_call_to(
     target_client: &str,
     call: ServerCall,
 ) -> Result<Value, RpcError> {
-    let kind = hook_kind_for(&call);
+    let kind = answer_kind_for(&call);
     let id = inner.next_call_id();
     let target = {
         let owners = inner.owners(session_id);
@@ -4580,16 +4582,16 @@ fn spawn_pump(
     })
 }
 
-/// Map a `ServerCall` to the `HookKind` its answerer must declare.
-fn hook_kind_for(call: &ServerCall) -> HookKind {
+/// Map a `ServerCall` to the `AnswerKind` its answerer must declare.
+fn answer_kind_for(call: &ServerCall) -> AnswerKind {
     match call {
-        ServerCall::Approve { .. } => HookKind::Approve,
-        ServerCall::PlanVerdict { .. } => HookKind::PlanVerdict,
-        ServerCall::AskUserQuestion { .. } => HookKind::AskUserQuestion,
-        ServerCall::BrowserOp { .. } => HookKind::BrowserOp,
-        ServerCall::ClipboardRead { .. } => HookKind::ClipboardRead,
-        ServerCall::OpenExternal { .. } => HookKind::OpenExternal,
-        ServerCall::InvokeClientTool { .. } => HookKind::ClientTool,
+        ServerCall::Approve { .. } => AnswerKind::Approve,
+        ServerCall::PlanVerdict { .. } => AnswerKind::PlanVerdict,
+        ServerCall::AskUserQuestion { .. } => AnswerKind::AskUserQuestion,
+        ServerCall::BrowserOp { .. } => AnswerKind::BrowserOp,
+        ServerCall::ClipboardRead { .. } => AnswerKind::ClipboardRead,
+        ServerCall::OpenExternal { .. } => AnswerKind::OpenExternal,
+        ServerCall::InvokeClientTool { .. } => AnswerKind::ClientTool,
     }
 }
 

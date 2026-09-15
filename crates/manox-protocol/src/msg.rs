@@ -259,7 +259,7 @@ mod tests {
                 id: MsgId::new("r-1"),
                 call: crate::client::ClientCall::Initialize(crate::handshake::Initialize {
                     client_id: "test".into(),
-                    capabilities: vec![crate::handshake::HookKind::Approve],
+                    capabilities: vec![crate::answer_kind::AnswerKind::Approve],
                     sessions: vec![],
                     protocol_epoch: crate::handshake::PROTOCOL_EPOCH,
                 }),
