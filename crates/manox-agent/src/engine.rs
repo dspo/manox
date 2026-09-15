@@ -582,6 +582,7 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
         | ThreadEvent::HistoryProgress
         | ThreadEvent::HistoryRestored
         | ThreadEvent::SteerInjected { .. }
+        | ThreadEvent::UserRowLanded { .. }
         | ThreadEvent::PeerMessage { .. } => return None,
     })
 }
