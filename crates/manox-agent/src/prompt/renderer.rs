@@ -79,9 +79,6 @@ const TPL_PLAN_MODE_APPROVED_EN: &str =
     include_str!("templates/en/mode/plan_mode_approved.tera.md");
 const TPL_PLAN_MODE_APPROVED_ZH_CN: &str =
     include_str!("templates/zh-CN/mode/plan_mode_approved.tera.md");
-const TPL_AGENT_TOOL_EN: &str = include_str!("templates/en/tools/agent_tool.tera.md");
-const TPL_AGENT_TOOL_ZH_CN: &str = include_str!("templates/zh-CN/tools/agent_tool.tera.md");
-
 /// `(PromptTemplate, English source, 简体中文 source)` for every built-in
 /// template. The single source of truth for what gets parsed into each
 /// language's Tera registry.
@@ -160,11 +157,6 @@ const REGISTRATIONS: &[(PromptTemplate, &str, &str)] = &[
         PromptTemplate::ModePlanApproved,
         TPL_PLAN_MODE_APPROVED_EN,
         TPL_PLAN_MODE_APPROVED_ZH_CN,
-    ),
-    (
-        PromptTemplate::AgentToolDescription,
-        TPL_AGENT_TOOL_EN,
-        TPL_AGENT_TOOL_ZH_CN,
     ),
 ];
 
@@ -593,34 +585,6 @@ mod tests {
                 )
                 .unwrap(),
                 PromptTemplate::SkillBody,
-                lang,
-            );
-
-            // Agent tool description (both branches: with/without subagents).
-            assert_clean(
-                &render(
-                    PromptTemplate::AgentToolDescription,
-                    lang,
-                    &crate::prompt::AgentToolDescriptionData {
-                        subagents: vec![crate::prompt::SubagentTypeData {
-                            name: "plan".to_string(),
-                            capability: "read-only",
-                            description: "plans".to_string(),
-                        }],
-                    },
-                )
-                .unwrap(),
-                PromptTemplate::AgentToolDescription,
-                lang,
-            );
-            assert_clean(
-                &render(
-                    PromptTemplate::AgentToolDescription,
-                    lang,
-                    &crate::prompt::AgentToolDescriptionData { subagents: vec![] },
-                )
-                .unwrap(),
-                PromptTemplate::AgentToolDescription,
                 lang,
             );
         }

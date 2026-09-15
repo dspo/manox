@@ -52,6 +52,7 @@ pub mod sidebar_order;
 pub mod skill;
 pub mod slash_builtins;
 pub mod steer_bus;
+pub mod subagent;
 pub mod subagent_restore;
 pub mod subagent_watchdog;
 pub mod team;
