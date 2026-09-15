@@ -73,7 +73,7 @@ pub mod monitor_bridge;
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};
 pub use message::{Message, MessageAuthor, MessageProvenance, MessageUiMetadata};
-pub use permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
+pub use permission::{AskAnswer, PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
 pub use plan::{PlanSnapshot, PlanStep, PlanStepStatus};
 pub use thread::{
     SideCallMetric, SubagentChildEvent, Thread, ThreadEvent, ThreadId, ToolCallStatus,

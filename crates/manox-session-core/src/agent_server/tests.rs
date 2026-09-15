@@ -1869,7 +1869,7 @@ fn ask_user_question_round_trips() {
     };
     client.send(FromClient::Reply {
         id: call_id,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     // The engine received the structured answers (not a bare Deny).
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1907,6 +1907,30 @@ fn ask_user_question_round_trips() {
 
 // ── §D.6 replay of parked adjudications + R1 expired verdicts. ─────────────
 
+/// The canonical parked-card input for the ask tests: one single-select
+/// question with the B2-PR-1 vocabulary (stable `id`, question text the
+/// legacy reply shape joins by).
+fn seeded_ask_input() -> Value {
+    json!({"questions": [{
+        "id": "color-q",
+        "question": "color?",
+        "header": "color",
+        "multiSelect": false,
+        "options": [
+            {"label": "blue", "description": ""},
+            {"label": "red", "description": ""}
+        ]
+    }]})
+}
+
+/// The canonical settle the transitional reader produces for a LEGACY
+/// positional reply `[["color?", <text>]]` against `seeded_ask_input()`:
+/// the old free text arrives as the answer's `custom` (the legacy shape has
+/// no way to say "selection"), routed by the parked question's id.
+fn legacy_answer(text: &str) -> manox_agent::permission::AskAnswer {
+    manox_agent::permission::AskAnswer::new("color-q".into(), vec![], Some(text.into()))
+}
+
 /// Seed the fake engine's pending set: the real engine's gate holds a
 /// parked interaction until it answers, and the replay settle-truth reads
 /// that same set.
@@ -1916,7 +1940,7 @@ fn seed_pending_ask(engine: &std::sync::Arc<FakeEngine>, auth_id: &str) {
         manox_agent::permission::PendingAuthMeta {
             tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
             summary: "pick a color".into(),
-            input: json!({"question": "color?"}),
+            input: seeded_ask_input(),
         },
     ));
 }
@@ -1946,7 +1970,7 @@ fn park_ask(
                 id: auth_id.into(),
                 tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
                 summary: "pick a color".into(),
-                input: json!({"question": "color?"}),
+                input: seeded_ask_input(),
             },
         )))
         .unwrap();
@@ -2055,7 +2079,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     );
     client_b.send(FromClient::Reply {
         id: b_id,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     // Drain A's still-open waiter with a late reply so the original
@@ -2066,7 +2090,7 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     // settle it receives, in arrival order.
     client_a.send(FromClient::Reply {
         id: a_id,
-        outcome: Ok(json!({"answers": [["color", "red"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "red"]], "response": null})),
     });
     std::thread::sleep(Duration::from_millis(200));
     let held = engine.auth_responses.lock().unwrap();
@@ -2078,8 +2102,8 @@ fn parked_ask_replays_to_a_late_owner_and_retires_on_settle() {
     assert!(
         matches!(
             q1[0],
-            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
-                if answers == &vec![("color".to_string(), "blue".to_string())]
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                if answers == &vec![legacy_answer("blue")]
         ),
         "the replayed owner's answer is the settle that reaches the gate first: {q1:?}"
     );
@@ -2190,6 +2214,94 @@ fn ask_dismissed_marker_converges_as_dismissed() {
     }
 }
 
+/// B2-PR-1 (transitional both-read, single write): the LEGACY positional
+/// reply shape — including the removed card-level `response` override, mapped
+/// into the canonical supplement vocabulary — and the NEW id-routed
+/// tri-state shape both converge to the SAME canonical
+/// `ToolAuthorizationResponse::AskUserQuestion` at the gate. This is the
+/// end-to-end shape-mismatch guard the plan demands before the paired
+/// manox-app PR lands.
+#[test]
+fn legacy_and_canonical_ask_replies_converge_to_one_canonical() {
+    use manox_agent::permission::{AskAnswer, ToolAuthorizationResponse};
+    let _g = lock_globals();
+    let cases: Vec<(&str, Value, Vec<AskAnswer>)> = vec![
+        (
+            "legacy positional answer",
+            json!({"answers": [["color?", "blue"]], "response": null}),
+            // The legacy text has no selection/supplement distinction: it
+            // arrives as the answer's `custom` under the parked question's id.
+            vec![AskAnswer::new(
+                "color-q".into(),
+                vec![],
+                Some("blue".into()),
+            )],
+        ),
+        (
+            "legacy card-level response only (old free-text dismissal of the card)",
+            json!({"answers": [], "response": "let me type instead"}),
+            vec![AskAnswer::new(
+                "color-q".into(),
+                vec![],
+                Some("let me type instead".into()),
+            )],
+        ),
+        (
+            "canonical id-routed selection",
+            json!({"answers": [{"id": "color-q", "selected": ["blue"]}]}),
+            vec![AskAnswer::new("color-q".into(), vec!["blue".into()], None)],
+        ),
+        (
+            "canonical explicit skip",
+            json!({"answers": [{"id": "color-q", "selected": [], "custom": "  "}]}),
+            // A blank custom normalises away: skip is `{[], None}`.
+            vec![AskAnswer::new("color-q".into(), vec![], None)],
+        ),
+    ];
+    for (name, payload, expected) in cases {
+        hermetic_home();
+        init_globals();
+        let (server, client) = harness(vec![AnswerKind::AskUserQuestion]);
+        create(&server, &client, "s1");
+        let (engine, events) = FakeEngine::new();
+        seed_pending_ask(&engine, "q1");
+        server.set_session_engine_for_test("s1", engine.clone(), events);
+        let id = park_ask(&client, &engine, "s1", "q1");
+        client.send(FromClient::Reply {
+            id,
+            outcome: Ok(payload.clone()),
+        });
+        wait_for_auth_settle(&engine, "q1", false);
+        let got = engine
+            .auth_responses
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(aid, _)| aid == "q1")
+            .find_map(|(_, r)| match r {
+                ToolAuthorizationResponse::AskUserQuestion { answers } => Some(answers.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: never converged to a canonical answer: {payload}"));
+        assert_eq!(
+            got, expected,
+            "{name} must normalise to the canonical answers"
+        );
+        engine
+            .notices
+            .send(BackendNotice::Settled {
+                cancelled: false,
+                failed: false,
+                steered: Vec::new(),
+                stranded: Vec::new(),
+            })
+            .unwrap();
+        drop(client);
+        drop(server);
+        manox_agent::thread_store::drop_global_for_test();
+    }
+}
+
 /// PR-0a: with the 300s wall-clock removed from the adjudication wait, a
 /// parked ask whose owner is STILL connected and simply has not answered yet
 /// must NOT be settled as `Expired`. (Before PR-0a this converged to Expired
@@ -2234,7 +2346,7 @@ fn parked_ask_is_not_expired_while_the_owner_stays_connected() {
     let id = MsgId::new("q1".to_string());
     client.send(FromClient::Reply {
         id,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     let held = engine.auth_responses.lock().unwrap();
@@ -2292,7 +2404,7 @@ fn reown_resends_the_parked_ask_through_the_live_waiter() {
     );
     client_a.send(FromClient::Reply {
         id: resent,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     std::thread::sleep(Duration::from_millis(200));
@@ -2374,7 +2486,7 @@ fn ask_survives_same_client_reseat() {
     );
     reseated.send(FromClient::Reply {
         id: replayed,
-        outcome: Ok(json!({"answers": [["color", "blue"]], "response": null})),
+        outcome: Ok(json!({"answers": [["color?", "blue"]], "response": null})),
     });
     wait_for_auth_settle(&engine, "q1", false);
     std::thread::sleep(Duration::from_millis(200));
@@ -2383,8 +2495,8 @@ fn ask_survives_same_client_reseat() {
         held.iter().any(|(id, r)| id == "q1"
             && matches!(
                 r,
-                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers, .. }
-                    if answers == &vec![("color".to_string(), "blue".to_string())]
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+                    if answers == &vec![legacy_answer("blue")]
             )),
         "the re-seated owner's answer reaches the gate: {held:?}"
     );

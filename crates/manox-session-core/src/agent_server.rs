@@ -3952,6 +3952,111 @@ fn apply_approve_reply(
     clear_pending_auth_if_settled(inner, session_id);
 }
 
+/// B2-PR-1 **transitional reply reader** for `apply_ask_reply`.
+///
+/// Accepts BOTH shapes and converges them to the canonical variant
+/// (`manox_agent::permission::AskAnswer`), so a pre-L1 client keeps working
+/// for exactly one release while paired clients ship the new shape:
+/// - NEW canonical: `{"answers": [{"id", "selected": [labels], "custom"?}]}`
+///   — id-routed tri-state (skip = empty `selected` with no `custom`).
+/// - OLD positional: `{"answers": [["question text", "answer text"], …]}`
+///   — joined by the question TEXT against the parked card's input; an
+///   answer whose question text is unknown is dropped. The old CARD-LEVEL
+///   `response: string` override is mapped into the canonical supplement
+///   vocabulary: it folds as a `custom` on the FIRST parked question (it
+///   always dismissed the whole card for the model, and the model-facing
+///   renderer reads `custom` as a supplemental note), and a non-empty old
+///   `response` also converts the old empty-answers default into one
+///   synthesized row instead of silently dropping the user's free text.
+///
+/// RETIREMENT: delete this both-read — accept ONLY the canonical shape — once
+/// the paired manox-app PR (canonical reply writer) is merged AND one
+/// manox-server release has shipped (the same no-lockstep window the plan's
+/// "transitional both-read, single write" calls for).
+fn parse_ask_answers(
+    parked_input: Option<&serde_json::Value>,
+    v: &serde_json::Value,
+) -> Vec<manox_agent::permission::AskAnswer> {
+    use manox_agent::permission::AskAnswer;
+    fn question_text(q: &serde_json::Value) -> &str {
+        q.get("question").and_then(Value::as_str).unwrap_or("")
+    }
+    let questions = parked_input
+        .and_then(|i| i.get("questions"))
+        .and_then(|q| q.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let parse_canonical = |arr: &[Value]| -> Vec<AskAnswer> {
+        arr.iter()
+            .filter_map(|p| {
+                let id = p.get("id").and_then(Value::as_str)?;
+                if id.trim().is_empty() || !p.get("selected").is_some_and(Value::is_array) {
+                    return None; // not a canonical row — drop, never guess
+                }
+                let selected: Vec<String> = p["selected"]
+                    .as_array()
+                    .map(|s| {
+                        s.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(AskAnswer::new(
+                    id.to_string(),
+                    selected,
+                    p.get("custom").and_then(Value::as_str).map(String::from),
+                ))
+            })
+            .collect()
+    };
+    let parse_legacy = |arr: &[Value]| -> Vec<AskAnswer> {
+        arr.iter()
+            .filter_map(|p| {
+                let q = p.get(0).and_then(Value::as_str)?;
+                let a = p.get(1).and_then(Value::as_str).unwrap_or("");
+                let id = questions
+                    .iter()
+                    .find(|it| question_text(it) == q)
+                    .and_then(|it| it.get("id"))
+                    .and_then(Value::as_str)?;
+                Some(AskAnswer::new(
+                    id.to_string(),
+                    Vec::new(),
+                    (!a.is_empty()).then(|| a.to_string()),
+                ))
+            })
+            .collect()
+    };
+    let mut answers = match v.get("answers").and_then(Value::as_array) {
+        Some(arr) if arr.iter().all(|p| p.is_array()) => parse_legacy(arr),
+        Some(arr) => parse_canonical(arr),
+        None => Vec::new(),
+    };
+    // Transitional mapping of the removed card-level `response` override
+    // (old clients only — canonical replies never carry the key).
+    if let Some(legacy_response) = v.get("response").and_then(Value::as_str)
+        && !legacy_response.trim().is_empty()
+    {
+        if let Some(first) = answers.iter_mut().find(|a| a.custom.is_none()) {
+            first.custom = Some(legacy_response.to_string());
+        } else if let Some(first_q) = questions
+            .first()
+            .and_then(|q| q.get("id"))
+            .and_then(Value::as_str)
+        {
+            answers.insert(
+                0,
+                AskAnswer::new(
+                    first_q.to_string(),
+                    Vec::new(),
+                    Some(legacy_response.to_string()),
+                ),
+            );
+        }
+    }
+    answers
+}
+
 fn apply_ask_reply(
     inner: &Arc<AgentServerInner>,
     session_id: &str,
@@ -3963,30 +4068,36 @@ fn apply_ask_reply(
         // speak replies with an explicit `dismissed` marker (a top-level bool,
         // or the report's canonical `outcome: "dismissed"`). A non-answer that
         // is neither a rejection nor a lapse. Old clients never send it, so the
-        // answer/`response` path is byte-for-byte unchanged for them; the
-        // manox-app side of this marker is a coordinated batch-2 change.
+        // answer path is byte-for-byte unchanged for them; the manox-app side
+        // of this marker is a coordinated batch-2 change.
         Ok(v)
             if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
                 || v.get("outcome").and_then(Value::as_str) == Some("dismissed") =>
         {
             manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
         }
-        Ok(v) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion {
-            answers: v
-                .get("answers")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|p| {
-                            let q = p.get(0).and_then(Value::as_str)?.to_string();
-                            let a = p.get(1).and_then(Value::as_str).unwrap_or("").to_string();
-                            Some((q, a))
-                        })
-                        .collect()
+        Ok(v) => {
+            // B2-PR-1: the reply is parsed through the transitional
+            // both-read, single-write reader above; everything the gate
+            // receives is canonical, id-routed tri-state. The parked card's
+            // input is read from the SAME session-thread borrow as the
+            // settle, so the question-text → id map for old-shape replies
+            // always describes THIS auth_id's card.
+            let answers = inner
+                .session_thread(session_id)
+                .map(|thread| {
+                    thread.with_mut(|t| {
+                        let parked = t
+                            .pending_auth_entries()
+                            .into_iter()
+                            .find(|(id, _)| id == &auth_id)
+                            .map(|(_, meta)| meta.input);
+                        parse_ask_answers(parked.as_ref(), &v)
+                    })
                 })
-                .unwrap_or_default(),
-            response: v.get("response").and_then(Value::as_str).map(String::from),
-        },
+                .unwrap_or_default();
+            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+        }
         // The reply never arrived as an answer (a withdrawn delivery, a
         // disconnected peer, or an abandoned replay waiter — NOT a wall-clock
         // timeout, which PR-0a removed for human adjudications): an explicit
