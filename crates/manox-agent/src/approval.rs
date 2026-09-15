@@ -845,32 +845,17 @@ impl PiAgentTool for PiAskUserQuestionTool {
 
         match response {
             ToolAuthorizationResponse::AskUserQuestion { answers } => {
-                // B2-PR-1 transitional renderer: the canonical tri-state
-                // answers are folded into the EXISTING Tera `Question:/
-                // Answer:` (+ supplemental note) shape — the model-facing
-                // encoding itself is replaced by B2-PR-2's compact canonical
-                // JSON. The fold must stay faithful:
-                // - single-select custom REPLACES the selection,
-                // - multi-select custom SUPPLEMENTS it,
-                // - an explicit skip renders as an unmistakable non-answer
-                //   line (never an empty `Answer:`), and
-                // - the card-level `response` override is gone: free text can
-                //   only ever attach to its own question.
-                let (qas, supplements) = fold_ask_answers(&params, answers);
-                let response = if supplements.is_empty() {
-                    None
-                } else {
-                    Some(supplements.join("\n"))
-                };
-                let text = crate::prompt::render(
-                    crate::prompt::PromptTemplate::WrapperAskUserQuestions,
-                    lang,
-                    &crate::prompt::AskUserQuestionsData {
-                        answers: qas,
-                        response,
-                    },
-                )
-                .expect("ask user questions render");
+                // PR-2 (C3): the model-facing encoding is the CANONICAL JSON
+                // line — the same vocabulary the client answered with:
+                // `{"answers":[{"id":…,"selected":[…],"custom":…?},…]}`.
+                // Skip is exactly `selected: []` with no `custom` (the
+                // prose skip line and the localized Question:/Answer:
+                // wrapper are gone: free text can only ever attach to its
+                // own question, single-select custom replaces the
+                // selection, multi-select custom supplements it — folded
+                // by `fold_ask_answers`).
+                let rows = fold_ask_answers(&params, answers);
+                let text = serde_json::json!({ "answers": rows }).to_string();
                 Ok(AgentToolResult::text(text))
             }
             // A lapsed delivery (no client able to answer, or a withdrawn
@@ -912,12 +897,6 @@ impl PiAgentTool for PiAskUserQuestionTool {
         }
     }
 }
-
-/// The model-facing line for an explicitly-skipped question (B2-PR-1
-/// tri-state). Always English, never i18n — the same discipline as the
-/// Dismissed/Expired verdict lines: the skip is model input, not UI copy.
-const ASK_SKIPPED_ANSWER: &str = "(The user explicitly skipped this question — they declined to answer it \
-     on purpose. Do not read this as consent or agreement.)";
 
 /// Mint a stable `id` onto every question that lacks one (B2-PR-1). Runs in
 /// `execute` after validation and before the request is parked/emitted, so
@@ -1096,32 +1075,33 @@ fn ask_user_question_schema() -> serde_json::Value {
     })
 }
 
-/// B2-PR-1: fold the canonical id-routed tri-state answers into the
-/// pre-existing Tera `{ question, answer }` rows plus card-level
-/// supplementals. Returns `(rows, supplements)`; the caller only sets the
-/// template's `response` from the SUPPLEMENTS (free text a multi-select
-/// answer carried alongside its selections) — the old client-sent card-level
-/// override is gone.
-///
-/// Routing is by `id` against the parked request input: an answer whose id
-/// matches no question is dropped (the client answered a card that is not
-/// this call's). Faithfulness rules:
-/// - `selected` non-empty + no custom → labels joined by `", "`.
-/// - custom on a SINGLE-select question → REPLACES the selection.
-/// - custom on a MULTI-select question alongside selections → SUPPLEMENTS:
-///   the labels answer the question, the text rides a supplemental note.
-/// - empty selection + no custom (or blank custom) → explicit skip line.
+/// B2-PR-1 / PR-2: fold the canonical id-routed tri-state answers into
+/// the canonical model-facing JSON rows — one object per answered
+/// question, `{"id", "selected": [label…], "custom"?: string}`, serialized
+/// under the top-level `{"answers": [...]}` by the caller. Routing is by
+/// `id` against the parked request input: an answer whose id matches no
+/// question is dropped (the client answered a card that is not this
+/// call's). Faithfulness rules (unchanged from the transitional renderer,
+/// now expressed in the vocabulary itself):
+/// - `selected` non-empty + no custom → the labels.
+/// - custom on a SINGLE-select question → REPLACES the selection
+///   (`selected: []` + the text).
+/// - custom on a MULTI-select question alongside selections →
+///   SUPPLEMENTS: labels plus `custom`.
+/// - multi-select, nothing picked, + custom → the text is the whole
+///   answer (`selected: []` + `custom`).
+/// - empty selection + no/blank custom → an explicit skip:
+///   `selected: []` with NO `custom`.
 fn fold_ask_answers(
     parked_input: &serde_json::Value,
     answers: Vec<AskAnswer>,
-) -> (Vec<crate::prompt::AskUserQa>, Vec<String>) {
+) -> Vec<serde_json::Value> {
     let questions = parked_input
         .get("questions")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
     let mut rows = Vec::new();
-    let mut supplements = Vec::new();
     for answer in answers {
         let Some(question) = questions
             .iter()
@@ -1129,41 +1109,25 @@ fn fold_ask_answers(
         else {
             continue; // id-routed: an answer for another card settles nothing here
         };
-        let text = question
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or(answer.id.as_str())
-            .to_string();
         let multi = question
             .get("multiSelect")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let row = |answer_text: String| crate::prompt::AskUserQa {
-            question: text.clone(),
-            answer: answer_text,
-        };
-        if answer.is_skip() {
-            rows.push(row(ASK_SKIPPED_ANSWER.to_string()));
-            continue;
-        }
-        let labels = answer.selected.join(", ");
-        match (multi, labels.is_empty(), answer.custom) {
-            // Single-select: custom replaces the selection outright.
-            (false, _, Some(custom)) => rows.push(row(custom)),
-            // Multi-select + selections: custom supplements.
-            (true, false, Some(custom)) => {
-                rows.push(row(labels));
-                supplements.push(custom);
+        let mut row = serde_json::json!({
+            "id": answer.id,
+            "selected": answer.selected,
+        });
+        if let Some(custom) = answer.custom {
+            // Single-select custom replaces the selection outright
+            // (dsh L6.3); multi-select custom supplements it.
+            if !multi {
+                row["selected"] = serde_json::Value::Array(Vec::new());
             }
-            // Multi-select, nothing picked: the text is the whole answer.
-            (true, true, Some(custom)) => rows.push(row(custom)),
-            // Selections only.
-            (_, false, None) => rows.push(row(labels)),
-            // Blank custom on a selection-empty answer — normalised skip.
-            (_, true, None) => rows.push(row(ASK_SKIPPED_ANSWER.to_string())),
+            row["custom"] = serde_json::Value::String(custom);
         }
+        rows.push(row);
     }
-    (rows, supplements)
+    rows
 }
 
 #[cfg(test)]
@@ -1453,8 +1417,11 @@ mod tests {
         assert_eq!(before, input);
     }
 
+    /// PR-2 (C3): the fold produces the canonical JSON rows — skip is
+    /// `selected: []` without a `custom`, single-select custom replaces the
+    /// selection, multi-select custom supplements it, unknown ids drop.
     #[test]
-    fn fold_ask_answers_translates_the_tristate() {
+    fn fold_ask_answers_produces_canonical_json_rows() {
         let parked = serde_json::json!({
             "questions": [
                 {"id": "s1", "question": "single?", "header": "h", "multiSelect": false,
@@ -1465,7 +1432,7 @@ mod tests {
                  "options": [{"label": "p", "description": ""}, {"label": "q", "description": ""}]}
             ]
         });
-        let (rows, supplements) = fold_ask_answers(
+        let rows = fold_ask_answers(
             &parked,
             vec![
                 // Multi-select: selections + custom → labels answer, custom supplements.
@@ -1482,21 +1449,19 @@ mod tests {
                 AskAnswer::new("nope".into(), vec!["a".into()], None),
             ],
         );
-        assert_eq!(rows.len(), 3, "the unknown-id answer is dropped");
-        assert_eq!(rows[0].question, "multi?");
-        assert_eq!(rows[0].answer, "x, y");
-        assert_eq!(supplements, vec!["and also z".to_string()]);
-        assert_eq!(rows[1].question, "single?");
-        assert_eq!(rows[1].answer, "a");
-        assert_eq!(rows[2].question, "skip?");
-        assert!(
-            rows[2].answer.contains("explicitly skipped") && rows[2].answer.contains("skipped"),
-            "skip renders the explicit English line: {}",
-            rows[2].answer
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!({"id": "m1", "selected": ["x", "y"], "custom": "and also z"}),
+                serde_json::json!({"id": "s1", "selected": ["a"]}),
+                // Skip: empty `selected`, NO `custom` key — no prose line.
+                serde_json::json!({"id": "k1", "selected": []}),
+            ],
+            "the unknown-id answer is dropped and the tri-state speaks the canonical shape"
         );
 
         // Single-select custom REPLACES the selection (dsh L6.3).
-        let (rows, supplements) = fold_ask_answers(
+        let rows = fold_ask_answers(
             &parked,
             vec![AskAnswer::new(
                 "s1".into(),
@@ -1504,21 +1469,81 @@ mod tests {
                 Some("typed".into()),
             )],
         );
-        assert_eq!(rows[0].answer, "typed", "custom overrides the selection");
-        assert!(
-            supplements.is_empty(),
-            "single-select custom is never a supplement"
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"id": "s1", "selected": [], "custom": "typed"}),
+            "custom overrides the selection, leaving `selected` empty"
         );
 
-        // Blank custom normalises to an explicit skip.
-        let (rows, _) = fold_ask_answers(
+        // Multi-select, nothing picked + custom → the text is the whole answer.
+        let rows = fold_ask_answers(
+            &parked,
+            vec![AskAnswer::new("m1".into(), vec![], Some("free".into()))],
+        );
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"id": "m1", "selected": [], "custom": "free"})
+        );
+
+        // Blank custom normalises (via AskAnswer::new) to an explicit skip.
+        let rows = fold_ask_answers(
             &parked,
             vec![AskAnswer::new("k1".into(), vec![], Some("   ".into()))],
         );
-        assert!(
-            rows[0].answer.contains("explicitly skipped"),
-            "blank custom collapses to skip: {}",
-            rows[0].answer
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"id": "k1", "selected": []}),
+            "blank custom collapses to skip"
+        );
+    }
+
+    /// PR-2 (C3): the tool's success result is ONE canonical JSON line —
+    /// `{"answers": [...]}` — with no wrapper prose; the model sees exactly
+    /// the vocabulary the client answered with.
+    #[tokio::test]
+    async fn ask_success_result_is_the_canonical_json_line() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let params = serde_json::json!({
+            "questions": [{
+                "id": "shape-q", "question": "shape?", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "round", "description": ""},
+                    {"label": "square", "description": ""},
+                ],
+            }],
+        });
+        let settle = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                gate.respond(
+                    "ask-1",
+                    ToolAuthorizationResponse::AskUserQuestion {
+                        answers: vec![AskAnswer::new(
+                            "shape-q".into(),
+                            vec!["round".into()],
+                            None,
+                        )],
+                    },
+                );
+            })
+        };
+        let result = tool
+            .execute("ask-1", params, CancellationToken::new(), &ctx)
+            .await
+            .expect("the ask tool returns a tool result, not a hard error");
+        settle.await.unwrap();
+        assert!(!result.is_error);
+        let text = result_text(&result);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).expect("the success result is one JSON line: {text}");
+        assert_eq!(
+            parsed,
+            serde_json::json!({"answers": [{"id": "shape-q", "selected": ["round"]}]})
         );
     }
 
@@ -1722,10 +1747,16 @@ mod tests {
         }
         assert_eq!(card_ids.len(), 1, "one authorization event");
         assert!(uuid::Uuid::parse_str(&card_ids[0]).is_ok());
-        // The rendered row shows the question's own text and the selected
-        // label (language-independent: both are payload strings).
-        let text = result_text(&result);
-        assert!(text.contains('q') && text.contains('a'), "rendered: {text}");
+        // PR-2 (C3): the settle arrives as the canonical JSON line, routed
+        // by the minted id — the selected label, language-independent, is
+        // what the model reads.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
+        assert_eq!(
+            parsed["answers"][0]["selected"][0], "a",
+            "the id-routed answer is the settle payload"
+        );
+        assert_eq!(parsed["answers"][0]["id"], card_ids[0]);
     }
 
     /// D5 `DELEGATED_CALLER`: the ask tool refuses to park a human when it is

@@ -128,20 +128,6 @@ pub struct PeerMessageData {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct AskUserQa {
-    pub question: String,
-    pub answer: String,
-}
-
-/// Multi-question ask-user result: each `{ question, answer }` rendered as a
-/// `Question: …\nAnswer: …` block.
-#[derive(Debug, Clone, Serialize)]
-pub struct AskUserQuestionsData {
-    pub answers: Vec<AskUserQa>,
-    pub response: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct RecoveryFailureData {
     pub reason: String,
 }
