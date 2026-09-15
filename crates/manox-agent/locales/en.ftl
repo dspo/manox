@@ -382,6 +382,7 @@ workspace-reasoning-max = Max
 workspace-clarify-title = Clarifying question
 workspace-ask-supplement-label = Supplemental note
 workspace-ask-supplement-placeholder = Add optional context
+workspace-ask-settled-elsewhere = Handled in another client
 workspace-ask-recommended = Recommended
 workspace-cancel = Cancel
 pending-auth-title = Approval requested

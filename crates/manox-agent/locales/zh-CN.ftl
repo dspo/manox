@@ -368,6 +368,7 @@ workspace-reasoning-max = 最高
 workspace-clarify-title = 澄清问题
 workspace-ask-supplement-label = 补充说明
 workspace-ask-supplement-placeholder = 添加可选补充说明
+workspace-ask-settled-elsewhere = 已在另一客户端处理
 workspace-ask-recommended = 推荐
 workspace-cancel = 取消
 pending-auth-title = 审批请求
