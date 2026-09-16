@@ -260,7 +260,6 @@ impl ProjectionSet {
         }
     }
 
-    /// The full baseline (snapshot payload, §D.1 `SessionSnapshot`).
     /// Whole-cut checkpoint rows (the durable cache's write face).
     pub fn checkpoint_rows(&self) -> BTreeMap<String, (u64, JsonValue)> {
         self.slots
@@ -310,6 +309,7 @@ impl ProjectionSet {
         }
     }
 
+    /// The full baseline (snapshot payload, §D.1 `SessionSnapshot`).
     pub fn baseline(&self) -> BTreeMap<String, JsonValue> {
         self.slots
             .iter()

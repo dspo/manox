@@ -17,7 +17,7 @@
 //! (BrowserOp/ClipboardRead/OpenExternal), terminal, and model_chat are
 //! β-3b-ii.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -162,6 +162,9 @@ struct AgentServerInner {
     /// half of the supersede contract; the sidecar marker is the
     /// restart-surviving half (`ThreadStore::superseded_by`).
     superseded: Mutex<HashMap<String, String>>,
+    /// Bind hand-offs in flight per predecessor: two quick `SetCwd` notes
+    /// must not mint two successors (review #805 [sugg] 6).
+    binding: Mutex<HashSet<String>>,
     /// The session-shared projection fold (one cell per session, fanned out
     /// to every follow stream; checkpoint-backed across restarts).
     projections: Arc<crate::projection_hub::ProjectionHub>,
@@ -634,6 +637,7 @@ impl AgentServer {
         let inner = Arc::new(AgentServerInner {
             cwd,
             superseded: Mutex::new(HashMap::new()),
+            binding: Mutex::new(HashSet::new()),
             projections: Arc::new(crate::projection_hub::ProjectionHub::default()),
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -981,7 +985,8 @@ impl AgentServerInner {
                     stream_id,
                     stream_kind,
                 } => {
-                    self.open_stream(&client_id, conn.clone(), stream_id, stream_kind);
+                    self.open_stream(&client_id, conn.clone(), stream_id, stream_kind)
+                        .await;
                 }
                 FromClient::StreamCancel { stream_id } => {
                     let handle = self
@@ -1004,26 +1009,37 @@ impl AgentServerInner {
     }
 
     // ── Pure state accessors (no spawning). ─────────────────────────────────
-    fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
-        // Resolve bind redirects (live map first, sidecar marker after a
-        // restart) so every session-addressed op converges on the
-        // successor log; bounded walk against a redirect cycle.
+    /// Resolve the bind redirect chain: the live map first, the sidecar
+    /// `superseded_by` marker as the restart-surviving half (cached into
+    /// the live map on first hit). The superseded guard drops before the
+    /// store read (lock order), and the bounded walk caps cycles.
+    fn resolve_redirect(&self, session_id: &str) -> String {
         let mut id = session_id.to_string();
         for _ in 0..8 {
-            let next = self.superseded.lock().get(&id).cloned().or_else(|| {
-                manox_agent::thread_store::try_global()
-                    .and_then(|store| store.read(|s| s.superseded_by(&id)))
+            let next = { self.superseded.lock().get(&id).cloned() };
+            let next = next.or_else(|| {
+                let from_store = manox_agent::thread_store::try_global()
+                    .and_then(|store| store.read(|s| s.superseded_by(&id)));
+                if let Some(succ) = &from_store {
+                    self.superseded.lock().insert(id.clone(), succ.clone());
+                }
+                from_store
             });
             match next {
                 Some(next) if next != id => id = next,
                 _ => break,
             }
         }
+        id
+    }
+
+    fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
+        let id = self.resolve_redirect(session_id);
         self.sessions.lock().get(&id).map(|s| s.thread.clone())
     }
 
     // ── §D.1 stream services. ───────────────────────────────────────────────
-    fn open_stream(
+    async fn open_stream(
         self: &Arc<Self>,
         client_id: &str,
         conn: Arc<dyn RpcConnection>,
@@ -1056,16 +1072,30 @@ impl AgentServerInner {
             // FollowTerminal is handled above; no other kind exists.
             return;
         };
-        let Some(thread) = self.session_thread(&session_id) else {
-            // §D.7 `session/not-found` as a terminal failure frame.
-            conn.send_to_client(FromServer::StreamEnd {
-                stream_id,
-                reason: StreamEndReason::Failure {
-                    code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
-                    message: format!("unknown session {session_id}"),
-                },
-            });
-            return;
+        let thread = match self.session_thread(&session_id) {
+            Some(thread) => thread,
+            None => {
+                // Restart window: the redirect target is not open in this
+                // process yet — open it under its own id (owner = this
+                // connection) and alias the stream onto it (review #805
+                // [issue] 4).
+                let effective = self.resolve_redirect(&session_id);
+                if !self.sessions.lock().contains_key(&effective) {
+                    let _ = open_session(self, client_id, &effective).await;
+                }
+                let Some(thread) = self.session_thread(&session_id) else {
+                    // §D.7 `session/not-found` as a terminal failure frame.
+                    conn.send_to_client(FromServer::StreamEnd {
+                        stream_id,
+                        reason: StreamEndReason::Failure {
+                            code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
+                            message: format!("unknown session {session_id}"),
+                        },
+                    });
+                    return;
+                };
+                thread
+            }
         };
         let handle = StreamHandle::new(
             session_id.clone(),
@@ -1573,6 +1603,10 @@ impl AgentServerInner {
         store.read(|s| {
             s.summaries()
                 .iter()
+                // Superseded predecessors never lead a sidebar partition:
+                // the successor row is the conversation's identity now
+                // (review #805 [issue] 3-i).
+                .filter(|t| t.superseded_by.is_none())
                 .map(|t| ThreadListItem {
                     id: t.id.clone(),
                     title: t.display_title().to_string(),
@@ -2323,7 +2357,7 @@ async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNot
         ClientNote::SetApprovalMode { session_id, mode } => {
             inner.set_approval_mode(&session_id, &mode)
         }
-        ClientNote::SetCwd { session_id, cwd } => inner.set_cwd(&session_id, &cwd),
+        ClientNote::SetCwd { session_id, cwd } => inner.set_cwd(&session_id, &cwd).await,
         ClientNote::SetPlanMode {
             session_id,
             enabled,
@@ -2928,7 +2962,6 @@ impl AgentServerInner {
             });
             // GW1 dual emit: the §D.5 Host mirror, directed to the same
             // single connection (owner-set control, never a broadcast).
-            self.projections.drop_session(session_id);
             conn.send_to_client(FromServer::Host {
                 host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
@@ -2941,6 +2974,11 @@ impl AgentServerInner {
             let removed = { self.sessions.lock().remove(session_id) };
             if removed.is_some() {
                 self.clear_embedder_tools(session_id);
+                // The projection cell is session-shared: reap it only with
+                // the session itself, never on one client's dispose (review
+                // #805 [severe] 2 — an early drop froze every other owner's
+                // live streams).
+                self.projections.drop_session(session_id);
             }
             if let Some(session) = removed {
                 // GW2: terminate the pump BEFORE the entry goes away — the
@@ -2985,7 +3023,6 @@ impl AgentServerInner {
             });
             // GW1 dual emit: the §D.5 Host mirror, directed to the detaching
             // connection only.
-            self.projections.drop_session(session_id);
             conn.send_to_client(FromServer::Host {
                 host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
@@ -2995,7 +3032,10 @@ impl AgentServerInner {
         }
         self.remove_owner(owner, session_id);
         if self.owners(session_id).is_empty() {
-            // Ownership lost ⇒ live streams close (§D.1 `Closed`).
+            // Ownership lost ⇒ live streams close (§D.1 `Closed`) and the
+            // session-shared projection cell reaps with them (review #805
+            // [severe] 2).
+            self.projections.drop_session(session_id);
             self.end_streams_for_session(session_id, StreamEndReason::Closed);
             // GW2 follow-up (deferred reap): a detach while the turn still
             // runs keeps the entry and its pump — the settle bookkeeping
@@ -3033,7 +3073,7 @@ impl AgentServerInner {
     /// from the append point is GW8). The compat `ClientNote::Submit`
     /// forwards here with `origin_rpc = None`.
     async fn submit(
-        &self,
+        self: &Arc<Self>,
         owner: &str,
         session_id: &str,
         text: String,
@@ -3041,6 +3081,14 @@ impl AgentServerInner {
         client_id: Option<String>,
         origin_rpc: Option<String>,
     ) -> Result<Value, RpcError> {
+        // Bind redirect + restart window: submissions addressed to a
+        // superseded predecessor land on the successor, opened under its
+        // own id with this connection as owner (review #805 [issue] 4).
+        let effective = self.resolve_redirect(session_id);
+        if !self.sessions.lock().contains_key(&effective) {
+            let _ = open_session(self, owner, &effective).await;
+        }
+        let session_id = effective.as_str();
         let receipt = |accepted: bool, message_id: Option<String>| {
             Ok(json!({ "accepted": accepted, "message_id": message_id }))
         };
@@ -3264,7 +3312,8 @@ impl AgentServerInner {
     }
 
     fn drop_queued(&self, session_id: &str, client_id: String) {
-        if let Some(session) = self.sessions.lock().get(session_id) {
+        let resolved = self.resolve_redirect(session_id);
+        if let Some(session) = self.sessions.lock().get(&resolved) {
             let pending = session.pending_submits.clone();
             pending.lock().retain(|q| q.client_id != client_id);
         }
@@ -3313,8 +3362,18 @@ impl AgentServerInner {
         thread.with_mut(|t| t.set_permission_mode(mode));
     }
 
-    fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
-        let Some(thread) = self.session_thread(session_id) else {
+    async fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
+        // Restart-window opens from a note carry no connection identity:
+        // use a transient owner and release it right after so it never
+        // defeats the orphaned-session reap (review #805 [sugg] 11).
+        const NOTE_OWNER: &str = "note-setcwd";
+        let effective = self.resolve_redirect(session_id);
+        let opened = !self.sessions.lock().contains_key(&effective);
+        if opened {
+            let _ = open_session(self, NOTE_OWNER, &effective).await;
+            self.remove_owner(NOTE_OWNER, &effective);
+        }
+        let Some(thread) = self.session_thread(&effective) else {
             return self.note_error(session_id, "unknown session");
         };
         if thread.read(|t| t.has_interacted()) {
@@ -3330,6 +3389,9 @@ impl AgentServerInner {
         // creation), and this predecessor degrades into a redirect stub
         // sharing the successor's engine (#802: no chain swap under a
         // live identity, ever).
+        if !self.binding.lock().insert(effective.clone()) {
+            return;
+        }
         let inner = Arc::clone(self);
         let session_id = session_id.to_string();
         let cwd = cwd.to_string();
@@ -3347,6 +3409,12 @@ impl AgentServerInner {
     /// so live streams/ops addressed to it converge on the new log, and
     /// publish the control-face hand-off (`SessionDisposed { successor }`).
     async fn bind_successor(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
+        let outcome = self.bind_successor_impl(pred_id, cwd).await;
+        self.binding.lock().remove(pred_id);
+        outcome
+    }
+
+    async fn bind_successor_impl(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
         let pred = self.session_thread(pred_id).ok_or("unknown session")?;
         let (model, approval, effort) = pred.read(|t| {
             (
@@ -3404,10 +3472,30 @@ impl AgentServerInner {
             .ok_or("successor engine not materialized")?;
         pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
         self.projections.reseed(pred_id, &pred);
-        self.broadcast_host(manox_protocol::stream::HostEvent::SessionDisposed {
-            session_id: pred_id.to_string(),
-            successor: Some(succ_id),
-        });
+        // Live predecessor streams hold the OLD engine's feed receiver: it
+        // never closes and never emits again, so the regression probe would
+        // never fire. End them with Resync — the client's budgeted reopen
+        // lands on the alias (review #805 [issue] 5).
+        self.end_streams_for_session(pred_id, StreamEndReason::Resync);
+        // Directed hand-off (§D.5 owner-set control, never a broadcast):
+        // note face + host mirror to the predecessor's owners (review #805
+        // [issue] 3).
+        self.route_note(
+            pred_id,
+            manox_protocol::server::ServerNote::SessionDisposed {
+                session_id: pred_id.to_string(),
+            },
+        );
+        self.route_host(
+            pred_id,
+            manox_protocol::stream::HostEvent::SessionDisposed {
+                session_id: pred_id.to_string(),
+                successor: Some(succ_id.clone()),
+            },
+        );
+        // The bind owner must not outlive the hand-off: a ghost owner
+        // defeats the orphaned-session reap (review #805 [sugg] 11).
+        self.remove_owner("server-bind", &succ_id);
         Ok(())
     }
 

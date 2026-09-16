@@ -837,9 +837,6 @@ impl ThreadStore {
             .or_insert_with(|| path.to_path_buf());
     }
 
-    /// Seed an active summary row without touching disk — lets foreign test
-    /// modules exercise the archive cascade against real thread ids.
-    #[cfg(any(test, feature = "test-support"))]
     /// Seed the bound project on a test summary row (the sidecar truth the
     /// workspace domain's header validation reads).
     #[cfg(any(test, feature = "test-support"))]
@@ -849,6 +846,9 @@ impl ThreadStore {
         }
     }
 
+    /// Seed an active summary row without touching disk — lets foreign test
+    /// modules exercise the archive cascade against real thread ids.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn insert_summary_for_test(&mut self, id: &str, parent: Option<&str>) {
         self.summaries.push(crate::db::ThreadSummary {
             id: id.to_string(),
@@ -1070,9 +1070,6 @@ impl ThreadStore {
         );
     }
 
-    /// Set the user tag on a session (persisted in its sidecar); `None`
-    /// removes it. Re-asserting the current value is a no-op — no sidecar
-    /// write, no rescan.
     /// Durable supersede marker for a bind hand-off: the summary mirror
     /// flips up front (the redirect and the list exclusion act on it
     /// immediately) and the sidecar write follows on the refresh pass.
@@ -1100,12 +1097,27 @@ impl ThreadStore {
         self.write_meta(id, move |meta| meta.superseded_by = Some(successor.clone()));
     }
 
+    /// The bound project straight from the session sidecar (sync read).
+    /// Unlike the summary mirror, the sidecar survives reconciles for
+    /// sessions whose journal never materialized — the header-validation
+    /// source the workspace domain relies on (review #805 follow-up).
+    pub fn sidecar_project(&self, id: &str) -> Option<String> {
+        let path = self.session_paths.get(id)?;
+        let meta_path = manox_harness::session_meta::meta_path(&self.sessions_dir, path);
+        let raw = std::fs::read_to_string(meta_path).ok()?;
+        let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
+        meta.project
+    }
+
     /// The successor a session was superseded by (summary mirror of the
     /// sidecar marker — the restart-surviving half of the redirect map).
     pub fn superseded_by(&self, id: &str) -> Option<String> {
         self.summary_by_id(id).and_then(|s| s.superseded_by.clone())
     }
 
+    /// Set the user tag on a session (persisted in its sidecar); `None`
+    /// removes it. Re-asserting the current value is a no-op — no sidecar
+    /// write, no rescan.
     pub fn set_thread_tag(&mut self, id: &str, tag: Option<String>) {
         if let Some(s) = self.summary_mut(id)
             && s.tag == tag

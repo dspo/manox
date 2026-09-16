@@ -2701,8 +2701,6 @@ pub(crate) mod tests {
 
         fn open_session(&self, _path: PathBuf) {}
 
-        fn new_session(&self, _cwd: PathBuf, _project: Option<PathBuf>) {}
-
         fn set_cwd(&self, _path: PathBuf) {}
 
         fn active_session_path(&self) -> Option<PathBuf> {

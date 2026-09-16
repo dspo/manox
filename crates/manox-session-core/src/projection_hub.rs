@@ -24,7 +24,18 @@ struct Cell {
     /// Dense-tail seq the fold has consumed (None = seed only).
     observed: Option<u64>,
     outbox: VecDeque<(u64, BTreeMap<String, JsonValue>)>,
+    /// Lowest as_of evicted by the outbox cap: a stream still behind it
+    /// can no longer be served losslessly and must resync (L5: overflow
+    /// is loud, never silent).
+    dropped_floor: Option<u64>,
     since_checkpoint: u64,
+}
+
+/// [`ProjectionHub::take_since`] outcomes: frames, or a loud "your cursor
+/// fell out of the outbox" resync request.
+pub enum TakeOutcome {
+    Frames(Vec<(u64, BTreeMap<String, JsonValue>)>),
+    Stale,
 }
 
 #[derive(Default)]
@@ -48,7 +59,11 @@ impl ProjectionHub {
         if let Some((as_of, values)) = cell.set.drain_changed() {
             cell.outbox.push_back((as_of, values));
             while cell.outbox.len() > OUTBOX_CAPACITY {
-                cell.outbox.pop_front();
+                let (dropped, _) = cell
+                    .outbox
+                    .pop_front()
+                    .expect("outbox non-empty above capacity");
+                cell.dropped_floor = Some(dropped);
             }
         }
         cell.since_checkpoint += 1;
@@ -60,29 +75,35 @@ impl ProjectionHub {
         if due {
             cell.since_checkpoint = 0;
             let rows = cell.set.checkpoint_rows();
-            let observed = cell.observed;
             drop(cells);
-            crate::projection_cache::save(session_id, observed, &rows);
+            crate::projection_cache::save(session_id, &rows);
             return;
         }
         drop(cells);
     }
 
-    /// Outbox frames past one stream's cursor (the fan-out half).
-    pub fn take_since(
-        &self,
-        session_id: &str,
-        last_as_of: Option<u64>,
-    ) -> Vec<(u64, BTreeMap<String, JsonValue>)> {
+    /// Outbox frames past one stream's cursor (the fan-out half). A cursor
+    /// behind the evicted floor answers [`TakeOutcome::Stale`]: the caller
+    /// ends the stream with `Resync` instead of silently missing the last
+    /// change of some key (review #805 [sugg] 9).
+    pub fn take_since(&self, session_id: &str, last_as_of: Option<u64>) -> TakeOutcome {
         let cells = self.cells.lock().unwrap();
         let Some(cell) = cells.get(session_id) else {
-            return Vec::new();
+            return TakeOutcome::Frames(Vec::new());
         };
-        cell.outbox
-            .iter()
-            .filter(|(as_of, _)| last_as_of.is_none_or(|last| *as_of > last))
-            .cloned()
-            .collect()
+        if cell
+            .dropped_floor
+            .is_some_and(|floor| last_as_of.is_some_and(|last| last < floor))
+        {
+            return TakeOutcome::Stale;
+        }
+        TakeOutcome::Frames(
+            cell.outbox
+                .iter()
+                .filter(|(as_of, _)| last_as_of.is_none_or(|last| *as_of > last))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// The consistent baseline cut for a snapshot: the cell (restored from
@@ -103,12 +124,14 @@ impl ProjectionHub {
                     set,
                     observed,
                     outbox: VecDeque::new(),
+                    dropped_floor: None,
                     since_checkpoint: 0,
                 },
                 None => Cell {
                     set: ProjectionSet::seed(thread),
                     observed: None,
                     outbox: VecDeque::new(),
+                    dropped_floor: None,
                     since_checkpoint: 0,
                 },
             }
@@ -133,11 +156,10 @@ impl ProjectionHub {
     pub fn reseed(&self, session_id: &str, thread: &ThreadHandle) {
         let mut cells = self.cells.lock().unwrap();
         if let Some(cell) = cells.get_mut(session_id) {
-            let mut set = crate::projections::ProjectionSet::seed(thread);
-            // Carry the watermark: records already folded into the previous
-            // seed must not re-enter through a later baseline call.
-            let _ = &mut set;
-            cell.set = set;
+            // Fresh live seed; the watermark clears so the next baseline
+            // folds the new log's records from the start (correct iff a
+            // baseline call follows immediately, which resync guarantees).
+            cell.set = crate::projections::ProjectionSet::seed(thread);
             cell.observed = None;
         }
     }
@@ -147,9 +169,8 @@ impl ProjectionHub {
         let mut cells = self.cells.lock().unwrap();
         if let Some(cell) = cells.remove(session_id) {
             let rows = cell.set.checkpoint_rows();
-            let observed = cell.observed;
             drop(cells);
-            crate::projection_cache::save(session_id, observed, &rows);
+            crate::projection_cache::save(session_id, &rows);
         }
     }
 }

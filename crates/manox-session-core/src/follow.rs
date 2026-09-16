@@ -314,8 +314,7 @@ fn send_snapshot(
         cursor: data.cursor,
         records: window,
         has_more,
-        // T5 projection registry: no keys folded yet — empty baseline, as
-        // of the read cursor (§D.1).
+        // P-face baseline from the session-shared registry fold (§E).
         projections,
         projections_as_of_seq: as_of_seq,
     };
@@ -469,7 +468,15 @@ async fn forward_entries(
                     // committed event (deduped across streams); each stream
                     // then drains the outbox from its own cursor (§E.1).
                     hub.apply(session_id, event.seq, &event.entry);
-                    for (as_of_seq, values) in hub.take_since(session_id, last_as_of) {
+                    let frames = match hub.take_since(session_id, last_as_of) {
+                        crate::projection_hub::TakeOutcome::Frames(frames) => frames,
+                        // This stream fell out of the shared outbox: resync
+                        // loudly rather than miss a key's last change.
+                        crate::projection_hub::TakeOutcome::Stale => {
+                            return StreamEndReason::Resync;
+                        }
+                    };
+                    for (as_of_seq, values) in frames {
                         last_as_of = Some(as_of_seq);
                         conn.send_to_client(FromServer::StreamItem {
                             stream_id: stream_id.clone(),

@@ -13,7 +13,7 @@
 //! Storage is a crate-owned sqlite file (`<manox home>/workspaces.db`);
 //! the cache is a fold shortcut nowhere — this db IS the authority.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -60,7 +60,6 @@ pub enum WorkspaceEvent {
 pub enum WorkspaceError {
     NotFound(String),
     InvalidPath(String),
-    DuplicatePath(String),
     SessionMismatch { session_id: String, path: String },
     Io(String),
 }
@@ -70,7 +69,6 @@ impl std::fmt::Display for WorkspaceError {
         match self {
             Self::NotFound(id) => write!(f, "workspace not found: {id}"),
             Self::InvalidPath(p) => write!(f, "cannot back a workspace: {p}"),
-            Self::DuplicatePath(p) => write!(f, "workspace already exists: {p}"),
             Self::SessionMismatch { session_id, path } => {
                 write!(f, "session {session_id} does not belong to {path}")
             }
@@ -86,7 +84,12 @@ const FEED_CAPACITY: usize = 64;
 /// The workspace registry: one sqlite file, one write chain (the internal
 /// mutex), one change feed.
 pub struct WorkspaceStore {
-    db: Mutex<Connection>,
+    path: PathBuf,
+    /// The single write chain: verbs serialize here while each operation
+    /// opens its own short-lived connection, so the registry holds no file
+    /// descriptors between calls (fd pressure under parallel suites,
+    /// review #805 follow-up).
+    write: Mutex<()>,
     feed: broadcast::Sender<WorkspaceEvent>,
 }
 
@@ -115,7 +118,7 @@ impl WorkspaceStore {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| WorkspaceError::Io(e.to_string()))?;
         }
-        let conn = Connection::open(path).map_err(|e| WorkspaceError::Io(e.to_string()))?;
+        let conn = Self::connect_at(path)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS workspaces (
                 id TEXT PRIMARY KEY,
@@ -140,7 +143,8 @@ impl WorkspaceStore {
         .map_err(|e| WorkspaceError::Io(e.to_string()))?;
         let (feed, _) = broadcast::channel(FEED_CAPACITY);
         let store = Self {
-            db: Mutex::new(conn),
+            path: path.to_path_buf(),
+            write: Mutex::new(()),
             feed,
         };
         store.recover_pending()?;
@@ -171,11 +175,11 @@ impl WorkspaceStore {
     /// value pair).
     pub fn create(&self, path: &Path) -> Result<(WorkspaceView, bool), WorkspaceError> {
         let canon = canonical_dir(path)?;
+        self.tx(|db| write_marker(db, "create", ""))?;
         let (view, created) = self.mutate(|db| {
             if let Some(row) = read_rows(db)?.into_iter().find(|r| r.path == canon) {
                 return Ok((row, false));
             }
-            write_marker(db, "create", "")?;
             let now = now_iso();
             let row = Row {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -201,9 +205,9 @@ impl WorkspaceStore {
             let mut state = read_state(db)?;
             state.workspace_ids.push(row.id.clone());
             write_state(db, &state)?;
-            clear_marker(db)?;
             Ok((row, true))
         })?;
+        self.tx(clear_marker)?;
         let view = self.validate_and_prune(view)?;
         if created {
             self.emit(WorkspaceEvent::Upsert {
@@ -220,7 +224,6 @@ impl WorkspaceStore {
             row.title = title.to_string();
             row.updated_at = now_iso();
             update_row(db, &row)?;
-            clear_marker(db)?;
             Ok(row)
         })?;
         let view = self.validate_and_prune(view)?;
@@ -231,11 +234,11 @@ impl WorkspaceStore {
     }
 
     pub fn delete(&self, workspace_id: &str) -> Result<(), WorkspaceError> {
+        self.tx(|db| write_marker(db, "delete", workspace_id))?;
         self.mutate(|db| {
             if read_row(db, workspace_id)?.is_none() {
                 return Ok(());
             }
-            write_marker(db, "delete", workspace_id)?;
             db.execute(
                 "DELETE FROM workspaces WHERE id = ?1",
                 params![workspace_id],
@@ -244,9 +247,9 @@ impl WorkspaceStore {
             let mut state = read_state(db)?;
             state.workspace_ids.retain(|id| id != workspace_id);
             write_state(db, &state)?;
-            clear_marker(db)?;
             Ok(())
         })?;
+        self.tx(clear_marker)?;
         self.emit(WorkspaceEvent::Remove {
             workspace_id: workspace_id.to_string(),
         });
@@ -296,7 +299,6 @@ impl WorkspaceStore {
                 update_row(db, &row)?;
             }
             prune_row(db, &mut row)?;
-            clear_marker(db)?;
             Ok(row)
         })?;
         let view = self.view_of(view);
@@ -322,7 +324,6 @@ impl WorkspaceStore {
             row.updated_at = now_iso();
             update_row(db, &row)?;
             prune_row(db, &mut row)?;
-            clear_marker(db)?;
             Ok(row)
         })?;
         let view = self.view_of(view);
@@ -343,7 +344,6 @@ impl WorkspaceStore {
             row.updated_at = now_iso();
             update_row(db, &row)?;
             prune_row(db, &mut row)?;
-            clear_marker(db)?;
             Ok(row)
         })?;
         let view = self.view_of(view);
@@ -458,32 +458,78 @@ impl WorkspaceStore {
 
     // ── internals ─────────────────────────────────────────────────────────
 
+    /// One short-lived connection. Multi-process home sharing (AGENTS.md):
+    /// WAL plus a busy timeout so a concurrent writer retries instead of
+    /// surfacing SQLITE_BUSY (review #805 [sugg] 7).
+    fn connect_at(path: &Path) -> Result<Connection, WorkspaceError> {
+        let conn = Connection::open(path).map_err(|e| WorkspaceError::Io(e.to_string()))?;
+        for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA busy_timeout=5000;"] {
+            if let Err(error) = conn.execute_batch(pragma) {
+                tracing::warn!(%error, "workspace pragma failed; continuing without it");
+            }
+        }
+        Ok(conn)
+    }
+
+    fn connect(&self) -> Result<Connection, WorkspaceError> {
+        Self::connect_at(&self.path)
+    }
+
     fn with_db<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, WorkspaceError>,
     ) -> Result<R, WorkspaceError> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.connect()?;
         f(&db)
+    }
+
+    /// One standalone transaction. The crash markers live in their OWN
+    /// transactions around the data transaction — inside it they could
+    /// never be observed (review #805 [sugg] 8).
+    fn tx<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, WorkspaceError>,
+    ) -> Result<R, WorkspaceError> {
+        let guard = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.connect()?;
+        let out = db
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| WorkspaceError::Io(e.to_string()))
+            .and_then(|()| match f(&db) {
+                Ok(value) => db
+                    .execute_batch("COMMIT")
+                    .map_err(|e| WorkspaceError::Io(e.to_string()))
+                    .map(|()| value),
+                Err(error) => {
+                    let _ = db.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            });
+        drop(guard);
+        out
     }
 
     fn mutate<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, WorkspaceError>,
     ) -> Result<R, WorkspaceError> {
-        let db = self.db.lock().unwrap_or_else(|e| e.into_inner());
-        db.execute_batch("BEGIN IMMEDIATE")
-            .map_err(|e| WorkspaceError::Io(e.to_string()))?;
-        match f(&db) {
-            Ok(value) => {
-                db.execute_batch("COMMIT")
-                    .map_err(|e| WorkspaceError::Io(e.to_string()))?;
-                Ok(value)
-            }
-            Err(error) => {
-                let _ = db.execute_batch("ROLLBACK");
-                Err(error)
-            }
-        }
+        let guard = self.write.lock().unwrap_or_else(|e| e.into_inner());
+        let db = self.connect()?;
+        let out = db
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| WorkspaceError::Io(e.to_string()))
+            .and_then(|()| match f(&db) {
+                Ok(value) => db
+                    .execute_batch("COMMIT")
+                    .map_err(|e| WorkspaceError::Io(e.to_string()))
+                    .map(|()| value),
+                Err(error) => {
+                    let _ = db.execute_batch("ROLLBACK");
+                    Err(error)
+                }
+            });
+        drop(guard);
+        out
     }
 
     /// Header-validate one row's account and durably prune filtered
@@ -603,7 +649,10 @@ fn session_belongs(session_id: &str, workspace_path: &str) -> bool {
     let Some(store) = manox_agent::thread_store::try_global() else {
         return false;
     };
-    let project = store.read(|s| s.summary_by_id(session_id).map(|sum| sum.project.clone()));
+    let project = store.read(|s| {
+        s.sidecar_project(session_id)
+            .or_else(|| s.summary_by_id(session_id).map(|sum| sum.project.clone()))
+    });
     match project {
         Some(project) if !project.is_empty() => {
             canonical_dir(Path::new(&project)).is_ok_and(|canon| canon == workspace_path)
@@ -774,6 +823,26 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Write a session sidecar carrying the bound project (the
+    /// header-validation source; stable across store reconciles).
+    fn seed_sidecar(id: &str, project: &str) {
+        let sessions = manox_agent::paths::manox_config_dir()
+            .unwrap()
+            .join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join(format!("{id}.meta.json")),
+            format!(
+                "{{\"project\":{}}}",
+                serde_json::to_string(project).unwrap()
+            ),
+        )
+        .unwrap();
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.note_session_path(id, &sessions.join(format!("{id}.jsonl")));
+        });
+    }
+
     /// One hermetic registry + thread store per test.
     fn rig() -> (tempfile::TempDir, WorkspaceStore) {
         manox_agent::runtime::hermetic_home_for_test();
@@ -816,7 +885,9 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let (view, _) = store.create(target.path()).unwrap();
         seed_thread(&target.path().to_string_lossy(), "s-in");
+        seed_sidecar("s-in", &target.path().to_string_lossy());
         seed_thread("/nowhere-else", "s-out");
+        seed_sidecar("s-out", "/nowhere-else");
         let attached = store.attach_session(&view.workspace_id, "s-in");
         assert!(attached.is_ok());
         let rejected = store.attach_session(&view.workspace_id, "s-out");
@@ -826,6 +897,7 @@ mod tests {
         ));
         // A project re-bind elsewhere prunes the account on next read.
         seed_thread("/nowhere-else", "s-in");
+        seed_sidecar("s-in", "/nowhere-else");
         let listed = store.list().unwrap();
         assert!(listed[0].session_ids.is_empty());
     }
@@ -839,6 +911,7 @@ mod tests {
         let (va, _) = store.create(a.path()).unwrap();
         let (vb, _) = store.create(b.path()).unwrap();
         seed_thread(&a.path().to_string_lossy(), "s-a");
+        seed_sidecar("s-a", &a.path().to_string_lossy());
         store.attach_session(&va.workspace_id, "s-a").unwrap();
         let moved = store
             .insert_session_before(&va.workspace_id, "s-a", None)
@@ -857,6 +930,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let (view, _) = store.create(target.path()).unwrap();
         seed_thread(&target.path().to_string_lossy(), "s-1");
+        seed_sidecar("s-1", &target.path().to_string_lossy());
         store.attach_session(&view.workspace_id, "s-1").unwrap();
         let archived = store.archive_session("s-1", true).unwrap();
         assert_eq!(archived, vec!["s-1".to_string()]);
@@ -908,6 +982,7 @@ mod tests {
             s.insert_summary_for_test("s-1", None);
             s.set_project_for_test("s-1", &project.path().to_string_lossy());
         });
+        seed_sidecar("s-1", &project.path().to_string_lossy());
         let store = WorkspaceStore::open_at(&dir.path().join("workspaces.db")).unwrap();
         let adopted = store.adopt_from_thread_store().unwrap();
         assert_eq!(adopted, 1);

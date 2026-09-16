@@ -2,6 +2,7 @@
 //! `mod tests` — `super` remains the agent_server module, so every
 //! import/visibility resolves exactly as before).
 use super::*;
+use std::collections::HashMap;
 use std::time::Duration;
 
 // Reuse the session module's serialized test scaffolding so this suite
@@ -205,13 +206,6 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
             .lock()
             .unwrap()
             .push(format!("open_session:{}", path.display()));
-    }
-    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
-        self.session_cmds.lock().unwrap().push(format!(
-            "new_session:{}+{}",
-            cwd.display(),
-            project.map(|p| p.display().to_string()).unwrap_or_default()
-        ));
     }
     fn set_cwd(&self, path: std::path::PathBuf) {
         self.cwds.lock().unwrap().push(path.clone());
@@ -1894,16 +1888,21 @@ fn projection_changes_fan_out_to_every_stream_and_late_joiners() {
             path: Some("/moved".into()),
         }),
     );
+    // Both streams' frames race from independent pump tasks: collect into a
+    // map first, then assert — draining per stream would drop the other
+    // stream's frame and deadlock the loop (review #805 [severe] 1).
+    let mut frames: HashMap<String, manox_protocol::stream::ProjectionsFrame> = HashMap::new();
+    while frames.len() < 2 {
+        if let FromServer::StreamItem {
+            stream_id,
+            frame: manox_protocol::StreamFrame::Projections(f),
+        } = client.recv()
+        {
+            frames.insert(stream_id.0, f);
+        }
+    }
     for stream in ["st-a", "st-b"] {
-        let frame = loop {
-            match client.recv() {
-                FromServer::StreamItem {
-                    stream_id,
-                    frame: manox_protocol::StreamFrame::Projections(f),
-                } if stream_id.0 == stream => break f,
-                _ => continue,
-            }
-        };
+        let frame = frames.get(stream).expect("both streams must fan out");
         assert_eq!(frame.as_of_seq, 1);
         assert_eq!(
             frame.values.get("project").and_then(|v| v.as_str()),

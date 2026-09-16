@@ -8,9 +8,9 @@
 //! from the live seed. Writes are fail-soft (a lost checkpoint costs one
 //! longer tail fold).
 //!
-//! Identity choice (documented decision): the thread store summary's
-//! `created_at` (unix seconds, millisecond-scaled) — stable across journal
-//! materialization and cheaper than a first-record read.
+//! Identity choice (documented decision): the journal file's header line
+//! (immutable per chain). A session without a materialized journal has no
+//! cache-worthy fold, so absence disables both save and load.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -51,7 +51,7 @@ mod tests {
             .skip(1)
             .map(|key| (key.to_string(), (0, JsonValue::Null)))
             .collect();
-        save("c-1", Some(0), &rows);
+        save("c-1", &rows);
         assert!(
             load("c-1", 0).is_none(),
             "a record missing declared keys must refold, never seed"
@@ -61,7 +61,7 @@ mod tests {
             .iter()
             .map(|key| (key.to_string(), (4, JsonValue::Null)))
             .collect();
-        save("c-1", Some(4), &full);
+        save("c-1", &full);
         assert!(load("c-1", 3).is_none(), "rows past the cursor must refold");
         assert!(load("c-1", 4).is_some(), "a bounded, complete record loads");
     }
@@ -150,7 +150,7 @@ pub fn load(session_id: &str, cursor: u64) -> Option<(ProjectionSet, Option<u64>
 }
 
 /// Fail-soft durable write of one session's whole cut.
-pub fn save(session_id: &str, observed: Option<u64>, rows: &BTreeMap<String, (u64, JsonValue)>) {
+pub fn save(session_id: &str, rows: &BTreeMap<String, (u64, JsonValue)>) {
     let Some(path) = record_path(session_id) else {
         return;
     };
@@ -189,5 +189,4 @@ pub fn save(session_id: &str, observed: Option<u64>, rows: &BTreeMap<String, (u6
         tracing::debug!(%error, "projection cache write failed (fail-soft)");
         let _ = std::fs::remove_file(tmp);
     }
-    let _ = observed;
 }
