@@ -1002,4 +1002,60 @@ mod tests {
         assert!(state.active_instructions().is_none());
         assert!(hook(ctx()).inject_messages.is_empty());
     }
+
+    /// W1 byte-freeze: the model-visible surface of `ProposePlan` — the tool
+    /// description and parameter schema that travel inside the cached prompt
+    /// prefix of every request, and the success text the model reads back as
+    /// the tool result. A later work package may not move a byte of any of it
+    /// without a conscious update to the literals below.
+    #[tokio::test]
+    async fn propose_plan_surface_bytes_are_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audit-plan.md"), "# Audit\n\nbody\n").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let tool = ProposePlanTool::new(tx, PlanSessionState::new(), dir.path().to_path_buf());
+        assert_eq!(
+            tool.description(),
+            "Submit the finished plan for the user's approval verdict. Call only \
+             after the plan file is complete and decision-complete: pass the \
+             <slug> of your <slug>-plan.md in the plans directory (and optionally \
+             a title). The user then chooses an execution option; do not start \
+             implementing before approval. Never use this tool to ask questions — \
+             use AskUserQuestion for that."
+        );
+        assert_eq!(
+            serde_json::to_string(&tool.parameters_schema()).unwrap(),
+            r##"{"type":"object","properties":{"slug":{"type":"string","description":"Slug of the plan file (<slug>-plan.md) in the plans directory"},"title":{"type":"string","description":"Optional short plan title; defaults to the plan's first heading"}},"required":["slug"]}"##
+        );
+        let ctx = manox_harness::tool::LocalToolContext::new(
+            std::sync::Arc::new(NullEnv),
+            dir.path().to_path_buf(),
+            std::sync::Arc::new(manox_harness::tool::ToolState::new()),
+        );
+        let result = tool
+            .execute(
+                "call",
+                serde_json::json!({ "slug": "audit" }),
+                tokio_util::sync::CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .expect("propose succeeds");
+        let text = match &result.content[0] {
+            manox_harness::types::ContentBlock::Text { text, .. } => text.clone(),
+            other => panic!("expected text content, got {other:?}"),
+        };
+        // Only the echoed plan-file path is dynamic (it carries the temp dir);
+        // the prose around it is frozen and the exact-equality check below
+        // proves nothing else rides in the string.
+        let plan_file = dir
+            .path()
+            .join("audit-plan.md")
+            .to_string_lossy()
+            .to_string();
+        const HEAD: &str = "Plan submitted for review: Audit (";
+        const TAIL: &str = "). The turn ends here; wait for the user's verdict and do not implement before approval.";
+        assert_eq!(text, format!("{HEAD}{plan_file}{TAIL}"));
+        assert!(result.terminate, "the proposal still ends the turn");
+    }
 }

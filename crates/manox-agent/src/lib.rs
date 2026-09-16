@@ -39,6 +39,9 @@ pub mod plan;
 pub mod plan_mode;
 pub mod plugin;
 pub mod plugin_hooks;
+/// Prefix-cache stability gate: read-only observation of the provider
+/// request payloads of a thread run (no payload mutation).
+pub mod prefix_gate;
 pub mod prompt;
 pub mod proposed_plan;
 pub mod provider;
