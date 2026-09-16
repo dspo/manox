@@ -3383,6 +3383,20 @@ fn attach_plugin_hooks(session: &mut AgentSession, cwd: &Path) {
     );
 }
 
+/// Register the prefix-cache stability gate on a session: it observes every
+/// provider request payload of this thread run and publishes
+/// `ThreadEvent::PrefixStability` / `ThreadEvent::CacheInvalidation` on the
+/// actor's notice channel. Observation is strictly read-only — the handler
+/// returns its context untouched, so the model-visible bytes are unchanged.
+/// One gate is one run's baseline: it is per-session state by construction.
+fn attach_prefix_gate(
+    session: &mut AgentSession,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    thread_id: &str,
+) {
+    crate::prefix_gate::attach_prefix_gate(session, notice_tx, thread_id);
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -3508,6 +3522,7 @@ async fn run_actor(
                 );
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_plugin_hooks(&mut s, &tool_cwd);
+                attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 // The restored file is the thread's active session.
@@ -3550,6 +3565,7 @@ async fn run_actor(
                     );
                     attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_plugin_hooks(&mut s, &cwd);
+                    attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                     // A fresh session is pinned to the facade thread's id.
                     crate::thread_registry::set_active(&thread_id, &thread_id).await;
                     s
@@ -4337,6 +4353,7 @@ async fn run_actor(
                         );
                         attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                         attach_plugin_hooks(&mut s, &cwd);
+                        attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                         // A fresh session never inherits plan mode — clear
                         // any state left over from the previous session.
                         state.plan.set(false, None);
@@ -4532,6 +4549,7 @@ async fn rebuild_session(
             // session's PreToolUse/PostToolUse fire-and-forget shell-outs
             // never attach (write confinement is now in ApprovalGatedTool).
             attach_plugin_hooks(&mut s, &cwd);
+            attach_prefix_gate(&mut s, notice_tx, thread_id);
             adopt_session_model(&s, pi_model, state);
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.

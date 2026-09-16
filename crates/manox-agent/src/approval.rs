@@ -2401,4 +2401,152 @@ mod tests {
             "a settled card must not journal a second decision"
         );
     }
+
+    /// W1 byte-freeze: the model-visible surface of `AskUserQuestion`. The
+    /// description and the parameter schema travel inside the cached prefix of
+    /// every request, so a later work package may not move a single byte of
+    /// them (nor of the answer row it produces) without a conscious update to
+    /// the literals below.
+    #[test]
+    fn ask_surface_bytes_are_frozen() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(gate);
+        assert_eq!(
+            tool.description(),
+            "Ask the user clarifying questions when multiple valid approaches exist \
+             and the answer changes what you do next. Use only for decisions that are \
+             genuinely the user's to make — not for facts you can verify yourself. \
+             Each question carries its options (any number), and may carry a stable \
+             `id` (one is minted for you when omitted), a `detail` markdown support \
+             text, and an `intent` ({kind, approve} — name the approving option \
+             label in `approve`, and only when a `detail` accompanies the question). \
+             Mark the recommended default with recommended=true when one exists. The \
+             user may also answer a question with free text or explicitly skip it. \
+             Do not use this tool to ask for plan approval or to confirm obvious \
+             defaults."
+        );
+        assert_eq!(
+            serde_json::to_string(&tool.parameters_schema()).unwrap(),
+            r##"{"type":"object","properties":{"questions":{"type":"array","description":"The questions to ask the user (any number). Each becomes one step in the question drawer.","minItems":1,"items":{"type":"object","properties":{"id":{"type":"string","description":"Stable identifier the user's answer routes by. Optional: one is minted when omitted."},"question":{"type":"string","description":"The full question text to display."},"detail":{"type":"string","description":"Optional markdown support text rendered beneath the question (required when `intent.kind` is set)."},"intent":{"type":"object","description":"Optional interaction intent. `kind` names the specialised surface (e.g. \"plan-review\"); `approve` must be one of this question's option labels — the option that means \"yes\" on that surface.","properties":{"kind":{"type":"string","description":"The intent kind, e.g. \"plan-review\"."},"approve":{"type":"string","description":"The option label that carries the approval verdict."}}},"header":{"type":"string","description":"Short label for the question (max 12 characters)."},"options":{"type":"array","description":"Choices for the user to select from (any number; omit for a free-text-only question).","items":{"type":"object","properties":{"label":{"type":"string","description":"Concise label for the choice (1–5 words)."},"description":{"type":"string","description":"Explanation of what the choice means or implies."},"recommended":{"type":"boolean","description":"Whether this option is the recommended default."}},"required":["label","description"]}},"multiSelect":{"type":"boolean","description":"When true, the user may select multiple options; otherwise exactly one."}},"required":["question","header","multiSelect"]}}},"required":["questions"]}"##
+        );
+    }
+
+    /// W1 byte-freeze: the result strings `AskUserQuestion` hands back to the
+    /// model — the canonical answer row (key order and skip spelling included)
+    /// and every non-answer verdict, byte for byte.
+    #[tokio::test]
+    async fn ask_result_bytes_are_frozen() {
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let params = serde_json::json!({
+            "questions": [{
+                "id": "frozen-q", "question": "q?", "header": "h", "multiSelect": false,
+                "options": [
+                    {"label": "a", "description": ""},
+                    {"label": "b", "description": ""},
+                ],
+            }],
+        });
+        let settle = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                gate.respond(
+                    "ask-1",
+                    ToolAuthorizationResponse::AskUserQuestion {
+                        answers: vec![
+                            AskAnswer::new("frozen-q".into(), vec!["a".into()], None),
+                            AskAnswer::new(
+                                "frozen-q".into(),
+                                vec!["b".into()],
+                                Some("free".into()),
+                            ),
+                        ],
+                    },
+                );
+            })
+        };
+        let answered = tool
+            .execute("ask-1", params, CancellationToken::new(), &ctx)
+            .await
+            .expect("the ask tool returns a tool result, not a hard error");
+        settle.await.unwrap();
+        assert!(!answered.is_error);
+        assert_eq!(
+            result_text(&answered),
+            r#"{"answers":[{"id":"frozen-q","selected":["a"]},{"id":"frozen-q","selected":[],"custom":"free"}]}"#,
+            "one row per answer, `id` then `selected` then `custom`, single-select \
+             custom replacing the selection"
+        );
+
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let expired = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionExpired,
+        )
+        .await;
+        assert!(expired.is_error);
+        assert_eq!(
+            result_text(&expired),
+            "[no-answer] The user did not answer this question — no client was \
+             available to answer it, or the pending question was withdrawn. Do not \
+             treat this as input or consent. Re-ask with fewer, simpler questions \
+             or continue under explicitly stated assumptions."
+        );
+
+        let (gate, _rx) = gate_with_events();
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let dismissed = run_ask_settled(
+            &tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert!(!dismissed.is_error);
+        assert_eq!(
+            result_text(&dismissed),
+            "The user dismissed your questions to speak instead; stop here and \
+             wait for their message."
+        );
+
+        let (gate, _rx) = gate_with_events();
+        let plan = crate::plan_mode::PlanSessionState::new();
+        plan.set(true, None);
+        let plan_tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
+        let dismissed_in_plan = run_ask_settled(
+            &plan_tool,
+            &gate,
+            &ctx,
+            ToolAuthorizationResponse::AskUserQuestionDismissed,
+        )
+        .await;
+        assert_eq!(
+            result_text(&dismissed_in_plan),
+            "The user dismissed the review to speak instead; stay in plan mode, \
+             stop here, and wait for their message."
+        );
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let delegated_gate =
+            Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))).with_delegated(true));
+        let delegated = PiAskUserQuestionTool::new(delegated_gate);
+        let refused = delegated
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
+            .await
+            .expect("a delegated refusal is a tool result, not a hard error");
+        assert!(refused.is_error);
+        assert_eq!(
+            result_text(&refused),
+            "[DELEGATED_CALLER] A delegated subagent cannot ask the user questions. \
+             Include the open question in your final summary so the parent agent — \
+             which can ask — resolves it."
+        );
+    }
 }
