@@ -667,6 +667,14 @@ fn ent_question(id: String, parent_id: Option<String>) -> SessionTreeEntry {
         payload: json!({"toolName": "AskUserQuestion", "verdict": "answered"}),
     }
 }
+fn ent_plan_mode_request(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+    SessionTreeEntry::PlanModeRequest {
+        id,
+        parent_id,
+        timestamp: fixed_ts(),
+        enabled: true,
+    }
+}
 fn ent_pinned_archived(id: String, parent_id: Option<String>) -> SessionTreeEntry {
     SessionTreeEntry::PinnedArchived {
         id,
@@ -8149,6 +8157,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         ent_permission_mode_change,
         ent_thinking_level_change,
         ent_plan_mode_change,
+        ent_plan_mode_request,
         ent_plan_update,
         ent_plan_review,
         ent_goal,
@@ -8171,7 +8180,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         builders.len(),
         JOURNAL_ENTRIES.len(),
         "J1: the builder list must stay 1:1 with the declared vocabulary \
-             (both sides are exhaustive over the same 39)"
+             (both sides are exhaustive over the same 40)"
     );
     let mut prev: Option<String> = None;
     for (seq, build) in builders.into_iter().enumerate() {

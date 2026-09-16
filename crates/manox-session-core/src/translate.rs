@@ -308,6 +308,9 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
         SessionTreeEntry::PermissionModeChange { mode, .. } => {
             W::PermissionModeChange { mode: mode.clone() }
         }
+        SessionTreeEntry::PlanModeRequest { enabled, .. } => {
+            W::PlanModeRequest { enabled: *enabled }
+        }
         SessionTreeEntry::PlanModeChange { enabled, .. } => W::PlanModeChange { enabled: *enabled },
         SessionTreeEntry::PlanUpdate { snapshot, .. } => W::PlanUpdate {
             snapshot: snapshot.clone(),
@@ -808,6 +811,12 @@ mod tests {
                 mode: "read-only".into(),
             },
             E::PlanModeChange {
+                id: id(),
+                parent_id: pid(),
+                timestamp: now,
+                enabled: true,
+            },
+            E::PlanModeRequest {
                 id: id(),
                 parent_id: pid(),
                 timestamp: now,

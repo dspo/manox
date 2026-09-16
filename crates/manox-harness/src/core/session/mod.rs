@@ -341,6 +341,15 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         enabled: bool,
     },
+    /// A plan-mode selection the user made, awaiting the next turn
+    /// boundary to commit as `plan_mode_change`. Log-only whole value.
+    #[serde(rename = "plan_mode_request", rename_all = "camelCase")]
+    PlanModeRequest {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        enabled: bool,
+    },
     /// The persisted plan snapshot changed.
     #[serde(rename = "plan_update", rename_all = "camelCase")]
     PlanUpdate {
@@ -489,6 +498,7 @@ impl SessionTreeEntry {
             SubagentProgress,
             ProjectChange,
             PermissionModeChange,
+            PlanModeRequest,
             PlanModeChange,
             PlanUpdate,
             PlanReview,
@@ -1876,6 +1886,7 @@ pub enum EntryType {
     SubagentProgress,
     ProjectChange,
     PermissionModeChange,
+    PlanModeRequest,
     PlanModeChange,
     PlanUpdate,
     PlanReview,
@@ -1921,6 +1932,7 @@ impl EntryType {
             EntryType::SubagentProgress => "subagent_progress",
             EntryType::ProjectChange => "project_change",
             EntryType::PermissionModeChange => "permission_mode_change",
+            EntryType::PlanModeRequest => "plan_mode_request",
             EntryType::PlanModeChange => "plan_mode_change",
             EntryType::PlanUpdate => "plan_update",
             EntryType::PlanReview => "plan_review",
@@ -2123,6 +2135,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::SubagentProgress { .. } => EntryType::SubagentProgress,
         SessionTreeEntry::ProjectChange { .. } => EntryType::ProjectChange,
         SessionTreeEntry::PermissionModeChange { .. } => EntryType::PermissionModeChange,
+        SessionTreeEntry::PlanModeRequest { .. } => EntryType::PlanModeRequest,
         SessionTreeEntry::PlanModeChange { .. } => EntryType::PlanModeChange,
         SessionTreeEntry::PlanUpdate { .. } => EntryType::PlanUpdate,
         SessionTreeEntry::PlanReview { .. } => EntryType::PlanReview,
