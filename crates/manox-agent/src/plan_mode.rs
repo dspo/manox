@@ -60,6 +60,7 @@ pub struct PlanSessionState {
 #[derive(Debug, Default, Clone)]
 struct PlanStateInner {
     enabled: bool,
+    requested: Option<bool>,
     plan_file: Option<String>,
     active_instructions: Option<String>,
 }
@@ -77,10 +78,25 @@ impl PlanSessionState {
         self.inner.read().unwrap().plan_file.clone()
     }
 
+    /// A user selection awaiting the next turn boundary. `None` = nothing
+    /// outstanding. The committed state stays `enabled` until the boundary
+    /// applies it; the log carries the selection as a `plan_mode_request`
+    /// entry from the moment it is made.
+    pub fn requested(&self) -> Option<bool> {
+        self.inner.read().unwrap().requested
+    }
+
+    /// Record (or clear) the outstanding selection without applying it.
+    pub fn set_requested(&self, requested: Option<bool>) {
+        self.inner.write().unwrap().requested = requested;
+    }
+
     /// Replace the full state (enter/exit plan mode).
     pub fn set(&self, enabled: bool, plan_file: Option<String>) {
         let mut inner = self.inner.write().unwrap();
         inner.enabled = enabled;
+        // A committed apply consumes any outstanding selection.
+        inner.requested = None;
         inner.plan_file = plan_file;
         if !enabled {
             inner.active_instructions = None;
@@ -1057,5 +1073,23 @@ mod tests {
         const TAIL: &str = "). The turn ends here; wait for the user's verdict and do not implement before approval.";
         assert_eq!(text, format!("{HEAD}{plan_file}{TAIL}"));
         assert!(result.terminate, "the proposal still ends the turn");
+    }
+
+    /// W4: a recorded selection does not change the committed state — only
+    /// the turn-boundary apply does.
+    #[test]
+    fn requested_selection_does_not_apply_plan_mode() {
+        let state = PlanSessionState::new();
+        assert!(!state.enabled());
+        state.set_requested(Some(true));
+        assert_eq!(state.requested(), Some(true));
+        assert!(
+            !state.enabled(),
+            "the committed state waits for the boundary"
+        );
+        // The committed apply consumes the outstanding selection.
+        state.set(true, None);
+        assert_eq!(state.requested(), None);
+        assert!(state.enabled());
     }
 }

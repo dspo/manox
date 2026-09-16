@@ -180,6 +180,7 @@ wire_surface! {
         JournalWireEvent::ReasoningEffortChange { .. } => "reasoningEffortChange" ~ JournalWireEvent::ReasoningEffortChange {
             effort: "high".into(),
         },
+        JournalWireEvent::PlanModeRequest { .. } => "planModeRequest" ~ JournalWireEvent::PlanModeRequest { enabled: true },
         JournalWireEvent::PlanModeChange { .. } => "planModeChange" ~ JournalWireEvent::PlanModeChange { enabled: true },
         JournalWireEvent::PlanUpdate { .. } => "planUpdate" ~ JournalWireEvent::PlanUpdate {
             snapshot: serde_json::json!({"body": "# plan"}),
@@ -267,6 +268,7 @@ pub const PROJECTION_KEYS: &[&str] = &[
     "model",
     "permission_mode",
     "reasoning_effort",
+    "plan_mode_pending",
     "plan_mode",
     "plan",
     "goal",

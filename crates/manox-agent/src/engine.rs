@@ -80,7 +80,10 @@ pub(crate) enum SessionCmd {
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
     /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
-    SetPlanMode { enabled: bool },
+    /// A user plan-mode selection: recorded as a `plan_mode_request`
+    /// journal entry and held pending until the next turn boundary commits it
+    /// through `SetPlanMode`.
+    RequestPlanMode { enabled: bool },
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     SetPlanReviewPending(bool),
     /// Persist the latest `UpdatePlan` snapshot (compaction survival: the
@@ -1248,7 +1251,7 @@ impl ThreadEngine for PiEngine {
     }
 
     fn set_plan_mode(&self, enabled: bool) {
-        let _ = self.cmd_tx.send(SessionCmd::SetPlanMode { enabled });
+        let _ = self.cmd_tx.send(SessionCmd::RequestPlanMode { enabled });
     }
 
     fn set_browser_suite(&self, suite: BrowserSuite, enable: bool) {
@@ -3967,6 +3970,17 @@ async fn run_actor(
                 // unchanged) instead of trusting the one-time assembly
                 // snapshot.
                 refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
+                // W4 boundary: a pending plan-mode selection commits at the
+                // turn's start, before any request assembly or the
+                // instruction injection can observe the old state. A request
+                // that already matches the committed state converges silently.
+                if let Some(enabled) = state.plan.requested() {
+                    if enabled != state.plan.enabled() {
+                        apply_plan_mode(&session, &sessions_dir, &state, &notice_tx, enabled).await;
+                    } else {
+                        state.plan.set_requested(None);
+                    }
+                }
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the
@@ -4147,20 +4161,23 @@ async fn run_actor(
             SessionCmd::SetBrowserSuite { suite, enable } => {
                 apply_browser_suite(&mut session, suite, enable).await;
             }
-            SessionCmd::SetPlanMode { enabled } => {
-                let plan_file = enabled.then(|| state.plan.plan_file()).flatten();
-                state.plan.set(enabled, plan_file);
-                state
-                    .plan
-                    .set_active_instructions(enabled.then(render_plan_instructions).flatten());
-                if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+            SessionCmd::RequestPlanMode { enabled } => {
+                state.plan.set_requested(Some(enabled));
+                // The selection is a logged fact from the moment it is made;
+                // the committed state still only moves at the boundary.
+                let appender = session.journal_appender();
+                if let Err(err) = append_typed_resilient(
+                    &appender,
+                    "plan_mode_request",
+                    serde_json::json!({ "enabled": enabled }),
+                )
+                .await
                 {
-                    tracing::warn!(error = %err, "failed to persist plan mode");
+                    // The request stays outstanding: a later boundary
+                    // retries the append (dsh: an append failure cannot
+                    // block the turn).
+                    tracing::warn!(error = %err, "failed to journal the plan-mode request");
                 }
-                let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                    ThreadEvent::PlanModeChanged { enabled },
-                )));
             }
             SessionCmd::SetPlanReviewPending(pending) => {
                 if let Err(err) =
@@ -5084,6 +5101,29 @@ fn render_plan_instructions() -> Option<String> {
             None
         }
     }
+}
+
+/// Apply a committed plan-mode switch: the in-memory state, the rendered
+/// instructions, the sidecar cache and the `PlanModeChanged` notice (whose
+/// tap emission journals the `plan_mode_change` entry, L3).
+async fn apply_plan_mode(
+    session: &AgentSession,
+    sessions_dir: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    enabled: bool,
+) {
+    let plan_file = enabled.then(|| state.plan.plan_file()).flatten();
+    state.plan.set(enabled, plan_file);
+    state
+        .plan
+        .set_active_instructions(enabled.then(render_plan_instructions).flatten());
+    if let Err(err) = write_plan_sidecar(sessions_dir, session.path(), &state.plan).await {
+        tracing::warn!(error = %err, "failed to persist plan mode");
+    }
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::PlanModeChanged { enabled },
+    )));
 }
 
 /// Persist plan mode + last plan file from the shared state into the session

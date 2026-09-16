@@ -232,6 +232,10 @@ pub enum JournalWireEvent {
     PlanModeChange {
         enabled: bool,
     },
+    /// A plan-mode selection awaiting the next turn boundary.
+    PlanModeRequest {
+        enabled: bool,
+    },
     /// The plan document updated (kernel snapshot shape, wire-opaque).
     PlanUpdate {
         snapshot: serde_json::Value,
