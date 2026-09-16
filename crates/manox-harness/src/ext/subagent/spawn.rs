@@ -202,7 +202,7 @@ impl SubagentProvider for SpawnProvider {
         // run observer would silently never enforce.
         if self.observer.is_none() && req.budgets.idle_timeout_ms.is_some() {
             return Err(SubagentError::InvalidRequest(
-                "idle_timeout was armed but this provider was assembled without a run observer                  to enforce it"
+                "idle_timeout was armed but this provider was assembled without a run observer to enforce it"
                     .to_string(),
             ));
         }

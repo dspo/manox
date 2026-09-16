@@ -2019,51 +2019,13 @@ fn build_tools(
         .all()
         .into_iter()
         .filter_map(|def| {
-            let tool_name = crate::subagent::sanitized_tool_name(&def.name, &taken_tool_names);
-            let Some(tool_name) = tool_name else {
-                tracing::warn!(
-                    def = %def.name,
-                    "agent definition has no usable model-facing tool name (charset \
-                     [A-Za-z0-9_-]{{1,64}} after sanitizing, or a name collision); \
-                     its delegation tool is skipped"
-                );
-                return None;
-            };
-            taken_tool_names.insert(tool_name.clone());
-            // Definition `tools:` data resolves against the child
-            // snapshot with warn-and-skip (the retired dispatch's
-            // semantics): a manifest naming an unknown or privileged
-            // tool must not hard-fail every dispatch.
-            let allow: Vec<String> = def
-                .tools
-                .iter()
-                .filter(|name| {
-                    if child_snapshot_names.contains(*name) {
-                        true
-                    } else if manox_harness::subagent::HUMAN_INTERACTION_TOOLS
-                        .contains(&name.as_str())
-                        || name.as_str() == "Steer"
-                    {
-                        tracing::warn!(
-                            agent = %def.name,
-                            tool = %name,
-                            "agent definition names a tool children never receive; \
-                             subagents never get it (DELEGATED_CALLER guard)"
-                        );
-                        false
-                    } else {
-                        tracing::warn!(
-                            agent = %def.name,
-                            tool = %name,
-                            "agent definition names a tool not in the child snapshot; \
-                             skipping it"
-                        );
-                        false
-                    }
-                })
-                .cloned()
-                .collect();
-            Some((tool_name, def, allow))
+            let assembly = crate::subagent::resolve_delegation_tool(
+                def,
+                &taken_tool_names,
+                &child_snapshot_names,
+            )?;
+            taken_tool_names.insert(assembly.tool_name.clone());
+            Some((assembly.tool_name, def, assembly.default_tools))
         })
         .collect();
     for (tool_name, _, _) in &delegation_defs {
@@ -2090,8 +2052,13 @@ fn build_tools(
     let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
         manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
     );
-    for (tool_name, def, allow) in delegation_defs {
+    // The plan-mode read-only map keys off the SANITIZED wire name the
+    // model actually calls — registry names and tool names diverge once
+    // plugin namespacing is sanitized away.
+    let mut read_only_by_tool: HashMap<String, bool> = HashMap::new();
+    for (tool_name, def, allow) in &delegation_defs {
         let capability = subagent_capability(def);
+        read_only_by_tool.insert(tool_name.clone(), capability == "read-only");
         let config = DelegationToolConfig {
             provider: "spawn".into(),
             name: tool_name.clone(),
@@ -2099,10 +2066,10 @@ fn build_tools(
             rendered_description: crate::subagent::delegation_description(
                 &def.description,
                 capability,
-                &tool_name,
+                tool_name,
             ),
             persona: def.system_prompt.clone(),
-            default_tools: allow,
+            default_tools: allow.clone(),
             frontmatter_model_spec: def.model.clone(),
             config_model_spec: overrides.get(&def.name).cloned(),
             max_depth: 1,
@@ -2126,16 +2093,12 @@ fn build_tools(
         Arc::clone(&subagent_runtime),
     )));
     // Plan-mode gate resolver: whether a delegation tool name targets a
-    // read-only definition. The resolver shares the registry Arc so the
-    // gate's read-only notion can never diverge from the capability routing.
-    let registry = Arc::new(registry);
+    // read-only definition, keyed by the sanitized wire name the model
+    // calls. Built from the same assembly pass that names the tools, so it
+    // cannot diverge from what is actually registered.
     let read_only_subagent: crate::plan_mode::ReadOnlySubagentResolver = {
-        let r = Arc::clone(&registry);
-        Arc::new(move |name: &str| {
-            r.get(name)
-                .map(subagent_capability)
-                .is_some_and(|c| c == "read-only")
-        })
+        let map = Arc::new(read_only_by_tool);
+        Arc::new(move |name: &str| map.get(name).copied().unwrap_or(false))
     };
     (
         tools,

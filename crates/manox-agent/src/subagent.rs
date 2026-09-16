@@ -72,6 +72,67 @@ pub fn sanitized_tool_name(def_name: &str, taken: &HashSet<String>) -> Option<St
     }
 }
 
+/// One definition's assembly result: the sanitized wire tool name and the
+/// definition `tools:` allow list resolved (warn-and-skip) against the
+/// child snapshot.
+pub struct DelegationAssembly {
+    pub tool_name: String,
+    pub default_tools: Vec<String>,
+}
+
+/// Resolve one agent definition into its delegation tool identity.
+/// `None` = the definition is skipped loudly (no usable wire name after
+/// sanitizing, or a collision with an already-taken tool name). Definition
+/// `tools:` data is definition data, not a call parameter: unknown names
+/// and privileged names (human-interaction tools, `Steer`) warn and skip
+/// instead of failing every dispatch — the request-param filter path stays
+/// fail-loud.
+pub fn resolve_delegation_tool(
+    def: &manox_harness::ext_point_agent::AgentDef,
+    taken: &HashSet<String>,
+    snapshot_names: &HashSet<String>,
+) -> Option<DelegationAssembly> {
+    let tool_name = sanitized_tool_name(&def.name, taken)?;
+    if tool_name != def.name {
+        tracing::info!(
+            def = %def.name,
+            tool = %tool_name,
+            "agent definition name sanitized into the provider wire charset"
+        );
+    }
+    let default_tools: Vec<String> = def
+        .tools
+        .iter()
+        .filter(|name| {
+            if snapshot_names.contains(*name) {
+                true
+            } else if manox_harness::subagent::HUMAN_INTERACTION_TOOLS.contains(&name.as_str())
+                || name.as_str() == "Steer"
+            {
+                tracing::warn!(
+                    agent = %def.name,
+                    tool = %name,
+                    "agent definition names a tool children never receive; subagents never \
+                     get it (DELEGATED_CALLER guard)"
+                );
+                false
+            } else {
+                tracing::warn!(
+                    agent = %def.name,
+                    tool = %name,
+                    "agent definition names a tool not in the child snapshot; skipping it"
+                );
+                false
+            }
+        })
+        .cloned()
+        .collect();
+    Some(DelegationAssembly {
+        tool_name,
+        default_tools,
+    })
+}
+
 // ── DelegationTool ───────────────────────────────────────────────────────
 
 /// One model-facing delegation tool, configured from a single agent
@@ -670,6 +731,15 @@ struct RunWatch {
     watchdog: Arc<Mutex<SubagentWatchdog>>,
 }
 
+/// The delivery inputs of a settled run, kept after the live row is
+/// removed: a tool future dropped by turn teardown never reaches its
+/// `retire`, and the settling delivery still needs the counters. Entries
+/// are bounded by the run count of one assembly and retire with the run.
+struct SettledStats {
+    turns: u64,
+    tool_calls: u64,
+}
+
 /// The host's observer: folds ext-level run events into the transcript rail
 /// (`SubagentProgress`/`SubagentChild`), drives the per-run health
 /// watchdog, and remembers the first activity per run for card titles.
@@ -677,6 +747,7 @@ pub struct SubagentRunObserver {
     pub(crate) owner_thread_id: String,
     pub(crate) notice_tx: mpsc::UnboundedSender<BackendNotice>,
     runs: Mutex<BTreeMap<String, RunWatch>>,
+    settled: Mutex<BTreeMap<String, SettledStats>>,
 }
 
 impl SubagentRunObserver {
@@ -688,6 +759,7 @@ impl SubagentRunObserver {
             owner_thread_id,
             notice_tx,
             runs: Mutex::new(BTreeMap::new()),
+            settled: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -708,28 +780,31 @@ impl SubagentRunObserver {
         })
     }
 
-    /// The first activity line recorded for one run (card titles).
-    pub fn first_activity_of(&self, run_id: &str) -> Option<String> {
-        let runs = self.locked();
-        let watch = runs.get(run_id)?;
-        let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
-        wd.last_activity().map(str::to_string)
-    }
-
     /// The watchdog's run counters for one run — `(turns, tool_calls)` —
-    /// for the background delivery footer. The row survives settlement
-    /// until [`Self::retire`] so the settling tool can still read it.
+    /// for the background delivery footer. Live rows answer from the
+    /// watchdog; settled runs from the retained settled table (so a tool
+    /// future dropped by turn teardown still settles its delivery).
     pub fn stats_of(&self, run_id: &str) -> Option<(u64, u64)> {
-        let runs = self.locked();
-        let watch = runs.get(run_id)?;
-        let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
-        Some((wd.turns(), wd.tool_calls()))
+        if let Some(watch) = self.locked().get(run_id) {
+            let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+            return Some((wd.turns(), wd.tool_calls()));
+        }
+        self.settled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .map(|s| (s.turns, s.tool_calls))
     }
 
-    /// Drop one run's observation state. The tool calls this after reading
-    /// what it needs from the settled run (health → delivery footers).
+    /// Drop one run's observation state (live row and settled entry). The
+    /// tool calls this after reading what it needs from the settled run
+    /// (health → delivery footers).
     pub fn retire(&self, run_id: &str) {
         self.locked().remove(run_id);
+        self.settled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(run_id);
     }
 
     fn emit_progress(
@@ -859,14 +934,29 @@ impl RunObserver for SubagentRunObserver {
     }
 
     fn on_settled(&self, end: &RunEndInfo) {
-        // The row is retired explicitly by the tool after it read the
-        // delivery inputs — removal here would race the stats read.
-        let subagent_type = {
-            let runs = self.locked();
-            runs.get(&end.run_id)
-                .map(|w| w.subagent_type.clone())
-                .unwrap_or_else(|| end.label.clone())
+        // The live row retires here; its delivery inputs move into the
+        // settled table so the settling tool (or a delivery task whose
+        // sibling tool future was dropped by turn teardown) can still read
+        // them. `retire` clears the table entry.
+        let (subagent_type, stats) = {
+            let mut runs = self.locked();
+            match runs.remove(&end.run_id) {
+                Some(watch) => {
+                    let (turns, tool_calls) = {
+                        let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+                        (wd.turns(), wd.tool_calls())
+                    };
+                    (watch.subagent_type, Some((turns, tool_calls)))
+                }
+                None => (end.label.clone(), None),
+            }
         };
+        if let Some((turns, tool_calls)) = stats {
+            self.settled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(end.run_id.clone(), SettledStats { turns, tool_calls });
+        }
         let (status, activity) = match end.stop_reason {
             StopReason::Completed => (
                 crate::thread::ToolCallStatus::Success,
@@ -976,6 +1066,42 @@ mod tests {
             background_delivery(&result(StopReason::Aborted, "", None), None),
             None
         );
+    }
+
+    /// Assembly-level resolution: a plugin-namespaced def sanitizes into a
+    /// safe wire name, a collision skips the def, and definition `tools:`
+    /// data resolves warn-and-skip against the child snapshot (unknown and
+    /// privileged names dropped, known names kept).
+    #[test]
+    fn resolve_delegation_tool_sanitizes_skips_and_warns() {
+        let snapshot: HashSet<String> = ["Read", "Grep"].iter().map(|s| s.to_string()).collect();
+        let mut def = manox_harness::ext_point_agent::AgentDef {
+            name: "remora:remora-task".into(),
+            description: "d".into(),
+            tools: vec!["Read".into(), "AskUserQuestion".into(), "Ghost".into()],
+            model: None,
+            system_prompt: "p".into(),
+        };
+        let assembly = crate::subagent::resolve_delegation_tool(&def, &HashSet::new(), &snapshot)
+            .expect("a namespaced def resolves");
+        assert_eq!(assembly.tool_name, "remora_remora-task");
+        assert_eq!(
+            assembly.default_tools,
+            vec!["Read".to_string()],
+            "privileged (AskUserQuestion) and unknown (Ghost) names warn-and-skip"
+        );
+
+        // A collision with an already-taken wire name skips the def.
+        let taken: HashSet<String> = ["remora_remora-task".to_string()].into_iter().collect();
+        assert!(crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot).is_none());
+
+        // A collision between two defs resolves the second only after the
+        // first's name is taken into account — the engine inserts as it
+        // goes, so distinct defs never collapse onto one tool.
+        def.name = "remora.task".into();
+        let assembly = crate::subagent::resolve_delegation_tool(&def, &taken, &snapshot)
+            .expect("a distinct def still resolves");
+        assert_eq!(assembly.tool_name, "remora_task");
     }
 
     /// Plugin namespacing (`remora:remora-task`) must never reach the wire:
