@@ -600,17 +600,29 @@ impl AgentServerInner {
 /// so tools a client registers via `RegisterSessionTools` are stored but
 /// never reach the model's tool set and `invokeClientTool` never fires.
 ///
-/// `set_provider` is last-wins by design (see
-/// `manox_agent::embedder_tools::set_provider`). In production the
-/// `AgentServer` is a process singleton built exactly once inside `global`
-/// (`ws` routes every connection through it), so this install runs once and
-/// the engine's `provider()` — an `Arc<dyn EmbedderToolProvider>` — always
-/// resolves to that live singleton. The only other callers of the
-/// constructors are tests, which mutate the slot under the `lock_globals`
-/// suite mutex, so no concurrent `AgentServer` can clobber the registration
-/// mid-assertion. Direct `AgentServer::new` (non-`global`) deliberately does
-/// NOT install: an embedder that drives a private server keeps ownership of
-/// the provider slot to wire itself.
+/// #803 first installed this on the `global()` singleton alone, and the
+/// coverage was incomplete: the napi edge (`crates/manox-napi/src/lib.rs`,
+/// `start`) builds its server through `AgentServer::new` and never routes
+/// through `global` — so the VS Code host kept `provider() == None` and
+/// client-registered tools stayed invisible to the model (reproduced with a
+/// headless addon probe: `{registered: 1}` yet no `client_*` tool in the
+/// model's tool enumeration). The original carve-out — a private-server
+/// embedder "keeping ownership of the provider slot" — never described a
+/// shipping host: every in-repo embedder needs the provider, and one now
+/// gets it by constructing a server.
+///
+/// The install therefore lives in the shared constructor (`new_inner`):
+/// EVERY build path — `global()` (the desktop and the `ws` gateway), the
+/// napi binding, and the test-only `new_without_store_watcher` — installs
+/// its own provider. `set_provider` stays last-wins by design (see
+/// `manox_agent::embedder_tools::set_provider`): each production host runs
+/// exactly one server per process (`global`'s OnceLock; napi's `start`
+/// rejects a second construction through its connection slot), so the slot
+/// always resolves to the live server, and an embedder that genuinely wants
+/// to own the slot can still re-set it after construction — last-wins is
+/// the escape hatch. Tests mutate the slot under the `lock_globals` suite
+/// mutex, so no concurrent construction can clobber a registration
+/// mid-assertion.
 fn install_embedder_provider(server: &AgentServer) {
     manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
         server,
@@ -623,12 +635,11 @@ fn install_embedder_provider(server: &AgentServer) {
 /// arguments are ignored (a second window shares the first window's cwd).
 pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
     static GLOBAL: std::sync::OnceLock<std::sync::Arc<AgentServer>> = std::sync::OnceLock::new();
+    // No provider install here (#803 follow-up): it moved into `new_inner`,
+    // where it covers this singleton AND the direct `AgentServer::new`
+    // paths (napi included) — see [`install_embedder_provider`].
     GLOBAL
-        .get_or_init(|| {
-            let server = std::sync::Arc::new(AgentServer::new(cwd));
-            install_embedder_provider(&server);
-            server
-        })
+        .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
         .clone()
 }
 
@@ -719,7 +730,15 @@ impl AgentServer {
                 }
             });
         }
-        Self(inner)
+        let server = Self(inner);
+        // The host wiring the engine's tool assembly consults: install
+        // THIS server's embedder-tool provider. Lives in the shared
+        // constructor — not in `global` — so every build path (desktop/ws
+        // through `global`, the napi binding through `AgentServer::new`,
+        // test fixtures) wires the provider; last-wins makes the newest
+        // construction authoritative. See [`install_embedder_provider`].
+        install_embedder_provider(&server);
+        server
     }
 
     /// Accept a connection: spawn the handshake + dispatch task. The

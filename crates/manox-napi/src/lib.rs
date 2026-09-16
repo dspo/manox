@@ -421,4 +421,110 @@ mod tests {
             .expect_err("closed enum rejects unknown tags");
         assert!(err.to_string().contains("timeTravel") || !err.to_string().is_empty());
     }
+
+    /// #803 follow-up: the napi edge constructs its server through
+    /// `AgentServer::new` (the `start` function above) and never touches
+    /// `global()` — the shipped coverage hole was that the embedder-tool
+    /// provider installed only inside `global`, so the VS Code host's
+    /// `embedder_tools::provider()` stayed `None` and client-registered
+    /// tools never reached the model.
+    ///
+    /// This test mirrors the host's actual construction (`AgentServer::new`)
+    /// end-to-end through the unified `AgentClient` wrapper the binding
+    /// uses, with NO manual `set_provider`: the slot the engine's tool
+    /// assembly consults must be Some, and a tool registered via the real
+    /// `RegisterSessionTools` request must surface as a `client_*` adapter
+    /// through that installed provider. The session-core companion
+    /// (`new_installs_the_embedder_provider_on_the_napi_edge`) covers the
+    /// same edge from inside the library; this is the napi-crate-level pin
+    /// proving the binding's own construction line wires the provider.
+    ///
+    /// Slot hygiene needs no `drop_provider_for_test` here (that helper is
+    /// `test-support`-gated and deliberately absent from this crate's
+    /// feature graph): `set_provider` is last-wins and this is the ONLY
+    /// AgentServer construction in the napi test binary, so the slot read
+    /// after the constructor is exactly this test's install — pre-fix it
+    /// is `None` and the expect fails.
+    ///
+    /// Only compiled under the full runtime (the `mcp` feature — a member
+    /// of `manox-napi`'s default set): the lean `--no-default-features`
+    /// addon build (the VS Code-harness staging, `script/build-napi`) is a
+    /// check-only lib leg that never activates `cfg(test)`, and the gate
+    /// keeps the lean feature surface untouched (the a6df124e TEST_HOME
+    /// lesson). The workspace test legs run it.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn napi_start_equivalent_construction_installs_the_embedder_provider() {
+        // `tools_for` resolves on the `Arc<dyn EmbedderToolProvider>` slot
+        // value without a trait import; the register/handshake frames ride
+        // the module-level `manox_protocol` imports.
+        use manox_protocol::answer_kind::AnswerKind;
+        use manox_session_core::agent_client::AgentClient;
+        use manox_session_core::agent_server::AgentServer;
+
+        // The host's boot: init the runtime and provider registry (the
+        // `start` fn does the same through `manox_agent::init`), then
+        // build the server EXACTLY like `start` does —
+        // `AgentServer::new(cwd)`, never `global()`.
+        manox_agent::runtime::init();
+        manox_agent::provider_glue::init();
+        let server = AgentServer::new(std::path::PathBuf::from("/"));
+        let installed = manox_agent::embedder_tools::provider()
+            .expect("AgentServer::new (the napi `start` construction) must install the provider");
+
+        // Drive a real `RegisterSessionTools` through the same wrapper the
+        // binding's `start` uses, then read back through the installed
+        // provider — the engine's tool-assembly lookup point.
+        let client =
+            AgentClient::connect(&server, "napi-edge", vec![AnswerKind::ClientTool], vec![]);
+        // Drain the handshake frames (Initialize ack + v1 Ready note +
+        // the Host Ready epoch echo) so the register response is next.
+        let recv = || {
+            let rx = client.conn().server_rx();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                assert!(std::time::Instant::now() < deadline, "server_rx stalled");
+                if let Ok(m) = rx.try_recv() {
+                    return m;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        for _ in 0..3 {
+            recv();
+        }
+        let reg_id = client.send_call(ClientCall::RegisterSessionTools {
+            session_id: "et-napi".into(),
+            client_id: "napi-edge".into(),
+            tools: vec![manox_protocol::client::ClientToolSpec {
+                name: "get_selection".into(),
+                description: "napi edge probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+            }],
+        });
+        // Await the register response (tolerant drain: any other frame is
+        // dropped, the id match settles the call).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "register never answered"
+            );
+            if let FromServer::Response { id, outcome } = recv()
+                && id == reg_id
+            {
+                let registered = outcome.expect("register succeeds")["registered"].as_u64();
+                assert_eq!(registered, Some(1));
+                break;
+            }
+        }
+
+        let tools = installed.tools_for("et-napi");
+        let tool = tools
+            .iter()
+            .find(|t| t.name() == "client_get_selection")
+            .expect("the napi-installed provider feeds the client_* adapter to the engine");
+        assert_eq!(tool.description(), "napi edge probe");
+    }
 }

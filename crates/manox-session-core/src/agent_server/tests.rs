@@ -10592,16 +10592,18 @@ fn dispose_clears_embedder_registrations() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-/// Assembly-level regression for the embedder-tool wiring. The only place a
-/// production build installs the engine-facing provider is
-/// [`global`] — the process singleton `ws` routes through — so this test
-/// drives that real path and deliberately NEVER calls `set_provider`
-/// itself. A missing install in `global` (the shipped defect:
-/// `RegisterSessionTools` stored the tools, but `embedder_tools::provider()`
-/// stayed `None`, so no `client_*` tool ever reached the model's tool set
-/// and `invokeClientTool` never fired) turns this red. The
-/// provider-impl/store tests above wire the provider manually and therefore
-/// cannot catch that omission.
+/// Assembly-level regression for the embedder-tool wiring. The install now
+/// lives in the shared constructor (every build path wires the provider —
+/// see [`install_embedder_provider`]); this test drives the `global()`
+/// production path (the desktop/`ws` gateway edge) and deliberately NEVER
+/// calls `set_provider` itself. The companion
+/// [`new_installs_the_embedder_provider_on_the_napi_edge`] below pins the
+/// direct `AgentServer::new` edge — the napi binding's construction, the
+/// shipped #803 coverage gap (a `global`-only install left that host's
+/// `embedder_tools::provider()` `None`, so a registered tool never reached
+/// the model's tool set). Removing the install from `new_inner` turns BOTH
+/// red. The provider-impl/store tests above wire the provider manually and
+/// therefore cannot catch the omission.
 #[test]
 fn global_installs_the_embedder_provider_for_the_engine() {
     let _g = lock_globals();
@@ -10609,8 +10611,9 @@ fn global_installs_the_embedder_provider_for_the_engine() {
     init_globals();
     manox_agent::embedder_tools::drop_provider_for_test();
 
-    // Production path: build the process-global singleton and let `global`
-    // install the provider. No manual `set_provider` in this test.
+    // Production path: build the process-global singleton and let the
+    // shared constructor install the provider. No manual `set_provider` in
+    // this test.
     let server = global(PathBuf::from("/"));
     let installed = manox_agent::embedder_tools::provider()
         .expect("global() must install the engine-facing embedder provider");
@@ -10679,6 +10682,98 @@ fn global_installs_the_embedder_provider_for_the_engine() {
             FromServer::Notification {
                 note: ServerNote::SessionDisposed { ref session_id },
             } if session_id == "et-global" => break,
+            _ => {}
+        }
+    }
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// The #803 follow-up's companion regression: the provider install moved
+/// from `global()`'s `get_or_init` into the shared constructor, so the
+/// DIRECT `AgentServer::new` path — what the napi binding runs at
+/// `crates/manox-napi/src/lib.rs` `start` (the VS Code host never touches
+/// `global()`, which was #803's coverage hole: `RegisterSessionTools`
+/// answered `{registered: 1}` there, yet `embedder_tools::provider()`
+/// stayed `None` and no `client_*` tool ever reached the model) — wires the
+/// provider too. Same shape as [`global_installs_the_embedder_provider_for_the_engine`]
+/// but constructed exactly like the embedding host: `AgentServer::new(cwd)`,
+/// never `global()`, never a manual `set_provider`. Removing the install
+/// from `new_inner` turns this red (the red-green evidence).
+#[test]
+fn new_installs_the_embedder_provider_on_the_napi_edge() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+
+    // The napi construction: a private server, no `global()` anywhere.
+    let server = AgentServer::new(PathBuf::from("/"));
+    let installed = manox_agent::embedder_tools::provider()
+        .expect("AgentServer::new must install the engine-facing embedder provider");
+
+    // Connect a ClientTool-capable client and register through the real
+    // `RegisterSessionTools` path (the same wrapper `start` uses).
+    let (client_conn, server_conn) = in_process_pair();
+    server.accept(std::sync::Arc::new(server_conn));
+    let client = Client { conn: client_conn };
+    client.send(FromClient::Request {
+        id: MsgId::new("init"),
+        call: ClientCall::Initialize(Initialize {
+            client_id: "test".into(),
+            capabilities: vec![AnswerKind::ClientTool],
+            sessions: vec![],
+            protocol_epoch: PROTOCOL_EPOCH,
+        }),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handshake never acked"
+        );
+        match client.recv() {
+            FromServer::Response { ref id, .. } if id.0 == "init" => break,
+            _ => {}
+        }
+    }
+    create(&server, &client, "et-new");
+    assert_eq!(
+        register_tools(&client, "et-new", vec![client_tool_spec("get_selection")])["registered"],
+        1
+    );
+
+    // The provider `new` installed — read back through the same global slot
+    // the engine's tool assembly consults at `engine.rs` — feeds the
+    // sanitized `client_*` adapter for the registered tool.
+    let tools = installed.tools_for("et-new");
+    let tool = tools
+        .iter()
+        .find(|t| t.name() == "client_get_selection")
+        .expect("the installed provider feeds the client_* adapter to the engine");
+    assert_eq!(tool.description(), "test embedder tool");
+
+    // Test hygiene: dispose the live session (the store-watcher-enabled
+    // constructor spawns broadcast tasks that must not outlive the process).
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("et-new", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-new".into(),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "et-new never disposed"
+        );
+        match client.recv() {
+            FromServer::Notification {
+                note: ServerNote::SessionDisposed { ref session_id },
+            } if session_id == "et-new" => break,
             _ => {}
         }
     }
