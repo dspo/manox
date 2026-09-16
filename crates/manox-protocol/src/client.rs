@@ -138,6 +138,10 @@ pub enum ClientCall {
     /// journal (turns / messages / per-model usage), cached by
     /// `(thread_id, cursor)`. The response is the §E.3 payload; fields the
     /// fold cannot source yet are `null`.
+    /// Workspace namespace verb (durable directory identity domain).
+    Workspace {
+        call: crate::workspace::WorkspaceCall,
+    },
     GetConversationInfo {
         session_id: String,
     },

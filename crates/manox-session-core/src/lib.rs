@@ -13,9 +13,12 @@ pub mod agent_server;
 pub mod follow;
 pub mod journal_query;
 pub mod model_chat;
+pub mod projection_cache;
+pub mod projection_hub;
 pub mod projections;
 pub mod translate;
 pub mod waterfall;
+pub mod workspace_serve;
 #[cfg(feature = "ws-gateway")]
 pub mod ws;
 
@@ -60,6 +63,12 @@ pub(crate) mod test_support {
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
     /// (`manox_agent::init` would also boot MCP/LSP/plugin subsystems).
+    /// Process-global serialization for tests that touch the thread store
+    /// and the durable caches outside the agent_server suite's own guard.
+    pub fn lock_globals_for_cache_test() -> std::sync::MutexGuard<'static, ()> {
+        lock_globals()
+    }
+
     pub(crate) fn init_globals() {
         INIT_ONCE.call_once(|| {
             manox_agent::runtime::init();

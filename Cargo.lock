@@ -2440,7 +2440,9 @@ dependencies = [
  "manox-harness",
  "manox-protocol",
  "manox-terminal",
+ "manox-workspace",
  "parking_lot",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -2469,6 +2471,22 @@ dependencies = [
  "sysinfo",
  "tokio",
  "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "manox-workspace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "manox-agent",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]

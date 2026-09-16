@@ -319,6 +319,13 @@ wire_surface! {
         },
         HostEvent::SessionDisposed { .. } => "sessionDisposed" ~ HostEvent::SessionDisposed {
             session_id: "s1".into(),
+            successor: None,
+        },
+        HostEvent::WorkspaceUpdate { .. } => "workspaceUpdate" ~ HostEvent::WorkspaceUpdate {
+            event: crate::workspace::WorkspaceWireEvent::Baseline {
+                workspaces: vec![],
+                archived_session_ids: vec![],
+            },
         },
         HostEvent::Error { .. } => "error" ~ HostEvent::Error {
             message: "gateway/internal".into(),
@@ -496,6 +503,9 @@ wire_surface! {
             through_seq: -1,
             before_seq: Some(40),
             max_messages: Some(32),
+        },
+        ClientCall::Workspace { .. } => "workspace" ~ ClientCall::Workspace {
+            call: crate::workspace::WorkspaceCall::List,
         },
         ClientCall::GetConversationInfo { .. } => "getConversationInfo" ~ ClientCall::GetConversationInfo {
             session_id: "s1".into(),

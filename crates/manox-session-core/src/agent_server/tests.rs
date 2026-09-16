@@ -1661,6 +1661,10 @@ fn set_model_and_thread_info() {
         ["beta-model".to_string()],
         "SetModel must forward the resolved model to the engine"
     );
+    // A freshly opened stream's baseline reconciles the unjournaled header
+    // switch (uninteracted threads mutate header facts without entries).
+    let baseline = projection_baseline_of(&client, "s1", "st-2");
+    assert_eq!(baseline["model"]["modelId"], json!("beta-model"));
     engine.push_journal(1, jentry("e-1", Some("e-0"), ent_model_change));
     let frame = drain_until_projection(&client, "s1", 1);
     assert_eq!(
@@ -1668,18 +1672,27 @@ fn set_model_and_thread_info() {
         json!({ "provider": "test-prov", "modelId": "m-1" }),
         "a journaled model change must republish the projection unprompted"
     );
-    // A freshly opened stream's baseline re-seeds from the live thread:
-    // it observes the switch the server applied.
-    let baseline = projection_baseline_of(&client, "s1", "st-2");
-    assert_eq!(baseline["model"]["modelId"], json!("beta-model"));
     client.send(FromClient::Notification {
         note: ClientNote::SetCwd {
             session_id: "s1".into(),
             cwd: "/proj".into(),
         },
     });
-    // Not-yet-interacted: SetCwd binds project + header cwd; the baseline
-    // of a fresh stream observes both.
+    // Not-yet-interacted: SetCwd binds project + header cwd on a SUCCESSOR
+    // session (the bind hand-off is async); the baseline of a fresh stream
+    // on the predecessor re-bases onto the successor and observes both.
+    loop {
+        match client.recv() {
+            FromServer::Host {
+                host:
+                    manox_protocol::stream::HostEvent::SessionDisposed {
+                        session_id,
+                        successor: Some(_),
+                    },
+            } if session_id == "s1" => break,
+            _ => continue,
+        }
+    }
     let baseline = projection_baseline_of(&client, "s1", "st-3");
     assert_eq!(baseline["cwd"], json!("/proj"));
     assert_eq!(baseline["project"], json!("/proj"));
@@ -1754,16 +1767,15 @@ fn set_cwd_after_interaction_moves_engine_not_project() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
-/// The not-yet-interacted `SetCwd` note must reach the engine as the
-/// establishment command (`new_session`) BEFORE the working-directory
-/// switch (`set_cwd`): the fresh chain journals its one unconditional
-/// `cwd_change` witness at birth, so the switch that follows lands on the
-/// projected tail and no-ops. The facade methods and the actor queue share
-/// one `cmd_tx`, making send order consumption order; this trace pins the
-/// bind's shape, so a reorder or facade-side rewrite must consciously
-/// rewrite it rather than drift silently.
+/// Bind on a not-yet-interacted thread mints a SUCCESSOR session (identity
+/// follows the log, #802): the predecessor is marked superseded, stubbed
+/// onto the successor's engine (live streams on the old id resync loudly
+/// onto the new chain), and the control face publishes
+/// `SessionDisposed { successor }`. The predecessor's own engine never
+/// receives a chain-swap command — the swap shape this test replaced is
+/// exactly what froze the project/cwd projections.
 #[test]
-fn set_cwd_note_drives_new_session_before_set_cwd() {
+fn set_cwd_bind_mints_a_successor_and_supersedes_the_predecessor() {
     let _g = lock_globals();
     hermetic_home();
     init_globals();
@@ -1777,16 +1789,238 @@ fn set_cwd_note_drives_new_session_before_set_cwd() {
             cwd: "/proj".into(),
         },
     });
-    client.settle(); // FIFO: the note has been dispatched.
-    let cmds = engine.session_cmds.lock().unwrap().clone();
-    assert_eq!(
-        cmds,
-        vec![
-            "new_session:/proj+/proj".to_string(),
-            "set_cwd:/proj".to_string(),
-        ],
-        "the bind must reach the engine as establishment (new_session) then the switch (set_cwd)"
+    // Control face: the predecessor is disposed WITH its successor.
+    let succ_id = loop {
+        match client.recv() {
+            FromServer::Host {
+                host:
+                    manox_protocol::stream::HostEvent::SessionDisposed {
+                        session_id,
+                        successor,
+                    },
+            } if session_id == "s1" => {
+                break successor.expect("the bind hand-off must carry the successor");
+            }
+            _ => continue,
+        }
+    };
+    assert_ne!(succ_id, "s1");
+    // The durable half of the redirect: the sidecar marker lands on the
+    // refresh pass (a not-yet-materialized predecessor has no scan-indexed
+    // path, so mark_superseded synthesizes the canonical one).
+    let meta_path = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".manox/sessions/s1.meta.json");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let marker = loop {
+        let raw = std::fs::read_to_string(&meta_path).unwrap_or_default();
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw)
+            && meta
+                .get("supersededBy")
+                .or_else(|| meta.get("superseded_by"))
+                .is_some()
+        {
+            break meta;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the supersede marker never landed: {raw}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let marked = marker
+        .get("supersededBy")
+        .or_else(|| marker.get("superseded_by"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(marked, succ_id);
+    // The predecessor's engine never saw a swap: bind no longer touches it.
+    assert!(
+        engine.session_cmds.lock().unwrap().is_empty(),
+        "the predecessor engine must not receive swap commands"
     );
+    // The predecessor's follow stream re-bases onto the successor: the
+    // snapshot's projection baseline carries the NEW binding even before
+    // the successor materializes (deferred first-assistant contract leaves
+    // its journal empty until then — the baseline seeds from the stubbed
+    // header mirror, which is exactly what the #802 chip reads).
+    open_follow(&client, "st-bind", "s1");
+    let snap = snapshot_for(&client, "st-bind");
+    assert_eq!(snap.session_id, "s1");
+    assert_eq!(
+        snap.projections.get("project").and_then(|v| v.as_str()),
+        Some("/proj"),
+        "the predecessor stream must re-base its projection baseline on the bind"
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// One fold per session, fanned out per stream (dsh registry parity): two
+/// live streams each receive exactly the change frame for a committed
+/// journal event, and a late joiner's snapshot baseline already carries it.
+#[test]
+fn projection_changes_fan_out_to_every_stream_and_late_joiners() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    engine.set_journal(
+        0,
+        vec![JournalRecord {
+            seq: 0,
+            entry: (*jentry("p-old", None, ent_project_change)).clone(),
+        }],
+    );
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    open_follow(&client, "st-a", "s1");
+    let first = snapshot_for(&client, "st-a");
+    assert_eq!(
+        first.projections.get("project").and_then(|v| v.as_str()),
+        Some("/j1/proj")
+    );
+    open_follow(&client, "st-b", "s1");
+    let _second = snapshot_for(&client, "st-b");
+    // A committed change on the new seq: both streams must see the frame.
+    engine.push_journal(
+        1,
+        Arc::new(manox_harness::session::SessionTreeEntry::ProjectChange {
+            id: "p-new".into(),
+            parent_id: Some("p-old".into()),
+            timestamp: fixed_ts(),
+            path: Some("/moved".into()),
+        }),
+    );
+    for stream in ["st-a", "st-b"] {
+        let frame = loop {
+            match client.recv() {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::StreamFrame::Projections(f),
+                } if stream_id.0 == stream => break f,
+                _ => continue,
+            }
+        };
+        assert_eq!(frame.as_of_seq, 1);
+        assert_eq!(
+            frame.values.get("project").and_then(|v| v.as_str()),
+            Some("/moved"),
+            "stream {stream} missed the fanned-out change frame: {:?}",
+            frame.values
+        );
+    }
+    // The late joiner's baseline carries the folded value without replay.
+    open_follow(&client, "st-c", "s1");
+    let late = snapshot_for(&client, "st-c");
+    assert_eq!(
+        late.projections.get("project").and_then(|v| v.as_str()),
+        Some("/moved")
+    );
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// WS-D probe: the workspace verb answers on the real composition path.
+#[test]
+fn workspace_call_answers() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    client.send(FromClient::Request {
+        id: MsgId::new("ws-1"),
+        call: ClientCall::Workspace {
+            call: manox_protocol::workspace::WorkspaceCall::List,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match client.recv_timeout(Duration::from_millis(200)) {
+            FromServer::Response { id, outcome } if id.0 == "ws-1" => {
+                eprintln!("WS-PROBE outcome: {outcome:?}");
+                break;
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("workspace call never answered");
+        }
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// #802: a log swap (a bind's chain swap, a crash-repair truncation)
+/// restarts the seq space under a LIVE follow stream. Higher-seq-wins
+/// projection merges would silently freeze state-carrying keys against the
+/// pre-swap watermark (the chip-stale bug), so the regression must resync
+/// LOUDLY: a second Snapshot re-bases both the client fold and the
+/// projection baseline on the new log, and live forwarding continues on the
+/// new seq space.
+#[test]
+fn seq_regression_under_a_live_stream_resyncs_with_a_fresh_snapshot() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    let project_change = |path: &str| -> SessionTreeEntry {
+        SessionTreeEntry::ProjectChange {
+            id: format!("proj-{path}"),
+            parent_id: None,
+            timestamp: fixed_ts(),
+            path: Some(path.into()),
+        }
+    };
+    // Old chain: the bound project at seq 0 — the stream's watermark.
+    engine.set_journal(
+        0,
+        vec![JournalRecord {
+            seq: 0,
+            entry: project_change("/old"),
+        }],
+    );
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    open_follow(&client, "st-reg", "s1");
+    let first = snapshot_for(&client, "st-reg");
+    assert_eq!(
+        first.projections.get("project").and_then(|v| v.as_str()),
+        Some("/old")
+    );
+    // The swap: a new chain whose seq space restarts at 0 with the re-bound
+    // project; its first feed event regresses the live watermark.
+    engine.set_journal(
+        0,
+        vec![JournalRecord {
+            seq: 0,
+            entry: project_change("/new"),
+        }],
+    );
+    engine.push_journal(0, Arc::new(project_change("/new")));
+    let second = snapshot_for(&client, "st-reg");
+    assert_eq!(
+        second.projections.get("project").and_then(|v| v.as_str()),
+        Some("/new"),
+        "the resync snapshot must re-base the projection baseline on the new log"
+    );
+    assert_eq!(second.records.len(), 1);
+    // Live forwarding continues on the new seq space past the snapshot tail.
+    engine.push_journal(1, jentry("e-cont", Some("proj-/new"), ent_turn_start));
+    expect(&client, |m| {
+        matches!(
+            m,
+            FromServer::StreamItem {
+                frame: manox_protocol::StreamFrame::Entry { seq: 1, .. },
+                ..
+            }
+        )
+    });
     drop(client);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();
@@ -6633,7 +6867,7 @@ fn session_disposed_and_detached_double_emit_host_frames() {
         matches!(
             m,
             FromServer::Host {
-                host: HostEvent::SessionDisposed { session_id }
+                host: HostEvent::SessionDisposed { session_id, .. }
             } if session_id == "gw1-d1"
         )
     });
@@ -6656,7 +6890,7 @@ fn session_disposed_and_detached_double_emit_host_frames() {
         matches!(
             m,
             FromServer::Host {
-                host: HostEvent::SessionDisposed { session_id }
+                host: HostEvent::SessionDisposed { session_id, .. }
             } if session_id == "gw1-d2"
         )
     });
@@ -7946,6 +8180,14 @@ fn real_composition_emits_every_host_event_and_answers_every_client_call() {
         },
         ClientCall::CancelDelivery {
             delivery_id: "j1-nope".into(),
+        },
+        ClientCall::Workspace {
+            call: manox_protocol::workspace::WorkspaceCall::List,
+        },
+        // The create mutation drives the workspace state-stream frame
+        // (workspaceUpdate host mirror) the surface table declares.
+        ClientCall::Workspace {
+            call: manox_protocol::workspace::WorkspaceCall::Create { path: "/".into() },
         },
         // The fork arm answers too — j1-s is FakeEngine-backed and has no
         // persisted file under the hermetic home, so this deterministically

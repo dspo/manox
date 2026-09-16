@@ -261,6 +261,55 @@ impl ProjectionSet {
     }
 
     /// The full baseline (snapshot payload, §D.1 `SessionSnapshot`).
+    /// Whole-cut checkpoint rows (the durable cache's write face).
+    pub fn checkpoint_rows(&self) -> BTreeMap<String, (u64, JsonValue)> {
+        self.slots
+            .iter()
+            .map(|(key, slot)| ((*key).to_string(), (slot.as_of_seq, slot.value.clone())))
+            .collect()
+    }
+
+    /// Seed a set from durable checkpoint rows. Keys re-intern through the
+    /// declared surface table, so an unknown or retired key can never enter
+    /// the slots; the caller validates identity and watermarks first.
+    pub fn from_checkpoint(rows: BTreeMap<String, (u64, JsonValue)>) -> Self {
+        let slots = rows
+            .into_iter()
+            .filter_map(|(key, (seq, value))| {
+                let interned = manox_protocol::surface::PROJECTION_KEYS
+                    .iter()
+                    .find(|k| **k == key)?;
+                Some((
+                    *interned,
+                    Slot {
+                        value,
+                        as_of_seq: seq,
+                        dirty: false,
+                    },
+                ))
+            })
+            .collect();
+        Self { slots }
+    }
+
+    /// Re-apply the live thread's header-derived keys without advancing the
+    /// watermark or marking dirty: uninteracted threads mutate header facts
+    /// (model / approval / bind stub mirror) without journal entries, and a
+    /// snapshot baseline must still reflect them (the per-open reseed
+    /// semantics the shared fold replaces).
+    pub fn reconcile_header(&mut self, t: &manox_agent::thread::Thread) {
+        let fresh = Self::seed_from(t);
+        for (key, slot) in &mut self.slots {
+            // A slot an event has folded since the seed carries journal
+            // authority; only never-folded slots track the live mirror.
+            if slot.as_of_seq == 0
+                && let Some(fresh_slot) = fresh.slots.get(key)
+            {
+                slot.value = fresh_slot.value.clone();
+            }
+        }
+    }
+
     pub fn baseline(&self) -> BTreeMap<String, JsonValue> {
         self.slots
             .iter()

@@ -1991,7 +1991,7 @@ impl Thread {
     }
 
     /// Move the session's working directory at any interaction state —
-    /// the host-driven `SetCwd` path. Unlike [`Thread::set_project`] (an
+    /// the host-driven `SetCwd` path. Unlike a bind (which mints a
     /// initial-only project binding, guarded by `has_interacted`), this
     /// follows the per-call cwd machinery: the sticky cwd advances and the
     /// move is durable as a `cwd_change` entry, never touching the header
@@ -2002,19 +2002,35 @@ impl Thread {
         }
     }
 
-    pub fn set_project(&mut self, dir: PathBuf) {
-        if self.has_interacted() {
-            return;
-        }
+    /// Creation-time project binding (the `new_in_project` path): the only
+    /// place a project binds — a live session never re-binds (identity
+    /// follows the log; a bind on a live thread mints a successor session
+    /// instead, see `AgentServerInner::bind_successor`).
+    pub fn bind_at_creation(&mut self, dir: PathBuf) {
         self.cwd = dir.clone();
         self.project = Some(dir.clone());
-        if let Some(engine) = &self.engine {
-            engine.new_session(dir.clone(), Some(dir));
-        } else {
+        if self.engine.is_none() {
             // Landing thread: materialize a project-bound fresh engine in
             // one step (no orphaned pre-project session file).
             self.ensure_engine(Some(dir));
         }
+    }
+
+    /// Identity-follows-log hand-off: this predecessor entity becomes a
+    /// redirect stub for its bind successor — the successor's engine (its
+    /// journal feed and read seam) plus mirrored header fields — so live
+    /// streams and ops still addressed to the predecessor id converge on
+    /// the successor log (the seq regression resyncs them loudly).
+    pub fn adopt_successor(&mut self, engine: Arc<dyn ThreadEngine>, dir: PathBuf) {
+        self.cwd = dir.clone();
+        self.project = Some(dir);
+        self.engine = Some(engine);
+    }
+
+    /// The engine behind this thread (the successor-stub hand-off shares it
+    /// between the predecessor stub and the canonical successor entity).
+    pub fn engine_clone(&self) -> Option<Arc<dyn ThreadEngine>> {
+        self.engine.clone()
     }
 
     /// Manual compaction (`/compact`): no-op while a turn is in flight (the

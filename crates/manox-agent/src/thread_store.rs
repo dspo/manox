@@ -464,7 +464,8 @@ impl ThreadStore {
     }
 
     /// Immutable lookup across both partitions by id.
-    fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
+    /// The summary mirror row for one session id (sidecar-merged truth).
+    pub fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
         self.summaries
             .iter()
             .find(|s| s.id == id)
@@ -775,6 +776,11 @@ impl ThreadStore {
         {
             return Ok(Some(handle));
         }
+        // Bind hand-off: a superseded id loads its successor — the
+        // predecessor's identity is a redirect, never a second log.
+        if let Some(successor) = self.superseded_by(id) {
+            return self.load_thread(&successor);
+        }
         let Some(path) = self.session_paths.get(id).cloned() else {
             return Ok(None);
         };
@@ -834,6 +840,15 @@ impl ThreadStore {
     /// Seed an active summary row without touching disk — lets foreign test
     /// modules exercise the archive cascade against real thread ids.
     #[cfg(any(test, feature = "test-support"))]
+    /// Seed the bound project on a test summary row (the sidecar truth the
+    /// workspace domain's header validation reads).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_project_for_test(&mut self, id: &str, project: &str) {
+        if let Some(sum) = self.summaries.iter_mut().find(|s| s.id == id) {
+            sum.project = project.to_string();
+        }
+    }
+
     pub fn insert_summary_for_test(&mut self, id: &str, parent: Option<&str>) {
         self.summaries.push(crate::db::ThreadSummary {
             id: id.to_string(),
@@ -849,6 +864,7 @@ impl ThreadStore {
             archived: false,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -1057,6 +1073,39 @@ impl ThreadStore {
     /// Set the user tag on a session (persisted in its sidecar); `None`
     /// removes it. Re-asserting the current value is a no-op — no sidecar
     /// write, no rescan.
+    /// Durable supersede marker for a bind hand-off: the summary mirror
+    /// flips up front (the redirect and the list exclusion act on it
+    /// immediately) and the sidecar write follows on the refresh pass.
+    pub fn mark_superseded(&mut self, id: &str, successor: &str) {
+        if self
+            .summary_by_id(id)
+            .and_then(|s| s.superseded_by.clone())
+            .as_deref()
+            == Some(successor)
+        {
+            return;
+        }
+        if let Some(sum) = self.summaries.iter_mut().find(|s| s.id == id) {
+            sum.superseded_by = Some(successor.to_string());
+        }
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+        // A not-yet-materialized predecessor has no scan-indexed path (the
+        // scan iterates journal files); synthesize the canonical one so the
+        // marker still lands on its sidecar.
+        if !self.session_paths.contains_key(id) {
+            let path = self.sessions_dir.join(format!("{id}.jsonl"));
+            self.session_paths.insert(id.to_string(), path);
+        }
+        let successor = successor.to_string();
+        self.write_meta(id, move |meta| meta.superseded_by = Some(successor.clone()));
+    }
+
+    /// The successor a session was superseded by (summary mirror of the
+    /// sidecar marker — the restart-surviving half of the redirect map).
+    pub fn superseded_by(&self, id: &str) -> Option<String> {
+        self.summary_by_id(id).and_then(|s| s.superseded_by.clone())
+    }
+
     pub fn set_thread_tag(&mut self, id: &str, tag: Option<String>) {
         if let Some(s) = self.summary_mut(id)
             && s.tag == tag
@@ -1435,6 +1484,7 @@ fn summary_from_cached(
         archived: meta.archived,
         pinned: meta.pinned,
         tag: meta.tag.clone(),
+        superseded_by: meta.superseded_by.clone(),
         has_unread: meta.unread,
         errored: meta.errored,
         created_at: entry.created_at.timestamp(),
@@ -2207,6 +2257,7 @@ mod tests {
             archived,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -2605,6 +2656,7 @@ mod tests {
             archived: false,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,

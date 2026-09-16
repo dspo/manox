@@ -4324,7 +4324,7 @@ async fn run_actor(
                 );
                 // Same identity contract as the startup build: the session
                 // carries the facade thread's id (the previous deferred
-                // session never materialized — `set_project` requires a
+                // session never materialized — a bind requires a
                 // non-interacted thread).
                 match builder.with_session_id(thread_id.clone()).build().await {
                     Ok(mut s) => {
@@ -5767,6 +5767,7 @@ fn session_info_to_summary(
     info: &manox_harness::session::repository::SessionInfo,
 ) -> ThreadSummary {
     ThreadSummary {
+        superseded_by: None,
         id: info.id.clone(),
         summary: info.first_message.clone(),
         title: None,
@@ -10286,11 +10287,10 @@ mod tests {
         session.close().await.unwrap();
     }
 
-    /// The project-binding command sequence — the `NewSession` swap's
-    /// establishment announcement, then the facade's `SetCwd` onto the
-    /// same directory — leaves exactly one witness on the new chain: the
-    /// no-op switch must not stack atop it, and a later real move still
-    /// lands its own.
+    /// The working-directory switch onto the already-projected tail is
+    /// witness-free (the establishment announcement stays the chain's
+    /// single `cwd_change`); a switch onto a different directory lands its
+    /// own durable move.
     #[tokio::test]
     async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
         let dir = tempfile::tempdir().unwrap();

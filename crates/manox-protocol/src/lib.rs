@@ -41,6 +41,7 @@ pub mod stream;
 pub mod surface;
 pub mod transport;
 pub mod wire;
+pub mod workspace;
 
 pub use answer_kind::AnswerKind;
 pub use client::{ClientCall, ClientNote, ImageAttachment};

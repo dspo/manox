@@ -158,6 +158,13 @@ pub struct AgentServer(Arc<AgentServerInner>);
 
 struct AgentServerInner {
     cwd: PathBuf,
+    /// Bind redirect map (predecessor → successor session id): the live
+    /// half of the supersede contract; the sidecar marker is the
+    /// restart-surviving half (`ThreadStore::superseded_by`).
+    superseded: Mutex<HashMap<String, String>>,
+    /// The session-shared projection fold (one cell per session, fanned out
+    /// to every follow stream; checkpoint-backed across restarts).
+    projections: Arc<crate::projection_hub::ProjectionHub>,
     sessions: Mutex<HashMap<String, ServerSession>>,
     clients: Mutex<HashMap<String, ClientEntry>>,
     /// session_id → client_ids that own (view) it. A session may have several
@@ -626,6 +633,8 @@ impl AgentServer {
         manox_terminal::runtime::set_runtime(manox_agent::runtime::handle().clone());
         let inner = Arc::new(AgentServerInner {
             cwd,
+            superseded: Mutex::new(HashMap::new()),
+            projections: Arc::new(crate::projection_hub::ProjectionHub::default()),
             sessions: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
@@ -689,6 +698,23 @@ impl AgentServer {
                     };
                     inner.broadcast_threads_after_store_change();
                 }
+            });
+        }
+        // Workspace state-stream forwarder: the domain feed is the single
+        // source; every accepted mutation reaches every client as a
+        // reconnect-safe host frame (dsh workspace-controller parity).
+        {
+            let feed_inner = Arc::clone(&inner);
+            manox_agent::runtime::handle().spawn(async move {
+                let mut rx = crate::workspace_serve::store().subscribe();
+                while let Ok(event) = rx.recv().await {
+                    feed_inner.broadcast_host(manox_protocol::stream::HostEvent::WorkspaceUpdate {
+                        event: crate::workspace_serve::wire_event(&event),
+                    });
+                }
+            });
+            manox_agent::runtime::handle().spawn(async {
+                crate::workspace_serve::adopt_when_ready().await;
             });
         }
         Self(inner)
@@ -979,10 +1005,21 @@ impl AgentServerInner {
 
     // ── Pure state accessors (no spawning). ─────────────────────────────────
     fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
-        self.sessions
-            .lock()
-            .get(session_id)
-            .map(|s| s.thread.clone())
+        // Resolve bind redirects (live map first, sidecar marker after a
+        // restart) so every session-addressed op converges on the
+        // successor log; bounded walk against a redirect cycle.
+        let mut id = session_id.to_string();
+        for _ in 0..8 {
+            let next = self.superseded.lock().get(&id).cloned().or_else(|| {
+                manox_agent::thread_store::try_global()
+                    .and_then(|store| store.read(|s| s.superseded_by(&id)))
+            });
+            match next {
+                Some(next) if next != id => id = next,
+                _ => break,
+            }
+        }
+        self.sessions.lock().get(&id).map(|s| s.thread.clone())
     }
 
     // ── §D.1 stream services. ───────────────────────────────────────────────
@@ -1047,6 +1084,7 @@ impl AgentServerInner {
             session_id,
             max_messages,
             thread,
+            Arc::clone(&self.projections),
             &handle,
             move |_end| {
                 inner.untrack_stream(&k.0, &k.1, &h);
@@ -1653,13 +1691,13 @@ async fn handle_call(
             seed,
             working_directories,
         } => {
-            AgentServerInner::create_session_request(
+            let created = AgentServerInner::create_session_request(
                 inner,
                 client_id,
                 SessionIntent {
                     session_id: None,
                     cwd,
-                    project,
+                    project: project.clone(),
                     initial_model,
                     approval_mode,
                     reasoning_effort,
@@ -1667,8 +1705,18 @@ async fn handle_call(
                     working_directories,
                 },
             )
-            .await
+            .await;
+            // dsh "prepend at attach": a session born under a registered
+            // directory joins that workspace's account; unregistered
+            // directories stay loose.
+            if let (Ok(value), Some(project)) = (&created, &project)
+                && let Some(id) = value.get("session_id").and_then(|v| v.as_str())
+            {
+                crate::workspace_serve::attach_if_member(project, id);
+            }
+            created
         }
+        ClientCall::Workspace { call } => crate::workspace_serve::call(call).await,
         ClientCall::Submit {
             session_id,
             text,
@@ -2152,7 +2200,7 @@ async fn fork_session(
                 t.set_reasoning_effort(effort);
             }
             if let Some(project) = project {
-                t.set_project(PathBuf::from(project));
+                t.bind_at_creation(PathBuf::from(project));
             }
         });
     }
@@ -2744,7 +2792,7 @@ impl AgentServerInner {
                         t.set_reasoning_effort(effort);
                     }
                     if let Some(project) = &intent.project {
-                        t.set_project(PathBuf::from(project));
+                        t.bind_at_creation(PathBuf::from(project));
                     }
                 });
             }
@@ -2880,9 +2928,11 @@ impl AgentServerInner {
             });
             // GW1 dual emit: the §D.5 Host mirror, directed to the same
             // single connection (owner-set control, never a broadcast).
+            self.projections.drop_session(session_id);
             conn.send_to_client(FromServer::Host {
                 host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
+                    successor: None,
                 },
             });
         }
@@ -2935,9 +2985,11 @@ impl AgentServerInner {
             });
             // GW1 dual emit: the §D.5 Host mirror, directed to the detaching
             // connection only.
+            self.projections.drop_session(session_id);
             conn.send_to_client(FromServer::Host {
                 host: HostEvent::SessionDisposed {
                     session_id: session_id.into(),
+                    successor: None,
                 },
             });
         }
@@ -3261,23 +3313,102 @@ impl AgentServerInner {
         thread.with_mut(|t| t.set_permission_mode(mode));
     }
 
-    fn set_cwd(&self, session_id: &str, cwd: &str) {
+    fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
-        thread.with_mut(|t| {
-            // Two distinct semantics, deliberately split:
-            // - Project binding is initial-only: a not-yet-interacted
-            //   thread adopts the directory as its project (the
-            //   `has_interacted` guard in `set_project` is correct for
-            //   binding — a conversation's project never re-binds).
-            // - The working-directory switch applies at ANY interaction
-            //   state, through the same per-call cwd machinery the model's
-            //   tools use: sticky advance + a durable `cwd_change` entry —
-            //   never the header cwd.
-            t.set_project(cwd.into());
-            t.set_cwd(cwd.into());
+        if thread.read(|t| t.has_interacted()) {
+            // The working-directory switch applies at ANY interaction
+            // state, through the same per-call cwd machinery the model's
+            // tools use: sticky advance + a durable `cwd_change` entry —
+            // never the header cwd, never a re-bind.
+            thread.with_mut(|t| t.set_cwd(cwd.into()));
+            return;
+        }
+        // Bind on a not-yet-interacted thread: identity follows the log —
+        // the directory becomes a SUCCESSOR session (fresh chain bound at
+        // creation), and this predecessor degrades into a redirect stub
+        // sharing the successor's engine (#802: no chain swap under a
+        // live identity, ever).
+        let inner = Arc::clone(self);
+        let session_id = session_id.to_string();
+        let cwd = cwd.to_string();
+        manox_agent::runtime::handle().spawn(async move {
+            if let Err(error) = inner.bind_successor(&session_id, &cwd).await {
+                tracing::warn!(session = %session_id, %error, "bind successor failed");
+                inner.note_error(&session_id, &format!("bind failed: {error}"));
+            }
         });
+    }
+
+    /// The bind hand-off (#802 / identity-follows-log): mint the successor
+    /// session bound to `cwd`, mark the predecessor superseded (sidecar +
+    /// live map), stub the predecessor entity onto the successor's engine
+    /// so live streams/ops addressed to it converge on the new log, and
+    /// publish the control-face hand-off (`SessionDisposed { successor }`).
+    async fn bind_successor(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
+        let pred = self.session_thread(pred_id).ok_or("unknown session")?;
+        let (model, approval, effort) = pred.read(|t| {
+            (
+                t.model()
+                    .map(|m| manox_protocol::ModelRef::new(format!("{}/{}", m.provider, m.id))),
+                t.permission_mode().wire().to_string(),
+                match t.reasoning_effort() {
+                    manox_agent::language_model::ReasoningEffort::High => "high",
+                    manox_agent::language_model::ReasoningEffort::Max => "max",
+                }
+                .to_string(),
+            )
+        });
+        let created = Self::create_session_request(
+            self,
+            "server-bind",
+            SessionIntent {
+                session_id: None,
+                cwd: Some(cwd.to_string()),
+                project: Some(cwd.to_string()),
+                initial_model: model,
+                approval_mode: Some(approval),
+                reasoning_effort: Some(effort),
+                seed: None,
+                working_directories: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|e| e.message)?;
+        let succ_id = created["session_id"]
+            .as_str()
+            .ok_or("create answered without a session id")?
+            .to_string();
+        // Owner inheritance: pending adjudications and streamed notes keep
+        // reaching the same clients across the hand-off.
+        for owner in self.owners(pred_id) {
+            self.add_owner(&owner, &succ_id);
+        }
+        manox_agent::thread_store::global().with_mut(|s| s.mark_superseded(pred_id, &succ_id));
+        self.superseded
+            .lock()
+            .insert(pred_id.to_string(), succ_id.clone());
+        // The bound directory becomes (or joins) a workspace row and the
+        // successor leads its account (dsh workspace parity for binds).
+        crate::workspace_serve::create_and_attach(cwd, &succ_id);
+        // Stub the predecessor onto the successor's engine + mirrored
+        // header fields: its live follow streams see the new chain's feed
+        // (the seq regression resyncs them loudly), and its journal seam
+        // answers the successor log.
+        let succ = self
+            .session_thread(&succ_id)
+            .ok_or("successor session missing after create")?;
+        let engine = succ
+            .read(|t| t.engine_clone())
+            .ok_or("successor engine not materialized")?;
+        pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
+        self.projections.reseed(pred_id, &pred);
+        self.broadcast_host(manox_protocol::stream::HostEvent::SessionDisposed {
+            session_id: pred_id.to_string(),
+            successor: Some(succ_id),
+        });
+        Ok(())
     }
 
     fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
