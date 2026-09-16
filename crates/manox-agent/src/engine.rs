@@ -26,11 +26,12 @@ use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiMo
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
-use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
+use crate::approval::{ApprovalGate, ApprovalGatedTool};
 use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE, UiNoteRecord};
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
+use crate::questions::PiAskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
