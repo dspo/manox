@@ -593,6 +593,30 @@ impl AgentServerInner {
     }
 }
 
+/// Install the process-wide embedder-tool provider backed by this server.
+///
+/// This is the host wiring the engine's tool assembly consults: without it
+/// `engine`'s `embedder_tools::provider()` is `None` in a production build,
+/// so tools a client registers via `RegisterSessionTools` are stored but
+/// never reach the model's tool set and `invokeClientTool` never fires.
+///
+/// `set_provider` is last-wins by design (see
+/// `manox_agent::embedder_tools::set_provider`). In production the
+/// `AgentServer` is a process singleton built exactly once inside `global`
+/// (`ws` routes every connection through it), so this install runs once and
+/// the engine's `provider()` — an `Arc<dyn EmbedderToolProvider>` — always
+/// resolves to that live singleton. The only other callers of the
+/// constructors are tests, which mutate the slot under the `lock_globals`
+/// suite mutex, so no concurrent `AgentServer` can clobber the registration
+/// mid-assertion. Direct `AgentServer::new` (non-`global`) deliberately does
+/// NOT install: an embedder that drives a private server keeps ownership of
+/// the provider slot to wire itself.
+fn install_embedder_provider(server: &AgentServer) {
+    manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
+        server,
+    )));
+}
+
 /// The process-global server (L11: one `AgentServer` per process — the
 /// desktop, the embedded web UI and every future frontend route through it,
 /// so ownership/routing tables are shared). First caller wins; later cwd
@@ -600,7 +624,11 @@ impl AgentServerInner {
 pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
     static GLOBAL: std::sync::OnceLock<std::sync::Arc<AgentServer>> = std::sync::OnceLock::new();
     GLOBAL
-        .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
+        .get_or_init(|| {
+            let server = std::sync::Arc::new(AgentServer::new(cwd));
+            install_embedder_provider(&server);
+            server
+        })
         .clone()
 }
 
