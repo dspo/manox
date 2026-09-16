@@ -10592,6 +10592,102 @@ fn dispose_clears_embedder_registrations() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// Assembly-level regression for the embedder-tool wiring. The only place a
+/// production build installs the engine-facing provider is
+/// [`global`] — the process singleton `ws` routes through — so this test
+/// drives that real path and deliberately NEVER calls `set_provider`
+/// itself. A missing install in `global` (the shipped defect:
+/// `RegisterSessionTools` stored the tools, but `embedder_tools::provider()`
+/// stayed `None`, so no `client_*` tool ever reached the model's tool set
+/// and `invokeClientTool` never fired) turns this red. The
+/// provider-impl/store tests above wire the provider manually and therefore
+/// cannot catch that omission.
+#[test]
+fn global_installs_the_embedder_provider_for_the_engine() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    manox_agent::embedder_tools::drop_provider_for_test();
+
+    // Production path: build the process-global singleton and let `global`
+    // install the provider. No manual `set_provider` in this test.
+    let server = global(PathBuf::from("/"));
+    let installed = manox_agent::embedder_tools::provider()
+        .expect("global() must install the engine-facing embedder provider");
+
+    // Connect a client to that same server and register a tool through the
+    // real `RegisterSessionTools` request path.
+    let (client_conn, server_conn) = in_process_pair();
+    server.accept(std::sync::Arc::new(server_conn));
+    let client = Client { conn: client_conn };
+    client.send(FromClient::Request {
+        id: MsgId::new("init"),
+        call: ClientCall::Initialize(Initialize {
+            client_id: "test".into(),
+            capabilities: vec![AnswerKind::ClientTool],
+            sessions: vec![],
+            protocol_epoch: PROTOCOL_EPOCH,
+        }),
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "handshake never acked"
+        );
+        match client.recv() {
+            FromServer::Response { ref id, .. } if id.0 == "init" => break,
+            _ => {}
+        }
+    }
+    create(&server, &client, "et-global");
+    assert_eq!(
+        register_tools(
+            &client,
+            "et-global",
+            vec![client_tool_spec("get_selection")]
+        )["registered"],
+        1
+    );
+
+    // The provider `global` installed — read back through the same global
+    // slot the engine's tool assembly consults at `engine.rs` — yields the
+    // sanitized `client_*` adapter for the registered tool.
+    let tools = installed.tools_for("et-global");
+    let tool = tools
+        .iter()
+        .find(|t| t.name() == "client_get_selection")
+        .expect("the installed provider feeds the client_* adapter to the engine");
+    assert_eq!(tool.description(), "test embedder tool");
+
+    // Test hygiene: dispose the live session (the store-watcher-enabled
+    // singleton spawns broadcast tasks that must not outlive the process).
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("et-global", engine, events);
+    client.send(FromClient::Notification {
+        note: ClientNote::DisposeSession {
+            session_id: "et-global".into(),
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "et-global never disposed"
+        );
+        match client.recv() {
+            FromServer::Notification {
+                note: ServerNote::SessionDisposed { ref session_id },
+            } if session_id == "et-global" => break,
+            _ => {}
+        }
+    }
+    drop(client);
+    drop(server);
+    manox_agent::embedder_tools::drop_provider_for_test();
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 // ── #13 wire terminals ────────────────────────────────────────────────────
 
 fn attach_terminal(client: &Client, session: &str, terminal_id: Option<&str>) -> Value {
