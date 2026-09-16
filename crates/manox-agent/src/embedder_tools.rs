@@ -4,7 +4,10 @@
 //!
 //! The registration store lives host-side (the AgentServer); this module is
 //! the process-level bridge the engine consults while assembling a
-//! session's tool set. In-process precursor of the protocol's
+//! session's tool set AND before every prompt turn (`engine::
+//! refresh_embedder_tools` — a host registers only after it learns the
+//! session id, so the one-time assembly snapshot would otherwise never
+//! contain it). In-process precursor of the protocol's
 //! `RegisterSessionTools` / `InvokeClientTool` pair: the provider returns
 //! tool adapters whose executions round-trip to the registering client over
 //! the wire.

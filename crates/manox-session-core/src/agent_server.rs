@@ -1827,9 +1827,13 @@ async fn handle_call(
             tools,
         } => {
             // Full replacement per client. An unknown session still
-            // registers — the registration is store-side state the next
-            // tool assembly of that session picks up (mirrors how the
-            // host's active-client setter lands regardless of turn state).
+            // registers — the registration is store-side state the engine
+            // consults at tool assembly AND again before every prompt
+            // turn (`manox_agent::engine::refresh_embedder_tools`), so a
+            // registration landing after the session's engine spawned
+            // still reaches that session's tool table (the host learns
+            // the session id only by creating it, so "register before
+            // assembly" is not the real-world order).
             let count = tools.len();
             inner
                 .embedder_tools
