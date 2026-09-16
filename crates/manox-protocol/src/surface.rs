@@ -208,6 +208,14 @@ wire_surface! {
             verdict: None,
             reason: None,
         },
+        JournalWireEvent::Question { .. } => "question" ~ JournalWireEvent::Question {
+            kind: "request".into(),
+            auth_id: "auth-1".into(),
+            tool_name: Some("AskUserQuestion".into()),
+            tool_call_id: Some("tc-1".into()),
+            verdict: None,
+            reason: None,
+        },
         JournalWireEvent::PinnedArchived { .. } => "pinnedArchived" ~ JournalWireEvent::PinnedArchived {
             pinned: true,
             archived: false,

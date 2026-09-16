@@ -531,7 +531,11 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
             summary,
             input,
         } => (
-            "approval".into(),
+            if tool_name == crate::tools::ASK_USER_QUESTION {
+                "question".to_string()
+            } else {
+                "approval".to_string()
+            },
             json!({
                 "kind": "request",
                 "authId": id,

@@ -392,6 +392,19 @@ pub enum SessionTreeEntry {
         auth_id: String,
         payload: JsonValue,
     },
+    /// A user-question request or decision (the question seam's own
+    /// vocabulary; `kind` is `"request" | "decision"`). Folds the same
+    /// pending-card badge as an approval, kept distinct so the approval
+    /// audit never carries an interactive ask.
+    #[serde(rename = "question", rename_all = "camelCase")]
+    Question {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        kind: String,
+        auth_id: String,
+        payload: JsonValue,
+    },
     /// Pin / archive flags changed.
     #[serde(rename = "pinned_archived", rename_all = "camelCase")]
     PinnedArchived {
@@ -484,6 +497,7 @@ impl SessionTreeEntry {
             BrowserSuites,
             BackgroundTask,
             Approval,
+            Question,
             PinnedArchived,
             CompactionStarted,
             Metrics,
@@ -1870,6 +1884,7 @@ pub enum EntryType {
     BrowserSuites,
     BackgroundTask,
     Approval,
+    Question,
     PinnedArchived,
     CompactionStarted,
     Metrics,
@@ -1914,6 +1929,7 @@ impl EntryType {
             EntryType::BrowserSuites => "browser_suites",
             EntryType::BackgroundTask => "background_task",
             EntryType::Approval => "approval",
+            EntryType::Question => "question",
             EntryType::PinnedArchived => "pinned_archived",
             EntryType::CompactionStarted => "compaction_started",
             EntryType::Metrics => "metrics",
@@ -2115,6 +2131,7 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::BrowserSuites { .. } => EntryType::BrowserSuites,
         SessionTreeEntry::BackgroundTask { .. } => EntryType::BackgroundTask,
         SessionTreeEntry::Approval { .. } => EntryType::Approval,
+        SessionTreeEntry::Question { .. } => EntryType::Question,
         SessionTreeEntry::PinnedArchived { .. } => EntryType::PinnedArchived,
         SessionTreeEntry::CompactionStarted { .. } => EntryType::CompactionStarted,
         SessionTreeEntry::Metrics { .. } => EntryType::Metrics,

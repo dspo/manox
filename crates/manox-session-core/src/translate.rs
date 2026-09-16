@@ -353,6 +353,31 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
         },
+        SessionTreeEntry::Question {
+            kind,
+            auth_id,
+            payload,
+            ..
+        } => W::Question {
+            kind: kind.clone(),
+            auth_id: auth_id.clone(),
+            tool_name: payload
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            tool_call_id: payload
+                .get("toolCallId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            verdict: payload
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            reason: payload
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        },
         SessionTreeEntry::PinnedArchived {
             pinned, archived, ..
         } => W::PinnedArchived {
@@ -819,6 +844,14 @@ mod tests {
                 snapshot: serde_json::json!({}),
             },
             E::Approval {
+                id: id(),
+                parent_id: pid(),
+                timestamp: now,
+                kind: "request".into(),
+                auth_id: "a".into(),
+                payload: serde_json::json!({}),
+            },
+            E::Question {
                 id: id(),
                 parent_id: pid(),
                 timestamp: now,

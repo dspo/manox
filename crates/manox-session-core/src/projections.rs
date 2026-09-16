@@ -216,7 +216,8 @@ impl ProjectionSet {
                     self.set("background_tasks", map, seq);
                 }
             }
-            SessionTreeEntry::Approval { kind, auth_id, .. } => {
+            SessionTreeEntry::Approval { kind, auth_id, .. }
+            | SessionTreeEntry::Question { kind, auth_id, .. } => {
                 let mut map = self
                     .slots
                     .get("pending_auth")
