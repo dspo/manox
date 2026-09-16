@@ -952,8 +952,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projection_key_table_has_exactly_20_entries() {
-        assert_eq!(PROJECTION_KEYS.len(), 20);
+    fn projection_key_table_has_exactly_21_entries() {
+        assert_eq!(PROJECTION_KEYS.len(), 21);
     }
 
     /// The generated tag match agrees with the generated table on every
