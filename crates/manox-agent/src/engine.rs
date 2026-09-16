@@ -4180,16 +4180,6 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetPlanReviewPending(pending) => {
-                if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
-                {
-                    tracing::warn!(error = %err, "failed to persist proposed plan source");
-                }
-                if let Err(err) =
-                    write_plan_review_pending_sidecar(&sessions_dir, session.path(), pending).await
-                {
-                    tracing::warn!(error = %err, "failed to persist plan review pending flag");
-                }
                 // C4 vocabulary augmentation: the review edge rides the
                 // journal (the pending projection's fold source — replay
                 // and the P face; the sidecar flag demotes to the
@@ -4220,7 +4210,7 @@ async fn run_actor(
                 if snapshot.is_none() || completed {
                     state.plan.set_plan_file(None);
                     if let Err(err) =
-                        write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                        write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                     {
                         tracing::warn!(error = %err, "failed to retire completed plan title source");
                     }
@@ -4265,7 +4255,7 @@ async fn run_actor(
             SessionCmd::StartPlanExecution(plan_file) => {
                 state.plan.set(false, Some(plan_file));
                 if let Err(error) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                    write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                 {
                     tracing::warn!(%error, "failed to persist plan execution title source");
                 }
@@ -4318,7 +4308,7 @@ async fn run_actor(
                 title_scheduler.start_execution(crate::title::TitleWakeReason::PlanStarted);
                 state.plan.set_active_instructions(None);
                 if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                    write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                 {
                     tracing::warn!(error = %err, "failed to persist plan-mode exit");
                 }
@@ -5118,7 +5108,7 @@ async fn apply_plan_mode(
     state
         .plan
         .set_active_instructions(enabled.then(render_plan_instructions).flatten());
-    if let Err(err) = write_plan_sidecar(sessions_dir, session.path(), &state.plan).await {
+    if let Err(err) = write_plan_file_sidecar(sessions_dir, session.path(), &state.plan).await {
         tracing::warn!(error = %err, "failed to persist plan mode");
     }
     let _ = notice_tx.send(BackendNotice::Event(Box::new(
@@ -5126,28 +5116,17 @@ async fn apply_plan_mode(
     )));
 }
 
-/// Persist plan mode + last plan file from the shared state into the session
-/// sidecar (`plan_mode` stored only while on; `plan_file` kept across exits
-/// for the execution handoff).
-async fn write_plan_sidecar(
+/// Persist the last plan file from the shared state into the session sidecar
+/// (kept across exits for the execution handoff). Plan mode itself is
+/// journal-only: the `plan_mode_change` / `plan_mode_request` entries are the
+/// single source, so no mode mirror lives here.
+async fn write_plan_file_sidecar(
     sessions_dir: &Path,
     session_path: &Path,
     plan: &crate::plan_mode::PlanSessionState,
 ) -> Result<(), anyhow::Error> {
     manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.plan_mode = plan.enabled().then_some(true);
         meta.plan_file = plan.plan_file();
-    })
-    .await
-}
-
-async fn write_plan_review_pending_sidecar(
-    sessions_dir: &Path,
-    session_path: &Path,
-    pending: bool,
-) -> Result<(), anyhow::Error> {
-    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.plan_review_pending = pending.then_some(true);
     })
     .await
 }
@@ -5322,13 +5301,9 @@ fn merge_restored_state(
     RestoredThreadState {
         permission_mode,
         reasoning_effort,
-        plan_mode: replayed
-            .plan_mode
-            .unwrap_or(meta.plan_mode.unwrap_or(false)),
+        plan_mode: replayed.plan_mode.unwrap_or(false),
         plan_file: meta.plan_file.clone(),
-        plan_review_pending: replayed
-            .plan_review_pending
-            .unwrap_or_else(|| meta.plan_review_pending.unwrap_or(false)),
+        plan_review_pending: replayed.plan_review_pending.unwrap_or(false),
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
             .title
@@ -5368,9 +5343,6 @@ async fn rebuild_restored_state(
     let repair_effort = replayed
         .reasoning_effort
         .filter(|effort| meta.reasoning_effort.as_deref() != Some(effort.wire_value()));
-    let repair_plan_mode = replayed
-        .plan_mode
-        .filter(|enabled| meta.plan_mode.unwrap_or(false) != *enabled);
     let repair_snapshot =
         journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
     let repair_title = replayed
@@ -5402,7 +5374,6 @@ async fn rebuild_restored_state(
     };
     if repair_mode.is_some()
         || repair_effort.is_some()
-        || repair_plan_mode.is_some()
         || repair_snapshot.is_some()
         || repair_flags.is_some()
         || repair_project.is_some()
@@ -5415,9 +5386,6 @@ async fn rebuild_restored_state(
                 }
                 if let Some(effort) = repair_effort {
                     meta.reasoning_effort = Some(effort.wire_value().to_string());
-                }
-                if let Some(enabled) = repair_plan_mode {
-                    meta.plan_mode = enabled.then_some(true);
                 }
                 if let Some(snapshot) = repair_snapshot {
                     meta.plan_snapshot = Some(snapshot);
@@ -9938,7 +9906,8 @@ mod tests {
             Some("danger-full-access")
         );
         assert_eq!(repaired.reasoning_effort.as_deref(), Some("max"));
-        assert_eq!(repaired.plan_mode, Some(true));
+        // Plan state has no sidecar mirror anymore (W4): the journal is the
+        // single source, so there is nothing to repair or assert here.
 
         // Coverage guard: every supported kind is actually on the chain —
         // a silently skipped kind would make the round-trip assertions
@@ -10176,8 +10145,11 @@ mod tests {
     }
 
     /// K2 migration window: a legacy chain without decision-point entries
-    /// resolves entirely from the sidecar — the rebuild never overwrites
-    /// cached state with defaults.
+    /// resolves from the sidecar for the fields that still cache there — and
+    /// plan state no longer does: with the `plan_mode_change` /
+    /// `plan_mode_request` / `plan_review` entries as the single source, a
+    /// chain that never saw them restores plan mode OFF (the radical
+    /// no-compat-read stance; W4 sidecar retirement).
     #[tokio::test]
     async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
         let replayed = crate::replay::ReplayedThreadState::default();
@@ -10185,10 +10157,8 @@ mod tests {
             title: Some("sidecar title".into()),
             project: Some("/sidecar/project".into()),
             approval_mode: Some("read-only".into()),
-            plan_mode: Some(true),
             reasoning_effort: Some("max".into()),
             plan_file: Some("/plans/x-plan.md".into()),
-            plan_review_pending: Some(true),
             plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
             pinned: true,
             archived: true,
@@ -10198,10 +10168,10 @@ mod tests {
         assert_eq!(merged.title.as_deref(), Some("sidecar title"));
         assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
         assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
-        assert!(merged.plan_mode);
+        assert!(!merged.plan_mode, "plan state is journal-only now");
         assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
         assert_eq!(merged.plan_file.as_deref(), Some("/plans/x-plan.md"));
-        assert!(merged.plan_review_pending);
+        assert!(!merged.plan_review_pending);
         assert_eq!(
             merged.plan_snapshot,
             Some(serde_json::json!([{ "content": "step" }]))
