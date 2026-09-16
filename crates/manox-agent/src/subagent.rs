@@ -16,7 +16,7 @@
 //! that touches host-owned surfaces (ThreadEvent notices, the watchdog,
 //! background cards, peer delivery) flows through here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +44,33 @@ pub const SUBAGENT_FAILED_DELIVERY_PREFIX: &str = "subagent failed: ";
 /// it: a timed-out run delivers (unlike an abort), and its row must read as
 /// `Error`, not the `Success` a plain delivery implies.
 pub const SUBAGENT_TIMED_OUT_DELIVERY_PREFIX: &str = "subagent timed out: ";
+
+/// Sanitize a definition's registry name into a model-facing tool name.
+/// Provider wire APIs constrain tool names to `[A-Za-z0-9_-]{1,64}` (a name
+/// like the plugin namespacing's `remora:remora-task` would make every
+/// provider request of the session fail with a 400 — tool definitions ride
+/// each request's cached prefix). Out-of-charset characters map to `_`.
+/// `None` = unusable (empty after cleaning, or a collision with an
+/// already-registered tool name) and the assembly skips the definition's
+/// delegation tool loudly.
+pub fn sanitized_tool_name(def_name: &str, taken: &HashSet<String>) -> Option<String> {
+    let cleaned: String = def_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() || taken.contains(&cleaned) {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
 
 // ── DelegationTool ───────────────────────────────────────────────────────
 
@@ -287,6 +314,7 @@ impl AgentTool for DelegationTool {
         } else {
             None
         };
+        let card_title = description.clone();
         let request = manox_harness::subagent::StartRequest {
             label: description,
             kind: self.config.name.clone(),
@@ -301,7 +329,15 @@ impl AgentTool for DelegationTool {
             isolation: isolation.map(String::from),
             env: Arc::clone(&self.env),
             cwd: self.cwd.clone(),
-            cancel: signal.clone(),
+            // A background run's cancellation is its own: the dispatching
+            // turn's abort must not reach it (it survives to deliver its
+            // report), and cancellation belongs to InterruptAgent / the
+            // card's TaskStop — both drive the runtime's dispose token.
+            cancel: if run_in_background {
+                CancellationToken::new()
+            } else {
+                signal.clone()
+            },
         };
         let run = self
             .runtime
@@ -312,19 +348,22 @@ impl AgentTool for DelegationTool {
         let run_id_for_result = run_id.clone();
         if !run_in_background {
             let result = run.result().await;
+            self.observer.retire(&run_id);
             if result.stop_reason == StopReason::Aborted && signal.is_cancelled() {
                 return Err(ToolError::ExecutionFailed("canceled".into()));
             }
             return Ok(foreground_result(&run_id_for_result, result));
         }
-        // Background: card + peer delivery of the settled report.
+        // Background: card + peer delivery of the settled report. The card
+        // title is the dispatch's `description` (the run label), not a
+        // watchdog activity line.
         let cancel = run.dispose_token().clone();
-        let label = self
-            .observer
-            .first_activity_of(&run_id)
-            .unwrap_or_else(|| format!("Subagent {}", self.config.name));
-        let (task_id, task) =
-            background_task::register(TaskKind::Subagent, self.owner_thread_id(), label, cancel);
+        let (task_id, task) = background_task::register(
+            TaskKind::Subagent,
+            self.owner_thread_id(),
+            card_title,
+            cancel,
+        );
         let _ = self.notice_tx().send(BackendNotice::Event(Box::new(
             ThreadEvent::BackgroundTaskUpdated {
                 snapshot: task.snapshot(&task_id),
@@ -337,7 +376,9 @@ impl AgentTool for DelegationTool {
         tokio::spawn(async move {
             let _keep_runtime = runtime; // the run table outlives the tool call
             let result = run.result().await;
-            let delivery = background_delivery(&result);
+            let stats = observer.stats_of(&run_id_for_delivery);
+            let delivery = background_delivery(&result, stats);
+            observer.retire(&run_id_for_delivery);
             match result.stop_reason {
                 StopReason::Aborted => task.set_terminal_status(TaskStatus::Stopped),
                 StopReason::Completed => task.set_terminal_status(TaskStatus::Completed),
@@ -425,26 +466,39 @@ fn foreground_result(run_id: &str, result: RunResult) -> AgentToolResult {
     tool_result
 }
 
-/// The background peer-delivery text: the final report on completion, the
-/// diagnostic (already carrying the shared failure/timed-out prefixes) on a
-/// delivering failure, and `None` on an explicit abort (the parent asked
-/// for it — no report revives the turn).
-fn background_delivery(result: &RunResult) -> Option<String> {
+/// The background peer-delivery text: the final report on completion; on a
+/// delivering failure the diagnostic (already carrying the shared
+/// failure/timed-out prefixes restore keys on) plus the watchdog's run
+/// counters and whatever partial output the child had produced; `None` on
+/// an explicit abort (the parent asked for it — no report revives the
+/// turn).
+fn background_delivery(result: &RunResult, stats: Option<(u64, u64)>) -> Option<String> {
+    let footer = stats
+        .map(|(turns, tool_calls)| format!(" ({turns} turns, {tool_calls} tool calls)"))
+        .unwrap_or_default();
     match result.stop_reason {
         StopReason::Completed => {
             if result.output.is_empty() {
-                Some("completed with no output".to_string())
+                Some(format!("completed with no output{footer}"))
             } else {
                 Some(result.output.clone())
             }
         }
         StopReason::Aborted => None,
-        _ => Some(
-            result
+        _ => {
+            let diagnostic = result
                 .diagnostic
                 .clone()
-                .unwrap_or_else(|| "subagent failed".to_string()),
-        ),
+                .unwrap_or_else(|| "subagent failed".to_string());
+            if result.output.is_empty() {
+                Some(format!("{diagnostic}{footer}"))
+            } else {
+                Some(format!(
+                    "{diagnostic}{footer}\n\nPartial result:\n{}",
+                    result.output
+                ))
+            }
+        }
     }
 }
 
@@ -508,6 +562,7 @@ impl AgentTool for ListAgentsTool {
             .map(|run| {
                 let mut row = serde_json::json!({
                     "id": run.id,
+                    "kind": run.kind,
                     "label": run.label,
                     "provider": run.provider,
                     "status": run.status,
@@ -515,6 +570,10 @@ impl AgentTool for ListAgentsTool {
                 });
                 if let Some(health) = self.observer.health_of(&run.id) {
                     row["health"] = serde_json::json!(health);
+                }
+                if let Some((turns, tool_calls)) = self.observer.stats_of(&run.id) {
+                    row["turns"] = serde_json::json!(turns);
+                    row["tool_calls"] = serde_json::json!(tool_calls);
                 }
                 row
             })
@@ -657,6 +716,22 @@ impl SubagentRunObserver {
         wd.last_activity().map(str::to_string)
     }
 
+    /// The watchdog's run counters for one run — `(turns, tool_calls)` —
+    /// for the background delivery footer. The row survives settlement
+    /// until [`Self::retire`] so the settling tool can still read it.
+    pub fn stats_of(&self, run_id: &str) -> Option<(u64, u64)> {
+        let runs = self.locked();
+        let watch = runs.get(run_id)?;
+        let wd = watch.watchdog.lock().unwrap_or_else(|e| e.into_inner());
+        Some((wd.turns(), wd.tool_calls()))
+    }
+
+    /// Drop one run's observation state. The tool calls this after reading
+    /// what it needs from the settled run (health → delivery footers).
+    pub fn retire(&self, run_id: &str) {
+        self.locked().remove(run_id);
+    }
+
     fn emit_progress(
         &self,
         run_id: &str,
@@ -784,10 +859,12 @@ impl RunObserver for SubagentRunObserver {
     }
 
     fn on_settled(&self, end: &RunEndInfo) {
+        // The row is retired explicitly by the tool after it read the
+        // delivery inputs — removal here would race the stats read.
         let subagent_type = {
-            let mut runs = self.locked();
-            runs.remove(&end.run_id)
-                .map(|w| w.subagent_type)
+            let runs = self.locked();
+            runs.get(&end.run_id)
+                .map(|w| w.subagent_type.clone())
                 .unwrap_or_else(|| end.label.clone())
         };
         let (status, activity) = match end.stop_reason {
@@ -867,34 +944,69 @@ mod tests {
     /// on); an explicit abort delivers nothing (the parent asked for it).
     #[test]
     fn background_delivery_mapping() {
-        let completed = background_delivery(&result(StopReason::Completed, "final report", None));
+        let completed =
+            background_delivery(&result(StopReason::Completed, "final report", None), None);
         assert_eq!(completed.as_deref(), Some("final report"));
 
-        let failed = background_delivery(&result(
-            StopReason::Error,
-            "partial",
-            Some("subagent failed: boom"),
-        ));
-        assert_eq!(failed.as_deref(), Some("subagent failed: boom"));
-
-        let timed_out = background_delivery(&result(
-            StopReason::Error,
-            "partial",
-            Some("subagent timed out: budget 1000ms exceeded"),
-        ));
-        assert_eq!(
-            timed_out.as_deref(),
-            Some("subagent timed out: budget 1000ms exceeded")
+        let failed = background_delivery(
+            &result(StopReason::Error, "partial", Some("subagent failed: boom")),
+            Some((2, 5)),
         );
+        let failed = failed.unwrap();
         assert!(
-            timed_out
-                .unwrap()
-                .starts_with(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX)
+            failed.starts_with(SUBAGENT_FAILED_DELIVERY_PREFIX),
+            "{failed}"
         );
+        assert!(failed.contains("(2 turns, 5 tool calls)"), "{failed}");
+        assert!(failed.contains("Partial result:\npartial"), "{failed}");
+
+        let timed_out = background_delivery(
+            &result(
+                StopReason::Error,
+                "",
+                Some("subagent timed out: budget 1000ms exceeded"),
+            ),
+            None,
+        );
+        let timed_out = timed_out.unwrap();
+        assert!(timed_out.starts_with(SUBAGENT_TIMED_OUT_DELIVERY_PREFIX));
+        assert!(!timed_out.contains("Partial result"), "{timed_out}");
 
         assert_eq!(
-            background_delivery(&result(StopReason::Aborted, "", None)),
+            background_delivery(&result(StopReason::Aborted, "", None), None),
             None
+        );
+    }
+
+    /// Plugin namespacing (`remora:remora-task`) must never reach the wire:
+    /// `:` sanitizes to `_`; a collision or empty result skips the def.
+    #[test]
+    fn sanitized_tool_name_maps_wire_charset_and_rejects_collisions() {
+        let taken: HashSet<String> = ["Sailor", "remora_remora-task"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::subagent::sanitized_tool_name("remora:remora-task", &taken),
+            None,
+            "collision with an existing tool name is skipped"
+        );
+        assert_eq!(
+            crate::subagent::sanitized_tool_name("remora:remora-task", &HashSet::new()),
+            Some("remora_remora-task".to_string())
+        );
+        assert_eq!(
+            crate::subagent::sanitized_tool_name("Explore", &HashSet::new()),
+            Some("Explore".to_string()),
+            "charset-clean names pass through"
+        );
+        let long = "x".repeat(70);
+        assert_eq!(
+            crate::subagent::sanitized_tool_name(&long, &HashSet::new())
+                .unwrap()
+                .chars()
+                .count(),
+            64
         );
     }
 

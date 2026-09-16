@@ -33,13 +33,12 @@ pub enum SteerReason {
 }
 
 /// The target specification: an address (member thread id) plus an optional
-/// spawn request. Subagent run budgets live on
+/// spawn request. Subagent budgets and worktree isolation live on
 /// `subagent::types::StartRequest`, not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToSpec {
     pub agent_address: String,
     pub spawn: Option<String>,
-    pub isolation: Option<String>,
 }
 
 /// The message payload. v1 carries text only (no images).

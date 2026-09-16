@@ -85,7 +85,7 @@ impl PromptTemplate {
 /// every variant registered" — the renderer pairs this against its
 /// `(variant, source)` table and panics at startup if a variant lacks a
 /// template file, rather than deferring the failure to a render-time 500.
-pub const ALL: [PromptTemplate; 16] = [
+pub const ALL: [PromptTemplate; 15] = [
     PromptTemplate::SystemMain,
     PromptTemplate::SystemAssembly,
     PromptTemplate::WrapperMaxTurnsSummary,

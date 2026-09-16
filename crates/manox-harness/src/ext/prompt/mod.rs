@@ -23,11 +23,32 @@ const TPL_ASSEMBLY: &str = include_str!("../../../templates/default/assembly.ter
 
 /// The Captain's subagent-dispatch prose. Prose is data — the template owns
 /// layout only — so prose edits never touch the render path.
-const SUBAGENTS_PROSE: &str = "You can delegate work to subagents — each     delegation tool dispatches one named subagent kind (e.g. `Explore`,     `Sailor`, or a user-defined kind) that runs in its own fresh context: it     cannot see this conversation, so its `prompt` must carry every fact,     path, and done-criterion the work needs. A subagent is a coroutine, not     a process: it cannot ask you or the user questions mid-run, and its     approval-requiring operations are auto-rejected — surface those steps in     your own work instead. To create a real manox Thread that persists,     appears in the sidebar, and can be resumed, use the `Steer` tool with     `to.spawn: \"TeamMember\"` (only the Captain may spawn members).\n\
-    By default a delegation call is foreground: it blocks until the child     finishes and its result carries the child's final report (failures carry     a diagnostic plus whatever partial output existed). Set     `run_in_background: true` to park the run on a background card instead     and receive the report as a peer message when the run settles — a     completed report, a timeout/failure report with partial output, or     nothing for a run you interrupted.\n\
-    Prefer parallel subagents over serial self-work: for splittable tasks —     reviewing multiple PRs, modifying independent files, exploring     alternatives — emit several background delegations in one turn so they     run concurrently. Pass `isolation: \"worktree\"` when a subagent needs     its own working tree (builds won't collide, edits won't clash).\n\
-    Time-box every dispatch: size `timeout_ms` to your estimate plus     headroom — an expired budget terminates the child and delivers a report     you can act on, instead of a task that runs forever. While background     runs are in flight, `ListAgents` reports each run's health (working,     tool running, stalled, looping) with its running time, and     `InterruptAgent` cancels one by id — inspect before acting, do not     guess.\n\
-    Delegation is not fire-and-forget; you own each subagent's lifecycle.     When a report arrives, decide deliberately: re-dispatch with a narrower     scope, widen the budget, or take the work over yourself.";
+const SUBAGENTS_PROSE: &str = "You can delegate work to subagents — each delegation tool \
+    dispatches one named subagent kind (e.g. `Explore`, `Sailor`, or a user-defined kind) that \
+    runs in its own fresh context: it cannot see this conversation, so its `prompt` must carry \
+    every fact, path, and done-criterion the work needs. A subagent cannot ask you or the user \
+    questions mid-run, and its approval-requiring operations are auto-rejected — surface those \
+    steps in your own work instead. To create a real manox Thread that persists, appears in the \
+    sidebar, and can be resumed, use the `Steer` tool with `to.spawn: \"TeamMember\"` (only the \
+    Captain may spawn members).\n\n\
+    By default a delegation call is foreground: it blocks until the child finishes, and the \
+    tool result carries the child's final report (failures carry a diagnostic plus whatever \
+    partial output existed). Set `run_in_background: true` to park the run on a background \
+    card instead and receive the report as a peer message when the run settles — a completed \
+    report, a timeout/failure report with partial output, or nothing for a run you \
+    interrupted.\n\n\
+    Prefer parallel subagents over serial self-work: for splittable tasks — reviewing multiple \
+    PRs, modifying independent files, exploring alternatives — emit several background \
+    delegations in one turn so they run concurrently. Pass `isolation: \"worktree\"` when a \
+    subagent needs its own working tree (builds won't collide, edits won't clash).\n\n\
+    Time-box every dispatch: size `timeout_ms` to your estimate plus headroom — an expired \
+    budget terminates the child and delivers a report you can act on, instead of a task that \
+    runs forever. While background runs are in flight, `ListAgents` reports each run's health \
+    (working, tool running, stalled, looping) with its running time and counters, and \
+    `InterruptAgent` cancels one by id — inspect before acting, do not guess.\n\n\
+    Delegation is not fire-and-forget; you own each subagent's lifecycle. When a report \
+    arrives, decide deliberately: re-dispatch with a narrower scope, widen the budget, or \
+    take the work over yourself.";
 
 /// The process-global registry of built-in prompt templates. Parsed once;
 /// immutable thereafter. A parse failure panics at first use — these are

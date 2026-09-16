@@ -31,6 +31,13 @@ use crate::ext::subagent::types::{
 /// watchdog's documented "~5s enforcement granularity".
 pub const SUBAGENT_TICK: Duration = Duration::from_secs(5);
 
+/// Bound on the session-assembly phase of a start (child build + effort
+/// apply). A wedged build must fail the dispatch stage-named instead of
+/// hanging the parent turn forever — the retired Steer dispatch carried the
+/// same 90s guard. Worktree preparation sits outside it: its git commands
+/// carry their own per-command timeouts.
+pub const START_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Cap a subagent's final summary before it rides into the parent's context
 /// window.
 const FINAL_MAX_BYTES: usize = 128 * 1024;
@@ -154,23 +161,9 @@ impl SpawnProvider {
             .filter(|t| filter.is_none_or(|f| f.admits(t.name())))
             .cloned()
             .collect();
-        if let Some(filter) = filter {
-            for name in filter.allow.iter().chain(filter.deny.iter()) {
-                if !self.tools.iter().any(|t| t.name() == name) {
-                    continue; // loud-failed earlier by the runtime's validation
-                }
-                if HUMAN_INTERACTION_TOOLS.contains(&name.as_str())
-                    || name == "Steer"
-                    || self.delegation_names.contains(name)
-                {
-                    tracing::warn!(
-                        tool = %name,
-                        "tool filter names a tool children never receive; subagents never \
-                         get it (DELEGATED_CALLER guard)"
-                    );
-                }
-            }
-        }
+        // Definition-supplied filters are pre-sanitized at assembly (warn +
+        // skip there); request-supplied filters are loud-validated at the
+        // runtime before this runs — nothing to warn about here.
         auto_deny_gated(selected)
     }
 }
@@ -205,8 +198,16 @@ impl SubagentProvider for SpawnProvider {
             validate_filter_names(filter, &names)
                 .map_err(|e| SubagentError::Provider(self.name().to_string(), e.to_string()))?;
         }
+        // Fail loud, not accept-then-ignore: an armed idle budget without a
+        // run observer would silently never enforce.
+        if self.observer.is_none() && req.budgets.idle_timeout_ms.is_some() {
+            return Err(SubagentError::InvalidRequest(
+                "idle_timeout was armed but this provider was assembled without a run observer                  to enforce it"
+                    .to_string(),
+            ));
+        }
         let mut selected = self.select_child_tools(req.tool_filter.as_ref());
-        let worktree = match req.isolation.as_deref() {
+        let mut worktree = match req.isolation.as_deref() {
             Some("worktree") => Some(
                 Worktree::prepare(req.env.as_ref(), &req.cwd)
                     .await
@@ -257,27 +258,54 @@ impl SubagentProvider for SpawnProvider {
         {
             builder = builder.with_model(model);
         }
-        let mut session = builder.build().await.map_err(|e| {
-            SubagentError::Provider(
-                self.name().to_string(),
-                format!("failed to start subagent: {e}"),
-            )
-        })?;
-        if let Some(effort) = req
-            .agent_options
-            .as_ref()
-            .and_then(|o| o.reasoning_effort.clone())
-        {
-            session
-                .set_thinking_level_local(Some(effort))
-                .await
-                .map_err(|e| {
-                    SubagentError::Provider(
-                        self.name().to_string(),
-                        format!("failed to apply reasoning effort: {e}"),
-                    )
-                })?;
-        }
+        // Bounded assembly: a wedged child build fails the dispatch
+        // stage-named (and never leaks the prepared worktree) instead of
+        // hanging the parent turn forever.
+        let built = tokio::time::timeout(START_TIMEOUT, async {
+            let mut session = builder.build().await.map_err(|e| {
+                SubagentError::Provider(
+                    self.name().to_string(),
+                    format!("failed to start subagent: {e}"),
+                )
+            })?;
+            if let Some(effort) = req
+                .agent_options
+                .as_ref()
+                .and_then(|o| o.reasoning_effort.clone())
+            {
+                session
+                    .set_thinking_level_local(Some(effort))
+                    .await
+                    .map_err(|e| {
+                        SubagentError::Provider(
+                            self.name().to_string(),
+                            format!("failed to apply reasoning effort: {e}"),
+                        )
+                    })?;
+            }
+            Ok::<_, SubagentError>(session)
+        })
+        .await;
+        let session = match built {
+            Ok(Ok(session)) => session,
+            Ok(Err(e)) => {
+                if let Some(worktree) = worktree.take() {
+                    let _ = worktree.clean_up(req.env.as_ref()).await;
+                }
+                return Err(e);
+            }
+            Err(_) => {
+                if let Some(worktree) = worktree.take() {
+                    let _ = worktree.clean_up(req.env.as_ref()).await;
+                }
+                return Err(SubagentError::Provider(
+                    self.name().to_string(),
+                    format!(
+                        "subagent start timed out at stage `build-session` ({START_TIMEOUT:?})"
+                    ),
+                ));
+            }
+        };
         let handle = session.handle();
         let model = session.model().clone();
 
@@ -302,22 +330,48 @@ impl SubagentProvider for SpawnProvider {
         let label = req.label.clone();
         let budgets = req.budgets;
         let task_run_id = run_id.clone();
+        let task_provider = provider_name.clone();
+        let task_label = label.clone();
         tokio::spawn(async move {
             let _temp_guard = temp_guard; // hold the throwaway transcript dir alive
-            let result = drive_run(DrivenRun {
-                session,
-                handle,
-                prompt: req.prompt,
-                budgets,
-                dispose: dispose.clone(),
-                observer,
-                run_id: task_run_id,
-                provider_name,
-                label,
-                worktree,
-                env: req.env,
-            })
-            .await;
+            // Panic-tolerant settle: a run-loop panic must still settle the
+            // result and the observer's surfaces (otherwise the rail row
+            // stays Running forever), not take the task down silently.
+            let result = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(drive_run(
+                DrivenRun {
+                    session,
+                    handle,
+                    prompt: req.prompt,
+                    budgets,
+                    dispose: dispose.clone(),
+                    observer: observer.clone(),
+                    run_id: task_run_id.clone(),
+                    provider_name: task_provider.clone(),
+                    label: task_label.clone(),
+                    worktree,
+                    env: req.env,
+                },
+            )))
+            .await
+            .unwrap_or_else(|_| {
+                let result = RunResult {
+                    output: String::new(),
+                    structured: None,
+                    diagnostic: Some(cap_diagnostic("subagent run task panicked")),
+                    stop_reason: StopReason::Error,
+                };
+                if let Some(observer) = &observer {
+                    observer.on_settled(&crate::ext::subagent::types::RunEndInfo {
+                        run_id: task_run_id,
+                        provider: task_provider,
+                        label: task_label,
+                        local: true,
+                        stop_reason: result.stop_reason.clone(),
+                        output: String::new(),
+                    });
+                }
+                result
+            });
             let _ = result_tx.send(result);
         });
         let result_future = async move {

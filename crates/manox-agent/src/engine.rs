@@ -7,7 +7,7 @@
 //! between pi wire types and the UI language live here (adapt), so the
 //! facade only ever sees `Message` / `ThreadEvent`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1944,11 +1944,6 @@ fn build_tools(
     // (`<plugin>/agents/`, namespaced) definitions layer over the
     // built-ins; same-name user files override built-ins.
     crate::agent_defs::register_user_and_plugin(&mut registry);
-    for def in registry.all() {
-        subagent_runtime.register_delegation_tool(&def.name);
-    }
-    subagent_runtime.register_delegation_tool(crate::subagent::ListAgentsTool::NAME);
-    subagent_runtime.register_delegation_tool(crate::subagent::InterruptAgentTool::NAME);
     // Dedicated per-definition models from the cx providers config's
     // `subagents:` map; an unreadable config warns and leaves subagents
     // inheriting the thread model.
@@ -1978,7 +1973,7 @@ fn build_tools(
     // ungated bypass); Write/Edit carry the process write lock so parallel
     // workers clobbering the same path surface a named-holder conflict
     // instead of silently racing.
-    let spawn_provider = SpawnProvider::new(vec![
+    let child_tools: Vec<Arc<dyn PiAgentTool>> = vec![
         Arc::new(manox_harness::read::SelectorReadTool::new()),
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
@@ -2003,15 +1998,90 @@ fn build_tools(
             ),
             "sailor",
         )),
-    ])
-    .with_model_runtime(runtime.clone())
-    .with_model_slot(Arc::clone(&model_slot))
-    .with_delegation_names(subagent_runtime.delegation_tool_names())
-    // Subagent transcripts persist under the host session root (a
-    // subdirectory the sidebar's non-recursive listing never surfaces) so
-    // their usage stays accountable.
-    .with_session_dir(crate::thread_store::sessions_dir().join("subagents"))
-    .with_observer(Arc::clone(&subagent_observer) as Arc<dyn manox_harness::subagent::RunObserver>);
+    ];
+    let child_snapshot_names: HashSet<String> =
+        child_tools.iter().map(|t| t.name().to_string()).collect();
+    // Delegation tool names: sanitized into the provider wire charset
+    // (`[A-Za-z0-9_-]{1,64}` — plugin namespacing's `:` would 400 every
+    // request of the session), collision-checked against every model-facing
+    // name in this assembly, and registered into the runtime so child
+    // snapshots strip them (nesting is structurally disabled this
+    // iteration).
+    let mut taken_tool_names: HashSet<String> =
+        tools.iter().map(|t| t.name().to_string()).collect();
+    taken_tool_names.insert(crate::subagent::ListAgentsTool::NAME.to_string());
+    taken_tool_names.insert(crate::subagent::InterruptAgentTool::NAME.to_string());
+    let delegation_defs: Vec<(
+        String,
+        &manox_harness::ext_point_agent::AgentDef,
+        Vec<String>,
+    )> = registry
+        .all()
+        .into_iter()
+        .filter_map(|def| {
+            let tool_name = crate::subagent::sanitized_tool_name(&def.name, &taken_tool_names);
+            let Some(tool_name) = tool_name else {
+                tracing::warn!(
+                    def = %def.name,
+                    "agent definition has no usable model-facing tool name (charset \
+                     [A-Za-z0-9_-]{{1,64}} after sanitizing, or a name collision); \
+                     its delegation tool is skipped"
+                );
+                return None;
+            };
+            taken_tool_names.insert(tool_name.clone());
+            // Definition `tools:` data resolves against the child
+            // snapshot with warn-and-skip (the retired dispatch's
+            // semantics): a manifest naming an unknown or privileged
+            // tool must not hard-fail every dispatch.
+            let allow: Vec<String> = def
+                .tools
+                .iter()
+                .filter(|name| {
+                    if child_snapshot_names.contains(*name) {
+                        true
+                    } else if manox_harness::subagent::HUMAN_INTERACTION_TOOLS
+                        .contains(&name.as_str())
+                        || name.as_str() == "Steer"
+                    {
+                        tracing::warn!(
+                            agent = %def.name,
+                            tool = %name,
+                            "agent definition names a tool children never receive; \
+                             subagents never get it (DELEGATED_CALLER guard)"
+                        );
+                        false
+                    } else {
+                        tracing::warn!(
+                            agent = %def.name,
+                            tool = %name,
+                            "agent definition names a tool not in the child snapshot; \
+                             skipping it"
+                        );
+                        false
+                    }
+                })
+                .cloned()
+                .collect();
+            Some((tool_name, def, allow))
+        })
+        .collect();
+    for (tool_name, _, _) in &delegation_defs {
+        subagent_runtime.register_delegation_tool(tool_name);
+    }
+    subagent_runtime.register_delegation_tool(crate::subagent::ListAgentsTool::NAME);
+    subagent_runtime.register_delegation_tool(crate::subagent::InterruptAgentTool::NAME);
+    let spawn_provider = SpawnProvider::new(child_tools)
+        .with_model_runtime(runtime.clone())
+        .with_model_slot(Arc::clone(&model_slot))
+        .with_delegation_names(subagent_runtime.delegation_tool_names())
+        // Subagent transcripts persist under the host session root (a
+        // subdirectory the sidebar's non-recursive listing never surfaces)
+        // so their usage stays accountable.
+        .with_session_dir(crate::thread_store::sessions_dir().join("subagents"))
+        .with_observer(
+            Arc::clone(&subagent_observer) as Arc<dyn manox_harness::subagent::RunObserver>
+        );
     let spawn_provider = match model {
         Some(model) => spawn_provider.with_model(model.clone()),
         None => spawn_provider,
@@ -2020,19 +2090,19 @@ fn build_tools(
     let subagent_env: Arc<dyn manox_harness::env::ExecutionEnv> = Arc::new(
         manox_harness::env::TokioExecutionEnv::new(cwd.to_path_buf()),
     );
-    for def in registry.all() {
+    for (tool_name, def, allow) in delegation_defs {
         let capability = subagent_capability(def);
         let config = DelegationToolConfig {
             provider: "spawn".into(),
-            name: def.name.clone(),
+            name: tool_name.clone(),
             capability: capability.to_string(),
             rendered_description: crate::subagent::delegation_description(
                 &def.description,
                 capability,
-                &def.name,
+                &tool_name,
             ),
             persona: def.system_prompt.clone(),
-            default_tools: def.tools.clone(),
+            default_tools: allow,
             frontmatter_model_spec: def.model.clone(),
             config_model_spec: overrides.get(&def.name).cloned(),
             max_depth: 1,

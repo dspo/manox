@@ -293,7 +293,6 @@ impl AgentTool for SteerTool {
         let to_spec = ToSpec {
             agent_address: agent_address.to_string(),
             spawn: spawn.map(String::from),
-            isolation: None,
         };
         let reason = match reason_str {
             "Dispatch" => SteerReason::Dispatch,
@@ -328,7 +327,6 @@ mod tests {
         ToSpec {
             agent_address: addr.into(),
             spawn: spawn.map(String::from),
-            isolation: None,
         }
     }
 

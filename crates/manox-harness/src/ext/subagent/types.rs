@@ -402,6 +402,8 @@ pub fn test_request(label: &str, prompt: &str) -> StartRequest {
 #[derive(Debug, Clone, Serialize)]
 pub struct RunSnapshot {
     pub id: String,
+    /// The definition kind the delegation tool was configured from.
+    pub kind: String,
     pub label: String,
     pub provider: String,
     /// dsh status vocabulary; one-shot runs are `running` until they settle.

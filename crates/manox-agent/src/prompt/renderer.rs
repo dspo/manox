@@ -384,8 +384,8 @@ mod tests {
         // when a variant is added — this tripwire makes a forgotten bump
         // fail loudly here rather than letting a new variant ship
         // unregistered.
-        assert_eq!(template::ALL.len(), 16);
-        assert_eq!(REGISTRATIONS.len(), 16);
+        assert_eq!(template::ALL.len(), 15);
+        assert_eq!(REGISTRATIONS.len(), 15);
     }
 
     /// The on-disk `en/` and `zh-CN/` template trees must carry the same set

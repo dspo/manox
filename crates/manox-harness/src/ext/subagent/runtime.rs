@@ -39,19 +39,38 @@ pub struct SubagentRuntime {
     /// start and ride the descriptor for the durable lineage).
     delegation_tools: Mutex<BTreeSet<String>>,
     events_tx: broadcast::Sender<Event>,
+    /// Per-assembly namespace minted into every run id: a thread resume
+    /// builds a fresh runtime, and the rail/restore keys and peer-delivery
+    /// authors are run ids — without the namespace a resumed thread would
+    /// re-emit `sub-0` and collide with the historical rows.
+    namespace: String,
     run_seq: AtomicU64,
 }
 
 impl SubagentRuntime {
+    /// A runtime with a freshly minted random namespace.
     pub fn new() -> Arc<Self> {
+        Self::with_namespace(Self::mint_namespace())
+    }
+
+    /// A runtime under a caller-chosen namespace token.
+    pub fn with_namespace(namespace: impl Into<String>) -> Arc<Self> {
         let (events_tx, _) = broadcast::channel(64);
         Arc::new(SubagentRuntime {
             providers: RwLock::new(BTreeMap::new()),
             runs: Mutex::new(BTreeMap::new()),
             delegation_tools: Mutex::new(BTreeSet::new()),
             events_tx,
+            namespace: namespace.into(),
             run_seq: AtomicU64::new(0),
         })
+    }
+
+    /// A short random namespace token (8 hex chars — enough entropy to make
+    /// a resume collision implausible, short enough to keep run ids
+    /// model-facing and rail rows readable).
+    fn mint_namespace() -> String {
+        uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
     }
 
     /// Register a provider; the returned guard removes it on drop.
@@ -130,8 +149,13 @@ impl SubagentRuntime {
         descriptor.persona = request.persona.clone();
         descriptor.tool_filter = request.tool_filter.clone();
 
-        let run_id = format!("sub-{}", self.run_seq.fetch_add(1, Ordering::SeqCst));
+        let run_id = format!(
+            "sub-{}-{}",
+            self.namespace,
+            self.run_seq.fetch_add(1, Ordering::SeqCst)
+        );
         let label = request.label.clone();
+        let kind = request.kind.clone();
         let request_kind = request.kind.clone();
         let request_model = request.agent_options.as_ref().and_then(|o| o.model.clone());
         let resolved_budgets = request.budgets;
@@ -146,6 +170,7 @@ impl SubagentRuntime {
             ActiveRun {
                 snapshot: RunSnapshot {
                     id: run_id.clone(),
+                    kind,
                     label: label.clone(),
                     provider: provider.to_string(),
                     status: "running",
@@ -272,6 +297,7 @@ impl Drop for ProviderGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ext::subagent::SpawnProvider;
     use crate::ext::subagent::SubagentRun;
     use crate::ext::subagent::types::{Capabilities, RunResult, StopReason, test_request};
     use std::sync::atomic::AtomicU64;
@@ -364,6 +390,38 @@ mod tests {
             runtime.list_runs().is_empty(),
             "settled runs leave the table"
         );
+    }
+
+    /// Run ids are namespaced per assembly: two runtimes (the resume case)
+    /// never mint colliding ids, because the rail/restore keys and the
+    /// peer-delivery authors are run ids.
+    #[tokio::test]
+    async fn run_ids_are_namespaced_per_runtime() {
+        let a = SubagentRuntime::new();
+        let b = SubagentRuntime::new();
+        let _ga = a.register_provider(Arc::new(ScriptedProvider::new(full_caps())));
+        let _gb = b.register_provider(Arc::new(ScriptedProvider::new(full_caps())));
+        let run_a = a.start("scripted", test_request("l", "p")).await.unwrap();
+        let run_b = b.start("scripted", test_request("l", "p")).await.unwrap();
+        assert_ne!(run_a.id, run_b.id);
+        assert!(run_a.id.starts_with("sub-") && run_b.id.starts_with("sub-"));
+    }
+
+    /// A provider assembled without a run observer cannot enforce an armed
+    /// idle budget — the request is rejected instead of accepted-then-
+    /// ignored (the seam's own fail-loud rule).
+    #[tokio::test]
+    async fn idle_budget_without_an_observer_is_rejected() {
+        use crate::ext::subagent::types::Budgets;
+        let runtime = SubagentRuntime::new();
+        runtime.register_provider_permanent(Arc::new(SpawnProvider::new(vec![])));
+        let mut request = test_request("l", "p");
+        request.budgets = Budgets {
+            timeout_ms: None,
+            idle_timeout_ms: Some(5_000),
+        };
+        let err = runtime.start("spawn", request).await.unwrap_err();
+        assert!(err.to_string().contains("run observer"), "{err}");
     }
 
     #[tokio::test]
