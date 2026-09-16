@@ -45,10 +45,6 @@ pub struct SessionMeta {
     /// global plans dir), kept for restore + execution handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_file: Option<String>,
-    /// A plan review card was pending (proposed, no verdict yet) when the
-    /// session last settled; a restarted session re-surfaces the card.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_review_pending: Option<bool>,
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`
