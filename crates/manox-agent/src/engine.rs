@@ -26,11 +26,12 @@ use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiMo
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
-use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
+use crate::approval::{ApprovalGate, ApprovalGatedTool};
 use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE, UiNoteRecord};
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
+use crate::questions::PiAskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
@@ -289,6 +290,9 @@ struct EngineState {
     /// The host permission gate wrapping every mutating tool (mode +
     /// pending interaction round trips).
     gate: Arc<ApprovalGate>,
+    /// The user-questions seam's pending registry (the ask tool parks here;
+    /// the gateway settles here through `Thread::respond_question`).
+    question_gate: Arc<crate::questions::UserQuestionGate>,
     /// Shared goal state with the thread facade; the goal tools read/write
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
@@ -527,7 +531,11 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
             summary,
             input,
         } => (
-            "approval".into(),
+            if tool_name == crate::tools::ASK_USER_QUESTION {
+                "question".to_string()
+            } else {
+                "approval".to_string()
+            },
             json!({
                 "kind": "request",
                 "authId": id,
@@ -927,6 +935,10 @@ pub fn spawn_engine(
     // change — the gate journals it as an `approval` decision entry through
     // the actor queue (the request entry rides the notice tap).
     gate.set_journal_sink(cmd_tx.clone());
+    // The question seam owns its own pending registry and journals its verdicts
+    // as `question` decision entries through the same actor queue.
+    let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
+    question_gate.set_journal_sink(cmd_tx.clone());
     // The thread-scoped journal feed; session relays publish into it as
     // sessions come and go (capacity matches the storage broadcast, L5).
     let (journal_feed_handle, _) =
@@ -953,6 +965,7 @@ pub fn spawn_engine(
         current_appender: Mutex::new(None),
         current_resources: Mutex::new(None),
         gate,
+        question_gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
         goal_continuation_reserved: AtomicBool::new(false),
@@ -1288,6 +1301,14 @@ impl ThreadEngine for PiEngine {
         self.state.gate.pending_entries()
     }
 
+    fn respond_question(&self, id: &str, outcome: crate::questions::AskOutcome) {
+        self.state.question_gate.respond(id, outcome);
+    }
+
+    fn pending_question_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        self.state.question_gate.pending_entries()
+    }
+
     fn set_thinking_level(&self, level: Option<String>) {
         let _ = self.cmd_tx.send(SessionCmd::SetThinkingLevel(level));
     }
@@ -1604,6 +1625,7 @@ fn build_tools(
     model: Option<&PiModel>,
     session_id: &str,
     gate: &Arc<ApprovalGate>,
+    question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
@@ -1776,7 +1798,7 @@ fn build_tools(
         })
         .collect();
     tools.push(Arc::new(
-        PiAskUserQuestionTool::new(Arc::clone(gate)).with_plan_state(Arc::clone(plan)),
+        PiAskUserQuestionTool::new(Arc::clone(question_gate)).with_plan_state(Arc::clone(plan)),
     ));
     // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
     // the verdict request itself, not a side effect.
@@ -3225,6 +3247,7 @@ fn session_builder(
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
+    question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
@@ -3243,6 +3266,7 @@ fn session_builder(
         model,
         thread_id,
         gate,
+        question_gate,
         plan,
         notice_tx,
         goal_bridge,
@@ -3503,6 +3527,7 @@ async fn run_actor(
             &runtime,
             None,
             &state.gate,
+            &state.question_gate,
             &state.plan,
             &notice_tx,
             state.goal_bridge.as_ref(),
@@ -3543,6 +3568,7 @@ async fn run_actor(
                 &runtime,
                 Some(&pi_model),
                 &state.gate,
+                &state.question_gate,
                 &state.plan,
                 &notice_tx,
                 state.goal_bridge.as_ref(),
@@ -4330,6 +4356,7 @@ async fn run_actor(
                     &runtime,
                     Some(&pi_model),
                     &state.gate,
+                    &state.question_gate,
                     &state.plan,
                     &notice_tx,
                     state.goal_bridge.as_ref(),
@@ -4526,6 +4553,7 @@ async fn rebuild_session(
         runtime,
         None,
         gate,
+        &state.question_gate,
         plan,
         notice_tx,
         goal_bridge,
@@ -7014,7 +7042,11 @@ mod tests {
         let cwd = std::env::temp_dir();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
         let model_slot = Arc::new(Mutex::new(None));
-        let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
+        let gate = Arc::new(ApprovalGate::new(
+            notice_tx.clone(),
+            Arc::clone(&model_slot),
+        ));
+        let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
         Arc::new(EngineState {
             running: AtomicBool::new(false),
             session_start_fired: AtomicBool::new(false),
@@ -7038,6 +7070,7 @@ mod tests {
             current_appender: Mutex::new(None),
             current_resources: Mutex::new(None),
             gate,
+            question_gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
             goal_continuation_reserved: AtomicBool::new(false),

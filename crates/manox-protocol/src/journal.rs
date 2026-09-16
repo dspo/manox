@@ -147,7 +147,9 @@ pub enum JournalWireEvent {
         stranded_steer_ids: Vec<String>,
     },
     /// The loop stopped advancing with an optional human reason.
-    Stop { reason: Option<String> },
+    Stop {
+        reason: Option<String>,
+    },
     /// A provider retry was scheduled.
     Retry {
         attempt: u32,
@@ -156,12 +158,18 @@ pub enum JournalWireEvent {
         reason: String,
     },
     /// A terminal error (`anyhow::Error` flattened to `{ message }`, §C.2).
-    Error { message: String },
+    Error {
+        message: String,
+    },
     // ── streaming delta ─────────────────────────────────────────────
     /// An assistant text delta (chunked, durable — dsh parity).
-    AgentTextDelta { s: String },
+    AgentTextDelta {
+        s: String,
+    },
     /// An assistant thinking delta.
-    AgentThinkingDelta { s: String },
+    AgentThinkingDelta {
+        s: String,
+    },
     /// A tool call announced / updated. `status` is the vocabulary string
     /// (`"pending" | "running" | "done" | "error"`). The tool-call handle is
     /// `callId` — the envelope's `id` belongs to the entry uuid alone
@@ -180,7 +188,10 @@ pub enum JournalWireEvent {
         is_error: bool,
     },
     /// A streaming chunk of a tool's stdout/stderr (`callId`, §C.1).
-    ToolOutputChunk { call_id: String, chunk: String },
+    ToolOutputChunk {
+        call_id: String,
+        chunk: String,
+    },
     /// An event surfaced by a subagent child session (`agentId`, §C.1).
     SubagentChild {
         agent_id: String,
@@ -202,17 +213,29 @@ pub enum JournalWireEvent {
         to: ModelRef,
     },
     /// Effective working directory moved.
-    CwdChange { path: String },
+    CwdChange {
+        path: String,
+    },
     /// Project binding changed (`None` = unbound).
-    ProjectChange { path: Option<String> },
+    ProjectChange {
+        path: Option<String>,
+    },
     /// Permission mode changed (vocabulary string).
-    PermissionModeChange { mode: String },
+    PermissionModeChange {
+        mode: String,
+    },
     /// Reasoning effort changed (vocabulary string).
-    ReasoningEffortChange { effort: String },
+    ReasoningEffortChange {
+        effort: String,
+    },
     /// Plan mode toggled.
-    PlanModeChange { enabled: bool },
+    PlanModeChange {
+        enabled: bool,
+    },
     /// The plan document updated (kernel snapshot shape, wire-opaque).
-    PlanUpdate { snapshot: serde_json::Value },
+    PlanUpdate {
+        snapshot: serde_json::Value,
+    },
     /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
     /// `state` = "proposed" (the review card is due — the pending
     /// projection raises) | "resolved" (a verdict landed — it clears; the
@@ -223,13 +246,21 @@ pub enum JournalWireEvent {
         plan_file: Option<String>,
     },
     /// Goal set / cleared (`None` = cleared).
-    Goal { goal: Option<serde_json::Value> },
+    Goal {
+        goal: Option<serde_json::Value>,
+    },
     /// Thread title changed.
-    Title { title: String },
+    Title {
+        title: String,
+    },
     /// Active browser suites changed.
-    BrowserSuites { suites: Vec<String> },
+    BrowserSuites {
+        suites: Vec<String>,
+    },
     /// Background-task registry snapshot updated.
-    BackgroundTask { snapshot: serde_json::Value },
+    BackgroundTask {
+        snapshot: serde_json::Value,
+    },
     /// Approval request / decision, dual-state (§C.2): the fold source of
     /// the `pending_auth` projection. `kind` is `"request"` | `"decision"`.
     Approval {
@@ -241,10 +272,25 @@ pub enum JournalWireEvent {
         reason: Option<String>,
     },
     /// Pinned / archived flags changed.
-    PinnedArchived { pinned: bool, archived: bool },
+    /// User-question request / decision (the question seam): the same
+    /// dual-state fold as `Approval`, with its own vocabulary.
+    Question {
+        kind: String,
+        auth_id: String,
+        tool_name: Option<String>,
+        tool_call_id: Option<String>,
+        verdict: Option<String>,
+        reason: Option<String>,
+    },
+    PinnedArchived {
+        pinned: bool,
+        archived: bool,
+    },
     /// The engine's active tool-set changed (kernel diagnostic state,
     /// wire-opaque). Completes the §C.2 set: no journal kind is wire-less.
-    ActiveToolsChange { tools: Vec<String> },
+    ActiveToolsChange {
+        tools: Vec<String>,
+    },
     /// Compaction of older history completed (spinner state is carried by
     /// the independent `CompactionStarted` entry, §C.2 note).
     Compaction {
@@ -255,17 +301,27 @@ pub enum JournalWireEvent {
         first_kept_entry_id: Option<String>,
     },
     /// Compaction of older history started (UI spinner edge).
-    CompactionStarted { tokens_before: u64 },
+    CompactionStarted {
+        tokens_before: u64,
+    },
     // ── compression / tree ──────────────────────────────────────────
     /// Summary entry produced when a branch point is collapsed.
-    BranchSummary { text: String },
+    BranchSummary {
+        text: String,
+    },
     /// A label was attached to an entry.
-    Label { label: String },
+    Label {
+        label: String,
+    },
     /// Session-info annotation row.
-    SessionInfo { data: serde_json::Value },
+    SessionInfo {
+        data: serde_json::Value,
+    },
     /// Leaf redirect (fork / merged follow-up; the `leaf.targetId` cursor
     /// semantics of §C.1). Carries only the target entry id.
-    Leaf { target_id: String },
+    Leaf {
+        target_id: String,
+    },
     // ── metrics ─────────────────────────────────────────────────────
     /// Diagnostic metric (low-priority group, §C.2):
     /// `kind` = `prefix_stability | cache_invalidation | side_call |

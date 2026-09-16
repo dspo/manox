@@ -256,6 +256,31 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
             .unwrap()
             .push((id.to_string(), response));
     }
+
+    fn respond_question(&self, id: &str, outcome: manox_agent::questions::AskOutcome) {
+        // The fake engine keeps the legacy response record so the ask-path
+        // assertions below stay readable; the conversion is one-to-one.
+        let legacy = match outcome {
+            manox_agent::questions::AskOutcome::Answered(answers) => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+            }
+            manox_agent::questions::AskOutcome::Dismissed => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+            }
+            manox_agent::questions::AskOutcome::Expired
+            | manox_agent::questions::AskOutcome::Cancelled => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired
+            }
+        };
+        self.auth_responses
+            .lock()
+            .unwrap()
+            .push((id.to_string(), legacy));
+    }
+
+    fn pending_question_entries(&self) -> Vec<(String, manox_agent::permission::PendingAuthMeta)> {
+        self.pending_auth.lock().unwrap().clone()
+    }
 }
 
 /// A connected client harness: the client end of an in-process pair.
@@ -630,6 +655,16 @@ fn ent_approval(id: String, parent_id: Option<String>) -> SessionTreeEntry {
         kind: "decision".into(),
         auth_id: "auth-j1".into(),
         payload: json!({"toolName": "Bash", "verdict": "allow_once"}),
+    }
+}
+fn ent_question(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+    SessionTreeEntry::Question {
+        id,
+        parent_id,
+        timestamp: fixed_ts(),
+        kind: "decision".into(),
+        auth_id: "auth-j1".into(),
+        payload: json!({"toolName": "AskUserQuestion", "verdict": "answered"}),
     }
 }
 fn ent_pinned_archived(id: String, parent_id: Option<String>) -> SessionTreeEntry {
@@ -8121,6 +8156,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         ent_browser_suites,
         ent_background_task,
         ent_approval,
+        ent_question,
         ent_pinned_archived,
         ent_active_tools_change,
         ent_compaction,
@@ -8135,7 +8171,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         builders.len(),
         JOURNAL_ENTRIES.len(),
         "J1: the builder list must stay 1:1 with the declared vocabulary \
-             (both sides are exhaustive over the same 38)"
+             (both sides are exhaustive over the same 39)"
     );
     let mut prev: Option<String> = None;
     for (seq, build) in builders.into_iter().enumerate() {
