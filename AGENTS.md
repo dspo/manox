@@ -54,7 +54,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 
 ## 提示词系统
 
-非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/manox-harness/src/ext/agents/*.md`（`include_str!`）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
+非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/manox-harness/ext-agents/*.md`（`include_str!`，由 `ext/subagent/spawn.rs` 嵌入）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
 ## 运行时配置（`~/.manox/`）
 
@@ -68,7 +68,7 @@ manox 区分**模型面向**与**用户面向**两条字符串边界：
 - 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
-- 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model/max_turns/allow_nesting + 正文）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
+- 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具，架构与 `~/projects/github/deepseek-harness` 的 subagent 服务同构：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）

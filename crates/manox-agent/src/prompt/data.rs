@@ -157,20 +157,3 @@ pub struct SkillBodyData {
 }
 
 // --- tool descriptions ---
-
-/// A sub-agent type advertised in the `agent` tool description.
-#[derive(Debug, Clone, Serialize)]
-pub struct SubagentTypeData {
-    pub name: String,
-    /// `read-only` / `write` / `bash` / `write+bash`.
-    pub capability: &'static str,
-    pub description: String,
-}
-
-/// Payload for the `agent` tool description. The static preamble lives in the
-/// template; the dynamic sub-agent list is an array so no `push_str` markdown
-/// is built in flow code.
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentToolDescriptionData {
-    pub subagents: Vec<SubagentTypeData>,
-}
