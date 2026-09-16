@@ -2115,6 +2115,117 @@ struct SessionOrchestrators {
     background: Arc<BackgroundManager>,
 }
 
+/// Re-mount the embedder's registered tools (the `RegisterSessionTools`
+/// store) onto a live session (#805 companion).
+///
+/// `build_tools` consults the provider once per session assembly, but the
+/// VS Code host registers tools only after it learns the session id —
+/// i.e. after Open/Create has already spawned this engine — so the
+/// assembly-time snapshot is stale by construction: the client adapters
+/// reach neither the model's schema nor `execute_one`'s dispatch table,
+/// and a model call fails with `Tool not found: client_<name>`. The
+/// handler's own comment promised "the NEXT tool assembly" sees a
+/// registration; for a long-lived session that assembly never came.
+///
+/// Called on every `Prompt` before the run starts (idle boundary, like
+/// the `Open`/`NewSession` re-binds this mirrors), it replaces the
+/// previously mounted `client_*` adapters with the provider's current
+/// set — preserving their position in the tool order so a narrow active
+/// selection keeps matching by name — and widens an existing selection
+/// to cover a fresh registration (new adapters were active at first
+/// assembly through `default_active_tool_names`, so a never-narrowed
+/// session keeps that behavior without persisting anything). Fail-soft:
+/// a rejected re-mount (e.g. a host registration colliding with a
+/// built-in name) logs and the turn runs on the existing table.
+async fn refresh_embedder_tools(
+    session: &mut AgentSession,
+    session_id: &str,
+    gate: &Arc<ApprovalGate>,
+) {
+    let Some(provider) = crate::embedder_tools::provider() else {
+        return;
+    };
+    let mounted = session.mounted_tools();
+    // The provider's adapters all carry the `client_` prefix; that is the
+    // same name contract `build_tools` mounted them under and the model
+    // dispatches against, so stripping the previous embedder set by
+    // prefix cannot disturb a built-in.
+    let fresh: Vec<Arc<dyn PiAgentTool>> = provider
+        .tools_for(session_id)
+        .into_iter()
+        .map(|tool| {
+            Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn PiAgentTool>
+        })
+        .collect();
+    let old_client: Vec<String> = mounted
+        .iter()
+        .filter(|t| t.name().starts_with("client_"))
+        .map(|t| t.name().to_string())
+        .collect();
+    let new_client: Vec<String> = fresh.iter().map(|t| t.name().to_string()).collect();
+    if old_client.is_empty() && new_client.is_empty() {
+        // The host-less / host-idle case: nothing embedder-shaped mounted
+        // and nothing registered — skip the rebuild so a plain CLI prompt
+        // pays no per-prompt allocation or prompt rebuild.
+        return;
+    }
+    if old_client == new_client {
+        // Identical registration (the extension re-sends the same set on
+        // activation): the mounted adapters already route to the current
+        // store state — no re-mount needed.
+        return;
+    }
+    let mut tools = Vec::with_capacity(mounted.len() + fresh.len());
+    let mut injected = false;
+    for tool in mounted {
+        if tool.name().starts_with("client_") {
+            // Drop every old adapter and inject the fresh set at the old
+            // set's first slot, preserving tool order.
+            if !injected {
+                tools.extend(fresh.iter().cloned());
+                injected = true;
+            }
+        } else {
+            tools.push(tool);
+        }
+    }
+    if !injected && !fresh.is_empty() {
+        // No client tools mounted yet (registration landed after the
+        // assembly): append at the end, mirroring build_tools' order.
+        tools.extend(fresh);
+    }
+    if let Err(err) = session.set_tools(tools) {
+        tracing::warn!(error = %err, "embedder tool refresh rejected; using the existing table");
+        return;
+    }
+    // A narrowed active selection was computed against the OLD set: carry
+    // the non-client names over verbatim and replace the client names
+    // with the fresh ones — mirroring the all-active behavior
+    // `default_active_tool_names` gave a registration at first assembly.
+    // Persisted only on a real change; a never-narrowed session reports
+    // `None` and needs nothing.
+    if let Some(active) = session.active_tool_names() {
+        let mut next: Vec<String> = active
+            .iter()
+            .filter(|n| !n.starts_with("client_"))
+            .cloned()
+            .collect();
+        next.extend(new_client.iter().cloned());
+        let mut cur_sorted = active.clone();
+        let mut next_sorted = next.clone();
+        cur_sorted.sort_unstable();
+        next_sorted.sort_unstable();
+        if cur_sorted != next_sorted
+            && let Err(err) = session.set_active_tools(next).await
+        {
+            tracing::warn!(
+                error = %err,
+                "embedder tool active-selection update rejected; model may not see a client tool"
+            );
+        }
+    }
+}
+
 /// Bind the orchestrators to a freshly built session: the monitor steerer
 /// lands events in the session's steering queue and the background manager
 /// subscribes to the session's lifecycle.
@@ -3807,6 +3918,13 @@ async fn run_actor(
                 origin_rpc,
                 accepted_entry,
             } => {
+                // #805 companion: the host registers its client tools only
+                // after it learns this session's id — i.e. after Open/Create
+                // spawned this engine — so re-consult the embedder provider
+                // before every prompt (no-op while the registration set is
+                // unchanged) instead of trusting the one-time assembly
+                // snapshot.
+                refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the
@@ -10431,5 +10549,315 @@ mod tests {
             "the decision must land a title entry"
         );
         session.close().await.unwrap();
+    }
+
+    // ── #805 companion: embedder tools registered AFTER session assembly
+    // must reach the live tool table. The VS Code host registers only once
+    // it learns the session id — i.e. after Open/Create spawned the engine
+    // — so the one-time `build_tools` snapshot is stale by construction:
+    // the adapters reach neither the model's schema nor `execute_one`'s
+    // dispatch table, and the model's call fails with
+    // `Tool not found: client_<name>`. These tests pin the per-Prompt
+    // refresh (`refresh_embedder_tools`, the call the actor makes before
+    // every run) at the exact breakage point: a real AgentSession, the
+    // real process provider slot, and a stub model that streams a
+    // `tool_use` for the registered name — dispatch must reach the
+    // adapter (the in-engine stand-in for the server's `InvokeClientTool`
+    // round trip) instead of the not-found error. The register-before-
+    // assembly order stays covered by `build_tools` itself (plus the
+    // napi-edge test in manox-napi); register-after is the shipping VS
+    // Code flow.
+
+    /// Guard for the process-wide provider slot across the tests here
+    /// (mirrors session-core's `lock_globals`; the slot is last-wins).
+    static EMBEDDER_SLOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A client tool that records its own executions — the in-engine
+    /// stand-in for the `EmbedderToolAdapter`'s `InvokeClientTool` call.
+    #[derive(Clone)]
+    struct ProbeClientTool {
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl manox_harness::tool::AgentTool for ProbeClientTool {
+        fn name(&self) -> &str {
+            "client_probe"
+        }
+        fn description(&self) -> &str {
+            "registered after the session was assembled"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        // The GenCodeChain registration is `read_only: true`; a gated
+        // probe would park the run on an approval card.
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _params: serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+            _ctx: &dyn manox_harness::tool::ToolContext,
+        ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(manox_harness::tool::AgentToolResult::text("probe-ok"))
+        }
+    }
+
+    /// Provider standing in for `AgentServerEmbedderTools`: hands out the
+    /// probe tool for one session id only once the test "registers" it —
+    /// mirroring `RegisterSessionTools` landing into the server map.
+    struct ProbeProvider {
+        registered: Arc<std::sync::atomic::AtomicBool>,
+        tool: ProbeClientTool,
+        session_id: &'static str,
+    }
+
+    impl crate::embedder_tools::EmbedderToolProvider for ProbeProvider {
+        fn tools_for(&self, session_id: &str) -> Vec<Arc<dyn manox_harness::tool::AgentTool>> {
+            if self.registered.load(std::sync::atomic::Ordering::SeqCst)
+                && session_id == self.session_id
+            {
+                vec![Arc::new(self.tool.clone()) as Arc<dyn manox_harness::tool::AgentTool>]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    /// Scripted provider: round 1 emits a `client_probe` tool_use (and
+    /// records whether the mounted schema advertised the tool); round 2
+    /// settles with plain text.
+    struct ProbeRoundStream {
+        calls: std::sync::atomic::AtomicUsize,
+        advertised: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    fn probe_tool_use(context: &manox_harness::types::AgentContext) -> AgentMessage {
+        AgentMessage::Assistant {
+            content: vec![ContentBlock::ToolUse {
+                id: "probe-1".into(),
+                name: "client_probe".into(),
+                input: serde_json::json!({}),
+                thought_signature: None,
+            }],
+            model: context.model.id.clone(),
+            provider: context.model.provider.clone(),
+            api: context.model.api.clone(),
+            response_model: None,
+            response_id: None,
+            diagnostics: None,
+            raw_stop_reason: None,
+            stop_reason: Some(manox_harness::types::StopReason::ToolUse),
+            usage: Box::new(manox_harness::types::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+            error_message: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl manox_harness::agent_loop::StreamFn for ProbeRoundStream {
+        async fn stream(
+            &self,
+            context: &manox_harness::types::AgentContext,
+            _signal: tokio_util::sync::CancellationToken,
+            _event_tx: tokio::sync::mpsc::Sender<manox_harness::types::AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                if context.tools.iter().any(|t| t.name() == "client_probe") {
+                    self.advertised
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                return Ok(probe_tool_use(context));
+            }
+            Ok(text_assistant(context, "settled"))
+        }
+    }
+
+    /// Register-after-assembly, full end to end: the provider slot exists
+    /// but returns NOTHING at session build (the map is empty when the
+    /// engine spawns), the registration lands afterwards, and the refresh
+    /// must surface the tool in the model's schema AND dispatch the
+    /// stub's tool_use into the adapter (not `Tool not found`).
+    // The std guard only serializes tests against each other on the
+    // process-wide provider slot; a current-thread test runtime has no
+    // re-entrant taker, so holding it across the test's own awaits is safe.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
+        let _slot = EMBEDDER_SLOT_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let advertised = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::embedder_tools::set_provider(Arc::new(ProbeProvider {
+            registered: Arc::clone(&registered),
+            tool: ProbeClientTool {
+                invocations: Arc::clone(&invocations),
+            },
+            session_id: "embedder-after",
+        }));
+
+        let stream = Arc::new(ProbeRoundStream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            advertised: Arc::clone(&advertised),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+        // The buggy state, pinned: at assembly the registration has not
+        // landed, so the mounted table carries no client adapter — the
+        // model never sees it and its call fails with `Tool not found`.
+        assert!(
+            !session.tools().iter().any(|n| n == "client_probe"),
+            "precondition: assembly must NOT contain the late registration"
+        );
+
+        let state = test_engine_state();
+        // The host registers — the `RegisterSessionTools` write landing
+        // into the AgentServer map after the engine spawned.
+        registered.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // What the actor does at the start of every `Prompt`.
+        refresh_embedder_tools(&mut session, "embedder-after", &state.gate).await;
+        assert!(
+            session.tools().iter().any(|n| n == "client_probe"),
+            "refresh must surface the late registration in the tool table: {:?}",
+            session.tools()
+        );
+
+        // And the round trip proves dispatch (not just the schema): the
+        // stub's tool_use must land in the adapter, not in the
+        // `Tool not found` arm of `execute_one`.
+        let messages = session
+            .prompt("use the host tool")
+            .await
+            .expect("the stub run completes");
+        assert!(
+            advertised.load(std::sync::atomic::Ordering::SeqCst),
+            "the provider request schema must advertise client_probe"
+        );
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tool_use must dispatch into the registered adapter"
+        );
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(
+            !serialized.contains("Tool not found"),
+            "dispatch must not answer with the not-found error: {serialized}"
+        );
+        assert!(serialized.contains("probe-ok"));
+
+        crate::embedder_tools::drop_provider_for_test();
+    }
+
+    /// The narrowed-selection timing variant: a session whose active set
+    /// was narrowed (browser-suite-toggle shape) BEFORE the registration
+    /// lands must still dispatch the late tool — the refresh must widen
+    /// the selection, since `apply_active_tools` would otherwise filter
+    /// the freshly mounted adapter out again (schema present, dispatch
+    /// still `Tool not found` — the exact split the bug report showed).
+    // The std guard only serializes tests against each other on the
+    // process-wide provider slot; a current-thread test runtime has no
+    // re-entrant taker, so holding it across the test's own awaits is safe.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session() {
+        let _slot = EMBEDDER_SLOT_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invocations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let advertised = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::embedder_tools::set_provider(Arc::new(ProbeProvider {
+            registered: Arc::clone(&registered),
+            tool: ProbeClientTool {
+                invocations: Arc::clone(&invocations),
+            },
+            session_id: "embedder-narrowed",
+        }));
+
+        let stream = Arc::new(ProbeRoundStream {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            advertised: Arc::clone(&advertised),
+        });
+        let stream_for_resolver = Arc::clone(&stream);
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+            Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+        // Narrowed selection with no client tool in it.
+        session.set_active_tools(vec![]).await.unwrap();
+        registered.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let state = test_engine_state();
+        refresh_embedder_tools(&mut session, "embedder-narrowed", &state.gate).await;
+
+        assert!(
+            session.tools().iter().any(|n| n == "client_probe"),
+            "the adapter must be mounted: {:?}",
+            session.tools()
+        );
+        let active = session.active_tool_names().expect("selection stays Some");
+        assert!(
+            active.iter().any(|n| n == "client_probe"),
+            "the narrowed selection must widen to the fresh registration: {active:?}"
+        );
+
+        let messages = session
+            .prompt("use the host tool")
+            .await
+            .expect("the stub run completes");
+        assert!(
+            advertised.load(std::sync::atomic::Ordering::SeqCst),
+            "the provider request schema must advertise client_probe"
+        );
+        assert_eq!(
+            invocations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tool_use must dispatch into the registered adapter"
+        );
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(
+            !serialized.contains("Tool not found"),
+            "dispatch must not answer with the not-found error: {serialized}"
+        );
+
+        crate::embedder_tools::drop_provider_for_test();
     }
 }

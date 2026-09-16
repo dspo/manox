@@ -577,13 +577,21 @@ impl AgentSession {
         Ok(())
     }
 
-    /// The full mounted tool set.
+    /// The full mounted tool set (names).
     pub fn tools(&self) -> Vec<String> {
         self.harness
             .tools()
             .iter()
             .map(|t| t.name().to_string())
             .collect()
+    }
+
+    /// The full mounted tool set as live tool objects. The engine's
+    /// embedder-tool refresh re-mounts the unchanged built-ins alongside the
+    /// freshly registered client adapters through here (`set_tools` takes
+    /// the whole set).
+    pub fn mounted_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.harness.tools().to_vec()
     }
 
     /// Replace the mounted tool set.
