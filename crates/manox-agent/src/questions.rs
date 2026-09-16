@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use manox_harness::tool::{AgentTool as PiAgentTool, AgentToolResult, ToolContext, ToolError};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::permission::{AskAnswer, PendingAuthMeta};
@@ -42,6 +42,53 @@ pub enum AskOutcome {
     Cancelled,
 }
 
+/// The question a composed answerer is offered: the parked tool call and its
+/// model-supplied input, so an in-process answerer can decide from the same
+/// bytes the card renders.
+#[derive(Clone, Copy)]
+pub struct AskRequest<'a> {
+    pub tool_call_id: &'a str,
+    pub input: &'a serde_json::Value,
+}
+
+/// The settle channel of one parked question: an answerer that needs the wire
+/// answerer (a human at a client) awaits it here instead of delegating.
+pub struct QuestionSettle {
+    rx: AsyncMutex<oneshot::Receiver<AskOutcome>>,
+}
+
+impl QuestionSettle {
+    fn new(rx: oneshot::Receiver<AskOutcome>) -> Self {
+        Self {
+            rx: AsyncMutex::new(rx),
+        }
+    }
+
+    /// Wait for the gateway's settle. A dropped responder (turn cancelled
+    /// before any settle) reads as `Cancelled`, exactly like the tool's own
+    /// signal arm.
+    pub async fn wait(&self) -> AskOutcome {
+        let mut rx = self.rx.lock().await;
+        match (&mut *rx).await {
+            Ok(outcome) => outcome,
+            Err(_) => AskOutcome::Cancelled,
+        }
+    }
+}
+
+/// One composed answerer of the user-questions seam. Returning `Some` claims
+/// the request (first claim wins); returning `None` delegates to the next
+/// answerer. The wire answerer — the fan-out to capable clients — is the
+/// implicit last resort and needs no registration: when every composed
+/// answerer delegates, the tool parks on the settle channel like before.
+#[async_trait::async_trait]
+pub trait UserQuestionAnswerer: Send + Sync {
+    /// Stable name, for diagnostics.
+    fn name(&self) -> &str;
+    /// Claim the request or delegate it.
+    async fn ask(&self, request: AskRequest<'_>, settle: &QuestionSettle) -> Option<AskOutcome>;
+}
+
 /// One parked question: the responder the tool awaits plus the card metadata
 /// the workspace re-surfaces after a thread switch.
 struct PendingQuestion {
@@ -59,6 +106,10 @@ pub struct UserQuestionGate {
     /// The actor command sender that carries verdict journaling (K3), set once
     /// the engine exists.
     journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
+    /// Composed answerers, consulted in registration order before the wire
+    /// answerer. Host assemblies (a TUI, an automation policy, a test) add
+    /// theirs here; the client fan-out needs no entry.
+    answerers: Mutex<Vec<Arc<dyn UserQuestionAnswerer>>>,
     delegated: bool,
 }
 
@@ -68,6 +119,7 @@ impl UserQuestionGate {
             notice_tx,
             pending: Mutex::new(HashMap::new()),
             journal_sink: Mutex::new(None),
+            answerers: Mutex::new(Vec::new()),
             delegated: false,
         }
     }
@@ -125,6 +177,28 @@ impl UserQuestionGate {
             self.journal_decision(id, &pending.meta.tool_name, verdict);
             let _ = pending.tx.send(outcome);
         }
+    }
+
+    /// Append one composed answerer; earlier registrations are asked first.
+    pub fn register_answerer(&self, answerer: Arc<dyn UserQuestionAnswerer>) {
+        self.answerers.lock().unwrap().push(answerer);
+    }
+
+    /// Offer the request to the composed answerers in order. The first claim
+    /// wins; when every answerer delegates (or none is registered) the caller
+    /// falls back to the wire answerer by awaiting the settle channel.
+    async fn compose(
+        &self,
+        request: AskRequest<'_>,
+        settle: &QuestionSettle,
+    ) -> Option<AskOutcome> {
+        let answerers: Vec<Arc<dyn UserQuestionAnswerer>> = self.answerers.lock().unwrap().clone();
+        for answerer in answerers {
+            if let Some(outcome) = answerer.ask(request, settle).await {
+                return Some(outcome);
+            }
+        }
+        None
     }
 
     /// Parked questions with their card metadata, so the workspace can
@@ -273,8 +347,28 @@ impl PiAgentTool for PiAskUserQuestionTool {
             input: params.clone(),
         });
 
+        let settle = QuestionSettle::new(rx);
+        let composed = self
+            .gate
+            .compose(
+                AskRequest {
+                    tool_call_id,
+                    input: &params,
+                },
+                &settle,
+            )
+            .await;
+        // No composed answerer claimed the request: the wire answerer (the
+        // fan-out to capable clients) is the last resort, exactly as before
+        // the seam existed.
+        let wait_wire = async {
+            match composed {
+                Some(outcome) => outcome,
+                None => settle.wait().await,
+            }
+        };
         let outcome = tokio::select! {
-            r = rx => r.unwrap_or(AskOutcome::Cancelled),
+            outcome = wait_wire => outcome,
             _ = signal.cancelled() => {
                 self.gate.discard(tool_call_id);
                 AskOutcome::Cancelled
@@ -1226,6 +1320,136 @@ mod tests {
             "[DELEGATED_CALLER] A delegated subagent cannot ask the user questions. \
              Include the open question in your final summary so the parent agent — \
              which can ask — resolves it."
+        );
+    }
+
+    /// One composed answerer that claims every request, recording the id it
+    /// saw so the test can prove composition reads the same parked bytes the
+    /// card renders.
+    struct ClaimingAnswerer {
+        seen_question: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl UserQuestionAnswerer for ClaimingAnswerer {
+        fn name(&self) -> &str {
+            "test-claimer"
+        }
+
+        async fn ask(
+            &self,
+            request: AskRequest<'_>,
+            _settle: &QuestionSettle,
+        ) -> Option<AskOutcome> {
+            let qid = request.input["questions"][0]["id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            *self.seen_question.lock().unwrap() = Some(qid.clone());
+            Some(AskOutcome::Answered(vec![AskAnswer::new(
+                qid,
+                vec!["a".into()],
+                None,
+            )]))
+        }
+    }
+
+    /// One composed answerer that delegates every request to the next one.
+    struct DelegatingAnswerer;
+
+    #[async_trait::async_trait]
+    impl UserQuestionAnswerer for DelegatingAnswerer {
+        fn name(&self) -> &str {
+            "test-delegator"
+        }
+
+        async fn ask(
+            &self,
+            _request: AskRequest<'_>,
+            _settle: &QuestionSettle,
+        ) -> Option<AskOutcome> {
+            None
+        }
+    }
+
+    /// A2: a composed answerer claims the request, so the tool renders its
+    /// answer without any wire settle — and it saw the parked card's minted id.
+    #[tokio::test]
+    async fn composed_answerer_claim_wins_without_a_wire_settle() {
+        let (gate, _rx) = gate_with_events();
+        let claimer = Arc::new(ClaimingAnswerer {
+            seen_question: std::sync::Mutex::new(None),
+        });
+        gate.register_answerer(Arc::clone(&claimer) as Arc<dyn UserQuestionAnswerer>);
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
+            .await
+            .expect("the ask tool returns a tool result");
+        assert!(!result.is_error);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
+        assert_eq!(parsed["answers"][0]["selected"][0], "a");
+        assert_eq!(parsed["answers"][0]["id"], parsed["answers"][0]["id"]);
+        let seen = claimer
+            .seen_question
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the answerer saw the request");
+        assert_eq!(
+            parsed["answers"][0]["id"].as_str(),
+            Some(seen.as_str()),
+            "composition reads the same parked id the card carries"
+        );
+        assert!(
+            gate.pending_entries().is_empty(),
+            "a composed claim leaves no parked card behind"
+        );
+    }
+
+    /// A2: delegation falls through — a delegating answerer before the wire
+    /// answerer must not consume the request.
+    #[tokio::test]
+    async fn composed_answerer_delegation_falls_through_to_the_wire() {
+        let (gate, _rx) = gate_with_events();
+        gate.register_answerer(Arc::new(DelegatingAnswerer) as Arc<dyn UserQuestionAnswerer>);
+        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let settle = {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
+                    tokio::task::yield_now().await;
+                }
+                let qid = gate
+                    .pending_entries()
+                    .into_iter()
+                    .find(|(id, _)| id == "ask-1")
+                    .expect("parked card")
+                    .1
+                    .input["questions"][0]["id"]
+                    .as_str()
+                    .expect("minted id")
+                    .to_string();
+                gate.respond(
+                    "ask-1",
+                    AskOutcome::Answered(vec![AskAnswer::new(qid, vec!["b".into()], None)]),
+                );
+            })
+        };
+        let result = tool
+            .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
+            .await
+            .expect("the ask tool returns a tool result");
+        settle.await.unwrap();
+        assert!(!result.is_error);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
+        assert_eq!(
+            parsed["answers"][0]["selected"][0], "b",
+            "the delegated request reached the wire settle"
         );
     }
 }
