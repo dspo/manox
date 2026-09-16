@@ -4237,7 +4237,7 @@ fn apply_ask_reply(
     auth_id: String,
     outcome: Result<Value, RpcError>,
 ) {
-    let response = match outcome {
+    let outcome: manox_agent::questions::AskOutcome = match outcome {
         // PR-0b (server-first): a client that lets the user CLOSE the card to
         // speak replies with an explicit `dismissed` marker (a top-level bool,
         // or the report's canonical `outcome: "dismissed"`). A non-answer that
@@ -4248,7 +4248,7 @@ fn apply_ask_reply(
             if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
                 || v.get("outcome").and_then(Value::as_str) == Some("dismissed") =>
         {
-            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+            manox_agent::questions::AskOutcome::Dismissed
         }
         Ok(v) => {
             // B2-PR-1: the reply is parsed through the transitional
@@ -4262,7 +4262,7 @@ fn apply_ask_reply(
                 .map(|thread| {
                     thread.with_mut(|t| {
                         let parked = t
-                            .pending_auth_entries()
+                            .pending_question_entries()
                             .into_iter()
                             .find(|(id, _)| id == &auth_id)
                             .map(|(_, meta)| meta.input);
@@ -4270,17 +4270,17 @@ fn apply_ask_reply(
                     })
                 })
                 .unwrap_or_default();
-            manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+            manox_agent::questions::AskOutcome::Answered(answers)
         }
         // The reply never arrived as an answer (a withdrawn delivery, a
         // disconnected peer, or an abandoned replay waiter — NOT a wall-clock
         // timeout, which PR-0a removed for human adjudications): an explicit
         // non-answer. An empty `AskUserQuestion` would read to the model as the
         // user answering nothing on purpose.
-        Err(_) => manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
+        Err(_) => manox_agent::questions::AskOutcome::Expired,
     };
     if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| t.respond_authorization(&auth_id, response));
+        thread.with_mut(|t| t.respond_question(&auth_id, outcome));
     }
     clear_pending_auth_if_settled(inner, session_id);
 }
@@ -4288,10 +4288,7 @@ fn apply_ask_reply(
 fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth_id: String) {
     if let Some(thread) = inner.session_thread(session_id) {
         thread.with_mut(|t| {
-            t.respond_authorization(
-                &auth_id,
-                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired,
-            )
+            t.respond_question(&auth_id, manox_agent::questions::AskOutcome::Expired)
         });
     }
     inner.note_error(session_id, "no client can answer this question");

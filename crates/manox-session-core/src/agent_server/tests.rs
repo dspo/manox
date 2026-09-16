@@ -256,6 +256,31 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
             .unwrap()
             .push((id.to_string(), response));
     }
+
+    fn respond_question(&self, id: &str, outcome: manox_agent::questions::AskOutcome) {
+        // The fake engine keeps the legacy response record so the ask-path
+        // assertions below stay readable; the conversion is one-to-one.
+        let legacy = match outcome {
+            manox_agent::questions::AskOutcome::Answered(answers) => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+            }
+            manox_agent::questions::AskOutcome::Dismissed => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+            }
+            manox_agent::questions::AskOutcome::Expired
+            | manox_agent::questions::AskOutcome::Cancelled => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired
+            }
+        };
+        self.auth_responses
+            .lock()
+            .unwrap()
+            .push((id.to_string(), legacy));
+    }
+
+    fn pending_question_entries(&self) -> Vec<(String, manox_agent::permission::PendingAuthMeta)> {
+        self.pending_auth.lock().unwrap().clone()
+    }
 }
 
 /// A connected client harness: the client end of an in-process pair.

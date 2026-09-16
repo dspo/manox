@@ -1,33 +1,169 @@
 //! The `AskUserQuestion` interactive round trip (host-layer tool).
 //!
+//! The user-questions seam: the host's `AskUserQuestion` interactive round
+//! trip and the pending registry it parks on.
+//!
 //! The pi kernel exposes the `requires_approval` seam on `AgentTool` but
-//! ships no interactive ask surface — that is a host concern. This module is
-//! the host's ask tool: it is interactive, never permission-gated. It parks
-//! a question card on the user through the [`ApprovalGate`]'s pending
-//! registry and folds the id-routed answers into a canonical JSON tool
-//! result. The gate itself (mode-based allow/deny policy) lives in
-//! `approval`; this tool only rides its register/emit/respond/discard
-//! plumbing.
+//! ships no interactive ask surface — that is a host concern. This module owns
+//! it end to end: the tool parses and validates the model's questions, parks
+//! one card per call on [`UserQuestionGate`], and folds the id-routed answers
+//! into a canonical JSON tool result. The gate is this seam's own settlement
+//! vocabulary ([`AskOutcome`]); the approval gate and its mode policy live in
+//! `approval` and are not involved.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use manox_harness::tool::{AgentTool as PiAgentTool, AgentToolResult, ToolContext, ToolError};
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::approval::ApprovalGate;
-use crate::permission::{
-    AskAnswer, PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse,
-};
+use crate::permission::{AskAnswer, PendingAuthMeta};
 use crate::thread::{ThreadEvent, ToolCallStatus};
+use crate::thread_engine::BackendNotice;
+
+/// How one parked question settled. The question seam's own vocabulary — the
+/// approval path's `ToolAuthorizationResponse` never carries an ask again.
+#[derive(Debug)]
+pub enum AskOutcome {
+    /// The canonical id-routed tri-state answers, one per answered or
+    /// explicitly skipped question.
+    Answered(Vec<AskAnswer>),
+    /// The user CLOSED the card to speak instead (dsh `ASK_CANCELLED`): an
+    /// explicit "not now, let me talk" that is neither an answer nor a
+    /// rejection nor a turn interrupt.
+    Dismissed,
+    /// The question settled without any user input (no capable answerer, a
+    /// withdrawn delivery, or an abandoned replay waiter) — an explicit
+    /// non-answer the model must not read as consent.
+    Expired,
+    /// The turn was cancelled while the card was parked (the caller's signal
+    /// fired); the model sees the tool-denied line, exactly as before.
+    Cancelled,
+}
+
+/// One parked question: the responder the tool awaits plus the card metadata
+/// the workspace re-surfaces after a thread switch.
+struct PendingQuestion {
+    tx: oneshot::Sender<AskOutcome>,
+    meta: PendingAuthMeta,
+}
+
+/// The user-questions seam's pending registry: the ask tool parks here and the
+/// gateway settles here through `Thread::respond_question`. One gate per
+/// session; the delegated flag mirrors the approval gate's, so a subagent
+/// caller is refused before any card is parked.
+pub struct UserQuestionGate {
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+    pending: Mutex<HashMap<String, PendingQuestion>>,
+    /// The actor command sender that carries verdict journaling (K3), set once
+    /// the engine exists.
+    journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
+    delegated: bool,
+}
+
+impl UserQuestionGate {
+    pub fn new(notice_tx: mpsc::UnboundedSender<BackendNotice>) -> Self {
+        Self {
+            notice_tx,
+            pending: Mutex::new(HashMap::new()),
+            journal_sink: Mutex::new(None),
+            delegated: false,
+        }
+    }
+
+    /// Mark this gate as backing a delegated (subagent) caller rather than the
+    /// runtime root.
+    pub fn with_delegated(mut self, delegated: bool) -> Self {
+        self.delegated = delegated;
+        self
+    }
+
+    pub fn is_delegated(&self) -> bool {
+        self.delegated
+    }
+
+    /// Wire the actor command sender that carries verdict journaling (K3).
+    pub(crate) fn set_journal_sink(&self, tx: mpsc::UnboundedSender<crate::engine::SessionCmd>) {
+        *self.journal_sink.lock().unwrap() = Some(tx);
+    }
+
+    fn emit(&self, event: ThreadEvent) {
+        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(event)));
+    }
+
+    /// Park one question: stores the responder, returns the receiver the tool
+    /// awaits.
+    fn register(&self, id: &str, meta: PendingAuthMeta) -> oneshot::Receiver<AskOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), PendingQuestion { tx, meta });
+        rx
+    }
+
+    /// Drop a parked question without an answer (turn cancelled). The
+    /// cancelled card still journals its decision, or the `pending_auth` fold
+    /// would keep a card alive that no client can ever answer.
+    fn discard(&self, id: &str) {
+        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            self.journal_decision(id, &pending.meta.tool_name, "cancelled");
+        }
+    }
+
+    /// Settle a parked question. Unknown ids are ignored (already settled) —
+    /// the first settle wins.
+    pub fn respond(&self, id: &str, outcome: AskOutcome) {
+        if let Some(pending) = self.pending.lock().unwrap().remove(id) {
+            let verdict = match &outcome {
+                AskOutcome::Answered(_) => "answered",
+                AskOutcome::Dismissed => "dismissed",
+                AskOutcome::Expired => "expired",
+                AskOutcome::Cancelled => "cancelled",
+            };
+            self.journal_decision(id, &pending.meta.tool_name, verdict);
+            let _ = pending.tx.send(outcome);
+        }
+    }
+
+    /// Parked questions with their card metadata, so the workspace can
+    /// re-surface a card after switching back to a parked thread.
+    pub fn pending_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        self.pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, pending)| (id.clone(), pending.meta.clone()))
+            .collect()
+    }
+
+    /// Queue the card's decision entry onto the engine actor (K3). Without a
+    /// sink (a standalone gate) or with the actor already gone the decision
+    /// does not journal: a gate with no engine has no session to append to.
+    fn journal_decision(&self, id: &str, tool_name: &str, verdict: &str) {
+        let Some(tx) = self.journal_sink.lock().unwrap().clone() else {
+            return;
+        };
+        let _ = tx.send(crate::engine::SessionCmd::AppendJournal {
+            kind: "question".into(),
+            payload: serde_json::json!({
+                "kind": "decision",
+                "authId": id,
+                "payload": { "toolName": tool_name, "verdict": verdict },
+            }),
+        });
+    }
+}
 
 /// The pi harness `AskUserQuestion` tool. Schema and semantics ported from
 /// the retired manox tool: the run IS the round trip — the question card
-/// renders from the `ToolCallAuthorization` event and the user's answers
-/// come back through `respond_tool_authorization`, short-circuited into a
-/// `ToolResult` without any execution. Read-only by contract: permission
-/// modes never touch it.
+/// renders from the `ToolCallAuthorization` event and the user's answers come
+/// back through [`UserQuestionGate`], short-circuited into a `ToolResult`
+/// without any execution. Read-only by contract: permission modes never touch
+/// it.
 pub struct PiAskUserQuestionTool {
-    gate: Arc<ApprovalGate>,
+    gate: Arc<UserQuestionGate>,
     /// Live plan-mode flag, so a dismissed question card can tell the model
     /// to *stay in plan mode* when the user closes it mid-planning (dsh
     /// `ASK_CANCELLED` under `intent:plan-review`) versus the plain stop-and-
@@ -37,7 +173,7 @@ pub struct PiAskUserQuestionTool {
 }
 
 impl PiAskUserQuestionTool {
-    pub fn new(gate: Arc<ApprovalGate>) -> Self {
+    pub fn new(gate: Arc<UserQuestionGate>) -> Self {
         Self { gate, plan: None }
     }
 
@@ -137,17 +273,17 @@ impl PiAgentTool for PiAskUserQuestionTool {
             input: params.clone(),
         });
 
-        let response = tokio::select! {
-            r = rx => r.unwrap_or(ToolAuthorizationResponse::Decision(PermissionDecision::Deny)),
+        let outcome = tokio::select! {
+            r = rx => r.unwrap_or(AskOutcome::Cancelled),
             _ = signal.cancelled() => {
                 self.gate.discard(tool_call_id);
-                ToolAuthorizationResponse::Decision(PermissionDecision::Deny)
+                AskOutcome::Cancelled
             }
         };
         self.gate.discard(tool_call_id);
 
-        match response {
-            ToolAuthorizationResponse::AskUserQuestion { answers } => {
+        match outcome {
+            AskOutcome::Answered(answers) => {
                 // PR-2 (C3): the model-facing encoding is the CANONICAL JSON
                 // line — the same vocabulary the client answered with:
                 // `{"answers":[{"id":…,"selected":[…],"custom":…?},…]}`.
@@ -165,7 +301,7 @@ impl PiAgentTool for PiAskUserQuestionTool {
             // delivery) with NO human action. This is NOT an empty answer:
             // the text names that explicitly so the model re-asks or proceeds
             // under stated assumptions instead of reading silence as consent.
-            ToolAuthorizationResponse::AskUserQuestionExpired => Ok(AgentToolResult::error(
+            AskOutcome::Expired => Ok(AgentToolResult::error(
                 "[no-answer] The user did not answer this question — no client was \
                  available to answer it, or the pending question was withdrawn. Do not \
                  treat this as input or consent. Re-ask with fewer, simpler questions \
@@ -176,7 +312,7 @@ impl PiAgentTool for PiAskUserQuestionTool {
             // stops and waits for the forthcoming message. In plan mode the
             // dsh line keeps the "stay in plan mode" clause; elsewhere the
             // same guidance drops it. Never re-asked as a denial.
-            ToolAuthorizationResponse::AskUserQuestionDismissed => {
+            AskOutcome::Dismissed => {
                 let text = if self.plan_mode_active() {
                     "The user dismissed the review to speak instead; stay in plan mode, \
                      stop here, and wait for their message."
@@ -186,10 +322,9 @@ impl PiAgentTool for PiAskUserQuestionTool {
                 };
                 Ok(AgentToolResult::text(text))
             }
-            // Any bare decision is a real rejection of the prompt — surface the
-            // tool-denied render. A card *close* is no longer routed here (it
-            // arrives as AskUserQuestionDismissed), so this arm is reject-only.
-            _ => {
+            // The turn was cancelled while the card was parked: the model sees
+            // the tool-denied render, exactly as the pre-seam path did.
+            AskOutcome::Cancelled => {
                 let text = crate::prompt::render_static(
                     crate::prompt::PromptTemplate::WrapperToolDenied,
                     lang,
@@ -439,15 +574,14 @@ mod tests {
     use crate::thread_engine::BackendNotice;
     use manox_harness::env::TokioExecutionEnv;
     use manox_harness::tool::{LocalToolContext, ToolState};
-    use std::sync::Mutex;
     use tokio::sync::mpsc;
 
-    fn gate_with_events() -> (Arc<ApprovalGate>, mpsc::UnboundedReceiver<BackendNotice>) {
+    fn gate_with_events() -> (
+        Arc<UserQuestionGate>,
+        mpsc::UnboundedReceiver<BackendNotice>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (
-            Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None)))),
-            rx,
-        )
+        (Arc::new(UserQuestionGate::new(tx)), rx)
     }
 
     fn tool_ctx() -> LocalToolContext {
@@ -721,9 +855,11 @@ mod tests {
                 }
                 gate.respond(
                     "ask-1",
-                    ToolAuthorizationResponse::AskUserQuestion {
-                        answers: vec![AskAnswer::new("shape-q".into(), vec!["round".into()], None)],
-                    },
+                    AskOutcome::Answered(vec![AskAnswer::new(
+                        "shape-q".into(),
+                        vec!["round".into()],
+                        None,
+                    )]),
                 );
             })
         };
@@ -765,7 +901,7 @@ mod tests {
                 while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
                     tokio::task::yield_now().await;
                 }
-                gate.respond("ask-1", ToolAuthorizationResponse::AskUserQuestionExpired);
+                gate.respond("ask-1", AskOutcome::Expired);
             })
         };
         let result = tool
@@ -804,9 +940,9 @@ mod tests {
     /// Drive the ask tool and settle its parked card with `response`.
     async fn run_ask_settled(
         tool: &PiAskUserQuestionTool,
-        gate: &Arc<ApprovalGate>,
+        gate: &Arc<UserQuestionGate>,
         ctx: &LocalToolContext,
-        response: ToolAuthorizationResponse,
+        outcome: AskOutcome,
     ) -> AgentToolResult {
         let settle = {
             let gate = Arc::clone(gate);
@@ -814,7 +950,7 @@ mod tests {
                 while !gate.pending_entries().iter().any(|(id, _)| id == "ask-1") {
                     tokio::task::yield_now().await;
                 }
-                gate.respond("ask-1", response);
+                gate.respond("ask-1", outcome);
             })
         };
         let result = tool
@@ -834,13 +970,7 @@ mod tests {
         let (gate, _rx) = gate_with_events();
         let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
-        let result = run_ask_settled(
-            &tool,
-            &gate,
-            &ctx,
-            ToolAuthorizationResponse::AskUserQuestionDismissed,
-        )
-        .await;
+        let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!result.is_error, "a dismissal is guidance, not an error");
         let text = result_text(&result);
         assert!(
@@ -866,13 +996,7 @@ mod tests {
         plan.set(true, None);
         let tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
         let ctx = tool_ctx();
-        let result = run_ask_settled(
-            &tool,
-            &gate,
-            &ctx,
-            ToolAuthorizationResponse::AskUserQuestionDismissed,
-        )
-        .await;
+        let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!result.is_error);
         let text = result_text(&result);
         assert!(
@@ -912,9 +1036,7 @@ mod tests {
                 );
                 gate.respond(
                     "ask-1",
-                    ToolAuthorizationResponse::AskUserQuestion {
-                        answers: vec![AskAnswer::new(qid, vec!["a".into()], None)],
-                    },
+                    AskOutcome::Answered(vec![AskAnswer::new(qid, vec!["a".into()], None)]),
                 );
             })
         };
@@ -960,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn ask_from_delegated_gate_is_rejected_as_delegated_caller() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let gate = Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))).with_delegated(true));
+        let gate = Arc::new(UserQuestionGate::new(tx).with_delegated(true));
         let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = tool
@@ -1037,16 +1159,10 @@ mod tests {
                 }
                 gate.respond(
                     "ask-1",
-                    ToolAuthorizationResponse::AskUserQuestion {
-                        answers: vec![
-                            AskAnswer::new("frozen-q".into(), vec!["a".into()], None),
-                            AskAnswer::new(
-                                "frozen-q".into(),
-                                vec!["b".into()],
-                                Some("free".into()),
-                            ),
-                        ],
-                    },
+                    AskOutcome::Answered(vec![
+                        AskAnswer::new("frozen-q".into(), vec!["a".into()], None),
+                        AskAnswer::new("frozen-q".into(), vec!["b".into()], Some("free".into())),
+                    ]),
                 );
             })
         };
@@ -1065,13 +1181,7 @@ mod tests {
 
         let (gate, _rx) = gate_with_events();
         let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
-        let expired = run_ask_settled(
-            &tool,
-            &gate,
-            &ctx,
-            ToolAuthorizationResponse::AskUserQuestionExpired,
-        )
-        .await;
+        let expired = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Expired).await;
         assert!(expired.is_error);
         assert_eq!(
             result_text(&expired),
@@ -1083,13 +1193,7 @@ mod tests {
 
         let (gate, _rx) = gate_with_events();
         let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
-        let dismissed = run_ask_settled(
-            &tool,
-            &gate,
-            &ctx,
-            ToolAuthorizationResponse::AskUserQuestionDismissed,
-        )
-        .await;
+        let dismissed = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!dismissed.is_error);
         assert_eq!(
             result_text(&dismissed),
@@ -1101,13 +1205,8 @@ mod tests {
         let plan = crate::plan_mode::PlanSessionState::new();
         plan.set(true, None);
         let plan_tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
-        let dismissed_in_plan = run_ask_settled(
-            &plan_tool,
-            &gate,
-            &ctx,
-            ToolAuthorizationResponse::AskUserQuestionDismissed,
-        )
-        .await;
+        let dismissed_in_plan =
+            run_ask_settled(&plan_tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert_eq!(
             result_text(&dismissed_in_plan),
             "The user dismissed the review to speak instead; stay in plan mode, \
@@ -1115,8 +1214,7 @@ mod tests {
         );
 
         let (tx, _rx) = mpsc::unbounded_channel();
-        let delegated_gate =
-            Arc::new(ApprovalGate::new(tx, Arc::new(Mutex::new(None))).with_delegated(true));
+        let delegated_gate = Arc::new(UserQuestionGate::new(tx).with_delegated(true));
         let delegated = PiAskUserQuestionTool::new(delegated_gate);
         let refused = delegated
             .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
