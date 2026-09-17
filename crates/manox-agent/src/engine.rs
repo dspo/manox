@@ -7423,7 +7423,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
         let state = test_engine_state();
         let live = Arc::new(Mutex::new(LiveTranscript::default()));
@@ -7453,7 +7453,7 @@ mod tests {
             &active_session_path,
             &journal_appender,
         );
-        let ((_result, _aborted), ()) = tokio::join!(run, async {});
+        let (_result, _aborted) = run.await;
         assert!(
             state.plan.enabled(),
             "the run start must commit the pending selection"
@@ -7468,7 +7468,6 @@ mod tests {
             }
         }
         assert!(announced, "the commit announces the switch");
-        let _ = cmd_tx;
     }
 
     fn test_model() -> PiModel {
