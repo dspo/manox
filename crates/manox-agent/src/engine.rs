@@ -2573,6 +2573,13 @@ where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
     tokio::pin!(run);
+    // W4 boundary: a pending plan-mode selection commits at the start of
+    // whatever run comes next — a user prompt, a drained steer, a goal round
+    // or a monitor wake-up — so no run can execute under the old mode while
+    // the projection already shows the selection pending. It lands before the
+    // run future is polled, hence before request assembly or the injected
+    // instructions can observe the old state.
+    commit_requested_plan_mode(session_path, sessions_dir, state, notice_tx).await;
     // Live journal appends run on a dedicated serializer task, never inline
     // in this select. The `run` branch below shares THIS task, and its
     // persistence middleware holds the session's append lock across file-I/O
@@ -2764,7 +2771,11 @@ where
                     // append, see the AppendJournal arm's deadlock note).
                     // The commit stays on the next turn boundary, which is
                     // what makes `plan_mode_pending` observable and the
-                    // selection revocable before it takes effect.
+                    // selection revocable before it takes effect. The request
+                    // row is best-effort here: a permanent serializer failure
+                    // parks a loss record and drops the row, while the
+                    // selection still commits at the boundary (the idle arm's
+                    // synchronous append, by contrast, refuses to commit).
                     state.plan.set_requested(Some(enabled));
                     let _ = live_row_tx.send((
                         "plan_mode_request".into(),
@@ -3983,10 +3994,6 @@ async fn run_actor(
                 // unchanged) instead of trusting the one-time assembly
                 // snapshot.
                 refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
-                // W4 boundary: a pending plan-mode selection commits at the
-                // turn's start, before any request assembly or the
-                // instruction injection can observe the old state.
-                commit_requested_plan_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the
@@ -4179,12 +4186,22 @@ async fn run_actor(
                 )
                 .await
                 {
-                    // The request stays outstanding and the mode does NOT
-                    // move: logging the intent first is what keeps a
-                    // committed `plan_mode_change` from appearing without its
-                    // request. A later boundary retries both.
-                    tracing::warn!(error = %err, "failed to journal the plan-mode request");
-                    return;
+                    // K4 discipline (same as every other idle append): record
+                    // the loss, park it for the settle/idle drains and tell
+                    // the facade — the actor stays alive. The mode does NOT
+                    // move here, so the log never carries a `plan_mode_change`
+                    // without its request.
+                    if let Some(row) =
+                        record_journal_loss(&appender, "plan_mode_request", &err).await
+                    {
+                        state.pending_journal.lock().unwrap().push(row);
+                    }
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!(
+                            "journal append permanently failed for `plan_mode_request`: {err:#}; the entry was dropped"
+                        ),
+                    ))));
+                    continue;
                 }
                 // Idle threads have no boundary to wait for, so the selection
                 // commits immediately (dsh parity — its `set()` appends
@@ -4192,7 +4209,8 @@ async fn run_actor(
                 // `drive_run` records them and leaves the commit to the
                 // Prompt boundary.
                 if !state.running.load(Ordering::Relaxed) {
-                    commit_requested_plan_mode(&session, &sessions_dir, &state, &notice_tx).await;
+                    commit_requested_plan_mode(session.path(), &sessions_dir, &state, &notice_tx)
+                        .await;
                 }
             }
             SessionCmd::SetPlanReviewPending(pending) => {
@@ -5114,7 +5132,7 @@ fn render_plan_instructions() -> Option<String> {
 /// the committed state converges silently (it was a no-op intent), so the log
 /// carries no redundant transition.
 async fn commit_requested_plan_mode(
-    session: &AgentSession,
+    session_path: &Path,
     sessions_dir: &Path,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -5123,7 +5141,7 @@ async fn commit_requested_plan_mode(
         return;
     };
     if enabled != state.plan.enabled() {
-        apply_plan_mode(session, sessions_dir, state, notice_tx, enabled).await;
+        apply_plan_mode(session_path, sessions_dir, state, notice_tx, enabled).await;
     } else {
         state.plan.set_requested(None);
     }
@@ -5133,7 +5151,7 @@ async fn commit_requested_plan_mode(
 /// instructions, the sidecar cache and the `PlanModeChanged` notice (whose
 /// tap emission journals the `plan_mode_change` entry, L3).
 async fn apply_plan_mode(
-    session: &AgentSession,
+    session_path: &Path,
     sessions_dir: &Path,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -5144,7 +5162,7 @@ async fn apply_plan_mode(
     state
         .plan
         .set_active_instructions(enabled.then(render_plan_instructions).flatten());
-    if let Err(err) = write_plan_file_sidecar(sessions_dir, session.path(), &state.plan).await {
+    if let Err(err) = write_plan_file_sidecar(sessions_dir, session_path, &state.plan).await {
         tracing::warn!(error = %err, "failed to persist plan mode");
     }
     let _ = notice_tx.send(BackendNotice::Event(Box::new(
@@ -7234,7 +7252,7 @@ mod tests {
             !state.plan.enabled(),
             "the selection waits for the boundary"
         );
-        commit_requested_plan_mode(&session, dir.path(), &state, &notice_tx).await;
+        commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
         assert!(state.plan.enabled(), "the boundary applies the selection");
         assert_eq!(state.plan.requested(), None, "and consumes it");
         let mut announced = false;
@@ -7249,7 +7267,7 @@ mod tests {
 
         // A selection equal to the committed state is a no-op intent.
         state.plan.set_requested(Some(true));
-        commit_requested_plan_mode(&session, dir.path(), &state, &notice_tx).await;
+        commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
         assert_eq!(state.plan.requested(), None);
         assert!(
             notice_rx.try_recv().is_err(),
