@@ -227,8 +227,19 @@ pub enum HostEvent {
         session_id: String,
         header: ThreadHeader,
     },
-    /// A session was disposed (owner-set control).
-    SessionDisposed { session_id: String },
+    /// A session was disposed (owner-set control). `successor` carries the
+    /// session that supersedes it (a bind's identity-follows-log hand-off):
+    /// clients auto-attach to it instead of treating the dispose as terminal.
+    SessionDisposed {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        successor: Option<String>,
+    },
+    /// Workspace domain state-stream frame (reconnect-safe baseline plus
+    /// increments on every accepted mutation).
+    WorkspaceUpdate {
+        event: crate::workspace::WorkspaceWireEvent,
+    },
     /// A host-level error. C4a: `session_id` scopes the error to a session
     /// (the desktop leaf normalization emits it there, exactly like the v1
     /// note's scope); `None` is connection-scoped (no leaf owns it —
@@ -410,6 +421,7 @@ mod tests {
             },
             HostEvent::SessionDisposed {
                 session_id: "s1".into(),
+                successor: None,
             },
             HostEvent::Error {
                 message: "boom".into(),

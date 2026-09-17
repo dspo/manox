@@ -464,7 +464,8 @@ impl ThreadStore {
     }
 
     /// Immutable lookup across both partitions by id.
-    fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
+    /// The summary mirror row for one session id (sidecar-merged truth).
+    pub fn summary_by_id(&self, id: &str) -> Option<&ThreadSummary> {
         self.summaries
             .iter()
             .find(|s| s.id == id)
@@ -775,6 +776,11 @@ impl ThreadStore {
         {
             return Ok(Some(handle));
         }
+        // Bind hand-off: a superseded id loads its successor — the
+        // predecessor's identity is a redirect, never a second log.
+        if let Some(successor) = self.superseded_by(id) {
+            return self.load_thread(&successor);
+        }
         let Some(path) = self.session_paths.get(id).cloned() else {
             return Ok(None);
         };
@@ -831,6 +837,15 @@ impl ThreadStore {
             .or_insert_with(|| path.to_path_buf());
     }
 
+    /// Seed the bound project on a test summary row (the sidecar truth the
+    /// workspace domain's header validation reads).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_project_for_test(&mut self, id: &str, project: &str) {
+        if let Some(sum) = self.summaries.iter_mut().find(|s| s.id == id) {
+            sum.project = project.to_string();
+        }
+    }
+
     /// Seed an active summary row without touching disk — lets foreign test
     /// modules exercise the archive cascade against real thread ids.
     #[cfg(any(test, feature = "test-support"))]
@@ -849,6 +864,7 @@ impl ThreadStore {
             archived: false,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -1052,6 +1068,53 @@ impl ThreadStore {
             "pinned_archived".into(),
             serde_json::json!({ "pinned": pinned, "archived": archived }),
         );
+    }
+
+    /// Durable supersede marker for a bind hand-off: the summary mirror
+    /// flips up front (the redirect and the list exclusion act on it
+    /// immediately) and the sidecar write follows on the refresh pass.
+    pub fn mark_superseded(&mut self, id: &str, successor: &str) {
+        if self
+            .summary_by_id(id)
+            .and_then(|s| s.superseded_by.clone())
+            .as_deref()
+            == Some(successor)
+        {
+            return;
+        }
+        if let Some(sum) = self.summaries.iter_mut().find(|s| s.id == id) {
+            sum.superseded_by = Some(successor.to_string());
+        }
+        self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
+        // A not-yet-materialized predecessor has no scan-indexed path (the
+        // scan iterates journal files); synthesize the canonical one so the
+        // marker still lands on its sidecar.
+        if !self.session_paths.contains_key(id) {
+            let path = self.sessions_dir.join(format!("{id}.jsonl"));
+            self.session_paths.insert(id.to_string(), path);
+        }
+        let successor = successor.to_string();
+        self.write_meta(id, move |meta| meta.superseded_by = Some(successor.clone()));
+    }
+
+    /// The bound project straight from the session sidecar (sync read).
+    /// Unlike the summary mirror, the sidecar survives reconciles for
+    /// sessions whose journal never materialized — the header-validation
+    /// source the workspace domain relies on (review #805 follow-up).
+    pub fn sidecar_project(&self, id: &str) -> Option<String> {
+        // The canonical sidecar path is derived from the id alone — a
+        // synthetic `session_paths` entry (bind-time predecessor) is not
+        // required, and a reconcile pass cannot invalidate the lookup.
+        let meta_path = self.sessions_dir.join(format!("{id}.meta.json"));
+        let raw = std::fs::read_to_string(meta_path).ok()?;
+        let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
+        meta.project
+    }
+
+    /// The successor a session was superseded by (summary mirror of the
+    /// sidecar marker — the restart-surviving half of the redirect map).
+    pub fn superseded_by(&self, id: &str) -> Option<String> {
+        self.summary_by_id(id).and_then(|s| s.superseded_by.clone())
     }
 
     /// Set the user tag on a session (persisted in its sidecar); `None`
@@ -1435,6 +1498,7 @@ fn summary_from_cached(
         archived: meta.archived,
         pinned: meta.pinned,
         tag: meta.tag.clone(),
+        superseded_by: meta.superseded_by.clone(),
         has_unread: meta.unread,
         errored: meta.errored,
         created_at: entry.created_at.timestamp(),
@@ -2207,6 +2271,7 @@ mod tests {
             archived,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,
@@ -2605,6 +2670,7 @@ mod tests {
             archived: false,
             pinned: false,
             tag: None,
+            superseded_by: None,
             has_unread: false,
             errored: false,
             created_at: 0,

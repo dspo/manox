@@ -112,12 +112,6 @@ pub(crate) enum SessionCmd {
     },
     /// Re-point the session at an existing jsonl file.
     Open { path: PathBuf },
-    /// Create a fresh session in the given directory, optionally bound to a
-    /// project (persisted in the session sidecar).
-    NewSession {
-        cwd: PathBuf,
-        project: Option<PathBuf>,
-    },
     /// Move the session's working directory (host-driven `SetCwd`): the
     /// sticky cwd advances and the move is durable as a `cwd_change`
     /// entry — never the header cwd or the project binding.
@@ -1294,10 +1288,6 @@ impl ThreadEngine for PiEngine {
 
     fn open_session(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(SessionCmd::Open { path });
-    }
-
-    fn new_session(&self, cwd: PathBuf, project: Option<PathBuf>) {
-        let _ = self.cmd_tx.send(SessionCmd::NewSession { cwd, project });
     }
 
     fn set_cwd(&self, path: PathBuf) {
@@ -4425,99 +4415,6 @@ async fn run_actor(
             SessionCmd::SetCwd { path } => {
                 handle_set_cwd(&mut session, &state, &notice_tx, &path).await;
             }
-            SessionCmd::NewSession { cwd, project } => {
-                let (builder, orchestrators, read_only_subagent) = session_builder(
-                    &cwd,
-                    &sessions_dir,
-                    &runtime,
-                    Some(&pi_model),
-                    &state.gate,
-                    &state.plan,
-                    &notice_tx,
-                    state.goal_bridge.as_ref(),
-                    &state.granted_roots,
-                    &thread_id,
-                    parent_session.as_deref(),
-                    &bus,
-                );
-                // Same identity contract as the startup build: the session
-                // carries the facade thread's id (the previous deferred
-                // session never materialized — `set_project` requires a
-                // non-interacted thread).
-                match builder.with_session_id(thread_id.clone()).build().await {
-                    Ok(mut s) => {
-                        attach_orchestrators(&mut s, &orchestrators);
-                        crate::monitor_bridge::spawn(
-                            Arc::clone(&orchestrators.monitor),
-                            Arc::clone(&orchestrators.background),
-                            notice_tx.clone(),
-                            thread_id.clone(),
-                        );
-                        attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
-                        attach_plugin_hooks(&mut s, &cwd);
-                        // A fresh session never inherits plan mode — clear
-                        // any state left over from the previous session.
-                        state.plan.set(false, None);
-                        state.plan.set_active_instructions(None);
-                        // …and earns its own SessionStart on the first turn.
-                        state.session_start_fired.store(false, Ordering::SeqCst);
-                        session = s;
-                        spawn_journal_relay(&session, &state.journal_tx);
-                        // K5: the swapped session is the acceptance-time
-                        // writer from here on.
-                        *state.current_appender.lock().unwrap() = Some(session.journal_appender());
-                        *state.current_resources.lock().unwrap() =
-                            Some(session.resources().clone());
-                        // The fresh session is pinned to the facade thread's id.
-                        crate::thread_registry::set_active(&thread_id, &thread_id).await;
-                        let new_path = session.path().to_path_buf();
-                        // K2: a fresh chain folds empty — the rebuild
-                        // resolves entirely to sidecar defaults, keeping
-                        // one restore face for every session establishment.
-                        let restored_state = rebuild_restored_state(&session, &sessions_dir).await;
-                        title_scheduler.retarget(
-                            new_path.clone(),
-                            cwd.clone(),
-                            load_title_scheduler(
-                                &sessions_dir,
-                                &new_path,
-                                successful_provider_responses(session.harness_messages()),
-                                restored_state.title.clone(),
-                            )
-                            .await,
-                        );
-                        _subscription = subscribe_session(
-                            &session,
-                            &notice_tx,
-                            Arc::clone(&live_mirror),
-                            title_scheduler.clone(),
-                        );
-                        _harness_subscription = subscribe_harness_events(
-                            &mut session,
-                            sessions_dir.clone(),
-                            new_path,
-                            &notice_tx,
-                            &wakeup_tx,
-                        );
-                        *state.active_path.lock().unwrap() = Some(session.path().to_path_buf());
-                        if let Some(project) = &project {
-                            bind_project(&sessions_dir, &session, project, &state, &notice_tx)
-                                .await;
-                        }
-                        announce_established_cwd(&session, &state, &notice_tx).await;
-                        resync_approval_mode(&restored_state, &state, &notice_tx);
-                        sync_history(&session, &sessions_dir, &state).await;
-                        sync_usage(&session, &state).await;
-                        spawn_session_list_refresh(&sessions_dir, &state);
-                    }
-                    Err(err) => {
-                        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                            "pi session create failed: {err}"
-                        )));
-                        return;
-                    }
-                }
-            }
             SessionCmd::AppendUiNote(record) => {
                 // Persist at the leaf through the append queue and refresh
                 // the mirror so an idle switch-away sees the note before the
@@ -5885,6 +5782,7 @@ fn session_info_to_summary(
     info: &manox_harness::session::repository::SessionInfo,
 ) -> ThreadSummary {
     ThreadSummary {
+        superseded_by: None,
         id: info.id.clone(),
         summary: info.first_message.clone(),
         title: None,
@@ -10404,11 +10302,10 @@ mod tests {
         session.close().await.unwrap();
     }
 
-    /// The project-binding command sequence — the `NewSession` swap's
-    /// establishment announcement, then the facade's `SetCwd` onto the
-    /// same directory — leaves exactly one witness on the new chain: the
-    /// no-op switch must not stack atop it, and a later real move still
-    /// lands its own.
+    /// The working-directory switch onto the already-projected tail is
+    /// witness-free (the establishment announcement stays the chain's
+    /// single `cwd_change`); a switch onto a different directory lands its
+    /// own durable move.
     #[tokio::test]
     async fn bind_order_leaves_exactly_one_cwd_witness_on_the_new_chain() {
         let dir = tempfile::tempdir().unwrap();
