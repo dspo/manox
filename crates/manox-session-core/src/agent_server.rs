@@ -1285,12 +1285,17 @@ impl AgentServerInner {
         if recs.is_empty() {
             return;
         }
+        // Both seams park here: an approval card on the approval gate, an
+        // interactive ask on the question gate. The replay's settle truth is
+        // the union — reading only one gate would retire a live ask as
+        // "already settled" and never re-deliver its card.
         let live_auth_ids: std::collections::HashSet<String> = self
             .session_thread(session_id)
             .map(|t| {
                 t.read(|t| {
                     t.pending_auth_entries()
                         .into_iter()
+                        .chain(t.pending_question_entries())
                         .map(|(id, _)| id)
                         .collect()
                 })
@@ -4306,9 +4311,12 @@ fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth
 /// traffic past a parked authorization), which only ever ran in-proc and
 /// only for one client.
 fn clear_pending_auth_if_settled(inner: &Arc<AgentServerInner>, session_id: &str) {
-    let settled = inner
-        .session_thread(session_id)
-        .is_none_or(|t| t.read(|t| t.pending_auth_entries().is_empty()));
+    // The badge rises for both families (they share the authorization
+    // event), so it may only fall when BOTH gates are empty — a concurrent
+    // ask keeps a settled approval's card company on screen.
+    let settled = inner.session_thread(session_id).is_none_or(|t| {
+        t.read(|t| t.pending_auth_entries().is_empty() && t.pending_question_entries().is_empty())
+    });
     if !settled {
         return;
     }

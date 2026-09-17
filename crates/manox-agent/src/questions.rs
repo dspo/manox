@@ -348,27 +348,26 @@ impl PiAgentTool for PiAskUserQuestionTool {
         });
 
         let settle = QuestionSettle::new(rx);
-        let composed = self
-            .gate
-            .compose(
-                AskRequest {
-                    tool_call_id,
-                    input: &params,
-                },
-                &settle,
-            )
-            .await;
-        // No composed answerer claimed the request: the wire answerer (the
-        // fan-out to capable clients) is the last resort, exactly as before
-        // the seam existed.
-        let wait_wire = async {
-            match composed {
-                Some(outcome) => outcome,
-                None => settle.wait().await,
-            }
-        };
+        // The whole composition runs INSIDE the select: a composed answerer
+        // that decides to wait on the wire answerer (the fan-out to capable
+        // clients) must not make the turn uncancellable.
         let outcome = tokio::select! {
-            outcome = wait_wire => outcome,
+            outcome = async {
+                match self
+                    .gate
+                    .compose(
+                        AskRequest {
+                            tool_call_id,
+                            input: &params,
+                        },
+                        &settle,
+                    )
+                    .await
+                {
+                    Some(claimed) => claimed,
+                    None => settle.wait().await,
+                }
+            } => outcome,
             _ = signal.cancelled() => {
                 self.gate.discard(tool_call_id);
                 AskOutcome::Cancelled
@@ -1391,7 +1390,6 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&result_text(&result)).expect("canonical JSON line");
         assert_eq!(parsed["answers"][0]["selected"][0], "a");
-        assert_eq!(parsed["answers"][0]["id"], parsed["answers"][0]["id"]);
         let seen = claimer
             .seen_question
             .lock()
