@@ -61,6 +61,12 @@ pub struct SessionMeta {
     /// User-assigned tag shown as a chip on the sidebar row. Absent = no tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// The session this one was superseded by: a bind on a not-yet-interacted
+    /// thread hands its identity to a successor session (identity follows
+    /// the log). Superseded rows hide from lists and resolve to their
+    /// successor on load; absent = live identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     /// Unix seconds of the last human-authored prompt or steer. The sidebar's
     /// recency key: no other write — assistant output, tool results, injected
     /// agent turns, titles, flags — advances it. Absent = never stamped.

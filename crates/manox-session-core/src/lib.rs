@@ -13,9 +13,12 @@ pub mod agent_server;
 pub mod follow;
 pub mod journal_query;
 pub mod model_chat;
+pub mod projection_cache;
+pub mod projection_hub;
 pub mod projections;
 pub mod translate;
 pub mod waterfall;
+pub mod workspace_serve;
 #[cfg(feature = "ws-gateway")]
 pub mod ws;
 
@@ -32,10 +35,34 @@ pub(crate) mod test_support {
     static HOME_ONCE: Once = Once::new();
     static INIT_ONCE: Once = Once::new();
 
+    /// macOS ships RLIMIT_NOFILE at 256: a parallel suite of session tests
+    /// (sqlite WAL triples per db, leases, journal appenders) collides with
+    /// it as EMFILE flakes (review #805 gate). Raise the soft limit once
+    /// per process from every common test entry point.
+    fn raise_fd_limit() {
+        static RAISED: Once = Once::new();
+        RAISED.call_once(|| {
+            // SAFETY: setrlimit on our own process at test setup; the new
+            // soft limit stays under the hard limit conventionally granted
+            // to interactive shells (fails silently otherwise).
+            unsafe {
+                let mut rl: libc::rlimit = std::mem::zeroed();
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 {
+                    let want = 4096.min(rl.rlim_max);
+                    if rl.rlim_cur < want {
+                        rl.rlim_cur = want;
+                        let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+                    }
+                }
+            }
+        });
+    }
+
     /// Take the suite serialization lock. A panic in one test poisons the
     /// mutex; recovering the guard keeps the failure contained instead of
     /// cascading into every later test in the process.
     pub(crate) fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
+        raise_fd_limit();
         GLOBALS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -44,6 +71,7 @@ pub(crate) mod test_support {
     /// restored: the test process is disposable and provider registration
     /// reads `HOME` from a background thread.
     pub(crate) fn hermetic_home() {
+        raise_fd_limit();
         HOME_ONCE.call_once(|| {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -60,7 +88,14 @@ pub(crate) mod test_support {
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
     /// (`manox_agent::init` would also boot MCP/LSP/plugin subsystems).
+    /// Process-global serialization for tests that touch the thread store
+    /// and the durable caches outside the agent_server suite's own guard.
+    pub fn lock_globals_for_cache_test() -> std::sync::MutexGuard<'static, ()> {
+        lock_globals()
+    }
+
     pub(crate) fn init_globals() {
+        raise_fd_limit();
         INIT_ONCE.call_once(|| {
             manox_agent::runtime::init();
             manox_agent::provider_glue::init();

@@ -134,6 +134,10 @@ pub enum ClientCall {
         before_seq: Option<i64>,
         max_messages: Option<u32>,
     },
+    /// Workspace namespace verb (durable directory identity domain).
+    Workspace {
+        call: crate::workspace::WorkspaceCall,
+    },
     /// On-demand conversation fold (§E.3, Q face): the server folds the
     /// journal (turns / messages / per-model usage), cached by
     /// `(thread_id, cursor)`. The response is the §E.3 payload; fields the

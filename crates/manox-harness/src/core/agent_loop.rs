@@ -689,22 +689,47 @@ async fn fail_tool_calls_from_truncated(
 /// null. Without this sweep those calls hang forever: dispatch never
 /// happens, so no result ever lands, and the transcript ends on a call the
 /// model believes is running. Every dangling call gets an explicit
-/// not-executed result so the next turn can re-issue it.
+/// not-executed result so the next turn can re-issue it. When the terminal
+/// error is a `json error:` (the tool-call arguments were truncated mid-stream
+/// at the output limit), the result instead tells the model to shrink or split
+/// its payload, since re-issuing the same bytes would truncate again.
 async fn fail_tool_calls_from_terminated(
     message: &AgentMessage,
     sink: &(dyn EventSink + Send + Sync),
 ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-    let tool_calls: Vec<(&str, &str, serde_json::Value)> = match message {
-        AgentMessage::Assistant { content, .. } => content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::ToolUse {
-                    id, name, input, ..
-                } => Some((id.as_str(), name.as_str(), input.clone())),
+    // The terminating message's error text decides how a dangling call is
+    // reported. A `json error:` prefix means the provider stream died at a
+    // wire decode point while parsing the accumulated `tool_use` input — that
+    // is input truncation at the model output limit, not a generic stream drop
+    // or a user abort. Re-issuing the same payload truncates again, so the
+    // model must shrink/split instead; every other `Error`/`Aborted` path
+    // (transport reset, abort, …) keeps the "re-issue with complete arguments"
+    // guidance, which is correct when the failure was not payload-shaped.
+    let (tool_calls, truncated_arguments_error): (
+        Vec<(&str, &str, serde_json::Value)>,
+        Option<String>,
+    ) = match message {
+        AgentMessage::Assistant {
+            content,
+            error_message,
+            ..
+        } => {
+            let truncated = match error_message.as_deref() {
+                Some(error) if error.starts_with("json error:") => Some(error.to_string()),
                 _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
+            };
+            let calls = content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse {
+                        id, name, input, ..
+                    } => Some((id.as_str(), name.as_str(), input.clone())),
+                    _ => None,
+                })
+                .collect();
+            (calls, truncated)
+        }
+        _ => (Vec::new(), None),
     };
     let mut messages = Vec::with_capacity(tool_calls.len());
     for (id, name, _args) in tool_calls {
@@ -714,11 +739,19 @@ async fn fail_tool_calls_from_terminated(
             arguments: serde_json::Value::Null,
         })
         .await?;
-        let result = AgentToolResult::error(format!(
-            "Tool call \"{name}\" was not executed: the turn ended (stream error or abort) \
-             before this call ran, so its arguments may be incomplete. Re-issue the tool call \
-             with complete arguments."
-        ));
+        let result = AgentToolResult::error(match &truncated_arguments_error {
+            Some(error) => format!(
+                "Tool call \"{name}\" was not executed: its arguments were truncated \
+                 mid-stream ({error}) at the model output limit. Re-issuing the same payload \
+                 will truncate again. Re-issue with a materially smaller argument payload \
+                 (fewer/shorter fields), or split the work across multiple smaller tool calls."
+            ),
+            None => format!(
+                "Tool call \"{name}\" was not executed: the turn ended (stream error or abort) \
+                 before this call ran, so its arguments may be incomplete. Re-issue the tool call \
+                 with complete arguments."
+            ),
+        });
         let result_message = AgentMessage::ToolResult {
             tool_call_id: id.to_string(),
             tool_name: name.to_string(),
@@ -2361,6 +2394,110 @@ mod tests {
         }
     }
 
+    /// A stream that dies at a wire decode point while parsing the accumulated
+    /// `tool_use` input: the partial assistant carries a half-built tool call
+    /// and the failure surfaces as `ProviderError::Json` (whose `Display` is
+    /// `"json error: …"`). This is input truncation at the output limit, not a
+    /// transport reset, so the dangling call must be reported as truncated.
+    struct PartialToolCallThenJsonErrorStreamFn;
+
+    #[async_trait::async_trait]
+    impl StreamFn for PartialToolCallThenJsonErrorStreamFn {
+        async fn stream(
+            &self,
+            _context: &AgentContext,
+            _signal: CancellationToken,
+            event_tx: mpsc::Sender<AgentEvent>,
+        ) -> Result<AgentMessage, anyhow::Error> {
+            let message = AgentMessage::Assistant {
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_trunc".into(),
+                    name: "Write".into(),
+                    input: serde_json::Value::Null,
+                    thought_signature: None,
+                }],
+                model: "mock".into(),
+                provider: "mock".into(),
+                api: "mock".into(),
+                response_model: None,
+                response_id: Some("resp_3".into()),
+                diagnostics: None,
+                raw_stop_reason: None,
+                stop_reason: None,
+                usage: Box::new(Usage::default()),
+                error_message: None,
+                timestamp: chrono::Utc::now(),
+            };
+            let _ = event_tx
+                .send(AgentEvent::MessageStart {
+                    message: Box::new(message.clone()),
+                })
+                .await;
+            // Truncated JSON input: `from_str` fails mid-string, and the wire
+            // line wraps it as `ProviderError::Json` (Display = "json error: …").
+            let serde_err = serde_json::from_str::<serde_json::Value>(
+                "{\"path\": \"/tmp/x\", \"content\": \"trun",
+            )
+            .unwrap_err();
+            Err(crate::core::provider::ProviderError::Json(serde_err).into())
+        }
+    }
+
+    /// When tool-call arguments were truncated mid-stream (a `json error:`
+    /// terminal), re-issuing the same payload would truncate again — so the
+    /// dangling call's result must tell the model to shrink or split, not to
+    /// re-issue the same bytes.
+    #[tokio::test]
+    async fn terminated_turn_reports_truncated_tool_call_arguments() {
+        let sink = MockSink::new();
+        let config = AgentLoopConfig::default();
+        let mut context = minimal_context();
+
+        let messages = run_loop(
+            &[AgentMessage::user("hi")],
+            &mut context,
+            &config,
+            None,
+            Arc::new(PartialToolCallThenJsonErrorStreamFn),
+            &TestToolContext::new(),
+            &sink,
+        )
+        .await
+        .unwrap();
+
+        let result = messages
+            .iter()
+            .find(|m| matches!(m, AgentMessage::ToolResult { tool_call_id, .. } if tool_call_id == "call_trunc"))
+            .expect("truncated call got a synthetic result");
+        let AgentMessage::ToolResult {
+            is_error,
+            tool_name,
+            content,
+            ..
+        } = result
+        else {
+            unreachable!()
+        };
+        assert!(is_error, "the synthetic result is an error");
+        assert_eq!(tool_name, "Write");
+        let text = match &content[0] {
+            ContentBlock::Text { text, .. } => text.clone(),
+            _ => panic!("tool result carries a text block"),
+        };
+        assert!(
+            text.contains("truncated mid-stream"),
+            "json-error terminations report argument truncation, got: {text}"
+        );
+        assert!(
+            !text.contains("Re-issue the tool call with complete arguments"),
+            "must not tell the model to re-issue the same (truncating) payload, got: {text}"
+        );
+        assert!(
+            text.contains("smaller"),
+            "guidance must point at shrinking or splitting the payload, got: {text}"
+        );
+    }
+
     /// A tool call that never dispatched (the stream died around it) still
     /// gets an explicit not-executed result: the transcript must never end
     /// on a dangling call, and the model must be told to re-issue it.
@@ -2389,6 +2526,7 @@ mod tests {
         let AgentMessage::ToolResult {
             is_error,
             tool_name,
+            content,
             ..
         } = result
         else {
@@ -2396,6 +2534,21 @@ mod tests {
         };
         assert!(is_error, "the synthetic result is an error");
         assert_eq!(tool_name, "Edit");
+        // Connection-reset (a transport/stream death, not a payload parse
+        // failure) must keep the generic "re-issue with complete arguments"
+        // guidance — the truncation branch is reserved for `json error:`.
+        let text = match &content[0] {
+            ContentBlock::Text { text, .. } => text.clone(),
+            _ => panic!("tool result carries a text block"),
+        };
+        assert!(
+            text.contains("Re-issue the tool call with complete arguments"),
+            "stream-death path keeps the re-issue guidance"
+        );
+        assert!(
+            !text.contains("truncated mid-stream"),
+            "a transport reset is not reported as argument truncation"
+        );
         let events = sink.events.lock().unwrap();
         assert!(
             events.iter().any(|e| matches!(
