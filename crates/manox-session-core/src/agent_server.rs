@@ -618,12 +618,51 @@ impl AgentServerInner {
     }
 }
 
+/// Install the process-wide embedder-tool provider backed by this server.
+///
+/// This is the host wiring the engine's tool assembly consults: without it
+/// `engine`'s `embedder_tools::provider()` is `None` in a production build,
+/// so tools a client registers via `RegisterSessionTools` are stored but
+/// never reach the model's tool set and `invokeClientTool` never fires.
+///
+/// #803 first installed this on the `global()` singleton alone, and the
+/// coverage was incomplete: the napi edge (`crates/manox-napi/src/lib.rs`,
+/// `start`) builds its server through `AgentServer::new` and never routes
+/// through `global` — so the VS Code host kept `provider() == None` and
+/// client-registered tools stayed invisible to the model (reproduced with a
+/// headless addon probe: `{registered: 1}` yet no `client_*` tool in the
+/// model's tool enumeration). The original carve-out — a private-server
+/// embedder "keeping ownership of the provider slot" — never described a
+/// shipping host: every in-repo embedder needs the provider, and one now
+/// gets it by constructing a server.
+///
+/// The install therefore lives in the shared constructor (`new_inner`):
+/// EVERY build path — `global()` (the desktop and the `ws` gateway), the
+/// napi binding, and the test-only `new_without_store_watcher` — installs
+/// its own provider. `set_provider` stays last-wins by design (see
+/// `manox_agent::embedder_tools::set_provider`): each production host runs
+/// exactly one server per process (`global`'s OnceLock; napi's `start`
+/// rejects a second construction through its connection slot), so the slot
+/// always resolves to the live server, and an embedder that genuinely wants
+/// to own the slot can still re-set it after construction — last-wins is
+/// the escape hatch. Tests mutate the slot under the `lock_globals` suite
+/// mutex, so no concurrent construction can clobber a registration
+/// mid-assertion.
+fn install_embedder_provider(server: &AgentServer) {
+    manox_agent::embedder_tools::set_provider(std::sync::Arc::new(AgentServerEmbedderTools::new(
+        server,
+    )));
+}
+
 /// The process-global server (L11: one `AgentServer` per process — the
 /// desktop, the embedded web UI and every future frontend route through it,
 /// so ownership/routing tables are shared). First caller wins; later cwd
 /// arguments are ignored (a second window shares the first window's cwd).
 pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
     static GLOBAL: std::sync::OnceLock<std::sync::Arc<AgentServer>> = std::sync::OnceLock::new();
+    // No provider install here (#803 follow-up): it moved into `new_inner`,
+    // where it covers this singleton AND the direct `AgentServer::new`
+    // paths (napi included) — see [`install_embedder_provider`].
     GLOBAL
         .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
         .clone()
@@ -736,7 +775,15 @@ impl AgentServer {
                 crate::workspace_serve::adopt_when_ready().await;
             });
         }
-        Self(inner)
+        let server = Self(inner);
+        // The host wiring the engine's tool assembly consults: install
+        // THIS server's embedder-tool provider. Lives in the shared
+        // constructor — not in `global` — so every build path (desktop/ws
+        // through `global`, the napi binding through `AgentServer::new`,
+        // test fixtures) wires the provider; last-wins makes the newest
+        // construction authoritative. See [`install_embedder_provider`].
+        install_embedder_provider(&server);
+        server
     }
 
     /// Accept a connection: spawn the handshake + dispatch task. The
@@ -1887,9 +1934,13 @@ async fn handle_call(
             tools,
         } => {
             // Full replacement per client. An unknown session still
-            // registers — the registration is store-side state the next
-            // tool assembly of that session picks up (mirrors how the
-            // host's active-client setter lands regardless of turn state).
+            // registers — the registration is store-side state the engine
+            // consults at tool assembly AND again before every prompt
+            // turn (`manox_agent::engine::refresh_embedder_tools`), so a
+            // registration landing after the session's engine spawned
+            // still reaches that session's tool table (the host learns
+            // the session id only by creating it, so "register before
+            // assembly" is not the real-world order).
             let count = tools.len();
             inner
                 .embedder_tools
