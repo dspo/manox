@@ -192,7 +192,7 @@ async fn run_follow_stream(
             return finish(&conn, &stream_id, end);
         }
     };
-    let (mut last_seq, last_as_of) = send_snapshot(
+    let (mut last_seq, mut last_as_of) = send_snapshot(
         &conn,
         &stream_id,
         &session_id,
@@ -241,7 +241,7 @@ async fn run_follow_stream(
             let upgraded = thread.subscribe_journal_feed();
             if let Some(live) = thread.journal_snapshot().await {
                 feed = upgraded;
-                (last_seq, _) = send_snapshot(
+                let (upgraded_tail, upgraded_as_of) = send_snapshot(
                     &conn,
                     &stream_id,
                     &session_id,
@@ -250,6 +250,13 @@ async fn run_follow_stream(
                     max_messages,
                     &hub,
                 );
+                // The upgrade snapshot carries its own projection watermark:
+                // keep the LARGER one — the cold snapshot's lower cut would
+                // replay already-published frames (harmless) and, if the
+                // cell filled meanwhile, read as "behind the floor"
+                // (review r4 [sugg] 3).
+                last_seq = upgraded_tail;
+                last_as_of = last_as_of.max(upgraded_as_of);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;

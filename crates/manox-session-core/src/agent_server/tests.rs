@@ -1958,24 +1958,37 @@ fn fresh_stream_after_outbox_overflow_keeps_streaming() {
     open_follow(&client, "st-fresh", "s1");
     let snap = snapshot_for(&client, "st-fresh");
     assert_eq!(snap.session_id, "s1");
+    // Two live events: the stale verdict (had it been miscomputed) ends the
+    // stream AFTER forwarding the first Entry, so only a SECOND forwarded
+    // entry proves the stream survived — and a `StreamEnd` for this stream
+    // at any point up to then fails the test (review r4 [issue] 1).
     engine.push_journal(301, title(301));
+    engine.push_journal(302, title(302));
+    let mut seen: Vec<u64> = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        match client.recv_timeout(Duration::from_millis(200)) {
-            FromServer::StreamItem {
-                stream_id,
-                frame: manox_protocol::StreamFrame::Entry { seq: 301, .. },
-            } if stream_id.0 == "st-fresh" => break,
-            FromServer::StreamEnd { stream_id, reason } if stream_id.0 == "st-fresh" => {
-                panic!("fresh stream must not end after an outbox overflow: {reason:?}");
+    while seen.len() < 2 {
+        while let Ok(msg) = client.conn.server_rx().try_recv() {
+            match msg {
+                FromServer::StreamItem {
+                    stream_id,
+                    frame: manox_protocol::StreamFrame::Entry { seq, .. },
+                } if stream_id.0 == "st-fresh" => seen.push(seq),
+                FromServer::StreamEnd { stream_id, reason } if stream_id.0 == "st-fresh" => {
+                    panic!("fresh stream must not end after an outbox overflow: {reason:?}");
+                }
+                _ => {}
             }
-            _ => {}
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "fresh stream never received the live entry"
+            "fresh stream forwarded only {seen:?}; a live stream must keep flowing"
         );
+        std::thread::sleep(Duration::from_millis(10));
     }
+    assert!(
+        seen.contains(&301) && seen.contains(&302),
+        "both live events must arrive on the fresh stream: {seen:?}"
+    );
     drop(client);
     drop(server);
     manox_agent::thread_store::drop_global_for_test();

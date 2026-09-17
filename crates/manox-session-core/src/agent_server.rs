@@ -154,6 +154,8 @@ struct ClientEntry {
 }
 
 /// The single gateway. Cloning shares the inner state.
+pub struct AgentServer(Arc<AgentServerInner>);
+
 /// Releases one transient session owner when its scope ends — success,
 /// failure or panic — so an internal open can never leave a ghost owner
 /// that defeats the orphaned-session reap (review r3 [sugg] 3).
@@ -168,8 +170,6 @@ impl Drop for OwnerLease {
         self.inner.remove_owner(self.owner, &self.id);
     }
 }
-
-pub struct AgentServer(Arc<AgentServerInner>);
 
 struct AgentServerInner {
     cwd: PathBuf,
