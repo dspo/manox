@@ -82,6 +82,11 @@ impl PlanSessionState {
     /// outstanding. The committed state stays `enabled` until the boundary
     /// applies it; the log carries the selection as a `plan_mode_request`
     /// entry from the moment it is made.
+    ///
+    /// Process-local by construction: a selection made mid-run and lost to a
+    /// process death leaves the log folding `plan_mode_pending` true with
+    /// nothing to commit it, exactly like dsh's process-local pending intents.
+    /// Re-selecting the mode is the recovery.
     pub fn requested(&self) -> Option<bool> {
         self.inner.read().unwrap().requested
     }
