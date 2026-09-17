@@ -2773,9 +2773,10 @@ where
                     // what makes `plan_mode_pending` observable and the
                     // selection revocable before it takes effect. The request
                     // row is best-effort here: a permanent serializer failure
-                    // parks a loss record and drops the row, while the
-                    // selection still commits at the boundary (the idle arm's
-                    // synchronous append, by contrast, refuses to commit).
+                    // parks a loss record and drops the row while the
+                    // selection still commits at the boundary (the idle arm
+                    // appends synchronously and therefore drops the selection
+                    // instead of committing without its request).
                     state.plan.set_requested(Some(enabled));
                     let _ = live_row_tx.send((
                         "plan_mode_request".into(),
@@ -4196,9 +4197,14 @@ async fn run_actor(
                     {
                         state.pending_journal.lock().unwrap().push(row);
                     }
+                    // The selection goes with the dropped row: committing it
+                    // later would put a `plan_mode_change` in the log with no
+                    // request behind it. The user got the Error notice, so
+                    // re-selecting the mode is the retry.
+                    state.plan.set_requested(None);
                     let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
                         anyhow::anyhow!(
-                            "journal append permanently failed for `plan_mode_request`: {err:#}; the entry was dropped"
+                            "journal append permanently failed for `plan_mode_request`: {err:#}; the selection was dropped — switch the mode again to retry"
                         ),
                     ))));
                     continue;
@@ -7493,6 +7499,80 @@ mod tests {
             thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         }
+    }
+
+    /// H3 guard: the plan-mode boundary commit sits at the shared run start,
+    /// so a run that does not come through the actor's Prompt arm (a goal
+    /// round, a drained steer, a monitor wake-up — modelled here by calling
+    /// `drive_run` directly) still commits a pending selection before the run
+    /// future is polled. Reverting the commit to the Prompt arm alone makes
+    /// this test fail with `enabled() == false`.
+    #[tokio::test]
+    async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+
+        // A selection is outstanding when the run starts.
+        state.plan.set_requested(Some(true));
+        assert!(!state.plan.enabled());
+
+        let run = drive_run(
+            session.prompt("first turn"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+            &journal_appender,
+        );
+        let ((_result, _aborted), ()) = tokio::join!(run, async {});
+        assert!(
+            state.plan.enabled(),
+            "the run start must commit the pending selection"
+        );
+        assert_eq!(state.plan.requested(), None, "and consume it");
+        let mut announced = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Event(event) = notice
+                && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
+            {
+                announced = true;
+            }
+        }
+        assert!(announced, "the commit announces the switch");
+        let _ = cmd_tx;
     }
 
     fn test_model() -> PiModel {
