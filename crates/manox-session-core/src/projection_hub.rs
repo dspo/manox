@@ -113,14 +113,17 @@ impl ProjectionHub {
 
     /// The consistent baseline cut for a snapshot: the cell (restored from
     /// the checkpoint cache when absent and usable, seeded from the live
-    /// thread otherwise) advanced over the snapshot's dense records.
+    /// thread otherwise) advanced over the snapshot's dense records. The
+    /// returned `as_of` is the watermark a stream must seed its outbox
+    /// cursor with — a fresh cursor is NOT "behind the floor" (review r3
+    /// [severe] 1).
     pub fn baseline(
         &self,
         session_id: &str,
         thread: &ThreadHandle,
         records: &[manox_harness::session::jsonl::JournalRecord],
         cursor: u64,
-    ) -> (BTreeMap<String, JsonValue>, u64) {
+    ) -> (BTreeMap<String, JsonValue>, u64, Option<u64>) {
         let mut cells = self.cells.lock().unwrap();
         let cell = cells.entry(session_id.to_string()).or_insert_with(|| {
             let restored = crate::projection_cache::load(session_id, cursor);
@@ -153,7 +156,13 @@ impl ProjectionHub {
             cell.observed = Some(record.seq);
         }
         let _ = cell.set.drain_changed();
-        (cell.set.baseline(), cursor)
+        // (values, frame as_of, cell watermark): the frame's cut is the
+        // snapshot cursor; the WATERMARK is where the fold actually stands,
+        // and it is what a stream seeds its outbox cursor with — the cell
+        // may be ahead of the snapshot, and a stream must never read as
+        // "behind" a floor its own cut already passed (review r3 [severe]
+        // 1).
+        (cell.set.baseline(), cursor, cell.observed)
     }
 
     /// Replace one session's fold with a fresh live seed (log swap / bind
@@ -161,11 +170,16 @@ impl ProjectionHub {
     pub fn reseed(&self, session_id: &str, thread: &ThreadHandle) {
         let mut cells = self.cells.lock().unwrap();
         if let Some(cell) = cells.get_mut(session_id) {
-            // Fresh live seed; the watermark clears so the next baseline
-            // folds the new log's records from the start (correct iff a
-            // baseline call follows immediately, which resync guarantees).
+            // Fresh live seed; watermark, outbox and eviction floor clear
+            // together — the previous log's change history says nothing
+            // about the new one, and a stale floor would re-Stale the
+            // resynced stream on its very next event (review r3 [severe]
+            // 1).
             cell.set = crate::projections::ProjectionSet::seed(thread);
             cell.observed = None;
+            cell.outbox.clear();
+            cell.dropped_floor = None;
+            cell.since_checkpoint = 0;
         }
     }
 
@@ -189,6 +203,7 @@ mod tests {
     /// key change (review #805 r2 [sugg] H).
     #[test]
     fn outbox_overflow_answers_stale_not_silent_loss() {
+        crate::test_support::init_globals();
         let thread = manox_agent::thread::Thread::landing_with_id(
             manox_agent::thread::ThreadId("hub-x".into()),
             std::path::PathBuf::from("/tmp"),
@@ -216,5 +231,19 @@ mod tests {
             matches!(hub.take_since("hub-x", Some(300)), TakeOutcome::Frames(_)),
             "a cursor at the floor tail is losslessly served"
         );
+        // A stream armed with its snapshot's watermark is never "behind"
+        // the floor — this is the regression shape review r3 [severe] 1
+        // proved (a fresh stream died on its first live event).
+        assert!(
+            matches!(hub.take_since("hub-x", Some(301)), TakeOutcome::Frames(_)),
+            "a watermark-armed cursor must not read as stale"
+        );
+        // `reseed` clears the eviction floor with the outbox: a resynced
+        // stream starts clean instead of re-Staling immediately.
+        hub.reseed("hub-x", &thread);
+        assert!(matches!(
+            hub.take_since("hub-x", None),
+            TakeOutcome::Frames(_)
+        ));
     }
 }

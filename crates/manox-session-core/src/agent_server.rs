@@ -154,6 +154,21 @@ struct ClientEntry {
 }
 
 /// The single gateway. Cloning shares the inner state.
+/// Releases one transient session owner when its scope ends — success,
+/// failure or panic — so an internal open can never leave a ghost owner
+/// that defeats the orphaned-session reap (review r3 [sugg] 3).
+struct OwnerLease {
+    inner: Arc<AgentServerInner>,
+    owner: &'static str,
+    id: String,
+}
+
+impl Drop for OwnerLease {
+    fn drop(&mut self) {
+        self.inner.remove_owner(self.owner, &self.id);
+    }
+}
+
 pub struct AgentServer(Arc<AgentServerInner>);
 
 struct AgentServerInner {
@@ -3387,7 +3402,15 @@ impl AgentServerInner {
         if effective != session_id && !self.sessions.lock().contains_key(&effective) {
             let _ = open_session(self, NOTE_OWNER, &effective).await;
         }
+        // The transient owner rides the OPENED id (never the id a bind
+        // may mint later), and every exit path releases it (review r3
+        // [problem] 2).
+        let opened_id = (effective != session_id && self.sessions.lock().contains_key(&effective))
+            .then(|| effective.clone());
         let Some(thread) = self.session_thread(&effective) else {
+            if let Some(id) = &opened_id {
+                self.remove_owner(NOTE_OWNER, id);
+            }
             return self.note_error(session_id, "unknown session");
         };
         if thread.read(|t| t.has_interacted()) {
@@ -3396,6 +3419,9 @@ impl AgentServerInner {
             // tools use: sticky advance + a durable `cwd_change` entry —
             // never the header cwd, never a re-bind.
             thread.with_mut(|t| t.set_cwd(cwd.into()));
+            if let Some(id) = &opened_id {
+                self.remove_owner(NOTE_OWNER, id);
+            }
             return;
         }
         // Bind on a not-yet-interacted thread: identity follows the log —
@@ -3410,6 +3436,11 @@ impl AgentServerInner {
             if let Err(error) = inner.bind_successor(&session_id, &cwd).await {
                 tracing::warn!(session = %session_id, %error, "bind successor failed");
                 inner.note_error(&session_id, &format!("bind failed: {error}"));
+            }
+            // Released AFTER the hand-off, on the id the owner was added
+            // to (review r3 [problem] 2).
+            if let Some(id) = opened_id {
+                inner.remove_owner(NOTE_OWNER, &id);
             }
         });
     }
@@ -3435,6 +3466,9 @@ impl AgentServerInner {
     }
 
     async fn bind_successor_impl(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
+        // The lease is armed as soon as the successor exists and releases
+        // the internal owner on EVERY exit — including the narrow failure
+        // window after `create` (review r3 [sugg] 3).
         let pred = self.session_thread(pred_id).ok_or("unknown session")?;
         let (model, approval, effort) = pred.read(|t| {
             (
@@ -3468,6 +3502,11 @@ impl AgentServerInner {
             .as_str()
             .ok_or("create answered without a session id")?
             .to_string();
+        let _bind_lease = OwnerLease {
+            inner: Arc::clone(self),
+            owner: "server-bind",
+            id: succ_id.clone(),
+        };
         // Every fail-able step runs BEFORE the durable hand-off: past
         // `mark_superseded` there is no rollback, so a failure below this
         // line would strand a superseded predecessor with no alias (review
@@ -3517,11 +3556,9 @@ impl AgentServerInner {
                 successor: Some(succ_id.clone()),
             },
         );
-        // Transient owners must not outlive the hand-off: a ghost owner
-        // defeats the orphaned-session reap (review #805 [sugg] 11; the
-        // note-open owner joins them, r2 [sugg] G).
-        self.remove_owner("server-bind", &succ_id);
-        self.remove_owner("note-setcwd", &succ_id);
+        // No explicit owner release here: `OwnerLease` covers the bind
+        // owner on every exit path, and the note-open owner belongs to
+        // `set_cwd`'s own scope (review r3 [problem] 2, [sugg] 3).
         Ok(())
     }
 

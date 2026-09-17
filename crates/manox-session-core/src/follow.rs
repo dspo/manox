@@ -192,7 +192,7 @@ async fn run_follow_stream(
             return finish(&conn, &stream_id, end);
         }
     };
-    let mut last_seq = send_snapshot(
+    let (mut last_seq, last_as_of) = send_snapshot(
         &conn,
         &stream_id,
         &session_id,
@@ -241,7 +241,7 @@ async fn run_follow_stream(
             let upgraded = thread.subscribe_journal_feed();
             if let Some(live) = thread.journal_snapshot().await {
                 feed = upgraded;
-                last_seq = send_snapshot(
+                (last_seq, _) = send_snapshot(
                     &conn,
                     &stream_id,
                     &session_id,
@@ -264,6 +264,7 @@ async fn run_follow_stream(
         &hub,
         &mut feed,
         &mut last_seq,
+        Some(last_as_of),
         &cancel,
         &reason,
     )
@@ -284,7 +285,7 @@ fn send_snapshot(
     data: &manox_agent::engine::JournalSnapshotData,
     max_messages: Option<u32>,
     hub: &crate::projection_hub::ProjectionHub,
-) -> Option<u64> {
+) -> (Option<u64>, u64) {
     let mut records: Vec<manox_protocol::journal::JournalWireEntry> =
         Vec::with_capacity(data.records.len());
     for record in &data.records {
@@ -296,7 +297,8 @@ fn send_snapshot(
     }
     // The P face baseline is the session-shared fold (checkpoint-restored
     // when usable), advanced over this snapshot's dense records.
-    let (projections, as_of_seq) = hub.baseline(session_id, thread, &data.records, data.cursor);
+    let (projections, as_of_seq, watermark) =
+        hub.baseline(session_id, thread, &data.records, data.cursor);
     // Header `createdAt` fallback: the oldest wire-mapped record (§C.3 seam
     // carries no file header — T4 gap note).
     let oldest = records.first().map(|r| r.timestamp.clone());
@@ -322,10 +324,15 @@ fn send_snapshot(
         stream_id: stream_id.clone(),
         frame: StreamFrame::Snapshot(snapshot),
     });
-    // The fold watermark this snapshot establishes: the dense tail seq the
-    // live feed must continue from (a regression against it is a log swap
-    // or shrink, never a duplicate).
-    data.records.last().map(|r| r.seq)
+    // (live-tail watermark, projection watermark): the first drives the
+    // seq-regression probe, the second seeds the stream's outbox cursor so
+    // a fresh stream never reads as "behind the floor" — the cell's own
+    // watermark when it is ahead of the snapshot, the frame cut otherwise
+    // (review r3 [severe] 1).
+    (
+        data.records.last().map(|r| r.seq),
+        watermark.unwrap_or(as_of_seq),
+    )
 }
 
 /// Outcome of the opening snapshot read (§C.3 seam).
@@ -396,12 +403,13 @@ async fn forward_entries(
     hub: &crate::projection_hub::ProjectionHub,
     feed: &mut tokio::sync::broadcast::Receiver<JournalFeed>,
     last_seq: &mut Option<u64>,
+    // The projection watermark of the OPENING snapshot: the outbox cursor
+    // starts there, not at "nothing seen yet" — a fresh stream is never
+    // behind an evicted floor (review r3 [severe] 1).
+    mut last_as_of: Option<u64>,
     cancel: &CancellationToken,
     reason: &Arc<StdMutex<Option<StreamEndReason>>>,
 ) -> StreamEndReason {
-    // Per-stream cursor into the session-shared change outbox (the fan-out
-    // half of the registry: one fold, N streams).
-    let mut last_as_of: Option<u64> = None;
     // §D.7 bounded window: the per-stream Entry queue is the feed's
     // broadcast capacity (the kernel's `JOURNAL_FEED_CAPACITY`, locked
     // equal to [`manox_protocol::ENTRY_BACKPRESSURE_CAPACITY`] by
@@ -432,10 +440,13 @@ async fn forward_entries(
                         match resync_in_place(conn, stream_id, session_id, thread, max_messages, hub)
                             .await
                         {
-                            Ok((upgraded, tail)) => {
+                            Ok((upgraded, tail, as_of)) => {
                                 *feed = upgraded;
                                 *last_seq = tail;
-                                last_as_of = None;
+                                // The fresh snapshot's own watermark: the
+                                // reseeded cell cleared its floor, and this
+                                // cursor matches the served cut.
+                                last_as_of = Some(as_of);
                             }
                             Err(end) => return end,
                         }
@@ -529,15 +540,24 @@ async fn resync_in_place(
     thread: &ThreadHandle,
     max_messages: Option<u32>,
     hub: &crate::projection_hub::ProjectionHub,
-) -> Result<(tokio::sync::broadcast::Receiver<JournalFeed>, Option<u64>), StreamEndReason> {
+) -> Result<
+    (
+        tokio::sync::broadcast::Receiver<JournalFeed>,
+        Option<u64>,
+        u64,
+    ),
+    StreamEndReason,
+> {
     let upgraded = thread.subscribe_journal_feed();
     match thread.journal_snapshot().await {
         Some(live) => {
             // The log under this stream changed identity: reseed the shared
-            // fold before the fresh baseline, or header mirrors from the old
-            // log would freeze (#802).
+            // fold (outbox + eviction floor clear with it) before the fresh
+            // baseline, or header mirrors from the old log would freeze and
+            // the returned cursor would land behind a stale floor (#802,
+            // review r3 [severe] 1).
             hub.reseed(session_id, thread);
-            let tail = send_snapshot(
+            let (tail, as_of) = send_snapshot(
                 conn,
                 stream_id,
                 session_id,
@@ -546,7 +566,7 @@ async fn resync_in_place(
                 max_messages,
                 hub,
             );
-            Ok((upgraded, tail))
+            Ok((upgraded, tail, as_of))
         }
         None => Err(StreamEndReason::Resync),
     }

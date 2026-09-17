@@ -1923,6 +1923,64 @@ fn projection_changes_fan_out_to_every_stream_and_late_joiners() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// R3 [severe] 1 regression: once the session-shared outbox has overflowed,
+/// a NEWLY opened stream must keep streaming. Its cursor is armed with the
+/// snapshot's projection watermark (the fold's own position), so it is never
+/// mistaken for "behind the evicted floor" and killed with `Resync` on the
+/// first live event.
+#[test]
+fn fresh_stream_after_outbox_overflow_keeps_streaming() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    open_follow(&client, "st-fill", "s1");
+    let _ = snapshot_for(&client, "st-fill");
+    let title = |seq: u64| {
+        Arc::new(manox_harness::session::SessionTreeEntry::Title {
+            id: format!("t-{seq}"),
+            parent_id: None,
+            timestamp: fixed_ts(),
+            title: format!("v{seq}"),
+        })
+    };
+    // 300 distinct changes overflow the 256-entry outbox; the pacing lets
+    // the fill pump keep up (the feed's own capacity is smaller) and the
+    // drain keeps the outbound queue from backpressuring it.
+    for seq in 1..=300u64 {
+        engine.push_journal(seq, title(seq));
+        while client.conn.server_rx().try_recv().is_ok() {}
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    open_follow(&client, "st-fresh", "s1");
+    let snap = snapshot_for(&client, "st-fresh");
+    assert_eq!(snap.session_id, "s1");
+    engine.push_journal(301, title(301));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.recv_timeout(Duration::from_millis(200)) {
+            FromServer::StreamItem {
+                stream_id,
+                frame: manox_protocol::StreamFrame::Entry { seq: 301, .. },
+            } if stream_id.0 == "st-fresh" => break,
+            FromServer::StreamEnd { stream_id, reason } if stream_id.0 == "st-fresh" => {
+                panic!("fresh stream must not end after an outbox overflow: {reason:?}");
+            }
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fresh stream never received the live entry"
+        );
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// Bind dedupe keys on the RESOLVED id (review #805 r2 [issue] A): a
 /// second SetCwd arriving on the superseded predecessor resolves to the
 /// successor and must mint the successor's own hand-off — the in-flight

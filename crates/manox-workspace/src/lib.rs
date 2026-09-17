@@ -224,6 +224,9 @@ impl WorkspaceStore {
             row.title = title.to_string();
             row.updated_at = now_iso();
             update_row(db, &row)?;
+            // A mutation is a durable-prune opportunity too (review r3
+            // [sugg] 4a): the read path stays side-effect free.
+            prune_row(db, &mut row)?;
             Ok(row)
         })?;
         let view = Self::validated_view(view);
@@ -917,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_requires_header_validation_and_prunes_stale_accounts() {
+    fn attach_requires_header_validation_and_writes_prune_stale_accounts() {
         let _g = test_lock();
         let (_dir, store) = rig();
         let target = tempfile::tempdir().unwrap();
@@ -933,7 +936,9 @@ mod tests {
             rejected,
             Err(WorkspaceError::SessionMismatch { .. })
         ));
-        // A project re-bind elsewhere prunes the account on next read.
+        // A project re-bind elsewhere drops out of the read view at once;
+        // the durable prune lands on the next accepted mutation (the read
+        // path itself never writes, review r3 [sugg] 4).
         seed_thread("/nowhere-else", "s-in");
         seed_sidecar("s-in", "/nowhere-else");
         let listed = store.list().unwrap();
