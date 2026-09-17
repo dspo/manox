@@ -257,6 +257,12 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
         id: &str,
         response: manox_agent::permission::ToolAuthorizationResponse,
     ) {
+        // The real gate removes the entry on settle; mirroring that keeps the
+        // badge-clear assertions meaningful.
+        self.pending_auth
+            .lock()
+            .unwrap()
+            .retain(|(pending_id, _)| pending_id != id);
         self.auth_responses
             .lock()
             .unwrap()

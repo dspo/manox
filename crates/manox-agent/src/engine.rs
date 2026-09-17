@@ -2758,6 +2758,19 @@ where
                     // repair — for the entire duration of a running turn.
                     reply_journal_snapshot(appender, reply).await;
                 }
+                Some(SessionCmd::RequestPlanMode { enabled }) => {
+                    // Mid-run selection: record the intent and journal it
+                    // LIVE (the serializer path — never an inline session
+                    // append, see the AppendJournal arm's deadlock note).
+                    // The commit stays on the next turn boundary, which is
+                    // what makes `plan_mode_pending` observable and the
+                    // selection revocable before it takes effect.
+                    state.plan.set_requested(Some(enabled));
+                    let _ = live_row_tx.send((
+                        "plan_mode_request".into(),
+                        serde_json::json!({ "enabled": enabled }),
+                    ));
+                }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
                     // loop applies it right after settle (P2: a mid-run click
@@ -4166,15 +4179,18 @@ async fn run_actor(
                 )
                 .await
                 {
-                    // The request stays outstanding: a later boundary
-                    // retries the append (dsh: an append failure cannot
-                    // block the turn).
+                    // The request stays outstanding and the mode does NOT
+                    // move: logging the intent first is what keeps a
+                    // committed `plan_mode_change` from appearing without its
+                    // request. A later boundary retries both.
                     tracing::warn!(error = %err, "failed to journal the plan-mode request");
+                    return;
                 }
-                // No run is in flight: there is no boundary to wait for, so
-                // the selection commits immediately (dsh parity — its `set()`
-                // appends between turns). A running turn keeps the request
-                // pending for its next start.
+                // Idle threads have no boundary to wait for, so the selection
+                // commits immediately (dsh parity — its `set()` appends
+                // between turns). Mid-run selections never reach this arm:
+                // `drive_run` records them and leaves the commit to the
+                // Prompt boundary.
                 if !state.running.load(Ordering::Relaxed) {
                     commit_requested_plan_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 }
