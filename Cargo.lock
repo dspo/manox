@@ -2483,6 +2483,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "manox-agent",
+ "manox-harness",
  "rusqlite",
  "serde",
  "serde_json",

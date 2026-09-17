@@ -208,7 +208,7 @@ impl WorkspaceStore {
             Ok((row, true))
         })?;
         self.tx(clear_marker)?;
-        let view = self.validate_and_prune(view)?;
+        let view = Self::validated_view(view);
         if created {
             self.emit(WorkspaceEvent::Upsert {
                 workspace: view.clone(),
@@ -226,7 +226,7 @@ impl WorkspaceStore {
             update_row(db, &row)?;
             Ok(row)
         })?;
-        let view = self.validate_and_prune(view)?;
+        let view = Self::validated_view(view);
         self.emit(WorkspaceEvent::Upsert {
             workspace: view.clone(),
         });
@@ -391,9 +391,7 @@ impl WorkspaceStore {
             });
             Ok(rows)
         })?;
-        rows.into_iter()
-            .map(|row| self.validate_and_prune(row))
-            .collect()
+        Ok(rows.into_iter().map(Self::validated_view).collect())
     }
 
     /// Live directory check; a missing directory never mutates the row.
@@ -463,9 +461,17 @@ impl WorkspaceStore {
     /// surfacing SQLITE_BUSY (review #805 [sugg] 7).
     fn connect_at(path: &Path) -> Result<Connection, WorkspaceError> {
         let conn = Connection::open(path).map_err(|e| WorkspaceError::Io(e.to_string()))?;
-        for pragma in ["PRAGMA journal_mode=WAL;", "PRAGMA busy_timeout=5000;"] {
-            if let Err(error) = conn.execute_batch(pragma) {
-                tracing::warn!(%error, "workspace pragma failed; continuing without it");
+        if let Err(error) = conn.execute_batch("PRAGMA busy_timeout=5000;") {
+            tracing::warn!(%error, "workspace busy_timeout failed; continuing without it");
+        }
+        // The journal-mode switch itself can contend with a concurrent
+        // writer — the busy timeout above must be in place first, and the
+        // switch gets one retry before falling back to delete-journal mode
+        // (review #805 r2 [sugg] E).
+        if let Err(first) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+            tracing::warn!(%first, "workspace WAL switch contended; retrying once");
+            if let Err(second) = conn.execute_batch("PRAGMA journal_mode=WAL;") {
+                tracing::warn!(%second, "workspace WAL switch abandoned; delete-journal mode");
             }
         }
         Ok(conn)
@@ -532,19 +538,25 @@ impl WorkspaceStore {
         out
     }
 
-    /// Header-validate one row's account and durably prune filtered
-    /// candidates; returns the consumer view.
-    fn validate_and_prune(&self, mut row: Row) -> Result<WorkspaceView, WorkspaceError> {
-        let before = row.session_ids.len();
+    /// The read-path view: header-validate the account in memory only —
+    /// durable pruning belongs to the mutative verbs (`prune_row` inside
+    /// their transactions), so `list()` never writes (review #805 r2
+    /// [issue] C).
+    fn validated_view(row: Row) -> WorkspaceView {
+        let mut row = row;
         row.session_ids.retain(|id| session_belongs(id, &row.path));
-        if row.session_ids.len() != before {
-            let snapshot = row.clone();
-            let _ = self.mutate(|db| {
-                update_row(db, &snapshot)?;
-                Ok(())
-            });
+        Self::view_of_row(row)
+    }
+
+    fn view_of_row(row: Row) -> WorkspaceView {
+        WorkspaceView {
+            workspace_id: row.id,
+            path: row.path,
+            title: row.title,
+            session_ids: row.session_ids,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
         }
-        Ok(self.view_of(row))
     }
 
     fn view_of(&self, row: Row) -> WorkspaceView {
@@ -649,9 +661,14 @@ fn session_belongs(session_id: &str, workspace_path: &str) -> bool {
     let Some(store) = manox_agent::thread_store::try_global() else {
         return false;
     };
+    // Summary first (pure memory — materialized sessions, the common
+    // case); the sidecar read only covers sessions whose journal has not
+    // materialized and are therefore absent from the reconciled mirror
+    // (review #805 r2 [issue] C: keep I/O off the locked hot path).
     let project = store.read(|s| {
-        s.sidecar_project(session_id)
-            .or_else(|| s.summary_by_id(session_id).map(|sum| sum.project.clone()))
+        s.summary_by_id(session_id)
+            .map(|sum| sum.project.clone())
+            .or_else(|| s.sidecar_project(session_id))
     });
     match project {
         Some(project) if !project.is_empty() => {
@@ -823,13 +840,34 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Write a session sidecar carrying the bound project (the
-    /// header-validation source; stable across store reconciles).
+    /// Materialize a session file plus its sidecar carrying the bound
+    /// project, then rescan: the store derives the summary from disk, so
+    /// validation survives reconciles exactly like production (the
+    /// sidecar alone feeds the unmaterialized fallback).
     fn seed_sidecar(id: &str, project: &str) {
+        use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
         let sessions = manox_agent::paths::manox_config_dir()
             .unwrap()
             .join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(format!("{id}.jsonl"));
+        let handle = manox_agent::runtime::handle();
+        if !path.exists() {
+            handle.block_on(async {
+                JsonlSessionStorage::create(
+                    &path,
+                    JsonlSessionMetadata {
+                        id: id.to_string(),
+                        cwd: project.to_string(),
+                        created_at: chrono::Utc::now(),
+                        parent_session_path: None,
+                        metadata: None,
+                    },
+                )
+                .await
+                .expect("seed session file");
+            });
+        }
         std::fs::write(
             sessions.join(format!("{id}.meta.json")),
             format!(
@@ -838,9 +876,9 @@ mod tests {
             ),
         )
         .unwrap();
-        manox_agent::thread_store::global().with_mut(|s| {
-            s.note_session_path(id, &sessions.join(format!("{id}.jsonl")));
-        });
+        let store = manox_agent::thread_store::global();
+        store.with_mut(|s| s.note_session_path(id, &path));
+        handle.block_on(store.refresh_now());
     }
 
     /// One hermetic registry + thread store per test.

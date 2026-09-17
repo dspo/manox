@@ -1923,6 +1923,108 @@ fn projection_changes_fan_out_to_every_stream_and_late_joiners() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// Bind dedupe keys on the RESOLVED id (review #805 r2 [issue] A): a
+/// second SetCwd arriving on the superseded predecessor resolves to the
+/// successor and must mint the successor's own hand-off — the in-flight
+/// set never wedges an id silently.
+#[test]
+fn set_cwd_dedupe_keys_on_the_resolved_id() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    let set_cwd = |cwd: &str| {
+        client.send(FromClient::Notification {
+            note: ClientNote::SetCwd {
+                session_id: "s1".into(),
+                cwd: cwd.into(),
+            },
+        });
+    };
+    set_cwd("/one");
+    let succ1 = loop {
+        match client.recv() {
+            FromServer::Host {
+                host:
+                    manox_protocol::stream::HostEvent::SessionDisposed {
+                        session_id,
+                        successor: Some(next),
+                    },
+            } if session_id == "s1" => break next,
+            _ => continue,
+        }
+    };
+    // The same (now superseded) id again: resolves to succ1, still
+    // uninteracted — a second hand-off MUST follow, not a silent drop.
+    set_cwd("/two");
+    let succ2 = loop {
+        match client.recv() {
+            FromServer::Host {
+                host:
+                    manox_protocol::stream::HostEvent::SessionDisposed {
+                        session_id,
+                        successor: Some(next),
+                    },
+            } if session_id == "s1" => break next,
+            _ => continue,
+        }
+    };
+    assert_ne!(succ1, succ2, "the second bind must mint a fresh successor");
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
+/// A cold, non-superseded id keeps the `session/not-found` semantics on
+/// Submit — the restart-window auto-open is reserved for real redirects
+/// (review #805 r2 [issue] B).
+#[test]
+fn cold_submit_does_not_auto_open() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    client.send(FromClient::Request {
+        id: MsgId::new("cold-1"),
+        call: ClientCall::Submit {
+            session_id: "no-such-cold".into(),
+            text: "hello".into(),
+            images: vec![],
+            origin_rpc: None,
+        },
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.recv_timeout(Duration::from_millis(200)) {
+            FromServer::Response {
+                id,
+                outcome: Err(error),
+            } if id.0 == "cold-1" => {
+                let code = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("code"))
+                    .and_then(|code| code.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                assert_eq!(code, "session/not-found");
+                break;
+            }
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cold submit never answered"
+        );
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// WS-D probe: the workspace verb answers on the real composition path.
 #[test]
 fn workspace_call_answers() {

@@ -1102,8 +1102,10 @@ impl ThreadStore {
     /// sessions whose journal never materialized — the header-validation
     /// source the workspace domain relies on (review #805 follow-up).
     pub fn sidecar_project(&self, id: &str) -> Option<String> {
-        let path = self.session_paths.get(id)?;
-        let meta_path = manox_harness::session_meta::meta_path(&self.sessions_dir, path);
+        // The canonical sidecar path is derived from the id alone — a
+        // synthetic `session_paths` entry (bind-time predecessor) is not
+        // required, and a reconcile pass cannot invalidate the lookup.
+        let meta_path = self.sessions_dir.join(format!("{id}.meta.json"));
         let raw = std::fs::read_to_string(meta_path).ok()?;
         let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
         meta.project

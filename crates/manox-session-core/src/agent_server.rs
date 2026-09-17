@@ -1075,12 +1075,13 @@ impl AgentServerInner {
         let thread = match self.session_thread(&session_id) {
             Some(thread) => thread,
             None => {
-                // Restart window: the redirect target is not open in this
-                // process yet — open it under its own id (owner = this
-                // connection) and alias the stream onto it (review #805
-                // [issue] 4).
+                // Restart window: ONLY a real redirect auto-opens (the
+                // successor under its own id, this connection as owner) and
+                // aliases the stream onto it — a cold non-superseded id
+                // keeps the session/not-found semantics (review #805 r2
+                // [issue] B).
                 let effective = self.resolve_redirect(&session_id);
-                if !self.sessions.lock().contains_key(&effective) {
+                if effective != session_id && !self.sessions.lock().contains_key(&effective) {
                     let _ = open_session(self, client_id, &effective).await;
                 }
                 let Some(thread) = self.session_thread(&session_id) else {
@@ -1227,6 +1228,7 @@ impl AgentServerInner {
         }
         drop(owners);
         let mut sessions = self.sessions.lock();
+        let mut reaped: Vec<String> = Vec::new();
         for sid in orphaned {
             // Ownership lost ⇒ every live stream of the session closes
             // (§D.1 `Closed`).
@@ -1242,10 +1244,18 @@ impl AgentServerInner {
                 .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
             if !running && let Some(session) = sessions.remove(&sid) {
                 session.stop_pump();
-                // §0: the spawned waterfall outlives the pump alone — the
-                // orphan's deliveries must converge fail-closed now.
-                self.cancel_deliveries_for_session(&sid);
+                reaped.push(sid);
             }
+        }
+        drop(sessions);
+        for sid in reaped {
+            // The session-shared projection cell reaps with the session on
+            // every removal path (review #805 r2 [sugg] D: disconnect is
+            // the most common one).
+            self.projections.drop_session(&sid);
+            // §0: the spawned waterfall outlives the pump alone — the
+            // orphan's deliveries must converge fail-closed now.
+            self.cancel_deliveries_for_session(&sid);
         }
     }
 
@@ -3083,9 +3093,11 @@ impl AgentServerInner {
     ) -> Result<Value, RpcError> {
         // Bind redirect + restart window: submissions addressed to a
         // superseded predecessor land on the successor, opened under its
-        // own id with this connection as owner (review #805 [issue] 4).
+        // own id with this connection as owner. Only a real redirect
+        // auto-opens — a cold id keeps not-found semantics (review #805
+        // r2 [issue] B).
         let effective = self.resolve_redirect(session_id);
-        if !self.sessions.lock().contains_key(&effective) {
+        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
             let _ = open_session(self, owner, &effective).await;
         }
         let session_id = effective.as_str();
@@ -3368,10 +3380,12 @@ impl AgentServerInner {
         // defeats the orphaned-session reap (review #805 [sugg] 11).
         const NOTE_OWNER: &str = "note-setcwd";
         let effective = self.resolve_redirect(session_id);
-        let opened = !self.sessions.lock().contains_key(&effective);
-        if opened {
+        // Only a real redirect auto-opens here (a cold id keeps not-found
+        // semantics, review #805 r2 [issue] B); the transient owner stays
+        // until the hand-off releases it so the session is never ownerless
+        // (r2 [sugg] G).
+        if effective != session_id && !self.sessions.lock().contains_key(&effective) {
             let _ = open_session(self, NOTE_OWNER, &effective).await;
-            self.remove_owner(NOTE_OWNER, &effective);
         }
         let Some(thread) = self.session_thread(&effective) else {
             return self.note_error(session_id, "unknown session");
@@ -3389,9 +3403,6 @@ impl AgentServerInner {
         // creation), and this predecessor degrades into a redirect stub
         // sharing the successor's engine (#802: no chain swap under a
         // live identity, ever).
-        if !self.binding.lock().insert(effective.clone()) {
-            return;
-        }
         let inner = Arc::clone(self);
         let session_id = session_id.to_string();
         let cwd = cwd.to_string();
@@ -3409,8 +3420,17 @@ impl AgentServerInner {
     /// so live streams/ops addressed to it converge on the new log, and
     /// publish the control-face hand-off (`SessionDisposed { successor }`).
     async fn bind_successor(self: &Arc<Self>, pred_id: &str, cwd: &str) -> Result<(), String> {
+        // Dedupe keys on the RESOLVED id: a note may arrive on any
+        // predecessor of the same redirect chain, and inserting one id
+        // while removing another wedges the set forever (review #805 r2
+        // [issue] A).
+        let key = self.resolve_redirect(pred_id);
+        if !self.binding.lock().insert(key.clone()) {
+            self.note_error(pred_id, "bind already in flight");
+            return Err("bind already in flight".into());
+        }
         let outcome = self.bind_successor_impl(pred_id, cwd).await;
-        self.binding.lock().remove(pred_id);
+        self.binding.lock().remove(&key);
         outcome
     }
 
@@ -3448,11 +3468,26 @@ impl AgentServerInner {
             .as_str()
             .ok_or("create answered without a session id")?
             .to_string();
+        // Every fail-able step runs BEFORE the durable hand-off: past
+        // `mark_superseded` there is no rollback, so a failure below this
+        // line would strand a superseded predecessor with no alias (review
+        // #805 r2 [sugg] F).
+        let succ = self
+            .session_thread(&succ_id)
+            .ok_or("successor session missing after create")?;
+        let engine = succ
+            .read(|t| t.engine_clone())
+            .ok_or("successor engine not materialized")?;
         // Owner inheritance: pending adjudications and streamed notes keep
         // reaching the same clients across the hand-off.
         for owner in self.owners(pred_id) {
             self.add_owner(&owner, &succ_id);
         }
+        // Stub the predecessor onto the successor's engine + mirrored
+        // header fields: its live follow streams see the new chain's feed
+        // (the seq regression resyncs them loudly), and its journal seam
+        // answers the successor log.
+        pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
         manox_agent::thread_store::global().with_mut(|s| s.mark_superseded(pred_id, &succ_id));
         self.superseded
             .lock()
@@ -3460,17 +3495,6 @@ impl AgentServerInner {
         // The bound directory becomes (or joins) a workspace row and the
         // successor leads its account (dsh workspace parity for binds).
         crate::workspace_serve::create_and_attach(cwd, &succ_id);
-        // Stub the predecessor onto the successor's engine + mirrored
-        // header fields: its live follow streams see the new chain's feed
-        // (the seq regression resyncs them loudly), and its journal seam
-        // answers the successor log.
-        let succ = self
-            .session_thread(&succ_id)
-            .ok_or("successor session missing after create")?;
-        let engine = succ
-            .read(|t| t.engine_clone())
-            .ok_or("successor engine not materialized")?;
-        pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
         self.projections.reseed(pred_id, &pred);
         // Live predecessor streams hold the OLD engine's feed receiver: it
         // never closes and never emits again, so the regression probe would
@@ -3493,9 +3517,11 @@ impl AgentServerInner {
                 successor: Some(succ_id.clone()),
             },
         );
-        // The bind owner must not outlive the hand-off: a ghost owner
-        // defeats the orphaned-session reap (review #805 [sugg] 11).
+        // Transient owners must not outlive the hand-off: a ghost owner
+        // defeats the orphaned-session reap (review #805 [sugg] 11; the
+        // note-open owner joins them, r2 [sugg] G).
         self.remove_owner("server-bind", &succ_id);
+        self.remove_owner("note-setcwd", &succ_id);
         Ok(())
     }
 

@@ -91,10 +91,15 @@ impl ProjectionHub {
         let Some(cell) = cells.get(session_id) else {
             return TakeOutcome::Frames(Vec::new());
         };
-        if cell
-            .dropped_floor
-            .is_some_and(|floor| last_as_of.is_some_and(|last| last < floor))
-        {
+        // A cursor with no watermark asked for the outbox from its start:
+        // once anything was evicted that request can no longer be served
+        // losslessly. A watermark at or past the floor is complete.
+        let stale = match (cell.dropped_floor, last_as_of) {
+            (Some(_), None) => true,
+            (Some(floor), Some(last)) => last < floor,
+            (None, _) => false,
+        };
+        if stale {
             return TakeOutcome::Stale;
         }
         TakeOutcome::Frames(
@@ -172,5 +177,44 @@ impl ProjectionHub {
             drop(cells);
             crate::projection_cache::save(session_id, &rows);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Outbox overflow must answer [`TakeOutcome::Stale`] for a cursor
+    /// behind the evicted floor — loud resync, never a silently missing
+    /// key change (review #805 r2 [sugg] H).
+    #[test]
+    fn outbox_overflow_answers_stale_not_silent_loss() {
+        let thread = manox_agent::thread::Thread::landing_with_id(
+            manox_agent::thread::ThreadId("hub-x".into()),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let hub = ProjectionHub::default();
+        hub.baseline("hub-x", &thread, &[], 0);
+        for seq in 1..=300u64 {
+            hub.apply(
+                "hub-x",
+                seq,
+                &manox_harness::session::SessionTreeEntry::Title {
+                    id: format!("t-{seq}"),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    title: format!("v{seq}"),
+                },
+            );
+        }
+        assert!(matches!(hub.take_since("hub-x", None), TakeOutcome::Stale));
+        assert!(matches!(
+            hub.take_since("hub-x", Some(0)),
+            TakeOutcome::Stale
+        ));
+        assert!(
+            matches!(hub.take_since("hub-x", Some(300)), TakeOutcome::Frames(_)),
+            "a cursor at the floor tail is losslessly served"
+        );
     }
 }
