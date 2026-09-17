@@ -1115,11 +1115,12 @@ impl ThreadStore {
         meta.project
     }
 
-    /// Purge superseded predecessors that never materialized: their only
-    /// artifact on disk is the sidecar carrying the redirect marker, and a
-    /// fresh process has no consumer for them (plan §3.1 B-iv). A
-    /// materialized predecessor (its `.jsonl` exists) keeps both file and
-    /// marker — its history is real and the redirect still resolves.
+    /// Prune the durable rows of superseded predecessors that never
+    /// materialized (plan §3.1 B-iv): a fresh process has no live entry for
+    /// them, and any rows a create-time upsert left behind are dead weight.
+    /// The SIDECAR MARKER STAYS — the redirect must keep resolving an id a
+    /// client (or another host) still holds across a restart (review #809
+    /// [sugg] 7); a materialized predecessor keeps its journal as well.
     pub fn purge_superseded_predecessors(&mut self) -> usize {
         let Ok(entries) = std::fs::read_dir(&self.sessions_dir) else {
             return 0;
@@ -1150,16 +1151,12 @@ impl ThreadStore {
             if meta.superseded_by.is_none() {
                 continue;
             }
-            match std::fs::remove_file(&path) {
+            self.session_paths.remove(id);
+            match self.db.delete_thread(id) {
                 Ok(()) => purged += 1,
                 Err(error) => {
-                    tracing::warn!(%error, session = %id, "superseded sidecar purge failed");
-                    continue;
+                    tracing::warn!(%error, session = %id, "superseded db row purge failed");
                 }
-            }
-            self.session_paths.remove(id);
-            if let Err(error) = self.db.delete_thread(id) {
-                tracing::debug!(%error, session = %id, "superseded db row purge skipped");
             }
         }
         purged
@@ -2016,10 +2013,10 @@ mod tests {
         path
     }
 
-    /// Plan §3.1 B-iv: the startup purge removes sidecars of superseded
-    /// predecessors that never materialized (their only artifact), and
-    /// keeps materialized ones — their history is real and the redirect
-    /// still resolves through the marker.
+    /// Plan §3.1 B-iv: the startup prune drops the durable rows of a
+    /// superseded predecessor that never materialized, and keeps its
+    /// sidecar marker (the redirect must survive a restart) as well as a
+    /// materialized predecessor's journal.
     #[test]
     fn purge_superseded_predecessors_removes_only_unmaterialized_sidecars() {
         let (db, db_path) = temp_db();
@@ -2033,10 +2030,10 @@ mod tests {
         std::fs::write(dir.join("plain.meta.json"), "{\"project\":\"/proj\"}").unwrap();
 
         let purged = handle.with_mut(|s| s.purge_superseded_predecessors());
-        assert_eq!(purged, 1, "only the unmaterialized predecessor purges");
+        assert_eq!(purged, 1, "only the unmaterialized predecessor prunes");
         assert!(
-            !dir.join("pred.meta.json").exists(),
-            "an unmaterialized superseded sidecar must be removed"
+            dir.join("pred.meta.json").exists(),
+            "the redirect marker SURVIVES: an id a client still holds must keep              resolving after a restart"
         );
         assert!(
             dir.join("kept.meta.json").exists() && kept_journal.exists(),

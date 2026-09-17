@@ -1957,10 +1957,11 @@ fn superseded_predecessor_reaps_when_its_last_stream_closes() {
     };
     // The audience moved to the successor (a swapped `add_owner` argument
     // order regression would leave it owned by nobody).
-    assert_eq!(
-        server.session_owners_for_test(&succ),
-        vec!["test".to_string()],
-        "the successor inherits the predecessor's owner"
+    assert!(
+        server
+            .session_owners_for_test(&succ)
+            .contains(&"test".to_string()),
+        "the successor inherits the predecessor's owner (the bind lease may          still be listed: it releases after the hand-off frames)"
     );
     assert!(
         server.session_owners_for_test("s1").is_empty(),

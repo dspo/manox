@@ -606,19 +606,26 @@ impl AgentServerInner {
         {
             return;
         }
-        let running = self
-            .sessions
-            .lock()
-            .get(session_id)
-            .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-        if running {
-            return;
-        }
-        let removed = { self.sessions.lock().remove(session_id) };
+        // Check-and-remove under ONE hold (the `remove_client` shape): a
+        // turn turning active between two holds would otherwise be reaped
+        // mid-flight with nobody left to settle it (review #809 [sugg] 3).
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            let running = sessions
+                .get(session_id)
+                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+            if running {
+                return;
+            }
+            sessions.remove(session_id)
+        };
         let Some(session) = removed else {
             return;
         };
         session.stop_pump();
+        // The registrations die with the entry, like every other removal
+        // path (review #809 [sugg] 4).
+        self.clear_embedder_tools(session_id);
         self.projections.drop_session(session_id);
         self.cancel_deliveries_for_session(session_id);
         tracing::debug!(session = %session_id, "reaped superseded predecessor");
@@ -1363,6 +1370,9 @@ impl AgentServerInner {
                 .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
             if !running && let Some(session) = sessions.remove(&sid) {
                 session.stop_pump();
+                // Registrations die with the entry on every removal path
+                // (review #809 [sugg] 4).
+                self.clear_embedder_tools(&sid);
                 reaped.push(sid);
             }
         }
@@ -3676,8 +3686,14 @@ impl AgentServerInner {
         // Live predecessor streams hold the OLD engine's feed receiver: it
         // never closes and never emits again, so the regression probe would
         // never fire. End them with Resync — the client's budgeted reopen
-        // lands on the alias (review #805 [issue] 5).
+        // lands on the alias (review #805 [issue] 5). BOTH ids: the streams
+        // a client opened on the resolved id carry `session_id ==
+        // effective`, and leaving them would also pin the reap predicate
+        // (review #809 [issue] 2).
         self.end_streams_for_session(pred_id, StreamEndReason::Resync);
+        if effective != pred_id {
+            self.end_streams_for_session(&effective, StreamEndReason::Resync);
+        }
         // Directed hand-off (§D.5 owner-set control, never a broadcast):
         // note face + host mirror to the assembled audience, one send per
         // connection (review #805 [issue] 3).

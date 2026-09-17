@@ -181,10 +181,6 @@ pub fn create_table(conn: &Connection) -> Result<()> {
 }
 
 impl ThreadsDatabase {
-    /// Upsert a thread record. When `touch` is true, both `interacted_at` and
-    /// `updated_at` advance to now (real user activity). When `touch` is false,
-    /// only `updated_at` advances; `interacted_at` is preserved (e.g. saving
-    /// state on thread switch without implying the user interacted with it).
     /// Delete one thread's durable rows (`threads` + `thread_data`). Used by
     /// the superseded-predecessor purge: such an id's only artifacts are its
     /// sidecar marker and, at most, rows a create-time upsert left behind.
@@ -197,6 +193,10 @@ impl ThreadsDatabase {
         Ok(())
     }
 
+    /// Upsert a thread record. When `touch` is true, both `interacted_at` and
+    /// `updated_at` advance to now (real user activity). When `touch` is false,
+    /// only `updated_at` advances; `interacted_at` is preserved (e.g. saving
+    /// state on thread switch without implying the user interacted with it).
     pub fn upsert(&self, rec: &ThreadRecord, touch: bool) -> Result<()> {
         let data = ThreadData {
             messages: rec.messages.clone(),
