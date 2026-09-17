@@ -571,14 +571,57 @@ impl AgentServerInner {
     /// (identity-guarded so a re-open with the same id is never deleted by
     /// the superseded task).
     fn untrack_stream(&self, client_id: &str, stream_id: &StreamId, handle: &StreamHandle) {
-        let mut streams = self.streams.lock();
-        let key = (client_id.to_string(), stream_id.clone());
-        if streams
-            .get(&key)
-            .is_some_and(|live| live.is_same_handle(handle))
         {
-            streams.remove(&key);
+            let mut streams = self.streams.lock();
+            let key = (client_id.to_string(), stream_id.clone());
+            if streams
+                .get(&key)
+                .is_some_and(|live| live.is_same_handle(handle))
+            {
+                streams.remove(&key);
+            }
         }
+        // The last consumer leaving is the predecessor's reap edge
+        // (plan §3.1 B-iv).
+        self.reap_superseded_if_idle(handle.session_id());
+    }
+
+    /// Reap a superseded predecessor once nothing consumes it any more:
+    /// without this its entry, pump and engine stay resident for the
+    /// process lifetime (plan §3.1 B-iv). A busy turn keeps its entry —
+    /// the settle arm reaps it, exactly like `remove_client`'s deferred
+    /// reap.
+    fn reap_superseded_if_idle(&self, session_id: &str) {
+        if !self.superseded.lock().contains_key(session_id) {
+            return;
+        }
+        if !self.owners(session_id).is_empty() {
+            return;
+        }
+        if self
+            .streams
+            .lock()
+            .values()
+            .any(|handle| handle.session_id() == session_id)
+        {
+            return;
+        }
+        let running = self
+            .sessions
+            .lock()
+            .get(session_id)
+            .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+        if running {
+            return;
+        }
+        let removed = { self.sessions.lock().remove(session_id) };
+        let Some(session) = removed else {
+            return;
+        };
+        session.stop_pump();
+        self.projections.drop_session(session_id);
+        self.cancel_deliveries_for_session(session_id);
+        tracing::debug!(session = %session_id, "reaped superseded predecessor");
     }
 
     /// End every live stream of a session with `reason` (dispose /
@@ -793,6 +836,20 @@ impl AgentServer {
         manox_agent::runtime::handle().spawn(async move {
             inner.serve_connection(conn).await;
         });
+    }
+
+    /// Test-only: the live session ids this server holds (the reap
+    /// regression needs to observe an entry disappearing).
+    #[cfg(test)]
+    pub fn live_session_ids(&self) -> Vec<String> {
+        self.0.sessions.lock().keys().cloned().collect()
+    }
+
+    /// Test-only: one session's owner ids (the hand-off must move the
+    /// audience to the successor, not the reverse).
+    #[cfg(test)]
+    pub fn session_owners_for_test(&self, session_id: &str) -> Vec<String> {
+        self.0.owners(session_id)
     }
 
     /// Test-only: set a scripted engine on a session before any turn runs, so
@@ -3568,20 +3625,50 @@ impl AgentServerInner {
         let engine = succ
             .read(|t| t.engine_clone())
             .ok_or("successor engine not materialized")?;
+        // The hand-off audience: every client owning the id the note
+        // arrived on OR the id it resolved to — they differ once a
+        // predecessor has already handed off, whose own owner set is
+        // cleared by that earlier hand-off (plan §3.1 B-iv).
+        let effective = self.resolve_redirect(pred_id);
+        let mut audience: Vec<String> = self.owners(pred_id);
+        for owner in self.owners(&effective) {
+            if !audience.contains(&owner) {
+                audience.push(owner);
+            }
+        }
+        let audience_conns: Vec<Arc<dyn RpcConnection>> = {
+            let clients = self.clients.lock();
+            audience
+                .iter()
+                .filter_map(|cid| clients.get(cid).map(|entry| entry.conn.clone()))
+                .collect()
+        };
         // Owner inheritance: pending adjudications and streamed notes keep
         // reaching the same clients across the hand-off.
-        for owner in self.owners(pred_id) {
-            self.add_owner(&owner, &succ_id);
+        for owner in &audience {
+            // `add_owner(session_id, client_id)`: the successor takes the
+            // audience, not the other way around.
+            self.add_owner(&succ_id, owner);
         }
         // Stub the predecessor onto the successor's engine + mirrored
         // header fields: its live follow streams see the new chain's feed
         // (the seq regression resyncs them loudly), and its journal seam
         // answers the successor log.
         pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
-        manox_agent::thread_store::global().with_mut(|s| s.mark_superseded(pred_id, &succ_id));
+        // Both ids mark the successor: the note's id (kept resolvable for
+        // clients that still address it) and the id it resolved to.
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.mark_superseded(pred_id, &succ_id);
+            if effective != pred_id {
+                s.mark_superseded(&effective, &succ_id);
+            }
+        });
         self.superseded
             .lock()
             .insert(pred_id.to_string(), succ_id.clone());
+        self.superseded
+            .lock()
+            .insert(effective.clone(), succ_id.clone());
         // The bound directory becomes (or joins) a workspace row and the
         // successor leads its account (dsh workspace parity for binds).
         crate::workspace_serve::create_and_attach(cwd, &succ_id);
@@ -3592,21 +3679,33 @@ impl AgentServerInner {
         // lands on the alias (review #805 [issue] 5).
         self.end_streams_for_session(pred_id, StreamEndReason::Resync);
         // Directed hand-off (§D.5 owner-set control, never a broadcast):
-        // note face + host mirror to the predecessor's owners (review #805
-        // [issue] 3).
-        self.route_note(
-            pred_id,
-            manox_protocol::server::ServerNote::SessionDisposed {
-                session_id: pred_id.to_string(),
-            },
-        );
-        self.route_host(
-            pred_id,
-            manox_protocol::stream::HostEvent::SessionDisposed {
-                session_id: pred_id.to_string(),
-                successor: Some(succ_id.clone()),
-            },
-        );
+        // note face + host mirror to the assembled audience, one send per
+        // connection (review #805 [issue] 3).
+        let note = manox_protocol::server::ServerNote::SessionDisposed {
+            session_id: pred_id.to_string(),
+        };
+        let host = manox_protocol::stream::HostEvent::SessionDisposed {
+            session_id: pred_id.to_string(),
+            successor: Some(succ_id.clone()),
+        };
+        for conn in &audience_conns {
+            conn.send_to_client(FromServer::Notification { note: note.clone() });
+            conn.send_to_client(FromServer::Host { host: host.clone() });
+        }
+        // The hand-off was announced; the audience is already inherited by
+        // the successor, so both predecessor ids drop their ownership here.
+        // Without this an entry could never satisfy the reap predicate while
+        // the client stays connected (plan §3.1 B-iv).
+        for owner in &audience {
+            self.remove_owner(owner, pred_id);
+            if effective != pred_id {
+                self.remove_owner(owner, &effective);
+            }
+        }
+        self.reap_superseded_if_idle(pred_id);
+        if effective != pred_id {
+            self.reap_superseded_if_idle(&effective);
+        }
         // No explicit owner release here: `OwnerLease` covers the bind
         // owner on every exit path, and the note-open owner belongs to
         // `set_cwd`'s own scope (review r3 [problem] 2, [sugg] 3).

@@ -185,6 +185,18 @@ impl ThreadsDatabase {
     /// `updated_at` advance to now (real user activity). When `touch` is false,
     /// only `updated_at` advances; `interacted_at` is preserved (e.g. saving
     /// state on thread switch without implying the user interacted with it).
+    /// Delete one thread's durable rows (`threads` + `thread_data`). Used by
+    /// the superseded-predecessor purge: such an id's only artifacts are its
+    /// sidecar marker and, at most, rows a create-time upsert left behind.
+    pub fn delete_thread(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM thread_data WHERE thread_id = ?1", params![id])
+            .context("delete thread_data")?;
+        conn.execute("DELETE FROM threads WHERE id = ?1", params![id])
+            .context("delete thread")?;
+        Ok(())
+    }
+
     pub fn upsert(&self, rec: &ThreadRecord, touch: bool) -> Result<()> {
         let data = ThreadData {
             messages: rec.messages.clone(),

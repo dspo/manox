@@ -1923,6 +1923,72 @@ fn projection_changes_fan_out_to_every_stream_and_late_joiners() {
     manox_agent::thread_store::drop_global_for_test();
 }
 
+/// Plan §3.1 B-iv: a superseded predecessor has no live purpose once its
+/// last consumer is gone — its entry, pump and projection cell reap instead
+/// of staying resident for the process lifetime.
+#[test]
+fn superseded_predecessor_reaps_when_its_last_stream_closes() {
+    let _g = lock_globals();
+    hermetic_home();
+    init_globals();
+    let (server, client) = harness(vec![]);
+    create(&server, &client, "s1");
+    let (engine, events) = FakeEngine::new();
+    server.set_session_engine_for_test("s1", engine.clone(), events);
+    open_follow(&client, "st-pred", "s1");
+    let _ = snapshot_for(&client, "st-pred");
+    client.send(FromClient::Notification {
+        note: ClientNote::SetCwd {
+            session_id: "s1".into(),
+            cwd: "/one".into(),
+        },
+    });
+    let succ = loop {
+        match client.recv() {
+            FromServer::Host {
+                host:
+                    manox_protocol::stream::HostEvent::SessionDisposed {
+                        session_id,
+                        successor: Some(next),
+                    },
+            } if session_id == "s1" => break next,
+            _ => continue,
+        }
+    };
+    // The audience moved to the successor (a swapped `add_owner` argument
+    // order regression would leave it owned by nobody).
+    assert_eq!(
+        server.session_owners_for_test(&succ),
+        vec!["test".to_string()],
+        "the successor inherits the predecessor's owner"
+    );
+    assert!(
+        server.session_owners_for_test("s1").is_empty(),
+        "the predecessor drops its ownership at the hand-off"
+    );
+    // The hand-off ended the predecessor's stream (Resync); its untrack is
+    // the reap edge.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let live = server.live_session_ids();
+        if !live.contains(&"s1".to_string()) {
+            assert!(
+                live.contains(&succ),
+                "the successor must stay live: {live:?}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the superseded predecessor never reaped: {live:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(client);
+    drop(server);
+    manox_agent::thread_store::drop_global_for_test();
+}
+
 /// R3 [severe] 1 regression: once the session-shared outbox has overflowed,
 /// a NEWLY opened stream must keep streaming. Its cursor is armed with the
 /// snapshot's projection watermark (the fold's own position), so it is never
