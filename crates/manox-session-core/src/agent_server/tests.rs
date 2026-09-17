@@ -32,6 +32,11 @@ struct FakeEngine {
     notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
     auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
     pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
+    /// The question seam's own registry — deliberately separate from
+    /// `pending_auth` so a gateway consumer that reads only one of the two
+    /// is caught by these tests (the regression guard for the production
+    /// two-gate split).
+    pending_questions: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
     /// GW9 probe: every `set_plan_review_pending` the facade forwards,
     /// in order. The trait default is a silent no-op, so without this
     /// recorder the kernel-side pending-review flag is unobservable in
@@ -81,6 +86,7 @@ impl FakeEngine {
                 notices,
                 auth_responses: StdMutex::new(Vec::new()),
                 pending_auth: StdMutex::new(Vec::new()),
+                pending_questions: StdMutex::new(Vec::new()),
                 plan_review_flags: StdMutex::new(Vec::new()),
                 plan_approvals: StdMutex::new(Vec::new()),
                 journal_tx: tokio::sync::broadcast::channel(64).0,
@@ -272,6 +278,10 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
                 manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired
             }
         };
+        self.pending_questions
+            .lock()
+            .unwrap()
+            .retain(|(pending_id, _)| pending_id != id);
         self.auth_responses
             .lock()
             .unwrap()
@@ -279,7 +289,7 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
     }
 
     fn pending_question_entries(&self) -> Vec<(String, manox_agent::permission::PendingAuthMeta)> {
-        self.pending_auth.lock().unwrap().clone()
+        self.pending_questions.lock().unwrap().clone()
     }
 }
 
@@ -1978,7 +1988,7 @@ fn legacy_answer(text: &str) -> manox_agent::permission::AskAnswer {
 /// parked interaction until it answers, and the replay settle-truth reads
 /// that same set.
 fn seed_pending_ask(engine: &std::sync::Arc<FakeEngine>, auth_id: &str) {
-    engine.pending_auth.lock().unwrap().push((
+    engine.pending_questions.lock().unwrap().push((
         auth_id.into(),
         manox_agent::permission::PendingAuthMeta {
             tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),

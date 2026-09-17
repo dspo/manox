@@ -3972,15 +3972,8 @@ async fn run_actor(
                 refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
                 // W4 boundary: a pending plan-mode selection commits at the
                 // turn's start, before any request assembly or the
-                // instruction injection can observe the old state. A request
-                // that already matches the committed state converges silently.
-                if let Some(enabled) = state.plan.requested() {
-                    if enabled != state.plan.enabled() {
-                        apply_plan_mode(&session, &sessions_dir, &state, &notice_tx, enabled).await;
-                    } else {
-                        state.plan.set_requested(None);
-                    }
-                }
+                // instruction injection can observe the old state.
+                commit_requested_plan_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the
@@ -4177,6 +4170,13 @@ async fn run_actor(
                     // retries the append (dsh: an append failure cannot
                     // block the turn).
                     tracing::warn!(error = %err, "failed to journal the plan-mode request");
+                }
+                // No run is in flight: there is no boundary to wait for, so
+                // the selection commits immediately (dsh parity — its `set()`
+                // appends between turns). A running turn keeps the request
+                // pending for its next start.
+                if !state.running.load(Ordering::Relaxed) {
+                    commit_requested_plan_mode(&session, &sessions_dir, &state, &notice_tx).await;
                 }
             }
             SessionCmd::SetPlanReviewPending(pending) => {
@@ -5090,6 +5090,26 @@ fn render_plan_instructions() -> Option<String> {
             tracing::warn!(error = %err, "failed to render plan-mode instructions");
             None
         }
+    }
+}
+
+/// Commit any outstanding plan-mode selection: the turn-boundary half of the
+/// `plan_mode_request` / `plan_mode_change` pair. A selection already equal to
+/// the committed state converges silently (it was a no-op intent), so the log
+/// carries no redundant transition.
+async fn commit_requested_plan_mode(
+    session: &AgentSession,
+    sessions_dir: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let Some(enabled) = state.plan.requested() else {
+        return;
+    };
+    if enabled != state.plan.enabled() {
+        apply_plan_mode(session, sessions_dir, state, notice_tx, enabled).await;
+    } else {
+        state.plan.set_requested(None);
     }
 }
 
@@ -7162,6 +7182,63 @@ mod tests {
                 JournalFeed::Lagged(n) => panic!("unexpected lag {n}"),
             }
         }
+    }
+
+    /// F7 guard: the ask path journals as `question`, everything else as
+    /// `approval`. The vocabulary 1:1 tests only prove the entry exists; this
+    /// pins the split itself.
+    #[test]
+    fn ask_authorizations_journal_as_questions_not_approvals() {
+        let kind_of = |tool_name: &str| {
+            durable_journal_payload(&ThreadEvent::ToolCallAuthorization {
+                id: "auth-1".into(),
+                tool_name: tool_name.into(),
+                summary: "card".into(),
+                input: serde_json::json!({}),
+            })
+            .expect("authorizations are journaled")
+            .0
+        };
+        assert_eq!(kind_of(crate::tools::ASK_USER_QUESTION), "question");
+        assert_eq!(kind_of("Bash"), "approval");
+    }
+
+    /// F6 guard: the turn-boundary commit applies a pending selection, consumes
+    /// it, announces the switch, and stays silent for a converged selection.
+    #[tokio::test]
+    async fn boundary_commit_applies_pending_plan_mode_and_converges_silently() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let session = steer_test_session(&dir).await;
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        let state = test_engine_state();
+
+        state.plan.set_requested(Some(true));
+        assert!(
+            !state.plan.enabled(),
+            "the selection waits for the boundary"
+        );
+        commit_requested_plan_mode(&session, dir.path(), &state, &notice_tx).await;
+        assert!(state.plan.enabled(), "the boundary applies the selection");
+        assert_eq!(state.plan.requested(), None, "and consumes it");
+        let mut announced = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Event(event) = notice
+                && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
+            {
+                announced = true;
+            }
+        }
+        assert!(announced, "the commit announces the mode change");
+
+        // A selection equal to the committed state is a no-op intent.
+        state.plan.set_requested(Some(true));
+        commit_requested_plan_mode(&session, dir.path(), &state, &notice_tx).await;
+        assert_eq!(state.plan.requested(), None);
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "a converged selection must not announce anything"
+        );
     }
 
     fn test_engine_state() -> Arc<EngineState> {

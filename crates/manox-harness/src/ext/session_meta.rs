@@ -33,10 +33,6 @@ pub struct SessionMeta {
     /// and falls back to its bounded default on unknown values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
-    /// Plan mode active for this session. Absent = off. Restored on thread
-    /// load so a resumed session keeps its read-only planning semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_mode: Option<bool>,
     /// The reasoning effort the session runs at (`"high"` or `"max"`), as
     /// chosen in the model dropdown. Absent = the harness default (High).
     #[serde(default, skip_serializing_if = "Option::is_none")]
