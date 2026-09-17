@@ -393,6 +393,10 @@ pub fn init() {
         pending_events: Vec::new(),
         pending_meta_writes: Vec::new(),
     });
+    let purged = handle.with_mut(|s| s.purge_superseded_predecessors());
+    if purged > 0 {
+        tracing::info!(purged, "purged superseded predecessor sidecars");
+    }
     handle.refresh();
     *GLOBAL.lock().unwrap() = Some(handle);
 }
@@ -1109,6 +1113,53 @@ impl ThreadStore {
         let raw = std::fs::read_to_string(meta_path).ok()?;
         let meta: manox_harness::session_meta::SessionMeta = serde_json::from_str(&raw).ok()?;
         meta.project
+    }
+
+    /// Prune the durable rows of superseded predecessors that never
+    /// materialized (plan §3.1 B-iv): a fresh process has no live entry for
+    /// them, and any rows a create-time upsert left behind are dead weight.
+    /// The SIDECAR MARKER STAYS — the redirect must keep resolving an id a
+    /// client (or another host) still holds across a restart (review #809
+    /// [sugg] 7); a materialized predecessor keeps its journal as well.
+    pub fn purge_superseded_predecessors(&mut self) -> usize {
+        let Ok(entries) = std::fs::read_dir(&self.sessions_dir) else {
+            return 0;
+        };
+        let mut purged = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let Some(id) = name.strip_suffix(".meta.json") else {
+                continue;
+            };
+            if self.sessions_dir.join(format!("{id}.jsonl")).exists() {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(meta) = serde_json::from_str::<manox_harness::session_meta::SessionMeta>(&raw)
+            else {
+                continue;
+            };
+            if meta.superseded_by.is_none() {
+                continue;
+            }
+            self.session_paths.remove(id);
+            match self.db.delete_thread(id) {
+                Ok(()) => purged += 1,
+                Err(error) => {
+                    tracing::warn!(%error, session = %id, "superseded db row purge failed");
+                }
+            }
+        }
+        purged
     }
 
     /// The successor a session was superseded by (summary mirror of the
@@ -1960,6 +2011,40 @@ mod tests {
         );
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    /// Plan §3.1 B-iv: the startup prune drops the durable rows of a
+    /// superseded predecessor that never materialized, and keeps its
+    /// sidecar marker (the redirect must survive a restart) as well as a
+    /// materialized predecessor's journal.
+    #[test]
+    fn purge_superseded_predecessors_removes_only_unmaterialized_sidecars() {
+        let (db, db_path) = temp_db();
+        let dir = std::env::temp_dir().join(format!("pi-store-purge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = store_handle(db);
+        handle.with_mut(|s| s.sessions_dir = dir.clone());
+        std::fs::write(dir.join("pred.meta.json"), "{\"superseded_by\":\"succ\"}").unwrap();
+        std::fs::write(dir.join("kept.meta.json"), "{\"superseded_by\":\"succ2\"}").unwrap();
+        let kept_journal = write_session_fixture(&dir, "kept", "hello");
+        std::fs::write(dir.join("plain.meta.json"), "{\"project\":\"/proj\"}").unwrap();
+
+        let purged = handle.with_mut(|s| s.purge_superseded_predecessors());
+        assert_eq!(purged, 1, "only the unmaterialized predecessor prunes");
+        assert!(
+            dir.join("pred.meta.json").exists(),
+            "the redirect marker SURVIVES: an id a client still holds must keep              resolving after a restart"
+        );
+        assert!(
+            dir.join("kept.meta.json").exists() && kept_journal.exists(),
+            "a materialized predecessor keeps its sidecar and journal"
+        );
+        assert!(
+            dir.join("plain.meta.json").exists(),
+            "a sidecar without the marker is never touched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     fn first_summary_of(store: &StoreHandle, id: &str) -> String {

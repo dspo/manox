@@ -333,6 +333,12 @@ pub struct Thread {
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
     pinned: bool,
+    /// This entity is a redirect stub for a bind successor: it shares the
+    /// successor's engine `Arc` without owning it, so `Drop` must not shut
+    /// that engine down (review #809 [sugg] 6 — the real engine's
+    /// `shutdown` asks the live actor to close, which would kill the
+    /// successor).
+    redirect_stub: bool,
     archived: bool,
     running: bool,
     restored: bool,
@@ -766,6 +772,7 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
+            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -866,6 +873,7 @@ impl Thread {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
+            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -1809,6 +1817,7 @@ impl Thread {
             reasoning_effort,
             pinned: false,
             archived: false,
+            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
@@ -2025,6 +2034,9 @@ impl Thread {
         self.cwd = dir.clone();
         self.project = Some(dir);
         self.engine = Some(engine);
+        // The stub shares the successor's engine without owning it: `Drop`
+        // must not ask that engine to shut down (review #809 [sugg] 6).
+        self.redirect_stub = true;
     }
 
     /// The engine behind this thread (the successor-stub hand-off shares it
@@ -2611,7 +2623,12 @@ impl Drop for Thread {
     fn drop(&mut self) {
         // The engine owns the actor; ask it to close gracefully. If the
         // channel is already gone the actor exited on its own. A landing
-        // thread has no engine to shut down.
+        // thread has no engine to shut down, and a redirect stub shares the
+        // successor's engine — shutting it down here would kill a live
+        // session (review #809 [sugg] 6).
+        if self.redirect_stub {
+            return;
+        }
         if let Some(engine) = &self.engine {
             engine.shutdown();
         }
@@ -2754,6 +2771,7 @@ pub(crate) mod tests {
             reasoning_effort: ReasoningEffort::default(),
             pinned: false,
             archived: false,
+            redirect_stub: false,
             running: false,
             restored: false,
             display: Vec::new(),
