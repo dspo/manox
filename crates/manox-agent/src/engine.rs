@@ -26,11 +26,12 @@ use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiMo
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
-use crate::approval::{ApprovalGate, ApprovalGatedTool, PiAskUserQuestionTool};
+use crate::approval::{ApprovalGate, ApprovalGatedTool};
 use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE, UiNoteRecord};
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
+use crate::questions::PiAskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
 
@@ -79,7 +80,10 @@ pub(crate) enum SessionCmd {
     /// Manual compaction (`/compact`), optionally steering the summary.
     Compact { custom_instructions: Option<String> },
     /// Toggle plan mode (persisted sidecar + hooks + instruction injection).
-    SetPlanMode { enabled: bool },
+    /// A user plan-mode selection: recorded as a `plan_mode_request`
+    /// journal entry and held pending until the next turn boundary commits it
+    /// through `SetPlanMode`.
+    RequestPlanMode { enabled: bool },
     /// Persist whether a plan review card is pending (restore re-surfaces it).
     SetPlanReviewPending(bool),
     /// Persist the latest `UpdatePlan` snapshot (compaction survival: the
@@ -283,6 +287,9 @@ struct EngineState {
     /// The host permission gate wrapping every mutating tool (mode +
     /// pending interaction round trips).
     gate: Arc<ApprovalGate>,
+    /// The user-questions seam's pending registry (the ask tool parks here;
+    /// the gateway settles here through `Thread::respond_question`).
+    question_gate: Arc<crate::questions::UserQuestionGate>,
     /// Shared goal state with the thread facade; the goal tools read/write
     /// through it, `GoalChanged` rides the notice channel. `None` when the
     /// threads db is unavailable (goal features degrade off).
@@ -521,7 +528,11 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
             summary,
             input,
         } => (
-            "approval".into(),
+            if tool_name == crate::tools::ASK_USER_QUESTION {
+                "question".to_string()
+            } else {
+                "approval".to_string()
+            },
             json!({
                 "kind": "request",
                 "authId": id,
@@ -921,6 +932,10 @@ pub fn spawn_engine(
     // change — the gate journals it as an `approval` decision entry through
     // the actor queue (the request entry rides the notice tap).
     gate.set_journal_sink(cmd_tx.clone());
+    // The question seam owns its own pending registry and journals its verdicts
+    // as `question` decision entries through the same actor queue.
+    let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
+    question_gate.set_journal_sink(cmd_tx.clone());
     // The thread-scoped journal feed; session relays publish into it as
     // sessions come and go (capacity matches the storage broadcast, L5).
     let (journal_feed_handle, _) =
@@ -947,6 +962,7 @@ pub fn spawn_engine(
         current_appender: Mutex::new(None),
         current_resources: Mutex::new(None),
         gate,
+        question_gate,
         plan: crate::plan_mode::PlanSessionState::new(),
         goal_bridge,
         goal_continuation_reserved: AtomicBool::new(false),
@@ -1229,7 +1245,7 @@ impl ThreadEngine for PiEngine {
     }
 
     fn set_plan_mode(&self, enabled: bool) {
-        let _ = self.cmd_tx.send(SessionCmd::SetPlanMode { enabled });
+        let _ = self.cmd_tx.send(SessionCmd::RequestPlanMode { enabled });
     }
 
     fn set_browser_suite(&self, suite: BrowserSuite, enable: bool) {
@@ -1280,6 +1296,14 @@ impl ThreadEngine for PiEngine {
 
     fn pending_auth_entries(&self) -> Vec<(String, PendingAuthMeta)> {
         self.state.gate.pending_entries()
+    }
+
+    fn respond_question(&self, id: &str, outcome: crate::questions::AskOutcome) {
+        self.state.question_gate.respond(id, outcome);
+    }
+
+    fn pending_question_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        self.state.question_gate.pending_entries()
     }
 
     fn set_thinking_level(&self, level: Option<String>) {
@@ -1594,6 +1618,7 @@ fn build_tools(
     model: Option<&PiModel>,
     session_id: &str,
     gate: &Arc<ApprovalGate>,
+    question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
@@ -1766,7 +1791,7 @@ fn build_tools(
         })
         .collect();
     tools.push(Arc::new(
-        PiAskUserQuestionTool::new(Arc::clone(gate)).with_plan_state(Arc::clone(plan)),
+        PiAskUserQuestionTool::new(Arc::clone(question_gate)).with_plan_state(Arc::clone(plan)),
     ));
     // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
     // the verdict request itself, not a side effect.
@@ -2538,6 +2563,13 @@ where
     F: std::future::Future<Output = anyhow::Result<Vec<AgentMessage>>>,
 {
     tokio::pin!(run);
+    // W4 boundary: a pending plan-mode selection commits at the start of
+    // whatever run comes next — a user prompt, a drained steer, a goal round
+    // or a monitor wake-up — so no run can execute under the old mode while
+    // the projection already shows the selection pending. It lands before the
+    // run future is polled, hence before request assembly or the injected
+    // instructions can observe the old state.
+    commit_requested_plan_mode(session_path, sessions_dir, state, notice_tx).await;
     // Live journal appends run on a dedicated serializer task, never inline
     // in this select. The `run` branch below shares THIS task, and its
     // persistence middleware holds the session's append lock across file-I/O
@@ -2722,6 +2754,24 @@ where
                     // PageHistory — the Q face AND the follow streams' gap
                     // repair — for the entire duration of a running turn.
                     reply_journal_snapshot(appender, reply).await;
+                }
+                Some(SessionCmd::RequestPlanMode { enabled }) => {
+                    // Mid-run selection: record the intent and journal it
+                    // LIVE (the serializer path — never an inline session
+                    // append, see the AppendJournal arm's deadlock note).
+                    // The commit stays on the next turn boundary, which is
+                    // what makes `plan_mode_pending` observable and the
+                    // selection revocable before it takes effect. The request
+                    // row is best-effort here: a permanent serializer failure
+                    // parks a loss record and drops the row while the
+                    // selection still commits at the boundary (the idle arm
+                    // appends synchronously and therefore drops the selection
+                    // instead of committing without its request).
+                    state.plan.set_requested(Some(enabled));
+                    let _ = live_row_tx.send((
+                        "plan_mode_request".into(),
+                        serde_json::json!({ "enabled": enabled }),
+                    ));
                 }
                 Some(SessionCmd::SetBrowserSuite { suite, enable }) => {
                     // The run owns the session; park the toggle so the idle
@@ -3326,6 +3376,7 @@ fn session_builder(
     runtime: &ModelRuntime,
     model: Option<&PiModel>,
     gate: &Arc<ApprovalGate>,
+    question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
     goal_bridge: Option<&Arc<crate::goal_tools::GoalBridge>>,
@@ -3344,6 +3395,7 @@ fn session_builder(
         model,
         thread_id,
         gate,
+        question_gate,
         plan,
         notice_tx,
         goal_bridge,
@@ -3484,6 +3536,20 @@ fn attach_plugin_hooks(session: &mut AgentSession, cwd: &Path) {
     );
 }
 
+/// Register the prefix-cache stability gate on a session: it observes every
+/// provider request payload of this thread run and publishes
+/// `ThreadEvent::PrefixStability` / `ThreadEvent::CacheInvalidation` on the
+/// actor's notice channel. Observation is strictly read-only — the handler
+/// returns its context untouched, so the model-visible bytes are unchanged.
+/// One gate is one run's baseline: it is per-session state by construction.
+fn attach_prefix_gate(
+    session: &mut AgentSession,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    thread_id: &str,
+) {
+    crate::prefix_gate::attach_prefix_gate(session, notice_tx, thread_id);
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -3590,6 +3656,7 @@ async fn run_actor(
             &runtime,
             None,
             &state.gate,
+            &state.question_gate,
             &state.plan,
             &notice_tx,
             state.goal_bridge.as_ref(),
@@ -3609,6 +3676,7 @@ async fn run_actor(
                 );
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_plugin_hooks(&mut s, &tool_cwd);
+                attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                 adopt_session_model(&s, &mut pi_model, &state);
                 restored = true;
                 // The restored file is the thread's active session.
@@ -3629,6 +3697,7 @@ async fn run_actor(
                 &runtime,
                 Some(&pi_model),
                 &state.gate,
+                &state.question_gate,
                 &state.plan,
                 &notice_tx,
                 state.goal_bridge.as_ref(),
@@ -3651,6 +3720,7 @@ async fn run_actor(
                     );
                     attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_plugin_hooks(&mut s, &cwd);
+                    attach_prefix_gate(&mut s, &notice_tx, &thread_id);
                     // A fresh session is pinned to the facade thread's id.
                     crate::thread_registry::set_active(&thread_id, &thread_id).await;
                     s
@@ -4095,32 +4165,51 @@ async fn run_actor(
             SessionCmd::SetBrowserSuite { suite, enable } => {
                 apply_browser_suite(&mut session, suite, enable).await;
             }
-            SessionCmd::SetPlanMode { enabled } => {
-                let plan_file = enabled.then(|| state.plan.plan_file()).flatten();
-                state.plan.set(enabled, plan_file);
-                state
-                    .plan
-                    .set_active_instructions(enabled.then(render_plan_instructions).flatten());
-                if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+            SessionCmd::RequestPlanMode { enabled } => {
+                state.plan.set_requested(Some(enabled));
+                // The selection is a logged fact from the moment it is made;
+                // the committed state still only moves at the boundary.
+                let appender = session.journal_appender();
+                if let Err(err) = append_typed_resilient(
+                    &appender,
+                    "plan_mode_request",
+                    serde_json::json!({ "enabled": enabled }),
+                )
+                .await
                 {
-                    tracing::warn!(error = %err, "failed to persist plan mode");
+                    // K4 discipline (same as every other idle append): record
+                    // the loss, park it for the settle/idle drains and tell
+                    // the facade — the actor stays alive. The mode does NOT
+                    // move here, so the log never carries a `plan_mode_change`
+                    // without its request.
+                    if let Some(row) =
+                        record_journal_loss(&appender, "plan_mode_request", &err).await
+                    {
+                        state.pending_journal.lock().unwrap().push(row);
+                    }
+                    // The selection goes with the dropped row: committing it
+                    // later would put a `plan_mode_change` in the log with no
+                    // request behind it. The user got the Error notice, so
+                    // re-selecting the mode is the retry.
+                    state.plan.set_requested(None);
+                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
+                        anyhow::anyhow!(
+                            "journal append permanently failed for `plan_mode_request`: {err:#}; the selection was dropped — switch the mode again to retry"
+                        ),
+                    ))));
+                    continue;
                 }
-                let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                    ThreadEvent::PlanModeChanged { enabled },
-                )));
+                // Idle threads have no boundary to wait for, so the selection
+                // commits immediately (dsh parity — its `set()` appends
+                // between turns). Mid-run selections never reach this arm:
+                // `drive_run` records them and leaves the commit to the
+                // Prompt boundary.
+                if !state.running.load(Ordering::Relaxed) {
+                    commit_requested_plan_mode(session.path(), &sessions_dir, &state, &notice_tx)
+                        .await;
+                }
             }
             SessionCmd::SetPlanReviewPending(pending) => {
-                if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
-                {
-                    tracing::warn!(error = %err, "failed to persist proposed plan source");
-                }
-                if let Err(err) =
-                    write_plan_review_pending_sidecar(&sessions_dir, session.path(), pending).await
-                {
-                    tracing::warn!(error = %err, "failed to persist plan review pending flag");
-                }
                 // C4 vocabulary augmentation: the review edge rides the
                 // journal (the pending projection's fold source — replay
                 // and the P face; the sidecar flag demotes to the
@@ -4151,7 +4240,7 @@ async fn run_actor(
                 if snapshot.is_none() || completed {
                     state.plan.set_plan_file(None);
                     if let Err(err) =
-                        write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                        write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                     {
                         tracing::warn!(error = %err, "failed to retire completed plan title source");
                     }
@@ -4196,7 +4285,7 @@ async fn run_actor(
             SessionCmd::StartPlanExecution(plan_file) => {
                 state.plan.set(false, Some(plan_file));
                 if let Err(error) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                    write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                 {
                     tracing::warn!(%error, "failed to persist plan execution title source");
                 }
@@ -4249,7 +4338,7 @@ async fn run_actor(
                 title_scheduler.start_execution(crate::title::TitleWakeReason::PlanStarted);
                 state.plan.set_active_instructions(None);
                 if let Err(err) =
-                    write_plan_sidecar(&sessions_dir, session.path(), &state.plan).await
+                    write_plan_file_sidecar(&sessions_dir, session.path(), &state.plan).await
                 {
                     tracing::warn!(error = %err, "failed to persist plan-mode exit");
                 }
@@ -4524,6 +4613,7 @@ async fn rebuild_session(
         runtime,
         None,
         gate,
+        &state.question_gate,
         plan,
         notice_tx,
         goal_bridge,
@@ -4547,6 +4637,7 @@ async fn rebuild_session(
             // session's PreToolUse/PostToolUse fire-and-forget shell-outs
             // never attach (write confinement is now in ApprovalGatedTool).
             attach_plugin_hooks(&mut s, &cwd);
+            attach_prefix_gate(&mut s, notice_tx, thread_id);
             adopt_session_model(&s, pi_model, state);
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.
@@ -4937,28 +5028,60 @@ fn render_plan_instructions() -> Option<String> {
     }
 }
 
-/// Persist plan mode + last plan file from the shared state into the session
-/// sidecar (`plan_mode` stored only while on; `plan_file` kept across exits
-/// for the execution handoff).
-async fn write_plan_sidecar(
+/// Commit any outstanding plan-mode selection: the turn-boundary half of the
+/// `plan_mode_request` / `plan_mode_change` pair. A selection already equal to
+/// the committed state converges silently (it was a no-op intent), so the log
+/// carries no redundant transition.
+async fn commit_requested_plan_mode(
+    session_path: &Path,
+    sessions_dir: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let Some(enabled) = state.plan.requested() else {
+        return;
+    };
+    if enabled != state.plan.enabled() {
+        apply_plan_mode(session_path, sessions_dir, state, notice_tx, enabled).await;
+    } else {
+        state.plan.set_requested(None);
+    }
+}
+
+/// Apply a committed plan-mode switch: the in-memory state, the rendered
+/// instructions, the sidecar cache and the `PlanModeChanged` notice (whose
+/// tap emission journals the `plan_mode_change` entry, L3).
+async fn apply_plan_mode(
+    session_path: &Path,
+    sessions_dir: &Path,
+    state: &Arc<EngineState>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    enabled: bool,
+) {
+    let plan_file = enabled.then(|| state.plan.plan_file()).flatten();
+    state.plan.set(enabled, plan_file);
+    state
+        .plan
+        .set_active_instructions(enabled.then(render_plan_instructions).flatten());
+    if let Err(err) = write_plan_file_sidecar(sessions_dir, session_path, &state.plan).await {
+        tracing::warn!(error = %err, "failed to persist plan mode");
+    }
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::PlanModeChanged { enabled },
+    )));
+}
+
+/// Persist the last plan file from the shared state into the session sidecar
+/// (kept across exits for the execution handoff). Plan mode itself is
+/// journal-only: the `plan_mode_change` / `plan_mode_request` entries are the
+/// single source, so no mode mirror lives here.
+async fn write_plan_file_sidecar(
     sessions_dir: &Path,
     session_path: &Path,
     plan: &crate::plan_mode::PlanSessionState,
 ) -> Result<(), anyhow::Error> {
     manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.plan_mode = plan.enabled().then_some(true);
         meta.plan_file = plan.plan_file();
-    })
-    .await
-}
-
-async fn write_plan_review_pending_sidecar(
-    sessions_dir: &Path,
-    session_path: &Path,
-    pending: bool,
-) -> Result<(), anyhow::Error> {
-    manox_harness::session_meta::update(sessions_dir, session_path, |meta| {
-        meta.plan_review_pending = pending.then_some(true);
     })
     .await
 }
@@ -5133,13 +5256,9 @@ fn merge_restored_state(
     RestoredThreadState {
         permission_mode,
         reasoning_effort,
-        plan_mode: replayed
-            .plan_mode
-            .unwrap_or(meta.plan_mode.unwrap_or(false)),
+        plan_mode: replayed.plan_mode.unwrap_or(false),
         plan_file: meta.plan_file.clone(),
-        plan_review_pending: replayed
-            .plan_review_pending
-            .unwrap_or_else(|| meta.plan_review_pending.unwrap_or(false)),
+        plan_review_pending: replayed.plan_review_pending.unwrap_or(false),
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
             .title
@@ -5179,9 +5298,6 @@ async fn rebuild_restored_state(
     let repair_effort = replayed
         .reasoning_effort
         .filter(|effort| meta.reasoning_effort.as_deref() != Some(effort.wire_value()));
-    let repair_plan_mode = replayed
-        .plan_mode
-        .filter(|enabled| meta.plan_mode.unwrap_or(false) != *enabled);
     let repair_snapshot =
         journal_plan_snapshot(&replayed).filter(|value| meta.plan_snapshot.as_ref() != Some(value));
     let repair_title = replayed
@@ -5213,7 +5329,6 @@ async fn rebuild_restored_state(
     };
     if repair_mode.is_some()
         || repair_effort.is_some()
-        || repair_plan_mode.is_some()
         || repair_snapshot.is_some()
         || repair_flags.is_some()
         || repair_project.is_some()
@@ -5226,9 +5341,6 @@ async fn rebuild_restored_state(
                 }
                 if let Some(effort) = repair_effort {
                     meta.reasoning_effort = Some(effort.wire_value().to_string());
-                }
-                if let Some(enabled) = repair_plan_mode {
-                    meta.plan_mode = enabled.then_some(true);
                 }
                 if let Some(snapshot) = repair_snapshot {
                     meta.plan_snapshot = Some(snapshot);
@@ -7008,11 +7120,72 @@ mod tests {
         }
     }
 
+    /// F7 guard: the ask path journals as `question`, everything else as
+    /// `approval`. The vocabulary 1:1 tests only prove the entry exists; this
+    /// pins the split itself.
+    #[test]
+    fn ask_authorizations_journal_as_questions_not_approvals() {
+        let kind_of = |tool_name: &str| {
+            durable_journal_payload(&ThreadEvent::ToolCallAuthorization {
+                id: "auth-1".into(),
+                tool_name: tool_name.into(),
+                summary: "card".into(),
+                input: serde_json::json!({}),
+            })
+            .expect("authorizations are journaled")
+            .0
+        };
+        assert_eq!(kind_of(crate::tools::ASK_USER_QUESTION), "question");
+        assert_eq!(kind_of("Bash"), "approval");
+    }
+
+    /// F6 guard: the turn-boundary commit applies a pending selection, consumes
+    /// it, announces the switch, and stays silent for a converged selection.
+    #[tokio::test]
+    async fn boundary_commit_applies_pending_plan_mode_and_converges_silently() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let session = steer_test_session(&dir).await;
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
+        let state = test_engine_state();
+
+        state.plan.set_requested(Some(true));
+        assert!(
+            !state.plan.enabled(),
+            "the selection waits for the boundary"
+        );
+        commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
+        assert!(state.plan.enabled(), "the boundary applies the selection");
+        assert_eq!(state.plan.requested(), None, "and consumes it");
+        let mut announced = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Event(event) = notice
+                && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
+            {
+                announced = true;
+            }
+        }
+        assert!(announced, "the commit announces the mode change");
+
+        // A selection equal to the committed state is a no-op intent.
+        state.plan.set_requested(Some(true));
+        commit_requested_plan_mode(session.path(), dir.path(), &state, &notice_tx).await;
+        assert_eq!(state.plan.requested(), None);
+        assert!(
+            notice_rx.try_recv().is_err(),
+            "a converged selection must not announce anything"
+        );
+    }
+
     fn test_engine_state() -> Arc<EngineState> {
         let cwd = std::env::temp_dir();
         let (notice_tx, _notice_rx) = mpsc::unbounded_channel();
         let model_slot = Arc::new(Mutex::new(None));
-        let gate = Arc::new(ApprovalGate::new(notice_tx, Arc::clone(&model_slot)));
+        let gate = Arc::new(ApprovalGate::new(
+            notice_tx.clone(),
+            Arc::clone(&model_slot),
+        ));
+        let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
         Arc::new(EngineState {
             running: AtomicBool::new(false),
             session_start_fired: AtomicBool::new(false),
@@ -7036,6 +7209,7 @@ mod tests {
             current_appender: Mutex::new(None),
             current_resources: Mutex::new(None),
             gate,
+            question_gate,
             plan: crate::plan_mode::PlanSessionState::new(),
             goal_bridge: None,
             goal_continuation_reserved: AtomicBool::new(false),
@@ -7221,6 +7395,79 @@ mod tests {
             thinking: manox_harness::types::ThinkingKind::None,
             metadata: Default::default(),
         }
+    }
+
+    /// H3 guard: the plan-mode boundary commit sits at the shared run start,
+    /// so a run that does not come through the actor's Prompt arm (a goal
+    /// round, a drained steer, a monitor wake-up — modelled here by calling
+    /// `drive_run` directly) still commits a pending selection before the run
+    /// future is polled. Reverting the commit to the Prompt arm alone makes
+    /// this test fail with `enabled() == false`.
+    #[tokio::test]
+    async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+            Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+        });
+        let mut session = create_agent_session()
+            .with_cwd(&cwd)
+            .with_session_dir(dir.path().join("sessions"))
+            .with_agent_dir(dir.path().join("agent"))
+            .with_model_runtime(ModelRuntime::new(resolver))
+            .with_model(test_model())
+            .with_system_prompt("You are a test assistant.")
+            .build()
+            .await
+            .unwrap();
+
+        let (_cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        let state = test_engine_state();
+        let live = Arc::new(Mutex::new(LiveTranscript::default()));
+        let mut run_steers = Vec::new();
+        let mut shutdown_after_run = false;
+        let mut pi_model = test_model();
+        let handle = session.handle();
+        let sessions_path = dir.path().join("sessions");
+        let active_session_path = session.path().clone();
+        let journal_appender = session.journal_appender();
+
+        // A selection is outstanding when the run starts.
+        state.plan.set_requested(Some(true));
+        assert!(!state.plan.enabled());
+
+        let run = drive_run(
+            session.prompt("first turn"),
+            &handle,
+            &mut cmd_rx,
+            &mut run_steers,
+            &mut shutdown_after_run,
+            live,
+            &state,
+            &notice_tx,
+            &mut pi_model,
+            &sessions_path,
+            &active_session_path,
+            &journal_appender,
+        );
+        let (_result, _aborted) = run.await;
+        assert!(
+            state.plan.enabled(),
+            "the run start must commit the pending selection"
+        );
+        assert_eq!(state.plan.requested(), None, "and consume it");
+        let mut announced = false;
+        while let Ok(notice) = notice_rx.try_recv() {
+            if let BackendNotice::Event(event) = notice
+                && matches!(*event, ThreadEvent::PlanModeChanged { enabled: true })
+            {
+                announced = true;
+            }
+        }
+        assert!(announced, "the commit announces the switch");
     }
 
     fn test_model() -> PiModel {
@@ -9745,7 +9992,8 @@ mod tests {
             Some("danger-full-access")
         );
         assert_eq!(repaired.reasoning_effort.as_deref(), Some("max"));
-        assert_eq!(repaired.plan_mode, Some(true));
+        // Plan state has no sidecar mirror anymore (W4): the journal is the
+        // single source, so there is nothing to repair or assert here.
 
         // Coverage guard: every supported kind is actually on the chain —
         // a silently skipped kind would make the round-trip assertions
@@ -9983,8 +10231,11 @@ mod tests {
     }
 
     /// K2 migration window: a legacy chain without decision-point entries
-    /// resolves entirely from the sidecar — the rebuild never overwrites
-    /// cached state with defaults.
+    /// resolves from the sidecar for the fields that still cache there — and
+    /// plan state no longer does: with the `plan_mode_change` /
+    /// `plan_mode_request` / `plan_review` entries as the single source, a
+    /// chain that never saw them restores plan mode OFF (the radical
+    /// no-compat-read stance; W4 sidecar retirement).
     #[tokio::test]
     async fn restored_state_falls_back_to_sidecar_for_legacy_chains() {
         let replayed = crate::replay::ReplayedThreadState::default();
@@ -9992,10 +10243,8 @@ mod tests {
             title: Some("sidecar title".into()),
             project: Some("/sidecar/project".into()),
             approval_mode: Some("read-only".into()),
-            plan_mode: Some(true),
             reasoning_effort: Some("max".into()),
             plan_file: Some("/plans/x-plan.md".into()),
-            plan_review_pending: Some(true),
             plan_snapshot: Some(serde_json::json!([{ "content": "step" }])),
             pinned: true,
             archived: true,
@@ -10005,10 +10254,10 @@ mod tests {
         assert_eq!(merged.title.as_deref(), Some("sidecar title"));
         assert_eq!(merged.project, Some(PathBuf::from("/sidecar/project")));
         assert_eq!(merged.permission_mode, PermissionMode::ReadOnly);
-        assert!(merged.plan_mode);
+        assert!(!merged.plan_mode, "plan state is journal-only now");
         assert_eq!(merged.reasoning_effort, ReasoningEffort::Max);
         assert_eq!(merged.plan_file.as_deref(), Some("/plans/x-plan.md"));
-        assert!(merged.plan_review_pending);
+        assert!(!merged.plan_review_pending);
         assert_eq!(
             merged.plan_snapshot,
             Some(serde_json::json!([{ "content": "step" }]))

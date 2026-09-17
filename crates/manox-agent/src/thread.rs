@@ -2083,6 +2083,23 @@ impl Thread {
             .unwrap_or_default()
     }
 
+    /// Deliver the user's answer for a pending question card
+    /// (`AskUserQuestion`). Unknown ids are ignored.
+    pub fn respond_question(&mut self, id: &str, outcome: crate::questions::AskOutcome) {
+        if let Some(engine) = &self.engine {
+            engine.respond_question(id, outcome);
+        }
+    }
+
+    /// Pending questions with their card metadata (the question seam's
+    /// own registry), so the workspace can re-surface a card after a switch.
+    pub fn pending_question_entries(&self) -> Vec<(String, crate::permission::PendingAuthMeta)> {
+        self.engine
+            .as_ref()
+            .map(|e| e.pending_question_entries())
+            .unwrap_or_default()
+    }
+
     pub fn set_pinned(&mut self, pinned: bool) {
         self.pinned = pinned;
     }

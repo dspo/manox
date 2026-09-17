@@ -211,6 +211,8 @@ pub enum JournalWireEvent {
     ReasoningEffortChange { effort: String },
     /// Plan mode toggled.
     PlanModeChange { enabled: bool },
+    /// A plan-mode selection awaiting the next turn boundary.
+    PlanModeRequest { enabled: bool },
     /// The plan document updated (kernel snapshot shape, wire-opaque).
     PlanUpdate { snapshot: serde_json::Value },
     /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
@@ -233,6 +235,16 @@ pub enum JournalWireEvent {
     /// Approval request / decision, dual-state (§C.2): the fold source of
     /// the `pending_auth` projection. `kind` is `"request"` | `"decision"`.
     Approval {
+        kind: String,
+        auth_id: String,
+        tool_name: Option<String>,
+        tool_call_id: Option<String>,
+        verdict: Option<String>,
+        reason: Option<String>,
+    },
+    /// User-question request / decision (the question seam): the same
+    /// dual-state fold as `Approval`, with its own vocabulary.
+    Question {
         kind: String,
         auth_id: String,
         tool_name: Option<String>,

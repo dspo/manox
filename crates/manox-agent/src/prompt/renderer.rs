@@ -611,4 +611,121 @@ mod tests {
             broken.replace("{{ arguments }}", "args")
         );
     }
+
+    /// W1 byte-freeze: the exact bytes plan mode puts in front of the model.
+    /// The active briefing is re-injected every turn, so any drift re-bills the
+    /// prompt; a later work package may only move these bytes by updating what
+    /// is pinned here.
+    #[test]
+    fn plan_mode_templates_bytes_are_frozen() {
+        // Active briefing: the embedded template is the frozen prose and the
+        // only dynamic seam is `plans_dir`, which must appear exactly four
+        // times and nowhere else. A renderer that adds, trims or rewrites bytes
+        // around the substitution fails here even though the prose itself is
+        // maintained in the `.tera.md`.
+        let active = crate::collaboration_mode::render_plan_mode_active(Language::En, "/p/plans")
+            .expect("plan-mode briefing renders");
+        assert_eq!(
+            active,
+            TPL_PLAN_MODE_ACTIVE_EN.replace("{{ plans_dir }}", "/p/plans"),
+            "the active briefing drifted from its template, or the placeholder vocabulary moved"
+        );
+        assert_eq!(
+            active.matches("/p/plans").count(),
+            4,
+            "exactly the four declared plan-dir references"
+        );
+        assert!(
+            active.starts_with("<critical>\nPlan mode is active."),
+            "opening bytes are frozen: {}",
+            &active[..40]
+        );
+        assert!(
+            active.ends_with(
+                "You MUST keep going until the plan is decision-complete.\n</critical>\n"
+            ),
+            "closing bytes (including the trailing newline) are frozen"
+        );
+
+        let approved =
+            crate::collaboration_mode::render_plan_mode_approved(Language::En, "/p/auth-plan.md")
+                .expect("approved briefing renders");
+        assert_eq!(
+            approved,
+            r##"The plan at `/p/auth-plan.md` has been approved by the user. Read the plan file, then implement it top to bottom exactly as written:
+
+- The plan is decision-complete — execute it, do NOT re-plan, re-design, or reopen settled choices.
+- If a step is ambiguous in a way the plan could not have anticipated, pick the smallest interpretation consistent with the plan's Context and Verification sections, and note the choice in your final summary.
+- Verify each load-bearing step as the plan's Verification section prescribes before reporting done.
+- Publish and track your execution progress with `UpdatePlan`: right after starting, publish the complete step list, then update it whenever progress changes (mark steps completed as you finish, keep at most one in_progress, all completed before you end). This drives the plan overview shown to the user.
+"##
+        );
+    }
+
+    /// W1 byte-freeze: one representative main system-prompt render with every
+    /// branch live (skills block, LSP line, project and worktree rows). This is
+    /// the head of the cached prefix of every request; the bytes are pinned
+    /// exactly, whitespace-control newlines included.
+    #[test]
+    fn main_system_prompt_bytes_are_frozen() {
+        let main = crate::prompt::MainSystemPromptData {
+            static_body: "STATIC",
+            skills: vec![crate::prompt::SkillSummaryPromptData {
+                name: "n".to_string(),
+                description: "d".to_string(),
+            }],
+            language: crate::prompt::LanguagePromptData {
+                language: "English",
+            },
+            runtime: crate::prompt::RuntimeIdentityPromptData {
+                cwd: "/c".to_string(),
+                project: Some("/p".to_string()),
+                active_worktree: Some(crate::prompt::WorktreePromptData {
+                    branch: "b".to_string(),
+                    path: "/w".to_string(),
+                }),
+                os: "macos",
+                shell: "zsh".to_string(),
+                python3: "3.12".to_string(),
+                node: "20".to_string(),
+                today: "2026-07-14".to_string(),
+                permission_mode: "danger-full-access",
+            },
+            lsp_ready_specs: "rust-analyzer".to_string(),
+        };
+        assert_eq!(
+            render(PromptTemplate::SystemMain, Language::En, &main).unwrap(),
+            r##"STATIC
+
+## Available skills (consult their full body via the `skill` tool on demand)
+- n: d
+
+
+## LSP ready
+rust-analyzer
+
+## Tool preferences
+Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+
+## Concurrency model
+Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns immediately and wakes the idle session on completion — never use `sleep` or poll loops to wait for a background task. `Monitor` streams events continuously for long-running observation (log tail, event stream). Use `BashOutput` to fetch full output and `TaskStop` to cancel.
+
+## Language
+
+Unless the user specifies otherwise, write your user-facing responses in English.
+
+## Runtime identity
+
+- Current working directory: `/c`
+- Project root: `/p`
+- Active worktree: `b` at `/w`
+- Operating system: macos
+- Default shell: zsh
+- python3: 3.12
+- node: 20
+- Today: 2026-07-14
+- Permission mode: danger-full-access. Modes: read-only (bash runs but writes are denied by the seatbelt; fs mutations refused), workspace-write (writes under the workspace, the manox home (~/.manox), and temp areas; bash confined to the workspace-write profile), danger-full-access (no sandbox; bash unsandboxed, fs mutations unfenced). A denied bash or fs write is reported as `[sandbox: file access denied under <mode> mode]`; when a wider mode would let it succeed, retry the exact same call once with `sandbox_permissions` (the narrowest wider mode that suffices) + a one-sentence `justification` — the approval prompt asks the user. Never escalate speculatively.
+"##
+        );
+    }
 }

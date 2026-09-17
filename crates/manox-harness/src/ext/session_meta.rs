@@ -33,22 +33,17 @@ pub struct SessionMeta {
     /// and falls back to its bounded default on unknown values.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<String>,
-    /// Plan mode active for this session. Absent = off. Restored on thread
-    /// load so a resumed session keeps its read-only planning semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_mode: Option<bool>,
     /// The reasoning effort the session runs at (`"high"` or `"max"`), as
     /// chosen in the model dropdown. Absent = the harness default (High).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Note: pre-W4 sidecars may still carry a `plan_mode` key. The field is
+    /// gone and `SessionMeta` ignores unknown keys, so the stale value is
+    /// inert — plan mode is journal-only now; never read it as state.
     /// Last plan file this session proposed (`<slug>-plan.md` under the
     /// global plans dir), kept for restore + execution handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_file: Option<String>,
-    /// A plan review card was pending (proposed, no verdict yet) when the
-    /// session last settled; a restarted session re-surfaces the card.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_review_pending: Option<bool>,
     /// Last execution plan the model published via `UpdatePlan`, persisted so
     /// it survives compaction (the transcript's tool calls are summarized
     /// away) and restarts. Serialized `manox_agent::plan::PlanSnapshot`; `None`

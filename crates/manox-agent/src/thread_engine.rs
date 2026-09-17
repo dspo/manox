@@ -245,6 +245,16 @@ pub trait ThreadEngine: Send + Sync {
     fn pending_auth_entries(&self) -> Vec<(String, PendingAuthMeta)> {
         Vec::new()
     }
+
+    /// Deliver one parked question's outcome (the user-questions seam).
+    /// Unknown ids are silently ignored (the call already settled).
+    fn respond_question(&self, _id: &str, _outcome: crate::questions::AskOutcome) {}
+
+    /// Parked questions with their card metadata, so the workspace can
+    /// re-surface a question card after switching back to a parked thread.
+    fn pending_question_entries(&self) -> Vec<(String, PendingAuthMeta)> {
+        Vec::new()
+    }
 }
 
 /// Restore-time state the actor projects onto the facade at `Ready`; boxed

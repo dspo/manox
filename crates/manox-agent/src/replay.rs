@@ -139,6 +139,8 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             | SessionTreeEntry::BrowserSuites { .. }
             | SessionTreeEntry::BackgroundTask { .. }
             | SessionTreeEntry::Approval { .. }
+            | SessionTreeEntry::PlanModeRequest { .. }
+            | SessionTreeEntry::Question { .. }
             | SessionTreeEntry::Label { .. }
             | SessionTreeEntry::SessionInfo { .. }
             | SessionTreeEntry::Leaf { .. }

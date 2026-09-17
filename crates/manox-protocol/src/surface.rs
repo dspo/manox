@@ -180,6 +180,7 @@ wire_surface! {
         JournalWireEvent::ReasoningEffortChange { .. } => "reasoningEffortChange" ~ JournalWireEvent::ReasoningEffortChange {
             effort: "high".into(),
         },
+        JournalWireEvent::PlanModeRequest { .. } => "planModeRequest" ~ JournalWireEvent::PlanModeRequest { enabled: true },
         JournalWireEvent::PlanModeChange { .. } => "planModeChange" ~ JournalWireEvent::PlanModeChange { enabled: true },
         JournalWireEvent::PlanUpdate { .. } => "planUpdate" ~ JournalWireEvent::PlanUpdate {
             snapshot: serde_json::json!({"body": "# plan"}),
@@ -204,6 +205,14 @@ wire_surface! {
             kind: "request".into(),
             auth_id: "auth-1".into(),
             tool_name: Some("Bash".into()),
+            tool_call_id: Some("tc-1".into()),
+            verdict: None,
+            reason: None,
+        },
+        JournalWireEvent::Question { .. } => "question" ~ JournalWireEvent::Question {
+            kind: "request".into(),
+            auth_id: "auth-1".into(),
+            tool_name: Some("AskUserQuestion".into()),
             tool_call_id: Some("tc-1".into()),
             verdict: None,
             reason: None,
@@ -259,6 +268,7 @@ pub const PROJECTION_KEYS: &[&str] = &[
     "model",
     "permission_mode",
     "reasoning_effort",
+    "plan_mode_pending",
     "plan_mode",
     "plan",
     "goal",
@@ -952,8 +962,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn projection_key_table_has_exactly_20_entries() {
-        assert_eq!(PROJECTION_KEYS.len(), 20);
+    fn projection_key_table_has_exactly_21_entries() {
+        assert_eq!(PROJECTION_KEYS.len(), 21);
     }
 
     /// The generated tag match agrees with the generated table on every

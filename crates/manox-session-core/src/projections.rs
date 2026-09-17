@@ -67,6 +67,7 @@ impl ProjectionSet {
             ("model", model.unwrap_or(JsonValue::Null)),
             ("permission_mode", serde_json::json!(permission)),
             ("reasoning_effort", serde_json::json!(effort)),
+            ("plan_mode_pending", serde_json::json!(false)),
             ("plan_mode", serde_json::json!(t.plan_mode())),
             (
                 "plan",
@@ -172,6 +173,19 @@ impl ProjectionSet {
             }
             SessionTreeEntry::PlanModeChange { enabled, .. } => {
                 self.set("plan_mode", serde_json::json!(enabled), seq);
+                self.set("plan_mode_pending", serde_json::json!(false), seq);
+            }
+            SessionTreeEntry::PlanModeRequest { enabled, .. } => {
+                let committed = self
+                    .slots
+                    .get("plan_mode")
+                    .and_then(|s| s.value.as_bool())
+                    .unwrap_or(false);
+                self.set(
+                    "plan_mode_pending",
+                    serde_json::json!(*enabled != committed),
+                    seq,
+                );
             }
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 self.set("plan", snapshot.clone(), seq);
@@ -216,7 +230,8 @@ impl ProjectionSet {
                     self.set("background_tasks", map, seq);
                 }
             }
-            SessionTreeEntry::Approval { kind, auth_id, .. } => {
+            SessionTreeEntry::Approval { kind, auth_id, .. }
+            | SessionTreeEntry::Question { kind, auth_id, .. } => {
                 let mut map = self
                     .slots
                     .get("pending_auth")
@@ -695,6 +710,26 @@ mod tests {
         );
         feed(
             &mut set,
+            E::PlanModeChange {
+                id: "sw-pmc".into(),
+                parent_id: None,
+                timestamp: ts,
+                enabled: true,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
+            E::PlanModeRequest {
+                id: "sw-pmr".into(),
+                parent_id: None,
+                timestamp: ts,
+                enabled: false,
+            },
+            &mut seq,
+        );
+        feed(
+            &mut set,
             E::PinnedArchived {
                 id: "sw-pa".into(),
                 parent_id: None,
@@ -762,6 +797,58 @@ mod tests {
         assert!(
             unfolded.is_empty(),
             "declared keys no fold arm writes (and not in the seed-only trio): {unfolded:?}"
+        );
+    }
+
+    /// W4: the plan-mode fold exposes the committed state and the pending
+    /// selection separately — a request flips `plan_mode_pending` only, a
+    /// change commits and clears it, and a request matching the committed
+    /// state is not pending.
+    #[test]
+    fn plan_mode_pending_tracks_the_selection_boundary() {
+        let mk = |enabled: bool, request: bool| {
+            if request {
+                SessionTreeEntry::PlanModeRequest {
+                    id: "x".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    enabled,
+                }
+            } else {
+                SessionTreeEntry::PlanModeChange {
+                    id: "x".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    enabled,
+                }
+            }
+        };
+        let mut set = seeded();
+        set.apply(&record(1, mk(true, false)));
+        assert_eq!(set.baseline()["plan_mode"], serde_json::json!(true));
+        assert_eq!(
+            set.baseline()["plan_mode_pending"],
+            serde_json::json!(false)
+        );
+
+        // A selection against the committed state is pending, not applied.
+        set.apply(&record(2, mk(false, true)));
+        assert_eq!(set.baseline()["plan_mode"], serde_json::json!(true));
+        assert_eq!(set.baseline()["plan_mode_pending"], serde_json::json!(true));
+
+        // The boundary commit converges both.
+        set.apply(&record(3, mk(false, false)));
+        assert_eq!(set.baseline()["plan_mode"], serde_json::json!(false));
+        assert_eq!(
+            set.baseline()["plan_mode_pending"],
+            serde_json::json!(false)
+        );
+
+        // A request that already matches the committed state is not pending.
+        set.apply(&record(4, mk(false, true)));
+        assert_eq!(
+            set.baseline()["plan_mode_pending"],
+            serde_json::json!(false)
         );
     }
 }

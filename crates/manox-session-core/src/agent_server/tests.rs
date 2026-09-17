@@ -33,6 +33,11 @@ struct FakeEngine {
     notices: tokio::sync::mpsc::UnboundedSender<BackendNotice>,
     auth_responses: StdMutex<Vec<(String, manox_agent::permission::ToolAuthorizationResponse)>>,
     pending_auth: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
+    /// The question seam's own registry — deliberately separate from
+    /// `pending_auth` so a gateway consumer that reads only one of the two
+    /// is caught by these tests (the regression guard for the production
+    /// two-gate split).
+    pending_questions: StdMutex<Vec<(String, manox_agent::permission::PendingAuthMeta)>>,
     /// GW9 probe: every `set_plan_review_pending` the facade forwards,
     /// in order. The trait default is a silent no-op, so without this
     /// recorder the kernel-side pending-review flag is unobservable in
@@ -82,6 +87,7 @@ impl FakeEngine {
                 notices,
                 auth_responses: StdMutex::new(Vec::new()),
                 pending_auth: StdMutex::new(Vec::new()),
+                pending_questions: StdMutex::new(Vec::new()),
                 plan_review_flags: StdMutex::new(Vec::new()),
                 plan_approvals: StdMutex::new(Vec::new()),
                 journal_tx: tokio::sync::broadcast::channel(64).0,
@@ -245,10 +251,45 @@ impl manox_agent::thread_engine::ThreadEngine for FakeEngine {
         id: &str,
         response: manox_agent::permission::ToolAuthorizationResponse,
     ) {
+        // The real gate removes the entry on settle; mirroring that keeps the
+        // badge-clear assertions meaningful.
+        self.pending_auth
+            .lock()
+            .unwrap()
+            .retain(|(pending_id, _)| pending_id != id);
         self.auth_responses
             .lock()
             .unwrap()
             .push((id.to_string(), response));
+    }
+
+    fn respond_question(&self, id: &str, outcome: manox_agent::questions::AskOutcome) {
+        // The fake engine keeps the legacy response record so the ask-path
+        // assertions below stay readable; the conversion is one-to-one.
+        let legacy = match outcome {
+            manox_agent::questions::AskOutcome::Answered(answers) => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestion { answers }
+            }
+            manox_agent::questions::AskOutcome::Dismissed => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionDismissed
+            }
+            manox_agent::questions::AskOutcome::Expired
+            | manox_agent::questions::AskOutcome::Cancelled => {
+                manox_agent::permission::ToolAuthorizationResponse::AskUserQuestionExpired
+            }
+        };
+        self.pending_questions
+            .lock()
+            .unwrap()
+            .retain(|(pending_id, _)| pending_id != id);
+        self.auth_responses
+            .lock()
+            .unwrap()
+            .push((id.to_string(), legacy));
+    }
+
+    fn pending_question_entries(&self) -> Vec<(String, manox_agent::permission::PendingAuthMeta)> {
+        self.pending_questions.lock().unwrap().clone()
     }
 }
 
@@ -624,6 +665,24 @@ fn ent_approval(id: String, parent_id: Option<String>) -> SessionTreeEntry {
         kind: "decision".into(),
         auth_id: "auth-j1".into(),
         payload: json!({"toolName": "Bash", "verdict": "allow_once"}),
+    }
+}
+fn ent_question(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+    SessionTreeEntry::Question {
+        id,
+        parent_id,
+        timestamp: fixed_ts(),
+        kind: "decision".into(),
+        auth_id: "auth-j1".into(),
+        payload: json!({"toolName": "AskUserQuestion", "verdict": "answered"}),
+    }
+}
+fn ent_plan_mode_request(id: String, parent_id: Option<String>) -> SessionTreeEntry {
+    SessionTreeEntry::PlanModeRequest {
+        id,
+        parent_id,
+        timestamp: fixed_ts(),
+        enabled: true,
     }
 }
 fn ent_pinned_archived(id: String, parent_id: Option<String>) -> SessionTreeEntry {
@@ -2341,7 +2400,7 @@ fn legacy_answer(text: &str) -> manox_agent::permission::AskAnswer {
 /// parked interaction until it answers, and the replay settle-truth reads
 /// that same set.
 fn seed_pending_ask(engine: &std::sync::Arc<FakeEngine>, auth_id: &str) {
-    engine.pending_auth.lock().unwrap().push((
+    engine.pending_questions.lock().unwrap().push((
         auth_id.into(),
         manox_agent::permission::PendingAuthMeta {
             tool_name: manox_agent::tools::ASK_USER_QUESTION.to_string(),
@@ -8528,6 +8587,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         ent_permission_mode_change,
         ent_thinking_level_change,
         ent_plan_mode_change,
+        ent_plan_mode_request,
         ent_plan_update,
         ent_plan_review,
         ent_goal,
@@ -8535,6 +8595,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         ent_browser_suites,
         ent_background_task,
         ent_approval,
+        ent_question,
         ent_pinned_archived,
         ent_active_tools_change,
         ent_compaction,
@@ -8549,7 +8610,7 @@ fn real_composition_streams_every_journal_entry_tag() {
         builders.len(),
         JOURNAL_ENTRIES.len(),
         "J1: the builder list must stay 1:1 with the declared vocabulary \
-             (both sides are exhaustive over the same 38)"
+             (both sides are exhaustive over the same 40)"
     );
     let mut prev: Option<String> = None;
     for (seq, build) in builders.into_iter().enumerate() {
