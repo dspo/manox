@@ -215,6 +215,7 @@ fn format_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
 
     /// `t` / `t_count` read the process-global `LANG`, so any test that flips
@@ -291,5 +292,49 @@ mod tests {
         assert!(workspace.contains("工作区访问"), "got: {workspace}");
         let full = t_str("workspace-mode-notice", &[("mode", "dangerfullaccess")]);
         assert!(full.contains("完全访问"), "got: {full}");
+    }
+
+    /// The plan chip's pending pair must resolve in both locales: the chip
+    /// falls back to the raw key when a term is missing, which would ship a
+    /// literal `plan-chip-pending-label` into the UI. Pin both halves so a
+    /// dropped translation fails here instead.
+    #[test]
+    fn plan_chip_pending_localized() {
+        let _g = TEST_LANG_LOCK.lock().unwrap();
+        set_lang(Language::En);
+        assert_eq!(t("plan-chip-pending-label").as_str(), "Plan mode pending");
+        assert!(t("plan-chip-pending-tooltip").contains("next turn"));
+        set_lang(Language::ZhCn);
+        assert!(t("plan-chip-pending-label").contains("待生效"));
+        assert!(t("plan-chip-pending-tooltip").contains("下一轮"));
+    }
+
+    /// Every `en` message has a `zh-CN` counterpart and vice versa: a term
+    /// added on one side only renders as its raw key for the other language,
+    /// which no per-key test would catch.
+    ///
+    /// Keys are read from the source text (a message term starts a line, an
+    /// attribute or continuation does not) rather than through `fluent-syntax`,
+    /// which is not a direct dependency here.
+    #[test]
+    fn locale_key_sets_agree() {
+        fn names(src: &str) -> BTreeSet<&str> {
+            src.lines()
+                .filter_map(|line| line.split_once(" = ").map(|(k, _)| k.trim()))
+                .filter(|k| {
+                    !k.is_empty()
+                        && k.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+                .collect()
+        }
+        let en = names(EN_FTL);
+        let zh = names(ZH_CN_FTL);
+        let only_en: Vec<_> = en.difference(&zh).collect();
+        let only_zh: Vec<_> = zh.difference(&en).collect();
+        assert!(
+            only_en.is_empty() && only_zh.is_empty(),
+            "locale key sets diverged — missing in zh-CN: {only_en:?}; missing in en: {only_zh:?}"
+        );
     }
 }
