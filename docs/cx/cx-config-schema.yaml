@@ -1,6 +1,7 @@
 # cx 配置文件结构（推荐版）
 # 用户运行时路径：~/.manox/cx.providers.config.yaml
-# 仓库基线示例：config/providers.default.yaml
+# 仓库内的脱敏示例与镜像 schema（manox-app 仓）：
+#   crates/manox-ext-agents/config/{providers.example.yaml,cx.providers.config.schema.yaml}
 #
 # 设计目标：
 # 1. Provider 表达“厂商 / 服务商”
@@ -16,7 +17,7 @@ providers:
       anthropic:
         url: "string (required)"
         agents: ["string (optional override filter)"]
-        copilot_auth: "enum: api_key | bearer_token (optional; Packy API requires bearer_token for cx copilot)"
+        copilot_auth: "enum: api_key | bearer_token (optional; bearer_token sends the Bearer auth header)"
       responses:
         url: "string (required)"
       completions:
