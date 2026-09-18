@@ -80,7 +80,11 @@ pub struct Settings {
     /// instruction files; matching files are excluded from the loaded set (the
     /// managed-policy file is exempt). Read once per session via
     /// [`claude_md_load_context`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Deliberately serialized even when empty: [`save`] merges only the keys
+    /// this struct writes, so a skipped field would leave a stale non-empty
+    /// list on disk and make "clear the excludes" impossible to persist.
+    #[serde(default)]
     pub claude_md_excludes: Vec<String>,
 
     /// Context optimization: tool discovery, history rewrite, pruning, and
@@ -418,6 +422,11 @@ pub fn load() -> Settings {
 /// every other key is carried over verbatim. Within an owned table a removed
 /// field does disappear, which is the intended behavior for our own schema.
 ///
+/// The read-modify-write is not file-locked. Both this function and the host's
+/// `ui_language` writer are driven by explicit settings-panel actions on the
+/// main thread, so the window is small; a background writer would need a shared
+/// lock (see the file-level concurrent-write convention for other stores).
+///
 /// Errors are returned to the caller — settings writes originate from explicit
 /// user action (UI save button), so surfacing a failure is the right move.
 pub fn save(settings: &Settings) -> Result<()> {
@@ -435,8 +444,15 @@ pub fn save(settings: &Settings) -> Result<()> {
     Ok(())
 }
 
-/// Render `settings` as a document to write, preserving any keys in
-/// `existing` that this crate does not own.
+/// Render `settings` as a document to write, preserving every key this crate
+/// does not write.
+///
+/// The merge is intentionally additive at the top level: only the keys present
+/// in the serialized [`Settings`] are overwritten. Two consequences follow.
+/// Keys the host owns (`ui_language`) survive a runtime save, and keys this
+/// crate has *retired* are never reclaimed — a stale `agent_language` or
+/// `follow_up_behavior` simply stays in the file, unread and harmless, rather
+/// than being silently deleted along with anything else we failed to model.
 ///
 /// Split out from [`save`] so the merge semantics are testable without
 /// touching the filesystem or the process environment.
@@ -572,6 +588,31 @@ default_model = "kept"
         assert_eq!(
             parsed.get("ui_language").and_then(|v| v.as_str()),
             Some("en")
+        );
+    }
+
+    /// Clearing `claude_md_excludes` must actually reach disk. The merge only
+    /// overwrites keys this struct serializes, so a field skipped when empty
+    /// would leave the previous non-empty list in place and silently discard
+    /// the clear.
+    #[test]
+    fn clearing_excludes_is_persisted() {
+        let existing = "claude_md_excludes = [\"vendor/**\"]\n";
+        let cleared = Settings {
+            claude_md_excludes: Vec::new(),
+            ..Default::default()
+        };
+
+        let out = merge_into_existing(&cleared, Some(existing)).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed
+                .get("claude_md_excludes")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0),
+            "clearing the excludes did not reach disk:\n{out}"
         );
     }
 
