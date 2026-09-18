@@ -294,28 +294,43 @@ mod tests {
         assert!(full.contains("完全访问"), "got: {full}");
     }
 
-    /// The plan chip's pending pair must resolve in both locales: the chip
-    /// falls back to the raw key when a term is missing, which would ship a
-    /// literal `plan-chip-pending-label` into the UI. Pin both halves so a
-    /// dropped translation fails here instead.
+    /// Both directions of the chip's pending state must resolve in both
+    /// locales. A term missing from `en.ftl` renders as its raw key; a term
+    /// missing from `zh-CN.ftl` renders the English string instead (the en
+    /// fallback bundle is attached whenever the locale is not en), so a
+    /// dropped Chinese translation ships English chrome silently. Pin all four
+    /// so a rename or a dropped translation fails here.
     #[test]
     fn plan_chip_pending_localized() {
         let _g = TEST_LANG_LOCK.lock().unwrap();
         set_lang(Language::En);
-        assert_eq!(t("plan-chip-pending-label").as_str(), "Plan mode pending");
-        assert!(t("plan-chip-pending-tooltip").contains("next turn"));
+        assert_eq!(
+            t("plan-chip-pending-enter-label").as_str(),
+            "Plan mode pending"
+        );
+        assert!(t("plan-chip-pending-enter-tooltip").contains("next turn"));
+        assert!(t("plan-chip-pending-exit-label").contains("leaving"));
+        assert!(t("plan-chip-pending-exit-tooltip").contains("stay blocked"));
         set_lang(Language::ZhCn);
-        assert!(t("plan-chip-pending-label").contains("待生效"));
-        assert!(t("plan-chip-pending-tooltip").contains("下一轮"));
+        assert!(t("plan-chip-pending-enter-label").contains("待生效"));
+        assert!(t("plan-chip-pending-enter-tooltip").contains("下一轮"));
+        assert!(t("plan-chip-pending-exit-label").contains("下一轮退出"));
+        assert!(t("plan-chip-pending-exit-tooltip").contains("写权限"));
     }
 
-    /// Every `en` message has a `zh-CN` counterpart and vice versa: a term
-    /// added on one side only renders as its raw key for the other language,
-    /// which no per-key test would catch.
+    /// Every `en` message has a `zh-CN` counterpart and vice versa. Without
+    /// this a term added on one side only degrades invisibly: missing from
+    /// `en.ftl` it renders as its raw key, missing from `zh-CN.ftl` it renders
+    /// English under a Chinese UI — and no per-key test notices, because every
+    /// key that does exist resolves correctly in its own locale.
     ///
     /// Keys are read from the source text (a message term starts a line, an
     /// attribute or continuation does not) rather than through `fluent-syntax`,
-    /// which is not a direct dependency here.
+    /// which is not a direct dependency here. Known limits: a `key =` whose
+    /// value continues on the next line is missed, and an indented continuation
+    /// line shaped like `ident = ` would be miscounted. Neither shape appears
+    /// in the current files; a real parser (via a dev-dependency) is the fix if
+    /// one ever does.
     #[test]
     fn locale_key_sets_agree() {
         fn names(src: &str) -> BTreeSet<&str> {
