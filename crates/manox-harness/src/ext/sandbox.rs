@@ -9,7 +9,7 @@
 //! re-exports `PermissionMode` from `crate::thread` for session/persistence.
 //!
 //! Model-facing strings (markers, escalation errors) are English and never
-//! pass through i18n — the model reads them verbatim.
+//! pass through untranslated — the model reads them verbatim.
 
 use std::path::{Path, PathBuf};
 

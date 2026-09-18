@@ -1,19 +1,18 @@
 //! User settings — `~/.manox/settings.toml`.
 //!
-//! Plain-file preferences. The two language fields are read at startup and on
-//! every save: `ui_language` drives the Fluent UI locale (and is swapped live
-//! by [`crate::i18n::set_ui_language`]); `agent_language` is snapshotted into
-//! each new [`crate::thread::Thread`] and selects that thread's harness / tool
-//! description language. `claude_md_excludes` filters which CLAUDE.md
+//! Plain-file preferences. `claude_md_excludes` filters which CLAUDE.md
 //! instruction files [`crate::claude_md`] loads. Absent file or parse failure
 //! is non-fatal: every failure path warns once and yields the default, so a
 //! malformed file never blocks startup.
+//!
+//! This repository carries no language configuration: agent-facing prose is
+//! English only and UI chrome localization belongs to the host application,
+//! which owns the `ui_language` key in the same file independently.
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
-use crate::language::Language;
 use crate::paths;
 
 static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
@@ -71,17 +70,6 @@ pub fn set_mcp_disabled(names: Vec<String>) -> Result<()> {
 /// partial file still yields a usable (defaulted) result.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
-    /// UI locale token (`"en"` / `"zh-CN"`). `None` → English. Drives the
-    /// Fluent bundle and is swapped live by [`crate::i18n::set_ui_language`].
-    #[serde(default)]
-    pub ui_language: Option<String>,
-
-    /// Agent language token (`"en"` / `"zh-CN"`). `None` → follow `ui_language`
-    /// at resolve time (see [`Settings::resolve`]). Snapshotted into each new
-    /// [`crate::thread::Thread`]; changing it never disturbs existing threads.
-    #[serde(default)]
-    pub agent_language: Option<String>,
-
     /// Default model for new pi-harness threads: a registry model id
     /// (`deepseek-v4-flash`) or a Claude/OpenAI alias (`sonnet`). Unset or
     /// unresolvable → the first registered model (sorted).
@@ -92,7 +80,11 @@ pub struct Settings {
     /// instruction files; matching files are excluded from the loaded set (the
     /// managed-policy file is exempt). Read once per session via
     /// [`claude_md_load_context`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Deliberately serialized even when empty: [`save`] merges only the keys
+    /// this struct writes, so a skipped field would leave a stale non-empty
+    /// list on disk and make "clear the excludes" impossible to persist.
+    #[serde(default)]
     pub claude_md_excludes: Vec<String>,
 
     /// Context optimization: tool discovery, history rewrite, pruning, and
@@ -382,47 +374,6 @@ pub fn resolve_side_call_policy(user: &SideCallPolicy, preset: SideCallPolicy) -
     }
 }
 
-/// Resolved language axes — the canonical [`Language`] values, with a missing
-/// `agent_language` falling back to the UI language rather than a hardcoded
-/// default, so a user who only ever set `ui_language` gets a coherent
-/// same-language agent axis for free.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResolvedLanguages {
-    pub ui: Language,
-    pub agent: Language,
-}
-
-impl Settings {
-    /// Resolve both language axes to canonical [`Language`] values. An unknown
-    /// token warns once and resolves to English; a missing `agent_language`
-    /// follows `ui` (after `ui`'s own resolution), so the two axes stay aligned
-    /// until the user splits them.
-    pub fn resolve(&self) -> ResolvedLanguages {
-        let ui = self.resolve_axis(self.ui_language.as_deref());
-        let agent = self
-            .agent_language
-            .as_deref()
-            .map_or(ui, |tok| self.resolve_axis(Some(tok)));
-        ResolvedLanguages { ui, agent }
-    }
-
-    /// Resolve a single language token to a [`Language`], warning + falling
-    /// back to English on a non-canonical token so a typo never silently
-    /// coerces to the wrong locale.
-    fn resolve_axis(&self, token: Option<&str>) -> Language {
-        match token {
-            None => Language::En,
-            Some(tok) => match Language::from_token(tok) {
-                Some(lang) => lang,
-                None => {
-                    tracing::warn!(token = tok, "unknown language token; defaulting to English");
-                    Language::En
-                }
-            },
-        }
-    }
-}
-
 /// Load settings from `settings.toml`. Always returns a usable [`Settings`] —
 /// every failure (missing path, missing file, parse error) warns once and
 /// falls back to the default.
@@ -461,18 +412,73 @@ pub fn load() -> Settings {
     }
 }
 
-/// Serialize `settings` to `settings.toml`, creating the manox config
-/// directory on demand. Errors are returned to the caller — settings writes
-/// originate from explicit user action (UI save button), so surfacing a
-/// failure is the right move.
+/// Persist `settings` to `settings.toml`, creating the manox config directory
+/// on demand.
+///
+/// This crate shares the file with the host application, which owns keys this
+/// struct does not model (currently `ui_language`). A whole-document rewrite
+/// would silently delete them, so the write is a parse-edit-merge: the on-disk
+/// document is read, the tables this struct owns are replaced wholesale, and
+/// every other key is carried over verbatim. Within an owned table a removed
+/// field does disappear, which is the intended behavior for our own schema.
+///
+/// The read-modify-write is not file-locked. Both this function and the host's
+/// `ui_language` writer are driven by explicit settings-panel actions on the
+/// main thread, so the window is small; a background writer would need a shared
+/// lock (see the file-level concurrent-write convention for other stores).
+///
+/// Errors are returned to the caller — settings writes originate from explicit
+/// user action (UI save button), so surfacing a failure is the right move.
 pub fn save(settings: &Settings) -> Result<()> {
     let dir = paths::ensure_manox_config_dir()
         .context("ensuring manox config dir exists before writing settings.toml")?;
     let path = dir.join("settings.toml");
-    let body = toml::to_string_pretty(settings).context("serializing settings.toml")?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading settings.toml"),
+    };
+    let body = merge_into_existing(settings, existing.as_deref())?;
     std::fs::write(&path, body)
         .with_context(|| format!("writing settings.toml at {}", path.display()))?;
     Ok(())
+}
+
+/// Render `settings` as a document to write, preserving every key this crate
+/// does not write.
+///
+/// The merge is intentionally additive at the top level: only the keys present
+/// in the serialized [`Settings`] are overwritten. Two consequences follow.
+/// Keys the host owns (`ui_language`) survive a runtime save, and keys this
+/// crate has *retired* are never reclaimed — a stale `agent_language` or
+/// `follow_up_behavior` simply stays in the file, unread and harmless, rather
+/// than being silently deleted along with anything else we failed to model.
+///
+/// Split out from [`save`] so the merge semantics are testable without
+/// touching the filesystem or the process environment.
+fn merge_into_existing(settings: &Settings, existing: Option<&str>) -> Result<String> {
+    let owned = toml::Value::try_from(settings)
+        .context("serializing settings.toml")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut doc = match existing {
+        Some(raw) => toml::from_str::<toml::Value>(raw).unwrap_or_else(|e| {
+            // A corrupt file cannot be merged into; replacing it is the only
+            // way forward, and the warn keeps the loss diagnosable.
+            tracing::warn!(error = %e, "settings.toml parse failed; rewriting it from scratch");
+            toml::Value::Table(toml::map::Map::new())
+        }),
+        None => toml::Value::Table(toml::map::Map::new()),
+    };
+    let table = doc
+        .as_table_mut()
+        .context("settings.toml top level is not a table")?;
+    for (key, value) in owned {
+        table.insert(key, value);
+    }
+    toml::to_string_pretty(&doc).context("serializing settings.toml")
 }
 
 #[cfg(test)]
@@ -480,91 +486,134 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unknown_top_level_field_is_ignored() {
-        // Serde ignores unknown fields by default, so a stale top-level key left
-        // in an old settings.toml never blocks load.
+    fn keys_this_crate_does_not_own_are_ignored_on_load() {
+        // The host application owns keys in the same file (currently
+        // `ui_language`), and a stale top-level key may linger from an older
+        // build. Neither may block a load: unknown fields are dropped rather
+        // than rejected.
         let raw = r#"
-ui_language = "en"
+ui_language = "zh-CN"
 follow_up_behavior = "Steer"
 "#;
         let settings: Settings = toml::from_str(raw).unwrap();
-        assert_eq!(settings.ui_language.as_deref(), Some("en"));
+        assert_eq!(settings.default_model, None);
+    }
+
+    /// `settings.toml` is shared with the host application, which owns keys
+    /// this crate does not model (`ui_language`). Saving must not delete them:
+    /// a whole-document rewrite would, silently resetting the user's chosen UI
+    /// language the next time any owned setting changed.
+    #[test]
+    fn save_preserves_host_owned_keys() {
+        let existing = r#"ui_language = "en"
+default_model = "kept"
+"#;
+        let settings = Settings {
+            default_model: Some("written".into()),
+            mcp: McpSettings {
+                disabled: vec!["some-server".into()],
+            },
+            ..Default::default()
+        };
+
+        let out = merge_into_existing(&settings, Some(existing)).unwrap();
+
         assert!(
-            !toml::to_string(&settings)
-                .unwrap()
-                .contains("follow_up_behavior")
+            out.contains(r#"ui_language = "en""#),
+            "the host-owned key was dropped:\n{out}"
+        );
+        // Keys this crate owns are written from the struct.
+        assert!(out.contains("written"), "owned write missing:\n{out}");
+        assert!(out.contains("some-server"), "owned write missing:\n{out}");
+    }
+
+    /// With no file on disk the merge still produces the owned schema, so a
+    /// first-ever save is complete rather than empty.
+    #[test]
+    fn save_without_an_existing_file_writes_the_owned_schema() {
+        let settings = Settings {
+            default_model: Some("written".into()),
+            ..Default::default()
+        };
+        let out = merge_into_existing(&settings, None).unwrap();
+        assert!(out.contains("written"), "owned value missing:\n{out}");
+        assert!(
+            out.contains("[context_optimization]"),
+            "schema missing:\n{out}"
         );
     }
 
+    /// A corrupt file cannot be merged into, so it is replaced rather than
+    /// blocking a save forever.
     #[test]
-    fn language_tokens_round_trip() {
+    fn save_recovers_from_a_corrupt_existing_file() {
         let settings = Settings {
-            ui_language: Some("zh-CN".into()),
-            agent_language: Some("en".into()),
+            default_model: Some("written".into()),
             ..Default::default()
         };
-        let s = toml::to_string_pretty(&settings).unwrap();
-        let back: Settings = toml::from_str(&s).unwrap();
-        assert_eq!(back.ui_language.as_deref(), Some("zh-CN"));
-        assert_eq!(back.agent_language.as_deref(), Some("en"));
+        let out = merge_into_existing(&settings, Some("this is not = valid = toml")).unwrap();
+        assert!(out.contains("written"), "owned value missing:\n{out}");
+        assert!(
+            out.contains("[context_optimization]"),
+            "schema missing:\n{out}"
+        );
     }
 
+    /// On-disk round trip through the merge: the document written back must
+    /// still carry a host-owned `ui_language` and any unowned value, so the app
+    /// reads the same language after the runtime saved one of its own settings.
     #[test]
-    fn old_language_field_does_not_serialize() {
-        // The legacy single `language` field is gone; a struct that carries only
-        // the new fields must not emit `language =` on serialize.
+    fn merge_round_trip_keeps_host_owned_keys_on_disk() {
+        let before = "ui_language = \"en\"\ndefault_model = \"x\"\n";
         let settings = Settings {
-            ui_language: Some("en".into()),
-            agent_language: Some("zh-CN".into()),
+            mcp: McpSettings {
+                disabled: vec!["srv".into()],
+            },
             ..Default::default()
         };
-        let s = toml::to_string_pretty(&settings).unwrap();
-        assert!(!s.contains("\nlanguage ="));
-        assert!(s.contains("ui_language"));
-        assert!(s.contains("agent_language"));
+
+        let after = merge_into_existing(&settings, Some(before)).unwrap();
+
+        assert!(
+            after.contains("ui_language = \"en\""),
+            "host-owned key dropped:\n{after}"
+        );
+        assert!(
+            after.contains("default_model = \"x\""),
+            "unowned value dropped:\n{after}"
+        );
+        assert!(after.contains("srv"), "owned write missing:\n{after}");
+        // And the app's parser still finds the language it wrote.
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed.get("ui_language").and_then(|v| v.as_str()),
+            Some("en")
+        );
     }
 
+    /// Clearing `claude_md_excludes` must actually reach disk. The merge only
+    /// overwrites keys this struct serializes, so a field skipped when empty
+    /// would leave the previous non-empty list in place and silently discard
+    /// the clear.
     #[test]
-    fn agent_language_follows_ui_when_absent() {
-        let settings = Settings {
-            ui_language: Some("zh-CN".into()),
-            agent_language: None,
+    fn clearing_excludes_is_persisted() {
+        let existing = "claude_md_excludes = [\"vendor/**\"]\n";
+        let cleared = Settings {
+            claude_md_excludes: Vec::new(),
             ..Default::default()
         };
-        let r = settings.resolve();
-        assert_eq!(r.ui, Language::ZhCn);
-        assert_eq!(r.agent, Language::ZhCn);
-    }
 
-    #[test]
-    fn agent_language_independent_when_set() {
-        let settings = Settings {
-            ui_language: Some("zh-CN".into()),
-            agent_language: Some("en".into()),
-            ..Default::default()
-        };
-        let r = settings.resolve();
-        assert_eq!(r.ui, Language::ZhCn);
-        assert_eq!(r.agent, Language::En);
-    }
+        let out = merge_into_existing(&cleared, Some(existing)).unwrap();
 
-    #[test]
-    fn missing_axes_default_to_english() {
-        let r = Settings::default().resolve();
-        assert_eq!(r.ui, Language::En);
-        assert_eq!(r.agent, Language::En);
-    }
-
-    #[test]
-    fn unknown_token_resolves_to_english() {
-        let settings = Settings {
-            ui_language: Some("fr".into()),
-            agent_language: Some("zh".into()),
-            ..Default::default()
-        };
-        let r = settings.resolve();
-        assert_eq!(r.ui, Language::En);
-        assert_eq!(r.agent, Language::En);
+        let parsed: toml::Value = toml::from_str(&out).unwrap();
+        assert_eq!(
+            parsed
+                .get("claude_md_excludes")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(0),
+            "clearing the excludes did not reach disk:\n{out}"
+        );
     }
 
     // ── context optimization / side-call tests ──────────────────────

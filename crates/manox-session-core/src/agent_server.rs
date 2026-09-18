@@ -1799,10 +1799,9 @@ impl AgentServerInner {
         for meta in manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
             commands.push(json!({
                 "name": meta.name,
-                "description": null,
+                "description": meta.description,
                 "kind": "command",
                 "argument_hint": null,
-                "i18n_key": meta.description_key,
             }));
         }
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
@@ -3784,15 +3783,14 @@ impl AgentServerInner {
             return self.note_error(session_id, "unknown session");
         };
         let plan_file = plan_file.to_string();
-        let lang = thread.read(|t| t.agent_language());
-        let seed_text =
-            match manox_agent::collaboration_mode::render_plan_mode_approved(lang, &plan_file) {
-                Ok(text) => text,
-                Err(e) => {
-                    thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-                    return;
-                }
-            };
+        let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(&plan_file)
+        {
+            Ok(text) => text,
+            Err(e) => {
+                thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+                return;
+            }
+        };
         thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
@@ -4872,19 +4870,16 @@ fn apply_plan_review(
                 return;
             };
             let compact = keep_or_compact == "compact";
-            let lang = thread.read(|t| t.agent_language());
-            let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(
-                lang, &plan_file,
-            ) {
-                Ok(text) => text,
-                Err(e) => {
-                    thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-                    return;
-                }
-            };
-            let compact_instructions = compact.then(|| {
-                manox_agent::collaboration_mode::plan_compact_instructions(lang, &plan_file)
-            });
+            let seed_text =
+                match manox_agent::collaboration_mode::render_plan_mode_approved(&plan_file) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
+                        return;
+                    }
+                };
+            let compact_instructions = compact
+                .then(|| manox_agent::collaboration_mode::plan_compact_instructions(&plan_file));
             thread.with_mut(|t| {
                 let ui = MessageUiMetadata {
                     model_id: t.model().map(|m| m.id.clone()),

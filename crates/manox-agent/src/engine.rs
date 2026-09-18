@@ -5011,15 +5011,13 @@ async fn load_approval_mode(sessions_dir: &Path, session_path: &Path) -> Permiss
     }
 }
 
-/// Render the plan-mode-active instructions for the configured agent
-/// language (the actor renders them itself — language comes from settings,
+/// Render the plan-mode-active instructions (the actor renders them itself,
 /// so no facade round-trip is needed on restore or session switches).
 fn render_plan_instructions() -> Option<String> {
     let plans_dir = crate::paths::plans_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| ".manox/plans".to_string());
-    let lang = crate::settings::load().resolve().agent;
-    match crate::collaboration_mode::render_plan_mode_active(lang, &plans_dir) {
+    match crate::collaboration_mode::render_plan_mode_active(&plans_dir) {
         Ok(text) => Some(text),
         Err(err) => {
             tracing::warn!(error = %err, "failed to render plan-mode instructions");

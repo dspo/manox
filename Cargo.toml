@@ -115,11 +115,6 @@ http = "1"
 # catches up with main.
 rustwright_core = { package = "rustwright-core", git = "https://github.com/Skyvern-AI/rustwright.git", rev = "af71449ea25ad45b1028581edefab1f523f9550d", default-features = false }
 
-# i18n —— fluent + BCP47 LanguageIdentifier。agent 自身的 locales/*.ftl 模型
-# 面向字符串一律英文，不经此栈；此处仅供 host 侧 chrome 文案复用同一版本。
-fluent = "0.17"
-unic-langid = "0.9"
-
 # tera —— prompt 模板引擎。所有模型可见提示词以纯文本 .tera.md 维护，仅在
 # 统一边界（prompt::render）一次性渲染。业务流程只构造强类型 data/draft，不拼字符串。
 tera = "2"
