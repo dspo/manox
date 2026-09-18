@@ -309,12 +309,14 @@ mod tests {
             "Plan mode pending"
         );
         assert!(t("plan-chip-pending-enter-tooltip").contains("next turn"));
-        assert!(t("plan-chip-pending-exit-label").contains("leaving"));
+        assert!(t("plan-chip-pending-exit-label").contains("exiting"));
         assert!(t("plan-chip-pending-exit-tooltip").contains("stay blocked"));
+        assert!(t("plan-mode-cancel-notice").contains("stays writable"));
         set_lang(Language::ZhCn);
         assert!(t("plan-chip-pending-enter-label").contains("待生效"));
         assert!(t("plan-chip-pending-enter-tooltip").contains("下一轮"));
-        assert!(t("plan-chip-pending-exit-label").contains("下一轮退出"));
+        assert!(t("plan-chip-pending-exit-label").contains("待退出"));
+        assert!(t("plan-mode-cancel-notice").contains("保持可写"));
         assert!(t("plan-chip-pending-exit-tooltip").contains("写权限"));
     }
 
