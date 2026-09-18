@@ -62,8 +62,6 @@ lsp = { workspace = true, optional = true }
 lsp-types = { workspace = true, optional = true }
 toml.workspace = true
 http.workspace = true
-fluent.workspace = true
-unic-langid.workspace = true
 tera.workspace = true
 tokio-tungstenite = { workspace = true }
 rustwright_core = { workspace = true, optional = true }

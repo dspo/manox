@@ -12,7 +12,6 @@
 
 use serde::Serialize;
 
-use crate::language::Language;
 use crate::language_model::{
     LanguageModelRequestMessage, LanguageModelRequestTool, MessageContent, Role,
 };
@@ -32,12 +31,9 @@ impl<D: Serialize> PromptDraft<D> {
         Self { template, data }
     }
 
-    /// Materialize the draft into its final prompt string, in `lang`. The
-    /// boundary call. `lang` is the thread's agent language — passed at the
-    /// boundary rather than stored, so a draft carries no language state and
-    /// can be rendered in either language at the materialize site.
-    pub fn render(self, lang: Language) -> anyhow::Result<String> {
-        render(self.template, lang, &self.data)
+    /// Materialize the draft into its final prompt string. The boundary call.
+    pub fn render(self) -> anyhow::Result<String> {
+        render(self.template, &self.data)
     }
 }
 
@@ -60,16 +56,11 @@ impl<D: Serialize> PromptMessageDraft<D> {
         }
     }
 
-    /// Materialize the message, in `lang`. The boundary call for history
-    /// insertion.
-    pub fn render(self, lang: Language) -> anyhow::Result<LanguageModelRequestMessage> {
+    /// Materialize the message. The boundary call for history insertion.
+    pub fn render(self) -> anyhow::Result<LanguageModelRequestMessage> {
         Ok(LanguageModelRequestMessage {
             role: self.role,
-            content: vec![MessageContent::Text(render(
-                self.template,
-                lang,
-                &self.data,
-            )?)],
+            content: vec![MessageContent::Text(render(self.template, &self.data)?)],
             cache: self.cache,
         })
     }
@@ -101,12 +92,12 @@ impl<D: Serialize> PromptToolDraft<D> {
         }
     }
 
-    /// Materialize the tool definition, in `lang`. The boundary call for
+    /// Materialize the tool definition. The boundary call for
     /// `to_request_tools*`.
-    pub fn render(self, lang: Language) -> anyhow::Result<LanguageModelRequestTool> {
+    pub fn render(self) -> anyhow::Result<LanguageModelRequestTool> {
         Ok(LanguageModelRequestTool {
             name: self.name,
-            description: render(self.template, lang, &self.data)?,
+            description: render(self.template, &self.data)?,
             input_schema: self.input_schema,
             use_input_streaming: self.use_input_streaming,
         })

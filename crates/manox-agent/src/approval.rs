@@ -32,7 +32,7 @@ use crate::permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationRe
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::BackendNotice;
 
-/// Model-facing denial marker (always English, never i18n): read-only mode
+/// Model-facing denial marker (always English, never localized): read-only mode
 /// refuses every fs mutation. Matches deepseek's `[sandbox: …]` vocabulary.
 const DENY_READ_ONLY: &str = "[sandbox: file access denied under read-only mode]";
 /// Model-facing denial marker: workspace-write refuses a mutation whose

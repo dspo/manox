@@ -44,17 +44,15 @@ script/gates.sh                      # 唯一门禁权威（fmt/clippy/test-real
 
 Rust **1.95.0**（`rust-toolchain.toml`），edition **2024**，需 `clippy`/`rustfmt`/`rust-src`。本仓库 headless，CI 无图形系统依赖。
 
-## i18n（重要：开发时勿忘）
+## 字符串与语言（重要：开发时勿忘）
 
-manox 区分**模型面向**与**用户面向**两条字符串边界：
+本仓库**不承载任何 i18n 设施**（无 Fluent 依赖、无 locales 资源、无语言配置、无 `.ftl`）：所有字符串——模板散文、工具 `description()`、工具 `run` 返回的 Err、日志、返回值、`thread.rs` 里 LLM 能读到的消息——**一律英文硬编码**，绝不本地化。
 
-1. **模型面向一律英文，绝不本地化**：`prompt/templates/{en,zh-CN}/**/*.tera.md` 模板散文、所有工具 `description()`、工具 `run` 返回的 Err 字符串、`thread.rs` 里 LLM 能读到的消息。永远不经 i18n。
-2. **仅 UI chrome 本地化**（UI 在 manox-app，但其文案键与资源在本仓库）：经 `manox_agent::i18n::t("key")`。
-3. **Fluent 资源**在 `crates/manox-agent/locales/{en,zh-CN}.ftl`，`include_str!` 编译期嵌入。**新增 UI 字符串 = 在两个 `.ftl` 各加一个键 + 调用处换 `t("key")`**，缺一不可。语言来自 `~/.manox/settings.toml`：UI 语言（`ui_language`）`manox_agent::init` 时读一次，可运行时热切换（`i18n::set_ui_language`，仅 chrome 重新本地化，已产生的内容不回改）；agent 语言（`agent_language`）按 thread 快照、终身不变。
+UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库不提供文案键、不暴露 `t()` 类 API、不读取任何语言配置。新增面向模型或面向用户的可读字符串 = 直接写英文。凡**由本仓库传给 host 的值**（tool title/summary、slash 命令 `description`、plan 文本、模型产出内容），host 一律原样渲染，不做二次本地化；host 若要本地化自己的界面，按自己的键自行维护。
 
 ## 提示词系统
 
-非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/{en,zh-CN}/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方）、子 agent 定义在 `crates/manox-harness/ext-agents/*.md`（`include_str!`，由 `ext/subagent/spawn.rs` 嵌入）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
+非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方；模板只有英文单语一份，无 locale 子树）、子 agent 定义在 `crates/manox-harness/ext-agents/*.md`（`include_str!`，由 `ext/subagent/spawn.rs` 嵌入）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
 ## 运行时配置（`~/.manox/`）
 

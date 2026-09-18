@@ -322,8 +322,10 @@ impl PiAgentTool for PiAskUserQuestionTool {
         // parked input, the delivered card, and the settled answer all speak
         // the same id vocabulary.
         ensure_ask_ids(&mut params);
-        let lang = crate::settings::load().resolve().agent;
-        let title = crate::i18n::t("workspace-clarify-title").to_string();
+        // English fallback title. Clients that render their own chrome may
+        // substitute a display title; this value is what the model and any
+        // non-localizing consumer see, and is never translated here.
+        let title = CLARIFY_TITLE.to_string();
 
         let rx = self.gate.register(
             tool_call_id,
@@ -418,16 +420,19 @@ impl PiAgentTool for PiAskUserQuestionTool {
             // The turn was cancelled while the card was parked: the model sees
             // the tool-denied render, exactly as the pre-seam path did.
             AskOutcome::Cancelled => {
-                let text = crate::prompt::render_static(
-                    crate::prompt::PromptTemplate::WrapperToolDenied,
-                    lang,
-                )
-                .expect("tool denied render");
+                let text =
+                    crate::prompt::render_static(crate::prompt::PromptTemplate::WrapperToolDenied)
+                        .expect("tool denied render");
                 Ok(AgentToolResult::error(text))
             }
         }
     }
 }
+
+/// Fallback display title for an `AskUserQuestion` tool call whose own
+/// `header`/summary is empty. English, never localized: it travels to clients
+/// as model-facing tool-call metadata.
+const CLARIFY_TITLE: &str = "Clarification";
 
 /// Mint a stable `id` onto every question that lacks one (B2-PR-1). Runs in
 /// `execute` after validation and before the request is parked/emitted, so

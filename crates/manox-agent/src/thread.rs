@@ -20,7 +20,6 @@ use crate::background_task::TaskSnapshot;
 use crate::db::{HistoryEntry, UiNoteRecord};
 use crate::goal::ThreadGoal;
 use crate::goal_tools::GoalBridge;
-use crate::language::Language;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
@@ -1483,10 +1482,6 @@ impl Thread {
         self.reasoning_effort
     }
 
-    pub fn agent_language(&self) -> Language {
-        crate::settings::load().resolve().agent
-    }
-
     pub fn is_pinned(&self) -> bool {
         self.pinned
     }
@@ -1750,7 +1745,6 @@ impl Thread {
         for msg in &msgs {
             let rendered = crate::prompt::render(
                 crate::prompt::PromptTemplate::WrapperPeerMessage,
-                self.agent_language(),
                 &crate::prompt::PeerMessageData {
                     from: msg.from.clone(),
                     content: msg.content.clone(),
@@ -2180,10 +2174,7 @@ pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> 
 
 /// The model-facing form of one content block. Pi keeps blocks verbatim —
 /// there is no manox envelope/compaction rewriting to undo.
-pub fn model_facing_content(
-    c: &MessageContent,
-    _lang: crate::language::Language,
-) -> MessageContent {
+pub fn model_facing_content(c: &MessageContent) -> MessageContent {
     c.clone()
 }
 
@@ -2231,7 +2222,6 @@ impl Thread {
         };
         let rendered = crate::prompt::render(
             crate::prompt::PromptTemplate::SkillBody,
-            self.agent_language(),
             &crate::prompt::SkillBodyData {
                 description: (!skill.description.is_empty()).then(|| skill.description.clone()),
                 body: skill.body.clone(),

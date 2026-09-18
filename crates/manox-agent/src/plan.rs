@@ -568,7 +568,7 @@ mod tests {
                     { "step": "Wire PlanUpdated through the thread", "status": "in_progress" },
                     { "step": "Delete the milestone state machine", "status": "pending" },
                     { "step": "Rewrite the Context Rail", "status": "pending" },
-                    { "step": "Update prompts and i18n", "status": "pending" },
+                    { "step": "Update prompts and docs", "status": "pending" },
                     { "step": "Tests, docs, and delivery", "status": "pending" },
                 ]),
             ),

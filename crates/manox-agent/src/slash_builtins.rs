@@ -18,8 +18,8 @@ pub struct BuiltinSlashMeta {
     /// Alternate invocation names (`/quit` for `/exit`). Typeaheads list
     /// only the canonical name; dispatch matches any alias.
     pub aliases: &'static [&'static str],
-    /// Fluent key in the agent locales carrying the one-line description.
-    pub description_key: &'static str,
+    /// One-line English description of what the command does.
+    pub description: &'static str,
 }
 
 /// The built-in command set, in popover listing order.
@@ -27,32 +27,32 @@ pub const BUILTIN_SLASH_COMMANDS: &[BuiltinSlashMeta] = &[
     BuiltinSlashMeta {
         name: "mode",
         aliases: &[],
-        description_key: "slash-mode-desc",
+        description: "Cycle the permission mode (Read Only → Workspace Access → Full Access); `/mode <name>` sets a mode, and with a prompt switches and starts working immediately",
     },
     BuiltinSlashMeta {
         name: "plan",
         aliases: &[],
-        description_key: "slash-plan-desc",
+        description: "Toggle plan mode (read-only research, plan file, structured approval); `/plan <prompt>` enters plan mode and starts planning the prompt",
     },
     BuiltinSlashMeta {
         name: "compact",
         aliases: &[],
-        description_key: "slash-compact-desc",
+        description: "Compact the conversation: summarize older history into a handoff note so the thread can keep going past the context limit",
     },
     BuiltinSlashMeta {
         name: "exit",
         aliases: &["quit"],
-        description_key: "slash-exit-desc",
+        description: "Archive the current thread and start a fresh one",
     },
     BuiltinSlashMeta {
         name: "new",
         aliases: &["clear", "archive"],
-        description_key: "slash-new-desc",
+        description: "Archive the current thread and start a fresh one that keeps the project, permission mode, and model",
     },
     BuiltinSlashMeta {
         name: "goal",
         aliases: &[],
-        description_key: "slash-goal-desc",
+        description: "Create or manage a persistent Goal (`/goal <objective>`, pause, resume, edit, clear)",
     },
 ];
 
@@ -93,16 +93,20 @@ mod tests {
     }
 
     #[test]
-    fn every_description_key_is_localized() {
-        // `t` falls back to the raw key when the bundle lacks it; a resolved
-        // value therefore proves the fluent copy exists.
+    fn every_description_is_a_real_sentence() {
         for meta in BUILTIN_SLASH_COMMANDS {
-            let en = crate::i18n::t(meta.description_key);
-            assert_ne!(
-                en.as_str(),
-                meta.description_key,
-                "missing fluent copy for {}",
-                meta.description_key
+            assert!(
+                !meta.description.trim().is_empty(),
+                "empty description for {}",
+                meta.name
+            );
+            // A description that echoes the command name would render as a
+            // useless popover row; require prose beyond the bare name.
+            assert!(
+                meta.description.len() > meta.name.len() + 3,
+                "description for {} looks like a placeholder: {}",
+                meta.name,
+                meta.description
             );
         }
     }

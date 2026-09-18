@@ -22,9 +22,7 @@ pub mod goal_tools;
 pub mod granted_roots;
 pub mod host;
 pub mod host_tools;
-pub mod i18n;
 pub mod image;
-pub mod language;
 pub mod language_model;
 #[cfg(feature = "lsp")]
 pub mod lsp_tools;
@@ -88,8 +86,8 @@ pub use thread_store::{
 };
 
 /// Register the tokio runtime, `ProviderRegistry`, `McpRegistry`,
-/// `ThreadStore`, the hashline snapshot store, the i18n bundle, and the
-/// subagent / skill / command / hook registries. Call at App startup.
+/// `ThreadStore`, the hashline snapshot store, and the subagent / skill /
+/// command / hook registries. Call at App startup.
 pub fn init() {
     // Login-shell PATH install (background): GUI processes inherit a minimal
     // launchd PATH, so bash/LSP/MCP/monitor subprocesses would lose Homebrew
@@ -98,9 +96,6 @@ pub fn init() {
     // the resolver lands.
     path_env::install();
     runtime::init();
-    // i18n before anything that renders UI or builds a system prompt, so the
-    // user's locale is settled before the first frame / first turn.
-    i18n::init();
     settings::init_optimization();
     provider_glue::init();
     // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
