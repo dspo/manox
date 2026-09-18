@@ -122,6 +122,79 @@ mod tests {
         }
     }
 
+    /// A database written by an older build still carries the retired
+    /// `agent_language` column: schema creation is `CREATE TABLE IF NOT EXISTS`
+    /// and this runtime never migrates. Loading must therefore work against a
+    /// table that has extra columns, and upserting must not depend on that
+    /// column's presence.
+    #[test]
+    fn loads_and_upserts_against_a_pre_i18n_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                summary TEXT NOT NULL DEFAULT '',
+                title TEXT,
+                title_override TEXT,
+                model_id TEXT NOT NULL DEFAULT '',
+                provider_id TEXT,
+                cwd TEXT,
+                project TEXT,
+                agent_language TEXT NOT NULL DEFAULT 'en',
+                approval_mode INTEGER NOT NULL DEFAULT 0,
+                reasoning_effort INTEGER NOT NULL DEFAULT 2,
+                depth INTEGER NOT NULL DEFAULT 0,
+                parent_id TEXT,
+                archived INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                has_unread INTEGER NOT NULL DEFAULT 0,
+                errored INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                interacted_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                session_started_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                revision INTEGER NOT NULL DEFAULT 0,
+                cumulative_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_output_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cumulative_cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE thread_data (
+                thread_id TEXT PRIMARY KEY,
+                data_type TEXT NOT NULL,
+                data BLOB NOT NULL
+            );
+            CREATE TABLE token_usage (
+                thread_id TEXT NOT NULL,
+                user_message_id TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+                completed_at INTEGER,
+                PRIMARY KEY (thread_id, user_message_id)
+            );
+            INSERT INTO threads (id, summary, agent_language, project, cwd)
+                VALUES ('legacy', 'old row', 'zh-CN', '/tmp', '/tmp');",
+        )
+        .unwrap();
+        let db = ThreadsDatabase {
+            conn: Mutex::new(conn),
+        };
+
+        // The pre-existing row loads despite the extra column.
+        let legacy = db.load("legacy").unwrap().expect("legacy row loads");
+        assert_eq!(legacy.summary, "old row");
+        assert_eq!(legacy.cwd, "/tmp");
+
+        // A fresh record upserts into the same old table.
+        let rec = sample_record("fresh");
+        db.upsert(&rec, true).unwrap();
+        let loaded = db.load("fresh").unwrap().expect("fresh row round-trips");
+        assert_eq!(loaded.summary, rec.summary);
+        assert_eq!(loaded.messages.len(), rec.messages.len());
+    }
+
     fn sample_record(id: &str) -> ThreadRecord {
         let mut usage = HashMap::new();
         usage.insert(

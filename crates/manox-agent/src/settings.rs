@@ -408,18 +408,61 @@ pub fn load() -> Settings {
     }
 }
 
-/// Serialize `settings` to `settings.toml`, creating the manox config
-/// directory on demand. Errors are returned to the caller — settings writes
-/// originate from explicit user action (UI save button), so surfacing a
-/// failure is the right move.
+/// Persist `settings` to `settings.toml`, creating the manox config directory
+/// on demand.
+///
+/// This crate shares the file with the host application, which owns keys this
+/// struct does not model (currently `ui_language`). A whole-document rewrite
+/// would silently delete them, so the write is a parse-edit-merge: the on-disk
+/// document is read, the tables this struct owns are replaced wholesale, and
+/// every other key is carried over verbatim. Within an owned table a removed
+/// field does disappear, which is the intended behavior for our own schema.
+///
+/// Errors are returned to the caller — settings writes originate from explicit
+/// user action (UI save button), so surfacing a failure is the right move.
 pub fn save(settings: &Settings) -> Result<()> {
     let dir = paths::ensure_manox_config_dir()
         .context("ensuring manox config dir exists before writing settings.toml")?;
     let path = dir.join("settings.toml");
-    let body = toml::to_string_pretty(settings).context("serializing settings.toml")?;
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(raw) => Some(raw),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).context("reading settings.toml"),
+    };
+    let body = merge_into_existing(settings, existing.as_deref())?;
     std::fs::write(&path, body)
         .with_context(|| format!("writing settings.toml at {}", path.display()))?;
     Ok(())
+}
+
+/// Render `settings` as a document to write, preserving any keys in
+/// `existing` that this crate does not own.
+///
+/// Split out from [`save`] so the merge semantics are testable without
+/// touching the filesystem or the process environment.
+fn merge_into_existing(settings: &Settings, existing: Option<&str>) -> Result<String> {
+    let owned = toml::Value::try_from(settings)
+        .context("serializing settings.toml")?
+        .as_table()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut doc = match existing {
+        Some(raw) => toml::from_str::<toml::Value>(raw).unwrap_or_else(|e| {
+            // A corrupt file cannot be merged into; replacing it is the only
+            // way forward, and the warn keeps the loss diagnosable.
+            tracing::warn!(error = %e, "settings.toml parse failed; rewriting it from scratch");
+            toml::Value::Table(toml::map::Map::new())
+        }),
+        None => toml::Value::Table(toml::map::Map::new()),
+    };
+    let table = doc
+        .as_table_mut()
+        .context("settings.toml top level is not a table")?;
+    for (key, value) in owned {
+        table.insert(key, value);
+    }
+    toml::to_string_pretty(&doc).context("serializing settings.toml")
 }
 
 #[cfg(test)]
@@ -438,6 +481,98 @@ follow_up_behavior = "Steer"
 "#;
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.default_model, None);
+    }
+
+    /// `settings.toml` is shared with the host application, which owns keys
+    /// this crate does not model (`ui_language`). Saving must not delete them:
+    /// a whole-document rewrite would, silently resetting the user's chosen UI
+    /// language the next time any owned setting changed.
+    #[test]
+    fn save_preserves_host_owned_keys() {
+        let existing = r#"ui_language = "en"
+default_model = "kept"
+"#;
+        let settings = Settings {
+            default_model: Some("written".into()),
+            mcp: McpSettings {
+                disabled: vec!["some-server".into()],
+            },
+            ..Default::default()
+        };
+
+        let out = merge_into_existing(&settings, Some(existing)).unwrap();
+
+        assert!(
+            out.contains(r#"ui_language = "en""#),
+            "the host-owned key was dropped:\n{out}"
+        );
+        // Keys this crate owns are written from the struct.
+        assert!(out.contains("written"), "owned write missing:\n{out}");
+        assert!(out.contains("some-server"), "owned write missing:\n{out}");
+    }
+
+    /// With no file on disk the merge still produces the owned schema, so a
+    /// first-ever save is complete rather than empty.
+    #[test]
+    fn save_without_an_existing_file_writes_the_owned_schema() {
+        let settings = Settings {
+            default_model: Some("written".into()),
+            ..Default::default()
+        };
+        let out = merge_into_existing(&settings, None).unwrap();
+        assert!(out.contains("written"), "owned value missing:\n{out}");
+        assert!(
+            out.contains("[context_optimization]"),
+            "schema missing:\n{out}"
+        );
+    }
+
+    /// A corrupt file cannot be merged into, so it is replaced rather than
+    /// blocking a save forever.
+    #[test]
+    fn save_recovers_from_a_corrupt_existing_file() {
+        let settings = Settings {
+            default_model: Some("written".into()),
+            ..Default::default()
+        };
+        let out = merge_into_existing(&settings, Some("this is not = valid = toml")).unwrap();
+        assert!(out.contains("written"), "owned value missing:\n{out}");
+        assert!(
+            out.contains("[context_optimization]"),
+            "schema missing:\n{out}"
+        );
+    }
+
+    /// On-disk round trip through the merge: the document written back must
+    /// still carry a host-owned `ui_language` and any unowned value, so the app
+    /// reads the same language after the runtime saved one of its own settings.
+    #[test]
+    fn merge_round_trip_keeps_host_owned_keys_on_disk() {
+        let before = "ui_language = \"en\"\ndefault_model = \"x\"\n";
+        let settings = Settings {
+            mcp: McpSettings {
+                disabled: vec!["srv".into()],
+            },
+            ..Default::default()
+        };
+
+        let after = merge_into_existing(&settings, Some(before)).unwrap();
+
+        assert!(
+            after.contains("ui_language = \"en\""),
+            "host-owned key dropped:\n{after}"
+        );
+        assert!(
+            after.contains("default_model = \"x\""),
+            "unowned value dropped:\n{after}"
+        );
+        assert!(after.contains("srv"), "owned write missing:\n{after}");
+        // And the app's parser still finds the language it wrote.
+        let parsed: toml::Value = toml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed.get("ui_language").and_then(|v| v.as_str()),
+            Some("en")
+        );
     }
 
     // ── context optimization / side-call tests ──────────────────────

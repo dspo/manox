@@ -432,7 +432,7 @@ impl PiAgentTool for PiAskUserQuestionTool {
 /// Fallback display title for an `AskUserQuestion` tool call whose own
 /// `header`/summary is empty. English, never localized: it travels to clients
 /// as model-facing tool-call metadata.
-const CLARIFY_TITLE: &str = "Clarification";
+const CLARIFY_TITLE: &str = "Clarifying question";
 
 /// Mint a stable `id` onto every question that lacks one (B2-PR-1). Runs in
 /// `execute` after validation and before the request is parked/emitted, so
