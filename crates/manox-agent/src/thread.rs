@@ -419,6 +419,9 @@ pub struct Thread {
     /// Events buffered by cx-free mutations, drained and broadcast to the
     /// handle's subscribers after each operation (replaces `cx.emit`).
     pending_events: Vec<ThreadEvent>,
+    pending_registry_displays: Vec<(usize, String)>,
+    pending_user_attributions: Vec<(usize, manox_harness::session_meta::UserAttributionMeta)>,
+    pending_interactions: Option<i64>,
     /// Engine notice channel parked by `ensure_engine` (lazy engine). `open`
     /// drains its engine directly at construction (no outer `with_mut` to
     /// borrow); `ensure_engine` runs inside a `with_mut`, so it parks the
@@ -797,6 +800,9 @@ impl Thread {
             goal_bridge: None,
             cwd_path: None,
             pending_events: Vec::new(),
+            pending_registry_displays: Vec::new(),
+            pending_user_attributions: Vec::new(),
+            pending_interactions: None,
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         })
@@ -902,6 +908,9 @@ impl Thread {
             goal_bridge,
             cwd_path: None,
             pending_events: Vec::new(),
+            pending_registry_displays: Vec::new(),
+            pending_user_attributions: Vec::new(),
+            pending_interactions: None,
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         });
@@ -1095,6 +1104,7 @@ impl Thread {
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
+                self.flush_pending_meta();
                 self.refresh_history();
                 // Rebuild on restore, and also after a failed restore — the
                 // preview may have streamed a corrupt file's partial content
@@ -1237,6 +1247,7 @@ impl Thread {
             .collect();
         self.display = display;
         self.request_usage = engine.request_token_usage();
+        self.flush_pending_meta();
     }
 
     // ── Thread duck-type: the turn pipeline ────────────────────────────────
@@ -1370,6 +1381,7 @@ impl Thread {
             return;
         }
         self.ensure_engine(self.project.clone());
+        self.flush_pending_meta();
         let prompt = std::mem::take(&mut self.pending_prompts).join("\n\n");
         let images = std::mem::take(&mut self.pending_images);
         let origin = self.pending_turn_origin.take();
@@ -1844,6 +1856,9 @@ impl Thread {
             label: name,
             cwd_path: None,
             pending_events: Vec::new(),
+            pending_registry_displays: Vec::new(),
+            pending_user_attributions: Vec::new(),
+            pending_interactions: None,
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         });
@@ -2218,7 +2233,16 @@ impl Thread {
         let Some(cmd) = crate::command::global().get(name).cloned() else {
             return false;
         };
-        self.insert_slash_turn(cmd.render(args), ui);
+        let mut ui = ui.unwrap_or_default();
+        if ui.display_text.is_none() {
+            let display = if args.trim().is_empty() {
+                format!("/{}", name)
+            } else {
+                format!("/{} {}", name, args.trim())
+            };
+            ui.display_text = Some(display);
+        }
+        self.insert_slash_turn(cmd.render(args), Some(ui));
         true
     }
 
@@ -2239,7 +2263,16 @@ impl Thread {
             },
         )
         .expect("skill body render");
-        self.insert_slash_turn(rendered, ui);
+        let mut ui = ui.unwrap_or_default();
+        if ui.display_text.is_none() {
+            let display = if args.trim().is_empty() {
+                format!("/{}", key)
+            } else {
+                format!("/{} {}", key, args.trim())
+            };
+            ui.display_text = Some(display);
+        }
+        self.insert_slash_turn(rendered, Some(ui));
         true
     }
 
@@ -2459,12 +2492,49 @@ impl Thread {
             .count()
     }
 
+    fn flush_pending_meta(&mut self) {
+        if self.pending_registry_displays.is_empty()
+            && self.pending_user_attributions.is_empty()
+            && self.pending_interactions.is_none()
+        {
+            return;
+        }
+        let Some(session_path) = self.active_session_path() else {
+            return;
+        };
+        let Some(sessions_dir) = crate::paths::manox_config_dir()
+            .ok()
+            .map(|dir| dir.join("sessions"))
+        else {
+            return;
+        };
+        for (ordinal, display) in std::mem::take(&mut self.pending_registry_displays) {
+            persist_registry_display_spawn(
+                sessions_dir.clone(),
+                session_path.clone(),
+                ordinal,
+                display,
+            );
+        }
+        for (ordinal, record) in std::mem::take(&mut self.pending_user_attributions) {
+            persist_user_attribution_spawn(
+                sessions_dir.clone(),
+                session_path.clone(),
+                ordinal,
+                record,
+            );
+        }
+        if let Some(at) = self.pending_interactions.take() {
+            persist_interaction_spawn(sessions_dir, session_path, at);
+        }
+    }
+
     /// Persist a registry turn's compact display form (`/key args`) in the
     /// session sidecar. The pi transcript stores only the expanded
     /// macro/skill body, so the sidecar is what lets `engine::sync_history`
     /// restore the send-time bubble after a reload. Fire-and-forget: a lost
     /// write only narrows the reload window, the live bubble is unaffected.
-    fn persist_registry_display(&self, ordinal: usize, display: Option<String>) {
+    fn persist_registry_display(&mut self, ordinal: usize, display: Option<String>) {
         let Some(display) = display else {
             return;
         };
@@ -2474,16 +2544,17 @@ impl Thread {
         else {
             return;
         };
-        let Some(session_path) = self.active_session_path() else {
-            return;
-        };
-        persist_registry_display_spawn(sessions_dir, session_path, ordinal, display);
+        if let Some(session_path) = self.active_session_path() {
+            persist_registry_display_spawn(sessions_dir, session_path, ordinal, display);
+        } else {
+            self.pending_registry_displays.push((ordinal, display));
+        }
     }
 
     /// Persist the attribution of an injected user turn in the session
     /// sidecar so a reload restores the send-time header. Same ordinal
     /// convention as `persist_registry_display`; a compaction clears both.
-    fn persist_user_attribution(&self, ordinal: usize, ui: &Option<MessageUiMetadata>) {
+    fn persist_user_attribution(&mut self, ordinal: usize, ui: &Option<MessageUiMetadata>) {
         let Some(ui) = ui else {
             return;
         };
@@ -2496,15 +2567,16 @@ impl Thread {
         else {
             return;
         };
-        let Some(session_path) = self.active_session_path() else {
-            return;
-        };
         let record = manox_harness::session_meta::UserAttributionMeta {
             author: author.routing().to_string(),
             peer: ui.peer,
             display_text: ui.display_text.clone(),
         };
-        persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
+        if let Some(session_path) = self.active_session_path() {
+            persist_user_attribution_spawn(sessions_dir, session_path, ordinal, record);
+        } else {
+            self.pending_user_attributions.push((ordinal, record));
+        }
     }
 
     /// Advance the session's interaction stamp — the sidebar's only recency
@@ -2514,7 +2586,7 @@ impl Thread {
     /// user-role message with no `author` is human input by the
     /// `MessageUiMetadata::author` contract. Fire-and-forget: the send path
     /// already refreshes the list, so this write never rides a rescan.
-    fn stamp_interaction(&self, human: bool) {
+    fn stamp_interaction(&mut self, human: bool) {
         if !human {
             return;
         }
@@ -2524,10 +2596,12 @@ impl Thread {
         else {
             return;
         };
-        let Some(session_path) = self.active_session_path() else {
-            return;
-        };
-        persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
+        let now = chrono::Utc::now().timestamp();
+        if let Some(session_path) = self.active_session_path() {
+            persist_interaction_spawn(sessions_dir, session_path, now);
+        } else {
+            self.pending_interactions = Some(now);
+        }
     }
 
     /// Whether the pi backend restored an existing session at startup.
@@ -2796,6 +2870,9 @@ pub(crate) mod tests {
             goal_bridge: None,
             cwd_path: None,
             pending_events: Vec::new(),
+            pending_registry_displays: Vec::new(),
+            pending_user_attributions: Vec::new(),
+            pending_interactions: None,
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         })
@@ -3811,6 +3888,23 @@ pub(crate) mod tests {
         })));
         thread.read(|t| {
             assert_eq!(t.project(), Some(&PathBuf::from("/store/project")));
+        });
+    }
+
+    #[tokio::test]
+    async fn submit_skill_preserves_slash_literal_display_text() {
+        let engine = Arc::new(FakeEngine::new());
+        let thread = thread_with_engine(HistoryPhase::Ready, engine);
+        thread.with_mut(|t| {
+            let handled = t.submit_skill("gitwork:deliver", "arg1", None);
+            assert!(handled, "skill should be handled");
+            let msg = t.messages.last().expect("last message present");
+            assert_eq!(msg.display_text(), Some("/gitwork:deliver arg1"));
+            let content_str = format!("{:?}", msg.content);
+            assert!(
+                content_str.contains("Deliver the completed task"),
+                "message content must contain expanded prompt body"
+            );
         });
     }
 }

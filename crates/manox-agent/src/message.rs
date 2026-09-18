@@ -179,6 +179,12 @@ impl Message {
     pub fn push_content(&mut self, content: MessageContent) {
         self.content.push(content);
     }
+
+    /// Returns the UI display text if set (e.g. compact slash command or
+    /// skill invocation), without expanding the full model-facing prompt body.
+    pub fn display_text(&self) -> Option<&str> {
+        self.ui.as_ref().and_then(|ui| ui.display_text.as_deref())
+    }
 }
 
 #[cfg(test)]
@@ -286,5 +292,17 @@ mod tests {
             MessageAuthor::from_routing("Sailor"),
             MessageAuthor::Agent("Sailor".into())
         );
+    }
+
+    #[test]
+    fn message_display_text_prefers_ui_display_text() {
+        let mut msg = Message::user("expanded skill body prompt text".to_string());
+        assert_eq!(msg.display_text(), None);
+
+        msg.ui = Some(MessageUiMetadata {
+            display_text: Some("/gitwork:deliver".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(msg.display_text(), Some("/gitwork:deliver"));
     }
 }

@@ -3276,6 +3276,22 @@ fn sync_live_history(live: &Arc<Mutex<LiveTranscript>>, state: &Arc<EngineState>
     // notes so a mid-run switch-back keeps the cards at their position.
     let notes = state.notes.lock().unwrap().clone();
     merge_positioned_notes(&mut display, &notes);
+    // Carry over send-time UI chrome (display_text, author, peer) from the
+    // existing history so mid-run refreshes don't strip it.
+    let prev_ui: Vec<Option<crate::message::MessageUiMetadata>> = history
+        .iter()
+        .filter_map(|entry| match entry {
+            HistoryEntry::Message(m) => Some(m.ui.clone()),
+            HistoryEntry::Note(_) => None,
+        })
+        .collect();
+    for (entry, old_ui) in display.iter_mut().zip(prev_ui) {
+        if let HistoryEntry::Message(m) = entry
+            && let Some(ui) = old_ui
+        {
+            m.ui = Some(ui);
+        }
+    }
     *history = display;
     true
 }
@@ -5505,7 +5521,9 @@ fn attach_user_attributions(
                 let ui = message.ui.get_or_insert_with(Default::default);
                 ui.author = Some(crate::message::MessageAuthor::from_routing(&record.author));
                 ui.peer = record.peer;
-                ui.display_text = record.display_text.clone();
+                if let Some(display_text) = &record.display_text {
+                    ui.display_text = Some(display_text.clone());
+                }
             }
             ordinal += 1;
         }
@@ -6237,6 +6255,38 @@ mod tests {
         assert!(
             ui_at(2).is_none(),
             "tool results never consume an ordinal nor carry attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_user_attributions_preserves_registry_display_when_attribution_display_is_none()
+    {
+        let mut msg = Message::user("expanded skill prompt text".to_string());
+        msg.ui = Some(crate::message::MessageUiMetadata {
+            display_text: Some("/gitwork:deliver".to_string()),
+            ..Default::default()
+        });
+        let mut history = vec![HistoryEntry::Message(msg)];
+        let attributions = [(
+            0usize,
+            manox_harness::session_meta::UserAttributionMeta {
+                author: "lead".into(),
+                peer: false,
+                display_text: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        attach_user_attributions(&mut history, &attributions);
+        let HistoryEntry::Message(message) = &history[0] else {
+            panic!("expected message");
+        };
+        let ui = message.ui.as_ref().expect("ui metadata present");
+        assert_eq!(ui.author, Some(crate::message::MessageAuthor::Lead));
+        assert_eq!(
+            ui.display_text.as_deref(),
+            Some("/gitwork:deliver"),
+            "display text set by registry display is preserved"
         );
     }
 

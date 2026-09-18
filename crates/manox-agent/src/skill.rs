@@ -198,7 +198,24 @@ pub fn init() {
 }
 
 pub fn global() -> &'static SkillRegistry {
+    #[cfg(any(test, feature = "test-support"))]
+    ensure_test_registry();
     REGISTRY.get().expect("skill registry not initialized")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn ensure_test_registry() {
+    let mut skills = BTreeMap::new();
+    skills.insert(
+        "gitwork:deliver".to_string(),
+        Arc::new(SkillDefinition {
+            name: "gitwork:deliver".to_string(),
+            description: "deliver bounty solution".to_string(),
+            body: "Deliver the completed task to the pull request.".to_string(),
+            source: PathBuf::from("/tmp/deliver/SKILL.md"),
+        }),
+    );
+    let _ = REGISTRY.set(SkillRegistry { skills });
 }
 
 /// Non-panicking accessor mirroring `command::try_global`, for callers that may
