@@ -1,7 +1,7 @@
 <critical>
 Plan mode is active. You MUST preserve read-only working-tree and system semantics:
 - You NEVER create, edit, delete, or rename working-tree files.
-- You NEVER run state-changing commands (`git commit`, installs, migrations) or make any other system change — `Bash` and other mutating tools are blocked while plan mode is on.
+- You NEVER run state-changing commands (`git commit`, installs, migrations) or make any other system change. `Bash` is admitted only for single read-only `git` commands (one command, no pipes/redirects/expansions — e.g. `git log -n 20`, `git -C <path> diff`, `git status`, `git config --get <key>`); every other command stays blocked while plan mode is on.
 - Read-only subagents (the `Explore` delegation tool, without `isolation`) stay available for delegated research; write/bash subagents (`Sailor`) and any `isolation: "worktree"` dispatch are blocked.
 - Plan files under `{{ plans_dir }}` are session-local planning artifacts: you MAY create or update them with `Write`/`Edit` (these writes are approval-free).
 - Temp scratch under `/tmp` and `/private/tmp` is also writable with `Write`/`Edit` (approval-free) for throwaway research artifacts; it is scratch space, not the working tree.

@@ -4,10 +4,13 @@
 //! (`~/.manox/plans/<slug>-plan.md`), and submits it for the user's verdict
 //! through the [`ProposePlanTool`] — a structured tool call, not free-text
 //! parsing. While plan mode is active a `ToolCall` hook hard-blocks mutating
-//! tools (plan-file and temp-scratch writes excepted, ungated) and a
-//! `BeforeAgentStart` hook injects the plan-mode instructions every turn. All
-//! wiring rides the kernel's existing extension points; `crates/pi` stays
-//! untouched.
+//! tools (plan-file and temp-scratch writes excepted, ungated), admits Bash
+//! only for single read-only `git` commands (see [`git_read_only`]), and a
+//! `BeforeAgentStart` hook injects the plan-mode instructions every turn.
+//! All wiring rides the kernel's existing extension points; `crates/pi`
+//! stays untouched.
+
+mod git_read_only;
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -29,10 +32,11 @@ pub const PROPOSE_PLAN: &str = "ProposePlan";
 
 /// Tools that stay available while plan mode is active. Read-only research
 /// tools plus the interaction/proposal devices; everything else is blocked
-/// (the working tree must stay untouched while planning). The `Agent` tool
-/// is conditionally allowed for read-only subagents (e.g. `Explore`) — see
-/// the gate's dispatch check; write/bash subagents (`Sailor`) and worktree
-/// isolation stay blocked.
+/// (the working tree must stay untouched while planning) — Bash excepted,
+/// which the gate admits only per-command as a read-only `git` invocation
+/// (see [`git_read_only`]). The `Agent` tool is conditionally allowed for
+/// read-only subagents (e.g. `Explore`) — see the gate's dispatch check;
+/// write/bash subagents (`Sailor`) and worktree isolation stay blocked.
 const PLAN_MODE_ALLOWED_TOOLS: &[&str] = &[
     "Read",
     "Grep",
@@ -312,10 +316,11 @@ fn is_read_only_subagent_dispatch(
 
 /// The `ToolCall` hook enforcing plan mode's read-only guarantee: research
 /// tools and the proposal devices pass; Write/Edit pass only for plan-file
-/// and temp-scratch targets; an `Agent` call passes only for a read-only
-/// subagent (e.g. `Explore`) without worktree isolation; every other tool
-/// (Bash, Monitor, write/bash sub-agents, MCP, …) is blocked with a reason
-/// the model can act on.
+/// and temp-scratch targets; a `Bash` call passes only when its command is a
+/// single read-only `git` invocation ([`git_read_only`]); an `Agent` call
+/// passes only for a read-only subagent (e.g. `Explore`) without worktree
+/// isolation; every other tool (Monitor, write/bash sub-agents, MCP, …) is
+/// blocked with a reason the model can act on.
 pub fn gate_handler(
     state: Arc<PlanSessionState>,
     plans_dir: PathBuf,
@@ -332,6 +337,7 @@ pub fn gate_handler(
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         let allowed = PLAN_MODE_ALLOWED_TOOLS.contains(&tool_name)
+            || is_read_only_git_bash_call(tool_name, &ctx.data["args"])
             || (PLAN_MODE_PATH_GATED_TOOLS.contains(&tool_name)
                 && is_plan_mode_writable_param(tool_name, &ctx.data["args"], &plans_dir, &cwd))
             || is_read_only_subagent_dispatch(tool_name, &ctx.data["args"], &is_read_only_subagent);
@@ -339,14 +345,26 @@ pub fn gate_handler(
             ctx.block_reason = Some(format!(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} and temp scratch (/tmp, /private/tmp) may be \
-                 written (Write/Edit); research with Read/Grep/Glob/Ls or a read-only \
-                 subagent (no worktree isolation), ask with AskUserQuestion, \
+                 written (Write/Edit); research with Read/Grep/Glob/Ls, run read-only git \
+                 through Bash as a single command with no pipes or redirects (e.g. \
+                 `git log`, `git -C <path> diff`, `git config --get <key>`), or use a \
+                 read-only subagent (no worktree isolation); ask with AskUserQuestion, \
                  and submit the plan with {PROPOSE_PLAN}.",
                 plans_dir.display()
             ));
         }
         ctx
     })
+}
+
+/// The Bash arm of the plan-mode gate: the call passes only when the
+/// command string classifies as a single read-only `git` invocation.
+fn is_read_only_git_bash_call(tool_name: &str, args: &serde_json::Value) -> bool {
+    tool_name == "Bash"
+        && args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .is_some_and(git_read_only::is_read_only_git_command)
 }
 
 /// The `BeforeAgentStart` hook injecting the rendered plan-mode instructions
@@ -935,9 +953,35 @@ mod tests {
             .block_reason
             .is_some()
         );
-        // Bash / other mutating tools blocked.
+        // Bash: read-only git passes, everything else stays blocked.
+        assert!(
+            run(
+                "Bash",
+                serde_json::json!({"command": "git log --oneline -n 5"})
+            )
+            .block_reason
+            .is_none()
+        );
+        assert!(
+            run(
+                "Bash",
+                serde_json::json!({"command": "git -C ../manox diff --stat"})
+            )
+            .block_reason
+            .is_none()
+        );
         assert!(
             run("Bash", serde_json::json!({"command": "ls"}))
+                .block_reason
+                .is_some()
+        );
+        assert!(
+            run("Bash", serde_json::json!({"command": "git push"}))
+                .block_reason
+                .is_some()
+        );
+        assert!(
+            run("Bash", serde_json::json!({"command": "git log | head -5"}))
                 .block_reason
                 .is_some()
         );

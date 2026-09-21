@@ -2309,6 +2309,7 @@ dependencies = [
  "base64",
  "brush-builtins",
  "brush-core",
+ "brush-parser",
  "chrono",
  "futures",
  "globset",
