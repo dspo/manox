@@ -10,6 +10,8 @@
 
 pub mod agent_client;
 pub mod agent_server;
+/// Read-only journal → AHP channel-state fold (v3 W2; see the module docs).
+pub mod ahp;
 pub mod follow;
 pub mod journal_query;
 pub mod model_chat;

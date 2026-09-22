@@ -21,6 +21,13 @@ tokio.workspace = true
 tokio-util.workspace = true
 manox-protocol.workspace = true
 manox-workspace.workspace = true
+# v3 (AHP) W2: the read-only journal → AHP channel-state fold (`src/ahp/`)
+# runs the host's own translator + the shared `ahp` reducers over the
+# journal, and reads the durable vocabulary from the leaf journal crate.
+manox-ahp.workspace = true
+manox-journal.workspace = true
+ahp.workspace = true
+ahp-types.workspace = true
 manox-terminal = { workspace = true, optional = true }
 parking_lot.workspace = true
 # The WS gateway transport arm (`src/ws/`) — the network face of the

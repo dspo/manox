@@ -2567,6 +2567,8 @@ dependencies = [
 name = "manox-session-core"
 version = "0.1.0"
 dependencies = [
+ "ahp",
+ "ahp-types",
  "anyhow",
  "async-channel",
  "async-trait",
@@ -2575,7 +2577,9 @@ dependencies = [
  "futures",
  "libc",
  "manox-agent",
+ "manox-ahp",
  "manox-harness",
+ "manox-journal",
  "manox-protocol",
  "manox-terminal",
  "manox-workspace",
