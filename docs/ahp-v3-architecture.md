@@ -314,7 +314,62 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ## §H as-built
 
-<!-- 占位：本节随各期落地逐段追加，记录与上文冻结规格的偏离（含 AHP 上游文档漂移的具体差异、
+<!-- 本节随各期落地逐段追加，记录与上文冻结规格的偏离（含 AHP 上游文档漂移的具体差异、
      映射表的实施期修订、W1 实际模块面与 §E.2/§F 的出入）。规格正文不回改，偏离只进本节。 -->
 
-（待填：W1 宿主骨架落地时追加第一段。）
+### H.1 W0/W1/W2（宿主侧 + 运行时只读面）已落地，2026-09-23
+
+分支 `codex/ahp-host`（5 个提交，未 push、未开 PR）。已落地面与门禁：
+
+- **W0 规格冻结**：本文档 + `docs/dsh-v2-architecture.md` 顶部取代指针。
+- **journal 词汇叶子化**：新增 `crates/manox-journal/`（`journal.rs` 377 + `base64_bytes.rs` 53），
+  偏离 §F/§E 的「迁入 manox-session-core」——叶子 crate 才不打断依赖拓扑
+  （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。
+  迁移窗口内 `manox-protocol` 以 `pub use manox_journal as journal;` 重导出，v2 面零改动。
+- **W1 宿主骨架**：`crates/manox-ahp/`（wire/router/sequencer/channels/backend/ext/error/
+  translate/transport{inproc,axum_ws}）。与 §E.2 的实施期修订：`Backend` 缝的实现方是
+  `manox-session-core`（见下），`Host` 自带 `chat_state`/`session_state` 读面供收敛性门禁使用。
+- **W2 宿主侧翻译**：`translate/actions.rs` 的状态机（`Translator::on_entry`）覆盖全部
+  journal 变体；`translate/mod.rs` 的 `target_of` 穷举即「新内核变体不落 wire 就编译失败」的门。
+  实施期修订：扩展动作的 `x-manox/*` 清单在 W2 增补了 `x-manox-work/activeToolsChanged`、
+  `x-manox/labelChanged`、`x-manox/sessionInfoChanged`、`x-manox/leafChanged`（AHP 无对应位）。
+- **W2 运行时只读面**：`crates/manox-session-core/src/ahp/` 的 `chat_state`/`session_state`
+  折叠（journal → AHP 通道状态），落定「宿主/客户端/冷启动折同一函数」的 L10 承诺；
+  诚实留空项见该模块文档头（live 连接事实、pin/label、会话级 token 汇总）。
+- **门禁**：`script/gates.sh` 六腿全 PASS（fmt/prod-libs/lean-libs/clippy/test-real/test-clean）；
+  `cargo test -p manox-ahp --features axum-ws` = 26 绿（14 单测 + 9 进程内 + 2 收敛性 + 1 WS）；
+  `cargo test -p manox-session-core` = 172 绿。
+
+### H.2 收敛性门禁抓到并修掉的缺陷（留档）
+
+首次运行 `crates/manox-ahp/tests/translation_convergence.rs` 即失败：翻译把
+`Approval{kind:"request"}` 也走了一遍 `chat/toolCallConfirmed`（此时 `verdict` 为空 ⇒ 读作拒绝），
+于是**正在等用户裁决的 tool call 被提前取消并 settle**，其后的 `ToolResult` 再也无法 complete，
+终态为 `Cancelled(Skipped)`。修法：request 只发 `chat/toolCallReady` + `session/inputNeededSet`；
+confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
+`Run → Ready → Confirmed → Complete(Completed{success:true})`，收敛与结构断言双绿。
+
+### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
+
+1. **W2 余下**：`manox_ahp::Backend` 的运行时实现（`dispatch` 动作→既有 intent 映射、
+   `createSession`/`disposeSession`/`createChat` 落到 AgentServer 既有 intent）、
+   网关同 listener 挂 `manox_ahp::transport::axum_ws::router("/ahp", host)`（v2 的 `/ws` 保留到 W4）、
+   `x-manox/*` 命令面与 `resource*` 最小文件面、`extension_baseline` 的真实现。
+   **该面未落地前，`/ahp` 路由不存在，外部 AHP 客户端尚不可连**——§G 的 W2 门禁 ④（真客户端 smoke）因此未执行。
+2. **W3**：manox-app 侧的 `AhpStore`（`ahp::Client` + reducers）、进程内 `ahp::Transport`、
+   `ConversationState` 改由 `ChatState.responseParts` 派生、删 `client_store*`/`journal_fold`/
+   `journal_translate`/`server_note_translate`、重写 `source_gates.rs`、更新 `UI-MAP.md`。
+3. **W4**：按 §F 删除清单拆除 v2；grep 门禁（生产区零 `FromClient|FromServer|ClientCall|
+   ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；`manox-napi` 改 AHP；
+   `~/.manox/gateway-ws.json` → `ahp-ws.json`、`cx web` → `cx ahp`。
+4. **W5**：有界重放缓冲（按 `serverSeq` 重放替换快照腿）、`delivery.maxLatencyMs` 合并调优、
+   `resource*` 完整面、远程鉴权、多客户端并发与 owner 语义。
+
+### H.4 AHP 上游文档漂移（实施期实测）
+
+- `docs/specification/*.md` 的示例仍写 `"0.3.0"`，而 `ahp-types::version::PROTOCOL_VERSION` 为 `0.9.0`
+  ——实现以 `types/` 与 crate 为准。
+- `JsonRpcRequest.id` 在 `ahp-types` 里是 `u64`：使用字符串 id 的 JSON-RPC 客户端会在解析期被拒
+  （整帧判为 `-32700`）。官方 Rust/TS 客户端均发数字 id，故暂不处理；容忍字符串 id 记入 W5 候选。
+- 规范 §B.4 提到的 `PlanVerdict` 在 `manox-protocol` 里**不存在**（实测 `ServerCall` 只有 6 个变体），
+  计划评审经 `Approve` 腿到达；`x-manox-plan/verdictRequested|verdict` 仍按 §D 声明保留。
