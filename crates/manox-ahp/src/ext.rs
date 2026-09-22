@@ -67,6 +67,9 @@ pub mod actions {
     pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
     /// Sub-agent tree / progress (host-emitted).
     pub const WORK_SUBAGENTS: &str = "x-manox-work/subagentsChanged";
+    /// The engine's active tool set (host-emitted; AHP's `session/serverToolsChanged`
+    /// describes *advertised* tools, not the model's currently-visible subset).
+    pub const WORK_ACTIVE_TOOLS: &str = "x-manox-work/activeToolsChanged";
     /// Aggregated metrics snapshot (host-emitted).
     pub const METRICS_CHANGED: &str = "x-manox-metrics/changed";
     /// Workspace catalogue baseline (host-emitted).
@@ -79,6 +82,14 @@ pub mod actions {
     pub const ORDER_CHANGED: &str = "x-manox/orderChanged";
     /// Thread pinned flag changed (client-dispatchable; AHP has no pin bit).
     pub const PINNED_CHANGED: &str = "x-manox/pinnedChanged";
+    /// A label row attached to an entry (host-emitted; the durable row carries
+    /// no target id, so it is announced as session state, not per-entry state).
+    pub const LABEL_CHANGED: &str = "x-manox/labelChanged";
+    /// Session-info annotation row (host-emitted; AHP has no session-info field).
+    pub const SESSION_INFO_CHANGED: &str = "x-manox/sessionInfoChanged";
+    /// Leaf cursor redirected (host-emitted; the journal's branch cursor has no
+    /// AHP field — forking a chat is the protocol-visible half of the same fact).
+    pub const LEAF_CHANGED: &str = "x-manox/leafChanged";
 
     /// Every declared action.
     pub const ALL: &[&str] = &[
@@ -91,12 +102,16 @@ pub mod actions {
         WORK_BACKGROUND_TASK_STOPPED,
         WORK_BROWSER_SUITES,
         WORK_SUBAGENTS,
+        WORK_ACTIVE_TOOLS,
         METRICS_CHANGED,
         WORKSPACES_BASELINE,
         WORKSPACES_CHANGED,
         WORKSPACES_REMOVED,
         ORDER_CHANGED,
         PINNED_CHANGED,
+        LABEL_CHANGED,
+        SESSION_INFO_CHANGED,
+        LEAF_CHANGED,
     ];
 }
 
@@ -191,6 +206,15 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     "terminal/claimed",
     "terminal/cleared",
 ];
+
+/// Whether an action tag is on the extension surface rather than AHP's own.
+///
+/// AHP's `x-` prefix is the reserved private namespace and no AHP reducer knows
+/// these actions, so a host that "failed to fold" one would only be logging its
+/// own bug. Peers treat them as unknown-tolerant (§D.3).
+pub fn is_extension_action(tag: &str) -> bool {
+    tag.starts_with("x-")
+}
 
 /// Whether the host accepts `action_type` dispatched on `channel_uri`.
 ///

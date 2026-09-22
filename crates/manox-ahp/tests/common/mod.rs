@@ -1,4 +1,5 @@
 //! Shared test fixtures: a minimal but honest [`Backend`].
+#![allow(dead_code)] // every integration-test binary includes this module and uses a different subset
 //!
 //! The backend answers from an in-memory stand-in for the durable journal, so
 //! the conformance suites exercise the real host path (route → acceptance →

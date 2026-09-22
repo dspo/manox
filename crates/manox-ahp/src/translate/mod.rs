@@ -12,9 +12,12 @@
 //! [`target_of`] is an exhaustive match over the entry vocabulary: a kernel
 //! entry added without deciding where it lands on the wire is a compile error,
 //! which is how the "no journal kind is wire-less" rule (v2 §C.2) survives the
-//! protocol change. W2 adds the action construction on top of this
-//! classification; the classification itself is what fixes the channel
-//! boundary, so it lands with the host skeleton.
+//! protocol change. [`actions::Translator`] builds the actions on top of this
+//! classification — one state machine per chat, entry by entry.
+
+pub mod actions;
+
+pub use actions::{Emitted, Translator, config_keys};
 
 use manox_journal::JournalWireEvent;
 

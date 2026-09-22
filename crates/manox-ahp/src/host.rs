@@ -132,6 +132,19 @@ impl Host {
         self.inner.session_added(summary);
     }
 
+    /// The host's authoritative chat state, as its own reducer fold left it.
+    ///
+    /// Convergence gate entry point: a client that reduced the envelopes it was
+    /// handed must land on exactly this value.
+    pub fn chat_state(&self, chat_id: &str) -> Option<ahp_types::state::ChatState> {
+        self.inner.store.read().chat(chat_id).cloned()
+    }
+
+    /// The host's authoritative session state. See [`Host::chat_state`].
+    pub fn session_state(&self, session_id: &str) -> Option<ahp_types::state::SessionState> {
+        self.inner.store.read().session(session_id).cloned()
+    }
+
     /// `root/sessionRemoved` to root subscribers.
     pub fn session_removed(&self, session_id: &str) {
         self.inner.session_removed(session_id);
@@ -237,17 +250,23 @@ impl Inner {
         origin: Option<ActionOrigin>,
     ) -> ActionEnvelope {
         let server_seq = self.seq.stamp() as u64;
-        if let Some(channel) = parse(uri) {
-            let outcome = self.store.write().apply(&channel, &action);
-            if !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
-                tracing::warn!(
-                    channel = uri,
-                    action = %wire::action_tag(&action),
-                    "host action reduced to {outcome:?}"
-                );
+        let tag = wire::action_tag(&action);
+        // Extension actions have no reducer by construction — `x-` is the
+        // reserved private namespace — so folding one could only produce a
+        // false alarm. They travel to subscribers untouched.
+        if !crate::ext::is_extension_action(&tag) {
+            if let Some(channel) = parse(uri) {
+                let outcome = self.store.write().apply(&channel, &action);
+                if !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
+                    tracing::warn!(
+                        channel = uri,
+                        action = %tag,
+                        "host action reduced to {outcome:?}"
+                    );
+                }
+            } else {
+                tracing::warn!(channel = uri, "host action on an unknown channel scheme");
             }
-        } else {
-            tracing::warn!(channel = uri, "host action on an unknown channel scheme");
         }
         ActionEnvelope {
             channel: uri.to_string(),
