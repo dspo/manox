@@ -30,10 +30,10 @@
 //! migration.
 
 pub mod answer_kind;
-pub mod base64_bytes;
+pub use manox_journal::base64_bytes;
 pub mod client;
 pub mod handshake;
-pub mod journal;
+pub use manox_journal as journal;
 pub mod journal_stream;
 pub mod msg;
 pub mod server;

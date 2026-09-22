@@ -28,6 +28,8 @@ members = [
 	"crates/manox-session-core",
 	"crates/manox-napi",
 	"crates/manox-protocol",
+	"crates/manox-journal",
+	"crates/manox-ahp",
 	"crates/manox-terminal",
 	"crates/hyperlinks",
 	"crates/manox-workspace",
@@ -53,6 +55,11 @@ lsp = { path = "crates/lsp" }
 manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
 manox-protocol = { path = "crates/manox-protocol" }
 manox-workspace = { path = "crates/manox-workspace" }
+manox-journal = { path = "crates/manox-journal" }
+# manox-ahp —— AHP（Agent Host Protocol）宿主半边：JSON-RPC 路由、全局
+# serverSeq、通道注册与订阅、journal→AHP 动作翻译、x-manox 扩展声明面。
+# 前端（GPUI 桌面/远程客户端）一律经它对话；v2 面拆除后为唯一协议层。
+manox-ahp = { path = "crates/manox-ahp" }
 manox-harness = { path = "crates/manox-harness" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
@@ -66,6 +73,12 @@ anyhow = "1"
 async-channel = "2"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
+# ahp / ahp-types —— Agent Host Protocol 官方 Rust crate（wire 类型 + 客户端
+# + 纯 reducer）。精确 pin：规范处于 pre-1.0、每个 minor 可能破坏；升级是显式
+# 任务而非顺手之举。宿主侧只用 ahp-types（类型）与 ahp::reducers（双端同码 fold）。
+ahp-types = "=0.9.0"
+ahp = "=0.9.0"
+ahp-ws = "=0.9.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"

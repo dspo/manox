@@ -1,10 +1,11 @@
 //! Journal wire vocabulary — the client-facing §C.2 entry set.
 //!
-//! Declaring surface: `JOURNAL_ENTRIES` (see [`crate::surface`]).
+//! Declaring surface: the AHP translation tables in `manox-ahp` (v3) and, until
+//! it is deleted, the v2 `JOURNAL_ENTRIES` table (`manox_protocol::surface`).
 //! [`JournalWireEvent`] is the wire form of the kernel `JournalEntry` enum
 //! (architecture doc §C.2): every observable state change of a thread is
 //! carried by one of these entries (L3), stamped with a chain-dense `seq` at
-//! the single append point (L4). The frames [`crate::stream`] carry are
+//! the single append point (L4). The v2 follow frames carry
 //! `JournalWireEntry` = `{seq, id, parentId, timestamp, event}` (§C.1);
 //! `StreamFrame::Entry` transports the full entry envelope (`seq`, `id`,
 //! `parentId`, `timestamp`, `event`) — identical to a snapshot record.
@@ -64,7 +65,7 @@ pub struct UsagePayload {
 }
 
 /// Thread header — the journal file's line 0 shape (§C.1), echoed into
-/// [`crate::stream::SessionSnapshot`] so a snapshot is self-describing.
+/// SessionSnapshot (v2 wire) so a snapshot is self-describing.
 ///
 /// Declaring surface: frame payload of `StreamFrame::Snapshot` (§D.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
