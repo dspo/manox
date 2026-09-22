@@ -1,0 +1,293 @@
+//! The x-manox extension surface — AHP's `x-` namespace, used for the domain
+//! state the protocol does not model.
+//!
+//! AHP deliberately stays agent-agnostic: plan mode and plan artefacts, goal,
+//! compaction, background work, browser suites, the sub-agent tree, thread
+//! pinning/ordering/grouping, the workspace rows, the command catalogue, the
+//! aggregated conversation metrics and client-contributed tools have **no**
+//! protocol counterpart. They travel as:
+//!
+//! - extension channels (`x-manox-plan:/<chat-id>`, …) carrying state, and
+//! - extension actions/commands/requests named `x-manox/*`, and
+//! - `_meta` keys on standard channels where the state already has a slot.
+//!
+//! [`declaration`] is the single declaration table for all of it, advertised
+//! once per connection as `initialize` result `_meta["x-manox"]`, so a client
+//! (or a proxy) can tell what this host serves. Unknown extension names are
+//! ignored by peers — a third-party AHP host simply serves none of this, and
+//! the manox client degrades to the standard surface.
+
+use serde_json::{Value, json};
+
+/// `_meta` key carrying the declaration on both `initialize` params and result.
+pub const META_KEY: &str = "x-manox";
+
+/// Extension surface version. Bump when an extension is renamed or removed.
+pub const VERSION: u32 = 1;
+
+/// State-bearing extension channel prefixes, in declaration order.
+pub mod channels {
+    /// Plan mode, plan document, plan review lifecycle (per chat).
+    pub const PLAN: &str = "x-manox-plan:/";
+    /// Goal, background tasks, browser suites, sub-agent tree (per session).
+    pub const WORK: &str = "x-manox-work:/";
+    /// Aggregated conversation metrics — the v2 Q face (per chat).
+    pub const METRICS: &str = "x-manox-metrics:/";
+    /// Durable workspace rows: directory identity plus ordered session account.
+    pub const WORKSPACES: &str = "x-manox-workspaces://";
+    /// Command / skill catalogue (stateless snapshot channel).
+    pub const COMMANDS: &str = "x-manox-commands://";
+    /// Bare-model completion side stream for client model providers (stateless).
+    pub const MODEL_CHAT: &str = "x-manox-modelchat:/";
+
+    /// Every declared channel prefix.
+    pub const ALL: &[&str] = &[PLAN, WORK, METRICS, WORKSPACES, COMMANDS, MODEL_CHAT];
+}
+
+/// Actions served by the extension channels.
+///
+/// A declaration row exists the moment the host *emits* the action; rows are
+/// grouped by channel in the declaration payload.
+pub mod actions {
+    /// Plan mode toggled (client-dispatchable).
+    pub const PLAN_MODE_CHANGED: &str = "x-manox-plan/planModeChanged";
+    /// The plan document changed (host-emitted).
+    pub const PLAN_CHANGED: &str = "x-manox-plan/planChanged";
+    /// A plan review is due, carrying the verdict request (host-emitted).
+    pub const PLAN_VERDICT_REQUESTED: &str = "x-manox-plan/verdictRequested";
+    /// A plan verdict settled (client-dispatchable).
+    pub const PLAN_VERDICT: &str = "x-manox-plan/verdict";
+    /// Goal set/cleared (host-emitted; clients set it through `x-manox/goal`).
+    pub const WORK_GOAL_CHANGED: &str = "x-manox-work/goalChanged";
+    /// Background-task registry snapshot (host-emitted).
+    pub const WORK_BACKGROUND_TASKS: &str = "x-manox-work/backgroundTasksChanged";
+    /// Background task stopped (client-dispatchable).
+    pub const WORK_BACKGROUND_TASK_STOPPED: &str = "x-manox-work/backgroundTaskStopped";
+    /// Active browser suites (host-emitted; clients set through `session/configChanged`).
+    pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
+    /// Sub-agent tree / progress (host-emitted).
+    pub const WORK_SUBAGENTS: &str = "x-manox-work/subagentsChanged";
+    /// Aggregated metrics snapshot (host-emitted).
+    pub const METRICS_CHANGED: &str = "x-manox-metrics/changed";
+    /// Workspace catalogue baseline (host-emitted).
+    pub const WORKSPACES_BASELINE: &str = "x-manox-workspaces/baseline";
+    /// One workspace row upserted (host-emitted).
+    pub const WORKSPACES_CHANGED: &str = "x-manox-workspaces/changed";
+    /// A workspace row removed (host-emitted).
+    pub const WORKSPACES_REMOVED: &str = "x-manox-workspaces/removed";
+    /// Thread/workspace display order changed (client-dispatchable).
+    pub const ORDER_CHANGED: &str = "x-manox/orderChanged";
+    /// Thread pinned flag changed (client-dispatchable; AHP has no pin bit).
+    pub const PINNED_CHANGED: &str = "x-manox/pinnedChanged";
+
+    /// Every declared action.
+    pub const ALL: &[&str] = &[
+        PLAN_MODE_CHANGED,
+        PLAN_CHANGED,
+        PLAN_VERDICT_REQUESTED,
+        PLAN_VERDICT,
+        WORK_GOAL_CHANGED,
+        WORK_BACKGROUND_TASKS,
+        WORK_BACKGROUND_TASK_STOPPED,
+        WORK_BROWSER_SUITES,
+        WORK_SUBAGENTS,
+        METRICS_CHANGED,
+        WORKSPACES_BASELINE,
+        WORKSPACES_CHANGED,
+        WORKSPACES_REMOVED,
+        ORDER_CHANGED,
+        PINNED_CHANGED,
+    ];
+}
+
+/// Extension commands (connection-level unless the declaration says otherwise;
+/// every params object still carries `channel`).
+pub mod commands {
+    /// Compact older history into a summary (journal rewrite).
+    pub const COMPACT: &str = "x-manox/compact";
+    /// Seed plan execution after a verdict.
+    pub const PLAN_EXECUTE: &str = "x-manox/planExecute";
+    /// Set or clear the session goal.
+    pub const GOAL: &str = "x-manox/goal";
+    /// Journal-entry level history page (v2 `PageHistory` parity).
+    pub const FETCH_ENTRIES: &str = "x-manox/fetchEntries";
+    /// Bare-model completion for client model providers.
+    pub const MODEL_CHAT: &str = "x-manox/modelChat";
+    /// Cancel an in-flight bare-model completion.
+    pub const MODEL_CHAT_CANCEL: &str = "x-manox/modelChatCancel";
+    /// Retract an unsettled adjudication delivery.
+    pub const CANCEL_DELIVERY: &str = "x-manox/cancelDelivery";
+    /// Register client-provided tools for a session.
+    pub const REGISTER_TOOLS: &str = "x-manox/registerSessionTools";
+    /// Host shutdown (process lifecycle).
+    pub const SHUTDOWN: &str = "x-manox/shutdown";
+
+    /// Every declared command.
+    pub const ALL: &[&str] = &[
+        COMPACT,
+        PLAN_EXECUTE,
+        GOAL,
+        FETCH_ENTRIES,
+        MODEL_CHAT,
+        MODEL_CHAT_CANCEL,
+        CANCEL_DELIVERY,
+        REGISTER_TOOLS,
+        SHUTDOWN,
+    ];
+}
+
+/// Host → client requests (AHP permits host-initiated requests; the `resource*`
+/// family is the standard precedent). Routed by client capability, fail-closed.
+pub mod requests {
+    /// Drive the embedded browser.
+    pub const BROWSER_OP: &str = "x-manox/browserOp";
+    /// Read the client clipboard.
+    pub const CLIPBOARD_READ: &str = "x-manox/clipboardRead";
+    /// Open a path/URL in the client's default handler.
+    pub const OPEN_EXTERNAL: &str = "x-manox/openExternal";
+    /// Invoke a tool the client contributed to the session.
+    pub const INVOKE_TOOL: &str = "x-manox/invokeTool";
+
+    /// Every declared host → client request.
+    pub const ALL: &[&str] = &[BROWSER_OP, CLIPBOARD_READ, OPEN_EXTERNAL, INVOKE_TOOL];
+}
+
+/// The subset of the acceptance table that is *not* extension-namespaced: the
+/// AHP actions this host accepts from clients and turns into runtime work.
+///
+/// Read-only against the spec: an action absent here is refused with
+/// [`crate::codes::X_MANOX_ACTION_REJECTED`] rather than silently dropped, so a
+/// client always learns whether its write landed.
+pub const ACCEPTED_ACTIONS: &[&str] = &[
+    // chat
+    "chat/turnStarted",
+    "chat/pendingMessageSet",
+    "chat/pendingMessageRemoved",
+    "chat/queuedMessagesReordered",
+    "chat/turnCancelled",
+    "chat/turnResume",
+    "chat/truncated",
+    "chat/draftChanged",
+    "chat/toolCallConfirmed",
+    "chat/toolCallComplete",
+    "chat/toolCallResultConfirmed",
+    "chat/inputAnswerChanged",
+    "chat/inputCompleted",
+    // session
+    "session/isReadChanged",
+    "session/isArchivedChanged",
+    "session/titleChanged",
+    "session/configChanged",
+    "session/workingDirectorySet",
+    "session/workingDirectoryRemoved",
+    "session/workingDirectoryReplaced",
+    "session/activeClientRemoved",
+    // chat working directories
+    "chat/workingDirectorySet",
+    "chat/workingDirectoryRemoved",
+    // terminal
+    "terminal/input",
+    "terminal/resized",
+    "terminal/claimed",
+    "terminal/cleared",
+];
+
+/// Whether the host accepts `action_type` dispatched on `channel_uri`.
+///
+/// Channel scoping is part of the check: a chat action on a session channel is
+/// a client bug, and refusing it keeps the acceptance table honest instead of
+/// letting reducers silently no-op.
+pub fn accepts_action(channel_uri: &str, action_type: &str) -> bool {
+    if action_type.starts_with("x-manox") {
+        return actions::ALL.contains(&action_type);
+    }
+    if !ACCEPTED_ACTIONS.contains(&action_type) {
+        return false;
+    }
+    let scope = action_type.split('/').next().unwrap_or_default();
+    match scope {
+        "chat" => channel_uri.starts_with("ahp-chat:/"),
+        "session" => channel_uri.starts_with("ahp-session:/"),
+        "terminal" => channel_uri.starts_with("ahp-terminal:/"),
+        _ => false,
+    }
+}
+
+/// The declaration payload advertised as `_meta["x-manox"]`.
+pub fn declaration_meta() -> ahp_types::common::JsonObject {
+    let mut meta = ahp_types::common::JsonObject::new();
+    meta.insert(META_KEY.to_string(), declaration());
+    meta
+}
+
+pub fn declaration() -> Value {
+    json!({
+        "version": VERSION,
+        "channels": channels::ALL,
+        "actions": actions::ALL,
+        "acceptedActions": ACCEPTED_ACTIONS,
+        "commands": commands::ALL,
+        "serverRequests": requests::ALL,
+        "capabilities": {
+            // Sessions are journals of branchable chats; the active-session
+            // pointer is `SessionState.defaultChat`.
+            "multipleChats": { "fork": true, "sideChat": true },
+            // Granted working directories are equal peers (the kernel fences
+            // tool access per granted root); no protected primary.
+            "multipleWorkingDirectories": { "immutablePrimary": false },
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_names_are_namespaced() {
+        for name in actions::ALL
+            .iter()
+            .chain(commands::ALL)
+            .chain(requests::ALL)
+        {
+            assert!(
+                name.starts_with("x-manox"),
+                "extension name outside the reserved prefix: {name}"
+            );
+        }
+        for channel in channels::ALL {
+            assert!(channel.starts_with("x-manox"));
+        }
+    }
+
+    #[test]
+    fn acceptance_table_is_channel_scoped() {
+        assert!(accepts_action(
+            "ahp-chat:/c-1",
+            "chat/pendingMessageRemoved"
+        ));
+        assert!(!accepts_action(
+            "ahp-session:/s-1",
+            "chat/pendingMessageRemoved"
+        ));
+        assert!(!accepts_action("ahp-chat:/c-1", "chat/unknownFutureAction"));
+        assert!(accepts_action(
+            "x-manox-plan:/c-1",
+            actions::PLAN_MODE_CHANGED
+        ));
+    }
+
+    #[test]
+    fn declaration_lists_every_surface() {
+        let value = declaration();
+        assert_eq!(value["version"], VERSION);
+        assert_eq!(
+            value["channels"].as_array().unwrap().len(),
+            channels::ALL.len()
+        );
+        assert_eq!(
+            value["commands"].as_array().unwrap().len(),
+            commands::ALL.len()
+        );
+    }
+}

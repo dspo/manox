@@ -1,0 +1,336 @@
+//! In-process conformance: the desktop path (typed messages, no socket) driven
+//! by the SDK's own `ahp::Client`, so host and client really are the two ends of
+//! the protocol rather than a self-consistent mock.
+
+mod common;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ahp::{Client, ClientConfig};
+use ahp_types::commands::ListSessionsParams;
+use ahp_types::common::ROOT_RESOURCE_URI;
+use ahp_types::state::AgentInfo;
+use ahp_types::version::PROTOCOL_VERSION;
+use manox_ahp::backend::Backend;
+use manox_ahp::channels::root;
+use manox_ahp::transport::inproc;
+use manox_ahp::{Host, StateAction};
+
+use common::{TestBackend, action};
+
+fn connect(host: &Host) -> impl std::future::Future<Output = Client> {
+    let (host_side, client_side) = inproc::pair();
+    host.accept(host_side);
+    async move {
+        Client::connect(client_side, ClientConfig::default())
+            .await
+            .expect("connects")
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_returns_snapshots_and_the_extension_declaration() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+
+    let init = client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![
+                ROOT_RESOURCE_URI.to_string(),
+                TestBackend::session_uri(),
+                TestBackend::chat_uri(),
+            ],
+        )
+        .await
+        .expect("initializes");
+
+    assert_eq!(init.protocol_version, PROTOCOL_VERSION);
+    assert_eq!(
+        init.snapshots.len(),
+        3,
+        "one snapshot per initial subscription"
+    );
+    assert_eq!(init.snapshots[0].resource, ROOT_RESOURCE_URI);
+    let meta = init.meta.expect("_meta is advertised");
+    let declaration = &meta["x-manox"];
+    assert_eq!(declaration["version"], 1);
+    assert!(
+        declaration["channels"]
+            .as_array()
+            .is_some_and(|c| !c.is_empty())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsupported_protocol_version_is_refused_with_the_supported_list() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+
+    let err = client
+        .initialize("desktop".to_string(), vec!["9.9.9".to_string()], vec![])
+        .await
+        .expect_err("must refuse");
+    let message = format!("{err:?}");
+    assert!(
+        message.contains("32005") || message.to_lowercase().contains("version"),
+        "unexpected error: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publish_reaches_subscribers_with_a_monotonic_server_seq() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+    let (result, mut sub) = client
+        .subscribe(TestBackend::session_uri())
+        .await
+        .expect("subscribes");
+    assert!(result.snapshot.is_some(), "sessions carry state");
+
+    host.publish(
+        &TestBackend::session_uri(),
+        action(serde_json::json!({
+            "type": "session/titleChanged",
+            "title": "renamed by the runtime",
+        })),
+        None,
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("action arrives")
+        .expect("subscription open");
+    let envelope = match event {
+        ahp::SubscriptionEvent::Action(envelope) => envelope,
+        other => panic!("expected an action envelope, got {other:?}"),
+    };
+    assert_eq!(envelope.server_seq, 1);
+    assert_eq!(envelope.channel, TestBackend::session_uri());
+    assert!(envelope.origin.is_none());
+
+    // The next stamp is strictly greater: AHP sequences the whole server.
+    let second = host.publish(
+        &TestBackend::session_uri(),
+        action(serde_json::json!({"type": "session/titleChanged", "title": "again"})),
+        None,
+    );
+    assert_eq!(second.server_seq, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dispatch_action_is_echoed_back_with_origin() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![TestBackend::chat_uri()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(&TestBackend::chat_uri()).await;
+
+    let handle = client
+        .dispatch(
+            TestBackend::chat_uri(),
+            action(serde_json::json!({
+                "type": "chat/pendingMessageRemoved",
+                "kind": "steering",
+                "id": "p-1",
+            })),
+        )
+        .await
+        .expect("dispatches");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("echo arrives")
+        .expect("subscription open");
+    let envelope = match event {
+        ahp::SubscriptionEvent::Action(envelope) => envelope,
+        other => panic!("expected an action envelope, got {other:?}"),
+    };
+    let origin = envelope
+        .origin
+        .expect("the originator's echo carries origin");
+    assert_eq!(origin.client_id, "desktop");
+    assert_eq!(origin.client_seq, handle.client_seq);
+    assert!(envelope.rejection_reason.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undeclared_action_is_echoed_with_a_rejection_reason() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![ROOT_RESOURCE_URI.to_string()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(ROOT_RESOURCE_URI).await;
+
+    // `root/agentsChanged` is host-originated only: a client must not send it,
+    // and it must learn that instead of being silently dropped.
+    client
+        .dispatch(
+            ROOT_RESOURCE_URI.to_string(),
+            StateAction::RootAgentsChanged(ahp_types::actions::RootAgentsChangedAction {
+                agents: Vec::<AgentInfo>::new(),
+            }),
+        )
+        .await
+        .expect("dispatch is fire-and-forget");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("rejection arrives")
+        .expect("subscription open");
+    let envelope = match event {
+        ahp::SubscriptionEvent::Action(envelope) => envelope,
+        other => panic!("expected an action envelope, got {other:?}"),
+    };
+    assert!(envelope.rejection_reason.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unsubscribe_stops_delivery() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![TestBackend::session_uri()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client
+        .attach_subscription(&TestBackend::session_uri())
+        .await;
+
+    client
+        .unsubscribe(TestBackend::session_uri())
+        .await
+        .expect("unsubscribes");
+    host.publish(
+        &TestBackend::session_uri(),
+        action(serde_json::json!({"type": "session/titleChanged", "title": "after unsubscribe"})),
+        None,
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(1), sub.recv()).await;
+    match event {
+        Ok(None) => {}
+        Ok(Some(other)) => panic!("delivery continued after unsubscribe: {other:?}"),
+        Err(_) => panic!("subscription handle stayed open after unsubscribe"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_answers_with_fresh_snapshots() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+
+    let first = connect(&host).await;
+    let init = first
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![ROOT_RESOURCE_URI.to_string()],
+        )
+        .await
+        .expect("initializes");
+    let last_seen = init.server_seq;
+    drop(first);
+
+    let second = connect(&host).await;
+    let result = second
+        .reconnect(
+            "desktop".to_string(),
+            last_seen,
+            vec![ROOT_RESOURCE_URI.to_string(), TestBackend::session_uri()],
+        )
+        .await
+        .expect("reconnects");
+
+    match result {
+        ahp_types::commands::ReconnectResult::Snapshot(snapshot) => {
+            assert_eq!(snapshot.snapshots.len(), 2);
+        }
+        other => panic!("manox answers reconnection with snapshots, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_process_scenario_matches_the_expected_log() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let (host_side, client_side) = inproc::pair();
+    host.accept(host_side);
+
+    let log = common::run_scenario(host, client_side).await;
+    assert_eq!(log, common::EXPECTED_LOG);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_sessions_pages_and_root_notifications_flow() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![ROOT_RESOURCE_URI.to_string()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(ROOT_RESOURCE_URI).await;
+
+    let listed: ahp_types::commands::ListSessionsResult = client
+        .request(
+            "listSessions",
+            ListSessionsParams {
+                channel: root::URI.to_string(),
+                meta: None,
+                limit: None,
+                cursor: None,
+            },
+        )
+        .await
+        .expect("lists sessions");
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].resource, TestBackend::session_uri());
+    assert!(listed.next_cursor.is_none());
+
+    host.summary_changed(
+        "s-1",
+        ahp_types::notifications::PartialSessionSummary {
+            title: Some("renamed".to_string()),
+            ..Default::default()
+        },
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("notification arrives")
+        .expect("subscription open");
+    match event {
+        ahp::SubscriptionEvent::SessionSummaryChanged(params) => {
+            assert_eq!(params.session, TestBackend::session_uri());
+            assert_eq!(params.changes.title.as_deref(), Some("renamed"));
+        }
+        other => panic!("expected a summary change, got {other:?}"),
+    }
+}
