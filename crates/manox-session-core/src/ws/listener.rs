@@ -140,10 +140,16 @@ async fn ahp_upgrade(
         tracing::warn!("gateway: refusing /ahp upgrade — foreign origin");
         return StatusCode::FORBIDDEN.into_response();
     }
+    tracing::info!(
+        origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-"),
+        "gateway: accepted /ahp upgrade"
+    );
     ws.on_upgrade(move |socket| async move {
-        state
-            .ahp
-            .accept(manox_ahp::transport::axum_ws::from_socket(socket));
+        manox_ahp::transport::axum_ws::serve(socket, (*state.ahp.host()).clone()).await;
+        tracing::info!("gateway: /ahp connection closed");
     })
 }
 

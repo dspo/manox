@@ -30,18 +30,21 @@ pub fn router(path: &str, host: Host) -> Router {
 }
 
 async fn upgrade(State(host): State<Host>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        host.accept(from_socket(socket));
-    })
+    ws.on_upgrade(move |socket| serve(socket, host))
 }
 
-/// Wrap an accepted WebSocket as a host transport.
-pub fn from_socket(socket: WebSocket) -> HostTransport {
+/// Serve an accepted WebSocket for its whole lifetime.
+///
+/// The upgrade callback's future owns the socket: returning from it closes the
+/// connection. Spawning the pump tasks and returning immediately therefore kills
+/// the socket the instant the handshake completes, so this awaits both halves
+/// and only returns once the peer is gone.
+pub async fn serve(socket: WebSocket, host: Host) {
     let (out_tx, out_rx) = async_channel::unbounded();
     let (in_tx, in_rx) = async_channel::unbounded();
     let (mut sink, mut stream) = socket.split();
 
-    tokio::spawn(async move {
+    let writer = tokio::spawn(async move {
         while let Ok(msg) = out_rx.recv().await {
             let text = wire::to_text(&msg);
             if sink.send(Message::Text(text.into())).await.is_err() {
@@ -51,7 +54,7 @@ pub fn from_socket(socket: WebSocket) -> HostTransport {
         let _ = sink.close().await;
     });
 
-    tokio::spawn(async move {
+    let reader = tokio::spawn(async move {
         while let Some(frame) = stream.next().await {
             match frame {
                 Ok(Message::Text(text)) => {
@@ -75,8 +78,9 @@ pub fn from_socket(socket: WebSocket) -> HostTransport {
         }
     });
 
-    HostTransport::new(
+    host.accept(HostTransport::new(
         Box::new(ChanSink { tx: out_tx }),
         Box::new(ChanSource { rx: in_rx }),
-    )
+    ));
+    let _ = tokio::join!(writer, reader);
 }

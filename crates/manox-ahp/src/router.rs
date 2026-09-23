@@ -13,9 +13,9 @@ use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, StateAction};
 use ahp_types::commands::{
     CreateChatParams, CreateSessionParams, DispatchActionParams, DisposeChatParams,
     DisposeSessionParams, FetchTurnsParams, InitializeParams, InitializeResult, ListSessionsParams,
-    ListSessionsResult, ReconnectParams, ReconnectResult, ReconnectSnapshotResult,
-    ResourceDeleteParams, ResourceListParams, ResourceReadParams, ResourceWriteParams,
-    SubscribeParams, SubscribeResult, UnsubscribeParams,
+    ListSessionsResult, ReconnectResult, ReconnectSnapshotResult, ResourceDeleteParams,
+    ResourceListParams, ResourceReadParams, ResourceWriteParams, SubscribeParams, SubscribeResult,
+    UnsubscribeParams,
 };
 use ahp_types::messages::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use ahp_types::state::Snapshot;
@@ -179,8 +179,12 @@ async fn initialize(
     conn: &Arc<Conn>,
     params: Value,
 ) -> Result<Value, HostError> {
+    // The reference client omits `channel` on connection-level commands in some
+    // builds; the root channel is what those commands mean either way, so a
+    // missing field is defaulted rather than refused (interoperability over
+    // schema literalism — a *wrong* channel is still rejected).
     let params: InitializeParams = parse_params(params)?;
-    if params.channel != root::URI {
+    if !params.channel.is_empty() && params.channel != root::URI {
         return Err(HostError::InvalidParams(
             "initialize targets ahp-root://".to_string(),
         ));
@@ -295,21 +299,41 @@ async fn reconnect(
     conn: &Arc<Conn>,
     params: Value,
 ) -> Result<Value, HostError> {
-    let params: ReconnectParams = parse_params(params)?;
-    if params.channel != root::URI {
-        return Err(HostError::InvalidParams(
-            "reconnect targets ahp-root://".to_string(),
-        ));
-    }
-    inner.reseat(conn, &params.client_id);
-    conn.set_identity(params.client_id.clone(), None);
+    // Parsed by hand, not through `ReconnectParams`: the reference client sends
+    // `reconnect` as a connection's **first** message with only `clientId` and
+    // `subscriptions` (no `channel`), and refusing it costs the whole handshake —
+    // the client then reports "Unable to connect to remote agent host".
+    let client_id = params
+        .get("clientId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HostError::InvalidParams("reconnect needs clientId".to_string()))?
+        .to_string();
+    let subscriptions: Vec<String> = params
+        .get("subscriptions")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    inner.reseat(conn, &client_id);
+    conn.set_identity(client_id.clone(), None);
 
     let mut snapshots = Vec::new();
-    for uri in &params.subscriptions {
+    for uri in &subscriptions {
         if let Ok(Some(snapshot)) = subscribe_uri(inner, conn, uri) {
             snapshots.push(shape_snapshot(snapshot, None));
         }
     }
+    tracing::info!(
+        client_id = %client_id,
+        last_seen = params.get("lastSeenServerSeq").and_then(|value| value.as_i64()).unwrap_or_default(),
+        subscriptions = subscriptions.len(),
+        "reconnect answered with snapshots"
+    );
     to_value(ReconnectResult::Snapshot(ReconnectSnapshotResult {
         snapshots,
     }))
