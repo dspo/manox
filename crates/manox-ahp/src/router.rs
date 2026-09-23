@@ -47,10 +47,10 @@ pub(crate) async fn handle(inner: &Arc<Inner>, conn: &Arc<Conn>, msg: JsonRpcMes
         }
         JsonRpcMessage::Notification(note) => dispatch_notification(inner, conn, &note).await,
         JsonRpcMessage::SuccessResponse(response) => {
-            inner.resolve_request(response.id, Ok(response.result));
+            conn.complete_waiter(crate::jsonrpc::MsgId(response.id), Ok(response.result));
         }
         JsonRpcMessage::ErrorResponse(response) => {
-            inner.resolve_request(response.id, Err(HostError::Backend(response.error.message)));
+            conn.complete_waiter(crate::jsonrpc::MsgId(response.id), Err(response.error));
         }
     }
 }

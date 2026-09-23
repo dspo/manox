@@ -7,25 +7,24 @@
 //! the host's authoritative state and queues the envelope to every subscriber.
 //! Nothing in that path awaits, so a stalled client can never stall the runtime.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ahp_types::actions::{ActionEnvelope, ActionOrigin, StateAction};
 use ahp_types::common::Uri;
-use ahp_types::messages::JsonRpcMessage;
+use ahp_types::messages::{JsonRpcError, JsonRpcMessage};
 use ahp_types::notifications::{
     PartialSessionSummary, SessionAddedParams, SessionRemovedParams, SessionSummaryChangedParams,
 };
 use ahp_types::state::{RootState, SessionSummary, Snapshot, SnapshotState};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use serde_json::Value;
-use tokio::sync::oneshot;
 
 use crate::backend::Backend;
 use crate::channels::{Channel, ChannelStore, parse, root};
 use crate::connection::Conn;
 use crate::error::HostError;
+use crate::jsonrpc::MsgId;
 use crate::sequencer::Sequencer;
 use crate::transport::HostTransport;
 use crate::wire;
@@ -42,7 +41,6 @@ pub(crate) struct Inner {
     pub(crate) seq: Sequencer,
     pub(crate) store: RwLock<ChannelStore>,
     pub(crate) conns: RwLock<Vec<Arc<Conn>>>,
-    pub(crate) pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, HostError>>>>,
     next_request: AtomicU64,
     next_conn: AtomicU64,
 }
@@ -57,7 +55,6 @@ impl Host {
                 seq: Sequencer::default(),
                 store: RwLock::new(ChannelStore::new(root)),
                 conns: RwLock::new(Vec::new()),
-                pending: Mutex::new(HashMap::new()),
                 next_request: AtomicU64::new(0),
                 next_conn: AtomicU64::new(0),
             }),
@@ -112,6 +109,11 @@ impl Host {
                     }
                 }
             }
+            conn.cancel_waiters(JsonRpcError {
+                code: crate::codes::X_MANOX_BACKEND,
+                message: "client connection closed".to_string(),
+                data: None,
+            });
             conn.kill();
             inner.conns.write().retain(|live| live.id() != conn.id());
         });
@@ -188,15 +190,35 @@ impl Host {
         method: &str,
         params: Value,
     ) -> Result<Value, HostError> {
-        let id = self.inner.next_request.fetch_add(1, Ordering::SeqCst) + 1;
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().insert(id, tx);
-        conn.send(wire::request(id, method, params));
-        match rx.await {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(err)) => Err(err),
+        /// A host → client request is answered by a human in the loop (an
+        /// approval, a question, a browser operation), so the deadline is
+        /// generous — and the issuer owns it, never the correlation layer.
+        const CLIENT_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+        let id = MsgId::next(&self.inner.next_request);
+        let Some(waiter) = conn.register_waiter(id) else {
+            // A duplicate id is our own bookkeeping bug: fail this delivery
+            // closed instead of clobbering a live waiter.
+            return Err(HostError::Backend(format!(
+                "duplicate request id {id} for {method}"
+            )));
+        };
+        conn.send(wire::request(id.0, method, params));
+        match tokio::time::timeout(CLIENT_ANSWER_TIMEOUT, waiter.recv()).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(HostError::Backend(error.message)),
+            Ok(Err(_)) => Err(HostError::Backend(format!(
+                "client connection closed before answering {method}"
+            ))),
             Err(_) => {
-                self.inner.pending.lock().remove(&id);
+                let _ = conn.complete_waiter(
+                    id,
+                    Err(JsonRpcError {
+                        code: crate::codes::X_MANOX_BACKEND,
+                        message: format!("client did not answer {method} in time"),
+                        data: None,
+                    }),
+                );
                 Err(HostError::Backend(format!(
                     "client did not answer {method}"
                 )))
@@ -240,6 +262,13 @@ impl Inner {
         if let Some(previous) = self.connection_for_client(client_id)
             && previous.id() != conn.id()
         {
+            // The previous connection's waiters die with it; the error says so,
+            // so a sender can tell a connection swap from a delivery failure.
+            previous.cancel_waiters(JsonRpcError {
+                code: crate::codes::X_MANOX_BACKEND,
+                message: "client/reseated".to_string(),
+                data: None,
+            });
             previous.kill();
             self.conns.write().retain(|live| live.id() != previous.id());
         }
@@ -384,13 +413,6 @@ impl Inner {
             "root/sessionSummaryChanged",
             serde_json::to_value(params).unwrap_or(Value::Null),
         );
-    }
-
-    /// Resolve a pending host → client request.
-    pub(crate) fn resolve_request(&self, id: u64, outcome: Result<Value, HostError>) {
-        if let Some(tx) = self.pending.lock().remove(&id) {
-            let _ = tx.send(outcome);
-        }
     }
 
     /// Make sure a session's state is loaded, seeding from the backend.

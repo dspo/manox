@@ -10,8 +10,10 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ahp_types::messages::JsonRpcMessage;
+use ahp_types::messages::{JsonRpcError, JsonRpcMessage};
 use parking_lot::Mutex;
+
+use crate::jsonrpc::{MsgId, RpcPeer};
 
 /// A live AHP connection.
 pub struct Conn {
@@ -21,6 +23,13 @@ pub struct Conn {
     subscriptions: Mutex<HashSet<String>>,
     out: async_channel::Sender<JsonRpcMessage>,
     alive: AtomicBool,
+    /// Waiters for the host → client requests this connection carries.
+    ///
+    /// Per connection, not per host: a request targets one client, and when that
+    /// client goes away its waiters must be retired (the re-seat case the v2 peer
+    /// learned: a closed receiver the caller folds into a fail-closed rejection
+    /// is worse than an explicit cancellation).
+    pending: RpcPeer,
 }
 
 impl Conn {
@@ -33,7 +42,30 @@ impl Conn {
             subscriptions: Mutex::new(HashSet::new()),
             out,
             alive: AtomicBool::new(true),
+            pending: RpcPeer::new(),
         }
+    }
+
+    /// Register the waiter for a host → client request (see [`RpcPeer::register`]).
+    pub(crate) fn register_waiter(
+        &self,
+        id: MsgId,
+    ) -> Option<async_channel::Receiver<Result<serde_json::Value, JsonRpcError>>> {
+        self.pending.register(id)
+    }
+
+    /// Resolve a host → client request with the client's answer.
+    pub(crate) fn complete_waiter(
+        &self,
+        id: MsgId,
+        outcome: Result<serde_json::Value, JsonRpcError>,
+    ) -> bool {
+        self.pending.complete(id, outcome)
+    }
+
+    /// Retire every outstanding waiter of this connection with `error`.
+    pub(crate) fn cancel_waiters(&self, error: JsonRpcError) {
+        self.pending.cancel_all(error);
     }
 
     /// The process-local connection number (logging only).
