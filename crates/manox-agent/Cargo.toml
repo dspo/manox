@@ -36,6 +36,7 @@ tokio-util = { workspace = true }
 libc = { workspace = true }
 brush-core = { workspace = true }
 brush-builtins = { workspace = true }
+brush-parser = { workspace = true }
 serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 serde_yaml.workspace = true
