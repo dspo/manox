@@ -23,9 +23,7 @@ use manox_ahp::backend::Backend;
 use common::TestBackend;
 
 async fn ahp_route(State(host): State<Host>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        host.accept(manox_ahp::transport::axum_ws::from_socket(socket));
-    })
+    ws.on_upgrade(move |socket| manox_ahp::transport::axum_ws::serve(socket, host))
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -189,14 +189,7 @@ async fn initialize(
             "initialize targets ahp-root://".to_string(),
         ));
     }
-    let chosen = params
-        .protocol_versions
-        .iter()
-        .find(|version| ahp_types::version::SUPPORTED_PROTOCOL_VERSIONS.contains(&version.as_str()))
-        .cloned()
-        .ok_or_else(|| HostError::UnsupportedProtocolVersion {
-            offered: params.protocol_versions.clone(),
-        })?;
+    let chosen = crate::jsonrpc::version::negotiate(&params.protocol_versions)?;
 
     inner.reseat(conn, &params.client_id);
     conn.set_identity(params.client_id.clone(), params.locale.clone());
