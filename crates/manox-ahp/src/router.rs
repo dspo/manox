@@ -62,6 +62,15 @@ async fn dispatch_request(
     request: &JsonRpcRequest,
 ) -> Result<Value, HostError> {
     let params = request.params.clone().unwrap_or(Value::Null);
+    // The declared surface is the gate: an unknown *or* a declined method is
+    // answered `MethodNotFound`, which tells a client the capability is absent
+    // rather than empty.
+    let Some(command) = crate::command::Command::of_method(&request.method) else {
+        return Err(HostError::MethodNotFound(request.method.clone()));
+    };
+    if command.intent() == crate::command::CommandIntent::Declined {
+        return Err(HostError::MethodNotFound(request.method.clone()));
+    }
     match request.method.as_str() {
         "initialize" => initialize(inner, conn, params).await,
         "ping" => Ok(Value::Null),
@@ -87,7 +96,12 @@ async fn dispatch_request(
         "resourceList" => resource_list(inner, params),
         "resourceDelete" => resource_delete(inner, params),
         other if other.starts_with("x-manox/") => inner.backend.extension(other, &params),
-        other => Err(HostError::MethodNotFound(other.to_string())),
+        // The table and this match must agree: a name that resolves to a command
+        // but reaches here is our own bug, so it surfaces as such instead of
+        // masquerading as an unknown method.
+        other => Err(HostError::Backend(format!(
+            "command {other} is declared but not matched"
+        ))),
     }
 }
 

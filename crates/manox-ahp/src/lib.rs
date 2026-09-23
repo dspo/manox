@@ -30,6 +30,7 @@
 
 pub mod backend;
 pub mod channels;
+pub mod command;
 pub mod connection;
 pub mod error;
 pub mod ext;
