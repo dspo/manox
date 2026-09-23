@@ -15,6 +15,33 @@ use parking_lot::Mutex;
 
 use crate::jsonrpc::{MsgId, RpcPeer};
 
+/// Per-connection rewriting of the wire, applied on both directions.
+///
+/// Some clients speak a dialect of the spec: they compute their own session URIs
+/// from the provider, build derived chat URIs, send a command against a different
+/// channel than the spec says, or omit `params.channel` on `reconnect`. Those
+/// adaptations belong here — at the boundary of the connection that has the
+/// dialect — never in the host, because publishing one client's dialect would
+/// impose it on every other client.
+///
+/// The default is the spec, verbatim: [`IdentityDialect`].
+pub trait Dialect: Send + Sync + 'static {
+    /// Rewrite one outbound message (host → client).
+    fn outgoing(&self, message: JsonRpcMessage) -> JsonRpcMessage {
+        message
+    }
+
+    /// Rewrite one inbound message (client → host).
+    fn incoming(&self, message: JsonRpcMessage) -> JsonRpcMessage {
+        message
+    }
+}
+
+/// The spec, verbatim.
+pub struct IdentityDialect;
+
+impl Dialect for IdentityDialect {}
+
 /// A live AHP connection.
 pub struct Conn {
     id: u64,
@@ -23,6 +50,7 @@ pub struct Conn {
     subscriptions: Mutex<HashSet<String>>,
     out: async_channel::Sender<JsonRpcMessage>,
     alive: AtomicBool,
+    dialect: Box<dyn Dialect>,
     /// Waiters for the host → client requests this connection carries.
     ///
     /// Per connection, not per host: a request targets one client, and when that
@@ -42,8 +70,14 @@ impl Conn {
             subscriptions: Mutex::new(HashSet::new()),
             out,
             alive: AtomicBool::new(true),
+            dialect: Box::new(IdentityDialect),
             pending: RpcPeer::new(),
         }
+    }
+
+    /// Install the dialect this connection speaks (see [`Dialect`]).
+    pub fn set_dialect(&mut self, dialect: Box<dyn Dialect>) {
+        self.dialect = dialect;
     }
 
     /// Register the waiter for a host → client request (see [`RpcPeer::register`]).
@@ -116,9 +150,15 @@ impl Conn {
     /// Queue one outbound message. A closed queue marks the connection dead
     /// (its writer task is gone), never blocks.
     pub(crate) fn send(&self, msg: JsonRpcMessage) {
+        let msg = self.dialect.outgoing(msg);
         if self.out.try_send(msg).is_err() {
             self.alive.store(false, Ordering::SeqCst);
         }
+    }
+
+    /// Rewrite one inbound message into what the host expects.
+    pub(crate) fn interpret(&self, msg: JsonRpcMessage) -> JsonRpcMessage {
+        self.dialect.incoming(msg)
     }
 
     /// Whether the connection can still be written to.

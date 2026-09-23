@@ -275,6 +275,75 @@ async fn reconnect_answers_with_fresh_snapshots() {
     }
 }
 
+/// A dialect that renames one method on the way in and one on the way out —
+/// the smallest proof that the per-connection seam is live in both directions.
+struct RenamingDialect;
+
+impl manox_ahp::connection::Dialect for RenamingDialect {
+    fn outgoing(
+        &self,
+        message: ahp_types::messages::JsonRpcMessage,
+    ) -> ahp_types::messages::JsonRpcMessage {
+        match message {
+            ahp_types::messages::JsonRpcMessage::Notification(mut note)
+                if note.method == "root/sessionAdded" =>
+            {
+                note.method = "root/dialectSessionAdded".to_string();
+                ahp_types::messages::JsonRpcMessage::Notification(note)
+            }
+            other => other,
+        }
+    }
+
+    fn incoming(
+        &self,
+        message: ahp_types::messages::JsonRpcMessage,
+    ) -> ahp_types::messages::JsonRpcMessage {
+        match message {
+            ahp_types::messages::JsonRpcMessage::Request(mut request)
+                if request.method == "dialect/ping" =>
+            {
+                request.method = "ping".to_string();
+                ahp_types::messages::JsonRpcMessage::Request(request)
+            }
+            other => other,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_dialect_rewrites_in_both_directions() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let (host_side, client_side) = inproc::pair();
+    // The seam is installed on the host side of the connection, exactly where a
+    // client's dialect would be recognised.
+    host.accept_with_dialect(host_side, Box::new(RenamingDialect));
+    let client = ahp::Client::connect(client_side, ClientConfig::default())
+        .await
+        .expect("connects");
+    client
+        .initialize(
+            "dialect".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+
+    // Inbound: the client's own method name reaches the host as the real one.
+    client
+        .notify(
+            "dialect/ping",
+            serde_json::json!({"channel": ROOT_RESOURCE_URI}),
+        )
+        .await
+        .expect("dialect ping is accepted");
+    assert!(
+        client.ping().await.is_ok(),
+        "the host is still answering after the dialect call"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_creation_commands_answer_with_empty_shapes() {
     // The reference client calls `resolveSessionConfig` before it creates a

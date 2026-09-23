@@ -76,14 +76,34 @@ impl Host {
         self.inner.conns.read().len()
     }
 
+    /// Accept a transport whose peer speaks a non-standard dialect.
+    pub fn accept_with_dialect(
+        &self,
+        transport: HostTransport,
+        dialect: Box<dyn crate::connection::Dialect>,
+    ) {
+        self.accept_inner(transport, Some(dialect));
+    }
+
     /// Accept a transport: one reader task and one writer task, until the peer
     /// closes.
     pub fn accept(&self, transport: HostTransport) {
+        self.accept_inner(transport, None);
+    }
+
+    fn accept_inner(
+        &self,
+        transport: HostTransport,
+        dialect: Option<Box<dyn crate::connection::Dialect>>,
+    ) {
         let (tx, rx) = async_channel::unbounded::<JsonRpcMessage>();
-        let conn = Arc::new(Conn::new(
-            self.inner.next_conn.fetch_add(1, Ordering::SeqCst) + 1,
-            tx,
-        ));
+        // The dialect is installed before the connection is shared, which is
+        // what keeps the seam per-connection rather than per-host.
+        let mut conn = Conn::new(self.inner.next_conn.fetch_add(1, Ordering::SeqCst) + 1, tx);
+        if let Some(dialect) = dialect {
+            conn.set_dialect(dialect);
+        }
+        let conn = Arc::new(conn);
         self.inner.conns.write().push(conn.clone());
 
         let (mut sink, mut source) = transport.split();
@@ -101,7 +121,10 @@ impl Host {
         tokio::spawn(async move {
             loop {
                 match source.recv().await {
-                    Ok(Some(msg)) => crate::router::handle(&inner, &conn, msg).await,
+                    Ok(Some(msg)) => {
+                        let msg = conn.interpret(msg);
+                        crate::router::handle(&inner, &conn, msg).await
+                    }
                     Ok(None) => break,
                     Err(err) => {
                         tracing::debug!(connection = conn.id(), "transport closed: {err}");
