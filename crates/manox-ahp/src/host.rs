@@ -145,6 +145,28 @@ impl Host {
         self.inner.store.read().session(session_id).cloned()
     }
 
+    /// Install the runtime's folded session state as this channel's state.
+    ///
+    /// The runtime seeds a session when it first serves one (and re-seeds it
+    /// after a feed gap): the fold is the same function clients would reach by
+    /// reducing every action, so seeding is not a second source of truth.
+    pub fn seed_session(&self, session_id: &str, state: ahp_types::state::SessionState) {
+        self.inner.store.write().insert_session(session_id, state);
+    }
+
+    /// Install the runtime's folded chat state (see [`Host::seed_session`]).
+    pub fn seed_chat(&self, session_id: &str, chat_id: &str, state: ahp_types::state::ChatState) {
+        self.inner
+            .store
+            .write()
+            .insert_chat(session_id, chat_id, state);
+    }
+
+    /// Install the runtime's folded terminal state (see [`Host::seed_session`]).
+    pub fn seed_terminal(&self, terminal_id: &str, state: ahp_types::state::TerminalState) {
+        self.inner.store.write().insert_terminal(terminal_id, state);
+    }
+
     /// `root/sessionRemoved` to root subscribers.
     pub fn session_removed(&self, session_id: &str) {
         self.inner.session_removed(session_id);

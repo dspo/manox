@@ -23,6 +23,9 @@ struct AppState {
     token: String,
     server: Arc<crate::agent_server::AgentServer>,
     port: u16,
+    /// The AHP host this listener also serves (`/ahp`): one process, one host,
+    /// two protocols on the same loopback listener (v3 architecture §E.3).
+    ahp: Arc<crate::ahp::runtime::AhpRuntime>,
 }
 
 /// Bind the loopback listener, publish the endpoint, then serve forever.
@@ -40,19 +43,48 @@ pub(super) async fn bind_and_serve(
         port,
         token: token.clone(),
     });
+    let cwd = super::default_cwd();
     let state = AppState {
         token,
         server,
         port,
+        ahp: crate::ahp::runtime::runtime(cwd),
     };
     axum::serve(listener, build_router(state)).await?;
     Ok(())
 }
 
 fn build_router(state: AppState) -> Router {
+    // Both routes ride one listener, one token and one machine lock; the AHP
+    // route is the v3 face, `/ws` the retiring v2 face.
+    let ahp = state.ahp.router("/ahp");
     Router::new()
         .route("/ws", get(ws_upgrade))
+        .route("/ahp", get(ahp_upgrade))
         .with_state(state)
+        .merge(ahp)
+}
+
+/// The AHP face's upgrade gate: the same per-boot token and same-origin rules
+/// the v2 route enforces (the endpoint file is the discovery channel).
+async fn ahp_upgrade(
+    ws: WebSocketUpgrade,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let token_ok = params.get("token").is_some_and(|t| t == &state.token);
+    if !token_ok {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !origin_ok(&headers, state.port) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    ws.on_upgrade(move |socket| async move {
+        state
+            .ahp
+            .accept(manox_ahp::transport::axum_ws::from_socket(socket));
+    })
 }
 
 /// Same-origin loopback browsers only: a page served from this listener has

@@ -171,7 +171,7 @@ impl Drop for OwnerLease {
     }
 }
 
-struct AgentServerInner {
+pub(crate) struct AgentServerInner {
     cwd: PathBuf,
     /// Bind redirect map (predecessor → successor session id): the live
     /// half of the supersede contract; the sidecar marker is the
@@ -845,6 +845,12 @@ impl AgentServer {
         });
     }
 
+    /// The AHP host dispatches into the same inner intents the v2 handlers use:
+    /// one write path, two protocols, no second implementation to drift.
+    pub(crate) fn ahp_inner(&self) -> &Arc<AgentServerInner> {
+        &self.0
+    }
+
     /// Test-only: the live session ids this server holds (the reap
     /// regression needs to observe an entry disappearing).
     #[cfg(test)]
@@ -1159,7 +1165,7 @@ impl AgentServerInner {
         id
     }
 
-    fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
+    pub(crate) fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
         let id = self.resolve_redirect(session_id);
         self.sessions.lock().get(&id).map(|s| s.thread.clone())
     }
@@ -2755,21 +2761,21 @@ pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
 /// server-side), working directory, project binding, and the initial
 /// model / approval mode / reasoning effort the session opens with (the
 /// "project/model inheritance" defect regression, §J.7).
-struct SessionIntent {
-    session_id: Option<String>,
-    cwd: Option<String>,
-    project: Option<String>,
-    initial_model: Option<manox_protocol::ModelRef>,
-    approval_mode: Option<String>,
-    reasoning_effort: Option<String>,
+pub(crate) struct SessionIntent {
+    pub(crate) session_id: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) initial_model: Option<manox_protocol::ModelRef>,
+    pub(crate) approval_mode: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     /// Hidden context blocks appended as non-displaying custom messages
     /// before the first turn (`CreateSession.seed`).
-    seed: Option<Vec<Value>>,
+    pub(crate) seed: Option<Vec<Value>>,
     /// Ordered extra working directories granted to the session
     /// (multi-root); each joins the session's granted-root set before the
     /// engine materializes, so `workspace-write` admits writes under all
     /// of them. Empty keeps single-cwd behavior.
-    working_directories: Vec<String>,
+    pub(crate) working_directories: Vec<String>,
 }
 
 impl AgentServerInner {
@@ -2785,7 +2791,7 @@ impl AgentServerInner {
     /// whose journal file already exists on disk is an existing COLD
     /// session: it restores through the `OpenSession` path (§D.2
     /// idempotency on disk, GW11) and is never re-minted over its file.
-    async fn create_session_request(
+    pub(crate) async fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
         intent: SessionIntent,
@@ -3089,7 +3095,7 @@ impl AgentServerInner {
         Ok(json!({ "session_id": session_id }))
     }
 
-    fn dispose_session(&self, owner: &str, session_id: &str) {
+    pub(crate) fn dispose_session(&self, owner: &str, session_id: &str) {
         // §D.5 dispose semantics: only the REQUESTING client is told — the
         // session survives for every other owner (broadcasting here made a
         // second client's UI drop a still-live session). Owner-table
@@ -3219,7 +3225,7 @@ impl AgentServerInner {
     /// correlation rides the pinned origin on the entry (receipt-id pairing
     /// from the append point is GW8). The compat `ClientNote::Submit`
     /// forwards here with `origin_rpc = None`.
-    async fn submit(
+    pub(crate) async fn submit(
         self: &Arc<Self>,
         owner: &str,
         session_id: &str,

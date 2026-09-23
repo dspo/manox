@@ -2569,6 +2569,7 @@ version = "0.1.0"
 dependencies = [
  "ahp",
  "ahp-types",
+ "ahp-ws",
  "anyhow",
  "async-channel",
  "async-trait",

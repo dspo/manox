@@ -154,10 +154,14 @@ pub async fn session_state(thread_id: &str) -> Option<SessionState> {
 /// One journal's fold: the chat state plus everything the fold routed to
 /// the thread's session channel (and the last model reference, which the
 /// chat state itself cannot carry).
-struct JournalFold {
-    chat: ChatState,
-    session_actions: Vec<StateAction>,
-    model_ref: Option<String>,
+pub(crate) struct JournalFold {
+    pub(crate) chat: ChatState,
+    pub(crate) session_actions: Vec<StateAction>,
+    pub(crate) model_ref: Option<String>,
+    /// The journal's dense tail (`JournalSnapshotData::cursor`): the highest seq
+    /// the fold consumed. A live bridge forwards feed events strictly above it,
+    /// which is what keeps a seeded snapshot and the following actions disjoint.
+    pub(crate) tail: u64,
 }
 
 /// Fold one session's journal through the shared translator + reducers.
@@ -167,7 +171,7 @@ struct JournalFold {
 /// for the session fold. Actions on `x-manox-*` extension channels
 /// (plan / work / metrics) are dropped here — the fold delivers standard
 /// AHP state only.
-async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<JournalFold> {
+pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<JournalFold> {
     let snapshot = match crate::journal_query::cold_read(chat_id).await {
         crate::journal_query::ColdRead::Data(snapshot) => snapshot,
         crate::journal_query::ColdRead::NotFound => return None,
@@ -210,6 +214,7 @@ async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<JournalFold> {
         chat: state,
         session_actions,
         model_ref,
+        tail: snapshot.cursor,
     })
 }
 
@@ -376,6 +381,32 @@ fn session_status_bits(
     }
     bits
 }
+
+/// The thread a session's journal belongs to.
+///
+/// Precedence mirrors the fold's membership rule: the registry's active-session
+/// pointer (a freshly swapped session may not carry the header stamp yet), then
+/// the journal header's own thread stamp, then the legacy singleton case where
+/// the session *is* the thread.
+pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
+    let registry = manox_agent::thread_registry::load().await;
+    for (thread_id, entry) in registry.iter() {
+        if entry.active_session == session_id {
+            return Some(thread_id.clone());
+        }
+    }
+    if let Some(path) = crate::agent_server::persisted_session_file(session_id)
+        && let Some(thread_id) = header_thread_id(&path)
+    {
+        return Some(thread_id);
+    }
+    manox_agent::thread_store::try_global()
+        .filter(|store| store.read(|state| state.summary_by_id(session_id).is_some()))
+        .map(|_| session_id.to_string())
+}
+
+mod backend;
+pub mod runtime;
 
 #[cfg(test)]
 mod tests;
