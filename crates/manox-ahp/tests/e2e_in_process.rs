@@ -1,6 +1,8 @@
-//! In-process conformance: the desktop path (typed messages, no socket) driven
-//! by the SDK's own `ahp::Client`, so host and client really are the two ends of
-//! the protocol rather than a self-consistent mock.
+//! End to end over the in-process transport (the plan's `e2e_in_process` gate).
+//!
+//! The desktop path — typed messages, no socket — driven by the SDK's own
+//! `ahp::Client`, so host and client really are the two ends of the protocol
+//! rather than a self-consistent mock.
 
 mod common;
 
