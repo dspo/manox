@@ -98,14 +98,22 @@ impl RuntimeBackend {
         if let Some(seeded) = self.seeds.lock().get(session_id).cloned() {
             return Some(seeded);
         }
-        let thread_id = super::thread_of_session(session_id).await?;
-        let fold = fold_journal(session_id, &thread_id).await?;
+        let thread_id = super::thread_of_session(session_id)
+            .await
+            .unwrap_or_else(|| session_id.to_string());
+        // A session created moments ago has no journal line yet: it is an empty
+        // chat, not an unknown one. Subscribing to a brand-new session must work,
+        // and the bridge picks its entries up from seq 0 onward.
+        let (chat, tail) = match fold_journal(session_id, &thread_id).await {
+            Some(fold) => (fold.chat, fold.tail),
+            None => (chat::initial(session_id), 0),
+        };
         let session_state = super::session_state(&thread_id).await?;
         let seeded = Arc::new(Seeded {
             thread_id,
             session: session_state,
-            chat: fold.chat,
-            tail: fold.tail,
+            chat,
+            tail,
         });
         self.seeds
             .lock()
@@ -250,6 +258,35 @@ impl RuntimeBackend {
     }
 }
 
+impl RuntimeBackend {
+    /// One page of a chat's turns, walking backwards from `cursor` (absent =
+    /// the tail). The fold is the source, so a page is always journal truth.
+    fn fetch_turns_window(
+        &self,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<(Vec<Turn>, Option<String>), HostError> {
+        const DEFAULT_PAGE: usize = 20;
+        const MAX_PAGE: usize = 200;
+        let Some(seeded) = self.seeds.lock().get(chat_id).cloned() else {
+            return Ok((Vec::new(), None));
+        };
+        let end = match cursor {
+            Some(cursor) => chat::index_of(cursor)
+                .ok_or_else(|| HostError::InvalidParams("unrecognised turns cursor".into()))?,
+            None => seeded.chat.turns.len(),
+        };
+        let page = limit
+            .map(|limit| limit.clamp(1, MAX_PAGE as i64) as usize)
+            .unwrap_or(DEFAULT_PAGE);
+        let start = end.saturating_sub(page);
+        let turns = seeded.chat.turns[start..end.min(seeded.chat.turns.len())].to_vec();
+        let next = (start > 0).then(|| chat::cursor_of(start));
+        Ok((turns, next))
+    }
+}
+
 impl Backend for RuntimeBackend {
     fn root_state(&self) -> RootState {
         root::with_agents(self.agents(), None)
@@ -347,8 +384,11 @@ impl Backend for RuntimeBackend {
             crate::agent_server::AgentServerInner::create_session_request(&inner, &owner, intent)
                 .await
         })
-        .map(|_| ())
-        .map_err(|error| HostError::Backend(error.message))
+        .map_err(|error| HostError::Backend(error.message))?;
+        // Seed and bridge the new session now, so a client that subscribes after
+        // creating it gets a snapshot and then live actions.
+        let _ = block_on(self.seeded(session_id));
+        Ok(())
     }
 
     fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
@@ -373,13 +413,20 @@ impl Backend for RuntimeBackend {
 
     fn fetch_turns(
         &self,
-        _chat_id: &str,
-        _cursor: Option<&str>,
-        _limit: Option<i64>,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
     ) -> Result<Vec<Turn>, HostError> {
-        // The subscription snapshot already carries the retained turns; paging
-        // older ones into state needs the metrics/history plane.
-        Ok(Vec::new())
+        Ok(self.fetch_turns_window(chat_id, cursor, limit)?.0)
+    }
+
+    fn fetch_turns_page(
+        &self,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<(Vec<Turn>, Option<String>), HostError> {
+        self.fetch_turns_window(chat_id, cursor, limit)
     }
 
     fn dispatch(
@@ -396,12 +443,18 @@ impl Backend for RuntimeBackend {
                 let text = started.message.text.clone();
                 let owner = origin.client_id.clone();
                 let inner = Arc::clone(self.server.ahp_inner());
+                let target = session_id.clone();
                 match block_on(async move {
                     inner
-                        .submit(&owner, &session_id, text, Vec::new(), None, None)
+                        .submit(&owner, &target, text, Vec::new(), None, None)
                         .await
                 }) {
-                    Ok(_) => DispatchOutcome::Accepted,
+                    Ok(_) => {
+                        // A submit materializes the engine, so a session that was
+                        // cold when the client subscribed has no bridge yet.
+                        let _ = block_on(self.seeded(&session_id));
+                        DispatchOutcome::Accepted
+                    }
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }

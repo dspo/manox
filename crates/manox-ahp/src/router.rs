@@ -200,7 +200,7 @@ async fn initialize(
     let mut snapshots = Vec::new();
     for uri in params.initial_subscriptions.clone().unwrap_or_default() {
         if let Some(snapshot) = subscribe_uri(inner, conn, &uri)? {
-            snapshots.push(snapshot);
+            snapshots.push(shape_snapshot(snapshot, None));
         }
     }
 
@@ -229,8 +229,29 @@ async fn subscribe(
     params: Value,
 ) -> Result<Value, HostError> {
     let params: SubscribeParams = parse_params(params)?;
-    let snapshot = subscribe_uri(inner, conn, &params.channel)?;
+    let view_turns = params.view.as_ref().and_then(|view| view.turns);
+    let snapshot = subscribe_uri(inner, conn, &params.channel)?
+        .map(|snapshot| shape_snapshot(snapshot, view_turns));
     to_value(SubscribeResult { snapshot })
+}
+
+/// Bound a chat snapshot to a turn tail (see [`crate::channels::chat::tail_view`]).
+///
+/// AHP would have a host return every retained turn when the client omits
+/// `view.turns`; a journal-backed session makes that frame unbounded, so this
+/// host caps the tail and hands out the paging cursor instead. A client that
+/// pages (`fetchTurns`) loses nothing; one that does not simply sees the tail.
+fn shape_snapshot(snapshot: Snapshot, view_turns: Option<i64>) -> Snapshot {
+    const DEFAULT_TAIL_TURNS: usize = 40;
+    let ahp_types::state::SnapshotState::Chat(state) = &snapshot.state else {
+        return snapshot;
+    };
+    let cut = crate::channels::chat::tail_view(state, view_turns, DEFAULT_TAIL_TURNS);
+    Snapshot {
+        resource: snapshot.resource,
+        state: ahp_types::state::SnapshotState::Chat(Box::new(cut)),
+        from_seq: snapshot.from_seq,
+    }
 }
 
 /// Subscribe one channel and answer its snapshot (or `None` for stateless
@@ -286,7 +307,7 @@ async fn reconnect(
     let mut snapshots = Vec::new();
     for uri in &params.subscriptions {
         if let Ok(Some(snapshot)) = subscribe_uri(inner, conn, uri) {
-            snapshots.push(snapshot);
+            snapshots.push(shape_snapshot(snapshot, None));
         }
     }
     to_value(ReconnectResult::Snapshot(ReconnectSnapshotResult {
@@ -425,14 +446,15 @@ fn fetch_turns(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
         .ok_or_else(|| HostError::InvalidParams("fetchTurns channel".to_string()))?
         .to_string();
     inner.ensure_chat(&chat_id)?;
-    let turns = inner
-        .backend
-        .fetch_turns(&chat_id, params.cursor.as_deref(), None)?;
+    let (turns, turns_next_cursor) =
+        inner
+            .backend
+            .fetch_turns_page(&chat_id, params.cursor.as_deref(), None)?;
     inner.publish(
         &params.channel,
         StateAction::ChatTurnsLoaded(ahp_types::actions::ChatTurnsLoadedAction {
             turns,
-            turns_next_cursor: None,
+            turns_next_cursor,
         }),
         None,
     );

@@ -86,6 +86,20 @@ pub trait Backend: Send + Sync + 'static {
         limit: Option<i64>,
     ) -> Result<Vec<Turn>, HostError>;
 
+    /// `fetchTurns` with the cursor of the page after this one.
+    ///
+    /// Snapshots are tail-cut ([`crate::channels::chat::tail_view`]), so paging
+    /// is what makes the cut lossless; a backend that cannot page more says so
+    /// by answering `None`, which is also this default.
+    fn fetch_turns_page(
+        &self,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<(Vec<Turn>, Option<String>), HostError> {
+        Ok((self.fetch_turns(chat_id, cursor, limit)?, None))
+    }
+
     /// Side effects of an accepted, client-dispatched action.
     fn dispatch(
         &self,

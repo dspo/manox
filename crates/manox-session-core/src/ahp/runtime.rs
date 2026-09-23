@@ -40,7 +40,27 @@ impl AhpRuntime {
             Arc::clone(&backend) as Arc<dyn manox_ahp::Backend>
         ));
         backend.attach_host(&host);
-        Arc::new(Self { host })
+        let runtime = Arc::new(Self {
+            host: Arc::clone(&host),
+        });
+        // The provider registry loads asynchronously; the root channel's agent
+        // catalogue is state, so it arrives as an action once it is ready rather
+        // than as a snapshot that may be born empty.
+        manox_agent::runtime::handle().spawn(async move {
+            manox_agent::provider_glue::wait_ready().await;
+            let agents = host.backend().root_state().agents;
+            if agents.is_empty() {
+                return;
+            }
+            host.publish(
+                ahp_types::common::ROOT_RESOURCE_URI,
+                ahp_types::actions::StateAction::RootAgentsChanged(
+                    ahp_types::actions::RootAgentsChangedAction { agents },
+                ),
+                None,
+            );
+        });
+        runtime
     }
 
     /// The one AHP host of this process.

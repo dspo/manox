@@ -58,6 +58,9 @@ tokio-tungstenite.workspace = true
 # than a hand-rolled frame pump.
 ahp-ws.workspace = true
 futures.workspace = true
+# The `ahp_serve` example installs a tracing subscriber so a verification run
+# can see gateway-side failures instead of guessing from the client end.
+tracing-subscriber.workspace = true
 
 [features]
 default = ["terminal", "ws-gateway"]

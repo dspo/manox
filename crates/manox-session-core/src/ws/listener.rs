@@ -73,7 +73,13 @@ async fn ahp_upgrade(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let token_ok = params.get("token").is_some_and(|t| t == &state.token);
+    // Two parameter names, one token: `token` is this repo's own convention and
+    // what the endpoint file advertises; `tkn` is what VS Code's "Add Remote
+    // Agent Host" writes into its address (its parser reads that key only, and
+    // pastes the rest of a query string through verbatim).
+    let token_ok = ["token", "tkn"]
+        .iter()
+        .any(|key| params.get(*key).is_some_and(|value| value == &state.token));
     if !token_ok {
         return StatusCode::UNAUTHORIZED.into_response();
     }

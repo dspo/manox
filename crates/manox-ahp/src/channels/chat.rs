@@ -39,6 +39,43 @@ pub fn initial(id: &str) -> ChatState {
     }
 }
 
+/// A snapshot cut to the trailing `turns` completed turns.
+///
+/// Journal-backed sessions can be enormous (a real one here is 67 MB / 272k
+/// entries), and AHP delivers a snapshot in a single JSON-RPC message: an
+/// uncut state would exceed what any client will frame and close the
+/// connection. `view.turns` is the protocol's own answer — the client asks for
+/// a tail and pages older turns in with `fetchTurns` — so the host serves the
+/// tail and leaves `turnsNextCursor` pointing at the first turn it withheld.
+///
+/// The host's own state is never cut: this shapes one subscriber's snapshot.
+pub fn tail_view(state: &ChatState, turns: Option<i64>, default_turns: usize) -> ChatState {
+    let keep = match turns {
+        Some(requested) if requested > 0 => requested as usize,
+        // A client that asked for nothing specific still gets a bounded frame;
+        // the cursor below is what keeps that lossless.
+        _ => default_turns,
+    };
+    if state.turns.len() <= keep {
+        return state.clone();
+    }
+    let mut cut = state.clone();
+    let first_kept = state.turns.len() - keep;
+    cut.turns_next_cursor = Some(cursor_of(first_kept));
+    cut.turns = state.turns[first_kept..].to_vec();
+    cut
+}
+
+/// The paging cursor addressing the turn at `index` (the first withheld one).
+pub fn cursor_of(index: usize) -> String {
+    format!("turn:{index}")
+}
+
+/// The index a [`cursor_of`] string addresses.
+pub fn index_of(cursor: &str) -> Option<usize> {
+    cursor.strip_prefix("turn:")?.parse().ok()
+}
+
 /// The catalogue entry mirrored into the owning session's `chats`.
 pub fn summary(state: &ChatState) -> ChatSummary {
     ChatSummary {
