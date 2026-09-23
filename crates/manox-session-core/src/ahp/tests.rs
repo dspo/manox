@@ -485,3 +485,326 @@ fn folds_answer_none_for_absent_inputs() {
     });
     uninstall();
 }
+
+// ── dispatch: an accepted action reaches its runtime intent ────────────────
+//
+// The write path is host-generic (acceptance table → reducer → echo); what is
+// manox-specific is that an accepted action must land on the *existing*
+// runtime intent rather than a second implementation. These tests pin that
+// wiring: each action is dispatched against a real session and the runtime
+// side of the effect is observed.
+//
+// Every action here is built as its **typed** variant rather than parsed from
+// JSON: AHP's `StateAction` ends in an untagged `Unknown(Value)` catch-all, so
+// a malformed literal would deserialize "successfully" into an action no arm
+// matches and the test would assert about the fallback instead of the mapping.
+
+mod dispatch {
+    use super::install;
+    use super::uninstall;
+    use crate::agent_server::AgentServer;
+    use ahp_types::actions::{
+        ActionOrigin, ChatPendingMessageRemovedAction, ChatToolCallConfirmedAction,
+        ChatTurnStartedAction, SessionConfigChangedAction, StateAction,
+    };
+    use ahp_types::common::JsonObject;
+    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+    use manox_ahp::backend::{Backend, DispatchOutcome};
+    use manox_ahp::channels::{chat, session, terminal};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// A server holding one live session, plus the backend under test.
+    async fn fixture() -> (Arc<AgentServer>, Arc<super::super::backend::RuntimeBackend>) {
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some("s-dispatch".to_string()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+        (server, backend)
+    }
+
+    fn origin() -> ActionOrigin {
+        ActionOrigin {
+            client_id: "client-a".to_string(),
+            client_seq: 1,
+        }
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message {
+            text: text.to_string(),
+            origin: MessageOrigin {
+                kind: MessageKind::User,
+            },
+            attachments: None,
+            model: None,
+            agent: None,
+            meta: None,
+        }
+    }
+
+    /// `chat/turnStarted` is the turn intent: the runtime is handed the text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_started_reaches_the_submit_intent() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = StateAction::ChatTurnStarted(ChatTurnStartedAction {
+            turn_id: "t-1".to_string(),
+            started_at: "2025-01-02T03:04:05.123Z".to_string(),
+            message: user_message("hello"),
+            queued_message_id: None,
+            meta: None,
+        });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        uninstall();
+    }
+
+    /// A tool-call confirmation settles the gate under the `authId` the
+    /// translator stamped — a guess here would answer a different call.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_call_confirmation_settles_under_the_stamped_auth_id() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let mut meta = JsonObject::new();
+        meta.insert(
+            "x-manox".to_string(),
+            json!({"authId": "auth-7", "summary": "run a command"}),
+        );
+        let action = StateAction::ChatToolCallConfirmed(ChatToolCallConfirmedAction {
+            turn_id: "t-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            meta: Some(meta),
+            approved: true,
+            confirmed: Some(ahp_types::state::ToolCallConfirmationReason::UserAction),
+            reason: None,
+            edited_tool_input: None,
+            user_suggestion: None,
+            reason_message: None,
+            selected_option_id: None,
+        });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        // Without the authId the confirmation is unattributable: it must not
+        // settle anything, and must not be reported as runtime work.
+        let mut unattributed = action.clone();
+        if let StateAction::ChatToolCallConfirmed(confirmed) = &mut unattributed {
+            confirmed.meta = None;
+        }
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &unattributed, &origin()),
+            DispatchOutcome::Ignored
+        );
+        uninstall();
+    }
+
+    /// `session/configChanged` fans out onto the selection intents.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_config_changed_reaches_the_selection_intents() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert("approvalMode".to_string(), json!("plan"));
+        config.insert("reasoningEffort".to_string(), json!("high"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        uninstall();
+    }
+
+    /// Withdrawing a parked follow-up is real runtime work (the runtime holds
+    /// the queue), so it is accepted rather than merely echoed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn withdrawing_a_pending_message_reaches_the_queue() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = StateAction::ChatPendingMessageRemoved(ChatPendingMessageRemovedAction {
+            kind: PendingMessageKind::Steering,
+            id: "p-1".to_string(),
+        });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        uninstall();
+    }
+
+    /// A client-side action the runtime does not own is echoed as accepted
+    /// (`Ignored`) rather than refused: every subscriber must observe one
+    /// sequence, and a refusal would contradict state they can already see.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_owned_actions_are_echoed_without_runtime_work() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = StateAction::ChatDraftChanged(ahp_types::actions::ChatDraftChangedAction {
+            draft: None,
+        });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Ignored
+        );
+        uninstall();
+    }
+
+    /// A client names the chat URI up front, so a fork must land on *that*
+    /// id — not on one the runtime minted behind its back. A client that
+    /// subscribes to the chat it asked for must find it there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_chat_lands_on_the_client_chosen_id() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        // A second chat in the same session needs a source to fork from, and
+        // the source needs a completed turn on disk.
+        let source = seed_fork_source().await;
+        let params = ahp_types::commands::CreateChatParams {
+            channel: session::uri("s-dispatch"),
+            meta: None,
+            chat: chat::uri("client-chosen"),
+            initial_message: None,
+            source: Some(ahp_types::commands::ChatSource::Fork(
+                ahp_types::commands::ForkChatSource {
+                    chat: chat::uri(&source),
+                    // AHP turn ids are the journal entry id with the
+                    // translator's `t-` prefix.
+                    turn_id: "t-e-turn".to_string(),
+                },
+            )),
+            working_directories: None,
+        };
+        backend
+            .create_chat("s-dispatch", "client-chosen", &params)
+            .expect("the fork lands on the requested id");
+
+        // The same id used twice must be refused, not silently truncated over
+        // the journal that already lives there.
+        let again = backend.create_chat("s-dispatch", "client-chosen", &params);
+        assert!(
+            again.is_err(),
+            "a colliding chat id must not overwrite the existing journal"
+        );
+        uninstall();
+    }
+
+    /// A `sideChat` keeps its source out of the visible history — a policy the
+    /// journal has no row for, so it is refused rather than faked as a fork.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_chat_refuses_a_side_chat_rather_than_faking_one() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let params = ahp_types::commands::CreateChatParams {
+            channel: session::uri("s-dispatch"),
+            meta: None,
+            chat: chat::uri("side-1"),
+            initial_message: None,
+            source: Some(ahp_types::commands::ChatSource::SideChat(
+                ahp_types::commands::SideChatSource {
+                    chat: chat::uri("s-dispatch"),
+                    turn_id: "t-1".to_string(),
+                    selection: None,
+                },
+            )),
+            working_directories: None,
+        };
+        assert!(
+            backend
+                .create_chat("s-dispatch", "side-1", &params)
+                .is_err()
+        );
+        uninstall();
+    }
+
+    /// A seeded source session with one completed turn, for the fork tests.
+    ///
+    /// The fork reads the source journal off disk, so the fixture is a real
+    /// `.jsonl` under the store's sessions dir rather than an in-memory state.
+    async fn seed_fork_source() -> String {
+        super::seed_session(
+            "s-source",
+            "s-source",
+            "/work/src",
+            vec![
+                ("e-user", super::user("hi")),
+                ("e-turn", super::turn_finish()),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-source", None));
+        "s-source".to_string()
+    }
+
+    /// An `x-manox` command the runtime performs reaches its intent; one it
+    /// only declares answers `-32080` rather than pretending to work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn extension_commands_split_performed_from_declared() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let params = json!({"channel": session::uri("s-dispatch"), "instructions": "tighten"});
+        assert_eq!(
+            backend
+                .extension(manox_ahp::ext::commands::COMPACT, &params)
+                .expect("compact is performed"),
+            serde_json::Value::Null
+        );
+
+        // Declared, not performed: the honest answer is the extension's own
+        // "unsupported" code, not a silent success.
+        let err = backend
+            .extension(manox_ahp::ext::commands::SHUTDOWN, &params)
+            .expect_err("shutdown is not wired");
+        assert_eq!(err.code(), manox_ahp::codes::X_MANOX_UNSUPPORTED);
+
+        // A session-scoped command on a non-session channel is a client bug.
+        let wrong = json!({"channel": chat::uri("s-dispatch")});
+        assert!(
+            backend
+                .extension(manox_ahp::ext::commands::COMPACT, &wrong)
+                .is_err()
+        );
+        uninstall();
+    }
+
+    /// An action with no intent at all is refused loudly — the trait contract
+    /// is that a refused write never looks accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unwired_actions_are_refused_with_a_reason() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+            data: "ls\n".to_string(),
+        });
+        match backend.dispatch(&terminal::uri("t-1"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("terminal/input"),
+                    "names the action: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        uninstall();
+    }
+}

@@ -121,6 +121,7 @@ impl Command {
             | Self::CreateSession
             | Self::DisposeSession
             | Self::CreateChat
+            | Self::DisposeChat
             | Self::FetchTurns
             | Self::ResolveSessionConfig
             | Self::Completions
@@ -129,9 +130,6 @@ impl Command {
             | Self::ResourceList
             | Self::ResourceDelete
             | Self::Extension => CommandIntent::Implemented,
-            // Declared by the protocol, not served yet: a chat is a journal, so
-            // disposing one is a runtime operation that has no seam today.
-            Self::DisposeChat => CommandIntent::Declined,
         }
     }
 }
@@ -154,15 +152,20 @@ mod tests {
         );
     }
 
-    /// The intent table is the served surface; a `Declined` command must not be
-    /// routed, so the lookup table stays the honest answer for clients.
+    /// The intent table is the served surface; it is the honest answer for a
+    /// client. Every listed command is served today, and the router matches on
+    /// this same table, so the two cannot disagree.
     #[test]
-    fn declined_commands_are_known_but_not_served() {
+    fn every_declared_command_is_served() {
         let declined: Vec<&str> = Command::ALL
             .iter()
             .filter(|(_, command)| command.intent() == CommandIntent::Declined)
             .map(|(name, _)| *name)
             .collect();
-        assert_eq!(declined, vec!["disposeChat"]);
+        assert!(
+            declined.is_empty(),
+            "the router serves the names in Command::ALL, so a Declined entry \
+             would be routed anyway: {declined:?}"
+        );
     }
 }

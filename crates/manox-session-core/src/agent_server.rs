@@ -1996,6 +1996,7 @@ async fn handle_call(
                 ForkIntent {
                     source_session_id,
                     through_entry_id,
+                    target_session_id: None,
                     cwd,
                     project,
                     initial_model,
@@ -2229,17 +2230,21 @@ async fn open_session(
 /// batched append (one lock hold, one validation pass, ONE file write):
 /// O(chain) total — a whole-prefix validation failure rejects the fork
 /// before any row touches disk.
-struct ForkIntent {
-    source_session_id: String,
-    through_entry_id: String,
-    cwd: Option<String>,
-    project: Option<String>,
-    initial_model: Option<manox_protocol::journal::ModelRef>,
-    approval_mode: Option<String>,
-    reasoning_effort: Option<String>,
+pub(crate) struct ForkIntent {
+    pub(crate) source_session_id: String,
+    pub(crate) through_entry_id: String,
+    /// The id the fork must land on, when the caller chose one (AHP's
+    /// `createChat` names the chat URI up front). `None` mints one, which is
+    /// what the v2 `ForkSession` call does.
+    pub(crate) target_session_id: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) project: Option<String>,
+    pub(crate) initial_model: Option<manox_protocol::journal::ModelRef>,
+    pub(crate) approval_mode: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
 }
 
-async fn fork_session(
+pub(crate) async fn fork_session(
     inner: &Arc<AgentServerInner>,
     owner: &str,
     intent: ForkIntent,
@@ -2247,6 +2252,7 @@ async fn fork_session(
     let ForkIntent {
         source_session_id,
         through_entry_id,
+        target_session_id,
         cwd,
         project,
         initial_model,
@@ -2323,11 +2329,20 @@ async fn fork_session(
 
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let Some(target_path) = persisted_session_file(&session_id) else {
         return Err(RpcError::new(-1, "minted fork id failed the path gate")
             .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
     };
+    // A caller-chosen id must not silently overwrite an existing journal: the
+    // fork file is created below, and `create` truncates. Refuse instead, so a
+    // colliding request is a loud error rather than a destroyed session.
+    if target_path.exists() {
+        return Err(
+            RpcError::new(-1, format!("session {session_id} already exists"))
+                .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST),
+        );
+    }
     let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
     let target = JsonlSessionStorage::create(
         &target_path,
@@ -3412,7 +3427,7 @@ impl AgentServerInner {
     /// `{accepted, message_id?}` (the echo of the call's steer id). The
     /// compat `ClientNote::Steer` forwards here with its `client_id` as
     /// `message_id`.
-    fn steer(
+    pub(crate) fn steer(
         &self,
         session_id: &str,
         message_id: String,
@@ -3466,7 +3481,7 @@ impl AgentServerInner {
         }))
     }
 
-    fn drop_queued(&self, session_id: &str, client_id: String) {
+    pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
         let resolved = self.resolve_redirect(session_id);
         if let Some(session) = self.sessions.lock().get(&resolved) {
             let pending = session.pending_submits.clone();
@@ -3474,7 +3489,7 @@ impl AgentServerInner {
         }
     }
 
-    fn set_model(&self, session_id: &str, id: &str) {
+    pub(crate) fn set_model(&self, session_id: &str, id: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
@@ -3489,7 +3504,7 @@ impl AgentServerInner {
         }
     }
 
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str) {
+    pub(crate) fn set_reasoning_effort(&self, session_id: &str, effort: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
@@ -3504,7 +3519,7 @@ impl AgentServerInner {
         thread.with_mut(|t| t.set_reasoning_effort(effort));
     }
 
-    fn set_approval_mode(&self, session_id: &str, mode: &str) {
+    pub(crate) fn set_approval_mode(&self, session_id: &str, mode: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
@@ -3517,7 +3532,7 @@ impl AgentServerInner {
         thread.with_mut(|t| t.set_permission_mode(mode));
     }
 
-    async fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
+    pub(crate) async fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
         // Restart-window opens from a note carry no connection identity:
         // use a transient owner and release it right after so it never
         // defeats the orphaned-session reap (review #805 [sugg] 11).
@@ -3777,14 +3792,14 @@ impl AgentServerInner {
         });
     }
 
-    fn compact(&self, session_id: &str, instructions: Option<String>) {
+    pub(crate) fn compact(&self, session_id: &str, instructions: Option<String>) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
         thread.with_mut(|t| t.compact(instructions));
     }
 
-    fn plan_seed(&self, session_id: &str, plan_file: &str) {
+    pub(crate) fn plan_seed(&self, session_id: &str, plan_file: &str) {
         let Some(thread) = self.session_thread(session_id) else {
             return self.note_error(session_id, "unknown session");
         };
@@ -3846,7 +3861,7 @@ impl AgentServerInner {
         }
     }
 
-    fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
+    pub(crate) fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
         if archived {
             // K3 (delivery request): journal the archive decision BEFORE
             // the dispose — while the engine route is still alive the

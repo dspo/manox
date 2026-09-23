@@ -26,6 +26,7 @@ use ahp_types::state::{
 use manox_ahp::backend::{Backend, DispatchOutcome};
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
+use manox_ahp::resource::ResourcePlane;
 use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
 use parking_lot::Mutex;
@@ -64,10 +65,13 @@ pub(crate) struct RuntimeBackend {
     /// The bridge task needs an `Arc` of this backend while the host holds only
     /// `&self` through the trait, so the backend keeps a weak handle to itself.
     me: OnceLock<Weak<RuntimeBackend>>,
+    /// The `resource*` file plane, fenced to the runtime's working directory.
+    resources: super::resources::RuntimeResources,
 }
 
 impl RuntimeBackend {
     pub(crate) fn new(server: Arc<AgentServer>, cwd: PathBuf) -> Arc<Self> {
+        let resources = super::resources::RuntimeResources::new(vec![cwd.clone()]);
         let backend = Arc::new(Self {
             server,
             cwd,
@@ -75,6 +79,7 @@ impl RuntimeBackend {
             seeds: Mutex::new(HashMap::new()),
             bridges: Mutex::new(HashMap::new()),
             me: OnceLock::new(),
+            resources,
         });
         let _ = backend.me.set(Arc::downgrade(&backend));
         backend
@@ -259,6 +264,109 @@ impl RuntimeBackend {
 }
 
 impl RuntimeBackend {
+    /// Settle a tool call's confirmation from a client action.
+    ///
+    /// The settle key travels on the action's `_meta["x-manox"]["authId"]` —
+    /// the same key the translator stamped when it surfaced the request, which
+    /// is what the runtime's gate is registered under. An action that arrives
+    /// without it (or for a call whose turn has already closed) settles
+    /// nothing: a confirmation we cannot attribute must not guess an identity,
+    /// because guessing would answer a *different* pending call.
+    fn confirm_tool_call(
+        &self,
+        channel: &str,
+        tool_call_id: &str,
+        meta: Option<&ahp_types::common::JsonObject>,
+        approved: bool,
+    ) -> DispatchOutcome {
+        let Some(session_id) = chat::id(channel) else {
+            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+        };
+        let Some(auth_id) = meta
+            .and_then(|meta| meta.get(manox_ahp::ext::META_KEY))
+            .and_then(|ext| ext.get("authId"))
+            .and_then(Value::as_str)
+        else {
+            // The translator stamps every surfaced confirmation with its authId,
+            // so a confirmation without one is a client that minted its own tool
+            // call. Refusing keeps the gate's identity single-sourced.
+            tracing::debug!(tool_call_id, "tool call confirmation without an authId");
+            return DispatchOutcome::Ignored;
+        };
+        let response = if approved {
+            manox_agent::permission::ToolAuthorizationResponse::Decision(
+                manox_agent::permission::PermissionDecision::AllowOnce,
+            )
+        } else {
+            manox_agent::permission::ToolAuthorizationResponse::Decision(
+                manox_agent::permission::PermissionDecision::Deny,
+            )
+        };
+        match self.server.ahp_inner().session_thread(session_id) {
+            Some(thread) => {
+                thread.with_mut(|t| t.respond_authorization(auth_id, response));
+                DispatchOutcome::Accepted
+            }
+            None => DispatchOutcome::Rejected("unknown session".to_string()),
+        }
+    }
+
+    /// Settle a question card from a client action (`chat/inputCompleted`).
+    ///
+    /// AHP's elicitation plane answers by request id, which is the same
+    /// `authId` the translator surfaced the card under, so the two protocols
+    /// name one identity.
+    fn answer_question(&self, channel: &str, request_id: &str) -> DispatchOutcome {
+        let Some(session_id) = chat::id(channel) else {
+            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+        };
+        match self.server.ahp_inner().session_thread(session_id) {
+            Some(thread) => {
+                // The answers themselves are not carried here: AHP's
+                // `inputCompleted` is dispatched with the completed card's
+                // answers already on the part, and the kernel reads them from
+                // the same parked card. Completing the card is what the runtime
+                // is asked for.
+                thread.with_mut(|t| {
+                    t.respond_question(
+                        request_id,
+                        manox_agent::questions::AskOutcome::Answered(Vec::new()),
+                    )
+                });
+                DispatchOutcome::Accepted
+            }
+            None => DispatchOutcome::Rejected("unknown session".to_string()),
+        }
+    }
+
+    /// Apply the model / effort / approval-mode / project selection a client
+    /// merged into `SessionState.config`.
+    ///
+    /// AHP config is an open bag, so a client may send any subset. Each known
+    /// key maps onto the runtime intent that owns it; an unknown key is not a
+    /// refusal (the reducer already folded it) — the runtime simply has no work
+    /// for it.
+    fn apply_session_config(
+        &self,
+        channel: &str,
+        config: &ahp_types::common::JsonObject,
+    ) -> DispatchOutcome {
+        let Some(session_id) = session::id(channel) else {
+            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+        };
+        let inner = self.server.ahp_inner();
+        if let Some(model) = config.get("model").and_then(Value::as_str) {
+            inner.set_model(session_id, model);
+        }
+        if let Some(effort) = config.get("reasoningEffort").and_then(Value::as_str) {
+            inner.set_reasoning_effort(session_id, effort);
+        }
+        if let Some(mode) = config.get("approvalMode").and_then(Value::as_str) {
+            inner.set_approval_mode(session_id, mode);
+        }
+        DispatchOutcome::Accepted
+    }
+
     /// One page of a chat's turns, walking backwards from `cursor` (absent =
     /// the tail). The fold is the source, so a page is always journal truth.
     fn fetch_turns_window(
@@ -398,17 +506,78 @@ impl Backend for RuntimeBackend {
 
     fn create_chat(
         &self,
-        _session_id: &str,
-        _chat_id: &str,
-        _params: &CreateChatParams,
+        session_id: &str,
+        chat_id: &str,
+        params: &CreateChatParams,
     ) -> Result<(), HostError> {
-        // A chat is a journal; branching one is `createChat{source}` mapped onto
-        // the runtime's fork intent, which is not wired yet.
-        Err(HostError::Unimplemented("createChat".to_string()))
+        // A manox chat *is* a journal, so a second chat in one session is a
+        // branch: AHP's `createChat{source: fork}` maps onto the runtime's fork
+        // intent, with the client-chosen chat id as the fork's target id.
+        let Some(source) = params.source.as_ref() else {
+            return Err(HostError::Unimplemented(
+                "createChat without a source (a session holds one journal)".to_string(),
+            ));
+        };
+        let (source_chat, turn_id) = match source {
+            ahp_types::commands::ChatSource::Fork(fork) => (&fork.chat, &fork.turn_id),
+            // A side chat keeps its source *out* of the visible history, which
+            // is a context-injection policy the journal has no row for. Refuse
+            // rather than fork a chat that would show the copied turns a side
+            // chat must not show.
+            ahp_types::commands::ChatSource::SideChat(_) => {
+                return Err(HostError::Unimplemented("createChat{sideChat}".to_string()));
+            }
+            ahp_types::commands::ChatSource::Unknown(kind) => {
+                return Err(HostError::Unimplemented(format!("createChat{{{kind}}}")));
+            }
+        };
+        // A fork copies through a *completed* turn, and the AHP turn id is the
+        // journal entry id with the translator's `t-` prefix (`translate/actions.rs`),
+        // so the prefix is stripped back off to name the journal row.
+        let Some(through_entry_id) = turn_id.strip_prefix("t-") else {
+            return Err(HostError::InvalidParams(
+                "a fork source must name a turn of this session".to_string(),
+            ));
+        };
+        let Some(source_session_id) = chat::id(source_chat.as_str()) else {
+            return Err(HostError::InvalidParams(
+                "a fork source must be an ahp-chat URI".to_string(),
+            ));
+        };
+        let owner = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .and_then(|ext| ext.get("clientId"))
+            .and_then(Value::as_str)
+            .unwrap_or("ahp")
+            .to_string();
+        let inner = Arc::clone(self.server.ahp_inner());
+        let intent = crate::agent_server::ForkIntent {
+            source_session_id: source_session_id.to_string(),
+            through_entry_id: through_entry_id.to_string(),
+            target_session_id: Some(chat_id.to_string()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+        };
+        block_on(async move { crate::agent_server::fork_session(&inner, &owner, intent).await })
+            .map_err(|error| HostError::Backend(error.message))?;
+        let _ = session_id;
+        // The forked journal is new to the host: seed and bridge it so a client
+        // that subscribes right after creating it gets a snapshot and then live
+        // actions.
+        let _ = block_on(self.seeded(chat_id));
+        Ok(())
     }
 
-    fn dispose_chat(&self, _chat_id: &str) -> Result<(), HostError> {
-        Err(HostError::Unimplemented("disposeChat".to_string()))
+    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+        // Disposing a chat retires its journal's live resources. The session
+        // itself survives, so this disposes the engine rather than the row.
+        self.server.ahp_inner().dispose_session("ahp", chat_id);
+        Ok(())
     }
 
     fn fetch_turns(
@@ -435,15 +604,17 @@ impl Backend for RuntimeBackend {
         action: &StateAction,
         origin: &ActionOrigin,
     ) -> DispatchOutcome {
-        let Some(session_id) = chat::id(channel).map(str::to_string) else {
-            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
-        };
         match action {
+            // ── chat actions ───────────────────────────────────────────────
             StateAction::ChatTurnStarted(started) => {
+                let Some(session_id) = chat::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
                 let text = started.message.text.clone();
                 let owner = origin.client_id.clone();
                 let inner = Arc::clone(self.server.ahp_inner());
-                let target = session_id.clone();
+                let target = session_id.to_string();
+                let session_id = target.clone();
                 match block_on(async move {
                     inner
                         .submit(&owner, &target, text, Vec::new(), None, None)
@@ -458,6 +629,105 @@ impl Backend for RuntimeBackend {
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
+            StateAction::ChatPendingMessageSet(set) => {
+                let Some(session_id) = chat::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                // A steering message is injected into the *running* turn; the
+                // runtime's steer path both parks it (when idle) and injects it
+                // (when running), so one intent covers both kinds. The pending
+                // message id is the steer id — the identity the journal row and
+                // the echo retirement share.
+                let text = set.message.text.clone();
+                let inner = Arc::clone(self.server.ahp_inner());
+                let target = session_id.to_string();
+                match inner.steer(&target, set.id.clone(), text, Vec::new(), None) {
+                    Ok(_) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
+                }
+            }
+            StateAction::ChatPendingMessageRemoved(removed) => {
+                let Some(session_id) = chat::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                // Both kinds name a parked follow-up the runtime holds by id, so
+                // withdrawing one is the same intent either way.
+                self.server
+                    .ahp_inner()
+                    .drop_queued(session_id, removed.id.clone());
+                DispatchOutcome::Accepted
+            }
+            StateAction::ChatTurnCancelled(_) => {
+                let Some(session_id) = chat::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match self.server.ahp_inner().session_thread(session_id) {
+                    Some(thread) => {
+                        thread.with_mut(|t| t.cancel());
+                        DispatchOutcome::Accepted
+                    }
+                    None => DispatchOutcome::Rejected("unknown session".to_string()),
+                }
+            }
+            StateAction::ChatToolCallConfirmed(confirmed) => self.confirm_tool_call(
+                channel,
+                &confirmed.tool_call_id,
+                confirmed.meta.as_ref(),
+                confirmed.approved,
+            ),
+            StateAction::ChatInputCompleted(completed) => {
+                self.answer_question(channel, &completed.request_id)
+            }
+            // ── session actions ────────────────────────────────────────────
+            StateAction::SessionConfigChanged(changed) => {
+                self.apply_session_config(channel, &changed.config)
+            }
+            StateAction::SessionWorkingDirectorySet(set) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                let Some(path) = file_uri_to_path(set.directory.as_str()) else {
+                    return DispatchOutcome::Rejected(
+                        "working directories must be file:// URIs".to_string(),
+                    );
+                };
+                let inner = Arc::clone(self.server.ahp_inner());
+                let target = session_id.to_string();
+                block_on(async move { inner.set_cwd(&target, &path).await });
+                DispatchOutcome::Accepted
+            }
+            StateAction::SessionTitleChanged(_) => {
+                // The runtime has no retitle intent: a title is what the title
+                // agent wrote and the journal recorded, and v2 exposes no
+                // rename either. The reducer folds the action (it is a
+                // protocol-level state field), so it is echoed as accepted with
+                // no runtime work behind it — refusing would tell every
+                // subscriber a title they can see is not real.
+                DispatchOutcome::Ignored
+            }
+            StateAction::SessionIsArchivedChanged(changed) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                self.server.ahp_inner().archive_thread(
+                    &origin.client_id,
+                    session_id,
+                    changed.is_archived,
+                );
+                DispatchOutcome::Accepted
+            }
+            // Actions the acceptance table admits and the reducer folds, but
+            // that describe client-side state the runtime does not own (draft
+            // text, read flags, turn resumption, result confirmation). They are
+            // echoed as accepted so every subscriber observes the same sequence,
+            // and no runtime work follows.
+            StateAction::ChatDraftChanged(_)
+            | StateAction::ChatTurnResume(_)
+            | StateAction::ChatToolCallResultConfirmed(_)
+            | StateAction::ChatInputAnswerChanged(_)
+            | StateAction::ChatQueuedMessagesReordered(_)
+            | StateAction::SessionIsReadChanged(_)
+            | StateAction::SessionActiveClientRemoved(_) => DispatchOutcome::Ignored,
             other => DispatchOutcome::Rejected(format!(
                 "no runtime intent yet: {}",
                 manox_ahp::wire::action_tag(other)
@@ -465,9 +735,68 @@ impl Backend for RuntimeBackend {
         }
     }
 
-    fn extension(&self, method: &str, _params: &Value) -> Result<Value, HostError> {
-        Err(HostError::Unimplemented(method.to_string()))
+    fn resources(&self) -> Option<&dyn ResourcePlane> {
+        // The plane is built once, over the roots the runtime was started
+        // with; per-session grants are a refinement the fence does not have a
+        // seam for yet, so the base cwd is the root.
+        Some(&self.resources)
     }
+
+    fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
+        // The extension surface is declared once in `ext::commands`; this maps
+        // the subset the runtime actually performs onto its existing intents.
+        // Everything else answers `Unimplemented`, which is the honest reply
+        // for a name we advertise but do not serve.
+        match method {
+            manox_ahp::ext::commands::COMPACT => {
+                let session_id = extension_session(params)?;
+                let instructions = params
+                    .get("instructions")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                match self.server.ahp_inner().session_thread(&session_id) {
+                    Some(_) => {
+                        self.server.ahp_inner().compact(&session_id, instructions);
+                        Ok(Value::Null)
+                    }
+                    None => Err(HostError::SessionNotFound(session_id)),
+                }
+            }
+            manox_ahp::ext::commands::PLAN_EXECUTE => {
+                let session_id = extension_session(params)?;
+                let Some(plan_file) = params.get("planFile").and_then(Value::as_str) else {
+                    return Err(HostError::InvalidParams(
+                        "x-manox/planExecute needs planFile".to_string(),
+                    ));
+                };
+                match self.server.ahp_inner().session_thread(&session_id) {
+                    Some(_) => {
+                        self.server.ahp_inner().plan_seed(&session_id, plan_file);
+                        Ok(Value::Null)
+                    }
+                    None => Err(HostError::SessionNotFound(session_id)),
+                }
+            }
+            // A client asked for a surface this build declares but does not
+            // perform. `-32080` tells it apart from "you sent a bad request".
+            other => Err(HostError::Unimplemented(other.to_string())),
+        }
+    }
+}
+
+/// The session an extension command names, from its `channel`.
+///
+/// Every extension command carries `channel`, and the ones the runtime
+/// performs are session-scoped, so the channel must be a session URI.
+fn extension_session(params: &Value) -> Result<String, HostError> {
+    let Some(channel) = params.get("channel").and_then(Value::as_str) else {
+        return Err(HostError::InvalidParams(
+            "an extension command needs a channel".to_string(),
+        ));
+    };
+    manox_ahp::channels::session::id(channel)
+        .map(str::to_string)
+        .ok_or_else(|| HostError::InvalidParams(format!("{channel} is not a session channel")))
 }
 
 /// `file://` URI → filesystem path (`None` for other schemes).

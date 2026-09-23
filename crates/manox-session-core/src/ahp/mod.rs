@@ -406,6 +406,7 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
 }
 
 mod backend;
+mod resources;
 pub mod runtime;
 
 #[cfg(test)]

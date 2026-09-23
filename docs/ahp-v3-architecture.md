@@ -368,13 +368,58 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
 - **仍未落地**：终端通道、`createChat`/`disposeChat`（分支/fork）、`fetchTurns` 分页、x-manox 命令面、
   `resource*` 文件面、`Backend::dispatch` 的其余动作映射（当前除 turn 起点外全部 `Rejected`）。
 
+### H.2c W2 写面与文件面落地（本轮新增，2026-09-23）
+
+`Backend::dispatch` 从此不再只有一个 turn 起点：accepted action 落到**既有**运行时 intent
+（不是第二份实现），未接线的仍响亮 `Rejected`。
+
+- **dispatch 映射**（`ahp/backend.rs`）：`chat/turnStarted`→`submit`；`chat/pendingMessageSet`→`steer`；
+  `chat/pendingMessageRemoved`→`drop_queued`；`chat/turnCancelled`→线程 `cancel`；
+  `chat/toolCallConfirmed`→`respond_authorization`；`chat/inputCompleted`→`respond_question`；
+  `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_approval_mode` 扇出；
+  `session/workingDirectorySet`→`set_cwd`；`session/isArchivedChanged`→`archive_thread`。
+  实施期修订：`SessionTitleChanged` 与 `SessionIsReadChanged`/`ChatDraftChanged`/`ChatTurnResume`/
+  `ChatToolCallResultConfirmed`/`ChatInputAnswerChanged`/`ChatQueuedMessagesReordered`/
+  `SessionActiveClientRemoved` 归 **`Ignored`**（reducer 已折叠、运行时无对应 intent），
+  回显而非拒绝——拒绝会告诉订阅者「你看得见的状态不是真的」。运行时**没有**重命名 intent
+  （v2 也没有；`thread_store.title_override` 只被写过 `None`），故 `session/titleChanged` 不接。
+- **审批身份单源**：settle key 走 action 的 `_meta["x-manox"]["authId"]`——即 translator 生成
+  `toolCallReady` 时盖的同一个 key。**没有 authId 的确认不 settle**（`Ignored`）：猜一个身份会去
+  回答**另一个** pending call。
+- **`createChat`/`disposeChat` 落地**：`createChat{source:fork}` 映射到 `fork_session`，并把客户端
+  选的 chat id 作为 fork 目标 id。为此 `ForkIntent` 增 `target_session_id: Option<String>`
+  （`None` 仍为 v2 的随机铸造），并新增**已存在即拒绝**的守卫——`JsonlSessionStorage::create` 会截断，
+  客户端选重 id 若不拦就是**毁掉一个已有会话**。`source:sideChat` 响亮 `Unimplemented`：
+  「源不进可见历史」是 journal 没有行的上下文策略，伪造成 fork 会展示它不该展示的 turns。
+  `disposeChat` 一并从 `CommandIntent::Declined` 转 `Implemented`（`command.rs` 的
+  `declined_commands_are_known_but_not_served` 改为 `every_declared_command_is_served`）。
+- **`resource*` 最小文件面**（`ahp/resources.rs`）：围栏即内核工具文件效果的同一围栏——路径**先
+  canonicalize 再判**，判据是组件级 `starts_with`（故 `/work/grants-evil` 不匹配 `/work/grants`），
+  `..`/符号链接/尚不存在的叶子都逃不出去（不存在的叶子经最近存在祖先解析后再判）。
+  读允许落在 `~/.manox`（宿主自己的 journal/plan 制品是客户端正当渲染的内容）；**写只许授权根**
+  ——状态根是宿主的记账，不是客户端可写面。denied 一律 `-32082`（`xManox/resourceDenied`）。
+- **`x-manox/*` 命令面**：`x-manox/compact`→`compact`、`x-manox/planExecute`→`plan_seed` 落到既有
+  intent；其余已声明命令答 `-32080`（`xManox/unsupported`）——「我声明了但不做」与「你请求写错了」
+  必须可区分。
+- **门禁证据**：`script/gates.sh` 六腿全 PASS（fmt/prod-libs/lean-libs/clippy/test-real/test-clean）；
+  `cargo test -p manox-session-core` = **192 绿**（本会话自 173 起，新增 dispatch 9 + 文件面围栏 9 +
+  网关 `/ahp` 路由 1）；`cargo test -p manox-ahp --features axum-ws` = 39 绿。
+  新测试全部用**类型化 action**（不经 JSON 往返）：`StateAction` 末尾的 untagged `Unknown(Value)`
+  会让一个写错的字面量「成功」反序列化成无人匹配的 action，测试就会去断言兜底臂而非映射。
+- **网关 `/ahp` 路由补测**：此前 `ws_conformance` 自绑 listener，绕过了网关自己的 token/origin 闸，
+  于是「唯一没覆盖的路径恰好是安全边界」（token 是本地页面与宿主之间唯一的墙）。新测试
+  `ws::tests::ahp_route_rides_the_gateway_token_gate` 走真实网关腿：无 token → 401；
+  带 token 但 `Origin: http://evil.example` → 403；带 token + 非浏览器 origin
+  （`vscode-file://vscode-app`，参考客户端的真实形状）→ 升级成功**并跑通 `initialize`**
+  （证明路由真的挂了宿主，而不只是「一个会拒绝一切的 404 handler 也回 401」）。
+
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
-1. **W2 余下**：`manox_ahp::Backend` 的运行时实现（`dispatch` 动作→既有 intent 映射、
-   `createSession`/`disposeSession`/`createChat` 落到 AgentServer 既有 intent）、
-   网关同 listener 挂 `manox_ahp::transport::axum_ws::router("/ahp", host)`（v2 的 `/ws` 保留到 W4）、
-   `x-manox/*` 命令面与 `resource*` 最小文件面、`extension_baseline` 的真实现。
-   **该面未落地前，`/ahp` 路由不存在，外部 AHP 客户端尚不可连**——§G 的 W2 门禁 ④（真客户端 smoke）因此未执行。
+1. **W2 余下**：`extension_baseline` 的真实现（`x-manox-plan:/…` 等无状态扩展通道的基线）；
+   `fetchTurns` 之外的 `x-manox/fetchEntries`；客户端工具注册（`x-manox/registerSessionTools`）；
+   `x-manox` 四个 server→client 请求（`browserOp`/`clipboardRead`/`openExternal`/`invokeTool`）。
+   `resource*` 已落地基础围栏，但 `resourceResolve`/`resourceCopy`/`if_match` 未接。
+   §G 的 W2 门禁 ④（真客户端 smoke：VS Code Agents window 发 prompt、看工具卡与审批）仍未执行。
 2. **W3**：manox-app 侧的 `AhpStore`（`ahp::Client` + reducers）、进程内 `ahp::Transport`、
    `ConversationState` 改由 `ChatState.responseParts` 派生、删 `client_store*`/`journal_fold`/
    `journal_translate`/`server_note_translate`、重写 `source_gates.rs`、更新 `UI-MAP.md`。
