@@ -179,18 +179,21 @@ fn origin_allowed(origin: &str, port: u16) -> bool {
     };
     let scheme = uri.scheme_str().unwrap_or("");
     // The origin gate exists for *browsers* (CSWSH / DNS rebinding): a page can
-    // only carry an `http(s)` origin, so a present origin with any other scheme
-    // is not a browser and cannot mount that attack. VS Code dials remote agent
-    // hosts with `Origin: vscode-file://vscode-app`; rejecting it would lock out
-    // the reference client for a threat it cannot pose. The token stays the
-    // trust boundary in that case, exactly as it is for a client sending no
-    // origin at all.
+    // only carry an `http(s)` origin, so a present origin naming some other
+    // scheme is not a browser and cannot mount that attack. VS Code dials remote
+    // agent hosts with `Origin: vscode-file://vscode-app`; rejecting it would
+    // lock out the reference client for a threat it cannot pose. The token stays
+    // the trust boundary there, exactly as it is for a client sending no origin.
+    // An origin we cannot even parse (no host) is refused rather than waved
+    // through: it is not evidence of anything.
     if scheme != "http" && scheme != "https" {
         return true;
     }
     let host = uri.host().unwrap_or("");
     let port_ok = uri.port_u16().map(|p| p == port).unwrap_or(false);
-    (host == "127.0.0.1" || host == "localhost") && port_ok
+    // An `http(s)` origin must be this listener's own loopback origin; in
+    // particular an `https` page on our plain-http port is not ours.
+    scheme == "http" && (host == "127.0.0.1" || host == "localhost") && port_ok
 }
 
 /// The Origin gate: a present Origin must pass [`origin_allowed`]; a missing
@@ -230,33 +233,43 @@ async fn handle_ws(socket: WebSocket, server: Arc<crate::agent_server::AgentServ
 mod tests {
     use super::*;
 
-    /// Only same-origin loopback browsers pass the Origin check.
+    /// Browsers must be same-origin loopback; everything else is not a browser
+    /// and rides the token instead (the reference client dials with
+    /// `Origin: vscode-file://vscode-app`).
     #[test]
-    fn origin_allowed_checks_loopback_scheme_and_port() {
+    fn origin_allowed_checks_browser_origins_only() {
         assert!(origin_allowed("http://127.0.0.1:4321", 4321));
         assert!(origin_allowed("http://localhost:4321", 4321));
         assert!(!origin_allowed("http://127.0.0.1:9999", 4321), "wrong port");
         assert!(
             !origin_allowed("https://127.0.0.1:4321", 4321),
-            "wrong scheme"
+            "https loopback is not this listener"
         );
         assert!(
             !origin_allowed("http://evil.com:4321", 4321),
-            "foreign host"
+            "foreign browser origin"
         );
-        assert!(!origin_allowed("", 4321), "missing origin");
-        assert!(!origin_allowed("file:///x", 4321), "non-http origin");
+        assert!(
+            origin_allowed("vscode-file://vscode-app", 4321),
+            "the reference client is not a browser"
+        );
+        assert!(
+            !origin_allowed("file:///x", 4321),
+            "an origin with no host cannot be validated, so it is refused"
+        );
     }
 
-    /// The gateway face: a present Origin is validated; a missing Origin
-    /// (non-browser client) passes — the token is its auth.
+    /// The gateway face: a present **browser** Origin is validated; a missing
+    /// Origin and a non-browser one pass — the token is their auth.
     #[test]
-    fn origin_gate_validates_present_origins_only() {
+    fn origin_gate_validates_present_browser_origins_only() {
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, "http://127.0.0.1:4321".parse().unwrap());
         assert!(origin_ok(&headers, 4321), "same-origin browser");
         headers.insert(header::ORIGIN, "http://evil.com:4321".parse().unwrap());
         assert!(!origin_ok(&headers, 4321), "foreign browser origin");
-        assert!(origin_ok(&HeaderMap::new(), 4321), "non-browser client");
+        assert!(origin_ok(&HeaderMap::new(), 4321), "no origin at all");
+        headers.insert(header::ORIGIN, "vscode-file://vscode-app".parse().unwrap());
+        assert!(origin_ok(&headers, 4321), "non-browser client origin");
     }
 }
