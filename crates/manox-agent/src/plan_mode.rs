@@ -346,8 +346,9 @@ pub fn gate_handler(
                 "Plan mode is active: the working tree is read-only while planning. \
                  Only the plan file under {} and temp scratch (/tmp, /private/tmp) may be \
                  written (Write/Edit); research with Read/Grep/Glob/Ls, run read-only git \
-                 through Bash as a single command with no pipes or redirects (e.g. \
-                 `git log`, `git -C <path> diff`, `git config --get <key>`), or use a \
+                 through Bash as a single command with no pipes, redirects, expansions, \
+                 quotes, or globs (e.g. `git log`, `git -C <path> diff`, \
+                 `git config --get <key>`), or use a \
                  read-only subagent (no worktree isolation); ask with AskUserQuestion, \
                  and submit the plan with {PROPOSE_PLAN}.",
                 plans_dir.display()
@@ -984,6 +985,24 @@ mod tests {
             run("Bash", serde_json::json!({"command": "git log | head -5"}))
                 .block_reason
                 .is_some()
+        );
+        // Read-only subcommands whose pager flag spawns an arbitrary program,
+        // and `stash show`'s pass-through `--output`, stay blocked.
+        assert!(
+            run(
+                "Bash",
+                serde_json::json!({"command": "git grep -O/tmp/x pattern"})
+            )
+            .block_reason
+            .is_some()
+        );
+        assert!(
+            run(
+                "Bash",
+                serde_json::json!({"command": "git stash show --output=./f.txt"})
+            )
+            .block_reason
+            .is_some()
         );
         assert!(run("Monitor", serde_json::json!({})).block_reason.is_some());
         assert!(

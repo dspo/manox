@@ -7,11 +7,19 @@
 //! The policy is a closed allowlist: any construct not explicitly admitted
 //! is rejected. Rejected structurally: command lists (`;`, `&&`, `||`,
 //! newlines), pipelines, redirections, background `&`, subshells and
-//! compounds, function definitions, env-assignment prefixes, process
-//! substitution, and any word carrying expansion or quoting (`$`, backtick,
-//! quotes, backslash) so no substitution can smuggle execution into an
-//! argument. Aliases never classify: only literal subcommand names are
-//! admitted, and user aliases cannot shadow them.
+//! compounds, function definitions, env-assignment prefixes, and process
+//! substitution. Rejected at word level: expansion and substitution (`$`,
+//! backtick), quoting and escaping (quotes, backslash), and glob/brace
+//! metacharacters — every construct that rewrites argv after classification,
+//! so the admitted words are exactly the words git receives. Rejected as
+//! argument flags: those in [`FORBIDDEN_ARG_FLAGS`], through which an
+//! admitted subcommand would stop being read-only. Aliases never classify:
+//! only literal subcommand names are admitted, and user aliases cannot
+//! shadow them.
+//!
+//! Admission is not side-effect-free: index-refreshing forms such as
+//! `git status` rewrite `.git/index` and run the repository's
+//! `post-index-change` hook.
 
 use brush_parser::ast::{Command, CommandPrefixOrSuffixItem, Program, SeparatorOperator};
 use brush_parser::{Parser, ParserOptions};
@@ -19,9 +27,30 @@ use brush_parser::{Parser, ParserOptions};
 /// Characters that disqualify a word outright. `$` and backtick enable
 /// expansion and command substitution (i.e. execution); quotes and
 /// backslashes mean the raw word text no longer maps one-to-one onto the
-/// argv the shell would build. Admissible git arguments (paths, revisions,
-/// flags) never need them.
-const FORBIDDEN_WORD_CHARS: [char; 5] = ['$', '`', '"', '\'', '\\'];
+/// argv the shell would build; `*` `?` `[` `]` `{` `}` glob or brace-expand
+/// into argv items the classifier never saw, flag-shaped ones included.
+/// Admissible git arguments (paths, revisions, flags) never need them.
+const FORBIDDEN_WORD_CHARS: [char; 11] = ['$', '`', '"', '\'', '\\', '*', '?', '[', ']', '{', '}'];
+
+/// Flags through which a subcommand in [`READ_ONLY_SUBCOMMANDS`] stops being
+/// read-only: `git grep -O<prog>` / `--open-files-in-pager=<prog>` hands the
+/// matched files to an arbitrary program, `git ls-remote
+/// --upload-pack=<prog>` (also spelled `--exec`) runs that program locally
+/// for a local URL, and `--output=<path>` — honored by `diff`, passed
+/// through by `stash show` — rewrites an argv-chosen path, working-tree
+/// files included. Any of them rejects the whole invocation, for every
+/// subcommand: the subverb arms (`branch`, `stash`, `remote`, …) admit
+/// arbitrary trailing words, so a per-arm filter misses them.
+///
+/// `-O` also rejects the read-only `git diff -O<orderfile>`; that rarity is
+/// the cheaper error than admitting a pager exec.
+const FORBIDDEN_ARG_FLAGS: &[&str] = &[
+    "-O",
+    "--open-files-in-pager",
+    "--upload-pack",
+    "--exec",
+    "--output",
+];
 
 /// git subcommands whose entire flag space is read-only. `reflog` is
 /// deliberately absent (its `expire`/`delete` subverbs write) — it is
@@ -137,6 +166,27 @@ fn simple_command_words(simple: &brush_parser::ast::SimpleCommand) -> Vec<String
     words
 }
 
+/// True when `arg` names one of [`FORBIDDEN_ARG_FLAGS`]: the `--flag`
+/// spelling, a long spelling git would accept as an unambiguous
+/// abbreviation of one, or a single-dash cluster carrying the flag's
+/// character anywhere (`git grep -iO<prog>`, which git reads as `-i` then
+/// `-O<prog>`).
+fn is_forbidden_arg_flag(arg: &str) -> bool {
+    if arg == "--" {
+        return false; // end-of-options separator
+    }
+    if let Some(long) = arg.strip_prefix("--") {
+        let name = &arg[..2 + long.split('=').next().map_or(0, str::len)];
+        return FORBIDDEN_ARG_FLAGS
+            .iter()
+            .any(|flag| name.starts_with(flag) || flag.starts_with(name));
+    }
+    arg.starts_with('-')
+        && FORBIDDEN_ARG_FLAGS
+            .iter()
+            .any(|flag| flag.len() == 2 && arg.contains(&flag[1..]))
+}
+
 /// Admission rules over the parsed argv.
 fn classify_git_argv(argv: &[String]) -> bool {
     if argv.first().map(String::as_str) != Some("git") {
@@ -146,6 +196,9 @@ fn classify_git_argv(argv: &[String]) -> bool {
         .iter()
         .any(|word| word.chars().any(|c| FORBIDDEN_WORD_CHARS.contains(&c)))
     {
+        return false;
+    }
+    if argv.iter().any(|arg| is_forbidden_arg_flag(arg)) {
         return false;
     }
     // Global flags before the subcommand: repository selection and pager
@@ -178,11 +231,7 @@ fn classify_git_argv(argv: &[String]) -> bool {
     };
     let rest = &argv[idx + 1..];
     match subcommand {
-        s if READ_ONLY_SUBCOMMANDS.contains(&s) => {
-            // `git diff --output=<file>` and friends write to an arbitrary
-            // path even though the subcommand itself reads.
-            !rest.iter().any(|arg| arg.starts_with("--output"))
-        }
+        s if READ_ONLY_SUBCOMMANDS.contains(&s) => true,
         // `git branch <name>` creates a branch; only flag-only listing
         // forms classify.
         "branch" => rest
@@ -306,9 +355,34 @@ mod tests {
             "git remote update",
             "git reflog expire --all",
             "git reflog delete HEAD@{0}",
-            // File-writing flags on read subcommands.
+            // File-writing flags on read subcommands — `stash show` passes
+            // its trailing words through to `diff`, so the rejection cannot
+            // live on the free-list arm alone.
             "git diff --output=/tmp/x",
             "git log --output=/tmp/x",
+            "git log --output ./f.txt",
+            "git stash show --output=./f.txt",
+            "git stash show --output ./f.txt",
+            "git stash show -p --output=./f.txt",
+            // Program-spawning flags, in every spelling git accepts: pager
+            // exec via `grep -O`, its long form, the `-i`-cluster that
+            // carries it, and `ls-remote --upload-pack` (aliased `--exec`,
+            // abbreviable, and valid with its value as a separate word).
+            "git grep -O/tmp/x p",
+            "git grep -iO/tmp/x p",
+            "git grep -inO/tmp/x p",
+            "git grep -O /tmp/x p",
+            "git grep -O",
+            "git grep --open-files-in-pager=/tmp/x p",
+            "git grep --open-files-in-pager /tmp/x p",
+            "git ls-remote --upload-pack=/tmp/x url",
+            "git ls-remote --upload-pack /tmp/x url",
+            "git ls-remote --upload-pa=/tmp/x url",
+            "git ls-remote --exec=/tmp/x url",
+            // Glob / brace expansion rewrites argv after classification.
+            "git log *",
+            "git diff HEAD~1 -- src/*.rs",
+            "git log {a,b}",
             // Compound constructs.
             "git log | head -5",
             "git log > out.txt",
