@@ -417,7 +417,7 @@ async fn create_session(
     _conn: &Arc<Conn>,
     params: Value,
 ) -> Result<Value, HostError> {
-    let params: CreateSessionParams = parse_params(params)?;
+    let params: CreateSessionParams = parse_params(tolerate_missing_active_client_tools(params))?;
     let session_id = session::id(&params.channel)
         .ok_or_else(|| HostError::InvalidParams("createSession channel".to_string()))?
         .to_string();
@@ -430,6 +430,52 @@ async fn create_session(
         inner.session_added(summary);
     }
     Ok(Value::Null)
+}
+
+/// Default `activeClient.tools` to an empty list when a client omits it.
+///
+/// `SessionActiveClient.tools` is **required** by the pinned `ahp-types` 0.9.0
+/// (no `#[serde(default)]`) and equally required by the specification's own
+/// TypeScript type (`state.d.ts`: `tools: ToolDefinition[]`) — but the
+/// specification's own TypeScript **client** does not send it when it
+/// constructs `createSession` (the command travels its generic `CommandMap`
+/// path, whose `activeClient` is assembled with `clientId` alone). So the types
+/// demand a field the reference client never fills, and a strict host answers
+/// `-32602` to a spec-conformant client that is doing nothing wrong.
+///
+/// This follows the same ruling as the other reference-client leniencies here
+/// (the omitted `channel` on connection-level commands): interoperability over
+/// schema literalism. A *malformed* `tools` is still rejected — only a missing
+/// one is defaulted, and a client that means to contribute tools still must
+/// list them.
+///
+/// The workaround is self-invalidating: if an upgrade makes the field optional
+/// upstream, the JSON rewrite below stops being reachable and this function
+/// should be deleted. `tolerated_upstream_gaps()` counts it.
+fn tolerate_missing_active_client_tools(mut params: Value) -> Value {
+    if let Some(client) = params
+        .get_mut("activeClient")
+        .and_then(Value::as_object_mut)
+        && !client.contains_key("tools")
+    {
+        client.insert("tools".to_string(), Value::Array(Vec::new()));
+    }
+    params
+}
+
+/// How many upstream-gap workarounds this host currently carries.
+///
+/// Each entry is a place where the pinned upstream types and the reference
+/// client disagree and we bridge the difference. The count exists so an upgrade
+/// cannot silently leave one behind: a test asserts the expected number and
+/// names each workaround, so when upstream closes a gap this fails and points at
+/// the function to delete (the "self-invalidating guard" pattern pi-ahp uses).
+///
+/// Current entries:
+/// 1. [`tolerate_missing_active_client_tools`] — `createSession` with an
+///    `activeClient` that omits the upstream-required `tools`.
+pub fn tolerated_upstream_gaps() -> usize {
+    1
 }
 
 fn dispose_session(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
@@ -580,4 +626,52 @@ fn parse_params<T: DeserializeOwned>(value: Value) -> Result<T, HostError> {
 /// an internal error rather than panicking.
 fn to_value<T: serde::Serialize>(value: T) -> Result<Value, HostError> {
     serde_json::to_value(value).map_err(|err| HostError::Backend(err.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The self-invalidating guard: when an upstream upgrade closes a gap, this
+    /// fails and names the workaround to delete. A count that only ever grows is
+    /// how a compatibility shim outlives its reason.
+    #[test]
+    fn upstream_gap_workarounds_are_counted_and_named() {
+        assert_eq!(
+            tolerated_upstream_gaps(),
+            1,
+            "if upstream made `activeClient.tools` optional (or the reference \
+             client started sending it), delete \
+             `tolerate_missing_active_client_tools` and lower this count"
+        );
+    }
+
+    /// Only a *missing* `tools` is defaulted; a malformed one still fails, so
+    /// the tolerance cannot swallow a real client bug.
+    #[test]
+    fn a_missing_tools_is_defaulted_but_a_malformed_one_is_not() {
+        let filled = tolerate_missing_active_client_tools(
+            serde_json::json!({"channel": "ahp-root://", "activeClient": {"clientId": "c"}}),
+        );
+        assert_eq!(filled["activeClient"]["tools"], serde_json::json!([]));
+
+        // A client that supplies tools keeps exactly what it supplied.
+        let kept = tolerate_missing_active_client_tools(serde_json::json!({
+            "channel": "ahp-root://",
+            "activeClient": {"clientId": "c", "tools": [{"name": "t"}]},
+        }));
+        assert_eq!(kept["activeClient"]["tools"][0]["name"], "t");
+
+        // A malformed `tools` is not repaired into an empty list.
+        let malformed = tolerate_missing_active_client_tools(serde_json::json!({
+            "channel": "ahp-root://",
+            "activeClient": {"clientId": "c", "tools": "not-a-list"},
+        }));
+        assert_eq!(malformed["activeClient"]["tools"], "not-a-list");
+
+        // No activeClient at all is left alone (nothing to default).
+        let none =
+            tolerate_missing_active_client_tools(serde_json::json!({"channel": "ahp-root://"}));
+        assert!(none.get("activeClient").is_none());
+    }
 }

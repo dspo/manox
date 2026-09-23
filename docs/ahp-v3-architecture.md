@@ -252,8 +252,18 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
   候选是新 crate `manox-ahp-runtime`，或搬进 `manox-agent`。**倾向前者**（保持
   `manox-agent` 不认识 AHP）。
 - **实施期修订（新增 crate）**：`crates/manox-journal`（`journal.rs` + `base64_bytes.rs`）是计划里
-  没有的落点——把线上词汇从 `manox-protocol` 里救出来成为叶子 crate，避免打断依赖拓扑
+  没有的落点——把**磁盘**词汇从 `manox-protocol` 里救出来成为叶子 crate，避免打断依赖拓扑
   （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。§F 删除清单需同步。
+- **W4 前置核查（已做，2026-09-23）**：`manox-journal` 里有没有残留 v2 词汇——否则删
+  `manox-protocol` 会把 v2 的一部分以新名字留下来。**结论：代码面零残留**。该 crate
+  `use` 只有 `serde`（无 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|
+  PROTOCOL_EPOCH|StreamFrame`），453 行里没有任何帧类型或网关词汇；它承载的是 `.jsonl` 的行形状，
+  而 v3 切换**不改磁盘格式**（这正是 R1 里「锁旧 rev 的 client 仍能工作」的前提）。
+  **但文档面有漂移且已修**：`journal.rs` 的头注释自称 "Journal wire vocabulary" 并把
+  `StreamFrame::Entry`/`Snapshot`（v2 帧类型）写成自己的声明面——那是**传输**的关切，不是这个
+  crate 的。已改写为「disk vocabulary」，并删掉三处会随 W4 变成悬空引用的 `StreamFrame::*`。
+  唯一保留的 v2 味道是 `running` / `pending_auth` 两个词——实测它们**两边都在用**
+  （`manox-ahp/translate/actions.rs:146` 也读 `"running"`），是共享词汇而非残留。
 - 按 §F 删除清单执行；`manox-napi` 改 AHP；文档补 §H as-built 章。
 - 门禁：全仓 `script/gates.sh`；**grep 门禁**（生产区零 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；双路径一致性（in-proc typed ≡ WS serde）；`journal_replay_is_consistent_across_disk_reload` 仍绿。
 - 中间绿：删除面已零消费者。
@@ -435,15 +445,44 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
 - `db/mod.rs:396-400` 早有一个通过的 round-trip 测试，写 `Some("renamed")` 再断言读回。
 - v2 没暴露重命名**不是**「运行时没有这个能力」，是 v2 没接。
 
-实施按 `archive_thread` 的同一形状（`条目即权威`，K2/L3）：
+实施按 `archive_thread` 的同一形状（`条目即权威`，K2/L3），**三条腿，缺一不可**：
 
-1. **journal**：复用既有的 `ThreadEvent::TitleChanged`（`engine.rs:513` 把它映射成 `("title", {title})`），
-   经 `handle_notice` 发出——不新开第二条 journaling 路线，因此重命名与模型生成标题走同一条路到达
-   follow 流与 AHP translator（`translate/actions.rs:595` 本来就在读 `JournalWireEvent::Title`）。
-2. **sidecar**：`thread_store.rename_thread` 更新内存行的 `title_override` 槽 + `write_meta`
-   （标题的 durable 权威是 `.meta.json`，`repository.rs:36` 明文）。空白标题被拒——它会抹掉会话名
-   却看起来像落上了。
-3. **dispatch**：`Accepted`（非 `Ignored`），空白标题 `Rejected`。
+1. **journal**：`thread_store.journal_title` 经 `dispatch_store_journal_row` 追加 `title` 行。
+   kind 与 payload 与 `engine.rs:513` 为 `TitleChanged` 产的完全一致，所以用户重命名与模型生成标题
+   落**同一种行**。这一行是 v2 与 AHP **两边唯一的路线**：v2 `projections.rs:203` 折
+   `SessionTreeEntry::Title`，AHP `translate/actions.rs:595` 读 journal；而实时
+   `ThreadEvent::TitleChanged` 恰在 `translate.rs:104` 的 `Skip` 表里——它本就不该被折叠，只该被 journal。
+2. **内存行**：`rename_thread` 更新 `title_override` 槽（`display_title()` 第一优先级），
+   facade 另经 `handle_notice` 拿到实时事件，侧栏立刻改名。
+3. **sidecar**：`write_meta` 让名字免重启、免重扫存活。
+
+**实施期纠错（重要，留档）**：本节初版把第 1 条写成「复用 `ThreadEvent::TitleChanged` 经
+`handle_notice` 发出，因此与生成标题走同一条路」——**那句话是假的**。`handle_notice` 是
+notice 链的**消费端**，在 engine 的 journal tap（`engine.rs:904-921`：发射点 → `notice_tx` →
+tap 写 journal → `tap_tx` → `notice_rx` → facade）**之后**，所以注入进去的事件只到 facade、
+**不产生 journal 行**。后果是真空洞：v2 客户端在重新 seed 前看不见重命名（`projections.rs:203`
+折的就是那行），而 W1–W3 期间两套协议并存——正是要避免的跨协议静默分歧。
+
+修法用既有先例 `journal_pinned_archived`（`thread_store.rs:1095`，store 级决定显式 journal）。
+**注意那个模板恰好包含我漏掉的那一步**——`archive_thread` 有显式的
+`journal_pinned_archived` 调用，正因为它是 store 级决定、也在 tap 之外。
+
+**通用陷阱**（已同时写进 `engine.rs:908` 与 `thread_store.rs` 的注释）：tap 的
+「no future emission site can forget to persist」保证**只对发射点成立**，对**注入点不成立**。
+任何未来从 store 侧注入 `ThreadEvent` 的代码都会踩同一个坑。
+
+**回归测试**：`rename_thread_appends_the_durable_title_row`（store 层）与
+`title_changed_appends_the_journal_row`（AHP 层）都断言 **journal 行**而非只断言 summary。
+两者都验证过「去掉 journal 那条腿即红」——在**全量 suite** 下复验过，只断言 summary 的
+`title_changed_renames_the_session` 在同样条件下**照样绿**，这正是这个洞此前没被发现的原因。
+
+**测试期第二个坑（留档）**：AHP 层那条测试初版复用共享 fixture 的 `s-dispatch`，
+于是**单独跑绿、全量跑红**——因为 `engine::engine_routes` 是**进程级、按 thread id 索引**的 map，
+先前某个测试的 `attach_engine` 为同一 id 注册了 route，本次 append 就被投递给那个已死的 actor，
+既不落盘也不走 cold-append 回退（且不报错）。修法是给该测试一个 uuid 后缀的 session id。
+教训：凡是直接断言 journal 落盘的测试，**session id 必须唯一**，否则会被引擎路由表串台。
+
+4. **dispatch**：`Accepted`（非 `Ignored`），空白标题 `Rejected`。
 
 为什么这不是「两种都不选」而是第三种：`Ignored` 在撒谎（reducer 折了、运行时没做），`Rejected`
 让标准客户端一个正常操作报错。让重命名**真的生效**既不撒谎也不报错，还顺手激活了一个一直没接线的
@@ -485,12 +524,21 @@ reconnect 快照腿、dispatch 句柄。
 
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
-1. **W2 余下**：`extension_baseline` 的真实现（`x-manox-plan:/…` 等无状态扩展通道的基线）；
-   `fetchTurns` 之外的 `x-manox/fetchEntries`；客户端工具注册（`x-manox/registerSessionTools`）；
-   `x-manox` 四个 server→client 请求（`browserOp`/`clipboardRead`/`openExternal`/`invokeTool`）。
-   `resource*` 已落地基础围栏，但 `resourceResolve`/`resourceCopy`/`if_match` 未接。
-   §G 的 W2 门禁 ④ 已拆分：**④a 已绿**（官方 TS client over WS，见 §H.2e）；**④b**
-   （真 VS Code Agents window 的方言税）单独立项、未做。
+0. **W2 状态：收口**（2026-09-23）。§G 的 W2 五条门禁逐条对照：
+   ① 收敛性证明（`translation_convergence.rs`，含 §H.2 那次抓到真缺陷的轨迹）——绿；
+   ② 全射/覆盖门（`translate/mod.rs` 的 `target_of` 穷举 + 编译期门）——绿；
+   ③ `快照 == fold(重放)`（L10）——绿；
+   ④a 官方 TS client over WS（§H.2e）——绿；④b 独立立项（见下）；
+   ⑤ 错误码纪律（`error.rs` 的 `DECLARED` 表 + 各 refusal 路径的测试）——绿。
+
+   **W2 认完成**。下列条目移入 W5 或独立立项，不再挡 W2：
+   `extension_baseline` 真实现、`x-manox/fetchEntries`、`x-manox/registerSessionTools`、
+   四个 `x-manox` server→client 请求（`browserOp`/`clipboardRead`/`openExternal`/`invokeTool`）、
+   `resourceResolve`/`resourceCopy`/`if_match`（基础围栏已在）。这些是**能力扩充**，
+   不是 W2 的验证面——W2 的验收标准已经全部满足。
+
+1. **④b（独立立项）**：真 VS Code Agents window 的方言税（R5 五处）。前置条件是 hcode fork 里
+   加一条可插拔 connection 来源（现只有 ambient/ssh/wsl，全是起 VS Code 自己的 agent host）。
 2. **W3**：manox-app 侧的 `AhpStore`（`ahp::Client` + reducers）、进程内 `ahp::Transport`、
    `ConversationState` 改由 `ChatState.responseParts` 派生、删 `client_store*`/`journal_fold`/
    `journal_translate`/`server_note_translate`、重写 `source_gates.rs`、更新 `UI-MAP.md`。
@@ -499,6 +547,56 @@ reconnect 快照腿、dispatch 句柄。
    `~/.manox/gateway-ws.json` → `ahp-ws.json`、`cx web` → `cx ahp`。
 4. **W5**：有界重放缓冲（按 `serverSeq` 重放替换快照腿）、`delivery.maxLatencyMs` 合并调优、
    `resource*` 完整面、远程鉴权、多客户端并发与 owner 语义。
+
+### H.2f ④a 外接客户端实测：三个只有外部 client 能暴露的发现（2026-09-23）
+
+④a 的价值在执行期立刻兑现——三个发现都不是 Rust 套件能看见的：
+
+1. **`listSessions` 对真实规模不可用（已修，性能缺陷）**。原实现对**每个** session 折一次完整 journal
+   （`session_summary` → `block_on(session_state)`）。本机 401 个 session / 1.2 GB，于是
+   `listSessions` **超过 8 秒超时**——而它是客户端第一个调用、也是后续每一页的来源。改为从
+   **store 行**构建（与 v2 `threads_snapshot` 同一口径），实测 **401 个 session 上 1 ms 返回 27 条**
+   （27 = 活跃 18 + 未 superseded；归档 222 条不进列表，与 v2 侧栏一致）。store 行没有的
+   三个字段（status/activity/workingDirectories）只在**已 seed** 时填真值，否则按
+   `is_running` 给 Idle/InProgress 并留空——绝不为了三个字段去折一份 journal，也绝不编造。
+
+2. **重命名的「成功」是假的（已修，fail-open）**。用外接客户端对**真实会话**（78 MB，正被
+   Manox.app 以写租约驱动）执行 `session/titleChanged`：journal 行**没落**、sidecar **没变**，
+   而宿主回了 `Accepted`。成因有两层：
+   - `dispatch_store_journal_row` 在**冷路径**遇到外来租约时按设计**响亮跳过**
+     （`tracing::error!` + 「sidecar carries the flag」，`engine.rs:853`），但 store 侧
+     `rename_thread` 返回 `bool`，把「标题空白」和「没能持久化」**折成同一个 `false`**；
+   - dispatch 又把每个 `false` 报成「a session title cannot be blank」——**对合法标题说了假话**。
+   修法：引入 `RenameOutcome{Renamed, Blank, UnknownSession, NotPersisted}`；
+   `dispatch_store_journal_row` 返回「这行有没有落点」（活 actor 队列 或 文件存在），
+   `journal_title` 据此返回是否可持久化，dispatch 四种结局**各自给各自的 reason**。
+   实测复验：对非本进程拥有的会话现在回 `unknown session: <id>` / `… not writable from this
+   process`，对合法且可写的会话回 `Accepted` 且 journal 行确实落盘。
+   **第三层（实测追加）**：外接客户端跑完整 `createSession → subscribe → rename` 时又暴露两处
+   ——`createSession` 播种的**新会话**还没有 store 行（行要等 list refresh 扫到新文件），
+   于是 `seeded` 在 `session_state` 上 `?` 掉、对这个刚建好的会话回 `session not found`；
+   而 store 侧只按 `summaries` 认会话，把「按 path 认识但没有 summary 行」读成「unknown session」。
+   两处都修（chat 半边本来就有这个宽容，session 半边补上；store 改为 row **或** path 认得即可）。
+   最后把 `journal_title` 的前置收紧为**文件必须已存在**：仅有活引擎 route 不够——
+   一个从未 materialize 文件的引擎收到排队的 `AppendJournal` 会**无声丢弃**，
+   于是「已入队」被误报成已持久化。修后该场景回
+   `the session's journal is not writable from this process`（fail-closed），
+   而 journal 已存在的会话正常 `Accepted` 且行确实落盘。
+   **这也是「fail-closed 不是口号」的一个实例**：一个 fail-open 的写回执比拒绝更糟，
+   因为它会让每个订阅者折进一个永远无法 replay 的标题。
+
+3. **`createSession` 的 `activeClient.tools` 是上游 crate 与规范客户端的真实分歧（未修，待决）**。
+   实测帧：`{"channel":"ahp-root://","session":"…","activeClient":{"clientId":"capture"},
+   "workingDirectories":["file:///tmp"]}` → 宿主回 `-32602 invalid params: missing field
+   \`tools\``。核查：`SessionActiveClient.tools: Vec<ToolDefinition>` 在 pin 的
+   `ahp-types 0.9.0` 里**没有 `#[serde(default)]`**（必填），TS 类型 `state.d.ts:241` 同样是必填
+   `tools: ToolDefinition[]`；但**规范自己的 TS client** 在 `createSession` 里不发这个字段
+   （`createSession` 走 `CommandMap` 泛型通道，TS 的 `activeClient` 拼装不填 `tools`）。
+   即：**类型要求它、官方客户端不填它**。宿主拒绝是「按 pin 的类型」正确，但会让标准客户端的
+   正常建会话失败——属 R2/R5 类。处置选项（未定）：(a) `activeClient` 缺 `tools` 时按空表接受
+   （对客户端宽容、偏离 pin 类型）；(b) 记入 `test/upstream-workarounds` 式自失效守卫，等上游修
+   TS client。**倾向 (a)**，因为它与既有的「reference client 宽容」先例一致（`/ahp` 的
+   token/origin 闸已为 VS Code 放宽过），但这条留待用户裁决。
 
 ### H.4 AHP 上游文档漂移（实施期实测）
 

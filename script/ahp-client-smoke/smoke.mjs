@@ -162,10 +162,53 @@ try {
     JSON.stringify(reconnected).slice(0, 200),
   );
 
-  // ── 7. a dispatch must be answered, not dropped ─────────────────────────
+  // ── 7. createSession must accept a spec-shaped request ──────────────────
+  // `channel` IS the session URI here (`channels-session/commands.d.ts`), and
+  // the reference client omits `activeClient.tools` even though the upstream
+  // types require it — a host that enforces the type literally answers -32602
+  // to a conformant client, so this exercises the toleration seam.
+  const newSession = "ahp-session:/" + crypto.randomUUID();
+  const created = await client.request("createSession", {
+    channel: newSession,
+    activeClient: { clientId: "ts-smoke" },
+    workingDirectories: ["file:///tmp"],
+  });
+  check("createSession accepts the reference client's shape", created === null, JSON.stringify(created));
+
+  // The client's chosen id must address the session afterwards — the host must
+  // not mint an id behind its back.
+  const createdSub = await client.subscribe(newSession);
+  check("the created session is addressable by the client's id", Boolean(createdSub?.result), newSession);
+
+  // ── 8. a dispatch must be answered, not dropped ─────────────────────────
   // AHP has no write receipt: the client learns the outcome from the echoed
   // envelope (or its `rejectionReason`). A dropped dispatch is indistinguishable
-  // from a slow one until the client gives up, so the echo is the contract.
+  // from a slow one until the client gives up, so the echo is the contract —
+  // and a *false* acceptance is worse than a rejection, so a rename that cannot
+  // be made durable must say so rather than echo as accepted.
+  const it = createdSub.subscription[Symbol.asyncIterator]();
+  client.dispatch(newSession, { type: "session/titleChanged", title: "smoke rename" });
+  let verdict = null;
+  const renameDeadline = Date.now() + 15000;
+  while (Date.now() < renameDeadline) {
+    const r = await Promise.race([it.next(), new Promise((res) => setTimeout(() => res({ done: true }), 2000))]);
+    if (r.done) continue;
+    const m = r.value?.params ?? r.value;
+    if (JSON.stringify(m).includes("titleChanged")) {
+      verdict = m.rejectionReason ?? null;
+      break;
+    }
+  }
+  check("a rename is answered (accepted or with a reason)", verdict !== undefined, `verdict=${verdict}`);
+  if (verdict !== null) {
+    // Refused: the reason must be truthful, never the blank-title message.
+    check(
+      "a refused rename names a real cause",
+      !verdict.includes("blank"),
+      verdict,
+    );
+  }
+
   const handle = client.dispatch(ROOT, { type: "x-manox/pinnedChanged", pinned: true });
   check("dispatch returns an awaitable handle", Boolean(handle));
 } catch (error) {

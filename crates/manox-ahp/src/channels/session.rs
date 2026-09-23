@@ -24,6 +24,20 @@ pub fn id(uri: &str) -> Option<&str> {
 
 /// A `lifecycle: creating` session state, as `createSession` must answer before
 /// the backend finishes initialising.
+/// An empty session state for a session with no store row yet.
+///
+/// `createSession` seeds the session it just created, and a brand-new session's
+/// row only appears after a list refresh scans its file. An empty state is what
+/// that session *is* at that moment — answering "not found" for it would make
+/// the create command fail on its own subject.
+pub fn initial_empty(thread_id: &str) -> SessionState {
+    let mut state = initial("", None, None);
+    // The active-session pointer is the one thing a store row would have told
+    // us, and it has a correct default for a fresh session: the session itself.
+    state.default_chat = Some(crate::channels::chat::uri(thread_id));
+    state
+}
+
 pub fn initial(
     provider: &str,
     working_directories: Option<Vec<Uri>>,

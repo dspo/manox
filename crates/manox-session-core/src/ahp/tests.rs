@@ -794,8 +794,22 @@ mod dispatch {
     async fn title_changed_renames_the_session() {
         let _guards = install();
         let (_server, backend) = fixture().await;
-        manox_agent::thread_store::global()
-            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+        // A rename is only durable against a session that has a journal, so the
+        // happy path needs one (the refusal case is its own test below).
+        let session_file =
+            manox_agent::thread_store::global_sessions_dir().join("s-dispatch.jsonl");
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session_file,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"s-dispatch\",\
+             \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
+             \"metadata\":{\"host\":\"manox\"}}\n",
+        )
+        .unwrap();
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-dispatch", None);
+            s.note_session_path("s-dispatch", &session_file);
+        });
 
         let action =
             StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
@@ -1134,6 +1148,254 @@ mod dispatch {
             Some(false),
             "unarchiving the seeded row is a real, observable state change"
         );
+        uninstall();
+    }
+
+    /// The rename's **durable** half: the journal row, which is the only route
+    /// either protocol face takes.
+    ///
+    /// The in-memory summary is not the contract. The v2 projection folds
+    /// `SessionTreeEntry::Title` and the AHP translator reads the journal,
+    /// while the live `TitleChanged` event sits on `translate.rs`'s `Skip`
+    /// list — so a rename that only flipped the summary would pass a
+    /// summary-only assertion and still be invisible to every client following
+    /// the session. This is the cross-protocol hole, pinned.
+    ///
+    /// A **unique session id** is load-bearing: engine routes are a
+    /// process-global map keyed by thread id (`engine::engine_routes`), so
+    /// reusing the shared fixture's `s-dispatch` would route this append to
+    /// whatever actor an earlier test registered for that id and the row would
+    /// never be written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn title_changed_appends_the_journal_row() {
+        let _guards = install();
+        let session_id = format!("s-title-{}", uuid::Uuid::new_v4().simple());
+        let session_file =
+            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl"));
+        std::fs::create_dir_all(session_file.parent().unwrap()).unwrap();
+        // The store's cold append (no live engine drives this session) writes to
+        // an existing journal, opened through its header row.
+        std::fs::write(
+            &session_file,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
+                 \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
+                 \"metadata\":{{\"host\":\"manox\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(session_id.clone()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+        manox_agent::thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test(&session_id, None);
+            s.note_session_path(&session_id, &session_file);
+        });
+
+        let action =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "durable name".to_string(),
+            });
+        assert_eq!(
+            backend.dispatch(&session::uri(&session_id), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        let mut titles: Vec<String> = Vec::new();
+        for _ in 0..500 {
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&session_file)
+                .await
+                .expect("session file opens");
+            titles = storage
+                .journal_range(0, u64::MAX)
+                .await
+                .expect("journal reads")
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    _ => None,
+                })
+                .collect();
+            if !titles.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            titles,
+            vec!["durable name".to_string()],
+            "the rename must land a journal title row, not only the summary"
+        );
+        uninstall();
+    }
+
+    /// The two refusal reasons are distinct, and the blank one is the one a
+    /// client can act on.
+    ///
+    /// A rename fails for two unrelated causes — an empty title (the client's
+    /// fault) and a title that cannot be made durable (the environment's) — and
+    /// a two-valued return reported the second as the first, so a client asking
+    /// to rename to a perfectly good string was told its title was blank. This
+    /// pins the blank reason here; the undurable one is pinned at the store,
+    /// where it can be produced deterministically (`rename_thread`'s own test),
+    /// because whether a live engine route exists is process-global state this
+    /// suite cannot control.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn title_changed_refusal_names_the_blank_title() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+
+        let action =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "   ".to_string(),
+            });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => assert!(
+                reason.contains("blank"),
+                "a blank title names itself as the cause: {reason}"
+            ),
+            other => panic!("a blank title must be refused, got {other:?}"),
+        }
+
+        // An unknown session is its own reason again, not "blank".
+        let unknown =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "fine".to_string(),
+            });
+        match backend.dispatch(&session::uri("s-absent-entirely"), &unknown, &origin()) {
+            DispatchOutcome::Rejected(reason) => assert!(
+                reason.contains("unknown session"),
+                "an unknown session names itself: {reason}"
+            ),
+            other => panic!("an unknown session must be refused, got {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// A brand-new session must be seedable before any list refresh has scanned
+    /// its file.
+    ///
+    /// `createSession` seeds the session it just created, and its store row only
+    /// appears once a refresh scans the new file. Requiring that row made the
+    /// host answer `session not found` for the session it had itself created —
+    /// and it is the very next step of the same request, so the command failed
+    /// on its own subject. The empty state is what such a session is.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fresh_session_seeds_before_its_store_row_exists() {
+        let _guards = install();
+        let session_id = format!("s-fresh-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some(session_id.clone()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+
+        // No store row was inserted: this is the state `createSession` seeds in.
+        let seeded = backend.session_state(&session_id);
+        assert!(
+            seeded.is_some(),
+            "a fresh session seeds from an empty state, not `None`"
+        );
+        assert_eq!(
+            seeded.unwrap().default_chat.as_deref(),
+            Some(chat::uri(&session_id).as_str()),
+            "the fresh session's active pointer is itself"
+        );
+        uninstall();
+    }
+
+    /// A session the client created is addressable by the id it chose, and a
+    /// rename on it reports the truth about durability.
+    ///
+    /// Two defects met here. `createSession` seeds what it just created, and a
+    /// fresh session's store row only appears after a list refresh scans its
+    /// new file — so the seed must tolerate the missing row (it answered
+    /// `session not found` for the session it had itself created). The rename
+    /// then hit the same gap from the other side: the store knows the session by
+    /// path (the create path notes it) but has no summary row, which the store
+    /// read as "unknown session".
+    ///
+    /// The remaining refusal is correct and is the point: a fresh session's
+    /// `.jsonl` materializes lazily at its first turn, so until then the rename
+    /// has no journal to be durable in — and saying so is the honest answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_created_session_is_addressable_and_reports_durability() {
+        let _guards = install();
+        let id = format!("s-created-{}", uuid::Uuid::new_v4().simple());
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let params = ahp_types::commands::CreateSessionParams {
+            channel: session::uri(&id),
+            meta: None,
+            provider: None,
+            working_directories: Some(vec!["file:///tmp".to_string()]),
+            config: None,
+            active_client: None,
+            progress_token: None,
+        };
+        backend.create_session(&id, &params).expect("creates");
+        assert!(
+            server.ahp_inner().session_thread(&id).is_some(),
+            "the runtime addresses the session by the client's chosen id"
+        );
+        assert!(
+            backend.chat_state(&id).is_some(),
+            "the AHP chat channel resolves for the created session"
+        );
+
+        let action =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "created rename".to_string(),
+            });
+        match backend.dispatch(&session::uri(&id), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => assert!(
+                reason.contains("not writable"),
+                "the reason is durability, not identity: {reason}"
+            ),
+            DispatchOutcome::Accepted => {
+                // Acceptable only when the journal really exists — an accepted
+                // rename must have a durable row behind it, and a live engine
+                // route alone is not that (a queued append to an engine that
+                // never opened a file is dropped without a trace).
+                assert!(
+                    manox_agent::thread_store::global_sessions_dir()
+                        .join(format!("{id}.jsonl"))
+                        .exists(),
+                    "an accepted rename must have a journal behind it"
+                );
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
         uninstall();
     }
 

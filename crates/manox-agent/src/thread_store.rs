@@ -442,6 +442,27 @@ pub fn drop_global_for_test() {
     *GLOBAL.lock().unwrap() = None;
 }
 
+/// What a rename did.
+///
+/// Three outcomes, not a bool: a caller has to tell "the title was rejected"
+/// from "the title could not be made durable", because only the first is the
+/// client's fault and only the second is recoverable by retrying later. Folding
+/// them into `false` made an AHP refusal report the blank-title message for a
+/// perfectly valid title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// The title is stored and both durable legs accepted it.
+    Renamed,
+    /// Nothing to rename: the title was empty or whitespace-only.
+    Blank,
+    /// No such session in the store.
+    UnknownSession,
+    /// The row was updated in memory, but the journal row had nowhere to land
+    /// (no live engine and no session file) — the rename is not durable, so the
+    /// caller must not report success.
+    NotPersisted,
+}
+
 impl ThreadStore {
     pub fn summaries(&self) -> &[ThreadSummary] {
         &self.summaries
@@ -690,31 +711,96 @@ impl ThreadStore {
         self.write_meta(id, move |meta| meta.unread = unread);
     }
 
-    /// Rename a session: the user's title, persisted in the sidecar.
+    /// Rename a session: the user's title, durable in the journal and the
+    /// sidecar.
     ///
-    /// The sidecar is the title's durable authority (the transcript-derived
-    /// name is not), so a rename is a meta write like [`Self::set_unread`].
-    /// The in-memory row is updated too, and its `title_override` slot is what
-    /// [`ThreadSummary::display_title`] reads first — so a rename outranks a
-    /// title the model generated and survives a rescan.
+    /// Three legs, and a rename needs all three:
+    ///
+    /// - **the journal** ([`Self::journal_title`]) carries `SessionTreeEntry::Title`,
+    ///   which the v2 title projection folds (`projections.rs`) and the AHP
+    ///   translator reads (`translate/actions.rs`). It is the only route
+    ///   either takes: the live `ThreadEvent::TitleChanged` is on
+    ///   `translate.rs`'s `Skip` list precisely because the journal row is its
+    ///   durable form.
+    /// - **the in-memory summary** updates the `title_override` slot that
+    ///   [`ThreadSummary::display_title`] reads first, so a rename outranks a
+    ///   model-generated title immediately.
+    /// - **the sidecar** makes that survive a restart without a rescan.
     ///
     /// An empty or whitespace-only title is not a rename; it is refused so a
     /// client cannot blank out a session's name by sending nothing.
-    pub fn rename_thread(&mut self, id: &str, title: &str) -> bool {
+    ///
+    /// # Why this journals explicitly
+    ///
+    /// A store-level decision runs *outside* the engine's journal tap: the tap
+    /// sits between an engine emission site and the facade, and consuming a
+    /// notice at the facade does not persist it. So any store-side change that
+    /// clients must see has to append its own row — the same reason
+    /// [`Self::journal_pinned_archived`] exists. (The tap's
+    /// "no future emission site can forget to persist" guarantee holds for
+    /// *emission* sites only, not for injection points like this one.)
+    pub fn rename_thread(&mut self, id: &str, title: &str) -> RenameOutcome {
         let title = title.trim();
         if title.is_empty() {
-            return false;
+            return RenameOutcome::Blank;
         }
-        let Some(summary) = self.summary_mut(id) else {
-            return false;
-        };
-        if summary.title_override.as_deref() == Some(title) {
-            return true;
+        // A session the store knows only by path is still known: a
+        // freshly-created session gets its id→path note immediately but no
+        // summary row until a list refresh scans the new file. Renaming it must
+        // work — refusing here answered "unknown session" for the session the
+        // client had just created. The durable legs go through the path; only
+        // the sidebar mirror needs the row, and it catches up on the refresh.
+        let known = self.summary_mut(id).is_some() || self.session_paths.contains_key(id);
+        if !known {
+            return RenameOutcome::UnknownSession;
         }
-        summary.title_override = Some(title.to_string());
+        if let Some(summary) = self.summary_mut(id) {
+            if summary.title_override.as_deref() == Some(title) {
+                return RenameOutcome::Renamed;
+            }
+            summary.title_override = Some(title.to_string());
+        }
+        // The durable legs. Both are best-effort against a session another
+        // process may be driving (the write lease is per session), so the
+        // outcome reports whether they actually landed rather than assuming
+        // they did — a caller that answered "accepted" on a rename that was
+        // silently dropped would be lying to every subscriber.
+        let journaled = self.journal_title(id, title);
         let owned = title.to_string();
         self.write_meta(id, move |meta| meta.title = Some(owned));
-        true
+        if journaled {
+            RenameOutcome::Renamed
+        } else {
+            RenameOutcome::NotPersisted
+        }
+    }
+
+    /// Append the durable `title` row for a rename.
+    ///
+    /// The kind and payload match what the engine's own `TitleChanged`
+    /// emission produces (`durable_journal_payload`), so a user rename and a
+    /// model-generated title land as the *same* row shape — a reader cannot
+    /// tell them apart, which is correct: both are the session's title.
+    ///
+    /// Returns whether a row could be queued at all. A session with no file, or
+    /// one whose write lease another process holds, cannot take the row: the
+    /// append is skipped (loudly, at the seam) and the caller is told, so it can
+    /// refuse the rename instead of reporting success.
+    fn journal_title(&self, id: &str, title: &str) -> bool {
+        // A session whose journal has not materialized yet has nowhere for the
+        // row to land. A live engine route is not enough: a queued
+        // `AppendJournal` to an engine that never opened a file is dropped
+        // without a trace, so the row would be reported as placed and never
+        // exist. The file's presence is the honest precondition.
+        if !self.session_paths.get(id).is_some_and(|path| path.exists()) {
+            return false;
+        }
+        crate::engine::dispatch_store_journal_row(
+            id.to_string(),
+            self.session_paths.get(id).cloned(),
+            "title".into(),
+            serde_json::json!({ "title": title }),
+        )
     }
 
     /// Persist the session's granted extra working directories (multi-
@@ -1093,7 +1179,7 @@ impl ThreadStore {
     /// the summary mirror (a thread whose summary never loaded carries the
     /// decided flag alone — every later decision re-carries the pair).
     fn journal_pinned_archived(&self, id: &str, pinned: bool, archived: bool) {
-        crate::engine::dispatch_store_journal_row(
+        let _ = crate::engine::dispatch_store_journal_row(
             id.to_string(),
             self.session_paths.get(id).cloned(),
             "pinned_archived".into(),
@@ -2001,13 +2087,95 @@ mod tests {
         (db, path)
     }
 
-    /// A rename is a user title: it takes display precedence over a
-    /// model-generated one (the `title_override` slot `display_title` reads
-    /// first), and a blank title is refused rather than stored — a blank would
-    /// read as "renamed to nothing" while the session kept its old name.
+    /// A rename must land a durable `title` **journal** row, not only the
+    /// sidecar.
+    ///
+    /// The row is the only route the two protocol faces take — the v2
+    /// projection folds `SessionTreeEntry::Title` and the AHP translator reads
+    /// the journal, while the live `TitleChanged` event is on `translate.rs`'s
+    /// `Skip` list. A store-side rename that skipped this would be invisible to
+    /// every client following the session, which is exactly the cross-protocol
+    /// divergence the store-level journal append exists to prevent.
     #[test]
-    fn rename_thread_sets_the_override_and_refuses_blank() {
+    fn rename_thread_appends_the_durable_title_row() {
+        let (db, db_path) = temp_db();
+        crate::runtime::init_hermetic_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("t-title.jsonl");
+        // An existing session file is what the cold-append fallback (no live
+        // engine in this test) appends to; a session with no file at all has
+        // nowhere to put the row, and the sidecar carries the flag instead.
+        std::fs::write(
+            &session,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"t-title\",\
+             \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
+             \"metadata\":{\"host\":\"manox\"}}\n",
+        )
+        .unwrap();
+        let store = store_handle(db.clone());
+        store.with_mut(|s| {
+            s.insert_summary_for_test("t-title", None);
+            s.session_paths
+                .insert("t-title".to_string(), session.clone());
+            s.sessions_dir = dir.path().to_path_buf();
+        });
+
+        store.with_mut(|s| {
+            assert_eq!(
+                s.rename_thread("t-title", "renamed by the user"),
+                RenameOutcome::Renamed
+            )
+        });
+
+        // Read the row back through the journal walk (not a byte match), so the
+        // assertion is on the durable vocabulary a reader actually folds.
+        let titles = |path: &std::path::Path| -> Vec<String> {
+            crate::runtime::handle()
+                .block_on(async {
+                    let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(path)
+                        .await
+                        .unwrap();
+                    storage.journal_range(0, u64::MAX).await.unwrap()
+                })
+                .into_iter()
+                .filter_map(|record| match record.entry {
+                    manox_harness::session::SessionTreeEntry::Title { title, .. } => Some(title),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut landed = Vec::new();
+        for _ in 0..500 {
+            landed = titles(&session);
+            if !landed.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            landed,
+            vec!["renamed by the user".to_string()],
+            "a rename must append a durable title row"
+        );
+        std::fs::remove_file(db_path).ok();
+    }
+
+    /// A rename takes display precedence over a model-generated title (the
+    /// `title_override` slot `display_title` reads first), and a blank title is
+    /// refused rather than stored — a blank would read as "renamed to nothing"
+    /// while the session kept its old name.
+    ///
+    /// This session has **no journal file**, so the durable leg has nowhere to
+    /// land and the outcome says so (`NotPersisted`). The in-memory row still
+    /// flips, which is exactly why the outcome — not the row — is what a caller
+    /// must report on: the title is visible here and unreadable to every other
+    /// process.
+    #[test]
+    fn rename_thread_reports_whether_it_could_persist() {
         let (db, _path) = temp_db();
+        // A rename journals as well as writing the sidecar, so the store needs
+        // the process runtime the journal append dispatches onto.
+        crate::runtime::init_hermetic_for_test();
         let store = store_handle(db);
         store.with_mut(|s| s.insert_summary_for_test("t-rename", None));
         store.with_mut(|s| {
@@ -2015,7 +2183,13 @@ mod tests {
             row.title = Some("model said this".to_string());
         });
 
-        store.with_mut(|s| assert!(s.rename_thread("t-rename", "user said this")));
+        store.with_mut(|s| {
+            assert_eq!(
+                s.rename_thread("t-rename", "user said this"),
+                RenameOutcome::NotPersisted,
+                "no journal file means the rename cannot be durable"
+            )
+        });
         let row = store
             .read(|s| s.summary_by_id("t-rename").cloned())
             .unwrap();
@@ -2027,8 +2201,8 @@ mod tests {
         );
 
         // Whitespace is not a title.
-        store.with_mut(|s| assert!(!s.rename_thread("t-rename", "   ")));
-        store.with_mut(|s| assert!(!s.rename_thread("t-rename", "")));
+        store.with_mut(|s| assert_eq!(s.rename_thread("t-rename", "   "), RenameOutcome::Blank));
+        store.with_mut(|s| assert_eq!(s.rename_thread("t-rename", ""), RenameOutcome::Blank));
         let row = store
             .read(|s| s.summary_by_id("t-rename").cloned())
             .unwrap();
@@ -2039,7 +2213,12 @@ mod tests {
         );
 
         // An unknown session is refused, not silently dropped.
-        store.with_mut(|s| assert!(!s.rename_thread("no-such-session", "x")));
+        store.with_mut(|s| {
+            assert_eq!(
+                s.rename_thread("no-such-session", "x"),
+                RenameOutcome::UnknownSession
+            )
+        });
     }
 
     fn store_handle(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {

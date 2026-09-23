@@ -113,7 +113,17 @@ impl RuntimeBackend {
             Some(fold) => (fold.chat, fold.tail),
             None => (chat::initial(session_id), 0),
         };
-        let session_state = super::session_state(&thread_id).await?;
+        // The session half needs the same tolerance as the chat half, for the
+        // same reason: a brand-new session has no store row until a list
+        // refresh scans its file, and `createSession` seeds it immediately —
+        // its own step, before any refresh. Requiring the row there made
+        // `createSession` answer `session not found` for the session it had just
+        // created. An empty state is what the session *is* at this point, and the
+        // fold replaces it as soon as the row appears.
+        let session_state = match super::session_state(&thread_id).await {
+            Some(state) => state,
+            None => session::initial_empty(&thread_id),
+        };
         let seeded = Arc::new(Seeded {
             thread_id,
             session: session_state,
@@ -210,6 +220,17 @@ impl RuntimeBackend {
                 Err(_) => break,
             }
         }
+    }
+
+    /// The live facts for a session this host has already folded, if any.
+    fn seeded_status(&self, session_id: &str) -> Option<SeededFacts> {
+        let seeded = self.seeds.lock().get(session_id).cloned()?;
+        Some(SeededFacts {
+            status: seeded.session.status,
+            activity: seeded.session.activity.clone(),
+            directories: seeded.session.working_directories.clone(),
+            title: seeded.session.title.clone(),
+        })
     }
 
     /// The agent catalogue for the root channel, from the live provider registry
@@ -395,47 +416,108 @@ impl RuntimeBackend {
     }
 }
 
+/// The live facts a store row does not carry, when this host has already
+/// folded the session.
+///
+/// `status`, `activity` and the granted directories live only in the fold. When
+/// a session has been seeded (a subscriber or a `createSession` folded it) the
+/// real values are used; when it has not, the list answers what the store knows
+/// rather than folding a journal to fill three fields — and omits what it
+/// cannot know instead of inventing it.
+#[derive(Clone)]
+struct SeededFacts {
+    status: u32,
+    activity: Option<String>,
+    directories: Option<Vec<String>>,
+    title: String,
+}
+
+/// One `SessionSummary` from a store row plus the live facts, if any.
+///
+/// The row's [`manox_agent::db::ThreadSummary::display_title`] already applied
+/// user-rename precedence, so it is the title of record; a seeded fold only
+/// overrides it when it actually carries one.
+fn summary_from_row(
+    row: &manox_agent::db::ThreadSummary,
+    store: &manox_agent::thread_store::ThreadStore,
+    seeded: Option<SeededFacts>,
+) -> SessionSummary {
+    let facts_title = seeded.as_ref().map(|facts| facts.title.clone());
+    let (status, activity, directories) = match seeded {
+        Some(facts) => (facts.status, facts.activity, facts.directories),
+        // A session the store knows and this host has not folded: idle unless a
+        // turn is live in this process.
+        None => (
+            if store.is_running(&row.id) {
+                ahp_types::state::SessionStatus::InProgress.bits()
+            } else {
+                ahp_types::state::SessionStatus::Idle.bits()
+            },
+            None,
+            None,
+        ),
+    };
+    SessionSummary {
+        provider: row.provider_id.clone().unwrap_or_default(),
+        // The row's `display_title` already applied user-rename precedence; a
+        // seeded fold only wins when it actually carries a title.
+        title: match &facts_title {
+            Some(title) if !title.is_empty() => title.clone(),
+            _ => row.display_title().to_string(),
+        },
+        status,
+        activity,
+        origin: None,
+        project: (!row.project.is_empty()).then(|| ahp_types::state::ProjectInfo {
+            uri: row.project.clone(),
+            display_name: row.project.clone(),
+        }),
+        working_directories: directories,
+        annotations: None,
+        resource: session::uri(&row.id),
+        created_at: String::new(),
+        modified_at: String::new(),
+        changes: None,
+        meta: None,
+    }
+}
+
 impl Backend for RuntimeBackend {
     fn root_state(&self) -> RootState {
         root::with_agents(self.agents(), None)
     }
 
     fn list_sessions(&self) -> Vec<SessionSummary> {
+        // A list is built from the **store rows**, never from a per-session
+        // journal fold. A fold reads a whole transcript, and this machine holds
+        // hundreds of sessions totalling gigabytes, so folding each one to
+        // produce a one-line summary made `listSessions` time out — and it is
+        // both the first call a client makes and the source of every later
+        // page. The v2 list path (`threads_snapshot`) reads the same rows for
+        // the same reason.
         let Some(store) = manox_agent::thread_store::try_global() else {
             return Vec::new();
         };
-        let ids = store.read(|state| {
+        store.read(|state| {
             state
                 .summaries()
                 .iter()
-                .map(|row| row.id.clone())
-                .collect::<Vec<_>>()
-        });
-        let mut out = Vec::new();
-        for id in ids {
-            if let Some(summary) = self.session_summary(&id) {
-                out.push(summary);
-            }
-        }
-        out
+                // A superseded predecessor is not the conversation's identity;
+                // its successor row is (the v2 list rules the same way).
+                .filter(|row| row.superseded_by.is_none())
+                .map(|row| summary_from_row(row, state, self.seeded_status(&row.id)))
+                .collect()
+        })
     }
 
     fn session_summary(&self, session_id: &str) -> Option<SessionSummary> {
         let store = manox_agent::thread_store::try_global()?;
-        let row = store.read(|state| state.summary_by_id(session_id).cloned())?;
-        // The store row carries no timestamps; the journal's own last entry is
-        // the deterministic stamp available to a fold (a wall-clock stamp here
-        // would make the fold non-reproducible).
-        let stamp = self
-            .seeds
-            .lock()
-            .get(session_id)
-            .map(|seeded| seeded.chat.modified_at.clone())
-            .unwrap_or_default();
-        let state = block_on(super::session_state(session_id))?;
-        let mut summary = session::summary(&state, session_id, &stamp, &stamp, state.status);
-        summary.provider = row.provider_id.unwrap_or(summary.provider);
-        Some(summary)
+        let seeded = self.seeded_status(session_id);
+        store.read(|state| {
+            state
+                .summary_by_id(session_id)
+                .map(|row| summary_from_row(row, state, seeded.clone()))
+        })
     }
 
     fn session_state(&self, session_id: &str) -> Option<SessionState> {
@@ -706,14 +788,26 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                if self
+                use manox_agent::thread_store::RenameOutcome;
+                match self
                     .server
                     .ahp_inner()
                     .rename_thread(session_id, &changed.title)
                 {
-                    DispatchOutcome::Accepted
-                } else {
-                    DispatchOutcome::Rejected("a session title cannot be blank".to_string())
+                    RenameOutcome::Renamed => DispatchOutcome::Accepted,
+                    RenameOutcome::Blank => {
+                        DispatchOutcome::Rejected("a session title cannot be blank".to_string())
+                    }
+                    RenameOutcome::UnknownSession => {
+                        DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
+                    }
+                    // Not durable (no engine and no journal file, or another
+                    // process drives the session), so it must not be reported as
+                    // accepted: every subscriber would then fold a title no
+                    // reader can ever replay.
+                    RenameOutcome::NotPersisted => DispatchOutcome::Rejected(
+                        "the session's journal is not writable from this process".to_string(),
+                    ),
                 }
             }
             StateAction::SessionIsArchivedChanged(changed) => {

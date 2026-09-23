@@ -3879,31 +3879,44 @@ impl AgentServerInner {
 
     /// Rename a session to a user-supplied title.
     ///
-    /// Two legs, in the order `archive_thread` established: the **journal**
-    /// gets the durable `title` entry (K2/L3 — the entry is the authority, and
-    /// it is what a cold fold replays), and the **sidecar** gets the same title
-    /// so the sidebar list and a cold restore agree without rescanning.
+    /// Two calls, and the split matters:
     ///
-    /// The engine's own title path emits [`manox_agent::thread::ThreadEvent::TitleChanged`]
-    /// and that is reused here rather than a second journaling route, so a
-    /// rename reaches follow streams and the AHP translator by the same road a
-    /// generated title does. A whitespace-only title is refused: it would blank
-    /// the session's name while looking like it landed.
-    pub(crate) fn rename_thread(&self, session_id: &str, title: &str) -> bool {
+    /// - `handle_notice` delivers the live [`manox_agent::thread::ThreadEvent::TitleChanged`]
+    ///   to the **facade**, so the sidebar and any in-process observer show the
+    ///   new name at once.
+    /// - `thread_store::rename_thread` performs the **durable** half: it appends
+    ///   the journal `title` entry (the row the v2 projection folds and the AHP
+    ///   translator reads) and writes the sidecar.
+    ///
+    /// The facade call deliberately does **not** stand in for persistence: it
+    /// feeds the consumer end of the engine's notice chain, which is *past* its
+    /// journal tap, so a notice injected here is never journalled. That is why
+    /// the store owns the durable append (the `journal_pinned_archived`
+    /// precedent) rather than this method reusing the engine's emission path.
+    ///
+    /// A whitespace-only title is refused: it would blank the session's name
+    /// while looking like it landed.
+    pub(crate) fn rename_thread(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> manox_agent::thread_store::RenameOutcome {
         let title = title.trim();
         if title.is_empty() {
-            return false;
+            return manox_agent::thread_store::RenameOutcome::Blank;
         }
         let Some(thread) = self.session_thread(session_id) else {
-            return false;
+            return manox_agent::thread_store::RenameOutcome::UnknownSession;
         };
+        // The live notice feeds the facade; the store call is the durable half
+        // (journal row + sidecar). Its outcome is what the caller can honestly
+        // report — a session another process is driving takes neither leg.
         thread.handle_notice(BackendNotice::Event(Box::new(
             manox_agent::thread::ThreadEvent::TitleChanged {
                 title: title.to_string(),
             },
         )));
-        manox_agent::thread_store::global().with_mut(|s| s.rename_thread(session_id, title));
-        true
+        manox_agent::thread_store::global().with_mut(|s| s.rename_thread(session_id, title))
     }
 
     /// GW3 (§D.4): mint the stable delivery identity for one adjudication —

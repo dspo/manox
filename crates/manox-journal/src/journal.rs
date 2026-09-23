@@ -1,14 +1,19 @@
-//! Journal wire vocabulary — the client-facing §C.2 entry set.
+//! The durable journal entry vocabulary — the on-disk §C.2 entry set.
 //!
-//! Declaring surface: the AHP translation tables in `manox-ahp` (v3) and, until
-//! it is deleted, the v2 `JOURNAL_ENTRIES` table (`manox_protocol::surface`).
-//! [`JournalWireEvent`] is the wire form of the kernel `JournalEntry` enum
-//! (architecture doc §C.2): every observable state change of a thread is
-//! carried by one of these entries (L3), stamped with a chain-dense `seq` at
-//! the single append point (L4). The v2 follow frames carry
-//! `JournalWireEntry` = `{seq, id, parentId, timestamp, event}` (§C.1);
-//! `StreamFrame::Entry` transports the full entry envelope (`seq`, `id`,
-//! `parentId`, `timestamp`, `event`) — identical to a snapshot record.
+//! This is a **disk** vocabulary, not a wire one: it is the serde shape of the
+//! rows in a session's `.jsonl`, and [`JournalWireEvent`] is the wire form of
+//! the kernel `JournalEntry` enum (architecture doc §C.2). Every observable
+//! state change of a thread is carried by one of these entries (L3), stamped
+//! with a chain-dense `seq` at the single append point (L4).
+//!
+//! Its declaring surfaces are the AHP translation tables in `manox-ahp` (v3)
+//! and, until it is deleted, the v2 `JOURNAL_ENTRIES` table
+//! (`manox_protocol::surface`). The v2 *transport* framing this header used to
+//! describe (`StreamFrame::Entry` / `Snapshot`) belongs to the retiring
+//! protocol, not here: this crate has no frame types, imports nothing but
+//! `serde`, and carries no gateway vocabulary. When W4 deletes
+//! `manox-protocol` this crate stays — it is the disk format, and the disk
+//! format is precisely what the v3 switch leaves unchanged.
 //!
 //! serde shape: internally tagged by `type` (camelCase), struct variants with
 //! camelCase payload fields. `unknown-variant-tolerant` on the read side is a
@@ -64,10 +69,11 @@ pub struct UsagePayload {
     pub reasoning: u64,
 }
 
-/// Thread header — the journal file's line 0 shape (§C.1), echoed into
-/// SessionSnapshot (v2 wire) so a snapshot is self-describing.
+/// Thread header — the journal file's line 0 shape (§C.1).
 ///
-/// Declaring surface: frame payload of `StreamFrame::Snapshot` (§D.1).
+/// A reader that wants a self-describing snapshot gets it from this row: it is
+/// the file's first line, so every consumer of a session file sees it before
+/// any entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadHeader {
@@ -217,10 +223,10 @@ pub enum JournalWireEvent {
     /// The plan document updated (kernel snapshot shape, wire-opaque).
     PlanUpdate { snapshot: serde_json::Value },
     /// A plan-review lifecycle edge (the C4 vocabulary augmentation):
-    /// `state` = "proposed" (the review card is due — the pending
-    /// projection raises) | "resolved" (a verdict landed — it clears; the
-    /// verdict discriminant rides the notice plane). `plan_file` names the
-    /// reviewed plan (forensics; always serialized, null when unknown).
+    /// `state` = "proposed" (the review card is due) | "resolved" (a verdict
+    /// landed, so it clears; the verdict discriminant rides the notice plane).
+    /// `plan_file` names the reviewed plan (forensics; always serialized, null
+    /// when unknown).
     PlanReview {
         state: String,
         plan_file: Option<String>,
@@ -289,10 +295,10 @@ pub enum JournalWireEvent {
     },
 }
 
-/// One journal entry line as it travels the wire (§C.1 entry envelope):
-/// chain-dense `seq` + identity + timestamp + the [`JournalWireEvent`].
-/// `StreamFrame::Entry { seq, id, parent_id, timestamp, event }` carries the same envelope inside the
-/// frame tag (§D.1).
+/// One journal entry line (§C.1 entry envelope): chain-dense `seq`, identity,
+/// timestamp, and the [`JournalWireEvent`]. This is the on-disk row shape. A
+/// transport that ships entries carries this envelope inside its own framing,
+/// which is the transport's concern rather than this vocabulary's.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JournalWireEntry {
