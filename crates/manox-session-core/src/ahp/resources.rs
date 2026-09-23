@@ -45,8 +45,26 @@ pub struct Fence {
 
 impl Fence {
     /// A fence over `roots`, with `home` additionally readable.
+    ///
+    /// Roots are canonicalized **here**, once, because a requested path is
+    /// always canonicalized before it is compared: a root left in its
+    /// as-written form would not match its own descendants whenever any
+    /// component is a symlink. That is not hypothetical — macOS `/var` is a
+    /// symlink to `/private/var`, so a scratch root under `/var/folders/...`
+    /// silently matched nothing, and the failure direction was a *denial* of
+    /// legitimate access that no test caught because the tests built fences
+    /// from already-canonical paths.
+    ///
+    /// A root that cannot be canonicalized (it does not exist yet) is kept
+    /// as-is rather than dropped: refusing to build the fence would turn a
+    /// missing directory into "every path denied", which is a worse failure
+    /// than a root that is merely compared unnormalized.
     pub fn new(roots: Vec<PathBuf>, home: Option<PathBuf>) -> Self {
-        Self { roots, home }
+        let canonical = |path: PathBuf| canonicalize_allow_missing(&path).unwrap_or(path);
+        Self {
+            roots: roots.into_iter().map(canonical).collect(),
+            home: home.map(canonical),
+        }
     }
 
     /// Whether `path` is under a granted root (canonicalized).
@@ -334,9 +352,12 @@ mod tests {
         dir
     }
 
+    /// A plane over one root, through the real constructor — the fence's own
+    /// canonicalization (see [`Fence::new`]) is part of what is under test, so
+    /// the tests must not pre-canonicalize the root for it.
     fn plane(root: &Path) -> RuntimeResources {
         RuntimeResources {
-            fence: Fence::new(vec![root.canonicalize().unwrap()], None),
+            fence: Fence::new(vec![root.to_path_buf()], None),
         }
     }
 
@@ -486,6 +507,59 @@ mod tests {
         let names: Vec<&str> = result.entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["a.txt", "b.txt", "dir"]);
         assert_eq!(result.entries[2].r#type, "directory");
+    }
+
+    /// The read fence is *wider* than the write fence: the session's own state
+    /// root is content a client legitimately renders (a journal entry, a plan
+    /// artefact), so it is readable — but never writable.
+    ///
+    /// This is the one relaxation in the plane, and `Fence::new` is what
+    /// applies it, so the test drives the real constructor rather than the
+    /// hand-built fence the other cases use. A relaxation with no test is the
+    /// worst kind of untested code: the failure mode is silent over-permission.
+    #[test]
+    fn the_state_root_is_readable_but_never_writable() {
+        // `hermetic_home` points HOME at a throwaway directory, so the state
+        // root is a scratch path and the developer's real ~/.manox is never
+        // touched.
+        let _guards = super::super::tests::install();
+        let home = manox_agent::paths::manox_config_dir().expect("a hermetic HOME");
+        let plans = home.join("plans");
+        std::fs::create_dir_all(&plans).unwrap();
+        std::fs::write(plans.join("kept.md"), "# plan").unwrap();
+
+        // No granted roots at all: everything reachable must be reachable
+        // *because* it is the state root.
+        let plane = RuntimeResources::new(Vec::new());
+        let result = plane
+            .read(&read_params(&format!("file://{}/kept.md", plans.display())))
+            .expect("the state root is readable");
+        assert_eq!(result.data, "# plan");
+
+        // The same path is not writable: the state root is the host's own
+        // bookkeeping, not client-writable surface.
+        let err = plane
+            .write(&write_params(
+                &format!("file://{}/plans/planted.md", home.display()),
+                "no",
+            ))
+            .expect_err("the state root is not writable");
+        assert_eq!(err.code(), manox_ahp::codes::X_MANOX_RESOURCE_DENIED);
+        assert!(
+            !home.join("plans").join("planted.md").exists(),
+            "a denied write must not touch the disk"
+        );
+
+        // And something outside both fences stays denied even for reads.
+        let outside = scratch();
+        std::fs::write(outside.join("x.txt"), "no").unwrap();
+        assert!(
+            plane
+                .read(&read_params(&format!("file://{}/x.txt", outside.display())))
+                .is_err(),
+            "the state root is a widening, not the removal of the fence"
+        );
+        super::super::tests::uninstall();
     }
 
     #[test]

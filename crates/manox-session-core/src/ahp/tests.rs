@@ -27,7 +27,7 @@ fn wire_stamp() -> String {
 /// locks, exactly like the `journal_query` cold-read tests; the returned
 /// guards keep the store override and the registry path effective for the
 /// duration of the test.
-fn install() -> (
+pub(super) fn install() -> (
     std::sync::MutexGuard<'static, ()>,
     std::sync::MutexGuard<'static, ()>,
 ) {
@@ -55,7 +55,7 @@ fn install() -> (
 /// Tear the installed overrides back down: suites outside this module may
 /// run expecting "no store" (the `journal_query` fallback cold read), so a
 /// leaked `TEST_OVERRIDE` is cross-suite red, not just local noise.
-fn uninstall() {
+pub(super) fn uninstall() {
     manox_agent::thread_registry::set_registry_path_for_test(None);
     manox_agent::thread_store::drop_for_test();
 }
@@ -783,6 +783,356 @@ mod dispatch {
             backend
                 .extension(manox_ahp::ext::commands::COMPACT, &wrong)
                 .is_err()
+        );
+        uninstall();
+    }
+
+    /// A rename is real work, not a fold-and-forget: the session's title
+    /// actually changes, and a blank title is refused instead of echoed (an
+    /// echo would fold an empty name while the session kept its old one).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn title_changed_renames_the_session() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+
+        let action =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "  a better name  ".to_string(),
+            });
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let stored = manox_agent::thread_store::global().read(|s| {
+            s.summary_by_id("s-dispatch")
+                .map(|row| row.display_title().to_string())
+        });
+        assert_eq!(
+            stored.as_deref(),
+            Some("a better name"),
+            "the rename lands, trimmed"
+        );
+
+        let blank =
+            StateAction::SessionTitleChanged(ahp_types::actions::SessionTitleChangedAction {
+                title: "   ".to_string(),
+            });
+        assert!(
+            matches!(
+                backend.dispatch(&session::uri("s-dispatch"), &blank, &origin()),
+                DispatchOutcome::Rejected(_)
+            ),
+            "a blank title must not be echoed as accepted"
+        );
+        uninstall();
+    }
+
+    /// A scripted engine that records the intents a dispatch reaches.
+    ///
+    /// The mappings below matter because their failure is *silent*: a
+    /// confirmation that never settles leaves a turn parked forever, and a
+    /// cancelled turn that never cancels keeps running. Asserting the dispatch
+    /// outcome alone would not catch either — the outcome is `Accepted` even
+    /// if the intent is dropped on the floor — so this records the calls.
+    #[derive(Default)]
+    struct RecordingEngine {
+        cancelled: std::sync::atomic::AtomicUsize,
+        questions: parking_lot::Mutex<Vec<(String, String)>>,
+        auth: parking_lot::Mutex<Vec<(String, bool)>>,
+        cwds: parking_lot::Mutex<Vec<std::path::PathBuf>>,
+        steers: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl RecordingEngine {
+        fn question_ids(&self) -> Vec<String> {
+            self.questions
+                .lock()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        }
+        fn auth_verdicts(&self) -> Vec<(String, bool)> {
+            self.auth.lock().clone()
+        }
+        /// The steer ids the server threaded through (the engine records the
+        /// facade's `steer` argument, which carries the client's id).
+        fn steer_ids(&self) -> Vec<String> {
+            self.steers.lock().clone()
+        }
+    }
+
+    impl manox_agent::thread_engine::ThreadEngine for RecordingEngine {
+        fn is_running(&self) -> bool {
+            false
+        }
+        fn history(&self) -> Vec<manox_agent::db::HistoryEntry> {
+            Vec::new()
+        }
+        // `ThreadHandle::cancel` reaches the engine through `abort`.
+        fn abort(&self) {
+            self.cancelled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn respond_question(&self, id: &str, outcome: manox_agent::questions::AskOutcome) {
+            self.questions
+                .lock()
+                .push((id.to_string(), format!("{outcome:?}")));
+        }
+        fn respond_tool_authorization(
+            &self,
+            id: &str,
+            response: manox_agent::permission::ToolAuthorizationResponse,
+        ) {
+            let allowed = matches!(
+                response,
+                manox_agent::permission::ToolAuthorizationResponse::Decision(
+                    manox_agent::permission::PermissionDecision::AllowOnce
+                )
+            );
+            self.auth.lock().push((id.to_string(), allowed));
+        }
+        fn set_cwd(&self, path: std::path::PathBuf) {
+            self.cwds.lock().push(path);
+        }
+        fn request_token_usage(
+            &self,
+        ) -> std::collections::HashMap<String, manox_agent::language_model::TokenUsage> {
+            std::collections::HashMap::new()
+        }
+        fn model(&self) -> Option<manox_harness::types::Model> {
+            None
+        }
+        fn run(&self, _prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {}
+        fn steer(
+            &self,
+            _prompt: String,
+            _content: Vec<manox_harness::types::ContentBlock>,
+            origin: Option<String>,
+        ) -> String {
+            let id = origin.unwrap_or_default();
+            self.steers.lock().push(id.clone());
+            id
+        }
+        fn cancel_steer(&self, _id: &str) -> bool {
+            false
+        }
+        fn set_model(&self, _model: manox_harness::types::Model) {}
+        fn set_thinking_level(&self, _level: Option<String>) {}
+        fn open_session(&self, _path: std::path::PathBuf) {}
+        fn active_session_path(&self) -> Option<std::path::PathBuf> {
+            None
+        }
+        fn session_list(&self) -> Vec<manox_agent::db::ThreadSummary> {
+            Vec::new()
+        }
+    }
+
+    /// Attach a recording engine to the fixture's session.
+    fn attach_engine(server: &Arc<AgentServer>) -> Arc<RecordingEngine> {
+        let engine = Arc::new(RecordingEngine::default());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        server.set_session_engine_for_test("s-dispatch", engine.clone(), rx);
+        engine
+    }
+
+    /// `chat/inputCompleted` must settle the parked question card. A dropped
+    /// settle is silent: the card stays up and the turn never resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn input_completed_settles_the_question_card() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        let engine = attach_engine(&server);
+
+        let action =
+            StateAction::ChatInputCompleted(ahp_types::actions::ChatInputCompletedAction {
+                request_id: "auth-q1".to_string(),
+                response: ahp_types::state::ChatInputResponseKind::Accept,
+                answers: None,
+            });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            engine.question_ids(),
+            vec!["auth-q1".to_string()],
+            "the card is settled under the id the request was surfaced with"
+        );
+        uninstall();
+    }
+
+    /// `chat/turnCancelled` must reach the engine's cancel. A dropped cancel is
+    /// silent: the UI says stopped while the turn keeps running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_cancelled_reaches_the_engine_cancel() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        let engine = attach_engine(&server);
+
+        let action = StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+            turn_id: "t-1".to_string(),
+            duration: 5,
+            meta: None,
+        });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            engine.cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the running turn is cancelled exactly once"
+        );
+        uninstall();
+    }
+
+    /// `session/workingDirectorySet` must reach the engine's cwd. A dropped one
+    /// is silent *and* dangerous: every later tool call would be fenced against
+    /// the wrong root.
+    ///
+    /// Two branches exist, and the difference is load-bearing: an *interacted*
+    /// session moves its cwd in place (synchronous, asserted here), while a
+    /// not-yet-interacted one binds a successor session on a spawned task
+    /// (`bind_successor`) and has no synchronous cwd to observe. The session is
+    /// therefore marked interacted first, so this pins the in-place leg rather
+    /// than racing a spawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn working_directory_set_reaches_the_engine_cwd() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        let engine = attach_engine(&server);
+        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
+            thread.with_mut(|t| t.insert_user_message_with_ui_metadata("first".into(), None));
+        }
+
+        let action = StateAction::SessionWorkingDirectorySet(
+            ahp_types::actions::SessionWorkingDirectorySetAction {
+                directory: "file:///work/granted".to_string(),
+            },
+        );
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            engine.cwds.lock().clone(),
+            vec![std::path::PathBuf::from("/work/granted")],
+            "the new root reaches the engine's fence"
+        );
+
+        // A non-file URI cannot name a grant, and must not be accepted as one.
+        let bogus = StateAction::SessionWorkingDirectorySet(
+            ahp_types::actions::SessionWorkingDirectorySetAction {
+                directory: "https://example.com/dir".to_string(),
+            },
+        );
+        assert!(matches!(
+            backend.dispatch(&session::uri("s-dispatch"), &bogus, &origin()),
+            DispatchOutcome::Rejected(_)
+        ));
+        assert_eq!(engine.cwds.lock().len(), 1, "the bogus grant never landed");
+        uninstall();
+    }
+
+    /// A confirmation's verdict must reach the engine as the user's decision —
+    /// both directions, since a deny that arrives as an allow is the worst
+    /// possible silent failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_call_verdicts_reach_the_engine_both_ways() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        let engine = attach_engine(&server);
+
+        for (auth_id, approved) in [("auth-allow", true), ("auth-deny", false)] {
+            let mut meta = JsonObject::new();
+            meta.insert("x-manox".to_string(), json!({"authId": auth_id}));
+            let action = StateAction::ChatToolCallConfirmed(ChatToolCallConfirmedAction {
+                turn_id: "t-1".to_string(),
+                tool_call_id: format!("call-{auth_id}"),
+                meta: Some(meta),
+                approved,
+                confirmed: None,
+                reason: None,
+                edited_tool_input: None,
+                user_suggestion: None,
+                reason_message: None,
+                selected_option_id: None,
+            });
+            assert_eq!(
+                backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+                DispatchOutcome::Accepted
+            );
+        }
+        assert_eq!(
+            engine.auth_verdicts(),
+            vec![
+                ("auth-allow".to_string(), true),
+                ("auth-deny".to_string(), false),
+            ],
+        );
+        uninstall();
+    }
+
+    /// `chat/pendingMessageSet` must park the steer under the id the client
+    /// chose — that id is what the journal row and the echo retirement share,
+    /// so a mismatch would leave a phantom pending message behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_message_set_parks_the_steer_under_its_id() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        let engine = attach_engine(&server);
+        // A turn must be in flight for the facade to steer rather than send a
+        // fresh prompt, and the flag that decides is the *facade's*, not the
+        // engine's.
+        if let Some(thread) = server.ahp_inner().session_thread("s-dispatch") {
+            thread.with_mut(|t| t.set_running_for_test(true));
+        }
+
+        let action =
+            StateAction::ChatPendingMessageSet(ahp_types::actions::ChatPendingMessageSetAction {
+                kind: ahp_types::state::PendingMessageKind::Steering,
+                id: "steer-1".to_string(),
+                message: user_message("change course"),
+            });
+        assert_eq!(
+            backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        // The injected steer carries the client's id through to the engine.
+        let steer_ids = engine.steer_ids();
+        assert_eq!(
+            steer_ids,
+            vec!["steer-1".to_string()],
+            "the steer id is threaded, not re-minted"
+        );
+        uninstall();
+    }
+
+    /// `session/isArchivedChanged` must move the row's archived bit. A dropped
+    /// archive is silent: the sidebar keeps showing a session the client was
+    /// told is gone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn is_archived_changed_moves_the_row() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+
+        let action = StateAction::SessionIsArchivedChanged(
+            ahp_types::actions::SessionIsArchivedChangedAction { is_archived: false },
+        );
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let archived = manox_agent::thread_store::global()
+            .read(|s| s.summary_by_id("s-dispatch").map(|row| row.archived));
+        assert_eq!(
+            archived,
+            Some(false),
+            "unarchiving the seeded row is a real, observable state change"
         );
         uninstall();
     }

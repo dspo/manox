@@ -3877,6 +3877,35 @@ impl AgentServerInner {
         }
     }
 
+    /// Rename a session to a user-supplied title.
+    ///
+    /// Two legs, in the order `archive_thread` established: the **journal**
+    /// gets the durable `title` entry (K2/L3 — the entry is the authority, and
+    /// it is what a cold fold replays), and the **sidecar** gets the same title
+    /// so the sidebar list and a cold restore agree without rescanning.
+    ///
+    /// The engine's own title path emits [`manox_agent::thread::ThreadEvent::TitleChanged`]
+    /// and that is reused here rather than a second journaling route, so a
+    /// rename reaches follow streams and the AHP translator by the same road a
+    /// generated title does. A whitespace-only title is refused: it would blank
+    /// the session's name while looking like it landed.
+    pub(crate) fn rename_thread(&self, session_id: &str, title: &str) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let Some(thread) = self.session_thread(session_id) else {
+            return false;
+        };
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            manox_agent::thread::ThreadEvent::TitleChanged {
+                title: title.to_string(),
+            },
+        )));
+        manox_agent::thread_store::global().with_mut(|s| s.rename_thread(session_id, title));
+        true
+    }
+
     /// GW3 (§D.4): mint the stable delivery identity for one adjudication —
     /// `dlv-{session}-{n}`, n counting the session's deliveries. Per-session
     /// (not per-server) so identical scripts on the two

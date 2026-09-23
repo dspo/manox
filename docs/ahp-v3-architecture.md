@@ -232,7 +232,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 - 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
 - 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
 - x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。
-- 门禁：①**收敛性证明**——对任一 journal，`宿主状态 == reduce(快照, 已发信封序列)`（用 `ahp` crate 的 reducers 跑同一批信封）；②全射/覆盖门（38 条目 ⇒ 动作 ⇒ 声明表行，编译期 + 测试期联动，沿用 v2 文档 §J.4 口径）；③`快照 == fold(重放)`（L10 新面）；④真客户端 smoke：VS Code Agents window 发 prompt、看到工具卡与审批、看 plan；AHPX 列会话并收流；⑤错误码纪律。
+- 门禁：①**收敛性证明**——对任一 journal，`宿主状态 == reduce(快照, 已发信封序列)`（用 `ahp` crate 的 reducers 跑同一批信封）；②全射/覆盖门（38 条目 ⇒ 动作 ⇒ 声明表行，编译期 + 测试期联动，沿用 v2 文档 §J.4 口径）；③`快照 == fold(重放)`（L10 新面）；④真客户端 smoke，**实施期拆为两条**：**④a** 官方 TS client over WS（`script/ahp-client-smoke/smoke.mjs`，已绿，见 §H.2e）；**④b** 真 VS Code Agents window 发 prompt、看到工具卡与审批、看 plan，AHPX 列会话并收流（需先在 hcode fork 里加一条可插拔的 connection 来源，独立立项）；⑤错误码纪律。
 - 中间绿：v2 继续服务桌面；AHP 面可独立跑。
 
 ### W3 客户端切换（manox-app）
@@ -243,6 +243,17 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W4 v2 拆除（manox）
 
+- **实施期修订（crate 形状）**：计划把 `adapter/` 放在 `crates/manox-ahp` 内，实施拆成了
+  `manox-ahp`（transport-agnostic host + translate，不依赖 `manox-agent`，可用假 backend 单测）
+  + `manox-session-core/src/ahp/`（`Backend` 实现，认识运行时）。这个解耦更好——`manox-ahp` 因此
+  不依赖 `manox-agent`，`Backend` trait + `DispatchOutcome` 三值就是它的收益，单向依赖规则真的成立。
+  **但它改变了 W4 的形状**：`manox-session-core` **不能**再按 §F 整体删除，因为
+  `src/ahp/`（约 2.8k 行）住在里面。W4 需要给 `manox-session-core/src/ahp/` 一个新家——
+  候选是新 crate `manox-ahp-runtime`，或搬进 `manox-agent`。**倾向前者**（保持
+  `manox-agent` 不认识 AHP）。
+- **实施期修订（新增 crate）**：`crates/manox-journal`（`journal.rs` + `base64_bytes.rs`）是计划里
+  没有的落点——把线上词汇从 `manox-protocol` 里救出来成为叶子 crate，避免打断依赖拓扑
+  （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。§F 删除清单需同步。
 - 按 §F 删除清单执行；`manox-napi` 改 AHP；文档补 §H as-built 章。
 - 门禁：全仓 `script/gates.sh`；**grep 门禁**（生产区零 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；双路径一致性（in-proc typed ≡ WS serde）；`journal_replay_is_consistent_across_disk_reload` 仍绿。
 - 中间绿：删除面已零消费者。
@@ -378,11 +389,11 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   `chat/toolCallConfirmed`→`respond_authorization`；`chat/inputCompleted`→`respond_question`；
   `session/configChanged`→`set_model`/`set_reasoning_effort`/`set_approval_mode` 扇出；
   `session/workingDirectorySet`→`set_cwd`；`session/isArchivedChanged`→`archive_thread`。
-  实施期修订：`SessionTitleChanged` 与 `SessionIsReadChanged`/`ChatDraftChanged`/`ChatTurnResume`/
+  实施期修订：`SessionIsReadChanged`/`ChatDraftChanged`/`ChatTurnResume`/
   `ChatToolCallResultConfirmed`/`ChatInputAnswerChanged`/`ChatQueuedMessagesReordered`/
   `SessionActiveClientRemoved` 归 **`Ignored`**（reducer 已折叠、运行时无对应 intent），
-  回显而非拒绝——拒绝会告诉订阅者「你看得见的状态不是真的」。运行时**没有**重命名 intent
-  （v2 也没有；`thread_store.title_override` 只被写过 `None`），故 `session/titleChanged` 不接。
+  回显而非拒绝——拒绝会告诉订阅者「你看得见的状态不是真的」。
+  **`SessionTitleChanged` 不在此列**：重命名实现为真动作（见 §H.2d）。
 - **审批身份单源**：settle key 走 action 的 `_meta["x-manox"]["authId"]`——即 translator 生成
   `toolCallReady` 时盖的同一个 key。**没有 authId 的确认不 settle**（`Ignored`）：猜一个身份会去
   回答**另一个** pending call。
@@ -402,8 +413,8 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   intent；其余已声明命令答 `-32080`（`xManox/unsupported`）——「我声明了但不做」与「你请求写错了」
   必须可区分。
 - **门禁证据**：`script/gates.sh` 六腿全 PASS（fmt/prod-libs/lean-libs/clippy/test-real/test-clean）；
-  `cargo test -p manox-session-core` = **192 绿**（本会话自 173 起，新增 dispatch 9 + 文件面围栏 9 +
-  网关 `/ahp` 路由 1）；`cargo test -p manox-ahp --features axum-ws` = 39 绿。
+  `cargo test -p manox-session-core` = **200 绿**；`cargo test -p manox-ahp --features axum-ws` = 39 绿；
+  `cargo test -p manox-agent` = 533 绿。
   新测试全部用**类型化 action**（不经 JSON 往返）：`StateAction` 末尾的 untagged `Unknown(Value)`
   会让一个写错的字面量「成功」反序列化成无人匹配的 action，测试就会去断言兜底臂而非映射。
 - **网关 `/ahp` 路由补测**：此前 `ws_conformance` 自绑 listener，绕过了网关自己的 token/origin 闸，
@@ -413,13 +424,73 @@ confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
   （`vscode-file://vscode-app`，参考客户端的真实形状）→ 升级成功**并跑通 `initialize`**
   （证明路由真的挂了宿主，而不只是「一个会拒绝一切的 404 handler 也回 401」）。
 
+### H.2d 重命名实现为真动作（本轮新增，2026-09-23）
+
+`session/titleChanged` 曾被归入 `Ignored`（「运行时没有重命名 intent」）。**该前提只对了一半**，
+复核后修正：持久化槽位、读取优先级、回归测试三样早就都在，缺的只是写它的那一跳。
+
+- `ThreadSummary::title_override` 是 DB 列 + 结构体字段，`upsert` 语句里有它（`db/threads.rs:24,79,140,252`）。
+- `display_title()` 的优先级是 **user rename > LLM title > summary**（`db/threads.rs:64-69`）——
+  这个槽位就是为用户重命名建的。
+- `db/mod.rs:396-400` 早有一个通过的 round-trip 测试，写 `Some("renamed")` 再断言读回。
+- v2 没暴露重命名**不是**「运行时没有这个能力」，是 v2 没接。
+
+实施按 `archive_thread` 的同一形状（`条目即权威`，K2/L3）：
+
+1. **journal**：复用既有的 `ThreadEvent::TitleChanged`（`engine.rs:513` 把它映射成 `("title", {title})`），
+   经 `handle_notice` 发出——不新开第二条 journaling 路线，因此重命名与模型生成标题走同一条路到达
+   follow 流与 AHP translator（`translate/actions.rs:595` 本来就在读 `JournalWireEvent::Title`）。
+2. **sidecar**：`thread_store.rename_thread` 更新内存行的 `title_override` 槽 + `write_meta`
+   （标题的 durable 权威是 `.meta.json`，`repository.rs:36` 明文）。空白标题被拒——它会抹掉会话名
+   却看起来像落上了。
+3. **dispatch**：`Accepted`（非 `Ignored`），空白标题 `Rejected`。
+
+为什么这不是「两种都不选」而是第三种：`Ignored` 在撒谎（reducer 折了、运行时没做），`Rejected`
+让标准客户端一个正常操作报错。让重命名**真的生效**既不撒谎也不报错，还顺手激活了一个一直没接线的
+既有能力。
+
+### H.2e W2 门禁 ④a：官方 TS client over WS 已绿（本轮新增，2026-09-23）
+
+计划把「真客户端 smoke」当一条门禁。它应当拆成两条——④a 现在就能做，④b 需要单独立项：
+
+- **④a（已执行）**：用上游**官方 TypeScript client**（`@microsoft/agent-host-protocol@0.9.0`，
+  与本仓 pin 的 `ahp-types = "=0.9.0"` 同版本）经 WS 打真实网关。
+  工具：`script/ahp-client-smoke/smoke.mjs`（13 项断言全 PASS）。
+- **④b（未做，独立立项）**：真 VS Code Agents window 的方言税（R5 那五处）。hcode 的连接来源
+  只有 ambient/ssh/wsl 三条，全是起 VS Code 自己的 agent host，端点不可插拔；指向 manox 的 `/ahp`
+  需要在 fork 里加一条 connection 来源。有价值，但不该继续挡着 W2 收口。
+
+**为什么 ④a 是独立一层**：Rust 套件（`ws_conformance.rs`、进程内 e2e）用的都是 `ahp::Client`，
+与宿主共享同一份 Rust `serde` 形状假设——我们把某个字段拼得与规范不同，在自己两半之间照样
+round-trip、照样绿。TS client 由规范的 TS 源码生成，正是对这一类分歧敏感。
+
+**执行记录**（`cargo run -p manox-session-core --example ahp_serve -- --port 0` 起网关，
+读 `~/.manox/gateway-ws.json` 取 port+token，再跑 smoke）：13 项断言全 PASS——initialize 版本协商、
+root 快照、`_meta["x-manox"]` 三查（version / channels 前缀）、ping、listSessions、
+resolveSessionConfig 的 schema+values 对、completions 的 items、subscribe 快照、
+reconnect 快照腿、dispatch 句柄。
+
+**smoke 过程中实测到的两件事**（都不是宿主缺陷，但都值得留档）：
+
+1. **`AhpClient` 的读泵不在构造函数里启动**——必须显式调 `client.connect()`。不调的话 socket
+   收得到帧、但没有任何东西分发它们，于是每一个请求都在一个完全健康的宿主上超时。这条已写进
+   smoke 脚本的注释，免得下一个人再花一小时。
+2. **`completions` 的 params 形状**：规范要求 `kind`（`"userMessage"`）+ `text` + `offset`（数字）。
+   宿主拒收缺 `kind` 的请求（`-32602`）是**正确**的——错的是我第一版 smoke 按
+   `{text, position:{line,character}}` 发。留档以免下次误判为宿主 bug。
+
+另：④a 首次执行时打的其实是**一个陈旧的 `ahp_serve` 进程**（当日 11:29 起的构建，早于
+`resolveSessionConfig` 落地），于是 `resolveSessionConfig` 回 `-32601`。那不是回归，是二进制过期；
+杀掉旧进程、用当前构建重跑即全绿。记在这里以免下次看到 `-32601` 又误判。
+
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
 1. **W2 余下**：`extension_baseline` 的真实现（`x-manox-plan:/…` 等无状态扩展通道的基线）；
    `fetchTurns` 之外的 `x-manox/fetchEntries`；客户端工具注册（`x-manox/registerSessionTools`）；
    `x-manox` 四个 server→client 请求（`browserOp`/`clipboardRead`/`openExternal`/`invokeTool`）。
    `resource*` 已落地基础围栏，但 `resourceResolve`/`resourceCopy`/`if_match` 未接。
-   §G 的 W2 门禁 ④（真客户端 smoke：VS Code Agents window 发 prompt、看工具卡与审批）仍未执行。
+   §G 的 W2 门禁 ④ 已拆分：**④a 已绿**（官方 TS client over WS，见 §H.2e）；**④b**
+   （真 VS Code Agents window 的方言税）单独立项、未做。
 2. **W3**：manox-app 侧的 `AhpStore`（`ahp::Client` + reducers）、进程内 `ahp::Transport`、
    `ConversationState` 改由 `ChatState.responseParts` 派生、删 `client_store*`/`journal_fold`/
    `journal_translate`/`server_note_translate`、重写 `source_gates.rs`、更新 `UI-MAP.md`。

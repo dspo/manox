@@ -690,6 +690,33 @@ impl ThreadStore {
         self.write_meta(id, move |meta| meta.unread = unread);
     }
 
+    /// Rename a session: the user's title, persisted in the sidecar.
+    ///
+    /// The sidecar is the title's durable authority (the transcript-derived
+    /// name is not), so a rename is a meta write like [`Self::set_unread`].
+    /// The in-memory row is updated too, and its `title_override` slot is what
+    /// [`ThreadSummary::display_title`] reads first — so a rename outranks a
+    /// title the model generated and survives a rescan.
+    ///
+    /// An empty or whitespace-only title is not a rename; it is refused so a
+    /// client cannot blank out a session's name by sending nothing.
+    pub fn rename_thread(&mut self, id: &str, title: &str) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        let Some(summary) = self.summary_mut(id) else {
+            return false;
+        };
+        if summary.title_override.as_deref() == Some(title) {
+            return true;
+        }
+        summary.title_override = Some(title.to_string());
+        let owned = title.to_string();
+        self.write_meta(id, move |meta| meta.title = Some(owned));
+        true
+    }
+
     /// Persist the session's granted extra working directories (multi-
     /// root) so a cold restore re-widens the fence (multi-working-dirs).
     pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {
@@ -1972,6 +1999,47 @@ mod tests {
             crate::db::ThreadsDatabase::open(&path).expect("open temp threads db"),
         );
         (db, path)
+    }
+
+    /// A rename is a user title: it takes display precedence over a
+    /// model-generated one (the `title_override` slot `display_title` reads
+    /// first), and a blank title is refused rather than stored — a blank would
+    /// read as "renamed to nothing" while the session kept its old name.
+    #[test]
+    fn rename_thread_sets_the_override_and_refuses_blank() {
+        let (db, _path) = temp_db();
+        let store = store_handle(db);
+        store.with_mut(|s| s.insert_summary_for_test("t-rename", None));
+        store.with_mut(|s| {
+            let row = s.summary_mut("t-rename").expect("seeded");
+            row.title = Some("model said this".to_string());
+        });
+
+        store.with_mut(|s| assert!(s.rename_thread("t-rename", "user said this")));
+        let row = store
+            .read(|s| s.summary_by_id("t-rename").cloned())
+            .unwrap();
+        assert_eq!(row.title_override.as_deref(), Some("user said this"));
+        assert_eq!(
+            row.display_title(),
+            "user said this",
+            "a rename outranks the model's title"
+        );
+
+        // Whitespace is not a title.
+        store.with_mut(|s| assert!(!s.rename_thread("t-rename", "   ")));
+        store.with_mut(|s| assert!(!s.rename_thread("t-rename", "")));
+        let row = store
+            .read(|s| s.summary_by_id("t-rename").cloned())
+            .unwrap();
+        assert_eq!(
+            row.title_override.as_deref(),
+            Some("user said this"),
+            "a refused rename leaves the previous title intact"
+        );
+
+        // An unknown session is refused, not silently dropped.
+        store.with_mut(|s| assert!(!s.rename_thread("no-such-session", "x")));
     }
 
     fn store_handle(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {

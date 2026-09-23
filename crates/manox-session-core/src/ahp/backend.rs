@@ -696,14 +696,25 @@ impl Backend for RuntimeBackend {
                 block_on(async move { inner.set_cwd(&target, &path).await });
                 DispatchOutcome::Accepted
             }
-            StateAction::SessionTitleChanged(_) => {
-                // The runtime has no retitle intent: a title is what the title
-                // agent wrote and the journal recorded, and v2 exposes no
-                // rename either. The reducer folds the action (it is a
-                // protocol-level state field), so it is echoed as accepted with
-                // no runtime work behind it — refusing would tell every
-                // subscriber a title they can see is not real.
-                DispatchOutcome::Ignored
+            StateAction::SessionTitleChanged(changed) => {
+                // A user rename is real work: the runtime journals the title
+                // entry and writes the sidecar, so the name outlives the
+                // connection and outranks a model-generated one. A blank title
+                // is refused rather than echoed — the reducer would fold an
+                // empty name while the session kept its old one, which is
+                // exactly the silent divergence the echo is supposed to avoid.
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                if self
+                    .server
+                    .ahp_inner()
+                    .rename_thread(session_id, &changed.title)
+                {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected("a session title cannot be blank".to_string())
+                }
             }
             StateAction::SessionIsArchivedChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
