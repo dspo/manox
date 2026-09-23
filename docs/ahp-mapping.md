@@ -154,6 +154,21 @@ turn id 方案。结论如下，三条证据相互印证：
 | `_meta` | `TitleChanged` |
 | 🔴 | `UserRowLanded`（client 从 journal fold，非 server 事件）·`PeerMessage`（多 agent 协作不在本期）·`HistoryProgress`·`HistoryRestored`（UI 瞬态）·`PrefixStability`·`CacheInvalidation`·`SideCallMetricsUpdated`·`MainCallMetricsUpdated`·`TokenUsageUpdated`（诊断指标，聚合进 `x-manox-metrics`） |
 
+## §2.6 实施期实证：扩展 state 不能进 AHP 快照（W1 落地时发现）
+
+计划要求「`x-manox` 状态挂在自有 channel 上」。类型核对后必须补一条约束：
+
+**`ahp_types::state::SnapshotState` 只有九个臂**（`Session`/`Chat`/`Terminal`/`Changeset`/
+`ResourceWatch`/`Annotations`/`Automations`/`AutomationRun`/`Root`），**没有 `Unknown`/泛型臂**
+（`ahp-types-0.9.0/src/state.rs`）。而 `subscribe` 的 `SubscribeResult.snapshot.state` 就是它。
+所以私有 channel **无法**用快照携带自己的 state。
+
+落地形态：`x-manox-*` channel 保持**stateless topic**（`subscribe` 回 `{}`），state 由宿主在
+`ext/reducer.rs` 里自行 fold（`XManoxState`），并以**扩展 action 信封**下发给订阅者 —— 订阅时
+补一条基线、之后发增量。这与 `_meta["x-manox"]` 的声明一致，且不需要碰 AHP 的 state 树。
+`x-manox` action 走 `StateAction::Unknown(serde_json::Value)` 原样 round-trip，upstream reducer
+对它们一律 `OutOfScope`（即永不 reduce），故 fold 必须自持 —— 这正是不能用原生 state 槽位的原因。
+
 ## §3 统计与红行清单
 
 | 词汇 | 总数 | AHP 原生 | `x-manox` | 🔴 丢弃 |

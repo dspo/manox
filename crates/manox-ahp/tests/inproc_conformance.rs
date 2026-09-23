@@ -312,6 +312,63 @@ impl manox_ahp::connection::Dialect for RenamingDialect {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn extension_channels_fold_their_own_state() {
+    // AHP's reducers ignore private actions by construction (`Unknown` is
+    // `OutOfScope` upstream), and `SnapshotState` has no arm for private state,
+    // so the host folds `x-manox` state itself and delivers it as actions.
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+    let uri = "x-manox-plan:/c-1";
+    let mut sub = client.attach_subscription(uri).await;
+    // Subscribing is what a client does; the channel is stateless by design
+    // (no snapshot), which the empty result states.
+    let (result, _) = client.subscribe(uri.to_string()).await.expect("subscribes");
+    assert!(
+        result.snapshot.is_none(),
+        "extension channels are stateless"
+    );
+
+    let envelope = host.publish(
+        uri,
+        action(serde_json::json!({
+            "type": "x-manox-plan/planModeChanged",
+            "enabled": true,
+        })),
+        None,
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("the delta arrives")
+        .expect("subscription open");
+    match delivered {
+        ahp::SubscriptionEvent::Action(envelope) => {
+            assert_eq!(envelope.server_seq, envelope.server_seq.max(1));
+        }
+        other => panic!("expected an action envelope, got {other:?}"),
+    }
+    assert_eq!(envelope.server_seq, 1);
+    let state = host.extension_state(uri).expect("folded extension state");
+    assert_eq!(state.plan_mode, Some(true));
+
+    // An action this build does not know leaves the state alone.
+    host.publish(
+        uri,
+        action(serde_json::json!({"type": "x-manox-session/ofTheFuture", "x": 1})),
+        None,
+    );
+    let after = host.extension_state(uri).expect("state survives");
+    assert_eq!(after, state);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_connection_dialect_rewrites_in_both_directions() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
     let (host_side, client_side) = inproc::pair();

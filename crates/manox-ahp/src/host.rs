@@ -192,6 +192,11 @@ impl Host {
         self.inner.store.write().insert_terminal(terminal_id, state);
     }
 
+    /// The host's folded `x-manox` state for one extension channel.
+    pub fn extension_state(&self, uri: &str) -> Option<crate::ext::XManoxState> {
+        self.inner.store.read().extension(uri).cloned()
+    }
+
     /// `root/sessionRemoved` to root subscribers.
     pub fn session_removed(&self, session_id: &str) {
         self.inner.session_removed(session_id);
@@ -325,22 +330,17 @@ impl Inner {
     ) -> ActionEnvelope {
         let server_seq = self.seq.stamp() as u64;
         let tag = wire::action_tag(&action);
-        // Extension actions have no reducer by construction — `x-` is the
-        // reserved private namespace — so folding one could only produce a
-        // false alarm. They travel to subscribers untouched.
-        if !crate::ext::is_extension_action(&tag) {
-            if let Some(channel) = parse(uri) {
-                let outcome = self.store.write().apply(&channel, &action);
-                if !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
-                    tracing::warn!(
-                        channel = uri,
-                        action = %tag,
-                        "host action reduced to {outcome:?}"
-                    );
-                }
-            } else {
-                tracing::warn!(channel = uri, "host action on an unknown channel scheme");
+        if let Some(channel) = parse(uri) {
+            let is_extension = crate::ext::is_extension_action(&tag);
+            let outcome = self.store.write().apply(&channel, &action);
+            // Extension actions have no upstream reducer by construction, so a
+            // no-op there is normal; a standard action that does not apply is a
+            // translation bug and must be loud.
+            if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
+                tracing::warn!(channel = uri, action = %tag, "host action reduced to {outcome:?}");
             }
+        } else {
+            tracing::warn!(channel = uri, "host action on an unknown channel scheme");
         }
         ActionEnvelope {
             channel: uri.to_string(),

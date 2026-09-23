@@ -94,6 +94,10 @@ pub struct ChannelStore {
     /// chat id → owning session id (kept in step with each session's `chats`).
     chat_owner: HashMap<String, String>,
     terminals: HashMap<String, TerminalState>,
+    /// `x-manox-*` channels: their state has no slot in AHP's `SnapshotState`
+    /// (nine arms, no generic one), so it is folded here and delivered to
+    /// subscribers as extension action envelopes.
+    extensions: HashMap<String, crate::ext::XManoxState>,
 }
 
 impl ChannelStore {
@@ -105,7 +109,13 @@ impl ChannelStore {
             chats: HashMap::new(),
             chat_owner: HashMap::new(),
             terminals: HashMap::new(),
+            extensions: HashMap::new(),
         }
+    }
+
+    /// The folded `x-manox` state of one extension channel, if any.
+    pub fn extension(&self, uri: &str) -> Option<&crate::ext::XManoxState> {
+        self.extensions.get(uri)
     }
 
     /// The root state (always present).
@@ -149,7 +159,21 @@ impl ChannelStore {
                 Some(state) => ahp::reducers::apply_action_to_terminal(state, action),
                 None => ReduceOutcome::OutOfScope,
             },
-            Channel::Extension(_) => ReduceOutcome::NoOp,
+            // Extension state is ours: AHP's reducers ignore it by construction
+            // (`StateAction::Unknown` is `OutOfScope` everywhere upstream), so
+            // the fold lives in `ext::reducer` and the outcome is reported as a
+            // plain `Applied`/`NoOp` here.
+            Channel::Extension(uri) => {
+                let entry = self.extensions.entry(uri.clone()).or_default();
+                match crate::ext::reducer::apply(
+                    entry,
+                    &serde_json::to_value(action).unwrap_or_default(),
+                ) {
+                    crate::ext::ExtOutcome::Applied => ReduceOutcome::Applied,
+                    crate::ext::ExtOutcome::NoOp => ReduceOutcome::NoOp,
+                    crate::ext::ExtOutcome::Unrecognised => ReduceOutcome::NoOp,
+                }
+            }
         };
         if let Channel::Session(id) = channel {
             self.reindex_chats(id);

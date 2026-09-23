@@ -19,6 +19,10 @@
 
 use serde_json::{Value, json};
 
+pub mod reducer;
+
+pub use reducer::{Outcome as ExtOutcome, XManoxState};
+
 /// `_meta` key carrying the declaration on both `initialize` params and result.
 pub const META_KEY: &str = "x-manox";
 
