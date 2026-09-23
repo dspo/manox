@@ -349,6 +349,25 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 confirmed 与 `session/inputNeededRemoved` 只属于 decision 腿。修后轨迹
 `Run → Ready → Confirmed → Complete(Completed{success:true})`，收敛与结构断言双绿。
 
+### H.2b 两条传输腿落地（本轮新增，2026-09-23）
+
+- **宿主可服务真实运行时**：`crates/manox-session-core/src/ahp/backend.rs` 实现 `manox_ahp::Backend`——
+  播种=journal 折叠（与客户端同码），并为每个会话起 bridge：**先订阅 kernel journal feed、再折叠播种**，
+  只转发 `seq > 播种 tail` 的事件（lagged 则重折重播），因此「快照 + 增量」严格不相交；
+  写入映射到既有 intent（`chat/turnStarted` → `AgentServerInner::submit`，`createSession` →
+  `create_session_request`，`disposeSession` → `dispose_session`），未接线的一律**响亮拒绝**。
+- **两条传输腿同一宿主（L11）**：`ahp/runtime.rs` 提供进程单例；`inproc()` 是 **over channel**（进程内 typed 帧，
+  桌面腿），`router("/ahp")` 是 **over websocket**（网关腿）。`ws/listener.rs` 在同一 listener、同一 per-boot token、
+  同一机器锁下把 `/ahp` 与 v2 的 `/ws` 并挂（v2 路由留到 W4 摘除）。根通道按 L8 列活 provider 目录（canonical
+  `provider/model`）。
+- **门禁证据**：`cargo test -p manox-session-core` = **173 绿**，含新增的**传输平价测试**
+  （`ahp::runtime::tests::in_process_and_websocket_legs_share_one_host`：一次 publish 同时到达进程内与
+  WebSocket 订阅者，且 `serverSeq` 相同）；`clippy -D warnings` 与 `fmt --check` 干净；
+  全 workspace 测试在**真实 HOME 与 hermetic clean HOME** 两种形态下均绿（clean 腿本轮因 /private/tmp 被系统清空、
+  临时 HOME 需重新物化工具链而在 rustup shim 处挂起，故改为「预置工具链的 clean HOME」等价跑法：隔离属性不变）。
+- **仍未落地**：终端通道、`createChat`/`disposeChat`（分支/fork）、`fetchTurns` 分页、x-manox 命令面、
+  `resource*` 文件面、`Backend::dispatch` 的其余动作映射（当前除 turn 起点外全部 `Rejected`）。
+
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
 1. **W2 余下**：`manox_ahp::Backend` 的运行时实现（`dispatch` 动作→既有 intent 映射、
