@@ -11,11 +11,12 @@ use std::sync::Arc;
 
 use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, StateAction};
 use ahp_types::commands::{
-    CreateChatParams, CreateSessionParams, DispatchActionParams, DisposeChatParams,
-    DisposeSessionParams, FetchTurnsParams, InitializeParams, InitializeResult, ListSessionsParams,
-    ListSessionsResult, ReconnectResult, ReconnectSnapshotResult, ResourceDeleteParams,
-    ResourceListParams, ResourceReadParams, ResourceWriteParams, SubscribeParams, SubscribeResult,
-    UnsubscribeParams,
+    CompletionsParams, CompletionsResult, CreateChatParams, CreateSessionParams,
+    DispatchActionParams, DisposeChatParams, DisposeSessionParams, FetchTurnsParams,
+    InitializeParams, InitializeResult, ListSessionsParams, ListSessionsResult, ReconnectResult,
+    ReconnectSnapshotResult, ResolveSessionConfigParams, ResolveSessionConfigResult,
+    ResourceDeleteParams, ResourceListParams, ResourceReadParams, ResourceWriteParams,
+    SubscribeParams, SubscribeResult, UnsubscribeParams,
 };
 use ahp_types::messages::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use ahp_types::state::Snapshot;
@@ -67,6 +68,15 @@ async fn dispatch_request(
         "subscribe" => subscribe(inner, conn, params).await,
         "reconnect" => reconnect(inner, conn, params).await,
         "listSessions" => list_sessions(inner, params),
+        // The reference client resolves the session configuration *before* it
+        // creates a session, and pages `completions` while the user types.
+        // Answering `MethodNotFound` to either would stop it before it ever
+        // reaches `createSession`, so both answer with the honest empty shape
+        // (the plan's "宁可回空也不回 MethodNotFound" decision): a host that
+        // advertises no pre-creation config, and a host with no completion
+        // provider.
+        "resolveSessionConfig" => resolve_session_config(params),
+        "completions" => completions(params),
         "createSession" => create_session(inner, conn, params).await,
         "disposeSession" => dispose_session(inner, params),
         "createChat" => create_chat(inner, conn, params).await,
@@ -330,6 +340,28 @@ async fn reconnect(
     to_value(ReconnectResult::Snapshot(ReconnectSnapshotResult {
         snapshots,
     }))
+}
+
+/// An empty-but-valid session configuration: no pre-creation options, no
+/// resolved values. Model choice and thinking level reach clients through
+/// `AgentInfo.models[].configSchema` instead, because they are per-model.
+fn resolve_session_config(params: Value) -> Result<Value, HostError> {
+    let _params: ResolveSessionConfigParams = parse_params(params)?;
+    to_value(ResolveSessionConfigResult {
+        schema: ahp_types::state::SessionConfigSchema {
+            r#type: "object".to_string(),
+            properties: std::collections::HashMap::new(),
+            required: None,
+        },
+        values: ahp_types::common::JsonObject::new(),
+    })
+}
+
+/// No completion provider: an empty item list, which is what a client showing
+/// an empty picker expects.
+fn completions(params: Value) -> Result<Value, HostError> {
+    let _params: CompletionsParams = parse_params(params)?;
+    to_value(CompletionsResult { items: Vec::new() })
 }
 
 fn list_sessions(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {

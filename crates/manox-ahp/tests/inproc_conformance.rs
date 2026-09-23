@@ -276,6 +276,55 @@ async fn reconnect_answers_with_fresh_snapshots() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn pre_creation_commands_answer_with_empty_shapes() {
+    // The reference client calls `resolveSessionConfig` before it creates a
+    // session and `completions` while the user types: both must answer, not
+    // `MethodNotFound`, or the client never reaches `createSession`.
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+
+    let resolved: ahp_types::commands::ResolveSessionConfigResult = client
+        .request(
+            "resolveSessionConfig",
+            ahp_types::commands::ResolveSessionConfigParams {
+                channel: ROOT_RESOURCE_URI.to_string(),
+                meta: None,
+                provider: None,
+                working_directory: None,
+                config: None,
+            },
+        )
+        .await
+        .expect("resolveSessionConfig answers");
+    assert_eq!(resolved.schema.r#type, "object");
+    assert!(resolved.schema.properties.is_empty());
+    assert!(resolved.values.is_empty());
+
+    let completions: ahp_types::commands::CompletionsResult = client
+        .request(
+            "completions",
+            ahp_types::commands::CompletionsParams {
+                channel: TestBackend::chat_uri(),
+                meta: None,
+                kind: ahp_types::commands::CompletionItemKind::UserMessage,
+                text: "@".to_string(),
+                offset: 1,
+            },
+        )
+        .await
+        .expect("completions answers");
+    assert!(completions.items.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn in_process_scenario_matches_the_expected_log() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
     let (host_side, client_side) = inproc::pair();
