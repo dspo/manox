@@ -1558,6 +1558,47 @@ mod dispatch {
         uninstall();
     }
 
+    /// The command catalogue carries the registry, not an empty list.
+    ///
+    /// `a_declared_extension_channel_answers_with_a_baseline` only proves a
+    /// channel *answers* — and an empty list answers too, which is how
+    /// `x-manox-commands://` served `{commands: []}` while the slash-command
+    /// registry behind it was fully populated. This pins the content a client
+    /// renders its palette from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_command_catalogue_lists_the_registry() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+
+        let baseline = backend
+            .extension_baseline(manox_ahp::ext::channels::COMMANDS)
+            .expect("the command catalogue is declared and must answer");
+        let commands = baseline.1["state"]["commands"]
+            .as_array()
+            .expect("the catalogue carries a commands array");
+        assert!(
+            !commands.is_empty(),
+            "the built-in slash commands must appear; an empty palette is what \
+             the v2 ListCommands call never returned"
+        );
+        let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            names.contains(&"compact") || names.contains(&"goal"),
+            "expected a built-in slash command in {names:?}"
+        );
+        for command in commands {
+            assert!(
+                command["name"].as_str().is_some_and(|n| !n.is_empty()),
+                "a catalogue row without a name: {command}"
+            );
+            assert!(
+                command["kind"].is_string(),
+                "a catalogue row without a kind: {command}"
+            );
+        }
+        uninstall();
+    }
+
     /// The baseline is the journal's own fold, so it carries the state a live
     /// subscriber would have reached — not an empty placeholder.
     #[tokio::test(flavor = "multi_thread")]
@@ -2204,7 +2245,7 @@ mod transport_parity {
         let meta = remote_init
             .meta
             .expect("the extension surface is advertised");
-        assert_eq!(meta["x-manox"]["version"], 1);
+        assert_eq!(meta["x-manox"]["version"], manox_ahp::ext::VERSION);
 
         // One publish, two subscribers, one sequence number.
         let published = runtime.host().publish(

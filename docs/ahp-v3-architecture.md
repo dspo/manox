@@ -588,6 +588,29 @@ reconnect 快照腿、dispatch 句柄。
   每一项要么落在 AHP action/state、要么落在 `x-manox` 扩展通道、要么是**有意的**结构性缺席
   （`-32601`）。此项在 W4 执行时**未完成**，是 W5 的第一件事。
 
+**W4 收尾审计发现的声明面残余（已定位，未修；不属 W4 的删除范围）**：W4 已把
+`commands::ALL` 从 8 条收到 3 条、`channels::ALL` 从 6 条收到 5 条（见 §H.5⑥⑦），但同一次审计
+发现 `actions::ALL` 仍有 **4 条只声明、无生产者**：
+
+| 声明 | 状态 |
+|---|---|
+| `x-manox-workspaces/baseline` | 无生产者；客户端只在 `extension_baseline` 拿一次快照 |
+| `x-manox-workspaces/changed` | 无生产者；workspace 增删改不推送给已订阅者 |
+| `x-manox-workspaces/removed` | 同上 |
+| `x-manox-work/backgroundTaskStopped` | 无生产者（客户端可派发，但宿主从不发） |
+
+**为什么不顺手修**：workspace 三个动作的正确落点比"加一个 forwarder"深一层——`manox-workspace`
+的 feed（`Baseline`/`Upsert`/`Remove`/`Order`/`Archived`）是现成的，但 `XManoxState` **没有
+`workspaces` 字段**，`ext/reducer.rs` 也不认这三个 tag；catalogue 通道的状态目前由
+`catalogue_baseline()` **旁路** fold 直接回答。所以只发 action 会 fold 成空、客户端仍然看不到
+状态——正是本 PR 反复在修的那类"接了一半"。要修就必须先决定：workspace 状态是进
+`XManoxState` 参与 fold，还是像现在这样长期走 catalogue 旁路（若是后者，这三个 action 就该
+从声明面删掉）。**这个决定留到 W5**，与"多客户端并发与 owner 语义"一起做，因为两者都动
+扩展状态模型。
+
+`x-manox-work/backgroundTaskStopped` 相对独立：`manox_agent::background_task` 有 stop 路径，
+补一个 producer 即可，但仍需先确认 AHP 的 `Unknown` 动作能承载它（同上的 fold 归属问题）。
+
 ### H.2i W4 准入账的第二轮补齐（2026-09-24）
 
 第二份验收意见（`/private/tmp/ahp-w3-review-and-next-2026-09-24.md`）指出四项，逐项处置：
@@ -821,6 +844,17 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 门禁：遍历 `commands::ALL`，任何一条落到 `X_MANOX_UNSUPPORTED` 即红。该门禁已用临时插入假声明
 验证过确实会红。
 
-**⑦ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
+**⑦ 通道面同样收口**：`channels::ALL` 原列 6 条，`x-manox-modelchat:/` 是**空声明**——它的实现
+模块随 v2 网关一起删了，订阅者只能永远等一个只可能回 `null` 的通道（会话级通道走
+`seeded.extensions`，而那条链早已没有生产者）。移出声明并在文档写明理由。
+`x-manox-commands://` 则是**有数据源却回空**：它硬编码 `{commands: []}`，而 v2 的 `ListCommands`
+读的三处注册表（`slash_builtins` / `command::try_global` / `skill::try_global`）都还在，§B.3 也
+明写这条通道就是 `ListCommands` 的落点。已实现为按 v2 相同的优先级去重合并
+（内置 → 用户命令 → skill，同名先到者胜）；新增
+`the_command_catalogue_lists_the_registry` 钉住**内容**（原测试只断言"有回答"，空列表也算有回答，
+这正是它漏过去的原因），并已用临时改回空列表验证会红。
+`ext::VERSION` 1 → 2（该常量自述"重命名或删除扩展时递增"）。
+
+**⑧ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
 `manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
 零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。

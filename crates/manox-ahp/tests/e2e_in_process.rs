@@ -58,7 +58,10 @@ async fn initialize_returns_snapshots_and_the_extension_declaration() {
     assert_eq!(init.snapshots[0].resource, ROOT_RESOURCE_URI);
     let meta = init.meta.expect("_meta is advertised");
     let declaration = &meta["x-manox"];
-    assert_eq!(declaration["version"], 1);
+    // Compare against the constant, not a frozen literal: the contract is that
+    // the host advertises the surface version it actually implements, and a
+    // removed extension has to be able to move that number.
+    assert_eq!(declaration["version"], manox_ahp::ext::VERSION);
     assert!(
         declaration["channels"]
             .as_array()

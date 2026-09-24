@@ -387,10 +387,7 @@ impl RuntimeBackend {
             return serde_json::json!({ "workspaces": workspaces, "order": order });
         }
         if channel.starts_with(manox_ahp::ext::channels::COMMANDS) {
-            // The command/skill catalogue is assembled by the runtime's
-            // slash-command registry; until that seam is wired the baseline is
-            // an empty list rather than a missing channel.
-            return serde_json::json!({ "commands": [] });
+            return command_catalogue();
         }
         Value::Null
     }
@@ -584,6 +581,55 @@ struct SeededFacts {
     activity: Option<String>,
     directories: Option<Vec<String>>,
     title: String,
+}
+
+/// The command/skill catalogue served on `x-manox-commands://`.
+///
+/// AHP has no notion of a slash command, so this channel is where a client
+/// reads the palette it can offer. The three sources are the same ones the v2
+/// `ListCommands` call read, in the same precedence: built-ins first, then
+/// user commands, then skills, with a name claimed by an earlier source
+/// winning — a user command that shadows a built-in must not appear twice.
+fn command_catalogue() -> Value {
+    let mut commands: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for meta in manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
+        seen.insert(meta.name.to_string());
+        commands.push(serde_json::json!({
+            "name": meta.name,
+            "description": meta.description,
+            "kind": "command",
+            "argumentHint": Value::Null,
+        }));
+    }
+    if let Some(registry) = manox_agent::command::try_global() {
+        for (key, def) in registry.entries() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            commands.push(serde_json::json!({
+                "name": key,
+                "description": def.description,
+                "kind": "command",
+                "argumentHint": def.argument_hint,
+            }));
+        }
+    }
+    if let Some(registry) = manox_agent::skill::try_global() {
+        for (key, def) in registry.entries() {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            commands.push(serde_json::json!({
+                "name": key,
+                "description": def.description,
+                "kind": "skill",
+                "argumentHint": Value::Null,
+            }));
+        }
+    }
+    serde_json::json!({ "commands": commands })
 }
 
 /// The mutable half of a session summary, as an AHP delta.

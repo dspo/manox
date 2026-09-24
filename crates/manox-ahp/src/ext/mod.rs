@@ -27,7 +27,12 @@ pub use reducer::{Outcome as ExtOutcome, XManoxState};
 pub const META_KEY: &str = "x-manox";
 
 /// Extension surface version. Bump when an extension is renamed or removed.
-pub const VERSION: u32 = 1;
+///
+/// 2: the v2 gateway's deletion took `x-manox-modelchat:/` and the
+/// `fetchEntries`/`modelChat`/`modelChatCancel`/`cancelDelivery`/`shutdown`
+/// commands off the surface. A client that caches version 1's declaration would
+/// otherwise keep offering names this build answers `unsupported` to.
+pub const VERSION: u32 = 2;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
@@ -41,11 +46,16 @@ pub mod channels {
     pub const WORKSPACES: &str = "x-manox-workspaces://";
     /// Command / skill catalogue (stateless snapshot channel).
     pub const COMMANDS: &str = "x-manox-commands://";
-    /// Bare-model completion side stream for client model providers (stateless).
-    pub const MODEL_CHAT: &str = "x-manox-modelchat:/";
 
-    /// Every declared channel prefix.
-    pub const ALL: &[&str] = &[PLAN, WORK, METRICS, WORKSPACES, COMMANDS, MODEL_CHAT];
+    /// Every declared channel prefix — and, like [`super::commands::ALL`], only
+    /// the ones this build actually serves.
+    ///
+    /// The v2 surface also carried a bare-model completion side stream
+    /// (`x-manox-modelchat:/`). It is **not** declared: the module that produced
+    /// it was deleted with the v2 gateway, so a subscriber would wait forever on
+    /// a channel that can only ever answer `null`. Re-declaring it is the right
+    /// move the moment a model-completion implementation exists to back it.
+    pub const ALL: &[&str] = &[PLAN, WORK, METRICS, WORKSPACES, COMMANDS];
 }
 
 /// Actions served by the extension channels.
