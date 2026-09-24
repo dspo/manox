@@ -855,6 +855,26 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 这正是它漏过去的原因），并已用临时改回空列表验证会红。
 `ext::VERSION` 1 → 2（该常量自述"重命名或删除扩展时递增"）。
 
-**⑧ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
+**⑧ steer 的 pending-kind 修正（review request-change 后修，2026-09-24）**：
+`Translator::on_message` 的 `"user"` 分支原本对**所有** `user` 行发
+`PendingMessageKind::Queued` 并铸 `m-<entry.id>`。manox 的 steer 正是以普通 `user` 行落盘的
+（`engine.rs` 的 `steer_with_id` → `steer_message` 构造 `AgentMessage::User{id:Some(steer_id)}`），
+于是 mid-run steer 被译成「排队给下一轮」——与它的语义**相反**——且 id 与客户端 echo、宿主
+`steer` intent 三者互不相等。两个后果（先写测试复现、均红）：
+
+1. 该 entry 不被它打断的那一轮消费。`pending_user` 由 `on_turn_start` 排空，所以 steer 会在
+   下一轮开始时被当作新的用户消息**再次注入**——同一段文本跑两次。
+2. AHP 只在收到 id 匹配的 `pendingMessageRemoved` 时清 `steeringMessage`（`reducers.rs`），
+   turn 结束**不清**。`m-` 前缀的 id 永远匹配不上，于是客户端一直渲染一条文本已在 transcript
+   里的 pending steer。
+
+修法两半：`on_message` 按 `self.open`（"assistant" 分支已在用的现成信号）区分——turn 开着时
+的 `user` 行是 `Steering` 且**不进** `pending_user`；否则维持 `Queued`。steer 的 id 取该行的
+`originRpc`（即客户端 steer id）。宿主则在 `RuntimeBackend::dispatch` 确认注入后发
+`pendingMessageRemoved{kind:Steering}`；为此 `steer` 的 receipt 新增 `injected` 字段——
+**这个事实无法从 journal 推出**：`ThreadEvent::SteerInjected` 被显式排除在落盘之外
+（`engine.rs` 的 `durable_journal_payload` 早退分支），宿主没有第二条途径得知。
+
+**⑨ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
 `manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
 零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。
