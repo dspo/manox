@@ -776,8 +776,8 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
   纯重命名，放进本 PR 只会扩大评审面）。
 - 进程单例的 builder 由**拥有会话存储的一方**安装（`AgentServer::global`），runtime crate 永不
   命名具体会话运行时。安装是单向的，第二次安装被拒。
-- 测试归属：AHP 适配器测试（79 个）住在 gateway 旁（它们驱动活的 gateway），runtime crate 只留
-  纯单元测试。
+- 测试归属：AHP 适配器测试（38 个：35 个 `#[tokio::test]` + 3 个 `#[test]`）住在 gateway 旁
+  （它们驱动活的 gateway），runtime crate 只留纯单元测试。
 
 **② 三处「re-exit」而非移植的通知点**（H.2j 列出的三处）：
 
