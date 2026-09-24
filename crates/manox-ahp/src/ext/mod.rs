@@ -128,32 +128,30 @@ pub mod commands {
     pub const PLAN_EXECUTE: &str = "x-manox/planExecute";
     /// Set or clear the session goal.
     pub const GOAL: &str = "x-manox/goal";
-    /// Journal-entry level history page (v2 `PageHistory` parity).
-    pub const FETCH_ENTRIES: &str = "x-manox/fetchEntries";
-    /// Bare-model completion for client model providers.
-    pub const MODEL_CHAT: &str = "x-manox/modelChat";
-    /// Cancel an in-flight bare-model completion.
-    pub const MODEL_CHAT_CANCEL: &str = "x-manox/modelChatCancel";
-    /// Retract an unsettled adjudication delivery.
-    pub const CANCEL_DELIVERY: &str = "x-manox/cancelDelivery";
-    /// Host shutdown (process lifecycle).
-    pub const SHUTDOWN: &str = "x-manox/shutdown";
 
-    /// Every declared command.
+    /// Every command this build **serves**, which is what [`declaration`]
+    /// advertises.
+    ///
+    /// The rule is the same one the whole extension surface follows: a name in
+    /// here is a promise, and a promise the runtime does not keep is worse than
+    /// a name that was never offered — a client that reads the declaration and
+    /// sends `x-manox/modelChat` has no way to tell "not built" from "broken".
+    /// So a capability is listed here only once something answers for it.
     ///
     /// Client-contributed tools are **not** here: AHP models them natively (see
     /// [`CLIENT_TOOLS_VIA_ACTION`]), so the v2 `RegisterSessionTools` capability
     /// has no `x-manox` command.
-    pub const ALL: &[&str] = &[
-        COMPACT,
-        PLAN_EXECUTE,
-        GOAL,
-        FETCH_ENTRIES,
-        MODEL_CHAT,
-        MODEL_CHAT_CANCEL,
-        CANCEL_DELIVERY,
-        SHUTDOWN,
-    ];
+    ///
+    /// Capabilities the v2 surface had and this face does **not** serve, none of
+    /// which is declared above:
+    ///
+    /// - history paging — AHP's own `fetchTurns` covers it, cursor and all;
+    /// - bare-model completions (`modelChat` / `modelChatCancel`) — the channel
+    ///   they fed was deleted with the v2 gateway, so there is nothing to call;
+    /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
+    ///   v2 waterfall's concept; AHP settles through channel actions;
+    /// - process shutdown — a host-lifecycle concern, not a session one.
+    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL];
 }
 
 /// Client-contributed session tools: an AHP-native action, not an extension

@@ -810,6 +810,17 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 （ownership note / pump / waterfall / follow stream），要么正由 `ahp_adapter_tests.rs` 在 AHP 面
 重覆盖。**这是本 PR 已知的覆盖缺口，记在 H.3。**
 
-**⑥ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
+**⑥ 声明面收口（W4 收尾新发现）**：`x-manox` 命令声明面原本列了 8 条，其中 **5 条没有任何
+运行时实现**：`fetchEntries`（AHP 原生 `fetchTurns` 已覆盖）、`modelChat`/`modelChatCancel`
+（它们喂的通道随 v2 网关一起删了）、`cancelDelivery`（delivery 是被删的 v2 waterfall 概念）、
+`shutdown`（宿主生命周期，非会话关切）。声明面只留真正被服务的 3 条
+（`compact`/`planExecute`/`goal`），未服务的四条在 `commands::ALL` 的文档里写明**为什么不服务**
+——「声明了却答不出来」比「从不提供」更坏：客户端读声明后发 `x-manox/modelChat`，无法区分
+「没编译进去」和「坏了」。同时把 `extension_commands_split_performed_from_declared` 从
+**固化该缺陷**（它把「声明了但没实现 → 回 `X_MANOX_UNSUPPORTED`」写成"诚实的答案"）改为真正的
+门禁：遍历 `commands::ALL`，任何一条落到 `X_MANOX_UNSUPPORTED` 即红。该门禁已用临时插入假声明
+验证过确实会红。
+
+**⑦ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
 `manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
 零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。

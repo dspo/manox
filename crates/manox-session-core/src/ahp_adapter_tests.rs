@@ -836,12 +836,33 @@ mod dispatch {
             serde_json::Value::Null
         );
 
-        // Declared, not performed: the honest answer is the extension's own
-        // "unsupported" code, not a silent success.
+        // An undeclared name answers "unsupported" rather than pretending: a
+        // client that guessed a method this build does not serve learns so.
         let err = backend
-            .extension(manox_ahp::ext::commands::SHUTDOWN, &params)
-            .expect_err("shutdown is not wired");
+            .extension("x-manox/notAServedCommand", &params)
+            .expect_err("an unserved name is refused");
         assert_eq!(err.code(), manox_ahp::codes::X_MANOX_UNSUPPORTED);
+
+        // Every DECLARED command must be performed by this build: the
+        // declaration is a promise, and a client cannot tell a promise the host
+        // breaks from one it never made. This is the gate that keeps the two
+        // lists from drifting — the drift is what let five commands sit in the
+        // declaration with nothing behind them.
+        //
+        // "Performed" means the runtime reached its own params validation, not
+        // that these *borrowed* params happened to satisfy it: `planExecute`
+        // requires a `planFile` this call does not supply, and `InvalidParams`
+        // is it working. `Unimplemented` is the tell for a name with nothing
+        // behind it.
+        for command in manox_ahp::ext::commands::ALL {
+            if let Err(error) = backend.extension(command, &params) {
+                assert_ne!(
+                    error.code(),
+                    manox_ahp::codes::X_MANOX_UNSUPPORTED,
+                    "declared command {command} has nothing behind it"
+                );
+            }
+        }
 
         // A session-scoped command on a non-session channel is a client bug.
         let wrong = json!({"channel": chat::uri("s-dispatch")});
