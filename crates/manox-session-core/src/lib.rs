@@ -1,30 +1,24 @@
 //! Context-free session orchestration core.
 //!
-//! Drives gpui-free `ThreadHandle`s through the `AgentServer` protocol gateway
-//! for any host (the gpui desktop in-process, the napi binding, or a WS
-//! client). The core owns no global state beyond the shared `agent` handles.
-//! `model_chat` is the stateless bare-model completion channel (its original
-//! consumer, the VS Code language-model provider, was removed with the
-//! frontends — round 3 §二.10④; the channel stays as the declared dormant
-//! face); `translate` projects `ThreadEvent`s onto wire calls.
+//! Drives gpui-free `ThreadHandle`s for any host over AHP: the crate owns the
+//! session store's live entries and the runtime intents that act on them
+//! (`agent_server`), and adapts them onto the AHP runtime seam (`ahp_gateway`).
+//! Protocol mechanics — channels, JSON-RPC, transports — belong to `manox-ahp`,
+//! and the runtime half that speaks them to this gateway belongs to
+//! `manox-ahp-runtime`; nothing here encodes a wire format.
 
-pub mod agent_client;
 pub mod agent_server;
-pub mod follow;
-pub mod journal_query;
-pub mod model_chat;
-pub mod projection_cache;
-pub mod projection_hub;
-pub mod projections;
-pub mod translate;
-pub mod waterfall;
-pub mod workspace_serve;
+/// The gateway's implementation of the AHP runtime seam.
+pub mod ahp_gateway;
+
+/// The loopback WS listener (`cx web`'s network face).
 #[cfg(feature = "ws-gateway")]
 pub mod ws;
 
-/// Suite-wide test scaffolding: session-creating tests mutate `HOME` and
-/// initialize `OnceLock` globals, so they must not interleave. Formerly the
-/// tail of the retired `session` module (the actor-era command engine).
+/// Integration tests for the AHP adapter against the live gateway.
+#[cfg(test)]
+mod ahp_adapter_tests;
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Mutex, Once};
@@ -88,12 +82,6 @@ pub(crate) mod test_support {
     /// The tokio runtime and provider registry are process-wide `OnceLock`
     /// globals; initialize them exactly once, lightweight variants only
     /// (`manox_agent::init` would also boot MCP/LSP/plugin subsystems).
-    /// Process-global serialization for tests that touch the thread store
-    /// and the durable caches outside the agent_server suite's own guard.
-    pub fn lock_globals_for_cache_test() -> std::sync::MutexGuard<'static, ()> {
-        lock_globals()
-    }
-
     pub(crate) fn init_globals() {
         raise_fd_limit();
         INIT_ONCE.call_once(|| {

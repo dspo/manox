@@ -1,5 +1,7 @@
 # manox Architecture v2 —— 完备设计与迭代计划
 
+> **v2 已由 v3 取代（W0 规格冻结）**：manox ↔ manox-app 交互协议全量改造为 AHP（Agent Host Protocol，channel 化）。本文即协议 v2（`manox-protocol`）的最终规格，自此进入冻结（只收 blocker 修复）；其历史章节不重写、不回流。**v2 → v3 的完整映射、x-manox 扩展声明面、不变式 L1–L12 处置、删除清单与分期门禁见 `docs/ahp-v3-architecture.md`（唯一事实源）。**
+
 > 主文档，唯一事实源。取代 `~/.manox/plans/dsh-event-journal-adoption-plan.md`（其 J1–J11 决策已全部并入本文；M0–M7 阶段被 §K 迭代计划取代）。
 > 参考架构：deepseek-harness（dsh）。参考生态结论：主仓 63 插件 + 社区 725+ 条目全部只消费五种底座原语、零内核修改。
 > 执行契约：**本地迭代、本地提交与合并、终局单 PR**；任务正交并行，单任务 256K–768K tokens；委派 subagent（packet 装配规则见 §K.4），主线由主 agent 验收集成；部分任务主 agent 亲做。

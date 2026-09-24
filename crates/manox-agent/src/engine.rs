@@ -155,12 +155,9 @@ pub enum JournalFeed {
     Lagged(u64),
 }
 
-/// The feed's broadcast capacity (§D.7, the Entry window bound the L5
-/// overflow-resync semantics ride on). The kernel cannot reference
-/// `manox_protocol::ENTRY_BACKPRESSURE_CAPACITY` (protocol sits above the
-/// kernel), so the value is declared here and LOCKED equal by
-/// `entry_window_capacity_matches_the_protocol_declaration` in
-/// session-core's agent-server tests — change them together.
+/// The feed's broadcast capacity: the Entry window the overflow-resync
+/// semantics ride on. The value is declared here because the kernel is the
+/// layer that owns the feed; a consumer that needs a bound states its own.
 pub const JOURNAL_FEED_CAPACITY: usize = 4096;
 
 /// One whole-chain journal read (§C.3), answered by the actor.
@@ -699,12 +696,22 @@ async fn append_row_fail_loud(
 /// cold path; `None` with no live route logs and drops the row (a thread
 /// that never materialized has no journal — its sidecar carries the flag
 /// until the journal exists, the K2 fallback).
+/// Returns whether the row was handed to a path that can still land it: a live
+/// actor's queue, or a cold append against a file that exists. `false` means
+/// there is nowhere for the row to go — no actor and no file — which the caller
+/// must treat as "not persisted" rather than assuming success.
+///
+/// A cold append can still be dropped *later* (the file may be driven by
+/// another process, whose lease this process cannot take); that case is logged
+/// loudly at the seam and is deliberately not folded into this answer, because
+/// deciding it here would mean taking the lease on a synchronous path that the
+/// store's own lock is held across.
 pub(crate) fn dispatch_store_journal_row(
     thread_id: String,
     session_path: Option<PathBuf>,
     kind: String,
     payload: serde_json::Value,
-) {
+) -> bool {
     enum Fate {
         Queued,
         Wait,
@@ -733,7 +740,7 @@ pub(crate) fn dispatch_store_journal_row(
         }
     };
     match fate {
-        Fate::Queued => {}
+        Fate::Queued => true,
         Fate::Wait => {
             crate::runtime::handle().spawn(wait_then_cold_journal_append(
                 thread_id,
@@ -741,9 +748,18 @@ pub(crate) fn dispatch_store_journal_row(
                 kind,
                 payload,
             ));
+            true
         }
         Fate::Cold => {
+            let have_file = session_path.as_ref().is_some_and(|path| path.exists());
+            if !have_file {
+                tracing::debug!(
+                    kind,
+                    "no live route and no session file; the row has nowhere to land"
+                );
+            }
             crate::runtime::handle().spawn(cold_journal_append(session_path, kind, payload));
+            have_file
         }
     }
 }
@@ -905,6 +921,13 @@ pub fn spawn_engine(
     // latency unchanged) and, for durable events, queues a typed journal
     // append onto the same actor command channel — persist order equals
     // notice order, and no future emission site can forget to persist.
+    //
+    // That guarantee is scoped to EMISSION sites: it covers everything sent
+    // into `notice_tx`, which is upstream of the tap. A store-level decision
+    // that consumes a notice at the facade (`ThreadHandle::handle_notice`)
+    // is downstream of it and persists nothing, so such a decision must append
+    // its own row via `dispatch_store_journal_row` — see `journal_pinned_archived`
+    // and `journal_title` in `thread_store`.
     let (notice_tx, tap_rx) = mpsc::unbounded_channel();
     let (tap_tx, notice_rx) = mpsc::unbounded_channel();
     let tap_cmd_tx = cmd_tx.clone();
@@ -3590,6 +3613,23 @@ async fn run_actor(
         bridge.set_sender(notice_tx.clone());
     }
     let Some(mut pi_model) = model.or_else(crate::provider_glue::default_model) else {
+        // Retire and land whatever was queued before the exit, exactly as the
+        // command loop's own shutdown does. An early return that skipped this
+        // left the route registered with a live sender, so a store dispatch
+        // sent its row into an actor that would never drain it and reported
+        // the row queued — the rename's sidecar then named a title whose
+        // journal row had never been written.
+        let stranded = retire_and_claim_journal_rows(&thread_id, &mut cmd_rx);
+        if !stranded.is_empty() {
+            tracing::debug!(
+                thread = %thread_id,
+                rows = stranded.len(),
+                "engine exited without a model; landing its queued journal rows"
+            );
+            for (kind, payload) in stranded {
+                cold_journal_append(initial_path.clone(), kind, payload).await;
+            }
+        }
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));

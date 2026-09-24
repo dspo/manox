@@ -5,9 +5,10 @@
 #                         sessions、tools + ext 扩展）
 #   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
 #                         + MCP/LSP 接线）
-#   - manox-session-core: 无上下文会话编排（AgentServer/AgentClient 协议网关、
-#                         journal 查询、projections、waterfall、ws 网关）
-#   - manox-protocol:     传输无关双向 RPC + journal/protocol v2 词汇
+#   - manox-journal:      会话磁盘格式（journal v4 条目词汇）的叶子 crate
+#   - manox-ahp:          Agent Host Protocol 宿主层（频道、JSON-RPC、传输）
+#   - manox-ahp-runtime:  AHP 宿主背后的运行时半边（SessionRuntime 缝）
+#   - manox-session-core: 无上下文会话编排（会话存储 + AHP 运行时缝的实现）
 #   - manox-napi:         napi-rs 绑定（dormant，为未来 TS host 保留）
 #   - manox-providers:    ~/.manox/cx.providers.config.yaml 解析的单一事实来源
 #   - supervisor / lsp:   进程总线与 LSP 客户端（manox-agent 的基础设施）
@@ -27,7 +28,9 @@ members = [
 	"crates/manox-providers",
 	"crates/manox-session-core",
 	"crates/manox-napi",
-	"crates/manox-protocol",
+	"crates/manox-journal",
+	"crates/manox-ahp",
+	"crates/manox-ahp-runtime",
 	"crates/manox-terminal",
 	"crates/hyperlinks",
 	"crates/manox-workspace",
@@ -51,8 +54,14 @@ manox-agent = { path = "crates/manox-agent", default-features = false }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
 manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
-manox-protocol = { path = "crates/manox-protocol" }
 manox-workspace = { path = "crates/manox-workspace" }
+manox-journal = { path = "crates/manox-journal" }
+# manox-ahp —— AHP（Agent Host Protocol）宿主半边：JSON-RPC 路由、全局
+# serverSeq、通道注册与订阅、journal→AHP 动作翻译、x-manox 扩展声明面。
+# 前端（GPUI 桌面/远程客户端）一律经它对话；v2 面拆除后为唯一协议层。
+manox-ahp = { path = "crates/manox-ahp" }
+# manox-ahp-runtime —— AHP 宿主的运行时半边（与传输无关的 manox-ahp 分离）。
+manox-ahp-runtime = { path = "crates/manox-ahp-runtime", default-features = false }
 manox-harness = { path = "crates/manox-harness" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。
@@ -66,6 +75,12 @@ anyhow = "1"
 async-channel = "2"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
+# ahp / ahp-types —— Agent Host Protocol 官方 Rust crate（wire 类型 + 客户端
+# + 纯 reducer）。精确 pin：规范处于 pre-1.0、每个 minor 可能破坏；升级是显式
+# 任务而非顺手之举。宿主侧只用 ahp-types（类型）与 ahp::reducers（双端同码 fold）。
+ahp-types = "=0.9.0"
+ahp = "=0.9.0"
+ahp-ws = "=0.9.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"

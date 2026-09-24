@@ -1,39 +1,25 @@
-//! AgentServer — the single protocol gateway.
+//! The session store and the runtime intents that act on it.
 //!
-//! The only public surface between frontends and the gpui-free kernel: every
-//! client (the gpui desktop in-process, and any WS-gateway or napi host)
-//! speaks [`manox_protocol`] over
-//! an [`RpcConnection`], and the server drives kernel [`ThreadHandle`]s from
-//! those messages. Kernel [`ThreadEvent`]s are projected through
-//! [`crate::translate`] into [`ServerNote`] (streamed to the owning client) or
-//! [`ServerCall`] (a round-trip the owning ∩ capable client must answer), so
-//! the kernel stays free of transport and frontend concerns.
+//! The gateway owns this process's live sessions: one [`ThreadHandle`] per
+//! open session, the ownership table, the queued-submit queues, the live
+//! terminals, and the client-contributed tool registrations. Protocol
+//! mechanics live elsewhere — `manox-ahp` owns the channels, JSON-RPC and
+//! transports, and `manox-ahp-runtime` adapts this crate onto that host's
+//! `Backend` seam through [`crate::ahp_gateway`].
 //!
-//! Scope: connection/handshake, session ownership, the full
-//! `ClientCall`/`ClientNote` dispatch, the `Note` event pump, and the
-//! event-driven `ServerCall` round-trips — `Approve` (β-3a) plus
-//! `AskUserQuestion` (β-3b-i; the plan review rides the same channel,
-//! pump-initiated on PlanReady). `CapabilityClient` rewiring
-//! (BrowserOp/ClipboardRead/OpenExternal), terminal, and model_chat are
-//! β-3b-ii.
+//! Every intent here is fallible with a
+//! [`manox_ahp_runtime::error::RuntimeError`]: the caller has already folded
+//! the client's action into the state its subscribers reduce, so a refusal has
+//! to be reported rather than swallowed — a silent no-op would leave every
+//! client converged on a session state that never took effect.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use manox_protocol::answer_kind::AnswerKind;
-use manox_protocol::base64_bytes;
-use manox_protocol::client::{ClientToolSpec, ImageAttachment};
-use manox_protocol::handshake::{ClientHello, Initialize, PROTOCOL_EPOCH};
-use manox_protocol::journal::StreamId;
-#[cfg(feature = "terminal")]
-use manox_protocol::stream::StreamFrame;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
-use manox_protocol::{
-    ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
-    RpcPeer, ServerCall, ServerNote, ThreadListItem,
-};
+use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
+use manox_journal::base64_bytes;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -43,92 +29,103 @@ use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
-use crate::follow::{self, StreamHandle};
-use crate::journal_query;
-use crate::translate::{Translated, translate};
-
-/// How long the server waits for a client to answer a `ServerCall` before
-/// treating it as fail-closed. Generous: a human reviewing a plan or an
-/// approval may take minutes. The kernel never sets its own timeout — that
-/// would duplicate the peer's correlation/timeout machinery.
-const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// One live session: the strong `ThreadHandle` (the retention owner) and its
-/// event pump. Dropping the `JoinHandle` alone only DETACHES the pump — it
-/// keeps running (its own `ThreadHandle` clone keeps the subscription alive),
-/// so every removal path must call [`ServerSession::stop_pump`] before the
-/// entry leaves the table; the `Drop` impl is the safety net that makes the
-/// guarantee structural (GW2).
+/// One live session: the strong `ThreadHandle` (the retention owner) and the
+/// turn bookkeeping the runtime intents read.
 struct ServerSession {
     thread: ThreadHandle,
-    /// Cancellation token for the pump loop's `tokio::select!` (the
-    /// [`crate::follow::StreamHandle`] pattern): cancel wakes a pump parked
-    /// in `rx.recv()`.
-    pump_cancel: tokio_util::sync::CancellationToken,
-    /// The pump task. Aborted alongside the token in [`Self::stop_pump`] —
-    /// the abort covers a pump parked inside a long `route_call` await that
-    /// never re-enters the select.
-    pump: tokio::task::JoinHandle<()>,
     turn_active: Arc<AtomicBool>,
     // parking_lot (round 4 §3.2): a panic inside a lock holder must not
     // poison the queue into a permanent cascade — the std .unwrap() locks
     // turned one panic into every subsequent submit/steer/drain panicking.
     pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
-}
-
-/// One live wire terminal (#13). The gpui-free [`TerminalHandle`] owns the
-/// PTY + grid; subscribers are the follow-terminal streams currently
-/// attached (each with its connection).
-/// One follow-terminal subscriber: (client_id, stream_id, connection).
-#[cfg(feature = "terminal")]
-type TerminalStreamSub = (String, StreamId, Arc<dyn RpcConnection>);
-
-#[cfg(feature = "terminal")]
-struct TerminalEntry {
-    handle: manox_terminal::TerminalHandle,
-    /// The session this terminal was attached for (cwd source + db row).
-    #[allow(dead_code)] // reserved for per-session terminal scoping
-    session_id: String,
-    cwd: String,
-    streams: Mutex<Vec<TerminalStreamSub>>,
-    exited: StdMutex<Option<i32>>,
-}
-
-impl ServerSession {
-    /// Terminate this session's pump (GW2): cancel the token and abort the
-    /// task (double insurance — either alone leaves a window). Idempotent;
-    /// runs before the entry is dropped so a concurrent reopen can never
-    /// observe a live session with a dead table entry, and a replaced entry
-    /// can never leave a second pump subscribed to the same thread.
-    fn stop_pump(&self) {
-        self.pump_cancel.cancel();
-        self.pump.abort();
-    }
+    /// The settle watcher's cancellation token. The watcher owns an `Arc` of
+    /// the entry's state, so dropping the entry alone would not end it.
+    settle_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Drop for ServerSession {
-    /// Safety net: a session entry leaving the table by ANY path (explicit
-    /// removal, map replacement, whole-server drop) takes its pump with it.
-    /// Without this, `JoinHandle` drop merely detached the pump: its
-    /// `ThreadHandle` clone kept `thread.subscribe()`'s unbounded channel
-    /// open, so `rx.recv()` never closed and the pump plus the engine actor
-    /// leaked process-wide (GW2).
+    /// A session entry leaving the table by ANY path takes its settle watcher
+    /// with it: the watcher's `ThreadHandle` clone keeps the thread's
+    /// subscription open, so without this it would outlive the entry and drain
+    /// a queue nobody owns any more.
     fn drop(&mut self) {
-        self.stop_pump();
+        self.settle_cancel.cancel();
     }
 }
 
-/// Bumps the server's finished-pump counter when the pump task exits — by
-/// token cancellation, subscription close, or `JoinHandle::abort` (the abort
-/// drops the task future, running this guard's `Drop`). Paired with the
-/// spawn counter it makes the live pump count observable for the GW2
-/// double-pump regressions.
-struct PumpExitGuard(Arc<AgentServerInner>);
+/// Drains one session's parked submissions when its turn settles.
+///
+/// A submit that arrives mid-turn is parked rather than refused (the user
+/// typed it; refusing would lose it), and this is what turns the parked batch
+/// into the follow-up turn. It watches the thread's own event stream, so it
+/// sees the same settle edge the kernel emitted — there is no polling and no
+/// second source of truth about whether a turn is running.
+fn spawn_settle_watcher(
+    session_id: String,
+    thread: ThreadHandle,
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
+    turn_active: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    // Subscribe synchronously: a receiver registered inside the task can miss
+    // an event fired before the task is first polled.
+    let rx = thread.subscribe();
+    manox_agent::runtime::handle().spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = cancel.cancelled() => break,
+                received = rx.recv() => match received {
+                    Ok(event) => event,
+                    // Every sender dropped: the thread is gone.
+                    Err(_) => break,
+                },
+            };
+            match &*event {
+                ThreadEvent::TurnStarted => turn_active.store(true, Ordering::SeqCst),
+                ThreadEvent::TurnFinished { cancelled, .. } => {
+                    turn_active.store(false, Ordering::SeqCst);
+                    // A cancelled turn settles the queue too: its text was not
+                    // run, and leaving it parked would strand it forever.
+                    let _ = cancelled;
+                    let drained: Vec<QueuedSubmit> = pending_submits.lock().drain(..).collect();
+                    if drained.is_empty() {
+                        continue;
+                    }
+                    let mut batch_origin: Option<String> = None;
+                    thread.with_mut(|t| {
+                        for queued in drained {
+                            if queued.origin.is_some() {
+                                batch_origin = queued.origin.clone();
+                            }
+                            let content = to_message_content(queued.text, queued.images);
+                            t.insert_user_message_with_content_and_ui_metadata(
+                                content,
+                                Some(queued.ui),
+                            );
+                        }
+                    });
+                    thread.with_mut(|t| {
+                        t.set_pending_turn_origin(batch_origin);
+                        t.run_turn();
+                    });
+                }
+                _ => {}
+            }
+        }
+        tracing::debug!(session = %session_id, "settle watcher stopped");
+    })
+}
 
-impl Drop for PumpExitGuard {
-    fn drop(&mut self) {
-        self.0.pumps_finished.fetch_add(1, Ordering::SeqCst);
-    }
+/// One live wire terminal (#13): the gpui-free [`TerminalHandle`] owns the
+/// PTY and the grid.
+#[cfg(feature = "terminal")]
+struct TerminalEntry {
+    handle: manox_terminal::TerminalHandle,
+    /// The session this terminal was attached for: the cwd source and the db
+    /// row's owner.
+    session_id: String,
+    cwd: String,
+    exited: StdMutex<Option<i32>>,
 }
 
 /// A submission parked while a turn runs; drained into one follow-up turn when
@@ -141,16 +138,6 @@ struct QueuedSubmit {
     /// The Submit's origin RPC id (echo retirement, §F.2). A drained batch
     /// merges into one turn, so the last non-None origin wins.
     origin: Option<String>,
-}
-
-/// One connected frontend.
-struct ClientEntry {
-    conn: Arc<dyn RpcConnection>,
-    peer: RpcPeer,
-    hello: ClientHello,
-    /// Monotonically increasing generation assigned on each handshake. Used by
-    /// `remove_client` to avoid deleting a newer entry that replaced this one.
-    generation: u64,
 }
 
 /// The single gateway. Cloning shares the inner state.
@@ -171,7 +158,7 @@ impl Drop for OwnerLease {
     }
 }
 
-struct AgentServerInner {
+pub(crate) struct AgentServerInner {
     cwd: PathBuf,
     /// Bind redirect map (predecessor → successor session id): the live
     /// half of the supersede contract; the sidecar marker is the
@@ -180,92 +167,30 @@ struct AgentServerInner {
     /// Bind hand-offs in flight per predecessor: two quick `SetCwd` notes
     /// must not mint two successors (review #805 [sugg] 6).
     binding: Mutex<HashSet<String>>,
-    /// The session-shared projection fold (one cell per session, fanned out
-    /// to every follow stream; checkpoint-backed across restarts).
-    projections: Arc<crate::projection_hub::ProjectionHub>,
     sessions: Mutex<HashMap<String, ServerSession>>,
-    clients: Mutex<HashMap<String, ClientEntry>>,
     /// session_id → client_ids that own (view) it. A session may have several
     /// owners; each receives its streamed notes.
     session_owners: Mutex<HashMap<String, Vec<String>>>,
-    /// Live §D.1 streams: `(client_id, stream_id)` → control handle. The
-    /// key pair mirrors the stream id's per-connection uniqueness (§D.1).
-    streams: Mutex<HashMap<(String, StreamId), StreamHandle>>,
     /// Live wire terminals (#13): id → entry. Spawned by `TerminalAttach`,
     /// fed by per-stream forwarder tasks, mirrored into the threads db and
     /// the `TerminalsUpdated` host snapshot.
     #[cfg(feature = "terminal")]
     terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
-    call_seq: AtomicU64,
-    /// GW3 (§D.4): per-session adjudication delivery counter — the `dlv-`
-    /// id's monotonic suffix. Per-session (not per-server) so the two
-    /// transports of `dual_path_transport_consistency` mint identical ids
-    /// for identical scripts after session-id normalization.
-    delivery_seq: Mutex<HashMap<String, u64>>,
-    /// GW3 (§D.4): in-flight waterfall deliveries — `delivery_id` →
-    /// (owning session, recipient client_id → cancel token). A
-    /// `CancelDelivery` call flips the sender's token; the delivery's
-    /// reply waiter folds that into the funnel as an expired reply,
-    /// converging the waterfall fail-closed through the existing expire
-    /// path. Registered for the fan-out window only (the [`DeliveryGuard`]
-    /// removes the entry at settlement — Drop covers the waiter task's
-    /// teardown in every exit shape). The owning session is what the
-    /// dispose sweep (`cancel_deliveries_for_session`) scans: with the
-    /// adjudication await off-pump (§0), pump termination alone no longer
-    /// reaches the waiter, so session teardown cancels the tokens by
-    /// session tag instead — never by parsing the id (session ids may
-    /// contain dashes, which makes the `dlv-{session}-{n}` prefix not
-    /// uniquely reversible).
-    pending_deliveries: Mutex<HashMap<String, PendingDelivery>>,
-    /// §D.6 replay: in-flight adjudications per session — the authoritative
-    /// copy the gateway re-delivers to every owner that joins later (open /
-    /// re-own / handshake re-declaration), keyed by the deterministic
-    /// MsgId identity (`auth_id`; for a plan review the plan file). A record
-    /// lives until its adjudication settles at `apply_reply`; `targets`
-    /// holds the owners already holding a live waiter so a re-join of an
-    /// existing target never re-registers (GW2 duplicate guard).
-    pending_adjudications: Mutex<HashMap<String, Vec<PendingAdjudication>>>,
-    /// In-flight bare-model completions by request id (the LanguageModelChat
-    /// provider path); cancellation tokens shared with the spawned streams.
-    model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
-    /// Monotonically increasing counter for client entry generations, used to
-    /// detect stale entries during same-client-id reconnection.
-    next_generation: AtomicU64,
-    /// §E.3 Q-face cache: `(thread_id, cursor)` → the folded conversation
-    /// info payload (recomputed only when the cursor advances).
-    conversation_info_cache: Arc<StdMutex<journal_query::ConversationInfoCache>>,
     /// Embedder tool registrations (RegisterSessionTools): session →
     /// client → full-replacement tool set. Consulted by the
     /// EmbedderToolProvider below each time the engine assembles a
     /// session's tools.
     embedder_tools: Mutex<HashMap<String, HashMap<String, Vec<ClientToolSpec>>>>,
-    /// GW2 pump observability: every `spawn_pump` bumps `pumps_spawned`;
-    /// every pump exit — token cancel, subscription close, or task abort
-    /// (the [`PumpExitGuard`]'s Drop runs in all three) — bumps
-    /// `pumps_finished`. Their difference is the live pump count the
-    /// double-pump regressions assert on.
-    pumps_spawned: AtomicU64,
-    pumps_finished: AtomicU64,
 }
 
 impl AgentServerInner {
-    /// Live pump count (GW2 observability): spawned minus finished. A
-    /// session's pump counts as finished once its task exits by token
-    /// cancel, subscription close, or abort — the double-pump regressions
-    /// poll this to a deadline instead of racing the runtime.
-    #[cfg(test)]
-    fn live_pumps(&self) -> u64 {
-        self.pumps_spawned.load(Ordering::SeqCst) - self.pumps_finished.load(Ordering::SeqCst)
-    }
-
-    /// Insert only when the key is absent, under ONE lock hold (§二.4③).
+    /// Insert only when the key is absent, under ONE lock hold.
+    ///
     /// The create path's live-session check and its insert were two lock
     /// acquisitions, so a racing same-id create/open could pass both checks
-    /// and mint two pumps — the old replace-and-stop_pump insert kept both
-    /// from running, but at the cost of CLOBBERING the winner's fresh state
-    /// (model / approval / effort seeds lost to the loser's). This recheck
-    /// adopts the entry that won the race; the loser is returned to its
-    /// caller for disposal (same shape as `open_session`'s phase-3).
+    /// and build two entries. This recheck adopts the entry that won the race
+    /// and hands the loser back to its caller, so the loser's intent seeds can
+    /// never overwrite the winner's model / approval / effort.
     fn insert_session_if_absent(
         &self,
         session_id: String,
@@ -285,13 +210,13 @@ impl AgentServerInner {
     /// bound to the session's cwd. Response carries the id + a text
     /// snapshot of the visible grid.
     #[cfg(feature = "terminal")]
-    fn attach_terminal(
+    pub(crate) fn attach_terminal(
         self: &Arc<Self>,
         session_id: &str,
         cols: u16,
         rows: u16,
         terminal_id: Option<String>,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         if let Some(id) = terminal_id.clone() {
             let existing = self.terminals.lock().get(&id).cloned();
             if let Some(entry) = existing {
@@ -304,8 +229,8 @@ impl AgentServerInner {
             .map(|t| t.read(|t| t.cwd().to_path_buf()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let pty = manox_terminal::pty::open(&cwd, cols, rows, None, &[]).map_err(|e| {
-            RpcError::new(-1, format!("terminal spawn failed: {e}"))
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            manox_ahp_runtime::error::RuntimeError::new(format!("terminal spawn failed: {e}"))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
         })?;
         let handle = manox_terminal::Terminal::spawn(
             id.clone(),
@@ -315,30 +240,83 @@ impl AgentServerInner {
             Box::new(pty),
         )
         .map_err(|e| {
-            RpcError::new(-1, format!("terminal spawn failed: {e}"))
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            manox_ahp_runtime::error::RuntimeError::new(format!("terminal spawn failed: {e}"))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
         })?;
         let entry = Arc::new(TerminalEntry {
             handle,
             session_id: session_id.to_string(),
             cwd: cwd.to_string_lossy().into_owned(),
-            streams: Mutex::new(Vec::new()),
             exited: StdMutex::new(None),
         });
         self.terminals.lock().insert(id.clone(), entry.clone());
         self.upsert_terminal_db(&entry, None);
-        self.broadcast_host(HostEvent::TerminalsUpdated {
-            terminals: self.terminals_summary(),
-        });
-        self.spawn_terminal_watcher(entry.clone());
         Ok(self.terminal_attach_response(&entry))
     }
 
-    /// `TerminalSnapshot`: the visible grid as text lines + cursor.
+    /// The raw PTY byte tap of a terminal, for the AHP output pump.
+    ///
+    /// Raw rather than the decoded event stream: `terminal/data` carries the
+    /// process's own bytes, and the pump is where a byte-fragment stream is
+    /// reassembled into text at character boundaries.
     #[cfg(feature = "terminal")]
-    fn terminal_snapshot(&self, terminal_id: &str) -> Option<Value> {
-        let entry = self.terminals.lock().get(terminal_id).cloned()?;
-        Some(self.terminal_snapshot_value(&entry))
+    pub(crate) fn terminal_raw_tap(
+        &self,
+        terminal_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
+        self.terminals
+            .lock()
+            .get(terminal_id)
+            .map(|entry| entry.handle.subscribe_raw())
+    }
+
+    /// `terminal/input`: forward keystrokes to a terminal's PTY.
+    ///
+    /// AHP types this as a side-effect-only action (the reducer no-ops it), so
+    /// the only observable effect is what the PTY does with the bytes — which
+    /// comes back on the wire as `terminal/data`.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), String> {
+        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
+            return Err(format!("unknown terminal {terminal_id}"));
+        };
+        entry
+            .handle
+            .read(|t| t.input(data.as_bytes()))
+            .map_err(|error| format!("terminal input failed: {error}"))
+    }
+
+    /// `terminal/resized`: resize a terminal's PTY grid.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
+            return Err(format!("unknown terminal {terminal_id}"));
+        };
+        entry
+            .handle
+            .with_mut(|t| t.resize(cols as usize, rows as usize));
+        Ok(())
+    }
+
+    /// `DisposeTerminal`: release a terminal.
+    ///
+    /// Dropping the entry is the release — the PTY handle reaps its child on
+    /// `Drop` — so the removed entry must actually be dropped here rather than
+    /// left to a lingering watcher clone. That is why the map removal is the
+    /// last statement and the value is not retained.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn dispose_terminal(&self, terminal_id: &str) -> bool {
+        let Some(entry) = self.terminals.lock().remove(terminal_id) else {
+            return false;
+        };
+        // The drop is the release: the PTY handle reaps its child on `Drop`.
+        drop(entry);
+        true
     }
 
     #[cfg(feature = "terminal")]
@@ -362,26 +340,58 @@ impl AgentServerInner {
         })
     }
 
+    /// The AHP view of one live terminal, for the `ahp-terminal:/<id>` channel.
+    ///
+    /// Unlike the v2 summary this is the channel's *state*, so it carries the
+    /// visible grid: a subscriber that arrives late needs the screen, not just
+    /// the fact that a terminal exists.
     #[cfg(feature = "terminal")]
-    fn terminals_summary(&self) -> Vec<manox_protocol::stream::TerminalSummary> {
-        self.terminals
-            .lock()
-            .iter()
-            .map(|(id, entry)| {
-                let exited = *entry.exited.lock().unwrap();
-                manox_protocol::stream::TerminalSummary {
-                    id: id.clone(),
-                    title: entry.handle.read(|t| t.title.clone()),
-                    lifecycle: if exited.is_some() {
-                        "exited"
-                    } else {
-                        "running"
-                    }
-                    .into(),
-                    exit_code: exited,
+    pub(crate) fn ahp_terminal_state(
+        &self,
+        terminal_id: &str,
+    ) -> Option<ahp_types::state::TerminalState> {
+        use ahp_types::state as ahp;
+        let entry = self.terminals.lock().get(terminal_id).cloned()?;
+        let (lines, cols, rows, title, cwd) = entry.handle.read(|t| {
+            let (lines, _, _) = t.text_snapshot();
+            (lines, t.cols, t.rows, t.title.clone(), t.cwd.clone())
+        });
+        let exited = *entry.exited.lock().unwrap();
+        Some(ahp::TerminalState {
+            title: title.unwrap_or_default(),
+            cwd: cwd.to_str().map(str::to_string),
+            cols: Some(cols as i64),
+            rows: Some(rows as i64),
+            // The visible grid is what a late subscriber must have. AHP allows a
+            // command/output split (`TerminalContentPart::Command`); this slice
+            // does not track command boundaries, so the whole screen is one
+            // unclassified part rather than a fabricated split.
+            content: vec![ahp::TerminalContentPart::Unclassified(
+                ahp::TerminalUnclassifiedPart {
+                    value: lines.join("\n"),
+                },
+            )],
+            lifecycle: match exited {
+                Some(code) => {
+                    ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
+                        exit_code: Some(code as i64),
+                    })
                 }
-            })
-            .collect()
+                None => ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {}),
+            },
+            // One process-local host serves every client, and the runtime does
+            // not arbitrate input ownership, so `Watched` is the honest claim:
+            // announcing a client claim we do not enforce would invite two
+            // clients to type into one PTY.
+            claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
+                session: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
+                chat: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
+                turn_id: None,
+                tool_call_id: None,
+            }),
+            supports_command_detection: Some(false),
+            is_pty: Some(true),
+        })
     }
 
     #[cfg(feature = "terminal")]
@@ -404,267 +414,6 @@ impl AgentServerInner {
             created_at: now,
             updated_at: now,
         });
-    }
-
-    /// One watcher per terminal: title/exit edges update the db mirror and
-    /// broadcast `TerminalsUpdated`.
-    #[cfg(feature = "terminal")]
-    fn spawn_terminal_watcher(self: &Arc<Self>, entry: Arc<TerminalEntry>) {
-        let rx = entry.handle.subscribe();
-        let inner = Arc::clone(self);
-        manox_agent::runtime::handle().spawn(async move {
-            while let Ok(ev) = rx.recv().await {
-                match &*ev {
-                    manox_terminal::event::TerminalEvent::Title(_) => {
-                        inner.upsert_terminal_db(&entry, None);
-                        inner.broadcast_host(HostEvent::TerminalsUpdated {
-                            terminals: inner.terminals_summary(),
-                        });
-                    }
-                    manox_terminal::event::TerminalEvent::ChildExit(_)
-                    | manox_terminal::event::TerminalEvent::Exit => {
-                        let code = match &*ev {
-                            manox_terminal::event::TerminalEvent::ChildExit(c) => Some(*c),
-                            _ => None,
-                        };
-                        *entry.exited.lock().unwrap() = code.or(Some(-1));
-                        inner.upsert_terminal_db(&entry, code);
-                        inner.broadcast_host(HostEvent::TerminalsUpdated {
-                            terminals: inner.terminals_summary(),
-                        });
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
-
-    /// `StreamOpen { FollowTerminal }`: one forwarder per stream relaying raw
-    /// PTY chunks as base64 `TerminalOutput` frames; ends `Closed` on child
-    /// exit / channel close, `Cancelled` on `StreamCancel`.
-    #[cfg(feature = "terminal")]
-    fn open_terminal_stream(
-        self: &Arc<Self>,
-        client_id: &str,
-        conn: Arc<dyn RpcConnection>,
-        stream_id: StreamId,
-        terminal_id: String,
-    ) {
-        let Some(entry) = self.terminals.lock().get(&terminal_id).cloned() else {
-            conn.send_to_client(FromServer::StreamEnd {
-                stream_id,
-                reason: StreamEndReason::Failure {
-                    code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
-                    message: format!("unknown terminal {terminal_id}"),
-                },
-            });
-            return;
-        };
-        let handle = StreamHandle::new(
-            terminal_id.clone(),
-            tokio_util::sync::CancellationToken::new(),
-            Arc::new(StdMutex::new(None)),
-        );
-        self.track_stream(client_id, &stream_id, handle.clone());
-        entry
-            .streams
-            .lock()
-            .push((client_id.to_string(), stream_id.clone(), conn.clone()));
-        let (cancel, _reason) = handle.parts();
-        // Raw byte tap for the relay; the lifecycle subscription carries the
-        // child-exit edge that ends the stream.
-        let mut raw_rx = entry.handle.subscribe_raw();
-        let life_rx = entry.handle.subscribe();
-        let client_id2 = client_id.to_string();
-        let stream_id2 = stream_id.clone();
-        manox_agent::runtime::handle().spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        conn.send_to_client(FromServer::StreamEnd {
-                            stream_id: stream_id.clone(),
-                            reason: StreamEndReason::Cancelled,
-                        });
-                        break;
-                    }
-                    ev = life_rx.recv() => {
-                        match ev {
-                            Ok(ev) => match &*ev {
-                                manox_terminal::event::TerminalEvent::ChildExit(_)
-                                | manox_terminal::event::TerminalEvent::Exit => {
-                                    conn.send_to_client(FromServer::StreamEnd {
-                                        stream_id: stream_id.clone(),
-                                        reason: StreamEndReason::Closed,
-                                    });
-                                    break;
-                                }
-                                _ => {}
-                            },
-                            Err(_) => {
-                                conn.send_to_client(FromServer::StreamEnd {
-                                    stream_id: stream_id.clone(),
-                                    reason: StreamEndReason::Closed,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                    chunk = raw_rx.recv() => {
-                        match chunk {
-                            Ok(bytes) => {
-                                conn.send_to_client(FromServer::StreamItem {
-                                    stream_id: stream_id.clone(),
-                                    frame: StreamFrame::TerminalOutput {
-                                        data: manox_protocol::base64_bytes::encode(&bytes),
-                                    },
-                                });
-                            }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                                // Bounded tap: a slow consumer drops chunks
-                                // rather than stalling the PTY pump; the
-                                // client re-snapshots on demand.
-                            }
-                            Err(_) => {
-                                conn.send_to_client(FromServer::StreamEnd {
-                                    stream_id: stream_id.clone(),
-                                    reason: StreamEndReason::Closed,
-                                });
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            entry
-                .streams
-                .lock()
-                .retain(|(c, s, _)| !(c == &client_id2 && s == &stream_id2));
-        });
-    }
-
-    /// insert (§二.4②) — its task sends its one `StreamEnd` and the
-    /// Register a live stream and return its control handle.
-    ///
-    /// A key that is already live means the previous stream task is being
-    /// replaced while still running: `untrack_stream` is identity-guarded,
-    /// so an unconditionally overwritten handle would be unreachable from
-    /// BOTH ends forever (no end request, no unregister — a live orphan).
-    /// The superseded stream is therefore ENDED (`Closed`) under the same
-    /// identity guard keeps the new entry intact.
-    fn track_stream(&self, client_id: &str, stream_id: &StreamId, handle: StreamHandle) {
-        let replaced = self
-            .streams
-            .lock()
-            .insert((client_id.to_string(), stream_id.clone()), handle);
-        if let Some(old) = replaced {
-            tracing::warn!(
-                client_id,
-                stream_id = stream_id.0,
-                "replaced a live stream entry; ending the superseded stream"
-            );
-            old.end(StreamEndReason::Closed);
-        }
-    }
-
-    /// Forget a stream after its task sent the terminal `StreamEnd`
-    /// (identity-guarded so a re-open with the same id is never deleted by
-    /// the superseded task).
-    fn untrack_stream(&self, client_id: &str, stream_id: &StreamId, handle: &StreamHandle) {
-        {
-            let mut streams = self.streams.lock();
-            let key = (client_id.to_string(), stream_id.clone());
-            if streams
-                .get(&key)
-                .is_some_and(|live| live.is_same_handle(handle))
-            {
-                streams.remove(&key);
-            }
-        }
-        // The last consumer leaving is the predecessor's reap edge
-        // (plan §3.1 B-iv).
-        self.reap_superseded_if_idle(handle.session_id());
-    }
-
-    /// Reap a superseded predecessor once nothing consumes it any more:
-    /// without this its entry, pump and engine stay resident for the
-    /// process lifetime (plan §3.1 B-iv). A busy turn keeps its entry —
-    /// the settle arm reaps it, exactly like `remove_client`'s deferred
-    /// reap.
-    fn reap_superseded_if_idle(&self, session_id: &str) {
-        if !self.superseded.lock().contains_key(session_id) {
-            return;
-        }
-        if !self.owners(session_id).is_empty() {
-            return;
-        }
-        if self
-            .streams
-            .lock()
-            .values()
-            .any(|handle| handle.session_id() == session_id)
-        {
-            return;
-        }
-        // Check-and-remove under ONE hold (the `remove_client` shape): a
-        // turn turning active between two holds would otherwise be reaped
-        // mid-flight with nobody left to settle it (review #809 [sugg] 3).
-        let removed = {
-            let mut sessions = self.sessions.lock();
-            let running = sessions
-                .get(session_id)
-                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-            if running {
-                return;
-            }
-            sessions.remove(session_id)
-        };
-        let Some(session) = removed else {
-            return;
-        };
-        session.stop_pump();
-        // The registrations die with the entry, like every other removal
-        // path (review #809 [sugg] 4).
-        self.clear_embedder_tools(session_id);
-        self.projections.drop_session(session_id);
-        self.cancel_deliveries_for_session(session_id);
-        tracing::debug!(session = %session_id, "reaped superseded predecessor");
-    }
-
-    /// End every live stream of a session with `reason` (dispose /
-    /// ownership-lost: §D.1 `Closed`). Returns the ended handles' ids for
-    /// logging.
-    fn end_streams_for_session(&self, session_id: &str, reason: StreamEndReason) {
-        let keys: Vec<(String, StreamId)> = self
-            .streams
-            .lock()
-            .iter()
-            .filter(|(_, h)| h.session_id() == session_id)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for key in keys {
-            let handle = self.streams.lock().remove(&key);
-            if let Some(handle) = handle {
-                handle.end(reason.clone());
-            }
-        }
-    }
-
-    /// End every stream owned by a disconnected client (§D.1 `Closed`).
-    fn end_streams_for_client(&self, client_id: &str) {
-        let keys: Vec<(String, StreamId)> = self
-            .streams
-            .lock()
-            .keys()
-            .filter(|(cid, _)| cid == client_id)
-            .cloned()
-            .collect();
-        for key in keys {
-            let handle = self.streams.lock().remove(&key);
-            if let Some(handle) = handle {
-                handle.end(StreamEndReason::Closed);
-            }
-        }
     }
 }
 
@@ -713,10 +462,27 @@ pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
     // No provider install here (#803 follow-up): it moved into `new_inner`,
     // where it covers this singleton AND the direct `AgentServer::new`
     // paths (napi included) — see [`install_embedder_provider`].
-    GLOBAL
+    let server = GLOBAL
         .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
-        .clone()
+        .clone();
+    // The AHP runtime half cannot construct a session runtime itself — that is
+    // this gateway's business, and naming one there would recreate the
+    // dependency the split exists to remove. So the owner installs the builder.
+    // Last-wins is refused: a process has one session store, and letting two
+    // embedders race would give the AHP face a runtime other than the one its
+    // clients are talking to.
+    if !AHP_BUILDER_INSTALLED.swap(true, Ordering::SeqCst) {
+        let _ = manox_ahp_runtime::ahp::runtime::install_builder(|cwd| {
+            Arc::new(crate::ahp_gateway::GatewayRuntime::new(global(cwd)))
+                as Arc<dyn manox_ahp_runtime::runtime_trait::SessionRuntime>
+        });
+    }
+    server
 }
+
+/// Whether this process already installed the AHP runtime builder.
+static AHP_BUILDER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl AgentServer {
     pub fn new(cwd: PathBuf) -> Self {
@@ -742,25 +508,11 @@ impl AgentServer {
             cwd,
             superseded: Mutex::new(HashMap::new()),
             binding: Mutex::new(HashSet::new()),
-            projections: Arc::new(crate::projection_hub::ProjectionHub::default()),
             sessions: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
             session_owners: Mutex::new(HashMap::new()),
-            streams: Mutex::new(HashMap::new()),
             #[cfg(feature = "terminal")]
             terminals: Mutex::new(HashMap::new()),
-            call_seq: AtomicU64::new(0),
-            delivery_seq: Mutex::new(HashMap::new()),
-            pending_deliveries: Mutex::new(HashMap::new()),
-            pending_adjudications: Mutex::new(HashMap::new()),
-            model_chats: Arc::new(StdMutex::new(HashMap::new())),
-            next_generation: AtomicU64::new(1),
-            conversation_info_cache: Arc::new(StdMutex::new(
-                journal_query::ConversationInfoCache::default(),
-            )),
             embedder_tools: Mutex::new(HashMap::new()),
-            pumps_spawned: AtomicU64::new(0),
-            pumps_finished: AtomicU64::new(0),
         });
         // U2 cross-domain #2 (§D.5 Models: pushed immediately on provider reload): a
         // provider reload broadcasts the fresh snapshot to every
@@ -808,23 +560,6 @@ impl AgentServer {
                 }
             });
         }
-        // Workspace state-stream forwarder: the domain feed is the single
-        // source; every accepted mutation reaches every client as a
-        // reconnect-safe host frame (dsh workspace-controller parity).
-        {
-            let feed_inner = Arc::clone(&inner);
-            manox_agent::runtime::handle().spawn(async move {
-                let mut rx = crate::workspace_serve::store().subscribe();
-                while let Ok(event) = rx.recv().await {
-                    feed_inner.broadcast_host(manox_protocol::stream::HostEvent::WorkspaceUpdate {
-                        event: crate::workspace_serve::wire_event(&event),
-                    });
-                }
-            });
-            manox_agent::runtime::handle().spawn(async {
-                crate::workspace_serve::adopt_when_ready().await;
-            });
-        }
         let server = Self(inner);
         // The host wiring the engine's tool assembly consults: install
         // THIS server's embedder-tool provider. Lives in the shared
@@ -833,16 +568,30 @@ impl AgentServer {
         // test fixtures) wires the provider; last-wins makes the newest
         // construction authoritative. See [`install_embedder_provider`].
         install_embedder_provider(&server);
+        // The engine's window into the frontend (browser, clipboard, opener).
+        // Also last-wins, for the same one-server-per-process reason.
+        manox_agent::capability::set_provider(std::sync::Arc::new(
+            AgentServerCapabilityClient::new(),
+        ));
         server
     }
 
-    /// Accept a connection: spawn the handshake + dispatch task. The
-    /// connection drives itself thereafter.
-    pub fn accept(&self, conn: Arc<dyn RpcConnection>) {
-        let inner = self.0.clone();
-        manox_agent::runtime::handle().spawn(async move {
-            inner.serve_connection(conn).await;
-        });
+    /// The AHP host dispatches into the same inner intents the socket surfaces
+    /// use: one write path, one implementation, no second copy to drift.
+    /// one write path, two protocols, no second implementation to drift.
+    pub(crate) fn ahp_inner(&self) -> &Arc<AgentServerInner> {
+        &self.0
+    }
+
+    /// Test-only: whether the gateway currently sees this session's turn as
+    /// running (the parked-submit drain keys off this flag).
+    #[cfg(test)]
+    pub(crate) fn turn_active_for_test(&self, session_id: &str) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .get(session_id)
+            .is_some_and(|s| s.turn_active.load(Ordering::SeqCst))
     }
 
     /// Test-only: the live session ids this server holds (the reap
@@ -875,265 +624,6 @@ impl AgentServer {
 }
 
 impl AgentServerInner {
-    /// Drive one connection: handshake, then dispatch until disconnect.
-    async fn serve_connection(self: Arc<Self>, conn: Arc<dyn RpcConnection>) {
-        let rx = conn.client_rx();
-        // ── Handshake: the first message must be Initialize. ─────────────
-        let (client_id, generation) = match rx.recv().await {
-            Ok(FromClient::Request {
-                id,
-                call:
-                    ClientCall::Initialize(Initialize {
-                        client_id,
-                        capabilities,
-                        sessions,
-                        protocol_epoch,
-                    }),
-            }) => {
-                if client_id.is_empty() {
-                    conn.send_to_client(FromServer::Response {
-                        id,
-                        outcome: Err(RpcError::new(-1, "empty client_id")
-                            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
-                    });
-                    return;
-                }
-                // C1 (L12 epoch negotiation): 0 is the pre-epoch v1
-                // generation (the serde default of a missing field) and
-                // stays accepted through the dual-protocol window;
-                // PROTOCOL_EPOCH is the generation this server speaks. Any
-                // other value is a generation whose frames this server would
-                // misread — refuse at the handshake with the stable §D.7
-                // code instead of interpreting future frames as current ones.
-                if protocol_epoch != 0 && protocol_epoch != PROTOCOL_EPOCH {
-                    conn.send_to_client(FromServer::Response {
-                        id,
-                        outcome: Err(RpcError::new(
-                            -1,
-                            format!(
-                                "unsupported protocol epoch {protocol_epoch} \
-                                 (server speaks {PROTOCOL_EPOCH}; v1 clients omit the field)"
-                            ),
-                        )
-                        .with_code(manox_protocol::msg::CODE_PROTOCOL_UNSUPPORTED_EPOCH)),
-                    });
-                    return;
-                }
-                // Same client_id reconnect: the old entry is stale (the client
-                // dropped its previous in-process connection, but the server-side
-                // dispatch loop never noticed). Cancel any outstanding
-                // ServerCall waiters on the old peer, close the old channel so
-                // its serve_connection loop exits promptly, then re-seat the
-                // entry with a fresh generation.
-                let mut reseated = false;
-                if let Some(old) = self.clients.lock().get(&client_id) {
-                    // `client/reseated` is the waiter-side signal that the
-                    // settle obligation transfers to the §D.6 replay, not a
-                    // delivery failure: the waterfall abandons the old
-                    // recipient instead of fail-closing the adjudication.
-                    old.peer.cancel_all(
-                        RpcError::new(-1, "client reconnected")
-                            .with_code(manox_protocol::msg::CODE_CLIENT_RESEATED),
-                    );
-                    old.conn.disconnect();
-                    // §D.1: the replaced connection's streams die with it
-                    // (`Closed`). Safe here — the new connection cannot have
-                    // opened any stream yet (handshake is first).
-                    self.end_streams_for_client(&client_id);
-                    reseated = true;
-                }
-                // A re-seat that drops a session declaration is the owner
-                // abandoning that session's parked calls: retire them
-                // fail-closed here, because the replay below will never
-                // re-deliver to a session this hello does not declare.
-                // Outside the `clients` lock — the retirement routes notes
-                // through the client registry.
-                if reseated {
-                    self.abandon_unredeclared_adjudications(&client_id, &sessions);
-                }
-                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-                let hello = ClientHello {
-                    client_id: client_id.clone(),
-                    capabilities,
-                    sessions,
-                };
-                self.clients.lock().insert(
-                    client_id.clone(),
-                    ClientEntry {
-                        conn: conn.clone(),
-                        peer: RpcPeer::new(),
-                        hello: hello.clone(),
-                        generation,
-                    },
-                );
-                // GW10: a handshake REPLACES the ownership this client_id
-                // holds. `remove_client`'s generation guard intentionally
-                // skips a re-seated entry, so the old generation's owner
-                // rows would otherwise survive and the pre-fix bare `push`
-                // below duplicated them on every reconnect that re-declared
-                // sessions — duplicated `owner_conns` frames and duplicate
-                // `RpcPeer::register` of the same ServerCall MsgId (the GW2
-                // auto-deny chain). Clear first, then re-add through the
-                // deduping `add_owner`: the fresh hello's `sessions` list is
-                // the authoritative ownership set.
-                self.session_owners.lock().retain(|_, list| {
-                    list.retain(|c| c != &client_id);
-                    !list.is_empty()
-                });
-                for s in &hello.sessions {
-                    self.add_owner(s, &client_id);
-                }
-                // §D.6: a handshake is a join — re-deliver every unsettled
-                // adjudication of the declared sessions to this owner. The
-                // gateway's pending registry is the authoritative copy, so a
-                // parked card resurfaces on reconnect without the client
-                // having to have seen the original fan-out.
-                for s in &hello.sessions {
-                    self.replay_pending_adjudications(&client_id, s);
-                }
-                conn.send_to_client(FromServer::Response {
-                    id,
-                    outcome: Ok(json!({"ack": true})),
-                });
-                conn.send_to_client(FromServer::Notification {
-                    note: ServerNote::Ready,
-                });
-                // GW1 dual emit + C1 epoch echo: the §D.5 Host mirror of the
-                // handshake ack, directed to THIS connection (a handshake is
-                // per-connection, never a broadcast). `Ready{epoch}` echoes
-                // the epoch the connection operates under — PROTOCOL_EPOCH
-                // for both accepted generations (a v1 client does not read
-                // Host frames; the C4 close-out retires the note arm).
-                conn.send_to_client(FromServer::Host {
-                    host: HostEvent::Ready {
-                        epoch: PROTOCOL_EPOCH,
-                    },
-                });
-                (client_id, generation)
-            }
-            other => {
-                let id = match other {
-                    Ok(FromClient::Request { id, .. }) => id,
-                    _ => MsgId::new("init"),
-                };
-                conn.send_to_client(FromServer::Response {
-                    id,
-                    outcome: Err(RpcError::new(-1, "expected Initialize first")
-                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
-                });
-                return;
-            }
-        };
-
-        // ── Dispatch loop. ────────────────────────────────────────────────
-        while let Ok(msg) = rx.recv().await {
-            match msg {
-                FromClient::Request { id, call } => {
-                    // List-type calls also push a matching notification to
-                    // the requesting client — the VS Code TS client reads
-                    // results from notifications (push delivery), not from
-                    // Response bodies (request-response). Both are sent for
-                    // protocol completeness. GW1 dual emit: the §D.5
-                    // HostEvent mirror rides along, directed to the
-                    // requester exactly like the v1 note (same audience,
-                    // same snapshot value; the C4 close-out retires the note
-                    // arm). Note first, then the Host mirror, then the
-                    // Response: v1 consumers see their familiar prefix.
-                    let push_after = match &call {
-                        ClientCall::ListModels => Some(ListPush::Models),
-                        ClientCall::ListThreads => Some(ListPush::Threads),
-                        ClientCall::ListCommands => Some(ListPush::Commands),
-                        _ => None,
-                    };
-                    let outcome = handle_call(&self, &client_id, call).await;
-                    if let Some(push) = push_after {
-                        match push {
-                            ListPush::Models => {
-                                let models = self.models_snapshot();
-                                conn.send_to_client(FromServer::Notification {
-                                    note: ServerNote::Models {
-                                        models: models.clone(),
-                                    },
-                                });
-                                conn.send_to_client(FromServer::Host {
-                                    host: HostEvent::Models { models },
-                                });
-                            }
-                            ListPush::Threads => {
-                                let threads = self.threads_snapshot();
-                                conn.send_to_client(FromServer::Notification {
-                                    note: ServerNote::ThreadsUpdated {
-                                        threads: threads.clone(),
-                                    },
-                                });
-                                conn.send_to_client(FromServer::Host {
-                                    host: HostEvent::ThreadsUpdated { threads },
-                                });
-                                // U2 cross-domain #1: the known-projects
-                                // registry rides the list push (host-only —
-                                // a new surface, no v1 consumer for an
-                                // unsolicited registry push). The desktop's
-                                // store-event pump refetches ListThreads
-                                // after register_project, so the registry
-                                // snapshot stays in lockstep with the rows.
-                                let known = manox_agent::thread_store::try_global()
-                                    .map(|store| store.read(|s| s.known_projects().to_vec()))
-                                    .unwrap_or_default();
-                                conn.send_to_client(FromServer::Host {
-                                    host: HostEvent::Projects { known },
-                                });
-                            }
-                            ListPush::Commands => {
-                                let commands = self.commands_snapshot();
-                                conn.send_to_client(FromServer::Notification {
-                                    note: ServerNote::Commands {
-                                        commands: commands.clone(),
-                                    },
-                                });
-                                conn.send_to_client(FromServer::Host {
-                                    host: HostEvent::Commands { commands },
-                                });
-                            }
-                        }
-                    }
-                    conn.send_to_client(FromServer::Response { id, outcome });
-                }
-                FromClient::Notification { note } => {
-                    handle_note(&self, &client_id, note).await;
-                }
-                FromClient::Reply { id, outcome } => {
-                    let clients = self.clients.lock();
-                    if let Some(entry) = clients.get(&client_id) {
-                        entry.peer.complete(&id, outcome);
-                    }
-                }
-                FromClient::StreamOpen {
-                    stream_id,
-                    stream_kind,
-                } => {
-                    self.open_stream(&client_id, conn.clone(), stream_id, stream_kind)
-                        .await;
-                }
-                FromClient::StreamCancel { stream_id } => {
-                    let handle = self
-                        .streams
-                        .lock()
-                        .remove(&(client_id.clone(), stream_id.clone()));
-                    match handle {
-                        Some(handle) => handle.end(StreamEndReason::Cancelled),
-                        // Unknown / already-ended stream: nothing to cancel
-                        // (the terminal StreamEnd was already delivered).
-                        None => {
-                            tracing::debug!(stream = %stream_id.0, "stream cancel for unknown stream");
-                        }
-                    }
-                }
-            }
-        }
-        // Client disconnected: release ownerships; ownerless sessions drop.
-        self.remove_client(&client_id, generation);
-    }
-
     // ── Pure state accessors (no spawning). ─────────────────────────────────
     /// Resolve the bind redirect chain: the live map first, the sidecar
     /// `superseded_by` marker as the restart-surviving half (cached into
@@ -1159,137 +649,9 @@ impl AgentServerInner {
         id
     }
 
-    fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
+    pub(crate) fn session_thread(&self, session_id: &str) -> Option<ThreadHandle> {
         let id = self.resolve_redirect(session_id);
         self.sessions.lock().get(&id).map(|s| s.thread.clone())
-    }
-
-    // ── §D.1 stream services. ───────────────────────────────────────────────
-    async fn open_stream(
-        self: &Arc<Self>,
-        client_id: &str,
-        conn: Arc<dyn RpcConnection>,
-        stream_id: StreamId,
-        kind: StreamKind,
-    ) {
-        #[cfg(feature = "terminal")]
-        if let StreamKind::FollowTerminal { terminal_id } = kind {
-            self.open_terminal_stream(client_id, conn, stream_id, terminal_id);
-            return;
-        }
-        #[cfg(not(feature = "terminal"))]
-        if let StreamKind::FollowTerminal { .. } = kind {
-            // GW7: the declared-but-unbuilt arm answers the stable code so
-            // clients distinguish "not built into this host" from a failure.
-            conn.send_to_client(FromServer::StreamEnd {
-                stream_id,
-                reason: StreamEndReason::Failure {
-                    code: manox_protocol::msg::CODE_FEATURE_UNAVAILABLE.into(),
-                    message: "terminal support not built into this host".into(),
-                },
-            });
-            return;
-        }
-        let StreamKind::FollowSession {
-            session_id,
-            max_messages,
-        } = kind
-        else {
-            // FollowTerminal is handled above; no other kind exists.
-            return;
-        };
-        let thread = match self.session_thread(&session_id) {
-            Some(thread) => thread,
-            None => {
-                // Restart window: ONLY a real redirect auto-opens (the
-                // successor under its own id, this connection as owner) and
-                // aliases the stream onto it — a cold non-superseded id
-                // keeps the session/not-found semantics (review #805 r2
-                // [issue] B).
-                let effective = self.resolve_redirect(&session_id);
-                if effective != session_id && !self.sessions.lock().contains_key(&effective) {
-                    let _ = open_session(self, client_id, &effective).await;
-                }
-                let Some(thread) = self.session_thread(&session_id) else {
-                    // §D.7 `session/not-found` as a terminal failure frame.
-                    conn.send_to_client(FromServer::StreamEnd {
-                        stream_id,
-                        reason: StreamEndReason::Failure {
-                            code: manox_protocol::msg::CODE_SESSION_NOT_FOUND.into(),
-                            message: format!("unknown session {session_id}"),
-                        },
-                    });
-                    return;
-                };
-                thread
-            }
-        };
-        let handle = StreamHandle::new(
-            session_id.clone(),
-            tokio_util::sync::CancellationToken::new(),
-            Arc::new(StdMutex::new(None)),
-        );
-        let key = (client_id.to_string(), stream_id.clone());
-        self.track_stream(client_id, &stream_id, handle.clone());
-        let inner = Arc::clone(self);
-        let (k, h) = (key, handle.clone());
-        // The task's JoinHandle is owned by the runtime; the stream's own
-        // terminal StreamEnd + [`untrack_stream`] retire the registry entry.
-        let _task = follow::spawn_follow_stream(
-            conn,
-            stream_id,
-            session_id,
-            max_messages,
-            thread,
-            Arc::clone(&self.projections),
-            &handle,
-            move |_end| {
-                inner.untrack_stream(&k.0, &k.1, &h);
-            },
-        );
-    }
-
-    /// Deliver a note to one connected client (request-scoped traffic such
-    /// as bare-model stream deltas, which have no session ownership).
-    ///
-    /// The connection is cloned under the `clients` lock and the send runs
-    /// outside it: a bounded network carrier can block inside
-    /// `send_to_client`, and sending under the lock would stall every other
-    /// client's routing, reply dispatch, and call registration while one
-    /// peer is slow (same clone-then-send discipline as `route_note`).
-    fn note_to_client(&self, client_id: &str, note: manox_protocol::ServerNote) {
-        let conn = self
-            .clients
-            .lock()
-            .get(client_id)
-            .map(|entry| entry.conn.clone());
-        if let Some(conn) = conn {
-            conn.send_to_client(FromServer::Notification { note });
-        }
-    }
-
-    /// GW1 (§D.5 dual emit): deliver a Host event to ONE connected client —
-    /// the Host twin of [`Self::note_to_client`] for the directed host
-    /// events (handshake `Ready`, the owner-controlled
-    /// `SessionCreated`/`SessionDisposed`, requester-scoped list mirrors).
-    /// Same clone-then-send discipline (GW4): the connection is cloned under
-    /// the `clients` lock and the send runs outside it.
-    fn host_to_client(&self, client_id: &str, host: manox_protocol::stream::HostEvent) {
-        let conn = self
-            .clients
-            .lock()
-            .get(client_id)
-            .map(|entry| entry.conn.clone());
-        if let Some(conn) = conn {
-            conn.send_to_client(FromServer::Host { host });
-        }
-    }
-
-    fn next_call_id(&self) -> MsgId {
-        MsgId::new(format!(
-            "call-{}",
-            self.call_seq.fetch_add(1, Ordering::Relaxed)
-        ))
     }
 
     fn owners(&self, session_id: &str) -> Vec<String> {
@@ -1318,385 +680,40 @@ impl AgentServerInner {
         }
     }
 
-    fn remove_client(&self, client_id: &str, generation: u64) {
-        // Generation guard + removal under ONE lock hold (§二.4①). The old
-        // check-then-remove pair took the clients lock twice: a same-id
-        // reconnect landing in between installed a newer generation, and the
-        // unconditional remove then deleted the NEW entry. One hold closes
-        // the window — a stale generation never removes a fresher entry.
-        let removed = {
-            let mut clients = self.clients.lock();
-            match clients.get(client_id) {
-                Some(entry) if entry.generation == generation => clients.remove(client_id),
-                _ => None,
-            }
-        };
-        let Some(_entry) = removed else {
-            return;
-        };
-        // Disconnect clears this connection's live streams (§D.1 `Closed`;
-        // the sends into the closed connection are no-ops by then).
-        self.end_streams_for_client(client_id);
-        let mut owners = self.session_owners.lock();
-        let orphaned: Vec<String> = owners
-            .iter_mut()
-            .filter_map(|(sid, list)| {
-                list.retain(|c| c != client_id);
-                if list.is_empty() {
-                    Some(sid.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for sid in &orphaned {
-            owners.remove(sid);
-        }
-        drop(owners);
-        let mut sessions = self.sessions.lock();
-        let mut reaped: Vec<String> = Vec::new();
-        for sid in orphaned {
-            // Ownership lost ⇒ every live stream of the session closes
-            // (§D.1 `Closed`).
-            self.end_streams_for_session(&sid, StreamEndReason::Closed);
-            // GW2: an orphaned session's pump must not outlive the entry —
-            // stop it explicitly (removal alone only detached the task).
-            // Deferred reap (GW2 follow-up): an orphan whose turn is still
-            // in flight keeps its entry and pump until the TurnFinished arm
-            // settles it — stopping here would strand the store's `running`
-            // flag and swallow the settle-time SessionStatus edges.
-            let running = sessions
-                .get(&sid)
-                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-            if !running && let Some(session) = sessions.remove(&sid) {
-                session.stop_pump();
-                // Registrations die with the entry on every removal path
-                // (review #809 [sugg] 4).
-                self.clear_embedder_tools(&sid);
-                reaped.push(sid);
-            }
-        }
-        drop(sessions);
-        for sid in reaped {
-            // The session-shared projection cell reaps with the session on
-            // every removal path (review #805 r2 [sugg] D: disconnect is
-            // the most common one).
-            self.projections.drop_session(&sid);
-            // §0: the spawned waterfall outlives the pump alone — the
-            // orphan's deliveries must converge fail-closed now.
-            self.cancel_deliveries_for_session(&sid);
-        }
-    }
+    // ── Catalogue push. ────────────────────────────────────────────────────
+    //
+    // The AHP host owns the root channel's catalogue, so a change to it is
+    // published through the host rather than pushed down a socket. These two
+    // hooks are the only reactions left to a store or provider change: the
+    // gateway keeps no per-connection fan-out, and a client that misses a
+    // notification re-lists.
+    //
+    // Both are no-ops when no AHP host is up (a headless embedder, or a test
+    // that drives only the runtime intents), so the intents stay usable
+    // without a protocol face.
 
-    fn owner_conns(&self, session_id: &str) -> Vec<Arc<dyn RpcConnection>> {
-        let owners = self.owners(session_id);
-        if owners.is_empty() {
-            return Vec::new();
-        }
-        let clients = self.clients.lock();
-        owners
-            .iter()
-            .filter_map(|cid| clients.get(cid).map(|e| e.conn.clone()))
-            .collect()
-    }
-
-    // ── §D.6 adjudication replay. ──────────────────────────────────────────
-    fn register_pending_adjudication(&self, session_id: &str, rec: PendingAdjudication) {
-        self.pending_adjudications
-            .lock()
-            .entry(session_id.to_string())
-            .or_default()
-            .push(rec);
-    }
-
-    /// A settled adjudication leaves the replay registry: no owner joining
-    /// afterwards is ever re-delivered it. Keys only ever collide within one
-    /// session's list (`auth_id` is globally unique; a session parks at most
-    /// one plan review at a time, so `plan_file` is its session-local key).
-    fn retire_pending_adjudication(&self, session_id: &str, key: &str) {
-        let mut pending = self.pending_adjudications.lock();
-        if let Some(list) = pending.get_mut(session_id) {
-            list.retain(|rec| rec.key != key);
-            if list.is_empty() {
-                pending.remove(session_id);
-            }
-        }
-    }
-
-    /// §D.6: re-deliver every unsettled adjudication of `session_id` to an
-    /// owner that just joined it (the gateway's authoritative pending copy).
-    /// A new waiter mints for owners that never received the fan-out; an
-    /// owner already holding a live waiter gets the same deterministic
-    /// `MsgId` frame re-sent WITHOUT re-registering (GW2 would refuse the
-    /// duplicate, and its reply still flows through the open waiter) — that
-    /// is the thread-switch-back path: the client lost its local card state,
-    /// the gate never did. The engine's pending set is the settle truth for
-    /// Approve/AskUser; the first delivery to settle answers wins
-    /// (`gate.respond` ignores late duplicates). Synchronous registration +
-    /// `send_to_client` only — the reply wait is a spawned task, so this is
-    /// safe to call from the dispatch loop.
-    fn replay_pending_adjudications(self: &Arc<Self>, client_id: &str, session_id: &str) {
-        let recs: Vec<PendingAdjudication> = self
-            .pending_adjudications
-            .lock()
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default();
-        if recs.is_empty() {
-            return;
-        }
-        // Both seams park here: an approval card on the approval gate, an
-        // interactive ask on the question gate. The replay's settle truth is
-        // the union — reading only one gate would retire a live ask as
-        // "already settled" and never re-deliver its card.
-        let live_auth_ids: std::collections::HashSet<String> = self
-            .session_thread(session_id)
-            .map(|t| {
-                t.read(|t| {
-                    t.pending_auth_entries()
-                        .into_iter()
-                        .chain(t.pending_question_entries())
-                        .map(|(id, _)| id)
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
-        let (conn, peer, hello, generation) = {
-            let clients = self.clients.lock();
-            let Some(entry) = clients.get(client_id) else {
-                return;
-            };
-            (
-                entry.conn.clone(),
-                entry.peer.clone(),
-                entry.hello.clone(),
-                entry.generation,
-            )
-        };
-        for rec in recs {
-            if !hello.can(rec.kind) {
-                continue;
-            }
-            // The settle check and the `register`/`add_adjudication_target`
-            // below are separate lock acquisitions: a settle landing in that
-            // window retires the record while this replay still delivers a
-            // frame. Benign by construction — the retired record's gate
-            // already settled first-wins, so the fresh waiter's reply
-            // double-applies into the same idempotent gate, and the next
-            // join re-checks and finds the record gone.
-            // PR-5a (C4): the ctx test excludes the plan-review ask — a
-            // pump-initiated review is not a gate interaction (the engine's
-            // pending-auth set can never contain it); its truth is the
-            // kernel's pending-review flag.
-            let gate_settled =
-                matches!(rec.kind, AnswerKind::Approve | AnswerKind::AskUserQuestion)
-                    && matches!(rec.ctx, ReplyCtx::Approve { .. } | ReplyCtx::AskUser { .. })
-                    && !live_auth_ids.contains(&rec.key);
-            if gate_settled {
-                self.retire_pending_adjudication(session_id, &rec.key);
-                continue;
-            }
-            let id = MsgId::new(rec.key.clone());
-            if rec
-                .targets
-                .iter()
-                .any(|(cid, target_gen)| cid == client_id && *target_gen == generation)
-                && peer.has_waiter(&id)
-            {
-                // The owner's CURRENT connection still carries the live
-                // waiter: re-send the frame only (GW2 forbids a duplicate
-                // register; the reply flows through the open waiter).
-                conn.send_to_client(FromServer::Request {
-                    id,
-                    call: rec.call.clone(),
-                });
-                continue;
-            }
-            // A target whose waiter died with a re-seated connection must
-            // re-mint here: the entry's peer is a fresh instance, so without
-            // this the client's eventual reply would resolve nothing and the
-            // call would strand until timeout.
-            let Some(rx) = peer.register(id.clone()) else {
-                continue;
-            };
-            self.add_adjudication_target(session_id, &rec.key, client_id, generation);
-            conn.send_to_client(FromServer::Request {
-                id,
-                call: rec.call.clone(),
-            });
-            // Not registered under the delivery's GW3 cancel tokens: the
-            // settling waterfall's `DeliveryGuard` cancels the whole
-            // delivery id, which would mis-kill this owner's fresh waiter.
-            // PR-0a: a replayed adjudication is the SAME human-facing card a
-            // newly-joined owner is re-delivered, so it awaits their answer
-            // with no wall-clock deadline too. A delivery superseded elsewhere
-            // is absorbed by the engine gate's first-wins idempotence when this
-            // waiter finally resolves (on the owner's reply or their connection
-            // closing); the pending record is retired on the next settle.
-            let inner = Arc::clone(self);
-            let sid = session_id.to_string();
-            manox_agent::runtime::handle().spawn(async move {
-                let outcome = match rx.recv().await {
-                    Ok(o) => o,
-                    _ => Err(RpcError::new(-1, "replayed adjudication delivery closed")
-                        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-                };
-                apply_reply(&inner, &sid, rec.ctx, outcome);
-            });
-        }
-    }
-
-    /// §D.6: an owner that re-seats WITHOUT re-declaring a session has
-    /// abandoned that session's parked calls — no future replay reaches it,
-    /// so a record whose targets empty out retires and fail-closes now.
-    /// (A record with other targets just loses this recipient from the
-    /// authoritative pending copy; their waterfalls learn of the hand-off
-    /// through the `client/reseated` funnel event.)
-    fn abandon_unredeclared_adjudications(self: &Arc<Self>, client_id: &str, declared: &[String]) {
-        let drained: Vec<(String, PendingAdjudication)> = {
-            let mut pending = self.pending_adjudications.lock();
-            let mut drained = Vec::new();
-            for (session_id, list) in pending.iter_mut() {
-                if declared.iter().any(|s| s == session_id) {
-                    continue;
-                }
-                let mut keep = Vec::new();
-                for mut rec in list.drain(..) {
-                    rec.targets.retain(|(cid, _)| cid != client_id);
-                    if rec.targets.is_empty() {
-                        drained.push((session_id.clone(), rec));
-                    } else {
-                        keep.push(rec);
-                    }
-                }
-                *list = keep;
-            }
-            pending.retain(|_, list| !list.is_empty());
-            drained
-        };
-        for (session_id, rec) in drained {
-            self.note_error(
-                &session_id,
-                "adjudication abandoned: owner re-seated without re-declaring the session",
-            );
-            apply_reply(
-                self,
-                &session_id,
-                rec.ctx,
-                Err(RpcError::new(
-                    -1,
-                    "adjudication abandoned: the answering owner re-seated without the session",
-                )
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-            );
-        }
-    }
-
-    fn add_adjudication_target(
-        &self,
-        session_id: &str,
-        key: &str,
-        client_id: &str,
-        generation: u64,
-    ) {
-        if let Some(list) = self.pending_adjudications.lock().get_mut(session_id)
-            && let Some(rec) = list.iter_mut().find(|rec| rec.key == key)
-        {
-            // One row per owner: a re-mint on a newer connection replaces the
-            // owner's stale-generation row rather than stacking duplicates.
-            rec.targets.retain(|(cid, _)| cid != client_id);
-            rec.targets.push((client_id.to_string(), generation));
-        }
-    }
-
-    // ── Note routing. ──────────────────────────────────────────────────────
-    /// §D.5: broadcast a host event to EVERY connected client (global,
-    /// change-driven — not owner-scoped like `route_note`).
-    /// §D.5 as-built (U2 cross-domain #2): the provider-reload broadcast —
-    /// Host frame only, to every connection. An unsolicited Models push has
-    /// no v1 note consumer (both migrated clients fold HostEvent::Models);
-    /// the ListModels RESPONSE side keeps its GW1 dual-emit.
+    /// Republish the agent catalogue after a provider reload.
     fn broadcast_models_after_reload(&self) {
-        let models = self.models_snapshot();
-        self.broadcast_host(HostEvent::Models { models });
+        let Some(runtime) = manox_ahp_runtime::ahp::runtime::try_runtime() else {
+            return;
+        };
+        let agents = runtime.host().backend().root_state().agents;
+        if agents.is_empty() {
+            return;
+        }
+        publish_root_agents(&runtime.host(), agents);
     }
 
-    /// U6a: the list-refresh broadcast on a store change — the same frame
-    /// shape as the `ListPush::Threads` arm (the v1 note first, then the
-    /// Host mirror, then the host-only `Projects` registry — GW1 dual emit
-    /// to the global list audience), sent to EVERY connection (the list is
-    /// a global registry channel, not owner-scoped).
+    /// Announce that the session catalogue moved (a session appeared, was
+    /// renamed, pinned, reordered or archived).
+    ///
+    /// The adapter owns the delta vocabulary, so the gateway only raises the
+    /// event; see `SessionRuntime::catalogue_changed`.
     fn broadcast_threads_after_store_change(&self) {
-        let threads = self.threads_snapshot();
-        let known = manox_agent::thread_store::try_global()
-            .map(|store| store.read(|s| s.known_projects().to_vec()))
-            .unwrap_or_default();
-        // Clone the connection list under the lock, then send outside it
-        // (the broadcast_host discipline: a stalled peer must not freeze
-        // the shared `clients` lock).
-        let conns: Vec<Arc<dyn RpcConnection>> = self
-            .clients
-            .lock()
-            .values()
-            .map(|entry| entry.conn.clone())
-            .collect();
-        for conn in conns {
-            conn.send_to_client(FromServer::Notification {
-                note: ServerNote::ThreadsUpdated {
-                    threads: threads.clone(),
-                },
-            });
-            conn.send_to_client(FromServer::Host {
-                host: HostEvent::ThreadsUpdated {
-                    threads: threads.clone(),
-                },
-            });
-            conn.send_to_client(FromServer::Host {
-                host: HostEvent::Projects {
-                    known: known.clone(),
-                },
-            });
-        }
-    }
-
-    fn broadcast_host(&self, host: manox_protocol::stream::HostEvent) {
-        let frame = FromServer::Host { host };
-        // Clone the connection list under the lock, then send outside it: a
-        // stalled client on a bounded carrier must not freeze the gateway's
-        // shared `clients` lock for every other path (pumps, reply dispatch,
-        // call registration). Per-client non-blocking delivery is the
-        // transport-policy question (§D.7); this keeps the blast radius of a
-        // slow peer to the broadcasting task alone.
-        let conns: Vec<Arc<dyn RpcConnection>> = self
-            .clients
-            .lock()
-            .values()
-            .map(|entry| entry.conn.clone())
-            .collect();
-        for conn in conns {
-            conn.send_to_client(frame.clone());
-        }
-    }
-
-    fn route_note(&self, session_id: &str, note: ServerNote) {
-        let conns = self.owner_conns(session_id);
-        if conns.is_empty() {
-            tracing::trace!(session_id, "dropping note for ownerless session");
-        }
-        for conn in conns {
-            conn.send_to_client(FromServer::Notification { note: note.clone() });
-        }
-    }
-
-    /// GW1 (§D.5 dual emit): route a Host event to a session's owner set —
-    /// the Host twin of [`Self::route_note`] (same audience, same
-    /// clone-conns-then-send-outside-the-lock discipline; `owner_conns`
-    /// already clones under the locks and returns).
-    fn route_host(&self, session_id: &str, host: manox_protocol::stream::HostEvent) {
-        let conns = self.owner_conns(session_id);
-        for conn in conns {
-            conn.send_to_client(FromServer::Host { host: host.clone() });
-        }
+        let Some(runtime) = manox_ahp_runtime::ahp::runtime::try_runtime() else {
+            return;
+        };
+        runtime.server().catalogue_changed();
     }
 
     /// Drop one session's embedder tool registrations. Called wherever the
@@ -1706,430 +723,46 @@ impl AgentServerInner {
         self.embedder_tools.lock().remove(session_id);
     }
 
-    fn note_error(&self, session_id: &str, message: &str) {
-        // GW1 dual emit: the §D.5 `HostEvent::Error` mirror rides to the
-        // SAME owner audience as the v1 note (a session-scoped error is not
-        // broadcast to non-owners). C4a: the host frame carries the session
-        // scope itself — the desktop leaf normalization (the authority face
-        // after C4a) filters on it.
-        self.route_note(
-            session_id,
-            ServerNote::Error {
-                session_id: Some(session_id.into()),
-                message: message.into(),
-            },
-        );
-        self.route_host(
-            session_id,
-            HostEvent::Error {
-                message: message.into(),
-                session_id: Some(session_id.into()),
-            },
-        );
-    }
-
-    // ── Snapshots (queries). ────────────────────────────────────────────────
-    //
-    // T10 (§D.6): the v1 `ThreadHistory`/`ThreadInfo` snapshot emitters are
-    // gone. History replays through the §D.1 follow stream's opening
-    // `Snapshot` frame; thread meta-info rides the projection baseline +
-    // P-face deltas (§E); `has_interacted` is a projection key.
-    fn threads_snapshot(&self) -> Vec<ThreadListItem> {
-        // Teardown-tolerant (cross-domain #5 side): the self-held rescan
-        // delayed list answers enough that a straggler dispatch task can
-        // outlive its test's store guard — a strict global() there panics
-        // a foreign worker thread and trips the gpui test scheduler of an
-        // UNRELATED test. Production initializes the store for the process
-        // lifetime; None answers an empty list.
-        let Some(store) = manox_agent::thread_store::try_global() else {
-            return Vec::new();
-        };
-        store.read(|s| {
-            s.summaries()
-                .iter()
-                // Superseded predecessors never lead a sidebar partition:
-                // the successor row is the conversation's identity now
-                // (review #805 [issue] 3-i).
-                .filter(|t| t.superseded_by.is_none())
-                .map(|t| ThreadListItem {
-                    id: t.id.clone(),
-                    title: t.display_title().to_string(),
-                    // U2-cross-domain #3: the wire column is documented as
-                    // the LAST INTERACTION — interacted_at advances on real
-                    // activity only, while updated_at advances on every
-                    // metadata save and would float stale threads in the
-                    // clients' recency ordering.
-                    updated_at: t.interacted_at as i32,
-                    running: s.is_running(&t.id),
-                    // GW5: unread is client-owned — the server keeps no
-                    // focus mirror, so the deprecated list field is always
-                    // false (clients derive unread from the
-                    // `SessionStatus.unread` settle deltas and clear it
-                    // locally on focus). C4 removes the field.
-                    unread: false,
-                    errored: t.errored,
-                    pending_auth: s.pending_auth_contains(&t.id),
-                    pending_plan: s.pending_plan_contains(&t.id),
-                    background_work: s.background_work_contains(&t.id),
-                    model_id: t.model_id.clone(),
-                    pinned: t.pinned,
-                    archived: t.archived,
-                    parent_id: t.parent_id.clone(),
-                    depth: t.depth,
-                    // U2 cross-domain #1: the grouping / label / approval
-                    // columns ride the wire row (the sidebar's decoration
-                    // push retires against them).
-                    project: (!t.project.is_empty()).then(|| t.project.clone()),
-                    tag: t.tag.clone(),
-                    approval_mode: Some(t.approval_mode),
-                })
-                .collect()
-        })
-    }
-
-    fn models_snapshot(&self) -> Vec<ModelInfo> {
-        deduped_models(manox_agent::provider_glue::global().models())
-            .iter()
-            .map(model_to_wire)
-            .collect()
-    }
-
-    fn commands_snapshot(&self) -> Value {
-        let mut commands = Vec::new();
-        for meta in manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
-            commands.push(json!({
-                "name": meta.name,
-                "description": meta.description,
-                "kind": "command",
-                "argument_hint": null,
-            }));
-        }
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
-            manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS
-                .iter()
-                .map(|m| m.name.to_string()),
-        );
-        if let Some(registry) = manox_agent::command::try_global() {
-            for (key, def) in registry.entries() {
-                if seen.contains(key.as_str()) {
-                    continue;
-                }
-                seen.insert(key.clone());
-                commands.push(json!({
-                    "name": key,
-                    "description": def.description,
-                    "kind": "command",
-                    "argument_hint": def.argument_hint,
-                }));
-            }
-        }
-        if let Some(registry) = manox_agent::skill::try_global() {
-            for (key, def) in registry.entries() {
-                if seen.contains(key.as_str()) {
-                    continue;
-                }
-                seen.insert(key.clone());
-                commands.push(json!({
-                    "name": key,
-                    "description": def.description,
-                    "kind": "skill",
-                    "argument_hint": null,
-                }));
-            }
-        }
-        json!(commands)
+    /// Full-replacement write of one client's embedder tool set for a session.
+    ///
+    /// The AHP face (`session/activeClientSet`) lands here, exactly like the v2
+    /// `RegisterSessionTools` call: both are the same registration fact, and
+    /// the engine consults this one store when it assembles a session's tools.
+    pub(crate) fn set_embedder_tools(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        tools: Vec<ClientToolSpec>,
+    ) {
+        self.embedder_tools
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(client_id.to_string(), tools);
     }
 }
 
-/// Which notification to push after a list-type ClientCall succeeds.
-#[derive(Debug, Clone, Copy)]
-enum ListPush {
-    Models,
-    Threads,
-    Commands,
-}
-
-// ── ClientCall dispatch (free fn — borrowed inner, no move per call). ────────
-async fn handle_call(
-    inner: &Arc<AgentServerInner>,
-    client_id: &str,
-    call: ClientCall,
-) -> Result<Value, RpcError> {
-    match call {
-        ClientCall::Initialize(_) => Err(RpcError::new(-1, "already initialized")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)),
-        // ── v2 write calls (§D.2: receipts only, L7). ───────────────────────
-        ClientCall::CreateSession {
-            cwd,
-            project,
-            initial_model,
-            approval_mode,
-            reasoning_effort,
-            seed,
-            working_directories,
-        } => {
-            let created = AgentServerInner::create_session_request(
-                inner,
-                client_id,
-                SessionIntent {
-                    session_id: None,
-                    cwd,
-                    project: project.clone(),
-                    initial_model,
-                    approval_mode,
-                    reasoning_effort,
-                    seed,
-                    working_directories,
-                },
-            )
-            .await;
-            // dsh "prepend at attach": a session born under a registered
-            // directory joins that workspace's account; unregistered
-            // directories stay loose.
-            if let (Ok(value), Some(project)) = (&created, &project)
-                && let Some(id) = value.get("session_id").and_then(|v| v.as_str())
-            {
-                crate::workspace_serve::attach_if_member(project, id);
-            }
-            created
-        }
-        ClientCall::Workspace { call } => crate::workspace_serve::call(call).await,
-        ClientCall::Submit {
-            session_id,
-            text,
-            images,
-            origin_rpc,
-        } => {
-            inner
-                .submit(client_id, &session_id, text, images, None, origin_rpc)
-                .await
-        }
-        ClientCall::Steer {
-            session_id,
-            message_id,
-            text,
-            images,
-            origin_rpc,
-        } => inner.steer(&session_id, message_id, text, images, origin_rpc),
-        // ── v2 journal read calls (§D.2 PageHistory, §E.3 Q face). ─────────
-        ClientCall::PageHistory {
-            session_id,
-            through_seq,
-            before_seq,
-            max_messages,
-        } => {
-            // §D.2: the cold read does not materialize the engine; the jsonl is
-            // read directly (GW6). The live engine
-            // seam answers when it is materialized; otherwise the persisted
-            // journal is read straight off disk — a cold session must never
-            // answer "journal engine is not materialized" (pre-fix the
-            // client's gap-repair and backwards paging both dead-ended on
-            // it). A live session with neither an answering engine nor a
-            // persisted file (a fresh deferred thread) has an EMPTY journal,
-            // not a missing one; a session that is neither live nor
-            // persisted stays `session/not-found`.
-            let thread = inner.session_thread(&session_id);
-            let snapshot = match &thread {
-                Some(t) => t.journal_snapshot().await,
-                None => None,
-            };
-            let snapshot = match snapshot {
-                Some(data) => data,
-                None => match journal_query::cold_read(&session_id).await {
-                    journal_query::ColdRead::Data(data) => data,
-                    // A live session with no file yet has an EMPTY journal,
-                    // not a missing one (unchanged semantics).
-                    journal_query::ColdRead::NotFound if thread.is_some() => {
-                        manox_agent::engine::JournalSnapshotData {
-                            cursor: 0,
-                            records: Vec::new(),
-                        }
-                    }
-                    journal_query::ColdRead::NotFound => {
-                        return Err(RpcError::new(-1, "unknown session")
-                            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
-                    }
-                    // §二.6: a corrupt journal is a loud error, never an
-                    // empty page — the old `.ok()?` collapse contradicted
-                    // the journal_query contract.
-                    journal_query::ColdRead::Corrupt(err) => {
-                        return Err(RpcError::new(-1, format!("journal corrupt: {err}"))
-                            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
-                    }
-                },
-            };
-            journal_query::page_history(snapshot, through_seq, before_seq, max_messages)
-        }
-        // GW3 (§D.4): withdraw a pending adjudication delivery — the server
-        // converges it through the existing expire path (fail-closed), never
-        // waiting out the 300s call timeout for a client that navigated away.
-        ClientCall::CancelDelivery { delivery_id } => Ok(json!({
-            "cancelled": inner.cancel_delivery(client_id, &delivery_id),
-        })),
-        ClientCall::GetConversationInfo { session_id } => {
-            let thread = inner.session_thread(&session_id).ok_or_else(|| {
-                RpcError::new(-1, "unknown session")
-                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
-            })?;
-            journal_query::conversation_info(&inner.conversation_info_cache, &thread, &session_id)
-                .await
-        }
-        ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
-        ClientCall::ForkSession {
-            source_session_id,
-            through_entry_id,
-            cwd,
-            project,
-            initial_model,
-            approval_mode,
-            reasoning_effort,
-        } => {
-            fork_session(
-                inner,
-                client_id,
-                ForkIntent {
-                    source_session_id,
-                    through_entry_id,
-                    cwd,
-                    project,
-                    initial_model,
-                    approval_mode,
-                    reasoning_effort,
-                },
-            )
-            .await
-        }
-        ClientCall::RegisterSessionTools {
-            session_id,
-            client_id,
-            tools,
-        } => {
-            // Full replacement per client. An unknown session still
-            // registers — the registration is store-side state the engine
-            // consults at tool assembly AND again before every prompt
-            // turn (`manox_agent::engine::refresh_embedder_tools`), so a
-            // registration landing after the session's engine spawned
-            // still reaches that session's tool table (the host learns
-            // the session id only by creating it, so "register before
-            // assembly" is not the real-world order).
-            let count = tools.len();
-            inner
-                .embedder_tools
-                .lock()
-                .entry(session_id)
-                .or_default()
-                .insert(client_id, tools);
-            Ok(json!({ "registered": count }))
-        }
-        ClientCall::ListThreads => {
-            // Freshness without the self-hold: answer from the current
-            // snapshot immediately — the answer has no `.await` gap, so the
-            // gpui test scheduler's same-poll timing profile is preserved —
-            // then kick the fingerprinted reconcile in the background. The
-            // store watcher broadcasts ThreadsUpdated when the scan lands,
-            // so a cold file surfaces one broadcast later instead of every
-            // caller blocking behind a directory scan (the pre-reconcile
-            // self-hold parked the desktop's first frame on a full parse of
-            // every session).
-            if !manox_agent::thread_store::test_override_active()
-                && let Some(store) = manox_agent::thread_store::try_global()
-            {
-                store.refresh();
-            }
-            serde_json::to_value(inner.threads_snapshot()).map_err(|_| {
-                RpcError::new(-1, "threads serialization failed")
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
-            })
-        }
-        ClientCall::ListModels => serde_json::to_value(inner.models_snapshot()).map_err(|_| {
-            RpcError::new(-1, "models serialization failed")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
-        }),
-        ClientCall::ListCommands => Ok(inner.commands_snapshot()),
-        // GW7: an explicit stable code, not a bare -1 — clients that
-        // declared terminal support must be able to distinguish "feature
-        // not built yet" from a generic failure (§D.7 code set, ratified
-        // with the msg.rs constant + spec revision).
-        #[cfg(feature = "terminal")]
-        ClientCall::TerminalAttach {
-            session,
-            cols,
-            rows,
-            terminal_id,
-        } => inner.attach_terminal(&session, cols, rows, terminal_id),
-        #[cfg(not(feature = "terminal"))]
-        ClientCall::TerminalAttach { .. } => Err(unavailable("terminal")),
-        #[cfg(feature = "terminal")]
-        ClientCall::TerminalSnapshot { terminal } => {
-            inner.terminal_snapshot(&terminal).ok_or_else(|| {
-                RpcError::new(-1, format!("unknown terminal {terminal}"))
-                    .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
-            })
-        }
-        #[cfg(not(feature = "terminal"))]
-        ClientCall::TerminalSnapshot { .. } => Err(unavailable("terminal")),
-        ClientCall::ModelChat {
-            request_id,
-            model,
-            messages,
-            tools,
-        } => {
-            // Bare-model completion (the VS Code LanguageModelChat provider):
-            // stream deltas back to the CALLING client as request-scoped
-            // notes. Ported from the retired actor command engine.
-            let registry = manox_agent::provider_glue::global();
-            let done = |stop: Option<&str>, error: Option<String>| {
-                inner.note_to_client(
-                    client_id,
-                    manox_protocol::ServerNote::ModelChatDone {
-                        request_id: request_id.clone(),
-                        stop: stop.map(str::to_string),
-                        error,
-                    },
-                );
-            };
-            let Some(resolved) = manox_harness::model_ref::resolve_model_ref(&registry, &model)
-            else {
-                done(None, Some("unknown model".into()));
-                return Ok(json!({}));
-            };
-            match registry.resolve_stream(&resolved) {
-                Ok(stream) => {
-                    let ctx = crate::model_chat::build_context(&resolved, &messages, &tools);
-                    let sink = {
-                        let inner = Arc::clone(inner);
-                        let owner = client_id.to_string();
-                        Arc::new(move |note| inner.note_to_client(&owner, note))
-                    };
-                    crate::model_chat::start(
-                        request_id,
-                        stream,
-                        ctx,
-                        sink,
-                        Arc::clone(&inner.model_chats),
-                    );
-                }
-                Err(err) => done(None, Some(err.to_string())),
-            }
-            Ok(json!({}))
-        }
-    }
-}
-
+/// Open (or re-own) a live session: load its journal, insert the entry, and
+/// make `owner` an owner of it.
+///
+/// Idempotent in both directions — an already-live session is re-owned without
+/// any IO, and two racing opens of a cold id converge on one entry (the loser
+/// adopts the winner's `ThreadHandle` through the store's weak upgrade, so
+/// nothing is loaded twice).
 async fn open_session(
     inner: &Arc<AgentServerInner>,
     owner: &str,
     session_id: &str,
-) -> Result<Value, RpcError> {
+) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
     // Phase 1 (fast path): a live session is re-owned without any IO.
     if inner.sessions.lock().contains_key(session_id) {
-        return reown_existing(inner, owner, session_id);
+        inner.add_owner(session_id, owner);
+        return Ok(());
     }
     // Phase 2 (U8): the journal-file IO runs OUTSIDE the `sessions` lock —
-    // a slow disk must not stall the whole gateway table (pre-fix this ran
-    // under the single hold, recorded as known debt in the GW2 batch).
-    // Concurrent racers load the SAME `ThreadHandle` (the store's weak
-    // upgrade), and only phase 3 decides who inserts.
+    // a slow disk must not stall the whole gateway table. Concurrent racers
+    // load the SAME `ThreadHandle` (the store's weak upgrade), and only phase
+    // 3 decides who inserts.
     let thread = manox_agent::thread_store::global()
         .with_mut(|s| s.load_thread(session_id))
         .map_err(|error| {
@@ -2137,67 +770,73 @@ async fn open_session(
             // the per-session write lease. Fail fast — the client surfaces
             // the stable code and can retry after the holder exits.
             tracing::warn!(session_id, %error, "session open blocked by a foreign write lease");
-            RpcError::new(-1, error.to_string())
-                .with_code(manox_protocol::msg::CODE_SESSION_ALREADY_OWNED)
+            manox_ahp_runtime::error::RuntimeError::new(error.to_string())
+                .with_code(manox_ahp_runtime::error::codes::SESSION_ALREADY_OWNED)
         })?
-        .ok_or_else(|| {
-            RpcError::new(-1, "thread not found")
-                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND)
-        })?;
-    // Phase 3: recheck–spawn–insert under ONE lock hold. The pump is
-    // spawned HERE, not in phase 2, so a race still yields exactly one
-    // entry and one pump: the loser finds the winner's entry and re-owns
-    // it, discarding its own load (the same handle via the weak upgrade —
-    // nothing leaks). GW2's structural invariant and GW6's resume
-    // singleflight both ride this hold.
+        .ok_or_else(|| unknown_session(session_id))?;
+    // Phase 3: recheck–insert under ONE lock hold. The loser finds the
+    // winner's entry and re-owns it, discarding its own load (the same handle
+    // via the weak upgrade — nothing leaks).
     {
         let mut sessions = inner.sessions.lock();
-        if sessions.contains_key(session_id) {
-            drop(sessions);
-            return reown_existing(inner, owner, session_id);
+        if !sessions.contains_key(session_id) {
+            let turn_active = Arc::new(AtomicBool::new(false));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
+            let settle_cancel = tokio_util::sync::CancellationToken::new();
+            // The watcher's handle is deliberately dropped: the entry owns the
+            // cancellation token, so the task ends when the entry does, and a
+            // parked handle would only be a second way to reach the same
+            // guarantee.
+            let _watcher = spawn_settle_watcher(
+                session_id.to_string(),
+                thread.clone(),
+                Arc::clone(&pending_submits),
+                Arc::clone(&turn_active),
+                settle_cancel.clone(),
+            );
+            sessions.insert(
+                session_id.to_string(),
+                ServerSession {
+                    thread: thread.clone(),
+                    turn_active,
+                    pending_submits,
+                    settle_cancel,
+                },
+            );
         }
-        // GW5: the open-time `set_unread(session_id, false)` store mirror
-        // write is gone — unread is client-owned (clients clear their
-        // badge locally on focus); the server keeps no read-state.
-        let turn_active = Arc::new(AtomicBool::new(false));
-        let pending_submits = Arc::new(Mutex::new(Vec::new()));
-        let pump_cancel = tokio_util::sync::CancellationToken::new();
-        let pump = spawn_pump(
-            Arc::clone(inner),
-            session_id.into(),
-            thread.clone(),
-            turn_active.clone(),
-            pending_submits.clone(),
-            pump_cancel.clone(),
-        );
-        sessions.insert(
-            session_id.into(),
-            ServerSession {
-                thread: thread.clone(),
-                pump_cancel,
-                pump,
-                turn_active,
-                pending_submits,
-            },
-        );
-        drop(sessions);
-        inner.add_owner(session_id, owner);
-        inner.route_note(
-            session_id,
-            ServerNote::SessionCreated {
-                session_id: session_id.into(),
-            },
-        );
-        // GW1 dual emit: the Host mirror to the owner set (after
-        // `add_owner` so the opening client is in the audience).
-        inner.route_host(session_id, session_created_event(session_id, &thread));
-        Ok(json!({ "restored": true }))
     }
+    inner.add_owner(session_id, owner);
+    Ok(())
 }
 
-/// `ClientCall::ForkSession` (dspo/manox-app#9): create a new session whose
-/// journal is the source's active chain up to (and including)
-/// `through_entry_id`.
+/// No such live session.
+///
+/// Shared by the runtime intents that refuse with `session/notFound`, so the
+/// code a client matches on does not depend on which intent refused.
+fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
+    manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
+        .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
+}
+
+/// No registered model answers to this id.
+fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
+    manox_ahp_runtime::error::RuntimeError::new(format!("unknown model: {id}"))
+        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+}
+
+/// Publish a fresh agent catalogue to the root channel's subscribers.
+fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state::AgentInfo>) {
+    host.publish(
+        ahp_types::common::ROOT_RESOURCE_URI,
+        ahp_types::actions::StateAction::RootAgentsChanged(
+            ahp_types::actions::RootAgentsChangedAction { agents },
+        ),
+        None,
+    );
+}
+
+/// Fork a session: create a new one whose journal is the source's active
+/// chain up to (and including) `through_entry_id`.
 ///
 /// The fork is a prefix copy, not a cross-file redirect — `Leaf` targets are
 /// file-local and the load-time chain validator rejects foreign parents — so
@@ -2223,24 +862,17 @@ async fn open_session(
 /// batched append (one lock hold, one validation pass, ONE file write):
 /// O(chain) total — a whole-prefix validation failure rejects the fork
 /// before any row touches disk.
-struct ForkIntent {
-    source_session_id: String,
-    through_entry_id: String,
-    cwd: Option<String>,
-    project: Option<String>,
-    initial_model: Option<manox_protocol::journal::ModelRef>,
-    approval_mode: Option<String>,
-    reasoning_effort: Option<String>,
-}
+pub(crate) use manox_ahp_runtime::runtime_trait::ForkIntent;
 
-async fn fork_session(
+pub(crate) async fn fork_session(
     inner: &Arc<AgentServerInner>,
     owner: &str,
     intent: ForkIntent,
-) -> Result<Value, RpcError> {
+) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
     let ForkIntent {
         source_session_id,
         through_entry_id,
+        target_session_id,
         cwd,
         project,
         initial_model,
@@ -2256,8 +888,11 @@ async fn fork_session(
             match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
                 Some(model) => Some(model),
                 None => {
-                    return Err(RpcError::new(-1, format!("unknown model: {}", m.0))
-                        .with_code(manox_protocol::msg::CODE_MODEL_UNRESOLVABLE));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                        "unknown model: {}",
+                        m.0
+                    ))
+                    .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                 }
             }
         }
@@ -2267,8 +902,10 @@ async fn fork_session(
         Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string())) {
             Ok(mode) => Some(mode),
             Err(_) => {
-                return Err(RpcError::new(-1, format!("unknown approval mode: {s}"))
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "unknown approval mode: {s}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
         },
     };
@@ -2277,51 +914,66 @@ async fn fork_session(
         Some("high") => Some(ReasoningEffort::High),
         Some("max") => Some(ReasoningEffort::Max),
         Some(other) => {
-            return Err(
-                RpcError::new(-1, format!("unknown reasoning effort: {other}"))
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST),
-            );
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "unknown reasoning effort: {other}"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
         }
     };
 
     // Source: the persisted file (cold path — valid for live and cold
     // sources; a deferred source has no file).
-    let Some(source_path) = persisted_session_file(&source_session_id) else {
-        return Err(RpcError::new(-1, "thread not found")
-            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+    let Some(source_path) = manox_ahp_runtime::paths::persisted_session_file(&source_session_id)
+    else {
+        return Err(
+            manox_ahp_runtime::error::RuntimeError::new("thread not found")
+                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+        );
     };
     if !source_path.exists() {
-        return Err(RpcError::new(-1, "thread not found")
-            .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+        return Err(
+            manox_ahp_runtime::error::RuntimeError::new("thread not found")
+                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+        );
     }
     let source = JsonlSessionStorage::open(&source_path)
         .await
         .map_err(|err| {
-            RpcError::new(-1, format!("journal corrupt: {err}"))
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+            manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
         })?;
     let records = source.journal_range(0, u64::MAX).await.map_err(|err| {
-        RpcError::new(-1, format!("journal corrupt: {err}"))
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        manox_ahp_runtime::error::RuntimeError::new(format!("journal corrupt: {err}"))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     let through = records
         .iter()
         .position(|r| r.entry.id() == through_entry_id)
         .ok_or_else(|| {
-            RpcError::new(
-                -1,
-                format!("entry {through_entry_id} is not on the source's active chain"),
-            )
-            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST)
+            manox_ahp_runtime::error::RuntimeError::new(format!(
+                "entry {through_entry_id} is not on the source's active chain"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
         })?;
 
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let Some(target_path) = persisted_session_file(&session_id) else {
-        return Err(RpcError::new(-1, "minted fork id failed the path gate")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+    let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let Some(target_path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
+        return Err(manox_ahp_runtime::error::RuntimeError::new(
+            "minted fork id failed the path gate",
+        )
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
     };
+    // A caller-chosen id must not silently overwrite an existing journal: the
+    // fork file is created below, and `create` truncates. Refuse instead, so a
+    // colliding request is a loud error rather than a destroyed session.
+    if target_path.exists() {
+        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+            "session {session_id} already exists"
+        ))
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+    }
     let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
     let target = JsonlSessionStorage::create(
         &target_path,
@@ -2342,16 +994,16 @@ async fn fork_session(
     )
     .await
     .map_err(|err| {
-        RpcError::new(-1, format!("fork file creation failed: {err}"))
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        manox_ahp_runtime::error::RuntimeError::new(format!("fork file creation failed: {err}"))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     let prefix: Vec<manox_harness::session::SessionTreeEntry> = records[..=through]
         .iter()
         .map(|r| r.entry.clone())
         .collect();
     target.append_entries(&prefix).await.map_err(|err| {
-        RpcError::new(-1, format!("fork row copy failed: {err}"))
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        manox_ahp_runtime::error::RuntimeError::new(format!("fork row copy failed: {err}"))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
     })?;
     drop(target);
 
@@ -2388,389 +1040,12 @@ async fn fork_session(
     Ok(json!({ "session_id": session_id }))
 }
 
-/// The idempotent re-own of a live session: the owner joins and the
-/// directed `SessionCreated` note + GW1 Host mirror reach ONLY the new
-/// owner (owner-set control, never a broadcast — the existing owners are
-/// not disturbed). T10 (§D.6): no v1 snapshot replay here; the client's
-/// history comes from the §D.1 follow stream's `Snapshot` frame.
-fn reown_existing(
-    inner: &Arc<AgentServerInner>,
-    owner: &str,
-    session_id: &str,
-) -> Result<Value, RpcError> {
-    let thread = {
-        let sessions = inner.sessions.lock();
-        let Some(existing) = sessions.get(session_id) else {
-            // Gone between a check and this re-own (a concurrent dispose):
-            // answer not-found; the caller's retry re-enters the open path.
-            return Err(RpcError::new(-1, "thread not found")
-                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
-        };
-        existing.thread.clone()
-    };
-    inner.add_owner(session_id, owner);
-    inner.note_to_client(
-        owner,
-        ServerNote::SessionCreated {
-            session_id: session_id.into(),
-        },
-    );
-    inner.host_to_client(owner, session_created_event(session_id, &thread));
-    // §D.6: joining a live session re-delivers its unsettled adjudications.
-    inner.replay_pending_adjudications(owner, session_id);
-    Ok(json!({ "restored": true }))
-}
-/// GW1 (§D.5): build the `SessionCreated` Host mirror — the wire note
-/// carries only the id, the Host event carries the header. Projected from
-/// the live thread exactly like the follow stream's snapshot header
-/// (`cwd` from the thread, `createdAt` the projection moment — the
-/// authoritative header rides the follow Snapshot; this mirror is
-/// transitional until C4).
-fn session_created_event(
-    session_id: &str,
-    thread: &ThreadHandle,
-) -> manox_protocol::stream::HostEvent {
-    let cwd = thread.read(|t| t.cwd().to_string_lossy().into_owned());
-    HostEvent::SessionCreated {
-        session_id: session_id.to_string(),
-        header: manox_protocol::journal::ThreadHeader {
-            id: session_id.to_string(),
-            cwd,
-            parent_session: None,
-            metadata: None,
-            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        },
-    }
-}
-
-// ── ClientNote dispatch (fire-and-forget). ───────────────────────────────────
-async fn handle_note(inner: &Arc<AgentServerInner>, owner: &str, note: ClientNote) {
-    match note {
-        ClientNote::CreateSession { session_id, cwd } => {
-            // Compat entry (§D.3 dual-protocol window): forward to the §D.2
-            // request path (no intent fields beyond cwd) and discard the
-            // receipt — v1 clients never await it. The explicit
-            // `session_id` is passed through so the desktop ids stay
-            // stable; the request path is idempotent on a live session.
-            let intent = SessionIntent {
-                working_directories: Vec::new(),
-                session_id: Some(session_id),
-                cwd,
-                project: None,
-                initial_model: None,
-                approval_mode: None,
-                reasoning_effort: None,
-                seed: None,
-            };
-            let _ = AgentServerInner::create_session_request(inner, owner, intent).await;
-        }
-        ClientNote::DisposeSession { session_id } => inner.dispose_session(owner, &session_id),
-        ClientNote::DetachSession { session_id } => inner.detach_session(owner, &session_id),
-        ClientNote::Submit {
-            session_id,
-            text,
-            images,
-            client_id,
-        } => {
-            // Compat entry: forward to the §D.2 receipt path, discard.
-            let _ = inner
-                .submit(owner, &session_id, text, images, client_id, None)
-                .await;
-        }
-        ClientNote::Steer {
-            session_id,
-            client_id,
-            text,
-            images,
-        } => {
-            // Compat entry: the note's `client_id` is the steer id.
-            let _ = inner.steer(&session_id, client_id, text, images, None);
-        }
-        ClientNote::DropQueued {
-            session_id,
-            client_id,
-        } => inner.drop_queued(&session_id, client_id),
-        ClientNote::CancelTurn { session_id } => {
-            if let Some(t) = inner.session_thread(&session_id) {
-                t.with_mut(|t| t.cancel());
-            } else {
-                inner.note_error(&session_id, "unknown session");
-            }
-        }
-        ClientNote::SetModel { session_id, id } => inner.set_model(&session_id, &id),
-        ClientNote::SetReasoningEffort { session_id, effort } => {
-            inner.set_reasoning_effort(&session_id, &effort)
-        }
-        ClientNote::SetApprovalMode { session_id, mode } => {
-            inner.set_approval_mode(&session_id, &mode)
-        }
-        ClientNote::SetCwd { session_id, cwd } => inner.set_cwd(&session_id, &cwd).await,
-        ClientNote::SetPlanMode {
-            session_id,
-            enabled,
-        } => {
-            if let Some(t) = inner.session_thread(&session_id) {
-                t.with_mut(|t| t.set_plan_mode(enabled));
-            } else {
-                inner.note_error(&session_id, "unknown session");
-            }
-        }
-        ClientNote::PlanSeedExecution {
-            session_id,
-            plan_file,
-        } => inner.plan_seed(&session_id, &plan_file),
-        ClientNote::Compact {
-            session_id,
-            instructions,
-        } => inner.compact(&session_id, instructions),
-        ClientNote::Goal {
-            session_id,
-            action,
-            objective,
-            budget,
-            max_rounds,
-        } => inner.goal(&session_id, &action, objective, budget, max_rounds),
-        ClientNote::StopBackgroundTask { task_id, .. } => {
-            manox_agent::runtime::handle().spawn(async move {
-                let _ = manox_agent::background_task::stop(&task_id).await;
-            });
-        }
-        ClientNote::ArchiveThread {
-            session_id,
-            archived,
-        } => inner.archive_thread(owner, &session_id, archived),
-        ClientNote::PinThread { session_id, pinned } => {
-            manox_agent::thread_store::global().with_mut(|s| s.pin_thread(&session_id, pinned));
-        }
-        // Sidebar order moves ride the same setter-note family: no receipt, the
-        // store's `SummariesUpdated` echo carries the new order to every
-        // connection as the §D.5 `ThreadsUpdated` snapshot. A rejected move
-        // (unaccounted row or anchor) changes nothing — the store warns.
-        ClientNote::InsertThreadBefore {
-            thread_id,
-            before_thread_id,
-        } => {
-            manox_agent::thread_store::global()
-                .with_mut(|s| s.insert_thread_before(&thread_id, before_thread_id.as_deref()));
-        }
-        ClientNote::InsertGroupBefore { path, before_path } => {
-            manox_agent::thread_store::global()
-                .with_mut(|s| s.insert_group_before(&path, before_path.as_deref()));
-        }
-        // U6b①: the browser-suite toggle rides the gateway (the setter-note
-        // family shape: a string suite name, fire-and-forget — the effect
-        // returns via the facade's BrowserSuitesChanged echo). The desktop's
-        // direct facade write was the U6 dual-source face; unknown suite
-        // names answer an error note (never a panic).
-        ClientNote::SetBrowserSuite {
-            session_id,
-            suite,
-            enable,
-        } => {
-            let Some(parsed) = manox_agent::engine::BrowserSuite::from_wire(&suite) else {
-                inner.note_error(&session_id, &format!("unknown browser suite: {suite}"));
-                return;
-            };
-            let Some(thread) = inner.session_thread(&session_id) else {
-                inner.note_error(&session_id, "unknown session");
-                return;
-            };
-            thread.with_mut(|t| t.set_browser_suite(parsed, enable));
-        }
-        #[cfg(feature = "terminal")]
-        ClientNote::TerminalInput { terminal, bytes } => {
-            // #13: keystroke-grade input into the terminal's PTY writer
-            // (enqueue-only, never blocks the caller).
-            let Some(entry) = inner.terminals.lock().get(&terminal).cloned() else {
-                let message = format!("unknown terminal {terminal}");
-                inner.note_to_client(
-                    owner,
-                    ServerNote::Error {
-                        session_id: None,
-                        message: message.clone(),
-                    },
-                );
-                inner.host_to_client(
-                    owner,
-                    HostEvent::Error {
-                        message,
-                        session_id: None,
-                    },
-                );
-                return;
-            };
-            if let Err(err) = entry.handle.read(|t| t.input(&bytes)) {
-                let message = format!("terminal input failed: {err}");
-                inner.note_to_client(
-                    owner,
-                    ServerNote::Error {
-                        session_id: None,
-                        message: message.clone(),
-                    },
-                );
-                inner.host_to_client(
-                    owner,
-                    HostEvent::Error {
-                        message,
-                        session_id: None,
-                    },
-                );
-            }
-        }
-        #[cfg(not(feature = "terminal"))]
-        ClientNote::TerminalInput { .. } => {
-            let message = "terminal support not built into this host".to_string();
-            inner.note_to_client(
-                owner,
-                ServerNote::Error {
-                    session_id: None,
-                    message: message.clone(),
-                },
-            );
-            inner.host_to_client(
-                owner,
-                HostEvent::Error {
-                    message,
-                    session_id: None,
-                },
-            );
-        }
-        #[cfg(feature = "terminal")]
-        ClientNote::TerminalResize {
-            terminal,
-            cols,
-            rows,
-        } => {
-            let Some(entry) = inner.terminals.lock().get(&terminal).cloned() else {
-                let message = format!("unknown terminal {terminal}");
-                inner.note_to_client(
-                    owner,
-                    ServerNote::Error {
-                        session_id: None,
-                        message: message.clone(),
-                    },
-                );
-                inner.host_to_client(
-                    owner,
-                    HostEvent::Error {
-                        message,
-                        session_id: None,
-                    },
-                );
-                return;
-            };
-            entry
-                .handle
-                .with_mut(|t| t.resize(cols as usize, rows as usize));
-        }
-        #[cfg(not(feature = "terminal"))]
-        ClientNote::TerminalResize { terminal, .. } => {
-            let message = format!("terminal support not built into this host ({terminal})");
-            inner.note_to_client(
-                owner,
-                ServerNote::Error {
-                    session_id: None,
-                    message: message.clone(),
-                },
-            );
-            inner.host_to_client(
-                owner,
-                HostEvent::Error {
-                    message,
-                    session_id: None,
-                },
-            );
-        }
-        ClientNote::AppendUserMessage {
-            session_id,
-            text,
-            images,
-        } => inner.append_user_message(&session_id, text, images),
-        ClientNote::AppendUiNote {
-            session_id,
-            kind,
-            data,
-        } => inner.append_ui_note(&session_id, &kind, data),
-        ClientNote::CancelModelChat { request_id } => {
-            crate::model_chat::cancel(&inner.model_chats, &request_id)
-        }
-        ClientNote::Shutdown => {
-            // Host-driven teardown rides the connection drop; nothing to do
-            // per-note.
-        }
-    }
-}
-
-/// GW7 stable-code error for a declared-but-unbuilt capability arm (the lean
-/// napi edge builds session-core without the `terminal` feature).
-#[cfg(not(feature = "terminal"))]
-fn unavailable(what: &str) -> RpcError {
-    RpcError::new(-1, format!("{what} support not built into this host"))
-        .with_code(manox_protocol::msg::CODE_FEATURE_UNAVAILABLE)
-}
-
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
 
-/// The canonical on-disk journal path for a session id
-/// (`<config>/sessions/<id>.jsonl`) — the same name creation and the
-/// repository scan use, so the GW11 identity probe, the GW6 cold read, and
-/// the eventual materialization can never disagree about the file.
-pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
-    // B5 (review round 2): wire-supplied ids reach this join BEFORE the
-    // not-found guards (PageHistory / the follow cold read), so an
-    // unvalidated id could probe arbitrary jsonl-shaped files under the
-    // manox home ("subagents/<uuid>", "../../x"). Session ids are the
-    // minters' uuid charset; admit ASCII alphanumeric, '-' and '_' only —
-    // no separators, no dots, no control bytes — and keep this function
-    // the sole wire-id → path mint (the repository's own
-    // `session_file_name` join reads ids from journal headers, never from
-    // the wire).
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return None;
-    }
-    // Sessions-dir single authority (review round 3, P0-1): the thread
-    // store owns the sessions dir — the production store is built from
-    // `paths::sessions_dir()` (same value, no behavior change), a test
-    // store points at its standalone temp dir, and the gateway's cold read
-    // must resolve through the store's seam or store-side fixtures starve
-    // the cold path (the `sidebar_thread_switch_restores_transcript` red).
-    // An uninitialized store falls back to the paths authority (the
-    // pre-fix behavior).
-    let dir = manox_agent::thread_store::try_global()
-        .map(|_| manox_agent::thread_store::global_sessions_dir())
-        .or_else(|| manox_agent::paths::sessions_dir().ok())?;
-    Some(
-        dir.join(manox_harness::session::repository::session_file_name(
-            session_id,
-        )),
-    )
-}
-
-/// The §D.2 `CreateSession` intent: optional explicit id (the compat
-/// `ClientNote::CreateSession` always supplies one; the v2 request mints
-/// server-side), working directory, project binding, and the initial
-/// model / approval mode / reasoning effort the session opens with (the
-/// "project/model inheritance" defect regression, §J.7).
-struct SessionIntent {
-    session_id: Option<String>,
-    cwd: Option<String>,
-    project: Option<String>,
-    initial_model: Option<manox_protocol::ModelRef>,
-    approval_mode: Option<String>,
-    reasoning_effort: Option<String>,
-    /// Hidden context blocks appended as non-displaying custom messages
-    /// before the first turn (`CreateSession.seed`).
-    seed: Option<Vec<Value>>,
-    /// Ordered extra working directories granted to the session
-    /// (multi-root); each joins the session's granted-root set before the
-    /// engine materializes, so `workspace-write` admits writes under all
-    /// of them. Empty keeps single-cwd behavior.
-    working_directories: Vec<String>,
-}
+/// The `createSession` intent: optional explicit id, working directory,
+/// project binding, and the initial model / approval mode / reasoning effort
+/// the session opens with.
+pub(crate) use manox_ahp_runtime::runtime_trait::SessionIntent;
 
 impl AgentServerInner {
     /// §D.2 `CreateSession`: build a live session from the intent and answer
@@ -2785,11 +1060,11 @@ impl AgentServerInner {
     /// whose journal file already exists on disk is an existing COLD
     /// session: it restores through the `OpenSession` path (§D.2
     /// idempotency on disk, GW11) and is never re-minted over its file.
-    async fn create_session_request(
+    pub(crate) async fn create_session_request(
         inner: &Arc<AgentServerInner>,
         owner: &str,
         intent: SessionIntent,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         // Resolve every intent field that can fail before touching state.
         let model = match intent.initial_model.as_ref() {
             None => None,
@@ -2798,8 +1073,11 @@ impl AgentServerInner {
                 match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
                     Some(model) => Some(model),
                     None => {
-                        return Err(RpcError::new(-1, format!("unknown model: {}", m.0))
-                            .with_code(manox_protocol::msg::CODE_MODEL_UNRESOLVABLE));
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "unknown model: {}",
+                            m.0
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                     }
                 }
             }
@@ -2810,8 +1088,10 @@ impl AgentServerInner {
             {
                 Ok(mode) => Some(mode),
                 Err(_) => {
-                    return Err(RpcError::new(-1, format!("unknown approval mode: {s}"))
-                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                        "unknown approval mode: {s}"
+                    ))
+                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
                 }
             },
         };
@@ -2820,10 +1100,10 @@ impl AgentServerInner {
             Some("high") => Some(ReasoningEffort::High),
             Some("max") => Some(ReasoningEffort::Max),
             Some(other) => {
-                return Err(
-                    RpcError::new(-1, format!("unknown reasoning effort: {other}"))
-                        .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST),
-                );
+                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "unknown reasoning effort: {other}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
         };
         // Seed blocks are kernel content blocks: validate the vocabulary
@@ -2839,11 +1119,10 @@ impl AgentServerInner {
                     ) {
                         Ok(b) => parsed.push(b),
                         Err(e) => {
-                            return Err(RpcError::new(
-                                -1,
-                                format!("seed block {i} is not a valid content block: {e}"),
-                            )
-                            .with_code(manox_protocol::msg::CODE_GATEWAY_BAD_REQUEST));
+                            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                                "seed block {i} is not a valid content block: {e}"
+                            ))
+                            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
                         }
                     }
                 }
@@ -2855,10 +1134,6 @@ impl AgentServerInner {
             && inner.sessions.lock().contains_key(existing)
         {
             inner.add_owner(existing, owner);
-            // §D.6: joining a live session re-delivers its unsettled
-            // adjudications (an orphaned-but-running session parked a card
-            // for this owner-to-be).
-            inner.replay_pending_adjudications(owner, existing);
             return Ok(json!({ "session_id": existing }));
         }
         // §D.2 idempotency on disk (GW11): an id whose journal file already
@@ -2873,7 +1148,7 @@ impl AgentServerInner {
         // `note_session_path` seeds the identity map for the restore's
         // `load_thread`.
         if let Some(existing) = intent.session_id.as_deref()
-            && let Some(path) = persisted_session_file(existing)
+            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(existing)
             && path.exists()
         {
             manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
@@ -2889,9 +1164,11 @@ impl AgentServerInner {
         // create keeps the deferred-fresh flow untouched.
         if !seed_blocks.is_empty() {
             let session_id = uuid::Uuid::new_v4().to_string();
-            let Some(path) = persisted_session_file(&session_id) else {
-                return Err(RpcError::new(-1, "minted session id failed the path gate")
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+            let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
+                return Err(manox_ahp_runtime::error::RuntimeError::new(
+                    "minted session id failed the path gate",
+                )
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
             };
             let cwd = intent
                 .cwd
@@ -2914,8 +1191,10 @@ impl AgentServerInner {
             )
             .await
             .map_err(|err| {
-                RpcError::new(-1, format!("seeded session file creation failed: {err}"))
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+                manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "seeded session file creation failed: {err}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             let seed_rows: Vec<manox_harness::session::SessionTreeEntry> = seed_blocks
                 .into_iter()
@@ -2935,8 +1214,10 @@ impl AgentServerInner {
                 })
                 .collect();
             storage.append_entries(&seed_rows).await.map_err(|err| {
-                RpcError::new(-1, format!("seed row append failed: {err}"))
-                    .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+                manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "seed row append failed: {err}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             drop(storage);
             // Path note + open are two steps, deliberately (review #778):
@@ -3010,7 +1291,7 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = persisted_session_file(&session_id)
+            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id)
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {
@@ -3034,192 +1315,59 @@ impl AgentServerInner {
         });
         let turn_active = Arc::new(AtomicBool::new(false));
         let pending_submits = Arc::new(Mutex::new(Vec::new()));
-        let pump_cancel = tokio_util::sync::CancellationToken::new();
-        let pump = spawn_pump(
-            Arc::clone(inner),
+        // The insert is a single-lock recheck: a racing same-id create/open
+        // that won the race since the live check above has its entry adopted
+        // and ours dropped — never clobbered, so the loser's intent seeds
+        // cannot overwrite the winner's model / approval / effort.
+        let settle_cancel = tokio_util::sync::CancellationToken::new();
+        let _watcher = spawn_settle_watcher(
             session_id.clone(),
             thread.clone(),
-            turn_active.clone(),
-            pending_submits.clone(),
-            pump_cancel.clone(),
+            Arc::clone(&pending_submits),
+            Arc::clone(&turn_active),
+            settle_cancel.clone(),
         );
-        // GW2 + §二.4③: the insert is a single-lock recheck — if a racing
-        // same-id create/open won the race since the live check above, our
-        // freshly spawned pump is retired and the WINNER's entry is adopted
-        // (never clobbered: the loser's intent seeds must not overwrite the
-        // winner's).
         let loser = inner.insert_session_if_absent(
             session_id.clone(),
             ServerSession {
                 thread: thread.clone(),
-                pump_cancel,
-                pump,
                 turn_active,
                 pending_submits,
+                settle_cancel,
             },
         );
-        if let Some(loser) = loser {
+        if loser.is_some() {
             tracing::warn!(
                 session_id,
-                "create lost a same-id race; adopting the winning entry and retiring this pump"
+                "create lost a same-id race; adopting the winning entry"
             );
-            loser.stop_pump();
-            inner.add_owner(&session_id, owner);
-            return Ok(json!({ "session_id": session_id }));
         }
         inner.add_owner(&session_id, owner);
-        // Hidden-context seeding (`CreateSession.seed`): one non-displaying
-        // custom row per block, BEFORE the SessionCreated broadcast — the
-        // actor queue makes the seeds land before any subsequent Submit's
-        // user entry. Model-visible, UI-hidden (the wire row carries
-        // `display: false`).
-        inner.route_note(
-            &session_id,
-            ServerNote::SessionCreated {
-                session_id: session_id.clone(),
-            },
-        );
-        // GW1 dual emit: the §D.5 Host mirror to the owner set (after
-        // `add_owner` so the creating client is in the audience).
-        inner.route_host(&session_id, session_created_event(&session_id, &thread));
-        // T10 (§D.6): the create-time `PermissionModeChanged` mirror is gone —
-        // the mode rides the follow-stream snapshot's `permission_mode`
-        // projection (seeded from the live thread) and the
-        // `permissionModeChange` journal entry on later changes.
         Ok(json!({ "session_id": session_id }))
     }
 
-    fn dispose_session(&self, owner: &str, session_id: &str) {
-        // §D.5 dispose semantics: only the REQUESTING client is told — the
-        // session survives for every other owner (broadcasting here made a
-        // second client's UI drop a still-live session). Owner-table
-        // removal below is per-client regardless.
-        // B4 (review round 2): clone the connection in its OWN statement —
-        // an `if let` scrutinee temporary (the clients MutexGuard) lives to
-        // the end of the body, so the blocking sends below would otherwise
-        // run under the lock and one saturated s2c queue would freeze every
-        // dispatch, broadcast and route_call on it (§D.7: clone under the
-        // lock, send outside it — the route_note pattern).
-        let conn = self.clients.lock().get(owner).map(|e| e.conn.clone());
-        if let Some(conn) = conn {
-            conn.send_to_client(FromServer::Notification {
-                note: ServerNote::SessionDisposed {
-                    session_id: session_id.into(),
-                },
-            });
-            // GW1 dual emit: the §D.5 Host mirror, directed to the same
-            // single connection (owner-set control, never a broadcast).
-            conn.send_to_client(FromServer::Host {
-                host: HostEvent::SessionDisposed {
-                    session_id: session_id.into(),
-                    successor: None,
-                },
-            });
-        }
+    /// Dispose one client's ownership of a session.
+    ///
+    /// Only the REQUESTING client loses ownership: the session survives for
+    /// every other owner, and the entry (with its `ThreadHandle`) leaves only
+    /// when the last owner does. A running turn is cancelled at that point —
+    /// there is nobody left to settle it.
+    pub(crate) fn dispose_session(&self, owner: &str, session_id: &str) {
         self.remove_owner(owner, session_id);
-        if self.owners(session_id).is_empty() {
-            let removed = { self.sessions.lock().remove(session_id) };
-            if removed.is_some() {
-                self.clear_embedder_tools(session_id);
-                // The projection cell is session-shared: reap it only with
-                // the session itself, never on one client's dispose (review
-                // #805 [severe] 2 — an early drop froze every other owner's
-                // live streams).
-                self.projections.drop_session(session_id);
-            }
-            if let Some(session) = removed {
-                // GW2: terminate the pump BEFORE the entry goes away — the
-                // pre-fix removal only dropped the JoinHandle, which detaches
-                // (the pump kept its ThreadHandle and ran forever), so a
-                // reopen of the same id spawned a second pump.
-                session.stop_pump();
-                // §0: with the adjudication await on its own task, the pump
-                // abort alone no longer reaches a parked waterfall — the
-                // dispose sweep cancels its deliveries, converging the
-                // parked cards fail-closed (and unregistering them via the
-                // `DeliveryGuard`).
-                self.cancel_deliveries_for_session(session_id);
-                // Disposal closes every live stream of the session (§D.1
-                // `Closed`).
-                self.end_streams_for_session(session_id, StreamEndReason::Closed);
-                if session.turn_active.load(Ordering::SeqCst) {
-                    session.thread.with_mut(|t| t.cancel());
-                    manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
-                }
+        if !self.owners(session_id).is_empty() {
+            return;
+        }
+        let removed = self.sessions.lock().remove(session_id);
+        if let Some(session) = removed {
+            self.clear_embedder_tools(session_id);
+            if session.turn_active.load(Ordering::SeqCst) {
+                session.thread.with_mut(|t| t.cancel());
+                manox_agent::thread_store::global().with_mut(|s| s.mark_idle(session_id));
             }
         }
     }
 
-    fn detach_session(&self, owner: &str, session_id: &str) {
-        // Detach drops this client's strong reference without cancelling: a
-        // turn keeps running for any other owner, and the thread persists for
-        // reopen. Only the detaching client is told (it stops being an owner,
-        // so route_note would drop the note after the table changes).
-        // B4 (review round 2): clone the connection in its OWN statement —
-        // an `if let` scrutinee temporary (the clients MutexGuard) lives to
-        // the end of the body, so the blocking sends below would otherwise
-        // run under the lock and one saturated s2c queue would freeze every
-        // dispatch, broadcast and route_call on it (§D.7: clone under the
-        // lock, send outside it — the route_note pattern).
-        let conn = self.clients.lock().get(owner).map(|e| e.conn.clone());
-        if let Some(conn) = conn {
-            conn.send_to_client(FromServer::Notification {
-                note: ServerNote::SessionDisposed {
-                    session_id: session_id.into(),
-                },
-            });
-            // GW1 dual emit: the §D.5 Host mirror, directed to the detaching
-            // connection only.
-            conn.send_to_client(FromServer::Host {
-                host: HostEvent::SessionDisposed {
-                    session_id: session_id.into(),
-                    successor: None,
-                },
-            });
-        }
-        self.remove_owner(owner, session_id);
-        if self.owners(session_id).is_empty() {
-            // Ownership lost ⇒ live streams close (§D.1 `Closed`) and the
-            // session-shared projection cell reaps with them (review #805
-            // [severe] 2).
-            self.projections.drop_session(session_id);
-            self.end_streams_for_session(session_id, StreamEndReason::Closed);
-            // GW2 follow-up (deferred reap): a detach while the turn still
-            // runs keeps the entry and its pump — the settle bookkeeping
-            // (store running/unread/pending flags and the SessionStatus
-            // edges) belongs to the pump, and stopping it here would strand
-            // the store's `running` flag true with nobody left to clear it.
-            // The TurnFinished arm reaps the orphan once it settles.
-            let running = self
-                .sessions
-                .lock()
-                .get(session_id)
-                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
-            if !running {
-                let removed = { self.sessions.lock().remove(session_id) };
-                if removed.is_some() {
-                    self.clear_embedder_tools(session_id);
-                }
-                if let Some(session) = removed {
-                    session.stop_pump();
-                    // §0: the idle-orphan detach terminates the session —
-                    // sweep its in-flight deliveries off-pump.
-                    self.cancel_deliveries_for_session(session_id);
-                }
-            }
-        }
-    }
-
-    /// §D.2 `Submit`: performs the submission and answers with the receipt
-    /// `{accepted, message_id?}` (L7 — the transcript arrives through the
-    /// follow stream). K5: a direct (non-queued, non-slash) submission is
-    /// persisted BEFORE the receipt — accepted ⟹ logged — through
-    /// `ThreadEngine::persist_user_submission`; a persistence failure
-    /// REFUSES the receipt (coded `gateway/internal`). The `origin_rpc`
-    /// correlation rides the pinned origin on the entry (receipt-id pairing
-    /// from the append point is GW8). The compat `ClientNote::Submit`
-    /// forwards here with `origin_rpc = None`.
-    async fn submit(
+    pub(crate) async fn submit(
         self: &Arc<Self>,
         owner: &str,
         session_id: &str,
@@ -3227,7 +1375,7 @@ impl AgentServerInner {
         images: Vec<ImageAttachment>,
         client_id: Option<String>,
         origin_rpc: Option<String>,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         // Bind redirect + restart window: submissions addressed to a
         // superseded predecessor land on the successor, opened under its
         // own id with this connection as owner. Only a real redirect
@@ -3265,9 +1413,7 @@ impl AgentServerInner {
                 s.pending_submits.clone(),
             )
         }) else {
-            self.note_error(session_id, "unknown session");
-            return Err(RpcError::new(-1, "unknown session")
-                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+            return Err(unknown_session(session_id));
         };
         let (thread, turn_active, pending_submits) = session;
         let client_id = client_id.unwrap_or_else(|| owner.to_string());
@@ -3378,9 +1524,8 @@ impl AgentServerInner {
                     // and tell the client why.
                     thread.with_mut(|t| t.set_pending_turn_origin(None));
                     let message = format!("submit persistence failed: {err}");
-                    self.note_error(session_id, &message);
-                    return Err(RpcError::new(-1, message)
-                        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(message)
+                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
                 }
             }
         }
@@ -3402,11 +1547,10 @@ impl AgentServerInner {
         receipt(true, message_id)
     }
 
-    /// §D.2 `Steer`: injects the steer and answers with the receipt
-    /// `{accepted, message_id?}` (the echo of the call's steer id). The
-    /// compat `ClientNote::Steer` forwards here with its `client_id` as
-    /// `message_id`.
-    fn steer(
+    /// Inject a steer into a running turn, answering with the receipt
+    /// `{accepted, message_id?}`. The steer id IS the echo correlation: the
+    /// client retires its optimistic bubble when its own injection settles.
+    pub(crate) fn steer(
         &self,
         session_id: &str,
         message_id: String,
@@ -3415,7 +1559,7 @@ impl AgentServerInner {
         // The steer id IS the echo correlation (the client retires its
         // echo when the steer's own injection settles); no origin pin.
         _origin_rpc: Option<String>,
-    ) -> Result<Value, RpcError> {
+    ) -> Result<Value, manox_ahp_runtime::error::RuntimeError> {
         let images: Vec<(String, String)> = images
             .into_iter()
             .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
@@ -3426,14 +1570,12 @@ impl AgentServerInner {
             .get(session_id)
             .map(|s| (s.thread.clone(), s.pending_submits.clone()))
         else {
-            self.note_error(session_id, "unknown session");
-            return Err(RpcError::new(-1, "unknown session")
-                .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
+            return Err(unknown_session(session_id));
         };
         // A steer removes its own parked follow-up so the turn-end drain does
         // not resend the same text as a plain follow-up.
         pending_submits.lock().retain(|q| q.client_id != message_id);
-        thread.with_mut(|t| {
+        let injected = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
@@ -3445,9 +1587,11 @@ impl AgentServerInner {
                 // the facade so the optimistic bubble, the injected `user`
                 // journal row, and the echo retirement share one identity.
                 t.enqueue_steer(content, Some(ui), Some(message_id.clone()));
+                true
             } else {
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();
+                false
             }
         });
         // T10 (§D.6): the `SteerPending` note mirror is gone — the steer's
@@ -3457,10 +1601,16 @@ impl AgentServerInner {
         Ok(json!({
             "accepted": true,
             "message_id": message_id,
+            // Whether the text went into the RUNNING turn or started one. The
+            // caller needs the difference: an injected steer is consumed by the
+            // turn it interrupted, so the pending message that announced it has
+            // to be retired, while a steer that started its own turn is carried
+            // by that turn like any other opening message.
+            "injected": injected,
         }))
     }
 
-    fn drop_queued(&self, session_id: &str, client_id: String) {
+    pub(crate) fn drop_queued(&self, session_id: &str, client_id: String) {
         let resolved = self.resolve_redirect(session_id);
         if let Some(session) = self.sessions.lock().get(&resolved) {
             let pending = session.pending_submits.clone();
@@ -3468,9 +1618,19 @@ impl AgentServerInner {
         }
     }
 
-    fn set_model(&self, session_id: &str, id: &str) {
+    /// Select the session's model.
+    ///
+    /// The refusal is reported to the caller, not only noted to the v2 clients:
+    /// the AHP dispatch path has already folded the change into the state its
+    /// subscribers reduce, so a swallowed failure would let every client
+    /// converge on a model the session is not running.
+    pub(crate) fn set_model(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         let registry = manox_agent::provider_glue::global();
         match manox_harness::model_ref::resolve_model_ref(&registry, id) {
@@ -3478,40 +1638,60 @@ impl AgentServerInner {
                 // T10: the v1 `ThreadInfo` republish is gone — the engine
                 // journals the change and the P-face delta refreshes chips.
                 thread.with_mut(|t| t.set_model(model));
+                Ok(())
             }
-            None => self.note_error(session_id, "unknown model"),
+            None => Err(unresolvable_model(id)),
         }
     }
 
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str) {
+    pub(crate) fn set_reasoning_effort(
+        &self,
+        session_id: &str,
+        effort: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         let effort = match effort {
             "high" => ReasoningEffort::High,
             "max" => ReasoningEffort::Max,
             _ => {
-                return self
-                    .note_error(session_id, "set_reasoning_effort requires effort: high|max");
+                return Err(manox_ahp_runtime::error::RuntimeError::new(
+                    "set_reasoning_effort requires effort: high|max",
+                )
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
         };
         thread.with_mut(|t| t.set_reasoning_effort(effort));
+        Ok(())
     }
 
-    fn set_approval_mode(&self, session_id: &str, mode: &str) {
+    pub(crate) fn set_approval_mode(
+        &self,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         // Parse strictly: an unparseable mode must not settle on the default
         // (a silent no-op beats a chip bounce-back on a projected mutation).
         let Ok(mode) = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
         else {
-            return self.note_error(session_id, &format!("unknown approval mode: {mode}"));
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "unknown approval mode: {mode}"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
         };
         thread.with_mut(|t| t.set_permission_mode(mode));
+        Ok(())
     }
 
-    async fn set_cwd(self: &Arc<Self>, session_id: &str, cwd: &str) {
+    pub(crate) async fn set_cwd(
+        self: &Arc<Self>,
+        session_id: &str,
+        cwd: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         // Restart-window opens from a note carry no connection identity:
         // use a transient owner and release it right after so it never
         // defeats the orphaned-session reap (review #805 [sugg] 11).
@@ -3533,7 +1713,7 @@ impl AgentServerInner {
             if let Some(id) = &opened_id {
                 self.remove_owner(NOTE_OWNER, id);
             }
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         if thread.read(|t| t.has_interacted()) {
             // The working-directory switch applies at ANY interaction
@@ -3544,7 +1724,7 @@ impl AgentServerInner {
             if let Some(id) = &opened_id {
                 self.remove_owner(NOTE_OWNER, id);
             }
-            return;
+            return Ok(());
         }
         // Bind on a not-yet-interacted thread: identity follows the log —
         // the directory becomes a SUCCESSOR session (fresh chain bound at
@@ -3557,7 +1737,6 @@ impl AgentServerInner {
         manox_agent::runtime::handle().spawn(async move {
             if let Err(error) = inner.bind_successor(&session_id, &cwd).await {
                 tracing::warn!(session = %session_id, %error, "bind successor failed");
-                inner.note_error(&session_id, &format!("bind failed: {error}"));
             }
             // Released AFTER the hand-off, on the id the owner was added
             // to (review r3 [problem] 2).
@@ -3565,6 +1744,7 @@ impl AgentServerInner {
                 inner.remove_owner(NOTE_OWNER, &id);
             }
         });
+        Ok(())
     }
 
     /// The bind hand-off (#802 / identity-follows-log): mint the successor
@@ -3579,7 +1759,6 @@ impl AgentServerInner {
         // [issue] A).
         let key = self.resolve_redirect(pred_id);
         if !self.binding.lock().insert(key.clone()) {
-            self.note_error(pred_id, "bind already in flight");
             return Err("bind already in flight".into());
         }
         let outcome = self.bind_successor_impl(pred_id, cwd).await;
@@ -3595,7 +1774,7 @@ impl AgentServerInner {
         let (model, approval, effort) = pred.read(|t| {
             (
                 t.model()
-                    .map(|m| manox_protocol::ModelRef::new(format!("{}/{}", m.provider, m.id))),
+                    .map(|m| manox_journal::ModelRef::new(format!("{}/{}", m.provider, m.id))),
                 t.permission_mode().wire().to_string(),
                 match t.reasoning_effort() {
                     manox_agent::language_model::ReasoningEffort::High => "high",
@@ -3650,27 +1829,19 @@ impl AgentServerInner {
                 audience.push(owner);
             }
         }
-        let audience_conns: Vec<Arc<dyn RpcConnection>> = {
-            let clients = self.clients.lock();
-            audience
-                .iter()
-                .filter_map(|cid| clients.get(cid).map(|entry| entry.conn.clone()))
-                .collect()
-        };
-        // Owner inheritance: pending adjudications and streamed notes keep
-        // reaching the same clients across the hand-off.
+        // Owner inheritance: the successor takes the predecessor's audience,
+        // so a client watching the predecessor keeps watching the session
+        // across the hand-off.
         for owner in &audience {
             // `add_owner(session_id, client_id)`: the successor takes the
             // audience, not the other way around.
             self.add_owner(&succ_id, owner);
         }
-        // Stub the predecessor onto the successor's engine + mirrored
-        // header fields: its live follow streams see the new chain's feed
-        // (the seq regression resyncs them loudly), and its journal seam
-        // answers the successor log.
+        // Stub the predecessor onto the successor's engine + mirrored header
+        // fields: its journal seam answers the successor's log from here on.
         pred.with_mut(|t| t.adopt_successor(engine, PathBuf::from(cwd)));
-        // Both ids mark the successor: the note's id (kept resolvable for
-        // clients that still address it) and the id it resolved to.
+        // Both ids mark the successor: the id clients still address, and the
+        // id it resolved to.
         manox_agent::thread_store::global().with_mut(|s| {
             s.mark_superseded(pred_id, &succ_id);
             if effective != pred_id {
@@ -3683,39 +1854,25 @@ impl AgentServerInner {
         self.superseded
             .lock()
             .insert(effective.clone(), succ_id.clone());
-        // The bound directory becomes (or joins) a workspace row and the
-        // successor leads its account (dsh workspace parity for binds).
-        crate::workspace_serve::create_and_attach(cwd, &succ_id);
-        self.projections.reseed(pred_id, &pred);
-        // Live predecessor streams hold the OLD engine's feed receiver: it
-        // never closes and never emits again, so the regression probe would
-        // never fire. End them with Resync — the client's budgeted reopen
-        // lands on the alias (review #805 [issue] 5). BOTH ids: the streams
-        // a client opened on the resolved id carry `session_id ==
-        // effective`, and leaving them would also pin the reap predicate
-        // (review #809 [issue] 2).
-        self.end_streams_for_session(pred_id, StreamEndReason::Resync);
-        if effective != pred_id {
-            self.end_streams_for_session(&effective, StreamEndReason::Resync);
+        // The bound directory becomes (or joins) a workspace row, and the
+        // successor leads its account. A workspace-store failure is logged,
+        // not fatal: the session hand-off is the user's intent and the
+        // bookkeeping row is not worth failing it over.
+        match manox_workspace::WorkspaceStore::open() {
+            Ok(store) => match store.create(std::path::Path::new(cwd)) {
+                Ok((view, _)) => {
+                    if let Err(error) = store.attach_session(&view.workspace_id, &succ_id) {
+                        tracing::debug!(%error, "workspace attach after bind skipped");
+                    }
+                }
+                Err(error) => tracing::debug!(%error, "workspace create after bind skipped"),
+            },
+            Err(error) => tracing::debug!(%error, "workspace store unavailable after bind"),
         }
-        // Directed hand-off (§D.5 owner-set control, never a broadcast):
-        // note face + host mirror to the assembled audience, one send per
-        // connection (review #805 [issue] 3).
-        let note = manox_protocol::server::ServerNote::SessionDisposed {
-            session_id: pred_id.to_string(),
-        };
-        let host = manox_protocol::stream::HostEvent::SessionDisposed {
-            session_id: pred_id.to_string(),
-            successor: Some(succ_id.clone()),
-        };
-        for conn in &audience_conns {
-            conn.send_to_client(FromServer::Notification { note: note.clone() });
-            conn.send_to_client(FromServer::Host { host: host.clone() });
-        }
-        // The hand-off was announced; the audience is already inherited by
-        // the successor, so both predecessor ids drop their ownership here.
+        // The hand-off is complete: the audience is inherited by the
+        // successor, so both predecessor ids drop their ownership here.
         // Without this an entry could never satisfy the reap predicate while
-        // the client stays connected (plan §3.1 B-iv).
+        // the client stays connected.
         for owner in &audience {
             self.remove_owner(owner, pred_id);
             if effective != pred_id {
@@ -3732,63 +1889,66 @@ impl AgentServerInner {
         Ok(())
     }
 
-    fn append_ui_note(&self, session_id: &str, kind: &str, data: Value) {
-        let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+    /// Drop a superseded predecessor's entry once nothing consumes it: without
+    /// this it stays resident for the process lifetime. A running turn keeps
+    /// its entry — there is still a settle path to reach.
+    fn reap_superseded_if_idle(&self, session_id: &str) {
+        if !self.superseded.lock().contains_key(session_id) {
+            return;
+        }
+        if !self.owners(session_id).is_empty() {
+            return;
+        }
+        // Check-and-remove under ONE hold: a turn turning active between two
+        // holds would otherwise be reaped mid-flight with nobody left to
+        // settle it.
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            let running = sessions
+                .get(session_id)
+                .is_some_and(|s| s.turn_active.load(Ordering::SeqCst));
+            if running {
+                return;
+            }
+            sessions.remove(session_id)
         };
-        let kind = match kind {
-            "error" => manox_agent::db::UiNoteKind::Error,
-            "notice" => manox_agent::db::UiNoteKind::Notice,
-            "plan_review" => manox_agent::db::UiNoteKind::PlanReview,
-            _ => return self.note_error(session_id, "unknown ui note kind"),
-        };
-        thread.with_mut(|t| {
-            t.append_ui_note(manox_agent::db::UiNoteRecord { kind, data });
-        });
+        if removed.is_some() {
+            // The registrations die with the entry, like every other removal
+            // path.
+            self.clear_embedder_tools(session_id);
+            tracing::debug!(session = %session_id, "reaped superseded predecessor");
+        }
     }
 
-    fn append_user_message(
+    pub(crate) fn compact(
         &self,
         session_id: &str,
-        text: String,
-        images: Vec<manox_protocol::ImageAttachment>,
-    ) {
+        instructions: Option<String>,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
-        };
-        let images: Vec<(String, String)> = images
-            .into_iter()
-            .map(|i| (base64_bytes::encode(&i.data), i.mime_type))
-            .collect();
-        thread.with_mut(|t| {
-            let ui = manox_agent::MessageUiMetadata {
-                model_id: t.model().map(|m| m.id.clone()),
-                approval_mode: Some(t.permission_mode().as_i64()),
-                ..Default::default()
-            };
-            let content = to_message_content(text, images);
-            t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
-        });
-    }
-
-    fn compact(&self, session_id: &str, instructions: Option<String>) {
-        let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         thread.with_mut(|t| t.compact(instructions));
+        Ok(())
     }
 
-    fn plan_seed(&self, session_id: &str, plan_file: &str) {
+    pub(crate) fn plan_seed(
+        &self,
+        session_id: &str,
+        plan_file: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         let plan_file = plan_file.to_string();
         let seed_text = match manox_agent::collaboration_mode::render_plan_mode_approved(&plan_file)
         {
             Ok(text) => text,
-            Err(e) => {
-                thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-                return;
+            Err(error) => {
+                return Err(
+                    manox_ahp_runtime::error::RuntimeError::new(error.to_string())
+                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
+                );
             }
         };
         thread.with_mut(|t| {
@@ -3804,18 +1964,36 @@ impl AgentServerInner {
             };
             t.seed_plan_execution(plan_file, seed_text, Some(ui));
         });
+        Ok(())
     }
 
-    fn goal(
+    /// Apply one goal lifecycle action (the `x-manox/goal` seam).
+    ///
+    /// The engine owns every rule — an unknown action is not silently a no-op
+    /// here, because the caller has already folded the command into its
+    /// declaration surface; a `Refused` would be a promise the runtime broke.
+    pub(crate) fn goal(
         &self,
         session_id: &str,
         action: &str,
         objective: Option<String>,
         budget: Option<u64>,
         max_rounds: Option<u64>,
-    ) {
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+        // Validate the verb before touching state: an unknown action is the
+        // caller's mistake, and reporting it as a thread-level failure would
+        // point at the wrong thing.
+        if !matches!(
+            action,
+            "create" | "edit" | "replace" | "clear" | "pause" | "resume"
+        ) {
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "unknown goal action: {action}"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+        }
         let Some(thread) = self.session_thread(session_id) else {
-            return self.note_error(session_id, "unknown session");
+            return Err(unknown_session(session_id));
         };
         let objective = objective.unwrap_or_default();
         let actor = manox_agent::db::GoalActor::User;
@@ -3833,14 +2011,17 @@ impl AgentServerInner {
                 actor,
             ),
             "resume" => t.set_goal_status(manox_agent::goal::GoalStatus::Active, None, actor),
+            // Unreachable: the verb was validated above. Answering Ok here
+            // rather than panicking keeps a future verb from becoming a crash.
             _ => Ok(()),
         });
-        if let Err(e) = result {
-            self.note_error(session_id, &e.to_string());
-        }
+        result.map_err(|error| {
+            manox_ahp_runtime::error::RuntimeError::new(error.to_string())
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+        })
     }
 
-    fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
+    pub(crate) fn archive_thread(&self, owner: &str, session_id: &str, archived: bool) {
         if archived {
             // K3 (delivery request): journal the archive decision BEFORE
             // the dispose — while the engine route is still alive the
@@ -3856,1209 +2037,131 @@ impl AgentServerInner {
         }
     }
 
-    /// GW3 (§D.4): mint the stable delivery identity for one adjudication —
-    /// `dlv-{session}-{n}`, n counting the session's deliveries. Per-session
-    /// (not per-server) so identical scripts on the two
-    /// `dual_path_transport_consistency` transports mint identical ids after
-    /// session-id normalization; the session prefix keeps the id unique
-    /// gateway-wide (the `pending_deliveries` registry key).
-    fn next_delivery_id(&self, session_id: &str) -> String {
-        let n = {
-            let mut seq = self.delivery_seq.lock();
-            let entry = seq.entry(session_id.to_string()).or_insert(0);
-            *entry += 1;
-            *entry
+    /// Pin or unpin a session (the AHP extension surface: AHP has no pin bit).
+    ///
+    /// The durable authority is the store row plus the session's sidecar, the
+    /// same path v2's `PinThread` takes — a pin the sidebar shows and a cold
+    /// restore forgets would be the worst of both.
+    pub(crate) fn pin_session(&self, session_id: &str, pinned: bool) -> bool {
+        let mut applied = false;
+        manox_agent::thread_store::global().with_mut(|store| {
+            applied = store.summary_by_id(session_id).is_some();
+            if applied {
+                store.pin_thread(session_id, pinned);
+            }
+        });
+        applied
+    }
+
+    /// Move a session before another in the sidebar order, or to the head when
+    /// `before` is `None`.
+    ///
+    /// A move that names an unaccounted row changes nothing and reports it: the
+    /// store's own `MoveInvalid` is the answer, surfaced rather than folded into
+    /// a success the sidebar would not show.
+    pub(crate) fn order_session(&self, session_id: &str, before: Option<&str>) -> bool {
+        // The store's move is fire-and-forget by design (it warns and leaves the
+        // account untouched on an unaccounted row or anchor), so what the caller
+        // can honestly be told is whether the row exists at all — an unknown
+        // session is a client error, while a rejected *move* is the store's own
+        // accounting to log.
+        let known = manox_agent::thread_store::global()
+            .read(|store| store.summary_by_id(session_id).is_some());
+        if !known {
+            return false;
+        }
+        manox_agent::thread_store::global()
+            .with_mut(|store| store.insert_thread_before(session_id, before));
+        true
+    }
+
+    /// Rename a session to a user-supplied title.
+    ///
+    /// Two calls, and the split matters:
+    ///
+    /// - `handle_notice` delivers the live [`manox_agent::thread::ThreadEvent::TitleChanged`]
+    ///   to the **facade**, so the sidebar and any in-process observer show the
+    ///   new name at once.
+    /// - `thread_store::rename_thread` performs the **durable** half: it appends
+    ///   the journal `title` entry (the row the v2 projection folds and the AHP
+    ///   translator reads) and writes the sidecar.
+    ///
+    /// The facade call deliberately does **not** stand in for persistence: it
+    /// feeds the consumer end of the engine's notice chain, which is *past* its
+    /// journal tap, so a notice injected here is never journalled. That is why
+    /// the store owns the durable append (the `journal_pinned_archived`
+    /// precedent) rather than this method reusing the engine's emission path.
+    ///
+    /// A whitespace-only title is refused: it would blank the session's name
+    /// while looking like it landed.
+    pub(crate) fn rename_thread(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> manox_agent::thread_store::RenameOutcome {
+        let title = title.trim();
+        if title.is_empty() {
+            return manox_agent::thread_store::RenameOutcome::Blank;
+        }
+        let Some(thread) = self.session_thread(session_id) else {
+            return manox_agent::thread_store::RenameOutcome::UnknownSession;
         };
-        format!("dlv-{session_id}-{n}")
-    }
-
-    /// GW3 (§D.4): withdraw `client_id`'s pending delivery — flips its
-    /// cancel token, which the delivery's reply waiter folds into the
-    /// funnel as an expired reply (the waterfall then converges fail-closed
-    /// through the existing expire path). `false` when the delivery already
-    /// settled, never existed, or targeted other clients only.
-    fn cancel_delivery(&self, client_id: &str, delivery_id: &str) -> bool {
-        let deliveries = self.pending_deliveries.lock();
-        match deliveries
-            .get(delivery_id)
-            .and_then(|entry| entry.tokens.get(client_id))
-        {
-            Some(token) => {
-                token.cancel();
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// §0: session teardown sweeps every in-flight delivery of THIS session
-    /// — flips every recipient's cancel token, which the per-recipient
-    /// waiters fold into the waterfall funnel as expired replies (the same
-    /// path a `CancelDelivery` takes). With the adjudication await spawned
-    /// off the pump, a disposed session's parked waiters must not rely on
-    /// the pump abort reaching them: this sweep is their termination path,
-    /// and the waterfall's fail-closed settle (`apply_reply` → expired
-    /// verdict + `DeliveryGuard` unregister) stays intact.
-    fn cancel_deliveries_for_session(&self, session_id: &str) {
-        let deliveries = self.pending_deliveries.lock();
-        for entry in deliveries.values() {
-            if entry.session_id != session_id {
-                continue;
-            }
-            for token in entry.tokens.values() {
-                token.cancel();
-            }
-        }
-    }
-}
-
-// ── ServerCall routing (β-3b: Approve / AskUserQuestion; since PR-5a the
-//    plan review rides the ask channel too). ───────────────────────────
-async fn route_call(inner: &Arc<AgentServerInner>, session_id: &str, call: ServerCall) {
-    let kind = answer_kind_for(&call);
-    // GW3 (§D.4): the gateway is the SINGLE stamping point for delivery
-    // identity — translate/pump construct the adjudication calls with an
-    // empty `delivery_id` (they are pure), and every adjudication passes
-    // through here before hitting the wire. Directed capability calls
-    // carry none.
-    let delivery_id = match &call {
-        ServerCall::Approve { .. } | ServerCall::AskUserQuestion { .. } => {
-            Some(inner.next_delivery_id(session_id))
-        }
-        _ => None,
-    };
-    let call = match &delivery_id {
-        Some(d) => with_delivery_id(call, d),
-        None => call,
-    };
-    // Per-kind context needed to apply the reply, extracted before `call`
-    // moves into the Request envelope.
-    let ctx = match &call {
-        ServerCall::Approve { auth_id, .. } => ReplyCtx::Approve {
-            auth_id: auth_id.clone(),
-        },
-        ServerCall::AskUserQuestion { auth_id, input, .. } => {
-            // PR-5a (C4): the plan review rides the ASK channel — the
-            // gateway-minted single-question shape (question id +
-            // `intent.kind` `plan-review`, `auth_id` = the plan file) is
-            // the discriminator. A model-issued ask never carries it (the
-            // ask tool contract forbids model-side plan approval asks).
-            if is_plan_review_input(input) {
-                ReplyCtx::PlanReview {
-                    plan_file: auth_id.clone(),
-                }
-            } else {
-                ReplyCtx::AskUser {
-                    auth_id: auth_id.clone(),
-                }
-            }
-        }
-        _ => ReplyCtx::Other, // β-3b-ii: BrowserOp/ClipboardRead/OpenExternal (capability seam).
-    };
-    // §D.4 + PR-4: adjudication kinds (Approve / AskUserQuestion — and,
-    // since PR-5a, the plan review riding the ask channel) fan out to
-    // EVERY owner that declared the capability — the settle policy is
-    // kind-scoped: an `AskUserQuestion` answers on the FIRST claim (the
-    // rest are cancelled with a terminal frame), `Approve` keeps all-next
-    // / any-deny, fail-closed (see [`crate::waterfall`]). Capability calls
-    // (BrowserOp/...) stay single-target.
-    let adjudication = matches!(
-        ctx,
-        ReplyCtx::Approve { .. } | ReplyCtx::AskUser { .. } | ReplyCtx::PlanReview { .. }
-    );
-
-    // Register a waiter per eligible owner under the clients lock (brief —
-    // register is synchronous).
-    let targets = {
-        let owners = inner.owners(session_id);
-        let clients = inner.clients.lock();
-        owners
-            .iter()
-            // One lookup carries both the eligibility filter and the entry
-            // (round 4 §3.4): the old filter + `expect("just checked")` pair
-            // indexed the map twice and panicked the moment the two views
-            // disagreed.
-            .filter_map(|cid| {
-                let entry = clients.get(cid).filter(|e| e.hello.can(kind))?;
-                // Deterministic MsgId per kind so a client without bridge
-                // state can correlate its Reply: Approve/AskUser echo the
-                // auth_id the card carries (for the plan-review ask the
-                // auth_id IS the plan file — one pending review per
-                // session); capability calls mint a fresh opaque id.
-                let id = match &ctx {
-                    ReplyCtx::Approve { auth_id }
-                    | ReplyCtx::AskUser { auth_id }
-                    | ReplyCtx::PlanReview { plan_file: auth_id } => MsgId::new(auth_id.clone()),
-                    ReplyCtx::Other => inner.next_call_id(),
-                };
-                // GW2: `register` refuses a duplicate MsgId (the first
-                // waiter stays live). A duplicate here means the same
-                // adjudication is being routed twice to one peer — a routing
-                // bug (double pump / duplicated owner row). Fail closed for
-                // this target: skip it; if every target is skipped the
-                // empty-targets path below denies/expires the call.
-                match entry.peer.register(id.clone()) {
-                    Some(rx) => Some((cid.clone(), entry.generation, entry.conn.clone(), rx, id)),
-                    None => {
-                        tracing::error!(
-                            session = %session_id,
-                            client = %cid,
-                            msg_id = %id.0,
-                            "duplicate ServerCall registration for the same MsgId \
-                             (double-routed adjudication); skipping target fail-closed"
-                        );
-                        None
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-    if targets.is_empty() {
-        fail_closed(inner, session_id, &ctx);
-        return;
-    }
-
-    if adjudication {
-        // §D.6 replay registry: live from fan-out until `apply_reply`
-        // settles it — any owner joining this session in the window gets
-        // the same call re-delivered. Registration stays synchronous on
-        // the pump (register-before-join): a later join can never miss a
-        // call whose waterfall has already started.
-        inner.register_pending_adjudication(
-            session_id,
-            PendingAdjudication {
-                key: ctx
-                    .settle_key()
-                    .expect("adjudication kinds all carry a settle key"),
-                kind,
-                ctx: ctx.clone(),
-                call: call.clone(),
-                targets: targets
-                    .iter()
-                    .map(|(cid, generation, ..)| (cid.clone(), *generation))
-                    .collect(),
+        // The live notice feeds the facade; the store call is the durable half
+        // (journal row + sidecar). Its outcome is what the caller can honestly
+        // report — a session another process is driving takes neither leg.
+        thread.handle_notice(BackendNotice::Event(Box::new(
+            manox_agent::thread::ThreadEvent::TitleChanged {
+                title: title.to_string(),
             },
-        );
-        // GW3: one cancel token per recipient. The registry entry is
-        // inserted HERE, synchronously on the pump (alongside the replay
-        // registration) — never from the spawned task — so a dispose
-        // sweeping `pending_deliveries` can never race past a delivery that
-        // has been routed but not yet started: the tokens exist the moment
-        // the call is live, and the sweep's cancels fold into the
-        // waterfall's first funnel recv as expired replies.
-        let tokens: HashMap<String, tokio_util::sync::CancellationToken> = targets
-            .iter()
-            .map(|(cid, ..)| (cid.clone(), tokio_util::sync::CancellationToken::new()))
-            .collect();
-        let delivery_id = delivery_id.expect("stamped above for exactly the adjudication kinds");
-        inner.pending_deliveries.lock().insert(
-            delivery_id.clone(),
-            PendingDelivery {
-                session_id: session_id.to_string(),
-                tokens: tokens.clone(),
-            },
-        );
-        // §0: the waterfall await is the human-facing wait — it runs on its
-        // own runtime task (the replay's spawned waiter is the precedent),
-        // never on the pump's stack. A parked adjudication therefore cannot
-        // stall the session's event bookkeeping (turn settle, queued-submit
-        // drain, deferred reap). Termination is structural either way: the
-        // `DeliveryGuard` unregisters on settle, and session teardown
-        // sweeps the delivery's tokens
-        // (`cancel_deliveries_for_session`).
-        let inner = Arc::clone(inner);
-        let adjudication = Adjudication {
-            session_id: session_id.to_string(),
-            kind,
-            ctx,
-            call,
-            targets,
-            delivery_id,
-            tokens,
-        };
-        manox_agent::runtime::handle().spawn(async move {
-            route_waterfall(inner, adjudication).await;
-        });
-        return;
+        )));
+        manox_agent::thread_store::global().with_mut(|s| s.rename_thread(session_id, title))
     }
-
-    let (conn, rx, id) = {
-        let (_, _, conn, rx, id) = targets.into_iter().next().expect("non-empty checked");
-        (conn, rx, id)
-    };
-    conn.send_to_client(FromServer::Request { id, call });
-    let outcome = match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-        Ok(Ok(o)) => o,
-        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-    };
-    if outcome.is_err() {
-        // Plan §5.2: a timed-out / errored call must surface the reason,
-        // mirroring the no-owner fail-closed path.
-        inner.note_error(session_id, "capability call timed out or cancelled");
-    }
-    apply_reply(inner, session_id, ctx, outcome);
 }
 
-/// §D.4 fan-out/fan-in: deliver the adjudication Request to every target,
-/// funnel their replies into a [`crate::waterfall::Waterfall`], and apply
-/// the SETTLING reply's payload (the first rejection / lapse, the first
-/// claim under `AskUserQuestion`, or the final next under the quorum).
-/// Every recipient still waiting at settlement gets a
-/// [`ServerNote::DeliveryCancelled`] frame (PR-4) on its current
-/// connection — the card it holds is terminal, "handled on another
-/// client" is the convergence, not a lapse.
+// ── Client capabilities (the engine's window into the frontend). ─────────────
+
+/// Routes the engine's frontend capability calls to the AHP client that
+/// declared them.
 ///
-/// One adjudication delivery: (client id, connection generation, connection,
-/// reply receiver, deterministic MsgId).
-type AdjudicationTarget = (
-    String,
-    u64,
-    Arc<dyn RpcConnection>,
-    async_channel::Receiver<Result<Value, RpcError>>,
-    MsgId,
-);
-
-/// §0: one fully prepared adjudication delivery — `route_call` registers
-/// the replay record and the GW3 delivery synchronously, then hands this
-/// bundle to the spawned waterfall task.
-struct Adjudication {
-    session_id: String,
-    kind: AnswerKind,
-    ctx: ReplyCtx,
-    call: ServerCall,
-    targets: Vec<AdjudicationTarget>,
-    delivery_id: String,
-    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
-}
-
-/// One unsettled adjudication, kept so every owner that joins the session
-/// later — re-open, re-own, or a handshake re-declaring the session —
-/// receives the same still-live call (§D.6 replay). `call` carries the
-/// original `delivery_id` (the client-side reply correlation is per
-/// delivery; the engine settle is per `auth_id` and first-wins).
-#[derive(Clone)]
-struct PendingAdjudication {
-    key: String,
-    kind: AnswerKind,
-    ctx: ReplyCtx,
-    call: ServerCall,
-    /// Owners holding a live reply waiter for this call, as
-    /// (client id, connection generation). One row per owner at most: the
-    /// generation is the handshake that minted the waiter, so a re-seat's
-    /// replay cannot mistake a same-cid waiter belonging to another
-    /// connection's call for its own (GW2 forbids duplicates only within one
-    /// generation). Replay re-sends without registering only while that
-    /// exact waiter is open on the owner's current connection.
-    targets: Vec<(String, u64)>,
-}
-
-/// GW3: one registered in-flight delivery — the owning session (the
-/// dispose-sweep key, see [`AgentServerInner::cancel_deliveries_for_session`])
-/// and the per-recipient cancel tokens.
-struct PendingDelivery {
-    session_id: String,
-    tokens: HashMap<String, tokio_util::sync::CancellationToken>,
-}
-
-/// GW3: unregister a delivery when its waterfall settles — and cancel the
-/// tokens of any recipient that never answered, so their reply-waiter tasks
-/// exit promptly instead of parking forever. Drop-based (the
-/// [`PumpExitGuard`] pattern): the spawned waterfall task's teardown in any
-/// exit shape (settle, panic unwind, runtime shutdown) still unregisters.
-/// §0: the guard holds the `Arc` (not a pump-stack borrow) precisely
-/// because the waterfall no longer runs on the pump's stack — its Drop can
-/// outlive every pump.
-struct DeliveryGuard {
-    inner: Arc<AgentServerInner>,
-    delivery_id: String,
-}
-
-impl Drop for DeliveryGuard {
-    fn drop(&mut self) {
-        let mut deliveries = self.inner.pending_deliveries.lock();
-        if let Some(entry) = deliveries.remove(&self.delivery_id) {
-            for token in entry.tokens.values() {
-                token.cancel();
-            }
-        }
-    }
-}
-
-/// GW3: rebuild an adjudication variant with the gateway-minted
-/// `delivery_id` (the single stamping point — see `route_call`);
-/// capability calls pass through untouched (they carry no delivery identity).
-fn with_delivery_id(call: ServerCall, delivery_id: &str) -> ServerCall {
-    match call {
-        ServerCall::Approve {
-            session_id,
-            auth_id,
-            tool_name,
-            summary,
-            input,
-            ..
-        } => ServerCall::Approve {
-            delivery_id: delivery_id.to_string(),
-            session_id,
-            auth_id,
-            tool_name,
-            summary,
-            input,
-        },
-        ServerCall::AskUserQuestion {
-            session_id,
-            auth_id,
-            input,
-            ..
-        } => ServerCall::AskUserQuestion {
-            delivery_id: delivery_id.to_string(),
-            session_id,
-            auth_id,
-            input,
-        },
-        ServerCall::InvokeClientTool {
-            session_id,
-            client_id,
-            tool_call_id,
-            name,
-            input,
-            ..
-        } => ServerCall::InvokeClientTool {
-            delivery_id: delivery_id.to_string(),
-            session_id,
-            client_id,
-            tool_call_id,
-            name,
-            input,
-        },
-        other => other,
-    }
-}
-
-/// One recipient's delivery lifecycle event, funneled from its waiter task.
-enum DeliveryEvent {
-    /// The client answered: `Ok` = answered next, `Err` = explicit rejection.
-    Reply(Result<Value, RpcError>),
-    /// The delivery lapsed without a human action (`CancelDelivery`, a
-    /// dispose sweep, or a closed channel) — kept distinct from a rejection
-    /// because the policies converge differently: a lapse fails a Unanimous
-    /// quorum immediately but only removes a FirstClaim claimant.
-    Expired(RpcError),
-    /// §D.6: the gateway replaced this owner's connection. The delivery's
-    /// settle obligation transfers to the replayed waiter on the new
-    /// connection — this waterfall drops the recipient without rejecting.
-    Reseated,
-}
-
-async fn route_waterfall(inner: Arc<AgentServerInner>, a: Adjudication) {
-    let Adjudication {
-        session_id,
-        kind,
-        ctx,
-        call,
-        targets,
-        delivery_id,
-        tokens,
-    } = a;
-    let (funnel_tx, mut funnel_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, DeliveryEvent)>();
-    // PR-4 (C2): the settle policy is kind-scoped — an `AskUserQuestion`
-    // (the plan review rides it too) is one truth so the FIRST claim
-    // settles; `Approve` keeps the all-next / any-deny quorum.
-    let mut waterfall = match kind {
-        AnswerKind::AskUserQuestion => {
-            crate::waterfall::Waterfall::first_claim(session_id.clone(), sorted_ids(&targets))
-        }
-        _ => crate::waterfall::Waterfall::new(session_id.clone(), sorted_ids(&targets)),
-    };
-    // PR-4: the cancel frames owed at settlement ride each recipient's
-    // CURRENT connection (a mid-window re-seat is served by the replay
-    // funnel, never by this map).
-    let conns: HashMap<String, Arc<dyn RpcConnection>> = targets
-        .iter()
-        .map(|(cid, _, conn, ..)| (cid.clone(), conn.clone()))
-        .collect();
-    // GW3: `tokens` were minted and registered by `route_call` before this
-    // task was spawned (the dispose sweep must never race a routed-but-
-    // unregistered delivery). A `CancelDelivery` from a recipient — or the
-    // session's dispose sweep — flips a token; the waiter below folds that
-    // into the funnel as an expired reply, converging the waterfall
-    // fail-closed through the SAME path a lapse takes (no parallel
-    // cancellation semantics).
-    let _delivery_guard = DeliveryGuard {
-        inner: Arc::clone(&inner),
-        delivery_id: delivery_id.clone(),
-    };
-    for (cid, _generation, conn, rx, id) in targets {
-        conn.send_to_client(FromServer::Request {
-            id,
-            call: call.clone(),
-        });
-        let tx = funnel_tx.clone();
-        let token = tokens
-            .get(&cid)
-            .expect("every target registered a token")
-            .clone();
-        manox_agent::runtime::handle().spawn(async move {
-            // PR-0a: a human answerer is awaited with NO wall-clock deadline
-            // (dsh semantics: a pending interaction lives until the human
-            // answers, the delivery is explicitly withdrawn, or the client
-            // channel closes). Convergence is event-driven — an answered reply,
-            // a `CancelDelivery` (the token below), or a re-seat / dead-
-            // connection resolving the waiter — never a clock. The engine gate
-            // remains first-wins, so a late answer after a hand-off is inert.
-            let event = tokio::select! {
-                _ = token.cancelled() => DeliveryEvent::Expired(
-                    RpcError::new(-1, "delivery withdrawn by client (cancelDelivery)").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
-                ),
-                replied = rx.recv() => match replied {
-                    // The re-seat cancel resolves this waiter with a coded
-                    // Err — the one Err outcome that is a hand-off, not a
-                    // delivery failure or a rejection.
-                    Ok(Err(e)) if e.stable_code() == Some(manox_protocol::msg::CODE_CLIENT_RESEATED) => {
-                        DeliveryEvent::Reseated
-                    }
-                    // A delivered reply payload — an answer (`Ok`) or an
-                    // explicit rejection (`Err`). Both are a human acting on
-                    // the card; a rejection settles the waterfall against the
-                    // call (fail-closed), never as a lapse.
-                    Ok(o) => DeliveryEvent::Reply(o),
-                    // The channel closed with no reply (peer disconnected, or a
-                    // teardown resolved nothing): the delivery lapsed without a
-                    // human action — fail-closed, NOT a wall-clock timeout
-                    // (PR-0a removed the clock; this arm replaces the old
-                    // timeout-expiry).
-                    Err(_) => DeliveryEvent::Expired(
-                        RpcError::new(-1, "adjudication delivery closed before an answer").with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
-                    ),
-                },
-            };
-            let _ = tx.send((cid, event));
-        });
-    }
-    drop(funnel_tx);
-    let mut settled: Option<Result<Value, RpcError>> = None;
-    // The most recent answered-next payload: a re-seat that completes the
-    // all-next quorum settles with the surviving answer.
-    let mut last_ok: Option<Value> = None;
-    let mut reseat_seen = false;
-    while let Some((cid, event)) = funnel_rx.recv().await {
-        let outcome = match event {
-            DeliveryEvent::Reseated => {
-                reseat_seen = true;
-                // The only settle `abandon` produces is Unanimous Allowed
-                // (this removal completed the all-next quorum, so an answer
-                // is already cached); FirstClaim never settles on hand-off.
-                if waterfall.abandon(&cid).is_some() {
-                    settled = Some(Ok(
-                        last_ok.expect("an Allowed quorum holds an answered delivery")
-                    ));
-                    break;
-                }
-                continue;
-            }
-            DeliveryEvent::Reply(o) => o,
-            DeliveryEvent::Expired(err) => Err(err),
-        };
-        let next = outcome.is_ok();
-        if let Ok(value) = &outcome {
-            last_ok = Some(value.clone());
-        }
-        if waterfall.reply(&cid, next).is_some() {
-            settled = Some(outcome);
-            break;
-        }
-    }
-    // A re-seat hands the undecided deliveries to the §D.6 replay's fresh
-    // waiters: this waterfall must not settle them — an Err would deny a
-    // call the replay can still answer, and an Error note would report a
-    // hand-off as a failure. This exit's `DeliveryGuard` drop also cancels
-    // the surviving co-recipients' tokens: their deliveries are silently
-    // retired until they rejoin, where the replay re-mints their waiters —
-    // no cancel frame is owed on a hand-off, and none is sent.
-    if settled.is_none() && reseat_seen {
-        return;
-    }
-    let outcome = settled.unwrap_or_else(|| {
-        Err(
-            RpcError::new(-1, "adjudication unsettled (all deliveries expired)")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
-        )
-    });
-    if outcome.is_err() {
-        inner.note_error(&session_id, "adjudication rejected or lapsed (no answer)");
-    }
-    // PR-4: every recipient still holding the card when the waterfall
-    // settled is owed the terminal frame — an answer elsewhere (or the
-    // quorum's failure) is not a lapse on THEIR side. This replaces the
-    // GW9 `verdict_failure` Error-note naming (the per-client view is
-    // exactly "this delivery is over").
-    for cid in waterfall.cancelled_recipients() {
-        if let Some(conn) = conns.get(&cid) {
-            conn.send_to_client(FromServer::Notification {
-                note: ServerNote::DeliveryCancelled {
-                    delivery_id: delivery_id.clone(),
-                },
-            });
-        }
-    }
-    apply_reply(&inner, &session_id, ctx, outcome);
-}
-
-fn sorted_ids(targets: &[AdjudicationTarget]) -> Vec<String> {
-    let mut ids = targets
-        .iter()
-        .map(|(cid, ..)| cid.clone())
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids
-}
-
-/// Per-`ServerCall` context carried out of the lock to apply the reply.
-#[derive(Clone)]
-enum ReplyCtx {
-    Approve {
-        auth_id: String,
-    },
-    AskUser {
-        auth_id: String,
-    },
-    /// PR-5a (C4): the plan review delivered as an `AskUserQuestion` card.
-    /// The settle identity is the plan file (one pending review per
-    /// session); the `auth_id` the card carries IS the plan file, so the
-    /// deterministic MsgId, the replay key, and the verdict target
-    /// coincide.
-    PlanReview {
-        plan_file: String,
-    },
-    Other,
-}
-
-impl ReplyCtx {
-    /// Identity of the adjudication this context settles: the deterministic
-    /// reply MsgId minus its envelope. `None` for capability calls, which
-    /// have no re-routable identity.
-    fn settle_key(&self) -> Option<String> {
-        match self {
-            ReplyCtx::Approve { auth_id } | ReplyCtx::AskUser { auth_id } => Some(auth_id.clone()),
-            ReplyCtx::PlanReview { plan_file } => Some(plan_file.clone()),
-            ReplyCtx::Other => None,
-        }
-    }
-}
-
-fn fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, ctx: &ReplyCtx) {
-    match ctx {
-        ReplyCtx::Approve { auth_id } => {
-            respond_auth_fail_closed(inner, session_id, auth_id.clone())
-        }
-        ReplyCtx::AskUser { auth_id } => {
-            respond_ask_fail_closed(inner, session_id, auth_id.clone())
-        }
-        // GW9: an unreviewable plan is a fail-closed rejection like any
-        // other — converge the pending-review state instead of leaving the
-        // session parked forever (the bare Error note was the pre-fix
-        // behavior; it cleared nothing). PR-5a (C4): the review rides the
-        // ask channel.
-        ReplyCtx::PlanReview { .. } => converge_plan_rejected(
-            inner,
-            session_id,
-            "no client can review this plan".to_string(),
-        ),
-        ReplyCtx::Other => {}
-    }
-}
-
-fn apply_reply(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    ctx: ReplyCtx,
-    outcome: Result<Value, RpcError>,
-) {
-    // Settlement retires the replay record first: a later owner joining
-    // after this point must not be re-delivered a settled call.
-    if let Some(key) = ctx.settle_key() {
-        inner.retire_pending_adjudication(session_id, &key);
-    }
-    match ctx {
-        ReplyCtx::Approve { auth_id } => apply_approve_reply(inner, session_id, auth_id, outcome),
-        ReplyCtx::AskUser { auth_id } => apply_ask_reply(inner, session_id, auth_id, outcome),
-        ReplyCtx::PlanReview { plan_file } => {
-            apply_plan_review(inner, session_id, plan_file, outcome)
-        }
-        ReplyCtx::Other => {}
-    }
-}
-
-fn respond_auth_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth_id: String) {
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| {
-            t.respond_authorization(
-                &auth_id,
-                manox_agent::permission::ToolAuthorizationResponse::Decision(
-                    manox_agent::permission::PermissionDecision::Deny,
-                ),
-            )
-        });
-    }
-    inner.note_error(session_id, "no client can answer this approval");
-    clear_pending_auth_if_settled(inner, session_id);
-}
-
-fn apply_approve_reply(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    auth_id: String,
-    outcome: Result<Value, RpcError>,
-) {
-    let allow = match outcome {
-        Ok(v) => v.get("allow").and_then(Value::as_bool).unwrap_or(false),
-        Err(_) => false,
-    };
-    let response = if allow {
-        manox_agent::permission::ToolAuthorizationResponse::Decision(
-            manox_agent::permission::PermissionDecision::AllowOnce,
-        )
-    } else {
-        manox_agent::permission::ToolAuthorizationResponse::Decision(
-            manox_agent::permission::PermissionDecision::Deny,
-        )
-    };
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| t.respond_authorization(&auth_id, response));
-    }
-    clear_pending_auth_if_settled(inner, session_id);
-}
-
-/// B2-PR-1 **transitional reply reader** for `apply_ask_reply`.
-///
-/// Accepts BOTH shapes and converges them to the canonical variant
-/// (`manox_agent::permission::AskAnswer`), so a pre-L1 client keeps working
-/// for exactly one release while paired clients ship the new shape:
-/// - NEW canonical: `{"answers": [{"id", "selected": [labels], "custom"?}]}`
-///   — id-routed tri-state (skip = empty `selected` with no `custom`).
-/// - OLD positional: `{"answers": [["question text", "answer text"], …]}`
-///   — joined by the question TEXT against the parked card's input; an
-///   answer whose question text is unknown is dropped. The old CARD-LEVEL
-///   `response: string` override is mapped into the canonical supplement
-///   vocabulary: it folds as a `custom` on the FIRST parked question (it
-///   always dismissed the whole card for the model, and the model-facing
-///   renderer reads `custom` as a supplemental note), and a non-empty old
-///   `response` also converts the old empty-answers default into one
-///   synthesized row instead of silently dropping the user's free text.
-///
-/// RETIREMENT: delete this both-read — accept ONLY the canonical shape — once
-/// the paired manox-app PR (canonical reply writer) is merged AND one
-/// manox-server release has shipped (the same no-lockstep window the plan's
-/// "transitional both-read, single write" calls for).
-fn parse_ask_answers(
-    parked_input: Option<&serde_json::Value>,
-    v: &serde_json::Value,
-) -> Vec<manox_agent::permission::AskAnswer> {
-    use manox_agent::permission::AskAnswer;
-    fn question_text(q: &serde_json::Value) -> &str {
-        q.get("question").and_then(Value::as_str).unwrap_or("")
-    }
-    let questions = parked_input
-        .and_then(|i| i.get("questions"))
-        .and_then(|q| q.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let parse_canonical = |arr: &[Value]| -> Vec<AskAnswer> {
-        arr.iter()
-            .filter_map(|p| {
-                let id = p.get("id").and_then(Value::as_str)?;
-                if id.trim().is_empty() || !p.get("selected").is_some_and(Value::is_array) {
-                    return None; // not a canonical row — drop, never guess
-                }
-                let selected: Vec<String> = p["selected"]
-                    .as_array()
-                    .map(|s| {
-                        s.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Some(AskAnswer::new(
-                    id.to_string(),
-                    selected,
-                    p.get("custom").and_then(Value::as_str).map(String::from),
-                ))
-            })
-            .collect()
-    };
-    let parse_legacy = |arr: &[Value]| -> Vec<AskAnswer> {
-        arr.iter()
-            .filter_map(|p| {
-                let q = p.get(0).and_then(Value::as_str)?;
-                let a = p.get(1).and_then(Value::as_str).unwrap_or("");
-                let id = questions
-                    .iter()
-                    .find(|it| question_text(it) == q)
-                    .and_then(|it| it.get("id"))
-                    .and_then(Value::as_str)?;
-                Some(AskAnswer::new(
-                    id.to_string(),
-                    Vec::new(),
-                    (!a.is_empty()).then(|| a.to_string()),
-                ))
-            })
-            .collect()
-    };
-    let mut answers = match v.get("answers").and_then(Value::as_array) {
-        Some(arr) if arr.iter().all(|p| p.is_array()) => parse_legacy(arr),
-        Some(arr) => parse_canonical(arr),
-        None => Vec::new(),
-    };
-    // Transitional mapping of the removed card-level `response` override
-    // (old clients only — canonical replies never carry the key).
-    if let Some(legacy_response) = v.get("response").and_then(Value::as_str)
-        && !legacy_response.trim().is_empty()
-    {
-        if let Some(first) = answers.iter_mut().find(|a| a.custom.is_none()) {
-            first.custom = Some(legacy_response.to_string());
-        } else if let Some(first_q) = questions
-            .first()
-            .and_then(|q| q.get("id"))
-            .and_then(Value::as_str)
-        {
-            answers.insert(
-                0,
-                AskAnswer::new(
-                    first_q.to_string(),
-                    Vec::new(),
-                    Some(legacy_response.to_string()),
-                ),
-            );
-        }
-    }
-    answers
-}
-
-fn apply_ask_reply(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    auth_id: String,
-    outcome: Result<Value, RpcError>,
-) {
-    let outcome: manox_agent::questions::AskOutcome = match outcome {
-        // PR-0b (server-first): a client that lets the user CLOSE the card to
-        // speak replies with an explicit `dismissed` marker (a top-level bool,
-        // or the report's canonical `outcome: "dismissed"`). A non-answer that
-        // is neither a rejection nor a lapse. Old clients never send it, so the
-        // answer path is byte-for-byte unchanged for them; the manox-app side
-        // of this marker is a coordinated batch-2 change.
-        Ok(v)
-            if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
-                || v.get("outcome").and_then(Value::as_str) == Some("dismissed") =>
-        {
-            manox_agent::questions::AskOutcome::Dismissed
-        }
-        Ok(v) => {
-            // B2-PR-1: the reply is parsed through the transitional
-            // both-read, single-write reader above; everything the gate
-            // receives is canonical, id-routed tri-state. The parked card's
-            // input is read from the SAME session-thread borrow as the
-            // settle, so the question-text → id map for old-shape replies
-            // always describes THIS auth_id's card.
-            let answers = inner
-                .session_thread(session_id)
-                .map(|thread| {
-                    thread.with_mut(|t| {
-                        let parked = t
-                            .pending_question_entries()
-                            .into_iter()
-                            .find(|(id, _)| id == &auth_id)
-                            .map(|(_, meta)| meta.input);
-                        parse_ask_answers(parked.as_ref(), &v)
-                    })
-                })
-                .unwrap_or_default();
-            manox_agent::questions::AskOutcome::Answered(answers)
-        }
-        // The reply never arrived as an answer (a withdrawn delivery, a
-        // disconnected peer, or an abandoned replay waiter — NOT a wall-clock
-        // timeout, which PR-0a removed for human adjudications): an explicit
-        // non-answer. An empty `AskUserQuestion` would read to the model as the
-        // user answering nothing on purpose.
-        Err(_) => manox_agent::questions::AskOutcome::Expired,
-    };
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| t.respond_question(&auth_id, outcome));
-    }
-    clear_pending_auth_if_settled(inner, session_id);
-}
-
-fn respond_ask_fail_closed(inner: &Arc<AgentServerInner>, session_id: &str, auth_id: String) {
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| {
-            t.respond_question(&auth_id, manox_agent::questions::AskOutcome::Expired)
-        });
-    }
-    inner.note_error(session_id, "no client can answer this question");
-    clear_pending_auth_if_settled(inner, session_id);
-}
-
-/// U3b: the verdict-time pending-auth clear. The store flag drops when the
-/// LAST authorization settles (the facade's pending set is the truth — a
-/// concurrent second authorization keeps the badge up) and the §D.5 delta
-/// tells the mirrors. This replaces the desktop's heuristic clears (tool
-/// traffic past a parked authorization), which only ever ran in-proc and
-/// only for one client.
-fn clear_pending_auth_if_settled(inner: &Arc<AgentServerInner>, session_id: &str) {
-    // The badge rises for both families (they share the authorization
-    // event), so it may only fall when BOTH gates are empty — a concurrent
-    // ask keeps a settled approval's card company on screen.
-    let settled = inner.session_thread(session_id).is_none_or(|t| {
-        t.read(|t| t.pending_auth_entries().is_empty() && t.pending_question_entries().is_empty())
-    });
-    if !settled {
-        return;
-    }
-    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_auth(session_id, false));
-    inner.broadcast_host(host_status(session_id, |f| {
-        f.pending_auth = Some(false);
-    }));
-}
-
-/// U3b: the verdict-time pending-plan clear — the kernel flag is consumed
-/// by the verdict arms themselves; this drops the store mirror and tells
-/// the §D.5 delta (formerly a desktop-local write, which left every other
-/// client's badge stale). The reject/expire path has its own convergence
-/// (`converge_plan_rejected`, GW9).
-fn clear_pending_plan_flags(inner: &Arc<AgentServerInner>, session_id: &str) {
-    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(session_id, false));
-    inner.broadcast_host(host_status(session_id, |f| {
-        f.pending_plan = Some(false);
-    }));
-}
-
-/// PR-5a (C4): the three plan-review options — the approval verdict
-/// vocabulary the review card offers (Fresh is gone: the gateway never
-/// carried an execute-fresh arm, and re-asking from a clean slate is a
-/// client-local action, not a server verdict). Model-facing English.
-const PLAN_REVIEW_APPROVE: &str = "Approve";
-const PLAN_REVIEW_APPROVE_COMPACT: &str = "Approve & compact";
-const PLAN_REVIEW_REFINE: &str = "Request changes";
-
-/// PR-5a (C4): the gateway-minted plan-review card. One `AskUserQuestion`
-/// question: `question` is the plan title, `detail` the plan body (the
-/// markdown the client renders), `intent.kind = plan-review` with
-/// `approve = "Approve"` — the vocabulary that marks the card as a plan
-/// review for both the discriminator below and any client surface.
-/// The reply maps through [`apply_plan_review`].
-fn plan_review_ask_input(plan_file: &str, title: &str, content: Option<String>) -> Value {
-    json!({
-        "questions": [{
-            "id": plan_file,
-            "question": title,
-            "header": "plan-review",
-            "multiSelect": false,
-            "detail": content.unwrap_or_default(),
-            "intent": { "kind": "plan-review", "approve": PLAN_REVIEW_APPROVE },
-            "options": [
-                { "label": PLAN_REVIEW_APPROVE, "description": "Execute the plan as written." },
-                { "label": PLAN_REVIEW_APPROVE_COMPACT, "description": "Execute, then compact the conversation." },
-                { "label": PLAN_REVIEW_REFINE, "description": "Stay in plan mode and revise the plan." },
-            ],
-        }]
-    })
-}
-
-/// PR-5a (C4): the discriminator between a plan-review card and a
-/// model-issued question — the gateway-minted single question carries the
-/// plan file as its `id` AND `intent.kind = plan-review`. A model ask
-/// never matches both (its ids are uuid-minted or model-chosen, and the
-/// ask contract forbids model-side approval asks).
-fn is_plan_review_input(input: &Value) -> bool {
-    let Some(question) = input
-        .get("questions")
-        .and_then(Value::as_array)
-        .and_then(|q| q.first())
-    else {
-        return false;
-    };
-    question.get("id").and_then(Value::as_str).is_some()
-        && question
-            .get("intent")
-            .and_then(|i| i.get("kind"))
-            .and_then(Value::as_str)
-            == Some("plan-review")
-}
-
-/// PR-5a (C4): map the canonical tri-state reply of a plan-review card to
-/// the semantic verdict. Returns `None` when the reply carries no
-/// well-formed canonical row (the caller treats that as a rejection —
-/// never a silent no-decision):
-/// - `"Approve & compact"` selected → `"compact"`,
-/// - `"Approve"` selected → `"keep"`,
-/// - `"Request changes"`, free-text custom, or an explicit skip
-///   (`selected: []`, no custom) → `"refine"` (plan mode stays, the
-///   review flag retires).
-fn parse_plan_verdict(v: &Value) -> Option<&'static str> {
-    let row = v.get("answers").and_then(Value::as_array).and_then(|arr| {
-        arr.iter().find(|p| {
-            p.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.is_empty())
-                && p.get("selected").is_some_and(Value::is_array)
-        })
-    })?;
-    let selected = row["selected"].as_array()?;
-    let pick = |label: &str| selected.iter().any(|s| s.as_str() == Some(label));
-    if pick(PLAN_REVIEW_APPROVE_COMPACT) {
-        Some("compact")
-    } else if pick(PLAN_REVIEW_APPROVE) {
-        Some("keep")
-    } else {
-        Some("refine") // "Request changes" / custom / skip
-    }
-}
-
-/// PR-5a (C4): settle a plan review delivered as an `AskUserQuestion`
-/// card. Approve keeps, approve-&-compact compacts, anything else the
-/// user answered with refines (flag consumed, plan mode stays on) —
-/// except
-/// DISMISSED: closing the card to speak is not a rejection (dsh
-/// `ASK_CANCELLED`); the review flag retires, plan mode stays on, the
-/// turn already ended at `ProposePlan`, and the session simply waits for
-/// the user's next message. Only a LAPSE (withdrawn delivery, dead
-/// connection, abandoned replay waiter — no human action) keeps GW9's
-/// fail-closed convergence.
-fn apply_plan_review(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    plan_file: String,
-    outcome: Result<Value, RpcError>,
-) {
-    let dismissed = matches!(&outcome, Ok(v)
-        if v.get("dismissed").and_then(Value::as_bool).unwrap_or(false)
-            || v.get("outcome").and_then(Value::as_str) == Some("dismissed"));
-    let verdict: String = match (
-        dismissed,
-        outcome.as_ref().ok().and_then(|v| parse_plan_verdict(v)),
-    ) {
-        (true, _) => "dismissed",
-        (false, Some(v)) => v,
-        // No canonical row at all: an RPC-level rejection or a lapse —
-        // both fail closed (GW9 convergence).
-        (false, None) => "rejected",
-    }
-    .to_string();
-    if verdict == "rejected" {
-        // `converge_plan_rejected` owns EVERY plane (kernel flag, store,
-        // §D.5 delta, Error note) and the parked-turn cancel — clear not
-        // twice, converge here.
-        return converge_plan_rejected(
-            inner,
-            session_id,
-            "plan review rejected or expired".to_string(),
-        );
-    }
-    // Every human action (verdict or dismissal) consumes the review:
-    // kernel flag off, store mirror + delta off.
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| t.set_plan_review_pending(false));
-    }
-    clear_pending_plan_flags(inner, session_id);
-    match verdict.as_str() {
-        "dismissed" | "refine" => {
-            // Both keep plan mode; the model waits for the next message.
-        }
-        keep_or_compact @ ("keep" | "compact") => {
-            let Some(thread) = inner.session_thread(session_id) else {
-                return;
-            };
-            let compact = keep_or_compact == "compact";
-            let seed_text =
-                match manox_agent::collaboration_mode::render_plan_mode_approved(&plan_file) {
-                    Ok(text) => text,
-                    Err(e) => {
-                        thread.handle_notice(BackendNotice::Event(Box::new(ThreadEvent::Error(e))));
-                        return;
-                    }
-                };
-            let compact_instructions = compact
-                .then(|| manox_agent::collaboration_mode::plan_compact_instructions(&plan_file));
-            thread.with_mut(|t| {
-                let ui = MessageUiMetadata {
-                    model_id: t.model().map(|m| m.id.clone()),
-                    approval_mode: Some(t.permission_mode().as_i64()),
-                    author: Some(t.self_author()),
-                    ..Default::default()
-                };
-                t.approve_plan(compact, compact_instructions, seed_text, Some(ui));
-            });
-        }
-        _ => {}
-    }
-}
-
-/// Converge a plan review that will never be answered — rejected, expired,
-/// or unreviewable (GW9). Fail-closed: the plan does NOT execute; every
-/// pending-review plane is cleared so the session stays operable instead of
-/// parking forever, and the parked turn is cancelled so its `TurnFinished`
-/// settles normally through the pump. `message` names the cause (who
-/// rejected / which delivery expired) and rides an Error note to the owners.
-///
-/// Extracted as a free function so the timeout path (a 300s `CALL_TIMEOUT`
-/// wait, unreachable inside a unit test) is testable by direct call.
-fn converge_plan_rejected(inner: &Arc<AgentServerInner>, session_id: &str, message: String) {
-    if let Some(thread) = inner.session_thread(session_id) {
-        thread.with_mut(|t| {
-            // Kernel flag: no stale review card re-surfaces on restart.
-            t.set_plan_review_pending(false);
-            // Cancel the parked turn so TurnFinished arrives and the pump's
-            // settlement path runs (running=false, queued-submit drain).
-            t.cancel();
-        });
-    }
-    // Store flag: the sidebar badge / ListThreads snapshot clears.
-    manox_agent::thread_store::global().with_mut(|s| s.mark_pending_plan(session_id, false));
-    // §D.5 status delta: every connection's pending_plan mirror clears.
-    inner.broadcast_host(host_status(session_id, |f| {
-        f.pending_plan = Some(false);
-    }));
-    // K3: the decision entry lands with the journal work.
-    inner.note_error(session_id, &message);
-}
-
-/// Route a capability `ServerCall` (BrowserOp/ClipboardRead/OpenExternal) to the
-/// owning ∩ capable client and return its Reply outcome. Unlike `route_call`,
-/// the reply is returned to the kernel (the engine's capability call awaits
-/// it), not applied internally — there is no engine-side auth/verdict state to
-/// mutate.
-async fn route_capability_call(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    call: ServerCall,
-) -> Result<Value, RpcError> {
-    let kind = answer_kind_for(&call);
-    let id = inner.next_call_id();
-    let target = {
-        let owners = inner.owners(session_id);
-        let clients = inner.clients.lock();
-        owners
-            .iter()
-            // Same single-lookup shape as the fan-out site above (§3.4).
-            .filter_map(|cid| Some((cid, clients.get(cid).filter(|e| e.hello.can(kind))?)))
-            .next()
-            .and_then(|(cid, entry)| {
-                // GW2: a fresh `call-N` id cannot collide unless a previous
-                // waiter for it is still registered; refuse the delivery
-                // fail-closed rather than clobbering the earlier waiter.
-                match entry.peer.register(id.clone()) {
-                    Some(rx) => Some((entry.conn.clone(), rx)),
-                    None => {
-                        tracing::error!(
-                            session = %session_id,
-                            client = %cid,
-                            msg_id = %id.0,
-                            "duplicate capability-call registration for the same MsgId; \
-                             failing closed"
-                        );
-                        None
-                    }
-                }
-            })
-    };
-    let Some((conn, rx)) = target else {
-        return Err(
-            RpcError::new(-1, "no client can answer this capability call")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
-        );
-    };
-    conn.send_to_client(FromServer::Request { id, call });
-    match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-        Ok(Ok(o)) => o,
-        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-    }
-}
-
-/// [`route_capability_call`] pinned to ONE client: an embedder tool
-/// invocation must reach the client that registered the tool (its
-/// implementation lives host-side), not whichever capable owner answers
-/// first. Same registration/timeout contract as the general form.
-async fn route_capability_call_to(
-    inner: &Arc<AgentServerInner>,
-    session_id: &str,
-    target_client: &str,
-    call: ServerCall,
-) -> Result<Value, RpcError> {
-    let kind = answer_kind_for(&call);
-    let id = inner.next_call_id();
-    let target = {
-        let owners = inner.owners(session_id);
-        if !owners.iter().any(|cid| cid == target_client) {
-            None
-        } else {
-            let clients = inner.clients.lock();
-            clients
-                .get(target_client)
-                .filter(|entry| entry.hello.can(kind))
-                .and_then(|entry| match entry.peer.register(id.clone()) {
-                    Some(rx) => Some((entry.conn.clone(), rx)),
-                    None => {
-                        tracing::error!(
-                            session = %session_id,
-                            client = %target_client,
-                            msg_id = %id.0,
-                            "duplicate capability-call registration for the same MsgId; failing closed"
-                        );
-                        None
-                    }
-                })
-        }
-    };
-    let Some((conn, rx)) = target else {
-        return Err(RpcError::new(
-            -1,
-            format!("client {target_client} cannot answer this capability call"),
-        )
-        .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
-    };
-    conn.send_to_client(FromServer::Request { id, call });
-    match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
-        Ok(Ok(o)) => o,
-        _ => Err(RpcError::new(-1, "capability call timed out or cancelled")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)),
-    }
-}
-
-/// The AgentServer's `CapabilityClient` impl: the kernel's `browser_op` is
-/// routed as a `ServerCall::BrowserOp` to the owning ∩ BrowserOp-capable
-/// client; the reply (a serialized `BrowserReply`) is returned to the engine.
-/// Registered as the provider in γ/δ (replacing the gpui BrowserHost); tested
-/// in-process here.
-pub struct AgentServerCapabilityClient(Arc<AgentServerInner>);
+/// The capability belongs to whichever client is watching the session, and AHP
+/// makes that a declaration (`serverRequests`) rather than a guess: the
+/// candidate set is the session channel's subscribers filtered by their own
+/// claim. There is no second transport to fall back to, so a session with no
+/// declared owner for a capability is a **refusal** — the engine's fail-closed
+/// contract depends on that being an error rather than a quiet no-op.
+pub(crate) struct AgentServerCapabilityClient;
 
 impl AgentServerCapabilityClient {
-    /// Wrap an `AgentServer` so the kernel's `browser_op` routes to its clients.
-    pub fn new(server: &AgentServer) -> Self {
-        Self(server.0.clone())
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
-/// The shared spine of every `CapabilityClient` method on
-/// [`AgentServerCapabilityClient``] (review #777): resolve the calling
-/// session from the `CURRENT_SESSION` task-local, build the session-scoped
-/// `ServerCall`, and route it — the caller only supplies the call builder
-/// and the reply mapping. `what` names the capability in the error when no
-/// session context exists.
-async fn route_session_capability(
-    inner: &Arc<AgentServerInner>,
-    what: &str,
-    call_for: impl FnOnce(String) -> ServerCall,
-) -> Result<Value, String> {
+
+/// Ask a session's AHP subscribers to perform `method`.
+///
+/// `Err` covers all three failure shapes — no AHP host, no session context, no
+/// declared client, a client that failed — because the engine's contract is the
+/// same for each: fail closed, never invent a reply.
+async fn route_session_capability(method: &str, params: Value) -> Result<Value, String> {
     let session_id = manox_agent::capability::CURRENT_SESSION
         .try_with(|c| c.clone())
         .ok()
         .flatten()
-        .ok_or_else(|| format!("no session context for {what}"))?;
-    let call = call_for(session_id.clone());
-    route_capability_call(inner, &session_id, call)
+        .ok_or_else(|| format!("no session context for {method}"))?;
+    let runtime = manox_ahp_runtime::ahp::runtime::try_runtime()
+        .ok_or_else(|| no_capable_client_error(method))?;
+    if !runtime.has_capable_client(&session_id, method) {
+        return Err(no_capable_client_error(method));
+    }
+    runtime
+        .request_client(&session_id, method, params)
         .await
-        .map_err(|e| e.message)
+        .map_err(|error| error.message())
+}
+
+/// The refusal when no connected client can serve a capability call.
+fn no_capable_client_error(method: &str) -> String {
+    format!("no client can answer this capability call: {method}")
 }
 
 impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
@@ -5067,334 +2170,38 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
         op: manox_agent::thread_engine::BrowserOp,
     ) -> futures::future::BoxFuture<'static, Result<manox_agent::thread_engine::BrowserReply, String>>
     {
-        let inner = self.0.clone();
         Box::pin(async move {
             let op_value = serde_json::to_value(&op).map_err(|e| e.to_string())?;
-            let v = route_session_capability(&inner, "browser op", |session_id| {
-                ServerCall::BrowserOp {
-                    session_id,
-                    op: op_value.clone(),
-                }
-            })
-            .await?;
-            serde_json::from_value::<manox_agent::thread_engine::BrowserReply>(v)
-                .map_err(|e| e.to_string())
+            let reply = route_session_capability(manox_ahp::ext::requests::BROWSER_OP, op_value)
+                .await
+                .map_err(|e| format!("browser op failed: {e}"))?;
+            serde_json::from_value(reply).map_err(|e| format!("browser reply invalid: {e}"))
         })
     }
 
-    /// The kernel's clipboard read routed as a `ServerCall::ClipboardRead`
-    /// to the owning ∩ ClipboardRead-capable client. The reply carries
-    /// `{data: base64, mimeType}` (or `null` = empty / not text) per the
-    /// server-call contract; non-text content fails closed rather than
-    /// decoding garbage into the model's context. Note the deliberate v1
-    /// surface (review #777): an `image/png` clipboard surfaces as that
-    /// same fail-closed error, not as rendered image feedback — relaxing
-    /// this to decode image payloads (a base64 image content block) is a
-    /// future, explicitly-designed change, not an oversight.
     fn clipboard_read(
         &self,
     ) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
-        let inner = self.0.clone();
         Box::pin(async move {
-            let v = route_session_capability(&inner, "clipboard read", |session_id| {
-                ServerCall::ClipboardRead { session_id }
-            })
-            .await?;
-            if v.is_null() {
-                return Ok(None);
-            }
-            let data = v
-                .get("data")
-                .and_then(|d| d.as_str())
-                .ok_or_else(|| "clipboard reply missing data".to_string())?;
-            let mime = v
-                .get("mimeType")
-                .and_then(|m| m.as_str())
-                .unwrap_or("text/plain");
-            if !mime.starts_with("text/") {
-                return Err(format!("clipboard holds non-text content ({mime})"));
-            }
-            let bytes = manox_protocol::base64_bytes::decode(data).map_err(|e| e.to_string())?;
-            String::from_utf8(bytes)
-                .map(Some)
-                .map_err(|e| format!("clipboard text is not valid UTF-8: {e}"))
+            let reply =
+                route_session_capability(manox_ahp::ext::requests::CLIPBOARD_READ, Value::Null)
+                    .await?;
+            Ok(reply.as_str().map(str::to_string))
         })
     }
 
-    /// The kernel's opener routed as a `ServerCall::OpenExternal` to the
-    /// owning ∩ OpenExternal-capable client. The host reply payload is `{}`
-    /// — the confirmation itself is the result.
     fn open_external(
         &self,
         url: String,
     ) -> futures::future::BoxFuture<'static, Result<(), String>> {
-        let inner = self.0.clone();
         Box::pin(async move {
-            route_session_capability(&inner, "open external", |session_id| {
-                ServerCall::OpenExternal { session_id, url }
-            })
+            route_session_capability(
+                manox_ahp::ext::requests::OPEN_EXTERNAL,
+                serde_json::json!({ "url": url }),
+            )
             .await
             .map(|_| ())
         })
-    }
-}
-
-/// The settable subset of a `SessionStatus` delta (§D.5).
-#[derive(Default)]
-struct SessionStatusDelta {
-    running: Option<bool>,
-    errored: Option<bool>,
-    unread: Option<bool>,
-    pending_auth: Option<bool>,
-    pending_plan: Option<bool>,
-    background_work: Option<bool>,
-}
-
-/// Build a `SessionStatus` delta (§D.5): only the fields the closure sets
-/// travel; clients merge monotonically (unread only rises until focus,
-/// errored edge-set, running latest-wins).
-fn host_status(session_id: &str, set: impl FnOnce(&mut SessionStatusDelta)) -> HostEvent {
-    let mut d = SessionStatusDelta::default();
-    set(&mut d);
-    HostEvent::SessionStatus {
-        session_id: session_id.to_string(),
-        running: d.running,
-        errored: d.errored,
-        unread: d.unread,
-        pending_auth: d.pending_auth,
-        pending_plan: d.pending_plan,
-        background_work: d.background_work,
-    }
-}
-
-// ── Event pump. ─────────────────────────────────────────────────────────────
-fn spawn_pump(
-    inner: Arc<AgentServerInner>,
-    session_id: String,
-    thread: ThreadHandle,
-    turn_active: Arc<AtomicBool>,
-    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    // Subscribe synchronously so the receiver is registered before any
-    // broadcast (a subscribe inside the task can lose events fired before
-    // the task is first polled).
-    let rx = thread.subscribe();
-    // GW2 observability: the live pump count is spawned minus finished; the
-    // exit guard bumps `finished` even when the task is aborted (the abort
-    // drops the future, running the guard's Drop).
-    inner.pumps_spawned.fetch_add(1, Ordering::SeqCst);
-    manox_agent::runtime::handle().spawn(async move {
-        let _exit_guard = PumpExitGuard(Arc::clone(&inner));
-        loop {
-            // GW2: the pump is terminable — `ServerSession::stop_pump`
-            // cancels this token (waking a pump parked in `recv`) and the
-            // callers additionally abort the JoinHandle (covering a pump
-            // parked inside a long `route_call` await below, which never
-            // re-enters this select). Pre-fix the loop was a bare
-            // `while let Ok(ev) = rx.recv().await`: the pump's own
-            // `ThreadHandle` clone kept the unbounded subscription open
-            // forever, so a "disposed" session's pump leaked process-wide
-            // and a reopen spawned a SECOND pump on the same thread — every
-            // `ToolCallAuthorization` was then routed twice, and the
-            // duplicate `RpcPeer::register` auto-denied the approval (GW2).
-            let ev = tokio::select! {
-                _ = cancel.cancelled() => break,
-                received = rx.recv() => match received {
-                    Ok(ev) => ev,
-                    // Every sender dropped: the thread is gone.
-                    Err(_) => break,
-                },
-            };
-            // Bookkeeping that mirrors the legacy host pump: thread-store list
-            // flags and the queued-follow-up drain. T10 (§D.6): no v1 notes
-            // are emitted here — translate only carries adjudication calls.
-            match &*ev {
-                ThreadEvent::TurnStarted => {
-                    turn_active.store(true, Ordering::SeqCst);
-                    let id = session_id.clone();
-                    manox_agent::thread_store::global().with_mut(|s| {
-                        s.mark_running(&id);
-                        s.set_errored(&id, false);
-                    });
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.running = Some(true);
-                        f.errored = Some(false);
-                    }));
-                }
-                ThreadEvent::TurnFinished {
-                    cancelled, failed, ..
-                } => {
-                    turn_active.store(false, Ordering::SeqCst);
-                    let id = session_id.clone();
-                    // GW5: no store-side unread mirror write — unread is
-                    // client-owned. (Pre-fix this arm wrote
-                    // `set_unread(id, true)` when the server's single-slot
-                    // `focused` mirror named another session; the slot is
-                    // gone and clients derive unread from the delta below.)
-                    manox_agent::thread_store::global().with_mut(|s| {
-                        s.mark_idle(&id);
-                        s.mark_pending_auth(&id, false);
-                        s.mark_pending_plan(&id, false);
-                        if !*failed {
-                            s.set_errored(&id, false);
-                        }
-                    });
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.running = Some(false);
-                        f.pending_auth = Some(false);
-                        f.pending_plan = Some(false);
-                        // GW5: the settle edge ALWAYS raises unread — the
-                        // server cannot know which of N clients is looking
-                        // (the single-slot focus mirror pretended it could,
-                        // and the desktop never even sent FocusThread).
-                        // Clients clear their own badge locally on focus.
-                        f.unread = Some(true);
-                    }));
-                    if !*cancelled {
-                        let drained = pending_submits.lock().drain(..).collect::<Vec<_>>();
-                        let drained_any = !drained.is_empty();
-                        let mut batch_origin: Option<String> = None;
-                        if drained_any {
-                            thread.with_mut(|t| {
-                                for q in drained {
-                                    if q.origin.is_some() {
-                                        batch_origin = q.origin.clone();
-                                    }
-                                    let content = to_message_content(q.text, q.images);
-                                    t.insert_user_message_with_content_and_ui_metadata(
-                                        content,
-                                        Some(q.ui),
-                                    );
-                                }
-                            });
-                        }
-                        thread.with_mut(|t| {
-                            if drained_any || t.has_pending_prompts() {
-                                t.set_pending_turn_origin(batch_origin);
-                                t.run_turn();
-                            }
-                        });
-                    }
-                    // Deferred reap (GW2 follow-up): an orphaned session
-                    // (last owner detached or disconnected mid-turn) kept
-                    // its entry and pump through this settle so the
-                    // bookkeeping above could converge the store flags;
-                    // reap it now unless the drain just started a follow-up
-                    // turn (`is_running` is the facade's synchronous truth —
-                    // run_turn sets it, the settle path cleared it before
-                    // this event was pushed). Dropping the entry runs
-                    // ServerSession::Drop → stop_pump; this loop exits on
-                    // the cancelled token at its next select.
-                    if inner.owners(&session_id).is_empty() && !thread.read(|t| t.is_running()) {
-                        inner.sessions.lock().remove(&session_id);
-                        inner.clear_embedder_tools(&session_id);
-                        // §0: the deferred reap terminates the session —
-                        // sweep any still-parked adjudication so its
-                        // waterfall converges fail-closed instead of
-                        // outliving the session on its own task.
-                        inner.cancel_deliveries_for_session(&session_id);
-                    }
-                }
-                ThreadEvent::ToolCallAuthorization { .. } => {
-                    let id = session_id.clone();
-                    manox_agent::thread_store::global()
-                        .with_mut(|s| s.mark_pending_auth(&id, true));
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.pending_auth = Some(true);
-                    }));
-                }
-                ThreadEvent::Error(_) => {
-                    let id = session_id.clone();
-                    // U3b: the Error edge idles the store and clears the
-                    // adjudication badges server-side — the desktop mirror
-                    // blocks that covered these gaps (mark_idle,
-                    // pending_auth) are redundant now and retire after the
-                    // desktop list migration.
-                    manox_agent::thread_store::global().with_mut(|s| {
-                        s.mark_idle(&id);
-                        s.set_errored(&id, true);
-                        s.mark_pending_plan(&id, false);
-                        s.mark_pending_auth(&id, false);
-                        s.mark_background_work(&id, false);
-                    });
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.errored = Some(true);
-                        f.running = Some(false);
-                        f.pending_plan = Some(false);
-                        f.pending_auth = Some(false);
-                        f.background_work = Some(false);
-                    }));
-                }
-                ThreadEvent::PlanReady { plan_file, title } => {
-                    let id = session_id.clone();
-                    manox_agent::thread_store::global()
-                        .with_mut(|s| s.mark_pending_plan(&id, true));
-                    thread.with_mut(|t| t.set_plan_review_pending(true));
-                    // §D.5: the pending_plan TRUE edge broadcasts like the
-                    // pending_auth one — without it client mirrors only ever
-                    // see the false edge (GW1 delivery finding) and a list
-                    // badge cannot rise until the next explicit ListThreads.
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.pending_plan = Some(true);
-                    }));
-                    // PR-5a (C4): the review rides the ASK channel — the
-                    // plan body becomes the card's `detail` (markdown),
-                    // the three verdict options are server-minted, and the
-                    // `intent` marks it as a plan review. GW3:
-                    // `delivery_id` is stamped at the single routing
-                    // point (`route_call`), never at construction.
-                    route_call(
-                        &inner,
-                        &session_id,
-                        ServerCall::AskUserQuestion {
-                            delivery_id: String::new(),
-                            session_id: session_id.clone(),
-                            auth_id: plan_file.clone(),
-                            input: plan_review_ask_input(
-                                plan_file,
-                                title,
-                                std::fs::read_to_string(plan_file).ok(),
-                            ),
-                        },
-                    )
-                    .await;
-                    continue;
-                }
-                ThreadEvent::BackgroundTaskUpdated { .. } => {
-                    let id = session_id.clone();
-                    // Computed OUTSIDE the store write lock (it takes the
-                    // background-task registry lock — nesting it inside was a
-                    // U8-class lock-order hazard) and broadcast: §D.5 lists
-                    // background work as a SessionStatus delta, and client
-                    // mirrors previously only learned it at the next
-                    // ListThreads.
-                    let active = manox_agent::background_task::thread_has_running_tasks(&id);
-                    manox_agent::thread_store::global()
-                        .with_mut(|s| s.mark_background_work(&id, active));
-                    inner.broadcast_host(host_status(&session_id, |f| {
-                        f.background_work = Some(active);
-                    }));
-                }
-                _ => {}
-            }
-            match translate(&ev, &session_id) {
-                Translated::Call(call) => route_call(&inner, &session_id, call).await,
-                Translated::Skip => {}
-            }
-        }
-    })
-}
-
-/// Map a `ServerCall` to the `AnswerKind` its answerer must declare.
-fn answer_kind_for(call: &ServerCall) -> AnswerKind {
-    match call {
-        ServerCall::Approve { .. } => AnswerKind::Approve,
-        ServerCall::AskUserQuestion { .. } => AnswerKind::AskUserQuestion,
-        ServerCall::BrowserOp { .. } => AnswerKind::BrowserOp,
-        ServerCall::ClipboardRead { .. } => AnswerKind::ClipboardRead,
-        ServerCall::OpenExternal { .. } => AnswerKind::OpenExternal,
-        ServerCall::InvokeClientTool { .. } => AnswerKind::ClientTool,
     }
 }
 
@@ -5422,42 +2229,6 @@ fn parse_slash(text: &str) -> Option<(String, String)> {
     let name = name.trim();
     (!name.is_empty()).then(|| (name.to_string(), args.trim_start().to_string()))
 }
-
-fn deduped_models(models: Vec<manox_harness::types::Model>) -> Vec<manox_harness::types::Model> {
-    let mut seen = std::collections::HashSet::new();
-    models
-        .into_iter()
-        .filter(|m| seen.insert((m.provider.clone(), m.id.clone())))
-        .collect()
-}
-
-fn model_to_wire(model: &manox_harness::types::Model) -> ModelInfo {
-    ModelInfo {
-        id: model.id.clone(),
-        name: manox_agent::provider_glue::display_name(model),
-        provider: model.provider.clone(),
-        provider_name: Some(manox_agent::provider_glue::display_provider_name(model)),
-        api: model.api.clone(),
-        context_window: model.context_window as u32,
-        max_tokens: Some(model.max_tokens as u32),
-        // U2 cross-domain #4: the config key + agents visibility — the
-        // external-CLI launch cascade's columns (config_id falls back to
-        // the model id; empty/absent agents = visible to all).
-        config_id: Some(manox_agent::provider_glue::config_id(model)),
-        agents: model
-            .metadata
-            .get("agents")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            }),
-    }
-}
-
-#[cfg(test)]
-mod tests;
 
 // ── Embedder tool bridge (dspo/manox-app#11): RegisterSessionTools store +
 // the engine-facing provider whose adapters round-trip executions to the
@@ -5490,8 +2261,6 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
             .flat_map(|(client_id, tools)| {
                 tools.iter().map(move |spec| {
                     std::sync::Arc::new(EmbedderToolAdapter {
-                        inner: self.0.clone(),
-                        session_id: session_id.to_string(),
                         client_id: client_id.clone(),
                         client_name: manox_agent::embedder_tools::client_tool_name(&spec.name),
                         spec: spec.clone(),
@@ -5506,8 +2275,6 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
 /// host's verbatim; execution routes to the registering client and the
 /// reply's `{content, isError}` settles the call.
 struct EmbedderToolAdapter {
-    inner: Arc<AgentServerInner>,
-    session_id: String,
     client_id: String,
     spec: ClientToolSpec,
     /// The sanitized model-facing name, computed once at construction —
@@ -5550,20 +2317,21 @@ impl manox_harness::tool::AgentTool for EmbedderToolAdapter {
         _signal: tokio_util::sync::CancellationToken,
         _ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        let call = with_delivery_id(
-            ServerCall::InvokeClientTool {
-                delivery_id: String::new(),
-                session_id: self.session_id.clone(),
-                client_id: self.client_id.clone(),
-                tool_call_id: tool_call_id.to_string(),
-                name: self.spec.name.clone(),
-                input: params,
-            },
-            &self.inner.next_delivery_id(&self.session_id),
-        );
-        let reply = route_capability_call_to(&self.inner, &self.session_id, &self.client_id, call)
-            .await
-            .map_err(|e| manox_harness::tool::ToolError::ExecutionFailed(e.message))?;
+        // The tool belongs to the client that registered it, and AHP's
+        // declaration is what names that client, so the request is addressed
+        // by capability rather than by the id captured at registration time
+        // (which a reconnecting client would have replaced).
+        let reply = route_session_capability(
+            manox_ahp::ext::requests::INVOKE_TOOL,
+            serde_json::json!({
+                "clientId": self.client_id,
+                "toolCallId": tool_call_id,
+                "name": self.spec.name,
+                "input": params,
+            }),
+        )
+        .await
+        .map_err(manox_harness::tool::ToolError::ExecutionFailed)?;
         let content = reply
             .get("content")
             .and_then(|c| c.as_str())
