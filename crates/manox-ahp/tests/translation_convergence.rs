@@ -303,3 +303,193 @@ fn scripted_journal_covers_the_groups_the_gate_cares_about() {
         assert!(tags.iter().any(|tag| tag == required), "missing {required}");
     }
 }
+
+/// A mid-run steer is `Steering`, not `Queued` — and it is not published twice.
+///
+/// A manox steer is injected into the *running* turn and journalled as an
+/// ordinary `user` row; it does not close the turn and does not wait for the
+/// next one. AHP draws that distinction in `PendingMessageKind`: `Steering`
+/// lands in `ChatState.steeringMessage` (consumed by the turn it interrupts),
+/// `Queued` lands in `ChatState.queuedMessages` (carried into the *next*
+/// turn). Translating a steer as `Queued` therefore does not merely mislabel it:
+/// the row is still sitting in the queue when the next turn starts, so the same
+/// text is injected a second time.
+fn mid_run_steer_journal() -> Vec<JournalWireEntry> {
+    let events = vec![
+        // The turn the user is watching.
+        Message {
+            role: "user".to_string(),
+            content: vec![serde_json::json!({"type": "text", "text": "run the tests"})],
+            usage: None,
+            origin_rpc: Some("rpc-submit".to_string()),
+            display: None,
+        },
+        TurnStart,
+        AgentTextDelta {
+            s: "Starting.".to_string(),
+        },
+        // The steer: a `user` row that arrives with the turn still open. The
+        // id is the client's steer id, which is also the id its
+        // `chat/pendingMessageSet{kind: steering}` echo carried.
+        Message {
+            role: "user".to_string(),
+            content: vec![serde_json::json!({"type": "text", "text": "use the fast suite"})],
+            usage: None,
+            origin_rpc: Some("steer-1".to_string()),
+            display: None,
+        },
+        AgentTextDelta {
+            s: "Using the fast suite.".to_string(),
+        },
+        TurnFinish {
+            cancelled: false,
+            failed: false,
+            stranded_steer_ids: Vec::new(),
+        },
+    ];
+
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(seq, event)| JournalWireEntry {
+            seq: seq as u64,
+            id: if seq == 3 {
+                // The engine keys the injected row by the client's steer id.
+                "steer-1".to_string()
+            } else {
+                format!("sentry-{seq}")
+            },
+            parent_id: (seq > 0).then(|| {
+                if seq == 3 {
+                    "sentry-2".to_string()
+                } else {
+                    format!("sentry-{}", seq - 1)
+                }
+            }),
+            timestamp: format!("2026-09-23T01:00:{seq:02}.000Z"),
+            event,
+        })
+        .collect()
+}
+
+/// The actions the translator emits for the mid-run steer scenario, reduced.
+fn mid_run_steer_state() -> ChatState {
+    let mut translator = Translator::new();
+    let mut state = manox_ahp::channels::chat::initial("c-1");
+    for entry in mid_run_steer_journal() {
+        for emitted in translator.on_entry("c-1", "s-1", &entry) {
+            ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+        }
+    }
+    state
+}
+
+#[test]
+fn a_mid_run_steer_is_steering_not_queued() {
+    let mut translator = Translator::new();
+    let mut seen = Vec::new();
+    for entry in mid_run_steer_journal() {
+        for emitted in translator.on_entry("c-1", "s-1", &entry) {
+            if let ahp_types::actions::StateAction::ChatPendingMessageSet(set) = &emitted.action {
+                seen.push((format!("{:?}", set.kind), set.id.clone()));
+            }
+        }
+    }
+    // Two pending messages, and that is correct: the opening submission is a
+    // genuine queue entry (the turn carries it as its first message), while the
+    // steer is not. What must never happen is the steer appearing as a *second*
+    // queued entry, or under a second id.
+    let kinds: Vec<&str> = seen.iter().map(|(kind, _)| kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["Queued", "Steering"],
+        "the submission queues; the mid-run steer is injected, not queued (got {seen:?})"
+    );
+    let (_, steer_id) = &seen[1];
+    assert_eq!(
+        steer_id, "steer-1",
+        "the pending id must be the client's steer id — the identity its echo \
+         and the host's `steer` intent both use; a translator-minted id can be \
+         retired by neither"
+    );
+    // The id is unique: a pending message the client cannot match against the
+    // one it already holds is what produced two entries for one steer.
+    let ids: Vec<&str> = seen.iter().map(|(_, id)| id.as_str()).collect();
+    assert_eq!(
+        ids.len(),
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        "pending ids must be distinct: {ids:?}"
+    );
+}
+
+#[test]
+fn a_consumed_steer_leaves_no_queued_residue() {
+    let state = mid_run_steer_state();
+    let queued = state.queued_messages.unwrap_or_default();
+    assert!(
+        queued.is_empty(),
+        "the steer must not remain queued: a queued entry is re-injected as a \
+         fresh user message by the next `turnStarted`, running the same text \
+         twice (residue: {queued:?})"
+    );
+}
+
+/// A later turn does not inherit the steer.
+///
+/// This is the consequence the kind fix exists for. The translator's contract
+/// ends at "the steer is `Steering`, not `Queued`": it publishes no removal,
+/// because the removal belongs to whoever observes the injection. What the fold
+/// must show is that nothing carries the text forward — a `Queued` entry is
+/// re-injected as a fresh user message by the next `turnStarted`.
+///
+/// The removal itself is asserted where it is emitted, on the host path
+/// (`manox-ahp-runtime`'s dispatch), since this test drives the translator
+/// alone and so never sees it.
+#[test]
+fn a_steer_is_not_replayed_by_a_later_turn() {
+    let mut translator = Translator::new();
+    let mut state = manox_ahp::channels::chat::initial("c-1");
+    for entry in mid_run_steer_journal() {
+        for emitted in translator.on_entry("c-1", "s-1", &entry) {
+            ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+        }
+    }
+
+    // The steer reached the running turn, so the turn's opening message is
+    // still the original submission — not the steer.
+    let turn = state
+        .turns
+        .last()
+        .expect("the scripted journal opens a turn");
+    assert_eq!(
+        turn.message.text, "run the tests",
+        "the steer is injected into the running turn; it must not replace or \
+         reopen it"
+    );
+
+    // Now the next turn starts. Nothing may carry the steer forward.
+    let next = JournalWireEntry {
+        seq: 99,
+        id: "sentry-99".to_string(),
+        parent_id: Some("sentry-5".to_string()),
+        timestamp: "2026-09-23T01:01:00.000Z".to_string(),
+        event: TurnStart,
+    };
+    for emitted in translator.on_entry("c-1", "s-1", &next) {
+        ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+    }
+    let queued = state.queued_messages.clone().unwrap_or_default();
+    assert!(
+        !queued.iter().any(|m| m.id == "steer-1"),
+        "the next turn must not inherit the steer: {queued:?}"
+    );
+    // The steering slot itself is retired by the host's removal, not by the
+    // fold — see the dispatch test. Assert it is still the CLIENT's id here, so
+    // that removal has something to match.
+    assert_eq!(
+        state.steering_message.as_ref().map(|m| m.id.as_str()),
+        Some("steer-1"),
+        "the pending steering entry keeps the client's id, which is what the \
+         host's removal matches on"
+    );
+}

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, Weak};
 
-use ahp_types::actions::{ActionOrigin, StateAction};
+use ahp_types::actions::{ActionOrigin, ChatPendingMessageRemovedAction, StateAction};
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
     AgentInfo, ChatState, RootState, SessionModelInfo, SessionState, SessionSummary, TerminalState,
@@ -998,10 +998,29 @@ impl Backend for RuntimeBackend {
                 // the echo retirement share.
                 let text = set.message.text.clone();
                 let target = session_id.to_string();
-                match self.server.steer(&target, &set.id, text) {
-                    Ok(_) => DispatchOutcome::Accepted,
-                    Err(error) => DispatchOutcome::Rejected(error.message),
+                let receipt = match self.server.steer(&target, &set.id, text) {
+                    Ok(receipt) => receipt,
+                    Err(error) => return DispatchOutcome::Rejected(error.message),
+                };
+                // An injected steer is consumed by the turn it interrupted, and
+                // AHP clears `steeringMessage` only when a matching removal
+                // arrives — nothing clears it on turn end. So the host owes that
+                // removal the moment the injection is confirmed; without it the
+                // client keeps rendering a steer that is already in the
+                // transcript, and a later turn inherits the residue.
+                if receipt.get("injected").and_then(Value::as_bool) == Some(true)
+                    && let Some(host) = self.host()
+                {
+                    host.publish(
+                        channel,
+                        StateAction::ChatPendingMessageRemoved(ChatPendingMessageRemovedAction {
+                            kind: ahp_types::state::PendingMessageKind::Steering,
+                            id: set.id.clone(),
+                        }),
+                        None,
+                    );
                 }
+                DispatchOutcome::Accepted
             }
             StateAction::ChatPendingMessageRemoved(removed) => {
                 let Some(session_id) = chat::id(channel) else {

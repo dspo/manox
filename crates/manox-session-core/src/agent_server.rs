@@ -1575,7 +1575,7 @@ impl AgentServerInner {
         // A steer removes its own parked follow-up so the turn-end drain does
         // not resend the same text as a plain follow-up.
         pending_submits.lock().retain(|q| q.client_id != message_id);
-        thread.with_mut(|t| {
+        let injected = thread.with_mut(|t| {
             let ui = MessageUiMetadata {
                 model_id: t.model().map(|m| m.id.clone()),
                 approval_mode: Some(t.permission_mode().as_i64()),
@@ -1587,9 +1587,11 @@ impl AgentServerInner {
                 // the facade so the optimistic bubble, the injected `user`
                 // journal row, and the echo retirement share one identity.
                 t.enqueue_steer(content, Some(ui), Some(message_id.clone()));
+                true
             } else {
                 t.insert_user_message_with_content_and_ui_metadata(content, Some(ui));
                 t.run_turn();
+                false
             }
         });
         // T10 (§D.6): the `SteerPending` note mirror is gone — the steer's
@@ -1599,6 +1601,12 @@ impl AgentServerInner {
         Ok(json!({
             "accepted": true,
             "message_id": message_id,
+            // Whether the text went into the RUNNING turn or started one. The
+            // caller needs the difference: an injected steer is consumed by the
+            // turn it interrupted, so the pending message that announced it has
+            // to be retired, while a steer that started its own turn is carried
+            // by that turn like any other opening message.
+            "injected": injected,
         }))
     }
 

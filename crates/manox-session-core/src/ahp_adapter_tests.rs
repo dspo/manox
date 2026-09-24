@@ -1228,6 +1228,52 @@ mod dispatch {
             vec!["steer-1".to_string()],
             "the steer id is threaded, not re-minted"
         );
+
+        // The receipt has to say the text went into the RUNNING turn, because
+        // that is what the host keys the pending-message removal off: AHP clears
+        // `steeringMessage` only on a matching removal, so a receipt that hides
+        // the difference leaves the client rendering a steer whose text is
+        // already in the transcript.
+        let receipt = server
+            .ahp_inner()
+            .steer(
+                "s-dispatch",
+                "steer-2".to_string(),
+                "keep going".to_string(),
+                Vec::new(),
+                None,
+            )
+            .expect("a steer into a running turn is accepted");
+        assert_eq!(
+            receipt["injected"],
+            serde_json::json!(true),
+            "a steer into a running turn reports that it was injected: {receipt}"
+        );
+        assert_eq!(receipt["message_id"], serde_json::json!("steer-2"));
+
+        // And a steer with no turn running reports the opposite: it opens a
+        // turn of its own, so its pending entry is carried by that turn rather
+        // than retired.
+        server
+            .ahp_inner()
+            .session_thread("s-dispatch")
+            .expect("live session")
+            .with_mut(|t| t.set_running_for_test(false));
+        let opened = server
+            .ahp_inner()
+            .steer(
+                "s-dispatch",
+                "steer-3".to_string(),
+                "start fresh".to_string(),
+                Vec::new(),
+                None,
+            )
+            .expect("a steer with no turn running opens one");
+        assert_eq!(
+            opened["injected"],
+            serde_json::json!(false),
+            "a steer that opens its own turn is not an injection: {opened}"
+        );
         uninstall();
     }
 

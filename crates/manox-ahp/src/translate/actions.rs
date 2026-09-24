@@ -794,20 +794,44 @@ impl Translator {
                     agent: None,
                     meta: Some(manox_meta(row)),
                 };
-                // Published as a queued pending message immediately — a row that
-                // never starts a turn (an idle append) is still on the wire — and
-                // carried again by the next `turnStarted`, whose `queuedMessageId`
-                // is what removes it from the queue.
-                let id = format!("m-{}", entry.id);
+                // A `user` row means one of two different things, and AHP draws
+                // the distinction in the pending kind:
+                //
+                // - **A turn is open** — this is a manox *steer*: the text is
+                //   injected into the turn already running, the row does not
+                //   close it, and nothing carries it forward. It is `Steering`,
+                //   which is what the running turn consumes. It must NOT join
+                //   `pending_user`: that queue is drained by the next
+                //   `turn_start`, so leaving it there re-injects the same text
+                //   as a fresh user message once this turn ends.
+                // - **No turn is open** — an ordinary queued submission, which
+                //   the next `turn_start` carries as its opening message.
+                let steering = self.open.is_some();
+                // The steer id is the client's, not one this translator mints:
+                // the engine keys the injected row by it, the host's `steer`
+                // intent receives it as the pending id, and the client retires
+                // its optimistic echo against it. An `m-`-prefixed id invented
+                // here would leave all three naming something nobody else uses,
+                // so the echo and the row could never be reconciled.
+                let id = match (steering, origin_rpc) {
+                    (true, Some(rpc)) => rpc.to_string(),
+                    _ => format!("m-{}", entry.id),
+                };
                 out.push(Emitted::new(
                     chat,
                     StateAction::ChatPendingMessageSet(ChatPendingMessageSetAction {
-                        kind: PendingMessageKind::Queued,
+                        kind: if steering {
+                            PendingMessageKind::Steering
+                        } else {
+                            PendingMessageKind::Queued
+                        },
                         id: id.clone(),
                         message: message.clone(),
                     }),
                 ));
-                self.pending_user.push_back(PendingUser { id, message });
+                if !steering {
+                    self.pending_user.push_back(PendingUser { id, message });
+                }
             }
             "assistant" => {
                 let text = blocks_text(content);
