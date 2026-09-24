@@ -1,8 +1,6 @@
 //! Client-contributed session tools over the real host path.
 //!
-//! v2 serves this capability as `ClientCall::RegisterSessionTools`, so the
-//! acceptance rule ("everything v2 can do, the AHP face must do") makes it a W4
-//! blocker. AHP models it natively — a client dispatches
+//! AHP models a client-contributed tool set natively — a client dispatches
 //! `session/activeClientSet` carrying its own `SessionActiveClient`, whose
 //! `tools` field is the contribution — so these tests pin *both* halves of that
 //! claim:

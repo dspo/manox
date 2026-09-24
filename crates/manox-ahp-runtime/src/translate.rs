@@ -5,11 +5,7 @@
 //! **disk** vocabulary's projection, and it is total: every kernel entry maps to
 //! exactly one event, so a new variant cannot be added on the kernel side
 //! without this file failing to compile — which is the moment the AHP mapping
-//! table (and the v2 one, while it lives) must state where it belongs.
-//!
-//! The v2 *adjudication* translation (`ThreadEvent` → `ServerCall`) lives in the
-//! gateway, not here: it names the retiring protocol's vocabulary, and only the
-//! v2 pump consumes it.
+//! table must state where it belongs.
 
 use manox_harness::session::SessionTreeEntry;
 use manox_harness::types::AgentMessage;

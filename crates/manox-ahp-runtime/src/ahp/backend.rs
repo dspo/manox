@@ -592,7 +592,9 @@ struct SeededFacts {
 /// summary and the timestamps are the server's identity for it, so restating
 /// them from a possibly-stale snapshot would be a regression rather than an
 /// update.
-pub(crate) fn summary_delta(summary: &SessionSummary) -> ahp_types::notifications::PartialSessionSummary {
+pub(crate) fn summary_delta(
+    summary: &SessionSummary,
+) -> ahp_types::notifications::PartialSessionSummary {
     ahp_types::notifications::PartialSessionSummary {
         provider: Some(summary.provider.clone()),
         title: Some(summary.title.clone()),
@@ -1235,7 +1237,9 @@ impl Backend for RuntimeBackend {
                 if !self.server.has_session(&session_id) {
                     return Err(HostError::SessionNotFound(session_id));
                 }
-                self.server.compact(&session_id, instructions);
+                self.server
+                    .compact(&session_id, instructions)
+                    .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
             }
             manox_ahp::ext::commands::PLAN_EXECUTE => {
@@ -1248,7 +1252,9 @@ impl Backend for RuntimeBackend {
                 if !self.server.has_session(&session_id) {
                     return Err(HostError::SessionNotFound(session_id));
                 }
-                self.server.plan_seed(&session_id, plan_file);
+                self.server
+                    .plan_seed(&session_id, plan_file)
+                    .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
             }
             manox_ahp::ext::commands::GOAL => {

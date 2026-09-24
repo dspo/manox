@@ -645,6 +645,62 @@ mod dispatch {
         uninstall();
     }
 
+    /// A submit that lands mid-turn is parked and then drained into a
+    /// follow-up turn when the turn settles.
+    ///
+    /// The drain is the one piece of turn bookkeeping the gateway cannot
+    /// delegate: parking without draining strands the user's text forever,
+    /// and the receipt it already returned said the submission was accepted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_turn_submit_is_drained_into_a_follow_up_turn() {
+        let _guards = install();
+        let (server, _backend) = fixture().await;
+        let engine = attach_engine(&server);
+
+        // Park the session as busy the way the kernel does — the watcher's
+        // own `TurnStarted` arm is what makes the gateway see a running turn.
+        let inner = Arc::clone(server.ahp_inner());
+        let thread = inner.session_thread("s-dispatch").expect("live session");
+        thread.handle_notice(manox_agent::thread_engine::BackendNotice::Event(Box::new(
+            manox_agent::ThreadEvent::TurnStarted,
+        )));
+        await_until(|| server.turn_active_for_test("s-dispatch")).await;
+
+        // The submit intent is what parks: with the turn active the text
+        // cannot run now, so it must wait for the settle edge.
+        let parked = inner
+            .submit(
+                "owner",
+                "s-dispatch",
+                "queued text".to_string(),
+                Vec::new(),
+                None,
+                None,
+            )
+            .await
+            .expect("a parked submit still answers a receipt");
+        assert_eq!(parked["accepted"], serde_json::json!(true));
+        assert!(
+            engine.prompts.lock().is_empty(),
+            "a mid-turn submit must not start a run of its own"
+        );
+
+        // Settle: the parked text must become the follow-up run.
+        thread.handle_notice(manox_agent::thread_engine::BackendNotice::Settled {
+            cancelled: false,
+            failed: false,
+            steered: Vec::new(),
+            stranded: Vec::new(),
+        });
+        await_until(|| !engine.prompts.lock().is_empty()).await;
+        assert_eq!(
+            engine.prompts.lock().as_slice(),
+            ["queued text"],
+            "the drained batch runs as one follow-up turn, with its own text"
+        );
+        uninstall();
+    }
+
     /// Withdrawing a parked follow-up is real runtime work (the runtime holds
     /// the queue), so it is accepted rather than merely echoed.
     #[tokio::test(flavor = "multi_thread")]
@@ -863,6 +919,8 @@ mod dispatch {
     #[derive(Default)]
     struct RecordingEngine {
         cancelled: std::sync::atomic::AtomicUsize,
+        /// Every prompt the facade handed to a run, in order.
+        prompts: parking_lot::Mutex<Vec<String>>,
         questions: parking_lot::Mutex<Vec<(String, String)>>,
         auth: parking_lot::Mutex<Vec<(String, bool)>>,
         cwds: parking_lot::Mutex<Vec<std::path::PathBuf>>,
@@ -928,7 +986,9 @@ mod dispatch {
         fn model(&self) -> Option<manox_harness::types::Model> {
             None
         }
-        fn run(&self, _prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {}
+        fn run(&self, prompt: String, _content: Vec<manox_harness::types::ContentBlock>) {
+            self.prompts.lock().push(prompt);
+        }
         fn steer(
             &self,
             _prompt: String,
@@ -950,6 +1010,22 @@ mod dispatch {
         }
         fn session_list(&self) -> Vec<manox_agent::db::ThreadSummary> {
             Vec::new()
+        }
+    }
+
+    /// Poll `condition` to a deadline, yielding to the runtime between checks.
+    ///
+    /// The watcher and the drain run on the agent runtime, so a test that
+    /// asserts on their effect has to wait for a task it does not own; a bare
+    /// sleep would either be flaky or needlessly slow.
+    async fn await_until(condition: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !condition() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition never became true"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 

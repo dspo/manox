@@ -199,6 +199,10 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ## §F 删除清单（W4 收口；LOC 为当时实测）
 
+> **已执行，见 §H.5。** 本节保留为计划的原始账；实际拆法与它有两处出入
+> （`manox-session-core` 未整体删除，新增 `manox-ahp-runtime`），
+> 原因记在 H.2j 与 H.5①。
+
 ### F.1 manox
 
 - 删 `crates/manox-protocol/`：`msg.rs` 634 / `client.rs` 469 / `server.rs` 319 / `stream.rs` 479 / `surface.rs` 1032 / `transport.rs` 494 / `handshake.rs` 113 / `journal_stream.rs` 497 / `workspace.rs` 86 / `answer_kind.rs` 47 / `wire.rs` 95 + `tests/{surface_coverage,journal_proptest,journal_vectors}.rs`。
@@ -267,6 +271,8 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 - 按 §F 删除清单执行；`manox-napi` 改 AHP；文档补 §H as-built 章。
 - 门禁：全仓 `script/gates.sh`；**grep 门禁**（生产区零 `FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）；双路径一致性（in-proc typed ≡ WS serde）；`journal_replay_is_consistent_across_disk_reload` 仍绿。
 - 中间绿：删除面已零消费者。
+- **已执行（2026-09-24），结果见 §H.5**：六腿全绿、grep 门禁零命中、`manox-protocol` 已删。
+  遗留覆盖缺口记在 H.3。
 
 ### W5 硬化与生态
 
@@ -566,6 +572,22 @@ reconnect 快照腿、dispatch 句柄。
 
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
+**W4 遗留的覆盖缺口（本 PR 已知，须在 W5 前补）**：删掉的 `agent_server/tests.rs` 有 130 个
+测试，其中一部分覆盖的是**仍然存在**的行为，AHP 面尚无对应用例：
+
+- 会话生命周期的多客户端语义：`detach_keeps_turn_alive`、`single_connection_multiplexes_multiple_sessions`、
+  `reinitialize_same_client_id_reseats_and_reopen_loads`、`add_owner_is_idempotent_no_duplicate_notes`。
+  AHP 侧的对应物是 channel 订阅与 `session/activeClientSet`，但**没有等价用例**。
+- 单会话写入路径：`submit_streams_turn_started_then_finished`、`create_session_with_a_cold_persisted_id_restores_history`、
+  `open_session_replays_thread_history`、`set_cwd_after_interaction_moves_engine_not_project`、
+  `set_cwd_bind_mints_a_successor_and_supersedes_the_predecessor`、`cold_submit_does_not_auto_open`。
+- 审批/提问的 parked 语义：`approve_call_round_trips_and_unparks`、`ask_expires_when_the_holding_owner_disconnects`、
+  `parked_ask_replays_to_a_late_owner`、`dual_owner_ask_first_claim_settles`。这些在 AHP 面走
+  `chat/toolCallConfirmed` 与 `chat/inputCompleted`，**是 W5「多客户端并发与 owner 语义」的前置**。
+- **40 个 `JournalWireEvent` / 21 个 projection key 的端到端归宿审计**：v2 删除前必须逐个确认
+  每一项要么落在 AHP action/state、要么落在 `x-manox` 扩展通道、要么是**有意的**结构性缺席
+  （`-32601`）。此项在 W4 执行时**未完成**，是 W5 的第一件事。
+
 ### H.2i W4 准入账的第二轮补齐（2026-09-24）
 
 第二份验收意见（`/private/tmp/ahp-w3-review-and-next-2026-09-24.md`）指出四项，逐项处置：
@@ -737,3 +759,57 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
   （整帧判为 `-32700`）。官方 Rust/TS 客户端均发数字 id，故暂不处理；容忍字符串 id 记入 W5 候选。
 - 规范 §B.4 提到的 `PlanVerdict` 在 `manox-protocol` 里**不存在**（实测 `ServerCall` 只有 6 个变体），
   计划评审经 `Approve` 腿到达；`x-manox-plan/verdictRequested|verdict` 仍按 §D 声明保留。
+
+### H.5 W4 已执行：v2 拆除完成（2026-09-24）
+
+四项全部落地，单 PR #818。**「v2 今天能做的，AHP 面都能做」的验收式已成立**：
+`manox-protocol` 不存在了，全仓生产区零 v2 词汇。
+
+**① crate 形状（对 §F 与 §G-W4 的修订）**。计划说 `manox-session-core` 整体删除，H.2j 已证伪；
+实际拆法：
+
+- 新增 `crates/manox-ahp-runtime`：AHP 宿主背后的运行时半边——`SessionRuntime` trait（22 个方法）、
+  适配器 `RuntimeBackend`、journal→AHP 的投影半边、`journal_query`、`paths`、`error`。
+  它**不依赖** `manox-ahp`（反向才是被禁的方向），也**不依赖** `manox-session-core`。
+- `manox-session-core` 保留：会话存储 + 22 个 intent（`agent_server.rs`）+ `SessionRuntime` 的
+  实现（`ahp_gateway.rs`）+ loopback WS 监听器。名字保留到 W4 之后（改名如 `manox-gateway` 是
+  纯重命名，放进本 PR 只会扩大评审面）。
+- 进程单例的 builder 由**拥有会话存储的一方**安装（`AgentServer::global`），runtime crate 永不
+  命名具体会话运行时。安装是单向的，第二次安装被拒。
+- 测试归属：AHP 适配器测试（79 个）住在 gateway 旁（它们驱动活的 gateway），runtime crate 只留
+  纯单元测试。
+
+**② 三处「re-exit」而非移植的通知点**（H.2j 列出的三处）：
+
+- `create_session_request` 的 `route_host`/`route_note`：AHP router 在 `create_session` 返回后
+  本来就发 `root/sessionAdded`，所以这两个 emit 是**同一事实的第二次宣告**，删掉即正确。
+- `open_session` 的 pump：活会话现在只是它的 `ThreadHandle`；AHP bridge 订阅 journal feed，
+  不再有 per-connection 的 pump fan-out。
+- `submit` 的 `note_error`：**拒绝已经由 intent 的 `Err` 承载**，v2 note 是并行的第二通道。
+  所有 `note_error` 调用点改为显式 refusal。
+
+**③ 拆除中暴露并修掉的 fail-closed 缺陷（都是真 bug，不是重构副作用）**：
+
+- `set_model`/`set_reasoning_effort`/`set_approval_mode` 返回 `()`，失败时只发 v2 note，而 AHP
+  派发无条件回 `Accepted`——**客户端被告知模型改动已生效，然后收敛到一个会话并未运行的模型**。
+  三个 setter 及 `compact`/`plan_seed`/`set_cwd`/`goal` 改为返回 `Result`，派发据实拒绝。
+- `x-manox/goal` 与 `x-manox/invokeTool` 在声明面里**声明了却从未派发**，客户端拿到的是
+  `-32080`。两者现已接到它们命名的那条 intent 上。
+- `/ahp` 路由原本经 `AhpRuntime::router` 挂载——那个 helper 提供的是**裸 upgrade，没有 token /
+  origin 闸**。改为经监听器自己的 `ahp_upgrade` 挂载；监听器自带的测试抓到了这一点。
+
+**④ engine 侧一个既有缺陷被 W4 暴露并修掉**（`manox-agent/src/engine.rs`）：
+`run_actor` 在「no model configured」的提前 return 上**没有走 K3 关闭协议**——route 保持注册、
+sender 仍然可用，于是 `dispatch_store_journal_row` 把行投进一个再也不会 drain 的 actor 并回报
+「已入队」。表现为：重命名落了 sidecar、journal 行永远不存在。修法是提前 return 也 retire 并
+claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 HOME 下 100% 命中，故此前
+`title_changed_appends_the_journal_row` 在并发全量跑里必红、单跑必绿。）
+
+**⑤ 测试面**：`agent_server/tests.rs`（11,682 行 / 130 测试）整体删除——它驱动的是 v2 线面
+（`ClientCall`/`ClientNote`/`ServerNote`），协议没了，测试随之消失；它覆盖的行为要么已被删除
+（ownership note / pump / waterfall / follow stream），要么正由 `ahp_adapter_tests.rs` 在 AHP 面
+重覆盖。**这是本 PR 已知的覆盖缺口，记在 H.3。**
+
+**⑥ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
+`manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
+零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。

@@ -159,11 +159,8 @@ pub mod commands {
 /// Client-contributed session tools: an AHP-native action, not an extension
 /// command.
 ///
-/// v2 serves this capability as `ClientCall::RegisterSessionTools`, and the
-/// project's acceptance rule ("everything v2 can do, the AHP face must do,
-/// before v2 can be deleted") makes it a W4 blocker rather than W5 work. It
-/// lands on the **standard** surface because AHP already models the whole
-/// lifecycle:
+/// It lands on the **standard** surface rather than under `x-manox` because
+/// AHP already models the whole lifecycle:
 ///
 /// - registration is `session/activeClientSet` carrying the client's own
 ///   [`SessionActiveClient`](ahp_types::state::SessionActiveClient), whose

@@ -1,25 +1,21 @@
-//! AgentServer — the single protocol gateway.
+//! The session store and the runtime intents that act on it.
 //!
-//! The only public surface between frontends and the gpui-free kernel: every
-//! client (the gpui desktop in-process, and any WS-gateway or napi host)
-//! speaks [`manox_protocol`] over
-//! an [`RpcConnection`], and the server drives kernel [`ThreadHandle`]s from
-//! those messages. Kernel [`ThreadEvent`]s are projected through
-//! [`manox_ahp_runtime::translate`] into [`ServerNote`] (streamed to the owning client) or
-//! [`ServerCall`] (a round-trip the owning ∩ capable client must answer), so
-//! the kernel stays free of transport and frontend concerns.
+//! The gateway owns this process's live sessions: one [`ThreadHandle`] per
+//! open session, the ownership table, the queued-submit queues, the live
+//! terminals, and the client-contributed tool registrations. Protocol
+//! mechanics live elsewhere — `manox-ahp` owns the channels, JSON-RPC and
+//! transports, and `manox-ahp-runtime` adapts this crate onto that host's
+//! `Backend` seam through [`crate::ahp_gateway`].
 //!
-//! Scope: connection/handshake, session ownership, the full
-//! `ClientCall`/`ClientNote` dispatch, the `Note` event pump, and the
-//! event-driven `ServerCall` round-trips — `Approve` (β-3a) plus
-//! `AskUserQuestion` (β-3b-i; the plan review rides the same channel,
-//! pump-initiated on PlanReady). `CapabilityClient` rewiring
-//! (BrowserOp/ClipboardRead/OpenExternal), terminal, and model_chat are
-//! β-3b-ii.
+//! Every intent here is fallible with a
+//! [`manox_ahp_runtime::error::RuntimeError`]: the caller has already folded
+//! the client's action into the state its subscribers reduce, so a refusal has
+//! to be reported rather than swallowed — a silent no-op would leave every
+//! client converged on a session state that never took effect.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
@@ -33,14 +29,6 @@ use manox_agent::thread_engine::BackendNotice;
 use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
-use manox_ahp_runtime::journal_query;
-
-/// How long the server waits for a client to answer a `ServerCall` before
-/// treating it as fail-closed. Generous: a human reviewing a plan or an
-/// approval may take minutes. The kernel never sets its own timeout — that
-/// would duplicate the peer's correlation/timeout machinery.
-const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// One live session: the strong `ThreadHandle` (the retention owner) and the
 /// turn bookkeeping the runtime intents read.
 struct ServerSession {
@@ -50,6 +38,82 @@ struct ServerSession {
     // poison the queue into a permanent cascade — the std .unwrap() locks
     // turned one panic into every subsequent submit/steer/drain panicking.
     pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
+    /// The settle watcher's cancellation token. The watcher owns an `Arc` of
+    /// the entry's state, so dropping the entry alone would not end it.
+    settle_cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for ServerSession {
+    /// A session entry leaving the table by ANY path takes its settle watcher
+    /// with it: the watcher's `ThreadHandle` clone keeps the thread's
+    /// subscription open, so without this it would outlive the entry and drain
+    /// a queue nobody owns any more.
+    fn drop(&mut self) {
+        self.settle_cancel.cancel();
+    }
+}
+
+/// Drains one session's parked submissions when its turn settles.
+///
+/// A submit that arrives mid-turn is parked rather than refused (the user
+/// typed it; refusing would lose it), and this is what turns the parked batch
+/// into the follow-up turn. It watches the thread's own event stream, so it
+/// sees the same settle edge the kernel emitted — there is no polling and no
+/// second source of truth about whether a turn is running.
+fn spawn_settle_watcher(
+    session_id: String,
+    thread: ThreadHandle,
+    pending_submits: Arc<Mutex<Vec<QueuedSubmit>>>,
+    turn_active: Arc<AtomicBool>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    // Subscribe synchronously: a receiver registered inside the task can miss
+    // an event fired before the task is first polled.
+    let rx = thread.subscribe();
+    manox_agent::runtime::handle().spawn(async move {
+        loop {
+            let event = tokio::select! {
+                _ = cancel.cancelled() => break,
+                received = rx.recv() => match received {
+                    Ok(event) => event,
+                    // Every sender dropped: the thread is gone.
+                    Err(_) => break,
+                },
+            };
+            match &*event {
+                ThreadEvent::TurnStarted => turn_active.store(true, Ordering::SeqCst),
+                ThreadEvent::TurnFinished { cancelled, .. } => {
+                    turn_active.store(false, Ordering::SeqCst);
+                    // A cancelled turn settles the queue too: its text was not
+                    // run, and leaving it parked would strand it forever.
+                    let _ = cancelled;
+                    let drained: Vec<QueuedSubmit> = pending_submits.lock().drain(..).collect();
+                    if drained.is_empty() {
+                        continue;
+                    }
+                    let mut batch_origin: Option<String> = None;
+                    thread.with_mut(|t| {
+                        for queued in drained {
+                            if queued.origin.is_some() {
+                                batch_origin = queued.origin.clone();
+                            }
+                            let content = to_message_content(queued.text, queued.images);
+                            t.insert_user_message_with_content_and_ui_metadata(
+                                content,
+                                Some(queued.ui),
+                            );
+                        }
+                    });
+                    thread.with_mut(|t| {
+                        t.set_pending_turn_origin(batch_origin);
+                        t.run_turn();
+                    });
+                }
+                _ => {}
+            }
+        }
+        tracing::debug!(session = %session_id, "settle watcher stopped");
+    })
 }
 
 /// One live wire terminal (#13): the gpui-free [`TerminalHandle`] owns the
@@ -112,15 +176,6 @@ pub(crate) struct AgentServerInner {
     /// the `TerminalsUpdated` host snapshot.
     #[cfg(feature = "terminal")]
     terminals: Mutex<HashMap<String, Arc<TerminalEntry>>>,
-    /// In-flight bare-model completions by request id (the LanguageModelChat
-    /// provider path); cancellation tokens shared with the spawned streams.
-    model_chats: Arc<StdMutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
-    /// Monotonically increasing counter for client entry generations, used to
-    /// detect stale entries during same-client-id reconnection.
-    next_generation: AtomicU64,
-    /// §E.3 Q-face cache: `(thread_id, cursor)` → the folded conversation
-    /// info payload (recomputed only when the cursor advances).
-    conversation_info_cache: Arc<StdMutex<journal_query::ConversationInfoCache>>,
     /// Embedder tool registrations (RegisterSessionTools): session →
     /// client → full-replacement tool set. Consulted by the
     /// EmbedderToolProvider below each time the engine assembles a
@@ -264,13 +319,6 @@ impl AgentServerInner {
         true
     }
 
-    /// `TerminalSnapshot`: the visible grid as text lines + cursor.
-    #[cfg(feature = "terminal")]
-    fn terminal_snapshot(&self, terminal_id: &str) -> Option<Value> {
-        let entry = self.terminals.lock().get(terminal_id).cloned()?;
-        Some(self.terminal_snapshot_value(&entry))
-    }
-
     #[cfg(feature = "terminal")]
     fn terminal_snapshot_value(&self, entry: &TerminalEntry) -> Value {
         let (lines, cursor_col, cursor_row) = entry.handle.read(|t| t.text_snapshot());
@@ -346,7 +394,6 @@ impl AgentServerInner {
         })
     }
 
-
     #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
         let Ok(path) = manox_agent::db::default_db_path() else {
@@ -368,7 +415,6 @@ impl AgentServerInner {
             updated_at: now,
         });
     }
-
 }
 
 /// Install the process-wide embedder-tool provider backed by this server.
@@ -466,11 +512,6 @@ impl AgentServer {
             session_owners: Mutex::new(HashMap::new()),
             #[cfg(feature = "terminal")]
             terminals: Mutex::new(HashMap::new()),
-            model_chats: Arc::new(StdMutex::new(HashMap::new())),
-            next_generation: AtomicU64::new(1),
-            conversation_info_cache: Arc::new(StdMutex::new(
-                journal_query::ConversationInfoCache::default(),
-            )),
             embedder_tools: Mutex::new(HashMap::new()),
         });
         // U2 cross-domain #2 (§D.5 Models: pushed immediately on provider reload): a
@@ -530,7 +571,7 @@ impl AgentServer {
         // The engine's window into the frontend (browser, clipboard, opener).
         // Also last-wins, for the same one-server-per-process reason.
         manox_agent::capability::set_provider(std::sync::Arc::new(
-            AgentServerCapabilityClient::new(&server),
+            AgentServerCapabilityClient::new(),
         ));
         server
     }
@@ -540,6 +581,17 @@ impl AgentServer {
     /// one write path, two protocols, no second implementation to drift.
     pub(crate) fn ahp_inner(&self) -> &Arc<AgentServerInner> {
         &self.0
+    }
+
+    /// Test-only: whether the gateway currently sees this session's turn as
+    /// running (the parked-submit drain keys off this flag).
+    #[cfg(test)]
+    pub(crate) fn turn_active_for_test(&self, session_id: &str) -> bool {
+        self.0
+            .sessions
+            .lock()
+            .get(session_id)
+            .is_some_and(|s| s.turn_active.load(Ordering::SeqCst))
     }
 
     /// Test-only: the live session ids this server holds (the reap
@@ -688,7 +740,6 @@ impl AgentServerInner {
             .or_default()
             .insert(client_id.to_string(), tools);
     }
-
 }
 
 /// Open (or re-own) a live session: load its journal, insert the entry, and
@@ -729,12 +780,27 @@ async fn open_session(
     {
         let mut sessions = inner.sessions.lock();
         if !sessions.contains_key(session_id) {
+            let turn_active = Arc::new(AtomicBool::new(false));
+            let pending_submits = Arc::new(Mutex::new(Vec::new()));
+            let settle_cancel = tokio_util::sync::CancellationToken::new();
+            // The watcher's handle is deliberately dropped: the entry owns the
+            // cancellation token, so the task ends when the entry does, and a
+            // parked handle would only be a second way to reach the same
+            // guarantee.
+            let _watcher = spawn_settle_watcher(
+                session_id.to_string(),
+                thread.clone(),
+                Arc::clone(&pending_submits),
+                Arc::clone(&turn_active),
+                settle_cancel.clone(),
+            );
             sessions.insert(
                 session_id.to_string(),
                 ServerSession {
                     thread: thread.clone(),
-                    turn_active: Arc::new(AtomicBool::new(false)),
-                    pending_submits: Arc::new(Mutex::new(Vec::new())),
+                    turn_active,
+                    pending_submits,
+                    settle_cancel,
                 },
             );
         }
@@ -758,17 +824,6 @@ fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
         .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
 }
 
-/// Carry a runtime failure across the async seam without losing its code.
-///
-/// The intents already classify their refusals; re-wrapping them with a generic
-/// code would erase exactly the distinction a client matches on, so the only
-/// thing this adds is the `Send`-safe ownership the spawned future needs.
-pub(crate) fn preserve_code(
-    error: manox_ahp_runtime::error::RuntimeError,
-) -> manox_ahp_runtime::error::RuntimeError {
-    error
-}
-
 /// Publish a fresh agent catalogue to the root channel's subscribers.
 fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state::AgentInfo>) {
     host.publish(
@@ -780,31 +835,8 @@ fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state
     );
 }
 
-/// The mutable half of a session summary, as an AHP delta.
-///
-/// Only the fields a store change can move are carried: identity (channel,
-/// createdAt, isRead) is not a "change", and leaving it absent lets the
-/// client's merge keep the values it already holds rather than restating them
-/// from a snapshot that may be a beat stale.
-fn summary_delta(
-    summary: &ahp_types::state::SessionSummary,
-) -> ahp_types::notifications::PartialSessionSummary {
-    ahp_types::notifications::PartialSessionSummary {
-        provider: Some(summary.provider.clone()),
-        title: Some(summary.title.clone()),
-        status: Some(summary.status),
-        activity: summary.activity.clone(),
-        origin: summary.origin.clone(),
-        project: summary.project.clone(),
-        working_directories: summary.working_directories.clone(),
-        annotations: summary.annotations.clone(),
-        ..Default::default()
-    }
-}
-
-/// `ClientCall::ForkSession` (dspo/manox-app#9): create a new session whose
-/// journal is the source's active chain up to (and including)
-/// `through_entry_id`.
+/// Fork a session: create a new one whose journal is the source's active
+/// chain up to (and including) `through_entry_id`.
 ///
 /// The fork is a prefix copy, not a cross-file redirect — `Leaf` targets are
 /// file-local and the load-time chain validator rejects foreign parents — so
@@ -856,8 +888,11 @@ pub(crate) async fn fork_session(
             match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
                 Some(model) => Some(model),
                 None => {
-                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!("unknown model: {}", m.0))
-                        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                        "unknown model: {}",
+                        m.0
+                    ))
+                    .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                 }
             }
         }
@@ -867,8 +902,10 @@ pub(crate) async fn fork_session(
         Some(s) => match serde_json::from_value::<PermissionMode>(Value::String(s.to_string())) {
             Ok(mode) => Some(mode),
             Err(_) => {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(format!("unknown approval mode: {s}"))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "unknown approval mode: {s}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
         },
     };
@@ -877,10 +914,10 @@ pub(crate) async fn fork_session(
         Some("high") => Some(ReasoningEffort::High),
         Some("max") => Some(ReasoningEffort::Max),
         Some(other) => {
-            return Err(
-                manox_ahp_runtime::error::RuntimeError::new(format!("unknown reasoning effort: {other}"))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
-            );
+            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                "unknown reasoning effort: {other}"
+            ))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
         }
     };
 
@@ -888,12 +925,16 @@ pub(crate) async fn fork_session(
     // sources; a deferred source has no file).
     let Some(source_path) = manox_ahp_runtime::paths::persisted_session_file(&source_session_id)
     else {
-        return Err(manox_ahp_runtime::error::RuntimeError::new("thread not found")
-            .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND));
+        return Err(
+            manox_ahp_runtime::error::RuntimeError::new("thread not found")
+                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+        );
     };
     if !source_path.exists() {
-        return Err(manox_ahp_runtime::error::RuntimeError::new("thread not found")
-            .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND));
+        return Err(
+            manox_ahp_runtime::error::RuntimeError::new("thread not found")
+                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND),
+        );
     }
     let source = JsonlSessionStorage::open(&source_path)
         .await
@@ -909,9 +950,9 @@ pub(crate) async fn fork_session(
         .iter()
         .position(|r| r.entry.id() == through_entry_id)
         .ok_or_else(|| {
-            manox_ahp_runtime::error::RuntimeError::new(
-                format!("entry {through_entry_id} is not on the source's active chain"),
-            )
+            manox_ahp_runtime::error::RuntimeError::new(format!(
+                "entry {through_entry_id} is not on the source's active chain"
+            ))
             .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
         })?;
 
@@ -919,17 +960,19 @@ pub(crate) async fn fork_session(
     // prefix must be visible to `list` and loadable cold).
     let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let Some(target_path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
-        return Err(manox_ahp_runtime::error::RuntimeError::new("minted fork id failed the path gate")
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+        return Err(manox_ahp_runtime::error::RuntimeError::new(
+            "minted fork id failed the path gate",
+        )
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
     };
     // A caller-chosen id must not silently overwrite an existing journal: the
     // fork file is created below, and `create` truncates. Refuse instead, so a
     // colliding request is a loud error rather than a destroyed session.
     if target_path.exists() {
-        return Err(
-            manox_ahp_runtime::error::RuntimeError::new(format!("session {session_id} already exists"))
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
-        );
+        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+            "session {session_id} already exists"
+        ))
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
     }
     let fork_cwd = cwd.clone().unwrap_or_else(|| source.metadata.cwd.clone());
     let target = JsonlSessionStorage::create(
@@ -999,11 +1042,9 @@ pub(crate) async fn fork_session(
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
 
-/// The §D.2 `CreateSession` intent: optional explicit id (the compat
-/// `ClientNote::CreateSession` always supplies one; the v2 request mints
-/// server-side), working directory, project binding, and the initial
-/// model / approval mode / reasoning effort the session opens with (the
-/// "project/model inheritance" defect regression, §J.7).
+/// The `createSession` intent: optional explicit id, working directory,
+/// project binding, and the initial model / approval mode / reasoning effort
+/// the session opens with.
 pub(crate) use manox_ahp_runtime::runtime_trait::SessionIntent;
 
 impl AgentServerInner {
@@ -1032,8 +1073,11 @@ impl AgentServerInner {
                 match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
                     Some(model) => Some(model),
                     None => {
-                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!("unknown model: {}", m.0))
-                            .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                        return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                            "unknown model: {}",
+                            m.0
+                        ))
+                        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                     }
                 }
             }
@@ -1044,8 +1088,10 @@ impl AgentServerInner {
             {
                 Ok(mode) => Some(mode),
                 Err(_) => {
-                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!("unknown approval mode: {s}"))
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                        "unknown approval mode: {s}"
+                    ))
+                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
                 }
             },
         };
@@ -1054,10 +1100,10 @@ impl AgentServerInner {
             Some("high") => Some(ReasoningEffort::High),
             Some("max") => Some(ReasoningEffort::Max),
             Some(other) => {
-                return Err(
-                    manox_ahp_runtime::error::RuntimeError::new(format!("unknown reasoning effort: {other}"))
-                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
-                );
+                return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "unknown reasoning effort: {other}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
             }
         };
         // Seed blocks are kernel content blocks: validate the vocabulary
@@ -1073,9 +1119,9 @@ impl AgentServerInner {
                     ) {
                         Ok(b) => parsed.push(b),
                         Err(e) => {
-                            return Err(manox_ahp_runtime::error::RuntimeError::new(
-                                format!("seed block {i} is not a valid content block: {e}"),
-                            )
+                            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                                "seed block {i} is not a valid content block: {e}"
+                            ))
                             .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
                         }
                     }
@@ -1119,8 +1165,10 @@ impl AgentServerInner {
         if !seed_blocks.is_empty() {
             let session_id = uuid::Uuid::new_v4().to_string();
             let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
-                return Err(manox_ahp_runtime::error::RuntimeError::new("minted session id failed the path gate")
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
+                return Err(manox_ahp_runtime::error::RuntimeError::new(
+                    "minted session id failed the path gate",
+                )
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL));
             };
             let cwd = intent
                 .cwd
@@ -1143,8 +1191,10 @@ impl AgentServerInner {
             )
             .await
             .map_err(|err| {
-                manox_ahp_runtime::error::RuntimeError::new(format!("seeded session file creation failed: {err}"))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
+                manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "seeded session file creation failed: {err}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             let seed_rows: Vec<manox_harness::session::SessionTreeEntry> = seed_blocks
                 .into_iter()
@@ -1164,8 +1214,10 @@ impl AgentServerInner {
                 })
                 .collect();
             storage.append_entries(&seed_rows).await.map_err(|err| {
-                manox_ahp_runtime::error::RuntimeError::new(format!("seed row append failed: {err}"))
-                    .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
+                manox_ahp_runtime::error::RuntimeError::new(format!(
+                    "seed row append failed: {err}"
+                ))
+                .with_code(manox_ahp_runtime::error::codes::GATEWAY_INTERNAL)
             })?;
             drop(storage);
             // Path note + open are two steps, deliberately (review #778):
@@ -1267,12 +1319,21 @@ impl AgentServerInner {
         // that won the race since the live check above has its entry adopted
         // and ours dropped — never clobbered, so the loser's intent seeds
         // cannot overwrite the winner's model / approval / effort.
+        let settle_cancel = tokio_util::sync::CancellationToken::new();
+        let _watcher = spawn_settle_watcher(
+            session_id.clone(),
+            thread.clone(),
+            Arc::clone(&pending_submits),
+            Arc::clone(&turn_active),
+            settle_cancel.clone(),
+        );
         let loser = inner.insert_session_if_absent(
             session_id.clone(),
             ServerSession {
                 thread: thread.clone(),
                 turn_active,
                 pending_submits,
+                settle_cancel,
             },
         );
         if loser.is_some() {
@@ -1486,10 +1547,9 @@ impl AgentServerInner {
         receipt(true, message_id)
     }
 
-    /// §D.2 `Steer`: injects the steer and answers with the receipt
-    /// `{accepted, message_id?}` (the echo of the call's steer id). The
-    /// compat `ClientNote::Steer` forwards here with its `client_id` as
-    /// `message_id`.
+    /// Inject a steer into a running turn, answering with the receipt
+    /// `{accepted, message_id?}`. The steer id IS the echo correlation: the
+    /// client retires its optimistic bubble when its own injection settles.
     pub(crate) fn steer(
         &self,
         session_id: &str,
@@ -1852,7 +1912,11 @@ impl AgentServerInner {
         }
     }
 
-    pub(crate) fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+    pub(crate) fn compact(
+        &self,
+        session_id: &str,
+        instructions: Option<String>,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
@@ -1860,7 +1924,11 @@ impl AgentServerInner {
         Ok(())
     }
 
-    pub(crate) fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+    pub(crate) fn plan_seed(
+        &self,
+        session_id: &str,
+        plan_file: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
@@ -1869,10 +1937,10 @@ impl AgentServerInner {
         {
             Ok(text) => text,
             Err(error) => {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(
-                    error.to_string(),
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
+                return Err(
+                    manox_ahp_runtime::error::RuntimeError::new(error.to_string())
+                        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST),
+                );
             }
         };
         thread.with_mut(|t| {
@@ -1907,7 +1975,10 @@ impl AgentServerInner {
         // Validate the verb before touching state: an unknown action is the
         // caller's mistake, and reporting it as a thread-level failure would
         // point at the wrong thing.
-        if !matches!(action, "create" | "edit" | "replace" | "clear" | "pause" | "resume") {
+        if !matches!(
+            action,
+            "create" | "edit" | "replace" | "clear" | "pause" | "resume"
+        ) {
             return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                 "unknown goal action: {action}"
             ))
@@ -2050,11 +2121,11 @@ impl AgentServerInner {
 /// claim. There is no second transport to fall back to, so a session with no
 /// declared owner for a capability is a **refusal** — the engine's fail-closed
 /// contract depends on that being an error rather than a quiet no-op.
-pub(crate) struct AgentServerCapabilityClient(Arc<AgentServerInner>);
+pub(crate) struct AgentServerCapabilityClient;
 
 impl AgentServerCapabilityClient {
-    pub(crate) fn new(server: &AgentServer) -> Self {
-        Self(Arc::clone(&server.0))
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -2100,15 +2171,21 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
         })
     }
 
-    fn clipboard_read(&self) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
+    fn clipboard_read(
+        &self,
+    ) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
         Box::pin(async move {
-            let reply = route_session_capability(manox_ahp::ext::requests::CLIPBOARD_READ, Value::Null)
-                .await?;
+            let reply =
+                route_session_capability(manox_ahp::ext::requests::CLIPBOARD_READ, Value::Null)
+                    .await?;
             Ok(reply.as_str().map(str::to_string))
         })
     }
 
-    fn open_external(&self, url: String) -> futures::future::BoxFuture<'static, Result<(), String>> {
+    fn open_external(
+        &self,
+        url: String,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
         Box::pin(async move {
             route_session_capability(
                 manox_ahp::ext::requests::OPEN_EXTERNAL,
@@ -2176,8 +2253,6 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
             .flat_map(|(client_id, tools)| {
                 tools.iter().map(move |spec| {
                     std::sync::Arc::new(EmbedderToolAdapter {
-                        inner: self.0.clone(),
-                        session_id: session_id.to_string(),
                         client_id: client_id.clone(),
                         client_name: manox_agent::embedder_tools::client_tool_name(&spec.name),
                         spec: spec.clone(),
@@ -2192,8 +2267,6 @@ impl manox_agent::embedder_tools::EmbedderToolProvider for AgentServerEmbedderTo
 /// host's verbatim; execution routes to the registering client and the
 /// reply's `{content, isError}` settles the call.
 struct EmbedderToolAdapter {
-    inner: Arc<AgentServerInner>,
-    session_id: String,
     client_id: String,
     spec: ClientToolSpec,
     /// The sanitized model-facing name, computed once at construction —

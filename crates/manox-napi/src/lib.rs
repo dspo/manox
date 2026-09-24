@@ -153,8 +153,10 @@ impl manox_ahp::transport::Sink for TextSink {
     fn send(
         &mut self,
         msg: JsonRpcMessage,
-    ) -> manox_ahp::transport::TransportFuture<'_, std::result::Result<(), manox_ahp::transport::TransportError>>
-    {
+    ) -> manox_ahp::transport::TransportFuture<
+        '_,
+        std::result::Result<(), manox_ahp::transport::TransportError>,
+    > {
         Box::pin(async move {
             let text = manox_ahp::wire::to_text(&msg);
             self.tx

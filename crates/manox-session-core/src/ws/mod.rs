@@ -101,7 +101,7 @@ fn release_gateway_lease() {
 /// `<config>/gateway-ws.json`. Fire-and-forget: a bind failure surfaces as a
 /// tracing error and a `None` endpoint until a later `start` retries
 /// (callers waiting on [`service_endpoint`] should bound their wait).
-pub fn start(cwd: PathBuf, port: u16) {
+pub fn start(_cwd: PathBuf, port: u16) {
     // Second-start guard (§三.2): the slot is RESERVED under one lock hold
     // before the bind is spawned, so neither a sequential nor a racing
     // second `start` can bind a second listener or overwrite the published

@@ -186,22 +186,18 @@ impl SessionRuntime for GatewayRuntime {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        block_on(async move {
-            AgentServerInner::create_session_request(&inner, &owner, intent).await
-        })
+        block_on(
+            async move { AgentServerInner::create_session_request(&inner, &owner, intent).await },
+        )
         .map(|_| ())
-        .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError> {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        block_on(
-            async move { crate::agent_server::fork_session(&inner, &owner, intent).await },
-        )
-        .map(|_| ())
-        .map_err(|error| crate::agent_server::preserve_code(error))
+        block_on(async move { crate::agent_server::fork_session(&inner, &owner, intent).await })
+            .map(|_| ())
     }
 
     fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
@@ -223,7 +219,6 @@ impl SessionRuntime for GatewayRuntime {
                 .submit(&owner, &session_id, text, Vec::new(), None, None)
                 .await
         })
-        .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn steer(
@@ -235,7 +230,6 @@ impl SessionRuntime for GatewayRuntime {
         self.server
             .ahp_inner()
             .steer(session_id, message_id.to_string(), text, Vec::new(), None)
-            .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn drop_queued(&self, session_id: &str, message_id: &str) {

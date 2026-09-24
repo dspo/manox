@@ -109,9 +109,9 @@ pub trait ThreadEngine: Send + Sync {
     /// S3 stable-id: when `message_id` is `Some`, it is used as the steer's
     /// durable identity end-to-end — the injected `user` journal row lands
     /// under this id and the returned id equals it, so the client that minted
-    /// the id (via `ClientCall::Steer`) can correlate the injection and, on an
-    /// aborted run, retract exactly this steer. `None` (internal steers such
-    /// as the monitor bridge) self-mints a fresh id as before.
+    /// the id can correlate the injection and, on an aborted run, retract
+    /// exactly this steer. `None` (internal steers such as the monitor bridge)
+    /// self-mints a fresh id as before.
     fn steer(
         &self,
         text: String,

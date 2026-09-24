@@ -25,11 +25,10 @@ use crate::error::RuntimeError;
 
 /// One client-contributed tool.
 ///
-/// A plain DTO, deliberately: it was `manox_protocol::client::ClientToolSpec`
-/// while v2 owned the capability's vocabulary, and it moves here because the
-/// runtime stores it and must outlive that crate. The schema is a JSON Schema
-/// object the host owns; the runtime treats it as opaque and hands it to the
-/// model.
+/// A plain DTO, deliberately: the runtime stores it and the host fills it, so
+/// it belongs to the seam between them rather than to either side. The schema
+/// is a JSON Schema object the host owns; the runtime treats it as opaque and
+/// hands it to the model.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClientToolSpec {
     /// The tool's name as the model sees it.

@@ -38,7 +38,7 @@ impl ConversationInfoCache {
     }
 }
 
-/// `ClientCall::PageHistory` (§D.2): `{records, has_more, cursor}`.
+/// One history page: `{records, has_more, cursor}`.
 ///
 /// `through_seq` is the inclusive tail (`-1` = latest); `before_seq` is an
 /// exclusive upper bound for backwards paging; `max_messages` caps the page
@@ -146,7 +146,7 @@ pub async fn cold_read(session_id: &str) -> ColdRead {
     }
 }
 
-/// `ClientCall::GetConversationInfo` (§E.3, Q face): the server-side fold of
+/// The conversation-info Q face: the server-side fold of
 /// the journal, cached by `(thread_id, cursor)` — recomputed only when the
 /// cursor advances.
 ///

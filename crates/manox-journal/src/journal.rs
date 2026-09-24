@@ -6,14 +6,11 @@
 //! state change of a thread is carried by one of these entries (L3), stamped
 //! with a chain-dense `seq` at the single append point (L4).
 //!
-//! Its declaring surfaces are the AHP translation tables in `manox-ahp` (v3)
-//! and, until it is deleted, the v2 `JOURNAL_ENTRIES` table
-//! (`manox_protocol::surface`). The v2 *transport* framing this header used to
-//! describe (`StreamFrame::Entry` / `Snapshot`) belongs to the retiring
-//! protocol, not here: this crate has no frame types, imports nothing but
-//! `serde`, and carries no gateway vocabulary. When W4 deletes
-//! `manox-protocol` this crate stays — it is the disk format, and the disk
-//! format is precisely what the v3 switch leaves unchanged.
+//! Its declaring surface is the AHP translation table in `manox-ahp`. The
+//! transport framing that once accompanied this header belonged to the v2
+//! protocol and is gone with it: this crate has no frame types, imports
+//! nothing but `serde`, and carries no gateway vocabulary. It is the disk
+//! format, and the disk format is exactly what the AHP switch left unchanged.
 //!
 //! serde shape: internally tagged by `type` (camelCase), struct variants with
 //! camelCase payload fields. `unknown-variant-tolerant` on the read side is a

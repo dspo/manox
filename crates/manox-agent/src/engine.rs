@@ -155,12 +155,9 @@ pub enum JournalFeed {
     Lagged(u64),
 }
 
-/// The feed's broadcast capacity (§D.7, the Entry window bound the L5
-/// overflow-resync semantics ride on). The kernel cannot reference
-/// `manox_protocol::ENTRY_BACKPRESSURE_CAPACITY` (protocol sits above the
-/// kernel), so the value is declared here and LOCKED equal by
-/// `entry_window_capacity_matches_the_protocol_declaration` in
-/// session-core's agent-server tests — change them together.
+/// The feed's broadcast capacity: the Entry window the overflow-resync
+/// semantics ride on. The value is declared here because the kernel is the
+/// layer that owns the feed; a consumer that needs a bound states its own.
 pub const JOURNAL_FEED_CAPACITY: usize = 4096;
 
 /// One whole-chain journal read (§C.3), answered by the actor.
@@ -3616,6 +3613,23 @@ async fn run_actor(
         bridge.set_sender(notice_tx.clone());
     }
     let Some(mut pi_model) = model.or_else(crate::provider_glue::default_model) else {
+        // Retire and land whatever was queued before the exit, exactly as the
+        // command loop's own shutdown does. An early return that skipped this
+        // left the route registered with a live sender, so a store dispatch
+        // sent its row into an actor that would never drain it and reported
+        // the row queued — the rename's sidecar then named a title whose
+        // journal row had never been written.
+        let stranded = retire_and_claim_journal_rows(&thread_id, &mut cmd_rx);
+        if !stranded.is_empty() {
+            tracing::debug!(
+                thread = %thread_id,
+                rows = stranded.len(),
+                "engine exited without a model; landing its queued journal rows"
+            );
+            for (kind, payload) in stranded {
+                cold_journal_append(initial_path.clone(), kind, payload).await;
+            }
+        }
         let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
             "no model configured — add a provider in Settings"
         )));
