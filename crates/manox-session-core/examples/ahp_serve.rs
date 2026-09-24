@@ -6,13 +6,12 @@
 //!
 //! It brings up the same loopback gateway `cx web` starts (`manox_agent::init`
 //! plus `ws::start`: one listener, one per-boot token, one machine lock) and
-//! prints the two endpoints that listener serves:
+//! prints the AHP endpoint it serves:
 //!
-//! - `/ahp` — the AHP (v3) face: JSON-RPC over one text frame per message.
-//!   Point an AHP client at `<url>ahp?token=<token>` (VS Code's agent window,
-//!   AHPX, or the companion smoke client in `manox-ahp`:
+//! - `/ahp` — JSON-RPC over one text frame per message. Point an AHP client at
+//!   `<url>ahp?token=<token>` (VS Code's agent window, AHPX, or the companion
+//!   smoke client in `manox-ahp`:
 //!   `cargo run -p manox-ahp --example ahp_smoke`).
-//! - `/ws` — the retiring v2 face, kept until the desktop app is switched over.
 //!
 //! The token is printed because an out-of-process client needs it; the same
 //! value is written to `<config>/gateway-ws.json` (mode 0600) for tooling that
@@ -75,10 +74,6 @@ fn main() {
     println!("clients    {}", endpoint.url);
     println!(
         "ahp        ws://127.0.0.1:{}/ahp?token={}",
-        endpoint.port, endpoint.token
-    );
-    println!(
-        "v2 (retiring) ws://127.0.0.1:{}/ws?token={}",
         endpoint.port, endpoint.token
     );
     println!();

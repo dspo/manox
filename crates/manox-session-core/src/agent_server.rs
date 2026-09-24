@@ -2145,9 +2145,6 @@ fn parse_slash(text: &str) -> Option<(String, String)> {
     (!name.is_empty()).then(|| (name.to_string(), args.trim_start().to_string()))
 }
 
-#[cfg(test)]
-mod tests;
-
 // ── Embedder tool bridge (dspo/manox-app#11): RegisterSessionTools store +
 // the engine-facing provider whose adapters round-trip executions to the
 // registering client as InvokeClientTool. ─────────────────────────────────

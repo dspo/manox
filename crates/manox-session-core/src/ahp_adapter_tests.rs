@@ -632,7 +632,7 @@ mod dispatch {
         let _guards = install();
         let (_server, backend) = fixture().await;
         let mut config = JsonObject::new();
-        config.insert("approvalMode".to_string(), json!("plan"));
+        config.insert("approvalMode".to_string(), json!("read-only"));
         config.insert("reasoningEffort".to_string(), json!("high"));
         let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
             config,

@@ -11,6 +11,10 @@ pub mod agent_server;
 /// The gateway's implementation of the AHP runtime seam.
 pub mod ahp_gateway;
 
+/// The loopback WS listener (`cx web`'s network face).
+#[cfg(feature = "ws-gateway")]
+pub mod ws;
+
 /// Integration tests for the AHP adapter against the live gateway.
 #[cfg(test)]
 mod ahp_adapter_tests;
