@@ -585,6 +585,43 @@ reconnect 快照腿、dispatch 句柄。
    只要它继续在本仓做 checkpoint 就会再累积——需在 hcode 侧关闭 checkpoint 或让它离开本仓（仓外决定）。
 4. **push + PR（已完成）**：PR #818，26 个提交，base `main`，head `ahp-host`（按用户裁决不用 `codex/` 前缀）。
 
+### H.2j W4 前置核实：计划的一条前提不成立（2026-09-24）
+
+W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体删除」不成立**：
+
+`crates/manox-session-core/src/agent_server.rs`（5,913 行 / 91 个方法 / 261 处 v2 引用）是
+**同一个 struct** 同时承载两件事：
+
+- **v2 网关**（~2,500 行，该删）：`handle_call`(266) / `handle_note`(256) / `route_call` /
+  `route_capability_call` / `ReplyCtx` / waterfall delivery / `fail_closed` / `apply_reply`；
+- **运行时 intent**（该留）：AHP 适配器需要的约 20 个方法
+  （`create_session_request`/`fork_session`/`submit`/`steer`/`dispose_session`/`session_thread`/
+  `archive_thread`/`set_model`/`set_cwd`/`rename_thread`/`pin_session`/`order_session`/
+  `terminal_input`/`terminal_resize`/`ahp_terminal_state`/`terminal_raw_tap`/`compact`/`plan_seed`）。
+
+**拆分可行的依据（实测）**：`src/ahp/` 对 v2 wire 层（`handle_call`/`handle_note`/`route_call`/
+`ReplyCtx`/delivery）的引用数 = **0**；对 `AgentServerInner` 内部状态（`sessions` 等）的直接访问 = **0**，
+只经方法。故窄接口足够。
+
+**但拆分不是「按方法切」**：AHP 需要的方法**间接**调 v2 通知函数，须**换出口**（改为 AHP publish）
+而非移植：
+
+| AHP 方法 | 调用的 v2 函数 |
+|---|---|
+| `create_session_request` | `route_host` / `route_note` / `replay_pending_adjudications` |
+| `submit` | `note_error` |
+| `dispose_session` / `archive_thread` | pump / streams / deliveries（v2 专属） |
+
+**另核实两点**（均与计划有出入）：
+- `RpcError` **不需要**搬——`manox-ahp` 用的是 AHP 自己的 `JsonRpcError`，而 AHP 适配器对
+  `RpcError` 引用数为 **0**。（计划把 `RpcPeer`/`MsgId` 列了，`RpcError` 未列，实测它属 v2 侧。）
+- `manox-protocol` 里 `journal`/`base64_bytes` **已是** `manox-journal` 的 re-export（W0 已搬），
+  `journal_stream.rs` 与 `wire.rs` 的外部消费者 = **0**。
+
+**结论**：W4 是一次「5,400 行删除 + 6,000 行文件拆分」，不是计划设想的三处快删。
+拆分后 `manox-session-core` 只剩 v2-free 的 gateway/journal_query/translate/waterfall 四块，
+名字已不诚实——但改名/并入会进一步扩大本次破坏面，故排 W4 之后单独收口。
+
 ### H.2h 版本注记
 
 - 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。

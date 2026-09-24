@@ -5223,10 +5223,8 @@ async fn route_capability_call(
             })
     };
     let Some((conn, rx)) = target else {
-        return Err(
-            RpcError::new(-1, "no client can answer this capability call")
-                .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL),
-        );
+        return Err(RpcError::new(-1, no_capable_client_error("clipboard"))
+            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
     };
     conn.send_to_client(FromServer::Request { id, call });
     match tokio::time::timeout(CALL_TIMEOUT, rx.recv()).await {
@@ -5319,12 +5317,14 @@ async fn route_session_capability(
     // Two live transports serve this session during the migration, and the
     // capability belongs to whichever one has a client that declared it. The
     // AHP host is asked first because its clients declare explicitly
-    // (`serverRequests`), so a positive answer there is precise; the v2 path is
-    // the same one this host has always used. This is transport selection, not
-    // a compatibility shim: when v2 is deleted the second leg goes with it and
-    // the first is unchanged.
-    // One call, two possible transports: the AHP request carries the params
-    // derived from it, and the v2 leg needs the call itself.
+    // (`serverRequests`), so a positive answer there is precise.
+    //
+    // **When the v2 leg goes, this `None` branch must not go with it.** An AHP
+    // host that has no declared owner for a capability is not "try elsewhere":
+    // it is the whole answer, and it is a refusal. Deleting v2 turns this into
+    // the error below — which is why the error is written here, next to the
+    // fallthrough it replaces, rather than left to be rediscovered when the
+    // second leg is removed. See `no_capable_client_error`.
     let call = call_for(session_id.clone());
     let ahp = crate::ahp::runtime::try_runtime();
     if let Some(reply) = route_ahp_capability(ahp.as_deref(), &session_id, method, &call).await {
@@ -5333,6 +5333,18 @@ async fn route_session_capability(
     route_capability_call(inner, &session_id, call)
         .await
         .map_err(|e| e.message)
+}
+
+/// The refusal when no connected client can serve a capability call.
+///
+/// Its own function because it is the answer at **two** points: today's v2
+/// branch, and — once the v2 leg is deleted — the `None` branch of
+/// `route_session_capability`, which currently falls through to v2. Removing
+/// that leg must leave this refusal in place rather than a dangling fallthrough,
+/// and having the message in one place is what makes that a substitution instead
+/// of a rediscovery.
+fn no_capable_client_error(kind: &str) -> String {
+    format!("no client can answer this {kind} capability call")
 }
 
 /// Ask the AHP host, when it has a client that declared `method` for this
