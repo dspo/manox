@@ -30,6 +30,7 @@ members = [
 	"crates/manox-protocol",
 	"crates/manox-journal",
 	"crates/manox-ahp",
+	"crates/manox-ahp-runtime",
 	"crates/manox-terminal",
 	"crates/hyperlinks",
 	"crates/manox-workspace",
@@ -60,6 +61,8 @@ manox-journal = { path = "crates/manox-journal" }
 # serverSeq、通道注册与订阅、journal→AHP 动作翻译、x-manox 扩展声明面。
 # 前端（GPUI 桌面/远程客户端）一律经它对话；v2 面拆除后为唯一协议层。
 manox-ahp = { path = "crates/manox-ahp" }
+# manox-ahp-runtime —— AHP 宿主的运行时半边（与传输无关的 manox-ahp 分离）。
+manox-ahp-runtime = { path = "crates/manox-ahp-runtime", default-features = false }
 manox-harness = { path = "crates/manox-harness" }
 # manox-providers —— provider 配置解析的单一事实来源（原 github.com/dspo/cx
 # 仓库并入；cx 启动器本体已随拆分移至 dspo/manox-app）。

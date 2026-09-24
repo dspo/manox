@@ -2479,6 +2479,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "manox-ahp-runtime"
+version = "0.1.0"
+dependencies = [
+ "ahp",
+ "ahp-types",
+ "async-channel",
+ "async-trait",
+ "chrono",
+ "futures",
+ "libc",
+ "manox-agent",
+ "manox-ahp",
+ "manox-harness",
+ "manox-journal",
+ "manox-terminal",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "manox-harness"
 version = "0.1.0"
 dependencies = [

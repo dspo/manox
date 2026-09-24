@@ -1,0 +1,33 @@
+[package]
+name = "manox-ahp-runtime"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+manox-agent.workspace = true
+manox-harness.workspace = true
+manox-ahp.workspace = true
+manox-journal.workspace = true
+manox-terminal = { workspace = true, optional = true }
+ahp.workspace = true
+ahp-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tokio-util.workspace = true
+async-channel.workspace = true
+async-trait = "0.1"
+libc.workspace = true
+
+[features]
+default = ["terminal"]
+terminal = ["dep:manox-terminal"]
+
+[dev-dependencies]
+manox-terminal.workspace = true
