@@ -45,6 +45,12 @@ pub(crate) struct Inner {
     next_conn: AtomicU64,
 }
 
+/// A host → client request is answered by a human in the loop (an approval, a
+/// question, a browser operation), so the default deadline is generous — and the
+/// issuer owns it, never the correlation layer. [`Host::request_within`] takes
+/// an explicit deadline for callers that should not wait that long.
+const CLIENT_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 impl Host {
     /// A host serving `backend`, with the root channel seeded from it.
     pub fn new(backend: Arc<dyn Backend>) -> Self {
@@ -218,11 +224,56 @@ impl Host {
         method: &str,
         params: Value,
     ) -> Result<Value, HostError> {
-        /// A host → client request is answered by a human in the loop (an
-        /// approval, a question, a browser operation), so the deadline is
-        /// generous — and the issuer owns it, never the correlation layer.
-        const CLIENT_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+        self.request_within(conn, method, params, CLIENT_ANSWER_TIMEOUT)
+            .await
+    }
 
+    /// [`Self::request`] against one session's subscribers, choosing a client
+    /// that declared it can answer `method`.
+    ///
+    /// A host-initiated request is session-scoped: the capability belongs to the
+    /// client watching that session (its clipboard, its browser, its window), so
+    /// the candidate set is the session channel's subscribers filtered by their
+    /// own declaration — never "any connected client", which would ask a client
+    /// that never claimed the capability and then wait out the deadline for an
+    /// answer that cannot come.
+    ///
+    /// Fail-closed at both ends: no declared-and-subscribed client is an error
+    /// before anything goes on the wire, and a silent client is an error after
+    /// the deadline. Nothing here invents a default value.
+    pub async fn request_client(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HostError> {
+        let uri = crate::channels::session::uri(session_id);
+        let candidates: Vec<Arc<Conn>> = self
+            .inner
+            .subscribers(&uri)
+            .into_iter()
+            .filter(|conn| conn.can_answer(method))
+            .collect();
+        let Some(conn) = candidates.first() else {
+            return Err(HostError::Backend(format!(
+                "no client subscribed to {uri} declared it can answer {method}"
+            )));
+        };
+        self.request(conn, method, params).await
+    }
+
+    /// [`Self::request`] with an explicit deadline.
+    ///
+    /// The deadline is a parameter rather than a knob because the issuer owns
+    /// it: production waits minutes (a human answers), a test waits
+    /// milliseconds, and neither should be able to change the other's.
+    pub async fn request_within(
+        &self,
+        conn: &Arc<Conn>,
+        method: &str,
+        params: Value,
+        within: std::time::Duration,
+    ) -> Result<Value, HostError> {
         let id = MsgId::next(&self.inner.next_request);
         let Some(waiter) = conn.register_waiter(id) else {
             // A duplicate id is our own bookkeeping bug: fail this delivery
@@ -232,7 +283,7 @@ impl Host {
             )));
         };
         conn.send(wire::request(id.0, method, params));
-        match tokio::time::timeout(CLIENT_ANSWER_TIMEOUT, waiter.recv()).await {
+        match tokio::time::timeout(within, waiter.recv()).await {
             Ok(Ok(Ok(value))) => Ok(value),
             Ok(Ok(Err(error))) => Err(HostError::Backend(error.message)),
             Ok(Err(_)) => Err(HostError::Backend(format!(

@@ -344,6 +344,55 @@ impl AgentServerInner {
         Ok(self.terminal_attach_response(&entry))
     }
 
+    /// The raw PTY byte tap of a terminal, for the AHP output pump.
+    ///
+    /// Raw rather than the decoded event stream: `terminal/data` carries the
+    /// process's own bytes, and the pump is where a byte-fragment stream is
+    /// reassembled into text at character boundaries.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn terminal_raw_tap(
+        &self,
+        terminal_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
+        self.terminals
+            .lock()
+            .get(terminal_id)
+            .map(|entry| entry.handle.subscribe_raw())
+    }
+
+    /// `terminal/input`: forward keystrokes to a terminal's PTY.
+    ///
+    /// AHP types this as a side-effect-only action (the reducer no-ops it), so
+    /// the only observable effect is what the PTY does with the bytes — which
+    /// comes back on the wire as `terminal/data`.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn terminal_input(&self, terminal_id: &str, data: &str) -> Result<(), String> {
+        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
+            return Err(format!("unknown terminal {terminal_id}"));
+        };
+        entry
+            .handle
+            .read(|t| t.input(data.as_bytes()))
+            .map_err(|error| format!("terminal input failed: {error}"))
+    }
+
+    /// `terminal/resized`: resize a terminal's PTY grid.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn terminal_resize(
+        &self,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), String> {
+        let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
+            return Err(format!("unknown terminal {terminal_id}"));
+        };
+        entry
+            .handle
+            .with_mut(|t| t.resize(cols as usize, rows as usize));
+        Ok(())
+    }
+
     /// `DisposeTerminal`: release a terminal.
     ///
     /// Dropping the entry is the release — the PTY handle reaps its child on
@@ -1802,6 +1851,24 @@ impl AgentServerInner {
     /// and must not outlive the session.
     fn clear_embedder_tools(&self, session_id: &str) {
         self.embedder_tools.lock().remove(session_id);
+    }
+
+    /// Full-replacement write of one client's embedder tool set for a session.
+    ///
+    /// The AHP face (`session/activeClientSet`) lands here, exactly like the v2
+    /// `RegisterSessionTools` call: both are the same registration fact, and
+    /// the engine consults this one store when it assembles a session's tools.
+    pub(crate) fn set_embedder_tools(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        tools: Vec<ClientToolSpec>,
+    ) {
+        self.embedder_tools
+            .lock()
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(client_id.to_string(), tools);
     }
 
     fn note_error(&self, session_id: &str, message: &str) {

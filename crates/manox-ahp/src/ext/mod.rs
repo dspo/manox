@@ -136,12 +136,14 @@ pub mod commands {
     pub const MODEL_CHAT_CANCEL: &str = "x-manox/modelChatCancel";
     /// Retract an unsettled adjudication delivery.
     pub const CANCEL_DELIVERY: &str = "x-manox/cancelDelivery";
-    /// Register client-provided tools for a session.
-    pub const REGISTER_TOOLS: &str = "x-manox/registerSessionTools";
     /// Host shutdown (process lifecycle).
     pub const SHUTDOWN: &str = "x-manox/shutdown";
 
     /// Every declared command.
+    ///
+    /// Client-contributed tools are **not** here: AHP models them natively (see
+    /// [`CLIENT_TOOLS_VIA_ACTION`]), so the v2 `RegisterSessionTools` capability
+    /// has no `x-manox` command.
     pub const ALL: &[&str] = &[
         COMPACT,
         PLAN_EXECUTE,
@@ -150,10 +152,35 @@ pub mod commands {
         MODEL_CHAT,
         MODEL_CHAT_CANCEL,
         CANCEL_DELIVERY,
-        REGISTER_TOOLS,
         SHUTDOWN,
     ];
 }
+
+/// Client-contributed session tools: an AHP-native action, not an extension
+/// command.
+///
+/// v2 serves this capability as `ClientCall::RegisterSessionTools`, and the
+/// project's acceptance rule ("everything v2 can do, the AHP face must do,
+/// before v2 can be deleted") makes it a W4 blocker rather than W5 work. It
+/// lands on the **standard** surface because AHP already models the whole
+/// lifecycle:
+///
+/// - registration is `session/activeClientSet` carrying the client's own
+///   [`SessionActiveClient`](ahp_types::state::SessionActiveClient), whose
+///   `tools` field *is* the contribution — ordinary session state that every
+///   subscriber folds through the upstream reducer and reads at
+///   `SessionState.activeClients[].tools`;
+/// - invocation is `SessionInputRequestKind::ToolClientExecution`, a running
+///   client-contributed tool call completed by `chat/toolCallComplete`.
+///
+/// A separate `x-manox/registerSessionTools` command therefore does not exist.
+/// Serving both would be two sources of truth for one fact — the extension
+/// command's payload would have to be re-derived into `activeClients` anyway —
+/// and the extension command carried no wire contract this action lacks. The
+/// name is absent from [`commands::ALL`] rather than kept as a dead
+/// declaration: this host's rule is that `_meta["x-manox"]` advertises only
+/// what it serves.
+pub const CLIENT_TOOLS_VIA_ACTION: &str = "session/activeClientSet";
 
 /// Host → client requests (AHP permits host-initiated requests; the `resource*`
 /// family is the standard precedent). Routed by client capability, fail-closed.
@@ -200,6 +227,7 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     "session/workingDirectorySet",
     "session/workingDirectoryRemoved",
     "session/workingDirectoryReplaced",
+    "session/activeClientSet",
     "session/activeClientRemoved",
     // chat working directories
     "chat/workingDirectorySet",

@@ -569,9 +569,11 @@ reconnect 快照腿、dispatch 句柄。
 ### H.2h 版本注记
 
 - 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。
-- terminal 面（`ahp-terminal:` + `createTerminal`/`disposeTerminal`）已服务，故
-  §G 的 W3 清单中「terminal」项已完成；W3 余下的是四个 `x-manox` server→client 请求
-  与 `extension_baseline` 之外的扩展命令面。
+- **terminal 快照面已服务**（`createTerminal`/`disposeTerminal` + `TerminalState` 快照）；
+  `terminal/input`、`terminal/resized`、`terminal/data` 三个 action **未接**——客户端能建能看
+  但不能打字、不能改尺寸、收不到活输出。W4 前必补。
+  （初稿此处写「terminal 项已完成」，**该结论超前**：实现描述只覆盖快照，结论却把
+  「快照已服务」表述为「terminal 已完成」。已按实测订正。）
 
 0. **W2 状态：收口**（2026-09-23）。§G 的 W2 五条门禁逐条对照：
    ① 收敛性证明（`translation_convergence.rs`，含 §H.2 那次抓到真缺陷的轨迹）——绿；
@@ -580,11 +582,23 @@ reconnect 快照腿、dispatch 句柄。
    ④a 官方 TS client over WS（§H.2e）——绿；④b 独立立项（见下）；
    ⑤ 错误码纪律（`error.rs` 的 `DECLARED` 表 + 各 refusal 路径的测试）——绿。
 
-   **W2 认完成**。下列条目移入 W5 或独立立项，不再挡 W2：
-   `extension_baseline` 真实现、`x-manox/fetchEntries`、`x-manox/registerSessionTools`、
-   四个 `x-manox` server→client 请求（`browserOp`/`clipboardRead`/`openExternal`/`invokeTool`）、
-   `resourceResolve`/`resourceCopy`/`if_match`（基础围栏已在）。这些是**能力扩充**，
-   不是 W2 的验证面——W2 的验收标准已经全部满足。
+   **W2 认完成**（验收公式见下）。
+
+   ### 验收公式（取代「AHP 覆盖度」）
+
+   > **v2 今天能做的，AHP 面都能做 → 才能删 v2。**
+
+   AHP 30 个命令中 14 个对应 manox 不具备或不需要的能力（automation / OTLP / MCP Apps /
+   OAuth / resource-watch / changeset），按规范结构性拒掉（`-32601`）**即正确答案**，不是欠账。
+   追求 30/30 会把 manox 变成 AHP 参考实现。
+
+   按此公式的 W4 准入账（2026-09-24 复核）：
+   - ✅ `extension_baseline`（§H.2g）
+   - ✅ 四个 `x-manox` server→client 请求（§H.2i）
+   - ✅ `terminal` 写路径 `input`/`resized`/`data`（§H.2i）
+   - ✅ 客户端贡献工具（`session/activeClientSet` → 既有 `embedder_tools` 路径，§H.2i）
+   - ⬜ `x-manox/fetchEntries`、pin + 手工排序 —— v2 在服务，W4 前需补齐或明确接受降级
+   - ⬜ `resourceResolve`/`resourceCopy`/`if_match`（基础围栏已在；v2 未服务这三条，故非阻塞）
 
 1. **④b（独立立项）**：真 VS Code Agents window 的方言税（R5 五处）。前置条件是 hcode fork 里
    加一条可插拔 connection 来源（现只有 ambient/ssh/wsl，全是起 VS Code 自己的 agent host）。

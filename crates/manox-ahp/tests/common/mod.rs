@@ -28,11 +28,12 @@ pub struct TestBackend {
 impl TestBackend {
     /// A backend with session `s-1` owning chat `c-1`.
     pub fn new() -> Arc<Self> {
-        let mut sessions = BTreeMap::new();
-        sessions.insert("s-1".to_string(), "c-1".to_string());
-        Arc::new(Self {
-            sessions: parking_lot::Mutex::new(sessions),
-        })
+        let backend = Self::default();
+        backend
+            .sessions
+            .lock()
+            .insert("s-1".to_string(), "c-1".to_string());
+        Arc::new(backend)
     }
 
     /// The seeded chat of `session_id`, taking no lock itself (callers hold
@@ -149,6 +150,139 @@ impl Backend for TestBackend {
 
     fn extension(&self, _method: &str, _params: &Value) -> Result<Value, HostError> {
         Err(HostError::Unimplemented("extension".to_string()))
+    }
+}
+
+/// A [`TestBackend`] that also records what the host dispatched to it.
+///
+/// The registration suite needs both halves of the claim in one place: the
+/// protocol state (which the host folds, so a subscriber reads it) and the
+/// runtime intent (which the backend receives, so the model can be offered the
+/// tool). A backend that only answered `Accepted` could not tell a routed call
+/// from a swallowed one.
+pub struct RecordingBackend {
+    inner: TestBackend,
+    dispatched: parking_lot::Mutex<Vec<(String, StateAction)>>,
+    /// The outcome `dispatch` answers; `None` means "accept everything".
+    refusal: parking_lot::Mutex<Option<String>>,
+}
+
+impl RecordingBackend {
+    /// The shared stand-in, seeded with session `s-1` like [`TestBackend::new`].
+    pub fn new() -> Arc<Self> {
+        let inner = TestBackend::default();
+        inner
+            .sessions
+            .lock()
+            .insert("s-1".to_string(), "c-1".to_string());
+        Arc::new(Self {
+            inner,
+            dispatched: parking_lot::Mutex::new(Vec::new()),
+            refusal: parking_lot::Mutex::new(None),
+        })
+    }
+
+    /// Every `(channel, action)` the host dispatched, in order.
+    pub fn dispatched(&self) -> Vec<(String, StateAction)> {
+        self.dispatched.lock().clone()
+    }
+
+    /// The `session/activeClientSet` entries the host dispatched.
+    pub fn active_client_sets(&self) -> Vec<ahp_types::state::SessionActiveClient> {
+        self.dispatched
+            .lock()
+            .iter()
+            .filter_map(|(_, action)| match action {
+                StateAction::SessionActiveClientSet(set) => Some(set.active_client.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Make every subsequent `dispatch` answer `Rejected(reason)`.
+    pub fn refuse_with(&self, reason: &str) {
+        *self.refusal.lock() = Some(reason.to_string());
+    }
+}
+
+impl Backend for RecordingBackend {
+    fn root_state(&self) -> RootState {
+        self.inner.root_state()
+    }
+    fn list_sessions(&self) -> Vec<SessionSummary> {
+        self.inner.list_sessions()
+    }
+    fn session_summary(&self, session_id: &str) -> Option<SessionSummary> {
+        self.inner.session_summary(session_id)
+    }
+    fn session_state(&self, session_id: &str) -> Option<SessionState> {
+        self.inner.session_state(session_id)
+    }
+    fn chat_state(&self, chat_id: &str) -> Option<ChatState> {
+        self.inner.chat_state(chat_id)
+    }
+    fn session_state_for_chat(&self, chat_id: &str) -> Option<String> {
+        self.inner.session_state_for_chat(chat_id)
+    }
+    fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
+        self.inner.terminal_state(terminal_id)
+    }
+    fn create_session(
+        &self,
+        session_id: &str,
+        params: &CreateSessionParams,
+    ) -> Result<(), HostError> {
+        self.inner.create_session(session_id, params)
+    }
+    fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_session(session_id)
+    }
+    fn create_chat(
+        &self,
+        session_id: &str,
+        chat_id: &str,
+        params: &CreateChatParams,
+    ) -> Result<(), HostError> {
+        self.inner.create_chat(session_id, chat_id, params)
+    }
+    fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
+        self.inner.dispose_chat(chat_id)
+    }
+    fn fetch_turns(
+        &self,
+        chat_id: &str,
+        cursor: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Turn>, HostError> {
+        self.inner.fetch_turns(chat_id, cursor, limit)
+    }
+    fn dispatch(
+        &self,
+        channel: &str,
+        action: &StateAction,
+        // Part of the trait's contract; this recorder asserts on the action and
+        // the channel, so the origin is not one of its observables.
+        _origin: &ActionOrigin,
+    ) -> DispatchOutcome {
+        self.dispatched
+            .lock()
+            .push((channel.to_string(), action.clone()));
+        match self.refusal.lock().clone() {
+            Some(reason) => DispatchOutcome::Rejected(reason),
+            None => DispatchOutcome::Accepted,
+        }
+    }
+    fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {
+        self.inner.extension(method, params)
+    }
+}
+
+/// A `TestBackend` with no seeded session, for suites that create their own.
+impl Default for TestBackend {
+    fn default() -> Self {
+        Self {
+            sessions: parking_lot::Mutex::new(BTreeMap::new()),
+        }
     }
 }
 

@@ -24,6 +24,8 @@ use ahp_types::state::{
     Turn,
 };
 use manox_ahp::backend::{Backend, DispatchOutcome};
+#[cfg(feature = "terminal")]
+use manox_ahp::channels::terminal;
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
 use manox_ahp::resource::ResourcePlane;
@@ -75,6 +77,9 @@ pub(crate) struct RuntimeBackend {
     me: OnceLock<Weak<RuntimeBackend>>,
     /// The `resource*` file plane, fenced to the runtime's working directory.
     resources: super::resources::RuntimeResources,
+    /// Live-output pumps by terminal id (see [`Self::ensure_terminal_pump`]).
+    #[cfg(feature = "terminal")]
+    terminal_pumps: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl RuntimeBackend {
@@ -88,6 +93,8 @@ impl RuntimeBackend {
             bridges: Mutex::new(HashMap::new()),
             me: OnceLock::new(),
             resources,
+            #[cfg(feature = "terminal")]
+            terminal_pumps: Mutex::new(HashMap::new()),
         });
         let _ = backend.me.set(Arc::downgrade(&backend));
         backend
@@ -239,6 +246,111 @@ impl RuntimeBackend {
                 Err(_) => break,
             }
         }
+    }
+
+    /// Start the live-output pump for a terminal (idempotent).
+    ///
+    /// The terminal channel's output leg: raw PTY bytes arrive on the terminal's
+    /// raw tap, are decoded to text, and go out as `terminal/data` actions
+    /// through the host's single write path — so a subscriber receives output on
+    /// the same numbered stream as every other channel state, and the browser of
+    /// `serverSeq` stays intact.
+    ///
+    /// The v2 follow-terminal stream relays the same tap per *stream*; an AHP
+    /// terminal is a channel, so one pump serves every subscriber.
+    #[cfg(feature = "terminal")]
+    fn ensure_terminal_pump(&self, terminal_id: &str) {
+        if self.terminal_pumps.lock().contains_key(terminal_id) {
+            return;
+        }
+        let Some(host) = self.host() else {
+            return;
+        };
+        let Some(server) = self.server.ahp_inner().terminal_raw_tap(terminal_id) else {
+            return;
+        };
+        let mut raw_rx = server;
+        let uri = manox_ahp::channels::terminal::uri(terminal_id);
+        let id = terminal_id.to_string();
+        let task = manox_agent::runtime::handle().spawn(async move {
+            // PTY chunks are byte fragments, not character boundaries, so a
+            // multi-byte character can straddle two chunks. Decoding each chunk
+            // on its own would replace the split halves with U+FFFD and corrupt
+            // exactly the non-ASCII output this runtime produces most of.
+            let mut pending: Vec<u8> = Vec::new();
+            while let Ok(chunk) = raw_rx.recv().await {
+                pending.extend_from_slice(&chunk);
+                let text = match std::str::from_utf8(&pending) {
+                    Ok(text) => {
+                        let owned = text.to_string();
+                        pending.clear();
+                        owned
+                    }
+                    Err(error) => {
+                        let valid = error.valid_up_to();
+                        if valid == 0 {
+                            // Nothing decodable yet; wait for the rest.
+                            continue;
+                        }
+                        let owned = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                        pending.drain(..valid);
+                        owned
+                    }
+                };
+                if text.is_empty() {
+                    continue;
+                }
+                host.publish(
+                    &uri,
+                    ahp_types::actions::StateAction::TerminalData(
+                        ahp_types::actions::TerminalDataAction { data: text },
+                    ),
+                    None,
+                );
+            }
+            tracing::debug!(terminal = %id, "terminal output pump ended");
+        });
+        self.terminal_pumps
+            .lock()
+            .insert(terminal_id.to_string(), task);
+    }
+
+    /// Register (or replace) one active client's contributed tools.
+    ///
+    /// This is the AHP face of v2's `RegisterSessionTools`, and it fills the
+    /// same store: the engine's `embedder_tools` provider is what makes a
+    /// registered tool callable by the model, so routing the protocol action
+    /// here — rather than into a parallel table — is what keeps one source of
+    /// truth for "the tools this session's clients contribute".
+    ///
+    /// Full replacement per client, matching `session/activeClientSet`'s
+    /// upsert-by-`clientId` semantics and the v2 call's own contract.
+    ///
+    /// Fail-closed on every input the runtime cannot honour: a session with no
+    /// live engine would otherwise accept the registration, answer `Accepted`,
+    /// fold the tools into the state every subscriber reads — and never mount
+    /// them, so the model would be offered a tool that cannot run.
+    fn register_client_tools(
+        &self,
+        session_id: &str,
+        client: &ahp_types::state::SessionActiveClient,
+    ) -> Result<(), String> {
+        if client.client_id.is_empty() {
+            return Err("an active client needs a clientId".to_string());
+        }
+        if self.server.ahp_inner().session_thread(session_id).is_none() {
+            return Err(format!(
+                "unknown session: {session_id} (no live engine to register tools on)"
+            ));
+        }
+        let mut specs = Vec::with_capacity(client.tools.len());
+        for tool in &client.tools {
+            specs.push(client_tool_spec(tool)?);
+        }
+        self.server
+            .ahp_inner()
+            .set_embedder_tools(session_id, &client.client_id, specs);
+        Ok(())
     }
 
     /// The live facts for a session this host has already folded, if any.
@@ -593,7 +705,9 @@ impl Backend for RuntimeBackend {
             .ahp_inner()
             .attach_terminal(session_id, cols, rows, Some(terminal_id.to_string()))
             .map(|_| ())
-            .map_err(|error| HostError::Backend(error.message))
+            .map_err(|error| HostError::Backend(error.message))?;
+        self.ensure_terminal_pump(terminal_id);
+        Ok(())
     }
 
     #[cfg(feature = "terminal")]
@@ -849,6 +963,24 @@ impl Backend for RuntimeBackend {
                 block_on(async move { inner.set_cwd(&target, &path).await });
                 DispatchOutcome::Accepted
             }
+            // `session/activeClientSet` is how an AHP client joins a session and
+            // publishes the tools it contributes. AHP carries the tool set on
+            // the client's own entry (`SessionState.activeClients[].tools`), so
+            // registration needs no `x-manox` channel: the action *is* the
+            // registration, and the host's reducer folds it into the very state
+            // a subscriber reads. The runtime half is the same registration
+            // store the v2 `RegisterSessionTools` call fills, so a tool a
+            // client contributes here becomes callable by the model through the
+            // one existing path (`embedder_tools`), not a second one.
+            StateAction::SessionActiveClientSet(set) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match self.register_client_tools(session_id, &set.active_client) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(reason) => DispatchOutcome::Rejected(reason),
+                }
+            }
             StateAction::SessionTitleChanged(changed) => {
                 // A user rename is real work: the runtime journals the title
                 // entry and writes the sidecar, so the name outlives the
@@ -881,6 +1013,59 @@ impl Backend for RuntimeBackend {
                     ),
                 }
             }
+            // ── terminal actions ───────────────────────────────────────────
+            //
+            // A build without the terminal plane has no PTY to drive; it refuses
+            // loudly rather than folding an action nothing acted on.
+            #[cfg(feature = "terminal")]
+            StateAction::TerminalInput(input) => {
+                let Some(terminal_id) = terminal::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match self
+                    .server
+                    .ahp_inner()
+                    .terminal_input(terminal_id, &input.data)
+                {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(reason) => DispatchOutcome::Rejected(reason),
+                }
+            }
+            #[cfg(feature = "terminal")]
+            StateAction::TerminalResized(resized) => {
+                let Some(terminal_id) = terminal::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                // AHP sizes are plain integers; the PTY's are `u16`. A value
+                // outside that range is a client bug, and clamping silently
+                // would resize to something the client did not ask for.
+                let (Ok(cols), Ok(rows)) =
+                    (u16::try_from(resized.cols), u16::try_from(resized.rows))
+                else {
+                    return DispatchOutcome::Rejected(format!(
+                        "terminal size out of range: {}x{}",
+                        resized.cols, resized.rows
+                    ));
+                };
+                match self
+                    .server
+                    .ahp_inner()
+                    .terminal_resize(terminal_id, cols, rows)
+                {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(reason) => DispatchOutcome::Rejected(reason),
+                }
+            }
+            #[cfg(not(feature = "terminal"))]
+            StateAction::TerminalInput(_) | StateAction::TerminalResized(_) => {
+                DispatchOutcome::Rejected(
+                    "terminal support is not built into this host".to_string(),
+                )
+            }
+            // AHP types this as client-owned observation state with no runtime
+            // effect: the claim is the protocol's, and this host does not
+            // arbitrate input between clients (see `ahp_terminal_state`).
+            StateAction::TerminalClaimed(_) => DispatchOutcome::Ignored,
             StateAction::SessionIsArchivedChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
@@ -1003,6 +1188,36 @@ impl Backend for RuntimeBackend {
             other => Err(HostError::Unimplemented(other.to_string())),
         }
     }
+}
+
+/// One client-contributed tool as the runtime's registration store holds it.
+///
+/// AHP's `ToolDefinition` carries the schema as optional (a client tool need
+/// not declare one) but the engine's `ClientToolSpec` requires it, so an absent
+/// schema becomes the permissive empty object — the model then calls the tool
+/// with no constraints, which is what "no schema declared" means. Everything
+/// else maps straight across; the `readOnlyHint` annotation is the registrant's
+/// advisory side-effect hint, and the approval gate stays the authority (the
+/// same rule MCP tools follow).
+fn client_tool_spec(
+    tool: &ahp_types::state::ToolDefinition,
+) -> Result<manox_protocol::client::ClientToolSpec, String> {
+    if tool.name.trim().is_empty() {
+        return Err("a contributed tool needs a name".to_string());
+    }
+    Ok(manox_protocol::client::ClientToolSpec {
+        name: tool.name.clone(),
+        description: tool.description.clone().unwrap_or_default(),
+        input_schema: tool
+            .input_schema
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object" })),
+        read_only: tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false),
+    })
 }
 
 /// The session an extension command names, from its `channel`.

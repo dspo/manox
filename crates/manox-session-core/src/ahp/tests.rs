@@ -515,7 +515,7 @@ mod dispatch {
     use ahp_types::common::JsonObject;
     use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
     use manox_ahp::backend::{Backend, DispatchOutcome};
-    use manox_ahp::channels::{chat, session, terminal};
+    use manox_ahp::channels::{chat, session};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -1546,6 +1546,58 @@ mod dispatch {
              announce a client claim it would not enforce"
         );
 
+        // The write path: keystrokes and resizes reach the PTY. Without these
+        // the client can create and watch a terminal but never type into it,
+        // which is not a usable terminal — and v2 serves both.
+        assert_eq!(
+            backend.dispatch(
+                &manox_ahp::channels::terminal::uri(&terminal_id),
+                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                    data: "echo hi\n".to_string(),
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(
+            backend.dispatch(
+                &manox_ahp::channels::terminal::uri(&terminal_id),
+                &StateAction::TerminalResized(ahp_types::actions::TerminalResizedAction {
+                    cols: 100,
+                    rows: 30,
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Accepted
+        );
+
+        // An out-of-range size is refused, not clamped: clamping would resize
+        // the PTY to something the client did not ask for.
+        assert!(matches!(
+            backend.dispatch(
+                &manox_ahp::channels::terminal::uri(&terminal_id),
+                &StateAction::TerminalResized(ahp_types::actions::TerminalResizedAction {
+                    cols: 100_000,
+                    rows: 30,
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+
+        // Input to a terminal that does not exist is refused, never silently
+        // dropped (the client would type into nothing and never learn).
+        assert!(matches!(
+            backend.dispatch(
+                &manox_ahp::channels::terminal::uri("no-such-terminal"),
+                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                    data: "x".to_string(),
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+
         // Disposal releases the PTY. The watcher task holds an `Arc` of the
         // entry, so this only holds if disposal breaks that cycle — otherwise
         // the map entry is gone, `disposeTerminal` reports success, and the
@@ -1567,18 +1619,264 @@ mod dispatch {
     async fn unwired_actions_are_refused_with_a_reason() {
         let _guards = install();
         let (_server, backend) = fixture().await;
-        let action = StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
-            data: "ls\n".to_string(),
+        // `chat/truncated` is on the acceptance table (a client may dispatch it)
+        // but has no runtime intent yet, so it must be refused by name rather
+        // than folded and echoed as if something had happened.
+        let action = StateAction::ChatTruncated(ahp_types::actions::ChatTruncatedAction {
+            turn_id: Some("t-1".to_string()),
         });
-        match backend.dispatch(&terminal::uri("t-1"), &action, &origin()) {
+        match backend.dispatch(&chat::uri("s-dispatch"), &action, &origin()) {
             DispatchOutcome::Rejected(reason) => {
                 assert!(
-                    reason.contains("terminal/input"),
+                    reason.contains("chat/truncated"),
                     "names the action: {reason}"
                 );
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
+        uninstall();
+    }
+
+    // ── client-contributed tools (`session/activeClientSet`) ───────────────
+    //
+    // The AHP face of v2's `RegisterSessionTools`. The registration lands in
+    // the runtime's embedder-tool store (so the model can call the tool) while
+    // `activeClients` carries it on the protocol surface (so every subscriber
+    // reads it). Both halves are asserted here, because either alone is a
+    // half-built capability.
+
+    /// One contributed tool definition, built typed rather than from JSON.
+    fn tool_definition(name: &str) -> ahp_types::state::ToolDefinition {
+        ahp_types::state::ToolDefinition {
+            name: name.to_string(),
+            title: None,
+            description: Some(format!("the {name} tool")),
+            input_schema: Some(json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+            })),
+            output_schema: None,
+            annotations: None,
+            meta: None,
+        }
+    }
+
+    /// An active-client entry as a registering client dispatches it.
+    fn active_client(
+        client_id: &str,
+        tools: Vec<ahp_types::state::ToolDefinition>,
+    ) -> ahp_types::state::SessionActiveClient {
+        ahp_types::state::SessionActiveClient {
+            client_id: client_id.to_string(),
+            display_name: Some("Test Client".to_string()),
+            tools,
+            customizations: None,
+        }
+    }
+
+    fn active_client_set(client: ahp_types::state::SessionActiveClient) -> StateAction {
+        StateAction::SessionActiveClientSet(ahp_types::actions::SessionActiveClientSetAction {
+            active_client: client,
+        })
+    }
+
+    /// A registration reaches the runtime's tool store, so the model can call
+    /// the tool: the AHP action and the v2 `RegisterSessionTools` call fill the
+    /// same registration the engine consults at assembly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_registers_tools_the_runtime_will_mount() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        manox_agent::embedder_tools::drop_provider_for_test();
+
+        let action = active_client_set(active_client(
+            "client-a",
+            vec![tool_definition("get_selection")],
+        ));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        // The runtime half: the engine-facing provider now hands out the tool,
+        // under the `client_` model-facing name v2 uses for the same fact.
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        let mounted = provider.tools_for("s-dispatch");
+        assert_eq!(mounted.len(), 1, "the registration reached the provider");
+        assert_eq!(mounted[0].name(), "client_get_selection");
+        assert_eq!(mounted[0].description(), "the get_selection tool");
+        assert_eq!(
+            mounted[0].parameters_schema(),
+            json!({"type": "object", "properties": { "q": { "type": "string" } }}),
+            "the registrant's schema is carried verbatim"
+        );
+        uninstall();
+    }
+
+    /// Re-registering replaces the set (full replacement per client), which is
+    /// both the AHP upsert contract and the v2 call's own semantics.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_replaces_a_previous_registration() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        manox_agent::embedder_tools::drop_provider_for_test();
+
+        let first = active_client_set(active_client("client-a", vec![tool_definition("old")]));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &first, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let second = active_client_set(active_client("client-a", vec![tool_definition("new")]));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &second, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        let mounted = provider.tools_for("s-dispatch");
+        assert_eq!(
+            mounted.iter().map(|t| t.name()).collect::<Vec<_>>(),
+            vec!["client_new"],
+            "the previous set is replaced, not merged"
+        );
+        uninstall();
+    }
+
+    /// Two clients keep their own sets: `activeClients` is keyed by `clientId`,
+    /// so one client's re-registration must not evict another's tools.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_is_scoped_to_the_registering_client() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        manox_agent::embedder_tools::drop_provider_for_test();
+
+        for (client, tool) in [("client-a", "alpha"), ("client-b", "beta")] {
+            let action = active_client_set(active_client(client, vec![tool_definition(tool)]));
+            assert_eq!(
+                backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+                DispatchOutcome::Accepted
+            );
+        }
+
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        let mut names: Vec<String> = provider
+            .tools_for("s-dispatch")
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["client_alpha", "client_beta"]);
+        uninstall();
+    }
+
+    /// A registration against a session this runtime does not drive is refused
+    /// loudly. Accepting it would fold a tool set into every subscriber's view
+    /// of a session whose engine will never mount it, so the model would be
+    /// offered a tool that cannot run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_on_an_unknown_session_is_refused() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = active_client_set(active_client("client-a", vec![tool_definition("t")]));
+        match backend.dispatch(&session::uri("no-such-session"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("no-such-session"),
+                    "names the session: {reason}"
+                );
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// A malformed registration is refused rather than stored: a nameless tool
+    /// cannot be called, and a blank name would sanitize into a collision with
+    /// another client's tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_with_a_nameless_tool_is_refused() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = active_client_set(active_client("client-a", vec![tool_definition("  ")]));
+        assert!(
+            matches!(
+                backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+                DispatchOutcome::Rejected(_)
+            ),
+            "a tool definition without a name is not registrable"
+        );
+        uninstall();
+    }
+
+    /// A registration with no client id is refused: it would land in the store
+    /// under an empty key, where nothing can route a subsequent invocation back
+    /// to the client that contributed the tool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_without_a_client_id_is_refused() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let action = active_client_set(active_client("", vec![tool_definition("t")]));
+        assert!(matches!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Rejected(_)
+        ));
+        uninstall();
+    }
+
+    /// A tool with no declared schema is still registrable — AHP makes the
+    /// schema optional for client tools — and defaults to the permissive object
+    /// schema rather than being refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_accepts_a_tool_without_a_schema() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        manox_agent::embedder_tools::drop_provider_for_test();
+        let mut tool = tool_definition("schemaless");
+        tool.input_schema = None;
+        let action = active_client_set(active_client("client-a", vec![tool]));
+
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        assert_eq!(
+            provider.tools_for("s-dispatch")[0].parameters_schema(),
+            json!({ "type": "object" })
+        );
+        uninstall();
+    }
+
+    /// The `readOnlyHint` annotation survives registration: the approval gate
+    /// reads it, so losing it would silently gate a read-only contributor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_client_set_carries_the_read_only_hint() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+        manox_agent::embedder_tools::drop_provider_for_test();
+        let mut tool = tool_definition("reader");
+        tool.annotations = Some(ahp_types::state::ToolAnnotations {
+            title: None,
+            read_only_hint: Some(true),
+            destructive_hint: None,
+            idempotent_hint: None,
+            open_world_hint: None,
+        });
+        let action = active_client_set(active_client("client-a", vec![tool]));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        let provider = crate::agent_server::AgentServerEmbedderTools::new(&server);
+        use manox_agent::embedder_tools::EmbedderToolProvider as _;
+        let mounted = provider.tools_for("s-dispatch");
+        assert!(mounted[0].is_read_only());
+        assert!(!mounted[0].requires_approval(&json!({})));
         uninstall();
     }
 }

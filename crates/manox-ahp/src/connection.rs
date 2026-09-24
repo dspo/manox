@@ -58,6 +58,13 @@ pub struct Conn {
     /// learned: a closed receiver the caller folds into a fail-closed rejection
     /// is worse than an explicit cancellation).
     pending: RpcPeer,
+    /// Host → client request methods this client declared it can answer.
+    ///
+    /// Read from the client's `initialize`/`reconnect` `_meta` (see
+    /// `router::declared_client_requests`), because AHP's `ClientCapabilities`
+    /// declares `mcpApps` alone and has no field for a host-initiated request.
+    /// Empty means the client declared nothing, which selects it for nothing.
+    client_requests: Mutex<Vec<String>>,
 }
 
 impl Conn {
@@ -72,7 +79,25 @@ impl Conn {
             alive: AtomicBool::new(true),
             dialect: Box::new(IdentityDialect),
             pending: RpcPeer::new(),
+            client_requests: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record the host → client request methods this connection declared.
+    pub fn set_client_requests(&self, methods: Vec<String>) {
+        *self.client_requests.lock() = methods;
+    }
+
+    /// Whether this client declared it can answer `method`.
+    ///
+    /// The gate for host-initiated requests: a client that did not declare a
+    /// method is never asked, so an unanswerable request fails at selection
+    /// rather than after a 300-second deadline.
+    pub fn can_answer(&self, method: &str) -> bool {
+        self.client_requests
+            .lock()
+            .iter()
+            .any(|declared| declared == method)
     }
 
     /// Install the dialect this connection speaks (see [`Dialect`]).

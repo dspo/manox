@@ -220,6 +220,9 @@ async fn initialize(
 
     inner.reseat(conn, &params.client_id);
     conn.set_identity(params.client_id.clone(), params.locale.clone());
+    conn.set_client_requests(declared_client_requests(
+        params.meta.as_ref().map(|meta| Value::Object(meta.clone())),
+    ));
 
     let mut snapshots = Vec::new();
     for uri in params.initial_subscriptions.clone().unwrap_or_default() {
@@ -666,6 +669,33 @@ fn declaration_meta() -> ahp_types::common::JsonObject {
 /// Parse command params, converting serde failures into `-32602`.
 fn parse_params<T: DeserializeOwned>(value: Value) -> Result<T, HostError> {
     serde_json::from_value(value).map_err(|err| HostError::InvalidParams(err.to_string()))
+}
+
+/// The host → client request methods a client declared it can answer, read from
+/// `_meta["x-manox"].serverRequests` on its `initialize` (or `reconnect`).
+///
+/// This is the client leg of the same declaration the host advertises in its
+/// `initialize` result. An `x-manox` key rather than a standard one because
+/// AHP's `ClientCapabilities` (0.9.0) declares `mcpApps` alone and has no field
+/// for a host-initiated request: there is no AHP-native neighbour to prefer, and
+/// this is the only channel the four names have.
+///
+/// Unknown names are kept: the host only ever asks for methods it serves, and
+/// refusing an unknown name here would turn a newer client's forward
+/// declaration into a handshake failure.
+fn declared_client_requests(meta: Option<Value>) -> Vec<String> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(ext::META_KEY))
+        .and_then(|value| value.get("serverRequests"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Serialize a result, converting the (impossible-by-construction) failure into
