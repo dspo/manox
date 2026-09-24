@@ -181,20 +181,13 @@ pub enum ClientCall {
     },
 }
 
-/// One embedder-registered tool: the schema is a JSON Schema object the
-/// host owns; the server treats it as opaque and echoes it to the model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ClientToolSpec {
-    pub name: String,
-    pub description: String,
-    pub input_schema: serde_json::Value,
-    /// The registrant's side-effect hint: `true` marks a read-only tool
-    /// (e.g. a selection reader) that need not surface an approval card.
-    /// Advisory only — the host's permission gate stays the authority;
-    /// absent (defaults `false`) means treat as mutating.
-    #[serde(default)]
-    pub read_only: bool,
-}
+/// One embedder-registered tool.
+///
+/// The shape now lives in `manox_ahp_runtime::runtime_trait::ClientToolSpec`,
+/// because the runtime stores it and must outlive this crate. It is re-exported
+/// here so the v2 surface stays source-compatible while v2 lives; when v2 is
+/// deleted, its consumers point at the runtime directly.
+pub use manox_ahp_runtime::runtime_trait::ClientToolSpec;
 
 /// Client → server fire-and-forget commands.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

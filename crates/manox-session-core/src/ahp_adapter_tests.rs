@@ -1,9 +1,10 @@
 //! Fold tests: a seeded journal on disk must reach the AHP chat/session
 //! states the same host-and-client fold produces (§C, L10).
 
-use super::*;
 use ahp_types::state::{ResponsePart, ToolCallState, ToolResultContent, TurnState};
+use ahp_types::state::{SessionLifecycle, SessionStatus};
 use chrono::{DateTime, Utc};
+use manox_ahp_runtime::ahp::{chat_state, session_state};
 use manox_harness::session::SessionTreeEntry as E;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 use manox_harness::types::{AgentMessage, ContentBlock, Usage};
@@ -520,10 +521,14 @@ mod dispatch {
     use std::sync::Arc;
 
     /// A server holding one live session, plus the backend under test.
-    async fn fixture() -> (Arc<AgentServer>, Arc<super::super::backend::RuntimeBackend>) {
+    async fn fixture() -> (
+        Arc<AgentServer>,
+        Arc<manox_ahp_runtime::ahp::backend::RuntimeBackend>,
+    ) {
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
-        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let intent = crate::agent_server::SessionIntent {
             session_id: Some("s-dispatch".to_string()),
             cwd: None,
@@ -1192,7 +1197,8 @@ mod dispatch {
 
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
-        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let intent = crate::agent_server::SessionIntent {
             session_id: Some(session_id.clone()),
             cwd: None,
@@ -1308,7 +1314,8 @@ mod dispatch {
         let session_id = format!("s-fresh-{}", uuid::Uuid::new_v4().simple());
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
-        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let intent = crate::agent_server::SessionIntent {
             session_id: Some(session_id.clone()),
             cwd: None,
@@ -1358,7 +1365,8 @@ mod dispatch {
         let id = format!("s-created-{}", uuid::Uuid::new_v4().simple());
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
-        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
         let params = ahp_types::commands::CreateSessionParams {
             channel: session::uri(&id),
             meta: None,
@@ -1491,7 +1499,8 @@ mod dispatch {
 
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
-        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
 
         let channel = format!("{}{session_id}", manox_ahp::ext::channels::PLAN);
         let (method, payload) = backend
@@ -1631,7 +1640,8 @@ mod dispatch {
             .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
 
         let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        let runtime = super::super::runtime::AhpRuntime::new(Arc::clone(&server), cwd);
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
 
         // A client that subscribes without declaring anything.
         let client = ahp::Client::connect(runtime.inproc(), ClientConfig::default())
@@ -1998,5 +2008,134 @@ mod dispatch {
         assert!(mounted[0].is_read_only());
         assert!(!mounted[0].requires_approval(&json!({})));
         uninstall();
+    }
+}
+
+/// The two-transport parity test (see its own docs).
+mod transport_parity {
+    use super::*;
+    use crate::agent_server::AgentServer;
+    use ahp::ClientConfig;
+    use ahp_types::version::PROTOCOL_VERSION;
+    use manox_ahp_runtime::ahp::runtime::AhpRuntime;
+    use std::path::PathBuf;
+
+    /// Both legs serve one host: a root action published once arrives at the
+    /// in-process subscriber and the WebSocket subscriber with the same
+    /// `serverSeq` — the property that lets a local window and a remote client
+    /// share a session without a second gateway in the process.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_process_and_websocket_legs_share_one_host() {
+        // The crate's established test scaffolding (same shape as the fold
+        // suite): a hermetic HOME, a standalone threads db and a scratch
+        // registry file, guarded so the overrides cannot leak across suites.
+        let outer = crate::test_support::lock_globals();
+        let store_lock = manox_agent::thread_store::store_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        let scratch = std::env::temp_dir().join(format!(
+            "manox-ahp-parity-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let db = Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&scratch.join("threads.db"))
+                .expect("threads db"),
+        );
+        manox_agent::thread_store::init_for_test(db);
+        manox_agent::thread_registry::set_registry_path_for_test(Some(
+            scratch.join("threads.registry.json"),
+        ));
+        let _guards = (outer, store_lock);
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = AhpRuntime::new(gateway, cwd);
+
+        // Leg one: over channel (in-process).
+        let inproc = ahp::Client::connect(runtime.inproc(), ClientConfig::default())
+            .await
+            .expect("in-process client connects");
+        let inproc_init = inproc
+            .initialize(
+                "desktop".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("in-process initialize");
+        let mut inproc_root = inproc
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        // Leg two: over websocket, through the gateway-shaped router.
+        let app = runtime.router("/ahp");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binds loopback");
+        let addr = listener.local_addr().expect("bound address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client_transport = ahp_ws::WebSocketTransport::connect(&format!("ws://{addr}/ahp"))
+            .await
+            .expect("websocket client connects");
+        let remote = ahp::Client::connect(client_transport, ClientConfig::default())
+            .await
+            .expect("websocket client ready");
+        let remote_init = remote
+            .initialize(
+                "remote".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("websocket initialize");
+        let mut remote_root = remote
+            .attach_subscription(ahp_types::common::ROOT_RESOURCE_URI)
+            .await;
+
+        // Same host, same snapshot.
+        assert_eq!(
+            serde_json::to_value(&inproc_init.snapshots[0].state).unwrap(),
+            serde_json::to_value(&remote_init.snapshots[0].state).unwrap(),
+        );
+        let meta = remote_init
+            .meta
+            .expect("the extension surface is advertised");
+        assert_eq!(meta["x-manox"]["version"], 1);
+
+        // One publish, two subscribers, one sequence number.
+        let published = runtime.host().publish(
+            ahp_types::common::ROOT_RESOURCE_URI,
+            ahp_types::actions::StateAction::RootAgentsChanged(
+                ahp_types::actions::RootAgentsChangedAction {
+                    agents: runtime.host().backend().root_state().agents,
+                },
+            ),
+            None,
+        );
+        let inproc_envelope = next_action(&mut inproc_root).await;
+        let remote_envelope = next_action(&mut remote_root).await;
+        assert_eq!(inproc_envelope.server_seq, published.server_seq);
+        assert_eq!(remote_envelope.server_seq, published.server_seq);
+
+        manox_agent::thread_registry::set_registry_path_for_test(None);
+        manox_agent::thread_store::drop_for_test();
+    }
+
+    async fn next_action(sub: &mut ahp::SessionSubscription) -> ahp_types::actions::ActionEnvelope {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
+            .await
+            .expect("action arrives")
+            .expect("subscription open");
+        match event {
+            ahp::SubscriptionEvent::Action(envelope) => envelope,
+            other => panic!("expected an action envelope, got {other:?}"),
+        }
     }
 }

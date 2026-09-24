@@ -25,7 +25,7 @@ struct AppState {
     port: u16,
     /// The AHP host this listener also serves (`/ahp`): one process, one host,
     /// two protocols on the same loopback listener (v3 architecture §E.3).
-    ahp: Arc<crate::ahp::runtime::AhpRuntime>,
+    ahp: Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
 }
 
 /// Bind the loopback listener, publish the endpoint, then serve forever.
@@ -54,7 +54,7 @@ pub(super) async fn bind_and_serve(
         token,
         server,
         port,
-        ahp: crate::ahp::runtime::runtime(cwd),
+        ahp: manox_ahp_runtime::ahp::runtime::runtime(cwd),
     };
     axum::serve(listener, build_router(state)).await?;
     Ok(())

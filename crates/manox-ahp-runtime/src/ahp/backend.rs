@@ -44,7 +44,7 @@ use super::fold_journal;
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(future))
 }
-use crate::agent_server::AgentServer;
+use crate::runtime_trait::SessionRuntime;
 
 /// One session's folded state plus the journal tail it was taken at.
 struct Seeded {
@@ -63,8 +63,8 @@ struct Seeded {
 ///
 /// Named in the `x-manox` namespace: it is our surface, not AHP's.
 /// The runtime adapter the AHP host talks to.
-pub(crate) struct RuntimeBackend {
-    server: Arc<AgentServer>,
+pub struct RuntimeBackend {
+    server: Arc<dyn SessionRuntime>,
     cwd: PathBuf,
     /// Set once by the runtime right after `Host::new`: the bridge needs the host
     /// to publish, and the host needs the backend to seed — a cycle broken by
@@ -83,7 +83,7 @@ pub(crate) struct RuntimeBackend {
 }
 
 impl RuntimeBackend {
-    pub(crate) fn new(server: Arc<AgentServer>, cwd: PathBuf) -> Arc<Self> {
+    pub fn new(server: Arc<dyn SessionRuntime>, cwd: PathBuf) -> Arc<Self> {
         let resources = super::resources::RuntimeResources::new(vec![cwd.clone()]);
         let backend = Arc::new(Self {
             server,
@@ -104,7 +104,7 @@ impl RuntimeBackend {
         self.me.get().and_then(Weak::upgrade)
     }
 
-    pub(crate) fn attach_host(&self, host: &Arc<manox_ahp::Host>) {
+    pub fn attach_host(&self, host: &Arc<manox_ahp::Host>) {
         let _ = self.host.set(Arc::downgrade(host));
     }
 
@@ -173,7 +173,7 @@ impl RuntimeBackend {
         if bridges.contains_key(session_id) {
             return;
         }
-        let Some(thread) = self.server.ahp_inner().session_thread(session_id) else {
+        let Some(thread) = self.server.journal_feed(session_id) else {
             // A cold session (no live engine) has no feed to bridge; its state
             // still answers from the journal, and a submit materializes the
             // engine, which re-runs this path.
@@ -266,7 +266,7 @@ impl RuntimeBackend {
         let Some(host) = self.host() else {
             return;
         };
-        let Some(server) = self.server.ahp_inner().terminal_raw_tap(terminal_id) else {
+        let Some(server) = self.server.terminal_raw_tap(terminal_id) else {
             return;
         };
         let mut raw_rx = server;
@@ -338,7 +338,7 @@ impl RuntimeBackend {
         if client.client_id.is_empty() {
             return Err("an active client needs a clientId".to_string());
         }
-        if self.server.ahp_inner().session_thread(session_id).is_none() {
+        if !self.server.has_session(session_id) {
             return Err(format!(
                 "unknown session: {session_id} (no live engine to register tools on)"
             ));
@@ -348,7 +348,6 @@ impl RuntimeBackend {
             specs.push(client_tool_spec(tool)?);
         }
         self.server
-            .ahp_inner()
             .set_embedder_tools(session_id, &client.client_id, specs);
         Ok(())
     }
@@ -477,21 +476,9 @@ impl RuntimeBackend {
             tracing::debug!(tool_call_id, "tool call confirmation without an authId");
             return DispatchOutcome::Ignored;
         };
-        let response = if approved {
-            manox_agent::permission::ToolAuthorizationResponse::Decision(
-                manox_agent::permission::PermissionDecision::AllowOnce,
-            )
-        } else {
-            manox_agent::permission::ToolAuthorizationResponse::Decision(
-                manox_agent::permission::PermissionDecision::Deny,
-            )
-        };
-        match self.server.ahp_inner().session_thread(session_id) {
-            Some(thread) => {
-                thread.with_mut(|t| t.respond_authorization(auth_id, response));
-                DispatchOutcome::Accepted
-            }
-            None => DispatchOutcome::Rejected("unknown session".to_string()),
+        match self.server.confirm_tool_call(session_id, auth_id, approved) {
+            Ok(()) => DispatchOutcome::Accepted,
+            Err(error) => DispatchOutcome::Rejected(error.message),
         }
     }
 
@@ -504,22 +491,13 @@ impl RuntimeBackend {
         let Some(session_id) = chat::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
-        match self.server.ahp_inner().session_thread(session_id) {
-            Some(thread) => {
-                // The answers themselves are not carried here: AHP's
-                // `inputCompleted` is dispatched with the completed card's
-                // answers already on the part, and the kernel reads them from
-                // the same parked card. Completing the card is what the runtime
-                // is asked for.
-                thread.with_mut(|t| {
-                    t.respond_question(
-                        request_id,
-                        manox_agent::questions::AskOutcome::Answered(Vec::new()),
-                    )
-                });
-                DispatchOutcome::Accepted
-            }
-            None => DispatchOutcome::Rejected("unknown session".to_string()),
+        // The answers themselves are not carried here: AHP's `inputCompleted` is
+        // dispatched with the completed card's answers already on the part, and
+        // the kernel reads them from the same parked card. Completing the card
+        // is what the runtime is asked for.
+        match self.server.answer_question(session_id, request_id) {
+            Ok(()) => DispatchOutcome::Accepted,
+            Err(error) => DispatchOutcome::Rejected(error.message),
         }
     }
 
@@ -538,15 +516,14 @@ impl RuntimeBackend {
         let Some(session_id) = session::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
-        let inner = self.server.ahp_inner();
         if let Some(model) = config.get("model").and_then(Value::as_str) {
-            inner.set_model(session_id, model);
+            self.server.set_model(session_id, model);
         }
         if let Some(effort) = config.get("reasoningEffort").and_then(Value::as_str) {
-            inner.set_reasoning_effort(session_id, effort);
+            self.server.set_reasoning_effort(session_id, effort);
         }
         if let Some(mode) = config.get("approvalMode").and_then(Value::as_str) {
-            inner.set_approval_mode(session_id, mode);
+            self.server.set_approval_mode(session_id, mode);
         }
         DispatchOutcome::Accepted
     }
@@ -699,7 +676,43 @@ impl Backend for RuntimeBackend {
 
     #[cfg(feature = "terminal")]
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
-        self.server.ahp_inner().ahp_terminal_state(terminal_id)
+        use ahp_types::state as ahp;
+        let snapshot = self.server.terminal_state(terminal_id)?;
+        Some(ahp::TerminalState {
+            title: snapshot.title,
+            cwd: snapshot.cwd,
+            cols: Some(snapshot.cols),
+            rows: Some(snapshot.rows),
+            // The visible grid is what a late subscriber must have. AHP allows a
+            // command/output split (`TerminalContentPart::Command`); this runtime
+            // does not track command boundaries, so the whole screen is one
+            // unclassified part rather than a fabricated split.
+            content: vec![ahp::TerminalContentPart::Unclassified(
+                ahp::TerminalUnclassifiedPart {
+                    value: snapshot.lines.join("\n"),
+                },
+            )],
+            lifecycle: match snapshot.exit_code {
+                Some(code) => {
+                    ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
+                        exit_code: Some(code),
+                    })
+                }
+                None => ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {}),
+            },
+            // One process-local host serves every client, and the runtime does not
+            // arbitrate input ownership, so the claim is the session's: announcing
+            // a client claim we would not enforce invites two clients to type into
+            // one PTY.
+            claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
+                session: manox_ahp::channels::session::uri(&snapshot.session_id),
+                chat: manox_ahp::channels::session::uri(&snapshot.session_id),
+                turn_id: None,
+                tool_call_id: None,
+            }),
+            supports_command_detection: Some(false),
+            is_pty: Some(true),
+        })
     }
 
     #[cfg(feature = "terminal")]
@@ -711,9 +724,7 @@ impl Backend for RuntimeBackend {
         rows: u16,
     ) -> Result<(), HostError> {
         self.server
-            .ahp_inner()
-            .attach_terminal(session_id, cols, rows, Some(terminal_id.to_string()))
-            .map(|_| ())
+            .create_terminal(session_id, terminal_id, cols, rows)
             .map_err(|error| HostError::Backend(error.message))?;
         self.ensure_terminal_pump(terminal_id);
         Ok(())
@@ -722,10 +733,8 @@ impl Backend for RuntimeBackend {
     #[cfg(feature = "terminal")]
     fn dispose_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
         self.server
-            .ahp_inner()
             .dispose_terminal(terminal_id)
-            .then_some(())
-            .ok_or_else(|| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))
+            .map_err(|_| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))
     }
 
     #[cfg(not(feature = "terminal"))]
@@ -752,7 +761,7 @@ impl Backend for RuntimeBackend {
             .as_ref()
             .map(|client| client.client_id.clone())
             .unwrap_or_else(|| "ahp".to_string());
-        let intent = crate::agent_server::SessionIntent {
+        let intent = crate::runtime_trait::SessionIntent {
             session_id: Some(session_id.to_string()),
             cwd: working_directories.first().cloned(),
             project: None,
@@ -762,13 +771,9 @@ impl Backend for RuntimeBackend {
             seed: None,
             working_directories,
         };
-        let server = Arc::clone(&self.server);
-        let inner = Arc::clone(server.ahp_inner());
-        block_on(async move {
-            crate::agent_server::AgentServerInner::create_session_request(&inner, &owner, intent)
-                .await
-        })
-        .map_err(|error| HostError::Backend(error.message))?;
+        self.server
+            .create_session(&owner, intent)
+            .map_err(|error| HostError::Backend(error.message))?;
         // Seed and bridge the new session now, so a client that subscribes after
         // creating it gets a snapshot and then live actions.
         let _ = block_on(self.seeded(session_id));
@@ -776,7 +781,7 @@ impl Backend for RuntimeBackend {
     }
 
     fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
-        self.server.ahp_inner().dispose_session("ahp", session_id);
+        let _ = self.server.dispose_session("ahp", session_id);
         Ok(())
     }
 
@@ -828,8 +833,7 @@ impl Backend for RuntimeBackend {
             .and_then(Value::as_str)
             .unwrap_or("ahp")
             .to_string();
-        let inner = Arc::clone(self.server.ahp_inner());
-        let intent = crate::agent_server::ForkIntent {
+        let intent = crate::runtime_trait::ForkIntent {
             source_session_id: source_session_id.to_string(),
             through_entry_id: through_entry_id.to_string(),
             target_session_id: Some(chat_id.to_string()),
@@ -839,7 +843,8 @@ impl Backend for RuntimeBackend {
             approval_mode: None,
             reasoning_effort: None,
         };
-        block_on(async move { crate::agent_server::fork_session(&inner, &owner, intent).await })
+        self.server
+            .fork_session(&owner, intent)
             .map_err(|error| HostError::Backend(error.message))?;
         let _ = session_id;
         // The forked journal is new to the host: seed and bridge it so a client
@@ -852,7 +857,7 @@ impl Backend for RuntimeBackend {
     fn dispose_chat(&self, chat_id: &str) -> Result<(), HostError> {
         // Disposing a chat retires its journal's live resources. The session
         // itself survives, so this disposes the engine rather than the row.
-        self.server.ahp_inner().dispose_session("ahp", chat_id);
+        let _ = self.server.dispose_session("ahp", chat_id);
         Ok(())
     }
 
@@ -888,14 +893,9 @@ impl Backend for RuntimeBackend {
                 };
                 let text = started.message.text.clone();
                 let owner = origin.client_id.clone();
-                let inner = Arc::clone(self.server.ahp_inner());
                 let target = session_id.to_string();
                 let session_id = target.clone();
-                match block_on(async move {
-                    inner
-                        .submit(&owner, &target, text, Vec::new(), None, None)
-                        .await
-                }) {
+                match self.server.submit(&owner, &target, text) {
                     Ok(_) => {
                         // A submit materializes the engine, so a session that was
                         // cold when the client subscribed has no bridge yet.
@@ -915,9 +915,8 @@ impl Backend for RuntimeBackend {
                 // message id is the steer id — the identity the journal row and
                 // the echo retirement share.
                 let text = set.message.text.clone();
-                let inner = Arc::clone(self.server.ahp_inner());
                 let target = session_id.to_string();
-                match inner.steer(&target, set.id.clone(), text, Vec::new(), None) {
+                match self.server.steer(&target, &set.id, text) {
                     Ok(_) => DispatchOutcome::Accepted,
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
@@ -928,21 +927,16 @@ impl Backend for RuntimeBackend {
                 };
                 // Both kinds name a parked follow-up the runtime holds by id, so
                 // withdrawing one is the same intent either way.
-                self.server
-                    .ahp_inner()
-                    .drop_queued(session_id, removed.id.clone());
+                self.server.drop_queued(session_id, &removed.id);
                 DispatchOutcome::Accepted
             }
             StateAction::ChatTurnCancelled(_) => {
                 let Some(session_id) = chat::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self.server.ahp_inner().session_thread(session_id) {
-                    Some(thread) => {
-                        thread.with_mut(|t| t.cancel());
-                        DispatchOutcome::Accepted
-                    }
-                    None => DispatchOutcome::Rejected("unknown session".to_string()),
+                match self.server.cancel_turn(session_id) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
             StateAction::ChatToolCallConfirmed(confirmed) => self.confirm_tool_call(
@@ -967,10 +961,10 @@ impl Backend for RuntimeBackend {
                         "working directories must be file:// URIs".to_string(),
                     );
                 };
-                let inner = Arc::clone(self.server.ahp_inner());
-                let target = session_id.to_string();
-                block_on(async move { inner.set_cwd(&target, &path).await });
-                DispatchOutcome::Accepted
+                match self.server.set_cwd(session_id, &path) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
+                }
             }
             // `session/activeClientSet` is how an AHP client joins a session and
             // publishes the tools it contributes. AHP carries the tool set on
@@ -1000,12 +994,8 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                use manox_agent::thread_store::RenameOutcome;
-                match self
-                    .server
-                    .ahp_inner()
-                    .rename_thread(session_id, &changed.title)
-                {
+                use crate::runtime_trait::RenameOutcome;
+                match self.server.rename_session(session_id, &changed.title) {
                     RenameOutcome::Renamed => DispatchOutcome::Accepted,
                     RenameOutcome::Blank => {
                         DispatchOutcome::Rejected("a session title cannot be blank".to_string())
@@ -1031,13 +1021,9 @@ impl Backend for RuntimeBackend {
                 let Some(terminal_id) = terminal::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                match self
-                    .server
-                    .ahp_inner()
-                    .terminal_input(terminal_id, &input.data)
-                {
+                match self.server.terminal_input(terminal_id, &input.data) {
                     Ok(()) => DispatchOutcome::Accepted,
-                    Err(reason) => DispatchOutcome::Rejected(reason),
+                    Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
             #[cfg(feature = "terminal")]
@@ -1056,13 +1042,9 @@ impl Backend for RuntimeBackend {
                         resized.cols, resized.rows
                     ));
                 };
-                match self
-                    .server
-                    .ahp_inner()
-                    .terminal_resize(terminal_id, cols, rows)
-                {
+                match self.server.terminal_resize(terminal_id, cols, rows) {
                     Ok(()) => DispatchOutcome::Accepted,
-                    Err(reason) => DispatchOutcome::Rejected(reason),
+                    Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
             #[cfg(not(feature = "terminal"))]
@@ -1094,7 +1076,7 @@ impl Backend for RuntimeBackend {
                         "x-manox/pinnedChanged needs a boolean `pinned`".to_string(),
                     );
                 };
-                if self.server.ahp_inner().pin_session(session_id, pinned) {
+                if self.server.pin_session(session_id, pinned) {
                     DispatchOutcome::Accepted
                 } else {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
@@ -1119,7 +1101,7 @@ impl Backend for RuntimeBackend {
                         );
                     }
                 };
-                if self.server.ahp_inner().order_session(session_id, before) {
+                if self.server.order_session(session_id, before) {
                     DispatchOutcome::Accepted
                 } else {
                     DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
@@ -1129,11 +1111,8 @@ impl Backend for RuntimeBackend {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
-                self.server.ahp_inner().archive_thread(
-                    &origin.client_id,
-                    session_id,
-                    changed.is_archived,
-                );
+                self.server
+                    .archive_session(&origin.client_id, session_id, changed.is_archived);
                 DispatchOutcome::Accepted
             }
             // Actions the acceptance table admits and the reducer folds, but
@@ -1219,13 +1198,11 @@ impl Backend for RuntimeBackend {
                     .get("instructions")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                match self.server.ahp_inner().session_thread(&session_id) {
-                    Some(_) => {
-                        self.server.ahp_inner().compact(&session_id, instructions);
-                        Ok(Value::Null)
-                    }
-                    None => Err(HostError::SessionNotFound(session_id)),
+                if !self.server.has_session(&session_id) {
+                    return Err(HostError::SessionNotFound(session_id));
                 }
+                self.server.compact(&session_id, instructions);
+                Ok(Value::Null)
             }
             manox_ahp::ext::commands::PLAN_EXECUTE => {
                 let session_id = extension_session(params)?;
@@ -1234,13 +1211,11 @@ impl Backend for RuntimeBackend {
                         "x-manox/planExecute needs planFile".to_string(),
                     ));
                 };
-                match self.server.ahp_inner().session_thread(&session_id) {
-                    Some(_) => {
-                        self.server.ahp_inner().plan_seed(&session_id, plan_file);
-                        Ok(Value::Null)
-                    }
-                    None => Err(HostError::SessionNotFound(session_id)),
+                if !self.server.has_session(&session_id) {
+                    return Err(HostError::SessionNotFound(session_id));
                 }
+                self.server.plan_seed(&session_id, plan_file);
+                Ok(Value::Null)
             }
             // A client asked for a surface this build declares but does not
             // perform. `-32080` tells it apart from "you sent a bad request".
@@ -1260,11 +1235,11 @@ impl Backend for RuntimeBackend {
 /// same rule MCP tools follow).
 fn client_tool_spec(
     tool: &ahp_types::state::ToolDefinition,
-) -> Result<manox_protocol::client::ClientToolSpec, String> {
+) -> Result<crate::runtime_trait::ClientToolSpec, String> {
     if tool.name.trim().is_empty() {
         return Err("a contributed tool needs a name".to_string());
     }
-    Ok(manox_protocol::client::ClientToolSpec {
+    Ok(crate::runtime_trait::ClientToolSpec {
         name: tool.name.clone(),
         description: tool.description.clone().unwrap_or_default(),
         input_schema: tool

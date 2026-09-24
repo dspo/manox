@@ -8291,7 +8291,6 @@ fn every_production_rpc_error_carries_a_stable_code() {
     // is every production source, and a read failure fails the gate.
     const FILES: &[&str] = &[
         "src/agent_server.rs",
-        "src/journal_query.rs",
         "src/follow.rs",
         "src/translate.rs",
         "src/agent_client.rs",
@@ -9153,11 +9152,12 @@ fn persisted_session_file_rejects_traversal_ids() {
     hermetic_home();
     init_globals();
     assert!(
-        persisted_session_file("3f2b8c1e-9d4a-4c7e-8f2b-1a6b5c4d3e2f").is_some(),
+        manox_ahp_runtime::paths::persisted_session_file("3f2b8c1e-9d4a-4c7e-8f2b-1a6b5c4d3e2f")
+            .is_some(),
         "a uuid-shaped id maps to its session file"
     );
     assert!(
-        persisted_session_file("u6b-d1").is_some(),
+        manox_ahp_runtime::paths::persisted_session_file("u6b-d1").is_some(),
         "the suite's alphanumeric-dash ids stay valid"
     );
     for bad in [
@@ -9173,7 +9173,7 @@ fn persisted_session_file_rejects_traversal_ids() {
         "external:claude:deadbeef",
     ] {
         assert!(
-            persisted_session_file(bad).is_none(),
+            manox_ahp_runtime::paths::persisted_session_file(bad).is_none(),
             "the traversal/hostile id {bad:?} must not mint a path"
         );
     }

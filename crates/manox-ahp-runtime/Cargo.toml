@@ -23,11 +23,15 @@ uuid.workspace = true
 tokio-util.workspace = true
 async-channel.workspace = true
 async-trait = "0.1"
+axum = { workspace = true, optional = true }
 libc.workspace = true
 
 [features]
 default = ["terminal"]
 terminal = ["dep:manox-terminal"]
+# The loopback gateway's `/ahp` route. Off by default so a headless embedder
+# does not link the HTTP stack it never serves.
+ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 
 [dev-dependencies]
 manox-terminal.workspace = true

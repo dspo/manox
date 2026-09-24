@@ -70,7 +70,7 @@ pub async fn chat_state(session_id: &str) -> Option<ChatState> {
     // The per-session title is sidecar truth (the journal's `title` row is
     // thread-level and rides the session channel), so it is overlaid, not
     // folded. Best effort: an absent sidecar leaves the empty title.
-    if let Some(path) = crate::agent_server::persisted_session_file(session_id)
+    if let Some(path) = crate::paths::persisted_session_file(session_id)
         && let Some(dir) = path.parent()
         && let Ok(meta) = manox_harness::session_meta::load(dir, &path).await
         && let Some(title) = meta.title
@@ -290,7 +290,7 @@ fn read_header(path: &Path) -> Option<manox_harness::session::jsonl::JsonlSessio
 }
 
 /// The directory the durable journals live in — the same resolution
-/// [`crate::agent_server::persisted_session_file`] uses, so enumeration and
+/// [`crate::paths::persisted_session_file`] uses, so enumeration and
 /// cold read can never disagree.
 fn sessions_dir() -> Option<PathBuf> {
     manox_agent::thread_store::try_global()
@@ -301,7 +301,7 @@ fn sessions_dir() -> Option<PathBuf> {
 /// The seeded granted set: the session's creation cwd plus the sidecar's
 /// multi-root grants. Per-directory `cwdChange` grants join via the fold.
 async fn seed_working_directories(session_id: &str) -> Option<Vec<String>> {
-    let path = crate::agent_server::persisted_session_file(session_id)?;
+    let path = crate::paths::persisted_session_file(session_id)?;
     let mut dirs = Vec::new();
     if let Some(header) = read_header(&path) {
         dirs.push(file_uri(&header.cwd));
@@ -407,7 +407,7 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
             return Some(thread_id.clone());
         }
     }
-    if let Some(path) = crate::agent_server::persisted_session_file(session_id)
+    if let Some(path) = crate::paths::persisted_session_file(session_id)
         && let Some(thread_id) = header_thread_id(&path)
     {
         return Some(thread_id);
@@ -417,7 +417,7 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
         .map(|_| session_id.to_string())
 }
 
-mod backend;
+pub mod backend;
 mod resources;
 pub mod runtime;
 
@@ -426,9 +426,6 @@ pub mod runtime;
 /// A terminal records the session that spawned it, and AHP addresses a session
 /// by URI, so the terminal claim needs the one place that spells that mapping.
 #[cfg(feature = "terminal")]
-pub(crate) fn session_uri_of_terminal(session_id: &str) -> String {
+pub fn session_uri_of_terminal(session_id: &str) -> String {
     manox_ahp::channels::session::uri(session_id)
 }
-
-#[cfg(test)]
-mod tests;

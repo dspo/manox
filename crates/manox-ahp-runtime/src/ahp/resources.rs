@@ -522,7 +522,9 @@ mod tests {
         // `hermetic_home` points HOME at a throwaway directory, so the state
         // root is a scratch path and the developer's real ~/.manox is never
         // touched.
-        let _guards = super::super::tests::install();
+        let _guards = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
         let home = manox_agent::paths::manox_config_dir().expect("a hermetic HOME");
         let plans = home.join("plans");
         std::fs::create_dir_all(&plans).unwrap();
@@ -559,7 +561,6 @@ mod tests {
                 .is_err(),
             "the state root is a widening, not the removal of the fence"
         );
-        super::super::tests::uninstall();
     }
 
     #[test]

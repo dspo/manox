@@ -5,7 +5,7 @@
 //! speaks [`manox_protocol`] over
 //! an [`RpcConnection`], and the server drives kernel [`ThreadHandle`]s from
 //! those messages. Kernel [`ThreadEvent`]s are projected through
-//! [`crate::translate`] into [`ServerNote`] (streamed to the owning client) or
+//! [`manox_ahp_runtime::translate`] into [`ServerNote`] (streamed to the owning client) or
 //! [`ServerCall`] (a round-trip the owning ∩ capable client must answer), so
 //! the kernel stays free of transport and frontend concerns.
 //!
@@ -44,8 +44,8 @@ use manox_agent::{MessageUiMetadata, Thread, ThreadEvent, ThreadId};
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};
 
 use crate::follow::{self, StreamHandle};
-use crate::journal_query;
 use crate::translate::{Translated, translate};
+use manox_ahp_runtime::journal_query;
 
 /// How long the server waits for a client to answer a `ServerCall` before
 /// treating it as fail-closed. Generous: a human reviewing a plan or an
@@ -490,8 +490,8 @@ impl AgentServerInner {
             // announcing a client claim we do not enforce would invite two
             // clients to type into one PTY.
             claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
-                session: crate::ahp::session_uri_of_terminal(&entry.session_id),
-                chat: crate::ahp::session_uri_of_terminal(&entry.session_id),
+                session: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
+                chat: manox_ahp_runtime::ahp::session_uri_of_terminal(&entry.session_id),
                 turn_id: None,
                 tool_call_id: None,
             }),
@@ -854,10 +854,27 @@ pub fn global(cwd: std::path::PathBuf) -> std::sync::Arc<AgentServer> {
     // No provider install here (#803 follow-up): it moved into `new_inner`,
     // where it covers this singleton AND the direct `AgentServer::new`
     // paths (napi included) — see [`install_embedder_provider`].
-    GLOBAL
+    let server = GLOBAL
         .get_or_init(|| std::sync::Arc::new(AgentServer::new(cwd)))
-        .clone()
+        .clone();
+    // The AHP runtime half cannot construct a session runtime itself — that is
+    // this gateway's business, and naming one there would recreate the
+    // dependency the split exists to remove. So the owner installs the builder.
+    // Last-wins is refused: a process has one session store, and letting two
+    // embedders race would give the AHP face a runtime other than the one its
+    // clients are talking to.
+    if !AHP_BUILDER_INSTALLED.swap(true, Ordering::SeqCst) {
+        let _ = manox_ahp_runtime::ahp::runtime::install_builder(|cwd| {
+            Arc::new(crate::ahp_gateway::GatewayRuntime::new(global(cwd)))
+                as Arc<dyn manox_ahp_runtime::runtime_trait::SessionRuntime>
+        });
+    }
+    server
 }
+
+/// Whether this process already installed the AHP runtime builder.
+static AHP_BUILDER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl AgentServer {
     pub fn new(cwd: PathBuf) -> Self {
@@ -2124,6 +2141,7 @@ async fn handle_call(
                 },
             };
             journal_query::page_history(snapshot, through_seq, before_seq, max_messages)
+                .map_err(to_rpc_error)
         }
         // GW3 (§D.4): withdraw a pending adjudication delivery — the server
         // converges it through the existing expire path (fail-closed), never
@@ -2138,6 +2156,7 @@ async fn handle_call(
             })?;
             journal_query::conversation_info(&inner.conversation_info_cache, &thread, &session_id)
                 .await
+                .map_err(to_rpc_error)
         }
         ClientCall::OpenSession { session_id } => open_session(inner, client_id, &session_id).await,
         ClientCall::ForkSession {
@@ -2457,7 +2476,8 @@ pub(crate) async fn fork_session(
 
     // Source: the persisted file (cold path — valid for live and cold
     // sources; a deferred source has no file).
-    let Some(source_path) = persisted_session_file(&source_session_id) else {
+    let Some(source_path) = manox_ahp_runtime::paths::persisted_session_file(&source_session_id)
+    else {
         return Err(RpcError::new(-1, "thread not found")
             .with_code(manox_protocol::msg::CODE_SESSION_NOT_FOUND));
     };
@@ -2489,7 +2509,7 @@ pub(crate) async fn fork_session(
     // Materialize the fork file immediately (never deferred — a non-empty
     // prefix must be visible to `list` and loadable cold).
     let session_id = target_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let Some(target_path) = persisted_session_file(&session_id) else {
+    let Some(target_path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
         return Err(RpcError::new(-1, "minted fork id failed the path gate")
             .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
     };
@@ -2891,45 +2911,6 @@ fn unavailable(what: &str) -> RpcError {
 
 // ── Per-command handlers (&self methods, no spawning). ────────────────────────
 
-/// The canonical on-disk journal path for a session id
-/// (`<config>/sessions/<id>.jsonl`) — the same name creation and the
-/// repository scan use, so the GW11 identity probe, the GW6 cold read, and
-/// the eventual materialization can never disagree about the file.
-pub(crate) fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
-    // B5 (review round 2): wire-supplied ids reach this join BEFORE the
-    // not-found guards (PageHistory / the follow cold read), so an
-    // unvalidated id could probe arbitrary jsonl-shaped files under the
-    // manox home ("subagents/<uuid>", "../../x"). Session ids are the
-    // minters' uuid charset; admit ASCII alphanumeric, '-' and '_' only —
-    // no separators, no dots, no control bytes — and keep this function
-    // the sole wire-id → path mint (the repository's own
-    // `session_file_name` join reads ids from journal headers, never from
-    // the wire).
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return None;
-    }
-    // Sessions-dir single authority (review round 3, P0-1): the thread
-    // store owns the sessions dir — the production store is built from
-    // `paths::sessions_dir()` (same value, no behavior change), a test
-    // store points at its standalone temp dir, and the gateway's cold read
-    // must resolve through the store's seam or store-side fixtures starve
-    // the cold path (the `sidebar_thread_switch_restores_transcript` red).
-    // An uninitialized store falls back to the paths authority (the
-    // pre-fix behavior).
-    let dir = manox_agent::thread_store::try_global()
-        .map(|_| manox_agent::thread_store::global_sessions_dir())
-        .or_else(|| manox_agent::paths::sessions_dir().ok())?;
-    Some(
-        dir.join(manox_harness::session::repository::session_file_name(
-            session_id,
-        )),
-    )
-}
-
 /// The §D.2 `CreateSession` intent: optional explicit id (the compat
 /// `ClientNote::CreateSession` always supplies one; the v2 request mints
 /// server-side), working directory, project binding, and the initial
@@ -3053,7 +3034,7 @@ impl AgentServerInner {
         // `note_session_path` seeds the identity map for the restore's
         // `load_thread`.
         if let Some(existing) = intent.session_id.as_deref()
-            && let Some(path) = persisted_session_file(existing)
+            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(existing)
             && path.exists()
         {
             manox_agent::thread_store::global().with_mut(|s| s.note_session_path(existing, &path));
@@ -3069,7 +3050,7 @@ impl AgentServerInner {
         // create keeps the deferred-fresh flow untouched.
         if !seed_blocks.is_empty() {
             let session_id = uuid::Uuid::new_v4().to_string();
-            let Some(path) = persisted_session_file(&session_id) else {
+            let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id) else {
                 return Err(RpcError::new(-1, "minted session id failed the path gate")
                     .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL));
             };
@@ -3190,7 +3171,7 @@ impl AgentServerInner {
         // (the journal materializes lazily at the first turn) so the
         // sidecar write is addressable.
         if !intent.working_directories.is_empty()
-            && let Some(path) = persisted_session_file(&session_id)
+            && let Some(path) = manox_ahp_runtime::paths::persisted_session_file(&session_id)
         {
             let dirs = intent.working_directories.clone();
             manox_agent::thread_store::global().with_mut(|s| {
@@ -5326,7 +5307,7 @@ async fn route_session_capability(
     // fallthrough it replaces, rather than left to be rediscovered when the
     // second leg is removed. See `no_capable_client_error`.
     let call = call_for(session_id.clone());
-    let ahp = crate::ahp::runtime::try_runtime();
+    let ahp = manox_ahp_runtime::ahp::runtime::try_runtime();
     if let Some(reply) = route_ahp_capability(ahp.as_deref(), &session_id, method, &call).await {
         return reply;
     }
@@ -5355,7 +5336,7 @@ fn no_capable_client_error(kind: &str) -> String {
 /// silent fallthrough: that would ask a second client a question the first one
 /// already owns.
 async fn route_ahp_capability(
-    runtime: Option<&crate::ahp::runtime::AhpRuntime>,
+    runtime: Option<&manox_ahp_runtime::ahp::runtime::AhpRuntime>,
     session_id: &str,
     method: &str,
     call: &ServerCall,
@@ -5474,6 +5455,24 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
             .map(|_| ())
         })
     }
+}
+
+/// The runtime's failure as the v2 wire error.
+///
+/// The two protocols meet here and nowhere else: the runtime speaks
+/// `RuntimeError` (it must outlive this gateway), the v2 surface answers
+/// `RpcError`, and this conversion is the single seam between them.
+fn to_rpc_error(error: manox_ahp_runtime::error::RuntimeError) -> RpcError {
+    // The v2 surface's contract is that **every** error carries a §D.7 stable
+    // code, so a runtime failure without one is converted to the internal code
+    // rather than crossing the boundary uncoded. Losing the distinction the
+    // runtime did not make is better than handing v2 clients an error they
+    // cannot match on.
+    let code: &'static str = match error.code.as_deref() {
+        Some(code) => manox_ahp_runtime::error::as_static(code),
+        None => manox_ahp_runtime::error::codes::GATEWAY_INTERNAL,
+    };
+    RpcError::new(-1, error.message).with_code(code)
 }
 
 /// The settable subset of a `SessionStatus` delta (§D.5).

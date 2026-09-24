@@ -23,6 +23,28 @@ use serde_json::Value;
 
 use crate::error::RuntimeError;
 
+/// One client-contributed tool.
+///
+/// A plain DTO, deliberately: it was `manox_protocol::client::ClientToolSpec`
+/// while v2 owned the capability's vocabulary, and it moves here because the
+/// runtime stores it and must outlive that crate. The schema is a JSON Schema
+/// object the host owns; the runtime treats it as opaque and hands it to the
+/// model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ClientToolSpec {
+    /// The tool's name as the model sees it.
+    pub name: String,
+    /// Description shown to the model.
+    pub description: String,
+    /// JSON Schema for the tool's input object.
+    pub input_schema: serde_json::Value,
+    /// The registrant's side-effect hint: `true` marks a read-only tool that
+    /// need not surface an approval card. Advisory only — the host's permission
+    /// gate stays the authority, and absent means treat as mutating.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// How to create one session.
 #[derive(Debug, Clone, Default)]
 pub struct SessionIntent {
@@ -189,6 +211,19 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Settle a question card.
     fn answer_question(&self, session_id: &str, request_id: &str) -> Result<(), RuntimeError>;
+
+    /// The session's live journal feed, when the runtime drives it.
+    ///
+    /// `None` for a cold session: its state still answers from the journal, and
+    /// a submit materializes the engine, which retries the bridge.
+    fn journal_feed(&self, session_id: &str) -> Option<manox_agent::thread::ThreadHandle>;
+
+    /// Register the tools a client contributes to one session.
+    ///
+    /// One registration path, not two: the same store v2's
+    /// `RegisterSessionTools` fills, so a contributed tool becomes callable by
+    /// the model through the existing `embedder_tools` machinery.
+    fn set_embedder_tools(&self, session_id: &str, client_id: &str, tools: Vec<ClientToolSpec>);
 
     /// The AHP-facing failure for a runtime failure.
     fn host_error(error: RuntimeError) -> HostError

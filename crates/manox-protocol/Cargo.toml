@@ -5,6 +5,9 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+# `ClientToolSpec` moved to the runtime crate (it must outlive v2) and is
+# re-exported here so this surface stays stable while v2 lives.
+manox-ahp-runtime = { workspace = true }
 manox-journal.workspace = true
 serde.workspace = true
 serde_json.workspace = true

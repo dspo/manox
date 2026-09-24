@@ -62,3 +62,24 @@ pub mod codes {
     /// The requested model does not resolve through the provider registry.
     pub const MODEL_UNRESOLVABLE: &str = "model/unresolvable";
 }
+
+/// Resolve a code string back to its `'static` form.
+///
+/// The v2 wire type takes `&'static str`, and a `RuntimeError` carries an owned
+/// string, so crossing that boundary needs the mapping. An unknown code maps to
+/// the internal code rather than being dropped: the v2 contract is that every
+/// error carries one.
+pub fn as_static(code: &str) -> &'static str {
+    for known in [
+        codes::SESSION_NOT_FOUND,
+        codes::SESSION_ALREADY_OWNED,
+        codes::GATEWAY_BAD_REQUEST,
+        codes::GATEWAY_INTERNAL,
+        codes::MODEL_UNRESOLVABLE,
+    ] {
+        if known == code {
+            return known;
+        }
+    }
+    codes::GATEWAY_INTERNAL
+}

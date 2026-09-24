@@ -31,7 +31,7 @@ use manox_protocol::stream::{SessionSnapshot, StreamEndReason, StreamFrame};
 use manox_protocol::{FromServer, RpcConnection};
 use tokio_util::sync::CancellationToken;
 
-use crate::translate::wire_entry;
+use manox_ahp_runtime::translate::wire_entry;
 
 /// The control side of a live follow stream, held by `AgentServerInner`.
 /// [`StreamHandle::end`] requests a terminal reason; the stream task sends
@@ -375,17 +375,19 @@ async fn opening_snapshot(
     }
     match thread.journal_snapshot().await {
         Some(data) => SnapshotResult::Data(data),
-        None => match crate::journal_query::cold_read(session_id).await {
-            crate::journal_query::ColdRead::Data(data) => SnapshotResult::Cold(data),
+        None => match manox_ahp_runtime::journal_query::cold_read(session_id).await {
+            manox_ahp_runtime::journal_query::ColdRead::Data(data) => SnapshotResult::Cold(data),
             // A live session with no file yet has an EMPTY journal, not a
             // missing one (unchanged semantics).
-            crate::journal_query::ColdRead::NotFound => {
+            manox_ahp_runtime::journal_query::ColdRead::NotFound => {
                 SnapshotResult::Cold(manox_agent::engine::JournalSnapshotData {
                     cursor: 0,
                     records: Vec::new(),
                 })
             }
-            crate::journal_query::ColdRead::Corrupt(err) => SnapshotResult::Corrupt(err),
+            manox_ahp_runtime::journal_query::ColdRead::Corrupt(err) => {
+                SnapshotResult::Corrupt(err)
+            }
         },
     }
 }
@@ -470,7 +472,7 @@ async fn forward_entries(
                     // the same conversion the snapshot records use, so a
                     // live entry and its snapshot-record twin are the same
                     // wire shape (no client-side id synthesis to drift).
-                    if let Some(wire) = crate::translate::wire_entry(event.seq, &event.entry) {
+                    if let Some(wire) = manox_ahp_runtime::translate::wire_entry(event.seq, &event.entry) {
                         conn.send_to_client(FromServer::StreamItem {
                             stream_id: stream_id.clone(),
                             frame: StreamFrame::Entry {

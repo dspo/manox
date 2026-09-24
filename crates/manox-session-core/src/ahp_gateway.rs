@@ -22,6 +22,16 @@ use serde_json::Value;
 
 use crate::agent_server::AgentServer;
 
+/// Run an async runtime seam from the host's synchronous `Backend` methods.
+///
+/// The host calls these from an async context, so the block has to yield the
+/// worker rather than park it (`block_in_place`) — the same discipline the
+/// adapter's own helper follows, and the reason a bare `handle().block_on`
+/// panics here.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(future))
+}
+
 /// The gateway as the AHP runtime.
 pub struct GatewayRuntime {
     server: Arc<AgentServer>,
@@ -176,24 +186,22 @@ impl SessionRuntime for GatewayRuntime {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        manox_agent::runtime::handle()
-            .block_on(async move {
-                AgentServerInner::create_session_request(&inner, &owner, intent.into()).await
-            })
-            .map(|_| ())
-            .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        block_on(async move {
+            AgentServerInner::create_session_request(&inner, &owner, intent.into()).await
+        })
+        .map(|_| ())
+        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
     }
 
     fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError> {
         let server = Arc::clone(&self.server);
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
-        manox_agent::runtime::handle()
-            .block_on(async move {
-                crate::agent_server::fork_session(&inner, &owner, intent.into()).await
-            })
-            .map(|_| ())
-            .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        block_on(
+            async move { crate::agent_server::fork_session(&inner, &owner, intent.into()).await },
+        )
+        .map(|_| ())
+        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
     }
 
     fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
@@ -210,13 +218,12 @@ impl SessionRuntime for GatewayRuntime {
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
         let session_id = session_id.to_string();
-        manox_agent::runtime::handle()
-            .block_on(async move {
-                inner
-                    .submit(&owner, &session_id, text, Vec::new(), None, None)
-                    .await
-            })
-            .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        block_on(async move {
+            inner
+                .submit(&owner, &session_id, text, Vec::new(), None, None)
+                .await
+        })
+        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
     }
 
     fn steer(
@@ -267,8 +274,7 @@ impl SessionRuntime for GatewayRuntime {
         let inner = Arc::clone(server.ahp_inner());
         let session_id = session_id.to_string();
         let cwd = cwd.to_string();
-        manox_agent::runtime::handle()
-            .block_on(async move { inner.set_cwd(&session_id, &cwd).await });
+        block_on(async move { inner.set_cwd(&session_id, &cwd).await });
         Ok(())
     }
 
@@ -303,6 +309,21 @@ impl SessionRuntime for GatewayRuntime {
 
     fn plan_seed(&self, session_id: &str, plan_file: &str) {
         self.server.ahp_inner().plan_seed(session_id, plan_file);
+    }
+
+    fn journal_feed(&self, session_id: &str) -> Option<manox_agent::thread::ThreadHandle> {
+        self.server.ahp_inner().session_thread(session_id)
+    }
+
+    fn set_embedder_tools(
+        &self,
+        session_id: &str,
+        client_id: &str,
+        tools: Vec<manox_ahp_runtime::runtime_trait::ClientToolSpec>,
+    ) {
+        self.server
+            .ahp_inner()
+            .set_embedder_tools(session_id, client_id, tools);
     }
 
     fn confirm_tool_call(

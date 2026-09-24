@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use manox_agent::thread::ThreadHandle;
-use manox_protocol::journal::{JournalWireEntry, ModelRef};
+use manox_journal::{JournalWireEntry, ModelRef};
 use serde_json::{Value, json};
 
 use crate::translate::wire_entry;
@@ -59,7 +59,7 @@ pub fn page_history(
     through_seq: i64,
     before_seq: Option<i64>,
     max_messages: Option<u32>,
-) -> Result<Value, manox_protocol::RpcError> {
+) -> Result<Value, crate::error::RuntimeError> {
     // Inclusive upper bound of the requested window.
     let through = if through_seq < 0 {
         snapshot.cursor
@@ -114,7 +114,7 @@ pub fn page_history(
 /// the session's history silently, permanently empty, contradicting this
 /// module's own contract above ("a corrupt journal is the caller's
 /// not-found-class answer, never a silent empty page"). Callers now answer
-/// corruption loudly (an `RpcError` / a `StreamEnd::Failure`).
+/// corruption loudly (a `RuntimeError` / a `StreamEnd::Failure`).
 pub enum ColdRead {
     /// No persisted file for the id (or the id fails the B5 shape gate) —
     /// the `session/not-found` class.
@@ -128,7 +128,7 @@ pub enum ColdRead {
 }
 
 pub async fn cold_read(session_id: &str) -> ColdRead {
-    let Some(path) = crate::agent_server::persisted_session_file(session_id) else {
+    let Some(path) = crate::paths::persisted_session_file(session_id) else {
         return ColdRead::NotFound;
     };
     if !path.exists() {
@@ -164,10 +164,10 @@ pub async fn conversation_info(
     cache: &Arc<std::sync::Mutex<ConversationInfoCache>>,
     thread: &ThreadHandle,
     session_id: &str,
-) -> Result<Value, manox_protocol::RpcError> {
+) -> Result<Value, crate::error::RuntimeError> {
     let snapshot = thread.journal_snapshot().await.ok_or_else(|| {
-        manox_protocol::RpcError::new(-1, "journal engine is not materialized")
-            .with_code(manox_protocol::msg::CODE_GATEWAY_INTERNAL)
+        crate::error::RuntimeError::new("journal engine is not materialized")
+            .with_code(crate::error::codes::GATEWAY_INTERNAL)
     })?;
     {
         let guard = cache.lock().unwrap();

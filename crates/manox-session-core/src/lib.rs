@@ -10,25 +10,25 @@
 
 pub mod agent_client;
 pub mod agent_server;
-/// Read-only journal → AHP channel-state fold (v3 W2; see the module docs).
-pub mod ahp;
 /// The gateway's implementation of the AHP runtime seam.
 pub mod ahp_gateway;
+/// Kernel `ThreadEvent` → v2 `ServerCall` adjudication translation (the v2 half
+/// of what was one module; the journal projection moved to `manox-ahp-runtime`).
+pub mod translate;
+
+/// Integration tests for the AHP adapter against the live gateway.
+#[cfg(test)]
+mod ahp_adapter_tests;
 pub mod follow;
-pub mod journal_query;
 pub mod model_chat;
 pub mod projection_cache;
 pub mod projection_hub;
 pub mod projections;
-pub mod translate;
 pub mod waterfall;
 pub mod workspace_serve;
 #[cfg(feature = "ws-gateway")]
 pub mod ws;
 
-/// Suite-wide test scaffolding: session-creating tests mutate `HOME` and
-/// initialize `OnceLock` globals, so they must not interleave. Formerly the
-/// tail of the retired `session` module (the actor-era command engine).
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::sync::{Mutex, Once};

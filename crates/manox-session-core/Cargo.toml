@@ -27,7 +27,7 @@ manox-workspace.workspace = true
 manox-ahp.workspace = true
 # The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
 # implements, so the adapter never names a gateway type.
-manox-ahp-runtime = { workspace = true, features = ["terminal"] }
+manox-ahp-runtime = { workspace = true, features = ["terminal", "ws-gateway"] }
 manox-journal.workspace = true
 ahp.workspace = true
 ahp-types.workspace = true
