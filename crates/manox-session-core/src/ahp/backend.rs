@@ -50,8 +50,16 @@ struct Seeded {
     session: SessionState,
     chat: ChatState,
     tail: u64,
+    /// The `x-manox*` channel state this journal folds to, by channel URI.
+    /// The AHP reducers do not fold extension actions, so this is what a
+    /// subscriber to a declared extension channel is answered with instead of
+    /// silence.
+    extensions: HashMap<String, manox_ahp::ext::XManoxState>,
 }
 
+/// The notification carrying an extension channel's baseline state.
+///
+/// Named in the `x-manox` namespace: it is our surface, not AHP's.
 /// The runtime adapter the AHP host talks to.
 pub(crate) struct RuntimeBackend {
     server: Arc<AgentServer>,
@@ -109,9 +117,19 @@ impl RuntimeBackend {
         // A session created moments ago has no journal line yet: it is an empty
         // chat, not an unknown one. Subscribing to a brand-new session must work,
         // and the bridge picks its entries up from seq 0 onward.
-        let (chat, tail) = match fold_journal(session_id, &thread_id).await {
-            Some(fold) => (fold.chat, fold.tail),
-            None => (chat::initial(session_id), 0),
+        let (chat, tail, extensions) = match fold_journal(session_id, &thread_id).await {
+            Some(fold) => {
+                let mut extensions: HashMap<String, manox_ahp::ext::XManoxState> = HashMap::new();
+                for (channel, action) in &fold.extension_actions {
+                    let Ok(value) = serde_json::to_value(action) else {
+                        continue;
+                    };
+                    let state = extensions.entry(channel.clone()).or_default();
+                    let _ = manox_ahp::ext::reducer::apply(state, &value);
+                }
+                (fold.chat, fold.tail, extensions)
+            }
+            None => (chat::initial(session_id), 0, HashMap::new()),
         };
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
@@ -129,6 +147,7 @@ impl RuntimeBackend {
             session: session_state,
             chat,
             tail,
+            extensions,
         });
         self.seeds
             .lock()
@@ -231,6 +250,29 @@ impl RuntimeBackend {
             directories: seeded.session.working_directories.clone(),
             title: seeded.session.title.clone(),
         })
+    }
+
+    /// The baseline for a connection-level catalogue channel.
+    ///
+    /// `x-manox-workspaces://` and `x-manox-commands://` describe the host, not
+    /// one session, so their state comes from the runtime's own tables rather
+    /// than a journal fold. A channel we declare but cannot describe answers
+    /// `Null` — deliberately still an answer, because the declaration is the
+    /// contract and silence would be the one outcome a client cannot act on.
+    fn catalogue_baseline(&self, channel: &str) -> Value {
+        if channel.starts_with(manox_ahp::ext::channels::WORKSPACES) {
+            let workspaces = manox_agent::thread_store::try_global()
+                .map(|store| store.read(|state| state.known_projects().to_vec()))
+                .unwrap_or_default();
+            return serde_json::json!({ "workspaces": workspaces });
+        }
+        if channel.starts_with(manox_ahp::ext::channels::COMMANDS) {
+            // The command/skill catalogue is assembled by the runtime's
+            // slash-command registry; until that seam is wired the baseline is
+            // an empty list rather than a missing channel.
+            return serde_json::json!({ "commands": [] });
+        }
+        Value::Null
     }
 
     /// The agent catalogue for the root channel, from the live provider registry
@@ -534,10 +576,39 @@ impl Backend for RuntimeBackend {
         block_on(super::thread_of_session(chat_id))
     }
 
+    #[cfg(feature = "terminal")]
+    fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState> {
+        self.server.ahp_inner().ahp_terminal_state(terminal_id)
+    }
+
+    #[cfg(feature = "terminal")]
+    fn create_terminal(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), HostError> {
+        self.server
+            .ahp_inner()
+            .attach_terminal(session_id, cols, rows, Some(terminal_id.to_string()))
+            .map(|_| ())
+            .map_err(|error| HostError::Backend(error.message))
+    }
+
+    #[cfg(feature = "terminal")]
+    fn dispose_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
+        self.server
+            .ahp_inner()
+            .dispose_terminal(terminal_id)
+            .then_some(())
+            .ok_or_else(|| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))
+    }
+
+    #[cfg(not(feature = "terminal"))]
     fn terminal_state(&self, _terminal_id: &str) -> Option<TerminalState> {
-        // The AHP terminal channel is not part of this slice: the runtime's
-        // terminals are followed through the v2 surface until the terminal plane
-        // lands (an absent state answers `not found`, never a fabricated one).
+        // The build has no terminal plane; an absent state answers `not found`,
+        // never a fabricated one.
         None
     }
 
@@ -845,6 +916,51 @@ impl Backend for RuntimeBackend {
         // with; per-session grants are a refinement the fence does not have a
         // seam for yet, so the base cwd is the root.
         Some(&self.resources)
+    }
+
+    /// The baseline a subscriber to a declared extension channel receives.
+    ///
+    /// Extension channels carry no AHP-reducible state, so `subscribe` has no
+    /// snapshot to hand back; without this the six channels advertised in
+    /// `_meta["x-manox"]` would accept a subscription and then say nothing —
+    /// the declaration would be a promise the host does not keep. The baseline
+    /// is the journal's own fold of that channel's actions, so a late subscriber
+    /// converges on the same state a live one reached by following along.
+    ///
+    /// A channel with no folded state still answers: an empty object is "this
+    /// channel is served and currently has nothing", which is a different and
+    /// actionable statement from silence.
+    fn extension_baseline(&self, channel: &str) -> Option<(String, Value)> {
+        if !manox_ahp::ext::is_extension_channel(channel) {
+            return None;
+        }
+        // The per-session channels fold one session's journal; the catalogue
+        // channels (`x-manox-workspaces://`, `x-manox-commands://`) describe the
+        // host and carry no session id.
+        let state = if manox_ahp::ext::is_session_scoped_channel(channel) {
+            let session_id = channel
+                .split_once(":/")?
+                .1
+                .split('/')
+                .next()
+                .filter(|id| !id.is_empty())?;
+            match block_on(self.seeded(session_id)) {
+                Some(seeded) => seeded
+                    .extensions
+                    .get(channel)
+                    .map(|state| serde_json::to_value(state).unwrap_or(Value::Null))
+                    .unwrap_or(Value::Null),
+                // An unknown session is not a served channel: answering an
+                // empty baseline would claim state for a session that has none.
+                None => return None,
+            }
+        } else {
+            self.catalogue_baseline(channel)
+        };
+        Some((
+            manox_ahp::ext::BASELINE_NOTIFICATION.to_string(),
+            serde_json::json!({ "channel": channel, "state": state }),
+        ))
     }
 
     fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {

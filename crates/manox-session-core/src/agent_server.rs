@@ -86,12 +86,20 @@ type TerminalStreamSub = (String, StreamId, Arc<dyn RpcConnection>);
 #[cfg(feature = "terminal")]
 struct TerminalEntry {
     handle: manox_terminal::TerminalHandle,
-    /// The session this terminal was attached for (cwd source + db row).
-    #[allow(dead_code)] // reserved for per-session terminal scoping
+    /// The session this terminal was attached for: the cwd source, the db row,
+    /// and (for AHP) the session a subscriber's `claim` names.
     session_id: String,
     cwd: String,
     streams: Mutex<Vec<TerminalStreamSub>>,
     exited: StdMutex<Option<i32>>,
+    /// The event watcher's task, so disposal can end it.
+    ///
+    /// The watcher holds an `Arc<TerminalEntry>`, so dropping the map's
+    /// reference does not release the PTY — the watcher would keep the entry
+    /// (and therefore the child) alive until its channel closes, which only
+    /// happens when the child exits. Disposal has to break that cycle from the
+    /// outside, or `disposeTerminal` reports success while the process runs on.
+    watcher: StdMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ServerSession {
@@ -285,7 +293,7 @@ impl AgentServerInner {
     /// bound to the session's cwd. Response carries the id + a text
     /// snapshot of the visible grid.
     #[cfg(feature = "terminal")]
-    fn attach_terminal(
+    pub(crate) fn attach_terminal(
         self: &Arc<Self>,
         session_id: &str,
         cols: u16,
@@ -324,14 +332,41 @@ impl AgentServerInner {
             cwd: cwd.to_string_lossy().into_owned(),
             streams: Mutex::new(Vec::new()),
             exited: StdMutex::new(None),
+            watcher: StdMutex::new(None),
         });
         self.terminals.lock().insert(id.clone(), entry.clone());
         self.upsert_terminal_db(&entry, None);
         self.broadcast_host(HostEvent::TerminalsUpdated {
             terminals: self.terminals_summary(),
         });
-        self.spawn_terminal_watcher(entry.clone());
+        let watcher = self.spawn_terminal_watcher(entry.clone());
+        *entry.watcher.lock().unwrap() = Some(watcher);
         Ok(self.terminal_attach_response(&entry))
+    }
+
+    /// `DisposeTerminal`: release a terminal.
+    ///
+    /// Dropping the entry is the release — the PTY handle reaps its child on
+    /// `Drop` — so the removed entry must actually be dropped here rather than
+    /// left to a lingering watcher clone. That is why the map removal is the
+    /// last statement and the value is not retained.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn dispose_terminal(&self, terminal_id: &str) -> bool {
+        let Some(entry) = self.terminals.lock().remove(terminal_id) else {
+            return false;
+        };
+        // Break the cycle before dropping: the watcher holds an `Arc` of this
+        // entry, so without this the entry survives the map removal and the
+        // child keeps running while disposal reports success.
+        if let Some(watcher) = entry.watcher.lock().unwrap().take() {
+            watcher.abort();
+        }
+        // Now the drop is the release: the PTY handle reaps its child on `Drop`.
+        drop(entry);
+        self.broadcast_host(HostEvent::TerminalsUpdated {
+            terminals: self.terminals_summary(),
+        });
+        true
     }
 
     /// `TerminalSnapshot`: the visible grid as text lines + cursor.
@@ -359,6 +394,60 @@ impl AgentServerInner {
         serde_json::json!({
             "terminal_id": id,
             "snapshot": self.terminal_snapshot_value(entry),
+        })
+    }
+
+    /// The AHP view of one live terminal, for the `ahp-terminal:/<id>` channel.
+    ///
+    /// Unlike the v2 summary this is the channel's *state*, so it carries the
+    /// visible grid: a subscriber that arrives late needs the screen, not just
+    /// the fact that a terminal exists.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn ahp_terminal_state(
+        &self,
+        terminal_id: &str,
+    ) -> Option<ahp_types::state::TerminalState> {
+        use ahp_types::state as ahp;
+        let entry = self.terminals.lock().get(terminal_id).cloned()?;
+        let (lines, cols, rows, title, cwd) = entry.handle.read(|t| {
+            let (lines, _, _) = t.text_snapshot();
+            (lines, t.cols, t.rows, t.title.clone(), t.cwd.clone())
+        });
+        let exited = *entry.exited.lock().unwrap();
+        Some(ahp::TerminalState {
+            title: title.unwrap_or_default(),
+            cwd: cwd.to_str().map(str::to_string),
+            cols: Some(cols as i64),
+            rows: Some(rows as i64),
+            // The visible grid is what a late subscriber must have. AHP allows a
+            // command/output split (`TerminalContentPart::Command`); this slice
+            // does not track command boundaries, so the whole screen is one
+            // unclassified part rather than a fabricated split.
+            content: vec![ahp::TerminalContentPart::Unclassified(
+                ahp::TerminalUnclassifiedPart {
+                    value: lines.join("\n"),
+                },
+            )],
+            lifecycle: match exited {
+                Some(code) => {
+                    ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
+                        exit_code: Some(code as i64),
+                    })
+                }
+                None => ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {}),
+            },
+            // One process-local host serves every client, and the runtime does
+            // not arbitrate input ownership, so `Watched` is the honest claim:
+            // announcing a client claim we do not enforce would invite two
+            // clients to type into one PTY.
+            claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
+                session: crate::ahp::session_uri_of_terminal(&entry.session_id),
+                chat: crate::ahp::session_uri_of_terminal(&entry.session_id),
+                turn_id: None,
+                tool_call_id: None,
+            }),
+            supports_command_detection: Some(false),
+            is_pty: Some(true),
         })
     }
 
@@ -409,7 +498,10 @@ impl AgentServerInner {
     /// One watcher per terminal: title/exit edges update the db mirror and
     /// broadcast `TerminalsUpdated`.
     #[cfg(feature = "terminal")]
-    fn spawn_terminal_watcher(self: &Arc<Self>, entry: Arc<TerminalEntry>) {
+    fn spawn_terminal_watcher(
+        self: &Arc<Self>,
+        entry: Arc<TerminalEntry>,
+    ) -> tokio::task::JoinHandle<()> {
         let rx = entry.handle.subscribe();
         let inner = Arc::clone(self);
         manox_agent::runtime::handle().spawn(async move {
@@ -437,7 +529,7 @@ impl AgentServerInner {
                     _ => {}
                 }
             }
-        });
+        })
     }
 
     /// `StreamOpen { FollowTerminal }`: one forwarder per stream relaying raw

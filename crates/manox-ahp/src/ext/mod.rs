@@ -211,6 +211,32 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     "terminal/cleared",
 ];
 
+/// The notification method carrying an extension channel's baseline state.
+pub const BASELINE_NOTIFICATION: &str = "x-manox/baseline";
+
+/// Whether `uri` is a **per-session** extension channel (`…:/<session-id>`)
+/// rather than a connection-level catalogue.
+///
+/// The distinction is load-bearing: a per-session channel's baseline is that
+/// session's journal fold, while the catalogue channels
+/// ([`channels::WORKSPACES`], [`channels::COMMANDS`]) describe the whole host
+/// and take no session id at all. A reader that treated them alike would look
+/// for a session named after a workspace prefix and find nothing.
+pub fn is_session_scoped_channel(uri: &str) -> bool {
+    channels::ALL
+        .iter()
+        .filter(|prefix| prefix.ends_with(":/"))
+        .any(|prefix| uri.starts_with(prefix))
+}
+
+/// Whether `uri` names one of the declared extension channels.
+///
+/// The set is the declaration's own list, so a channel advertised in
+/// `_meta["x-manox"]` and a channel the host will answer for cannot drift apart.
+pub fn is_extension_channel(uri: &str) -> bool {
+    channels::ALL.iter().any(|prefix| uri.starts_with(prefix))
+}
+
 /// Whether an action tag is on the extension surface rather than AHP's own.
 ///
 /// AHP's `x-` prefix is the reserved private namespace and no AHP reducer knows
@@ -256,6 +282,11 @@ pub fn declaration() -> Value {
         "acceptedActions": ACCEPTED_ACTIONS,
         "commands": commands::ALL,
         "serverRequests": requests::ALL,
+        // How a subscriber receives an extension channel's state: these channels
+        // are not state-bearing, so `subscribe` answers with this notification
+        // rather than a snapshot. Declared because a client cannot guess the
+        // method name, and a channel it cannot read is a channel not served.
+        "baselineNotification": BASELINE_NOTIFICATION,
         "capabilities": {
             // Sessions are journals of branchable chats; the active-session
             // pointer is `SessionState.defaultChat`.

@@ -1,21 +1,29 @@
-//! The served method surface, declared once.
+//! The method surface, declared once against the **upstream** list.
 //!
 //! AHP's Rust side ships types, not a machine-readable method registry (the
-//! schema is a type dictionary with no method index), so the method names this
-//! host answers live here — and only here. Two properties are enforced by
-//! construction:
+//! schema is a type dictionary with no method index), so the names live here.
+//! The list is not a subset we chose — it is upstream's `CommandMap`
+//! (`types/common/messages.ts`, 30 entries) spelled out in full, plus the two
+//! client notifications (`ClientNotificationMap`: `unsubscribe`,
+//! `dispatchAction`), which are not commands but are routed here too.
 //!
-//! - [`Command::ALL`] is the single list; [`Command::of_method`] is the single
-//!   lookup; the router matches on it. A method that is not in the list is
-//!   answered `MethodNotFound`, which is also how an unimplemented surface stays
-//!   *invisible* to a client instead of looking like an empty feature.
-//! - [`Command::intent`] is an exhaustive match with no `_` arm, so a new command
-//!   cannot be added without stating whether this build serves it or declines it.
+//! That completeness is the point. An exhaustive match over a list we maintain
+//! ourselves is a tautology: it catches a typo in our own table and nothing
+//! else. Covering upstream's *whole* map is what makes the match a real gate —
+//! when a protocol release adds a command, [`Command::intent`] has no arm for it
+//! and the build fails, which is the only moment the drift is cheap to fix.
+//! (`pi-ahp` gets the same property from `satisfies Record<keyof CommandMap,
+//! CommandPolicy>` in TypeScript; this is its Rust equivalent.)
 //!
-//! Method names are spelled exactly as the upstream protocol spells them
-//! (`types/common/messages.ts` in microsoft/agent-host-protocol, the `CommandMap`
-//! keys); a mismatch would be invisible to our own tests and fatal to a client,
-//! so `tests/command_surface.rs` pins the ones we serve.
+//! Two consequences worth stating plainly:
+//!
+//! - [`CommandIntent::Declined`] is a **live** outcome, not dead code: the
+//!   commands this build does not serve are listed and marked, so the gap is
+//!   visible in one place instead of being an absence.
+//! - A *declined* command and an unknown one both answer `MethodNotFound`, so a
+//!   client cannot tell them apart and must not try: the surface it should
+//!   believe is `CommandIntent::Implemented` (and the x-manox declaration for
+//!   the extension plane).
 
 /// One connection-level or channel-scoped method this host knows about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,7 +64,36 @@ pub enum Command {
     ResourceList,
     /// Delete a resource.
     ResourceDelete,
-    /// Our own extension namespace (`x-manox/*`).
+    /// Copy a resource.
+    ResourceCopy,
+    /// Move/rename a resource.
+    ResourceMove,
+    /// Resolve a resource (etag + metadata), for conditional writes.
+    ResourceResolve,
+    /// Create a directory.
+    ResourceMkdir,
+    /// Serve a resource the *client* owns (the reverse `resource*` direction).
+    ResourceRequest,
+    /// Create a terminal.
+    CreateTerminal,
+    /// Dispose a terminal.
+    DisposeTerminal,
+    /// Watch a resource for changes.
+    CreateResourceWatch,
+    /// Authenticate a provider / MCP server challenge.
+    Authenticate,
+    /// Session-config completions (distinct from inline `completions`).
+    SessionConfigCompletions,
+    /// Invoke an operation offered by a changeset.
+    InvokeChangesetOperation,
+    /// List automation trigger definitions.
+    ListAutomationTriggerDefinitions,
+    /// Run an automation.
+    RunAutomation,
+    /// Page an automation's runs.
+    FetchAutomationRuns,
+    /// Our own extension namespace (`x-manox/*`), which is **not** an upstream
+    /// command: it is the declared private surface (`ext::commands`).
     Extension,
 }
 
@@ -72,30 +109,63 @@ pub enum CommandIntent {
 }
 
 impl Command {
-    /// Every command name this host looks up, paired with the command it names.
+    /// Every method this host routes, paired with the command it names.
     ///
-    /// The order is the wire order of `types/common/messages.ts`'s `CommandMap`,
-    /// so a diff against upstream is a straight read.
+    /// The order is upstream's wire order (`CommandMap` in
+    /// `types/common/messages.ts`, then the two `ClientNotificationMap` names),
+    /// so a diff against upstream is a straight read. The count is asserted:
+    /// 30 commands + 2 notifications.
     pub const ALL: &'static [(&'static str, Command)] = &[
+        // ── CommandMap (30) ────────────────────────────────────────────
         ("initialize", Command::Initialize),
         ("ping", Command::Ping),
         ("reconnect", Command::Reconnect),
         ("subscribe", Command::Subscribe),
-        ("unsubscribe", Command::Unsubscribe),
-        ("dispatchAction", Command::DispatchAction),
-        ("listSessions", Command::ListSessions),
         ("createSession", Command::CreateSession),
         ("disposeSession", Command::DisposeSession),
         ("createChat", Command::CreateChat),
         ("disposeChat", Command::DisposeChat),
-        ("fetchTurns", Command::FetchTurns),
-        ("resolveSessionConfig", Command::ResolveSessionConfig),
-        ("completions", Command::Completions),
+        ("createTerminal", Command::CreateTerminal),
+        ("disposeTerminal", Command::DisposeTerminal),
+        ("createResourceWatch", Command::CreateResourceWatch),
+        ("listSessions", Command::ListSessions),
         ("resourceRead", Command::ResourceRead),
         ("resourceWrite", Command::ResourceWrite),
         ("resourceList", Command::ResourceList),
+        ("resourceCopy", Command::ResourceCopy),
         ("resourceDelete", Command::ResourceDelete),
+        ("resourceMove", Command::ResourceMove),
+        ("resourceResolve", Command::ResourceResolve),
+        ("resourceMkdir", Command::ResourceMkdir),
+        ("resourceRequest", Command::ResourceRequest),
+        ("fetchTurns", Command::FetchTurns),
+        ("authenticate", Command::Authenticate),
+        ("resolveSessionConfig", Command::ResolveSessionConfig),
+        (
+            "sessionConfigCompletions",
+            Command::SessionConfigCompletions,
+        ),
+        ("completions", Command::Completions),
+        (
+            "invokeChangesetOperation",
+            Command::InvokeChangesetOperation,
+        ),
+        (
+            "listAutomationTriggerDefinitions",
+            Command::ListAutomationTriggerDefinitions,
+        ),
+        ("runAutomation", Command::RunAutomation),
+        ("fetchAutomationRuns", Command::FetchAutomationRuns),
+        // ── ClientNotificationMap (2), routed here as well ─────────────
+        ("unsubscribe", Command::Unsubscribe),
+        ("dispatchAction", Command::DispatchAction),
     ];
+
+    /// How many of [`Self::ALL`] come from upstream's `CommandMap`.
+    ///
+    /// The remainder are the two client notifications, which this host routes
+    /// through the same table but which upstream types separately.
+    pub const UPSTREAM_COMMAND_COUNT: usize = 30;
 
     /// The command a wire method names, if this host knows the name at all.
     pub fn of_method(method: &str) -> Option<Self> {
@@ -122,6 +192,8 @@ impl Command {
             | Self::DisposeSession
             | Self::CreateChat
             | Self::DisposeChat
+            | Self::CreateTerminal
+            | Self::DisposeTerminal
             | Self::FetchTurns
             | Self::ResolveSessionConfig
             | Self::Completions
@@ -130,6 +202,26 @@ impl Command {
             | Self::ResourceList
             | Self::ResourceDelete
             | Self::Extension => CommandIntent::Implemented,
+            // Declared upstream, not served by this build. The router does not
+            // route them, so a client sees `MethodNotFound` and treats the
+            // surface as absent rather than empty — which is the honest answer
+            // for a capability this slice does not have.
+            //
+            // These are listed rather than omitted so the gap is legible: the
+            // alternative (dropping them from the table) is what made the match
+            // exhaustive over a list of our own choosing, i.e. a tautology.
+            Self::CreateResourceWatch
+            | Self::ResourceCopy
+            | Self::ResourceMove
+            | Self::ResourceResolve
+            | Self::ResourceMkdir
+            | Self::ResourceRequest
+            | Self::Authenticate
+            | Self::SessionConfigCompletions
+            | Self::InvokeChangesetOperation
+            | Self::ListAutomationTriggerDefinitions
+            | Self::RunAutomation
+            | Self::FetchAutomationRuns => CommandIntent::Declined,
         }
     }
 }
@@ -152,20 +244,58 @@ mod tests {
         );
     }
 
-    /// The intent table is the served surface; it is the honest answer for a
-    /// client. Every listed command is served today, and the router matches on
-    /// this same table, so the two cannot disagree.
+    /// The table covers upstream's **entire** `CommandMap`, so the exhaustive
+    /// `intent` match is a real gate rather than a tautology over our own
+    /// subset. Upstream's map holds 30 entries; the two client notifications
+    /// ride the same table.
+    ///
+    /// When a protocol release adds a command, this count and the match's
+    /// exhaustiveness both fail — which is the point, and the only moment the
+    /// drift is cheap to notice.
     #[test]
-    fn every_declared_command_is_served() {
+    fn the_table_covers_upstreams_whole_command_map() {
+        assert_eq!(
+            Command::ALL.len(),
+            Command::UPSTREAM_COMMAND_COUNT + 2,
+            "CommandMap (30) plus the two ClientNotificationMap names"
+        );
+        let upstream = Command::ALL
+            .iter()
+            .filter(|(name, _)| *name != "unsubscribe" && *name != "dispatchAction")
+            .count();
+        assert_eq!(upstream, Command::UPSTREAM_COMMAND_COUNT);
+    }
+
+    /// Declined is a live outcome: the build declines a documented set, and each
+    /// name still resolves (so a client asking for one gets `MethodNotFound`
+    /// through the table rather than falling off it).
+    #[test]
+    fn declined_commands_are_listed_and_resolve() {
         let declined: Vec<&str> = Command::ALL
             .iter()
             .filter(|(_, command)| command.intent() == CommandIntent::Declined)
             .map(|(name, _)| *name)
             .collect();
-        assert!(
-            declined.is_empty(),
-            "the router serves the names in Command::ALL, so a Declined entry \
-             would be routed anyway: {declined:?}"
+        assert_eq!(
+            declined,
+            vec![
+                "createResourceWatch",
+                "resourceCopy",
+                "resourceMove",
+                "resourceResolve",
+                "resourceMkdir",
+                "resourceRequest",
+                "authenticate",
+                "sessionConfigCompletions",
+                "invokeChangesetOperation",
+                "listAutomationTriggerDefinitions",
+                "runAutomation",
+                "fetchAutomationRuns",
+            ],
+            "the unserved surface is explicit, not an absence"
         );
+        for name in declined {
+            assert!(Command::of_method(name).is_some(), "{name} resolves");
+        }
     }
 }

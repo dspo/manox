@@ -12,18 +12,19 @@ use std::sync::Arc;
 use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, StateAction};
 use ahp_types::commands::{
     CompletionsParams, CompletionsResult, CreateChatParams, CreateSessionParams,
-    DispatchActionParams, DisposeChatParams, DisposeSessionParams, FetchTurnsParams,
-    InitializeParams, InitializeResult, ListSessionsParams, ListSessionsResult, ReconnectResult,
-    ReconnectSnapshotResult, ResolveSessionConfigParams, ResolveSessionConfigResult,
-    ResourceDeleteParams, ResourceListParams, ResourceReadParams, ResourceWriteParams,
-    SubscribeParams, SubscribeResult, UnsubscribeParams,
+    CreateTerminalParams, DispatchActionParams, DisposeChatParams, DisposeSessionParams,
+    DisposeTerminalParams, FetchTurnsParams, InitializeParams, InitializeResult,
+    ListSessionsParams, ListSessionsResult, ReconnectResult, ReconnectSnapshotResult,
+    ResolveSessionConfigParams, ResolveSessionConfigResult, ResourceDeleteParams,
+    ResourceListParams, ResourceReadParams, ResourceWriteParams, SubscribeParams, SubscribeResult,
+    UnsubscribeParams,
 };
 use ahp_types::messages::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest};
 use ahp_types::state::Snapshot;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::channels::{self, Channel, chat, root, session};
+use crate::channels::{self, Channel, chat, root, session, terminal};
 use crate::connection::Conn;
 use crate::error::HostError;
 use crate::ext;
@@ -88,6 +89,8 @@ async fn dispatch_request(
         "completions" => completions(params),
         "createSession" => create_session(inner, conn, params).await,
         "disposeSession" => dispose_session(inner, params),
+        "createTerminal" => create_terminal(inner, params).await,
+        "disposeTerminal" => dispose_terminal(inner, params),
         "createChat" => create_chat(inner, conn, params).await,
         "disposeChat" => dispose_chat(inner, params),
         "fetchTurns" => fetch_turns(inner, params),
@@ -486,6 +489,49 @@ fn dispose_session(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError
     inner.backend.dispose_session(&session_id)?;
     inner.store.write().remove_session(&session_id);
     inner.session_removed(&session_id);
+    Ok(Value::Null)
+}
+
+/// `createTerminal`: spawn (or re-attach) a terminal for a session.
+///
+/// AHP's terminal carries a `claim` describing who owns input. This host does
+/// not arbitrate input between clients, so the claim it reports back is the
+/// session's — announcing a client claim it would not enforce is what invites
+/// two clients to type into one PTY.
+async fn create_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+    let params: CreateTerminalParams = parse_params(params)?;
+    let terminal_id = terminal::id(&params.channel)
+        .ok_or_else(|| HostError::InvalidParams("createTerminal channel".to_string()))?
+        .to_string();
+    let session_id = match &params.claim {
+        ahp_types::state::TerminalClaim::Session(claim) => session::id(&claim.session)
+            .ok_or_else(|| HostError::InvalidParams("createTerminal claim.session".to_string()))?
+            .to_string(),
+        ahp_types::state::TerminalClaim::Client(_) => {
+            return Err(HostError::Unimplemented(
+                "createTerminal with a client claim".to_string(),
+            ));
+        }
+    };
+    let cols = params.cols.unwrap_or(80).clamp(1, 1000) as u16;
+    let rows = params.rows.unwrap_or(24).clamp(1, 1000) as u16;
+    if inner.store.read().terminal(&terminal_id).is_some() {
+        return Err(HostError::AlreadyExists(terminal::uri(&terminal_id)));
+    }
+    inner
+        .backend
+        .create_terminal(&session_id, &terminal_id, cols, rows)?;
+    inner.ensure_terminal(&terminal_id)?;
+    Ok(Value::Null)
+}
+
+fn dispose_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+    let params: DisposeTerminalParams = parse_params(params)?;
+    let terminal_id = terminal::id(&params.channel)
+        .ok_or_else(|| HostError::InvalidParams("disposeTerminal channel".to_string()))?
+        .to_string();
+    inner.backend.dispose_terminal(&terminal_id)?;
+    inner.store.write().remove_terminal(&terminal_id);
     Ok(Value::Null)
 }
 

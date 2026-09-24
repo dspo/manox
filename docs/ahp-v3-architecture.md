@@ -522,7 +522,56 @@ reconnect 快照腿、dispatch 句柄。
 `resolveSessionConfig` 落地），于是 `resolveSessionConfig` 回 `-32601`。那不是回归，是二进制过期；
 杀掉旧进程、用当前构建重跑即全绿。记在这里以免下次看到 `-32601` 又误判。
 
+### H.2g 三条声明面缺陷（本轮修复，2026-09-23）
+
+评审指出三条，逐条核实后全部成立，均已修：
+
+**1. 穷尽性是假的（唯一的结构性倒退）。** `command.rs` 的 `intent()` 确实没有 `_` 臂，但它穷尽的是
+**我们自己挑的 18 个名字**，不是上游 `CommandMap` 的 30 个——上游加命令不会编译失败。而且
+`CommandIntent::Declined` 是死代码：没有一项是 Declined，于是 `of_method` 对表外名字回 `None`，
+那个变体永不触发。**对自己子集的穷尽是同义反复。**
+修法：表扩到**上游全部 30 条**（顺序即 `types/common/messages.ts` 的 `CommandMap` 顺序）+
+2 条 `ClientNotificationMap`（`unsubscribe`/`dispatchAction`，它们不是 command 但同表路由），
+14 条标 `Declined`，删掉「没有 Declined」的断言，改为「表长 == 30 + 2」。
+`Declined` 因此**活了**：`createResourceWatch`/`resourceCopy|Move|Resolve|Mkdir|Request`/
+`authenticate`/`sessionConfigCompletions`/`invokeChangesetOperation`/三个 automation 命令。
+路由行为不变（declined 与 unknown 都回 `-32601`，已被
+`declined_commands_answer_method_not_found` 钉住），但上游加命令时会编译失败——这正是
+「自失效上游守卫」要防的那类漂移。（`createTerminal`/`disposeTerminal` 本轮补完，见 §H.2h。）
+
+**2. terminal 是半声明。** `parse` 认 `ahp-terminal:/`、`Channel::Terminal` 有状态类型、
+`ensure_terminal` 有路径，但 `terminal_state` 回 `None`——客户端 parse 得过、订阅只得 `not-found`。
+**半声明比不声明差**（正是我们在 `titleChanged` 上反对过的那种静默不一致）。
+用户裁决**补完**：`ahp_terminal_state`（`agent_server.rs`）接 live PTY 注册表，
+回 AHP `TerminalState`（可见网格作为一个 `Unclassified` part、`running`/`exited` 生命周期、
+`isPty`）。`claim` 报 **session** 而非 client：本宿主不在客户端之间仲裁输入，
+宣告一个不会执行的 client claim 会招来两个客户端往同一个 PTY 里打字。
+`createTerminal`/`disposeTerminal` 一并落到 `attach_terminal`/新的 `dispose_terminal`
+（drop entry 即释放：PTY handle 在 `Drop` 里收子进程），两条命令从 `Declined` 转 `Implemented`。
+实测（官方 TS client over WS）：create → 订阅拿到 **80×24 / running / isPty:true** → dispose，
+三步全绿。`--no-default-features` 腿仍干净（helper 与 `terminal_state` 双臂 cfg）。
+
+**3. 六个扩展通道声明了却不服务。** `extension_baseline` 是 trait 默认 `None`，runtime 侧无覆盖；
+扩展通道 `is_state_bearing()` 为 false，所以订阅它们**只**走这条路——结果是客户端读
+`_meta["x-manox"]` 看到 6 个通道，订阅任意一个收到**静默**。
+修法：`fold_journal` 现在收集 `x-manox*` 侧的行（此前直接丢弃），按通道用
+`ext::reducer::apply` 折成 `XManoxState`，`extension_baseline` 把它作为
+**`x-manox/baseline` 通知**交付（方法名已进 `_meta["x-manox"]` 声明，客户端猜不出来）。
+实测该基线是**真 fold 而非空占位**：种一条 `PlanModeChange{enabled:true}` 的 journal，
+基线回 `planMode: true`。
+**实施期新增的一条区分**：`x-manox-workspaces://` 与 `x-manox-commands://` 是
+**连接级目录**（无 session id），与四个 per-session 通道不是一类；
+`ext::is_session_scoped_channel` 把两者分开，目录通道走 `catalogue_baseline`
+（workspaces 读 `known_projects`，commands 暂回空列表）。
+
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
+
+### H.2h 版本注记
+
+- 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。
+- terminal 面（`ahp-terminal:` + `createTerminal`/`disposeTerminal`）已服务，故
+  §G 的 W3 清单中「terminal」项已完成；W3 余下的是四个 `x-manox` server→client 请求
+  与 `extension_baseline` 之外的扩展命令面。
 
 0. **W2 状态：收口**（2026-09-23）。§G 的 W2 五条门禁逐条对照：
    ① 收敛性证明（`translation_convergence.rs`，含 §H.2 那次抓到真缺陷的轨迹）——绿；

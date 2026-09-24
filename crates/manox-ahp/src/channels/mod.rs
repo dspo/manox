@@ -195,6 +195,11 @@ impl ChannelStore {
     }
 
     /// Seed (or replace) one terminal's state.
+    /// Drop a terminal's state (its PTY is the backend's to release).
+    pub fn remove_terminal(&mut self, id: &str) {
+        self.terminals.remove(id);
+    }
+
     pub fn insert_terminal(&mut self, id: &str, state: TerminalState) {
         self.terminals.insert(id.to_string(), state);
     }

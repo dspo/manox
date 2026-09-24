@@ -403,6 +403,45 @@ async fn a_connection_dialect_rewrites_in_both_directions() {
     );
 }
 
+/// A command the build **declines** must answer `MethodNotFound` — the same
+/// answer an unknown method gets, so a client reads the capability as absent
+/// rather than present-and-empty.
+///
+/// This is what makes `CommandIntent::Declined` worth having: before the table
+/// covered upstream's whole `CommandMap` there was nothing to decline, so the
+/// router's guard for it could never run, and a capability gap was invisible
+/// instead of stated.
+#[tokio::test(flavor = "multi_thread")]
+async fn declined_commands_answer_method_not_found() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+
+    for method in [
+        "resourceCopy",
+        "authenticate",
+        "runAutomation",
+        "createResourceWatch",
+    ] {
+        let err = client
+            .request::<serde_json::Value, serde_json::Value>(method, serde_json::json!({}))
+            .await
+            .expect_err("a declined command must not succeed");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("-32601") || message.contains("MethodNotFound"),
+            "{method} answers method-not-found, got {message}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pre_creation_commands_answer_with_empty_shapes() {
     // The reference client calls `resolveSessionConfig` before it creates a

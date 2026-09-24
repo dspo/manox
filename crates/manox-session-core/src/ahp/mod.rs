@@ -157,6 +157,10 @@ pub async fn session_state(thread_id: &str) -> Option<SessionState> {
 pub(crate) struct JournalFold {
     pub(crate) chat: ChatState,
     pub(crate) session_actions: Vec<StateAction>,
+    /// Every `x-manox*` emission of this journal, in order, with its channel.
+    /// The AHP reducers do not fold these, so a late subscriber's baseline is
+    /// built by replaying them through [`crate::ext::reducer`].
+    pub(crate) extension_actions: Vec<(String, StateAction)>,
     pub(crate) model_ref: Option<String>,
     /// The journal's dense tail (`JournalSnapshotData::cursor`): the highest seq
     /// the fold consumed. A live bridge forwards feed events strictly above it,
@@ -183,6 +187,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     let mut state = chat::initial(chat_id);
     let mut translator = Translator::new();
     let mut session_actions = Vec::new();
+    let mut extension_actions: Vec<(String, StateAction)> = Vec::new();
     let mut model_ref: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     for record in &snapshot.records {
@@ -200,6 +205,12 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
                 session_actions.push(emitted.action);
             } else if chat::id(&emitted.channel) == Some(chat_id) {
                 let _ = apply_action_to_chat(&mut state, &emitted.action);
+            } else {
+                // Extension (`x-manox*`) channels carry their own state and no
+                // AHP reducer folds them. A subscriber that arrives late needs
+                // the result of these emissions, not the stream, so they are
+                // kept for the baseline (see `extension_baseline`).
+                extension_actions.push((emitted.channel, emitted.action));
             }
         }
         last_timestamp = Some(entry.timestamp);
@@ -213,6 +224,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     Some(JournalFold {
         chat: state,
         session_actions,
+        extension_actions,
         model_ref,
         tail: snapshot.cursor,
     })
@@ -408,6 +420,15 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
 mod backend;
 mod resources;
 pub mod runtime;
+
+/// The AHP session URI of a manox session id.
+///
+/// A terminal records the session that spawned it, and AHP addresses a session
+/// by URI, so the terminal claim needs the one place that spells that mapping.
+#[cfg(feature = "terminal")]
+pub(crate) fn session_uri_of_terminal(session_id: &str) -> String {
+    manox_ahp::channels::session::uri(session_id)
+}
 
 #[cfg(test)]
 mod tests;

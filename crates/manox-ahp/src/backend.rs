@@ -57,6 +57,25 @@ pub trait Backend: Send + Sync + 'static {
     /// Terminal state, when the runtime owns the terminal.
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalState>;
 
+    /// Spawn (or re-attach) a terminal for `session_id` under `terminal_id`.
+    ///
+    /// The id is the client's, from the channel URI, so a client that names a
+    /// terminal can find it again by that name.
+    fn create_terminal(
+        &self,
+        _session_id: &str,
+        _terminal_id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), HostError> {
+        Err(HostError::Unimplemented("createTerminal".to_string()))
+    }
+
+    /// Dispose a terminal and release its PTY.
+    fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), HostError> {
+        Err(HostError::Unimplemented("disposeTerminal".to_string()))
+    }
+
     /// Create (or adopt) a session for a client-chosen URI.
     fn create_session(
         &self,

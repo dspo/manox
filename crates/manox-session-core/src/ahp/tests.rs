@@ -115,6 +115,11 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             id: i,
             parent_id: p,
             ..
+        }
+        | E::PlanModeChange {
+            id: i,
+            parent_id: p,
+            ..
         } => {
             *i = id.to_string();
             *p = parent_id;
@@ -1396,6 +1401,163 @@ mod dispatch {
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
+        uninstall();
+    }
+
+    /// Subscribing to a declared extension channel must deliver its state, not
+    /// silence.
+    ///
+    /// `_meta["x-manox"]` advertises six channels; none is state-bearing, so
+    /// `subscribe` has no snapshot and the baseline is the only thing a client
+    /// can receive. Returning nothing made the declaration a promise the host
+    /// did not keep — the failure mode is a subscriber that waits forever with
+    /// no error to report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_extension_channel_answers_with_a_baseline() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+
+        // Every declared channel answers. The per-session ones carry the
+        // session id; the catalogue ones describe the host and take none.
+        for prefix in manox_ahp::ext::channels::ALL {
+            let channel = if prefix.ends_with(":/") {
+                format!("{prefix}s-dispatch")
+            } else {
+                (*prefix).to_string()
+            };
+            let baseline = backend
+                .extension_baseline(&channel)
+                .unwrap_or_else(|| panic!("{channel} is declared and must answer"));
+            assert_eq!(baseline.0, manox_ahp::ext::BASELINE_NOTIFICATION);
+            assert_eq!(
+                baseline.1["channel"], channel,
+                "the baseline names the channel it describes"
+            );
+        }
+
+        // A session-scoped channel names its session in the URI; the baseline
+        // echoes the channel so a client can correlate it. (Existence is the
+        // subscribe path's job — `ensure_session` runs before this — so a
+        // baseline is not the place to re-litigate it.)
+
+        // A channel that is not ours is not answered here (the standard
+        // channels take the snapshot path).
+        assert!(
+            backend
+                .extension_baseline("ahp-session:/s-dispatch")
+                .is_none()
+        );
+        assert!(backend.extension_baseline("ahp-chat:/s-dispatch").is_none());
+        uninstall();
+    }
+
+    /// The baseline is the journal's own fold, so it carries the state a live
+    /// subscriber would have reached — not an empty placeholder.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_extension_baseline_carries_the_folded_state() {
+        use manox_harness::session::SessionTreeEntry as E;
+        let _guards = install();
+        let session_id = "s-ext-baseline";
+        super::seed_session(
+            session_id,
+            session_id,
+            "/work/src",
+            vec![
+                (
+                    "e-1",
+                    E::PlanModeChange {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: super::stamp(),
+                        enabled: true,
+                    },
+                ),
+                (
+                    "e-2",
+                    E::Title {
+                        id: String::new(),
+                        parent_id: None,
+                        timestamp: super::stamp(),
+                        title: "extension baseline".to_string(),
+                    },
+                ),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test(session_id, None));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let backend = super::super::backend::RuntimeBackend::new(Arc::clone(&server), cwd);
+
+        let channel = format!("{}{session_id}", manox_ahp::ext::channels::PLAN);
+        let (method, payload) = backend
+            .extension_baseline(&channel)
+            .expect("the plan channel answers");
+        assert_eq!(method, manox_ahp::ext::BASELINE_NOTIFICATION);
+        assert_eq!(
+            payload["state"]["planMode"], true,
+            "the baseline is the journal's fold, not an empty placeholder: {payload}"
+        );
+        uninstall();
+    }
+
+    /// The terminal channel serves real state, not a declaration.
+    ///
+    /// `ahp-terminal:/<id>` was parseable but unserved: `terminal_state` returned
+    /// `None`, so a client could subscribe and only ever get `not found`. A
+    /// channel that parses but never answers is worse than one that is not
+    /// declared at all — the failure is a silent wait, not an error.
+    #[cfg(feature = "terminal")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_terminal_channel_serves_live_state() {
+        let _guards = install();
+        let (server, backend) = fixture().await;
+
+        let attached = server
+            .ahp_inner()
+            .attach_terminal("s-dispatch", 80, 24, None)
+            .expect("a terminal spawns");
+        let terminal_id = attached
+            .get("terminal_id")
+            .and_then(|v| v.as_str())
+            .expect("the attach response names the terminal")
+            .to_string();
+
+        let state = backend
+            .terminal_state(&terminal_id)
+            .expect("the terminal channel answers for a live terminal");
+        assert_eq!(state.cols, Some(80));
+        assert_eq!(state.rows, Some(24));
+        assert!(
+            matches!(
+                state.lifecycle,
+                ahp_types::state::TerminalLifecycleState::Running(_)
+            ),
+            "a freshly spawned terminal is running"
+        );
+        assert_eq!(state.is_pty, Some(true));
+        assert!(
+            !matches!(state.claim, ahp_types::state::TerminalClaim::Client(_)),
+            "the runtime does not arbitrate client input ownership, so it must not \
+             announce a client claim it would not enforce"
+        );
+
+        // Disposal releases the PTY. The watcher task holds an `Arc` of the
+        // entry, so this only holds if disposal breaks that cycle — otherwise
+        // the map entry is gone, `disposeTerminal` reports success, and the
+        // child shell keeps running.
+        assert!(backend.dispose_terminal(&terminal_id).is_ok());
+        assert!(
+            backend.terminal_state(&terminal_id).is_none(),
+            "a disposed terminal is gone from the channel"
+        );
+
+        // An unknown terminal is absent, never fabricated.
+        assert!(backend.terminal_state("no-such-terminal").is_none());
         uninstall();
     }
 
