@@ -172,13 +172,18 @@ pub trait SessionRuntime: Send + Sync + 'static {
     fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError>;
 
     /// Select the session's model.
-    fn set_model(&self, session_id: &str, model: &str);
+    ///
+    /// A refusal is an `Err`, never a silent no-op: the caller has already
+    /// folded the change into the state its subscribers reduce, so swallowing
+    /// the failure would leave every client converging on a model the session
+    /// is not running.
+    fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError>;
 
     /// Select the session's reasoning effort.
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str);
+    fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError>;
 
     /// Select the session's approval mode.
-    fn set_approval_mode(&self, session_id: &str, mode: &str);
+    fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError>;
 
     /// Move the session's effective working directory.
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError>;
@@ -196,10 +201,21 @@ pub trait SessionRuntime: Send + Sync + 'static {
     fn order_session(&self, session_id: &str, before: Option<&str>) -> bool;
 
     /// Compact the session's history.
-    fn compact(&self, session_id: &str, instructions: Option<String>);
+    fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError>;
 
     /// Seed plan execution after a verdict.
-    fn plan_seed(&self, session_id: &str, plan_file: &str);
+    fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), RuntimeError>;
+
+    /// Apply one goal lifecycle action (`create`/`edit`/`replace`/`clear`/
+    /// `pause`/`resume`), the `x-manox/goal` seam.
+    fn goal(
+        &self,
+        session_id: &str,
+        action: &str,
+        objective: Option<String>,
+        budget: Option<u64>,
+        max_rounds: Option<u64>,
+    ) -> Result<(), RuntimeError>;
 
     /// Settle a tool-call confirmation.
     fn confirm_tool_call(
@@ -232,6 +248,15 @@ pub trait SessionRuntime: Send + Sync + 'static {
     {
         HostError::Backend(error.message)
     }
+
+    /// Announce that the session catalogue moved (a session appeared,
+    /// disappeared, was renamed, pinned, reordered or archived).
+    ///
+    /// The runtime raises the event where the change happens — it owns the
+    /// store — and the AHP adapter turns it into the root-channel
+    /// notification, because only the adapter knows the protocol's delta
+    /// vocabulary. A backend with no host attached does nothing.
+    fn catalogue_changed(&self) {}
 }
 
 /// What a rename did.

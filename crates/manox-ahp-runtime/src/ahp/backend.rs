@@ -508,6 +508,10 @@ impl RuntimeBackend {
     /// key maps onto the runtime intent that owns it; an unknown key is not a
     /// refusal (the reducer already folded it) — the runtime simply has no work
     /// for it.
+    ///
+    /// A runtime refusal on a key the reducer DID fold is a rejection, not a
+    /// note: answering `Accepted` would leave the client's state on a model or
+    /// mode the session never adopted.
     fn apply_session_config(
         &self,
         channel: &str,
@@ -516,14 +520,24 @@ impl RuntimeBackend {
         let Some(session_id) = session::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
-        if let Some(model) = config.get("model").and_then(Value::as_str) {
-            self.server.set_model(session_id, model);
-        }
-        if let Some(effort) = config.get("reasoningEffort").and_then(Value::as_str) {
-            self.server.set_reasoning_effort(session_id, effort);
-        }
-        if let Some(mode) = config.get("approvalMode").and_then(Value::as_str) {
-            self.server.set_approval_mode(session_id, mode);
+        let applied = [
+            config
+                .get("model")
+                .and_then(Value::as_str)
+                .map(|model| self.server.set_model(session_id, model)),
+            config
+                .get("reasoningEffort")
+                .and_then(Value::as_str)
+                .map(|effort| self.server.set_reasoning_effort(session_id, effort)),
+            config
+                .get("approvalMode")
+                .and_then(Value::as_str)
+                .map(|mode| self.server.set_approval_mode(session_id, mode)),
+        ];
+        for outcome in applied.into_iter().flatten() {
+            if let Err(error) = outcome {
+                return DispatchOutcome::Rejected(error.message);
+            }
         }
         DispatchOutcome::Accepted
     }
@@ -570,6 +584,26 @@ struct SeededFacts {
     activity: Option<String>,
     directories: Option<Vec<String>>,
     title: String,
+}
+
+/// The mutable half of a session summary, as an AHP delta.
+///
+/// Only fields a store change can move are carried: the channel URI keys the
+/// summary and the timestamps are the server's identity for it, so restating
+/// them from a possibly-stale snapshot would be a regression rather than an
+/// update.
+pub(crate) fn summary_delta(summary: &SessionSummary) -> ahp_types::notifications::PartialSessionSummary {
+    ahp_types::notifications::PartialSessionSummary {
+        provider: Some(summary.provider.clone()),
+        title: Some(summary.title.clone()),
+        status: Some(summary.status),
+        activity: summary.activity.clone(),
+        origin: summary.origin.clone(),
+        project: summary.project.clone(),
+        working_directories: summary.working_directories.clone(),
+        annotations: summary.annotations.clone(),
+        ..Default::default()
+    }
 }
 
 /// One `SessionSummary` from a store row plus the live facts, if any.
@@ -1215,6 +1249,30 @@ impl Backend for RuntimeBackend {
                     return Err(HostError::SessionNotFound(session_id));
                 }
                 self.server.plan_seed(&session_id, plan_file);
+                Ok(Value::Null)
+            }
+            manox_ahp::ext::commands::GOAL => {
+                let session_id = extension_session(params)?;
+                // `action` is required: a goal command with no verb has no
+                // meaning, and defaulting it would make a malformed request
+                // look like a lifecycle step that did nothing.
+                let Some(action) = params.get("action").and_then(Value::as_str) else {
+                    return Err(HostError::InvalidParams(
+                        "x-manox/goal needs action".to_string(),
+                    ));
+                };
+                if !self.server.has_session(&session_id) {
+                    return Err(HostError::SessionNotFound(session_id));
+                }
+                let objective = params
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let budget = params.get("budget").and_then(Value::as_u64);
+                let max_rounds = params.get("maxRounds").and_then(Value::as_u64);
+                self.server
+                    .goal(&session_id, action, objective, budget, max_rounds)
+                    .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
             }
             // A client asked for a surface this build declares but does not

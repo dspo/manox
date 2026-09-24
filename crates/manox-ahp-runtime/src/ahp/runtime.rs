@@ -55,6 +55,7 @@ pub fn install_builder(
 /// The AHP host plus the runtime adapter behind it.
 pub struct AhpRuntime {
     host: Arc<Host>,
+    server: Arc<dyn SessionRuntime>,
 }
 
 impl AhpRuntime {
@@ -68,6 +69,7 @@ impl AhpRuntime {
         backend.attach_host(&host);
         let runtime = Arc::new(Self {
             host: Arc::clone(&host),
+            server: Arc::clone(&server),
         });
         // The provider registry loads asynchronously; the root channel's agent
         // catalogue is state, so it arrives as an action once it is ready rather
@@ -92,6 +94,54 @@ impl AhpRuntime {
     /// The one AHP host of this process.
     pub fn host(&self) -> Arc<Host> {
         Arc::clone(&self.host)
+    }
+
+    /// Republish every session summary whose row exists, as a `sessionAdded`
+    /// for a session the host has never seen and a `sessionSummaryChanged`
+    /// delta for one it knows.
+    ///
+    /// The session id lives in the store row, not in [`SessionSummary`] — the
+    /// protocol keys a summary by its channel URI — so this walks the rows
+    /// rather than the summaries the paging call returns. Sending
+    /// `sessionAdded` twice would make a client insert a second sidebar row for
+    /// one session, which is why the two cases are distinguished at all.
+    /// Republish every session summary whose row exists: `sessionAdded` for a
+    /// session the host has never seen, `sessionSummaryChanged` for one it
+    /// knows.
+    ///
+    /// The session id lives in the store row, not in the summary — AHP keys a
+    /// summary by its channel URI — so this walks the rows rather than the
+    /// summaries the paging call returns. Sending `sessionAdded` twice would
+    /// make a client insert a second sidebar row for one session, which is why
+    /// the two cases are distinguished at all.
+    pub fn catalogue_changed(&self) {
+        let host = Arc::clone(&self.host);
+        let Some(store) = manox_agent::thread_store::try_global() else {
+            return;
+        };
+        let rows: Vec<String> = store.read(|state| {
+            state
+                .summaries()
+                .iter()
+                .filter(|row| row.superseded_by.is_none())
+                .map(|row| row.id.clone())
+                .collect()
+        });
+        for session_id in rows {
+            let Some(summary) = self.host.backend().session_summary(&session_id) else {
+                continue;
+            };
+            if host.session_state(&session_id).is_some() {
+                host.summary_changed(&session_id, super::backend::summary_delta(&summary));
+            } else {
+                host.session_added(summary);
+            }
+        }
+    }
+
+    /// The session runtime behind the host.
+    pub fn server(&self) -> &Arc<dyn SessionRuntime> {
+        &self.server
     }
 
     /// Connect one **in-process** client ("over channel") and hand back the

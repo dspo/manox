@@ -187,10 +187,10 @@ impl SessionRuntime for GatewayRuntime {
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
         block_on(async move {
-            AgentServerInner::create_session_request(&inner, &owner, intent.into()).await
+            AgentServerInner::create_session_request(&inner, &owner, intent).await
         })
         .map(|_| ())
-        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn fork_session(&self, owner: &str, intent: ForkIntent) -> Result<(), RuntimeError> {
@@ -198,10 +198,10 @@ impl SessionRuntime for GatewayRuntime {
         let inner = Arc::clone(server.ahp_inner());
         let owner = owner.to_string();
         block_on(
-            async move { crate::agent_server::fork_session(&inner, &owner, intent.into()).await },
+            async move { crate::agent_server::fork_session(&inner, &owner, intent).await },
         )
         .map(|_| ())
-        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn dispose_session(&self, owner: &str, session_id: &str) -> Result<(), RuntimeError> {
@@ -223,7 +223,7 @@ impl SessionRuntime for GatewayRuntime {
                 .submit(&owner, &session_id, text, Vec::new(), None, None)
                 .await
         })
-        .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+        .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn steer(
@@ -235,7 +235,7 @@ impl SessionRuntime for GatewayRuntime {
         self.server
             .ahp_inner()
             .steer(session_id, message_id.to_string(), text, Vec::new(), None)
-            .map_err(|error| RuntimeError::new(error.message).with_code("gateway/internal"))
+            .map_err(|error| crate::agent_server::preserve_code(error))
     }
 
     fn drop_queued(&self, session_id: &str, message_id: &str) {
@@ -255,18 +255,18 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn set_model(&self, session_id: &str, model: &str) {
-        self.server.ahp_inner().set_model(session_id, model);
+    fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError> {
+        self.server.ahp_inner().set_model(session_id, model)
     }
 
-    fn set_reasoning_effort(&self, session_id: &str, effort: &str) {
+    fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
         self.server
             .ahp_inner()
-            .set_reasoning_effort(session_id, effort);
+            .set_reasoning_effort(session_id, effort)
     }
 
-    fn set_approval_mode(&self, session_id: &str, mode: &str) {
-        self.server.ahp_inner().set_approval_mode(session_id, mode);
+    fn set_approval_mode(&self, session_id: &str, mode: &str) -> Result<(), RuntimeError> {
+        self.server.ahp_inner().set_approval_mode(session_id, mode)
     }
 
     fn set_cwd(&self, session_id: &str, cwd: &str) -> Result<(), RuntimeError> {
@@ -274,8 +274,7 @@ impl SessionRuntime for GatewayRuntime {
         let inner = Arc::clone(server.ahp_inner());
         let session_id = session_id.to_string();
         let cwd = cwd.to_string();
-        block_on(async move { inner.set_cwd(&session_id, &cwd).await });
-        Ok(())
+        block_on(async move { inner.set_cwd(&session_id, &cwd).await })
     }
 
     fn archive_session(&self, owner: &str, session_id: &str, archived: bool) {
@@ -303,12 +302,25 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().order_session(session_id, before)
     }
 
-    fn compact(&self, session_id: &str, instructions: Option<String>) {
-        self.server.ahp_inner().compact(session_id, instructions);
+    fn compact(&self, session_id: &str, instructions: Option<String>) -> Result<(), RuntimeError> {
+        self.server.ahp_inner().compact(session_id, instructions)
     }
 
-    fn plan_seed(&self, session_id: &str, plan_file: &str) {
-        self.server.ahp_inner().plan_seed(session_id, plan_file);
+    fn plan_seed(&self, session_id: &str, plan_file: &str) -> Result<(), RuntimeError> {
+        self.server.ahp_inner().plan_seed(session_id, plan_file)
+    }
+
+    fn goal(
+        &self,
+        session_id: &str,
+        action: &str,
+        objective: Option<String>,
+        budget: Option<u64>,
+        max_rounds: Option<u64>,
+    ) -> Result<(), RuntimeError> {
+        self.server
+            .ahp_inner()
+            .goal(session_id, action, objective, budget, max_rounds)
     }
 
     fn journal_feed(&self, session_id: &str) -> Option<manox_agent::thread::ThreadHandle> {
@@ -364,36 +376,6 @@ impl SessionRuntime for GatewayRuntime {
             }
             None => Err(RuntimeError::new(format!("unknown session {session_id}"))
                 .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
-        }
-    }
-}
-
-impl From<SessionIntent> for crate::agent_server::SessionIntent {
-    fn from(intent: SessionIntent) -> Self {
-        Self {
-            session_id: intent.session_id,
-            cwd: intent.cwd,
-            project: intent.project,
-            initial_model: intent.initial_model,
-            approval_mode: intent.approval_mode,
-            reasoning_effort: intent.reasoning_effort,
-            seed: intent.seed,
-            working_directories: intent.working_directories,
-        }
-    }
-}
-
-impl From<ForkIntent> for crate::agent_server::ForkIntent {
-    fn from(intent: ForkIntent) -> Self {
-        Self {
-            source_session_id: intent.source_session_id,
-            through_entry_id: intent.through_entry_id,
-            target_session_id: intent.target_session_id,
-            cwd: intent.cwd,
-            project: intent.project,
-            initial_model: intent.initial_model,
-            approval_mode: intent.approval_mode,
-            reasoning_effort: intent.reasoning_effort,
         }
     }
 }
