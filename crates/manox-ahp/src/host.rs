@@ -262,6 +262,19 @@ impl Host {
         self.request(conn, method, params).await
     }
 
+    /// Whether any subscriber of this session declared it can answer `method`.
+    ///
+    /// The router's gate: it must be able to tell "no AHP client owns this
+    /// capability" (fall through to another transport) from "an AHP client owns
+    /// it and failed" (an error), and only this can distinguish them.
+    pub fn has_capable_client(&self, session_id: &str, method: &str) -> bool {
+        let uri = crate::channels::session::uri(session_id);
+        self.inner
+            .subscribers(&uri)
+            .iter()
+            .any(|conn| conn.can_answer(method))
+    }
+
     /// [`Self::request`] with an explicit deadline.
     ///
     /// The deadline is a parameter rather than a knob because the issuer owns
@@ -545,5 +558,47 @@ impl Inner {
             .ok_or_else(|| HostError::NotFound(crate::channels::terminal::uri(terminal_id)))?;
         self.store.write().insert_terminal(terminal_id, state);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection is a candidate only for the methods it declared.
+    ///
+    /// This is the gate that decides whether the AHP transport owns a
+    /// host-initiated request at all. If it answered "yes" for everything, the
+    /// capability router would hand this transport a request no client can
+    /// serve and then wait out the 300-second deadline for an answer that cannot
+    /// come — while the transport that did own it was never asked.
+    #[test]
+    fn only_declared_client_requests_select_a_connection() {
+        let (tx, _rx) = async_channel::unbounded();
+        let conn = Conn::new(1, tx);
+
+        // A client that declared nothing owns nothing.
+        assert!(!conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+
+        conn.set_client_requests(vec![
+            crate::ext::requests::CLIPBOARD_READ.to_string(),
+            crate::ext::requests::OPEN_EXTERNAL.to_string(),
+        ]);
+        assert!(conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+        assert!(conn.can_answer(crate::ext::requests::OPEN_EXTERNAL));
+        assert!(
+            !conn.can_answer(crate::ext::requests::BROWSER_OP),
+            "a method the client did not declare is not owed to it"
+        );
+        assert!(
+            !conn.can_answer("x-manox/unknownFutureMethod"),
+            "an undeclared method of any name is refused"
+        );
+
+        // Re-declaring replaces rather than accumulates: a client that dropped a
+        // capability must stop being asked for it.
+        conn.set_client_requests(vec![crate::ext::requests::BROWSER_OP.to_string()]);
+        assert!(!conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+        assert!(conn.can_answer(crate::ext::requests::BROWSER_OP));
     }
 }

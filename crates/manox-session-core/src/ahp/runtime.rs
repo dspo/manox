@@ -26,6 +26,9 @@ use manox_ahp::transport::inproc::InprocClientTransport;
 use super::backend::RuntimeBackend;
 use crate::agent_server::AgentServer;
 
+/// The process-singleton AHP runtime (L11).
+static RUNTIME: OnceLock<Arc<AhpRuntime>> = OnceLock::new();
+
 /// The AHP host plus the runtime adapter behind it.
 pub struct AhpRuntime {
     host: Arc<Host>,
@@ -88,10 +91,37 @@ impl AhpRuntime {
     }
 }
 
+impl AhpRuntime {
+    /// Whether any of this session's AHP subscribers declared it can answer
+    /// `method` — the gate the capability router uses to decide whether this
+    /// transport has a client for the request at all.
+    pub fn has_capable_client(&self, session_id: &str, method: &str) -> bool {
+        self.host.has_capable_client(session_id, method)
+    }
+
+    /// Ask one such client (see [`manox_ahp::Host::request_client`]).
+    pub async fn request_client(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, manox_ahp::error::HostError> {
+        self.host.request_client(session_id, method, params).await
+    }
+}
+
+/// The process-singleton runtime, when it has been initialized.
+///
+/// `None` in a host that never brought the AHP face up — a headless or napi
+/// embedder, or a test that only exercises the v2 path. Callers treat that as
+/// "this transport has no client", never as an error.
+pub fn try_runtime() -> Option<Arc<AhpRuntime>> {
+    RUNTIME.get().map(Arc::clone)
+}
+
 /// The process-singleton runtime (L11). `cwd` only matters on first call, where
 /// it seeds the agent server identity the v2 hosts also use.
 pub fn runtime(cwd: PathBuf) -> Arc<AhpRuntime> {
-    static RUNTIME: OnceLock<Arc<AhpRuntime>> = OnceLock::new();
     Arc::clone(RUNTIME.get_or_init(|| {
         let server = crate::agent_server::global(cwd.clone());
         AhpRuntime::new(server, cwd)

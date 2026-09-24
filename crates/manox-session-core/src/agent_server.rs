@@ -4036,6 +4036,44 @@ impl AgentServerInner {
         }
     }
 
+    /// Pin or unpin a session (the AHP extension surface: AHP has no pin bit).
+    ///
+    /// The durable authority is the store row plus the session's sidecar, the
+    /// same path v2's `PinThread` takes — a pin the sidebar shows and a cold
+    /// restore forgets would be the worst of both.
+    pub(crate) fn pin_session(&self, session_id: &str, pinned: bool) -> bool {
+        let mut applied = false;
+        manox_agent::thread_store::global().with_mut(|store| {
+            applied = store.summary_by_id(session_id).is_some();
+            if applied {
+                store.pin_thread(session_id, pinned);
+            }
+        });
+        applied
+    }
+
+    /// Move a session before another in the sidebar order, or to the head when
+    /// `before` is `None`.
+    ///
+    /// A move that names an unaccounted row changes nothing and reports it: the
+    /// store's own `MoveInvalid` is the answer, surfaced rather than folded into
+    /// a success the sidebar would not show.
+    pub(crate) fn order_session(&self, session_id: &str, before: Option<&str>) -> bool {
+        // The store's move is fire-and-forget by design (it warns and leaves the
+        // account untouched on an unaccounted row or anchor), so what the caller
+        // can honestly be told is whether the row exists at all — an unknown
+        // session is a client error, while a rejected *move* is the store's own
+        // accounting to log.
+        let known = manox_agent::thread_store::global()
+            .read(|store| store.summary_by_id(session_id).is_some());
+        if !known {
+            return false;
+        }
+        manox_agent::thread_store::global()
+            .with_mut(|store| store.insert_thread_before(session_id, before));
+        true
+    }
+
     /// Rename a session to a user-supplied title.
     ///
     /// Two calls, and the split matters:
@@ -5270,6 +5308,7 @@ impl AgentServerCapabilityClient {
 async fn route_session_capability(
     inner: &Arc<AgentServerInner>,
     what: &str,
+    method: &str,
     call_for: impl FnOnce(String) -> ServerCall,
 ) -> Result<Value, String> {
     let session_id = manox_agent::capability::CURRENT_SESSION
@@ -5277,10 +5316,65 @@ async fn route_session_capability(
         .ok()
         .flatten()
         .ok_or_else(|| format!("no session context for {what}"))?;
+    // Two live transports serve this session during the migration, and the
+    // capability belongs to whichever one has a client that declared it. The
+    // AHP host is asked first because its clients declare explicitly
+    // (`serverRequests`), so a positive answer there is precise; the v2 path is
+    // the same one this host has always used. This is transport selection, not
+    // a compatibility shim: when v2 is deleted the second leg goes with it and
+    // the first is unchanged.
+    // One call, two possible transports: the AHP request carries the params
+    // derived from it, and the v2 leg needs the call itself.
     let call = call_for(session_id.clone());
+    let ahp = crate::ahp::runtime::try_runtime();
+    if let Some(reply) = route_ahp_capability(ahp.as_deref(), &session_id, method, &call).await {
+        return reply;
+    }
     route_capability_call(inner, &session_id, call)
         .await
         .map_err(|e| e.message)
+}
+
+/// Ask the AHP host, when it has a client that declared `method` for this
+/// session.
+///
+/// `None` means "no AHP client claimed this" — the caller then tries the v2
+/// path. An AHP client that claimed it and then failed is an `Err`, never a
+/// silent fallthrough: that would ask a second client a question the first one
+/// already owns.
+async fn route_ahp_capability(
+    runtime: Option<&crate::ahp::runtime::AhpRuntime>,
+    session_id: &str,
+    method: &str,
+    call: &ServerCall,
+) -> Option<Result<Value, String>> {
+    // Both the runtime and the wire shape are checked before anything is asked:
+    // an AHP host that is not up, or a call AHP has no request for, is "this
+    // transport does not own it" rather than an error.
+    let runtime = runtime?;
+    let params = ahp_capability_params(call)?;
+    if !runtime.has_capable_client(session_id, method) {
+        return None;
+    }
+    Some(
+        runtime
+            .request_client(session_id, method, params)
+            .await
+            .map_err(|error| error.message()),
+    )
+}
+
+/// The AHP params for a v2 capability call.
+///
+/// `None` for a call AHP has no request for; the caller falls through to the v2
+/// path rather than inventing a wire shape.
+fn ahp_capability_params(call: &ServerCall) -> Option<Value> {
+    match call {
+        ServerCall::BrowserOp { op, .. } => Some(op.clone()),
+        ServerCall::ClipboardRead { .. } => Some(Value::Null),
+        ServerCall::OpenExternal { url, .. } => Some(serde_json::json!({ "url": url })),
+        _ => None,
+    }
 }
 
 impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
@@ -5292,12 +5386,15 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
         let inner = self.0.clone();
         Box::pin(async move {
             let op_value = serde_json::to_value(&op).map_err(|e| e.to_string())?;
-            let v = route_session_capability(&inner, "browser op", |session_id| {
-                ServerCall::BrowserOp {
+            let v = route_session_capability(
+                &inner,
+                "browser op",
+                manox_ahp::ext::requests::BROWSER_OP,
+                |session_id| ServerCall::BrowserOp {
                     session_id,
                     op: op_value.clone(),
-                }
-            })
+                },
+            )
             .await?;
             serde_json::from_value::<manox_agent::thread_engine::BrowserReply>(v)
                 .map_err(|e| e.to_string())
@@ -5318,9 +5415,12 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     ) -> futures::future::BoxFuture<'static, Result<Option<String>, String>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            let v = route_session_capability(&inner, "clipboard read", |session_id| {
-                ServerCall::ClipboardRead { session_id }
-            })
+            let v = route_session_capability(
+                &inner,
+                "clipboard read",
+                manox_ahp::ext::requests::CLIPBOARD_READ,
+                |session_id| ServerCall::ClipboardRead { session_id },
+            )
             .await?;
             if v.is_null() {
                 return Ok(None);
@@ -5352,9 +5452,12 @@ impl manox_agent::capability::CapabilityClient for AgentServerCapabilityClient {
     ) -> futures::future::BoxFuture<'static, Result<(), String>> {
         let inner = self.0.clone();
         Box::pin(async move {
-            route_session_capability(&inner, "open external", |session_id| {
-                ServerCall::OpenExternal { session_id, url }
-            })
+            route_session_capability(
+                &inner,
+                "open external",
+                manox_ahp::ext::requests::OPEN_EXTERNAL,
+                |session_id| ServerCall::OpenExternal { session_id, url },
+            )
             .await
             .map(|_| ())
         })

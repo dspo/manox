@@ -373,10 +373,19 @@ impl RuntimeBackend {
     /// contract and silence would be the one outcome a client cannot act on.
     fn catalogue_baseline(&self, channel: &str) -> Value {
         if channel.starts_with(manox_ahp::ext::channels::WORKSPACES) {
-            let workspaces = manox_agent::thread_store::try_global()
-                .map(|store| store.read(|state| state.known_projects().to_vec()))
+            // The catalogue carries both halves of the workspace account: the
+            // folder order and each partition's thread order. Manual ordering is
+            // a user-visible feature with no AHP slot, so this channel is where a
+            // client reads back what its `x-manox/orderChanged` moves produced.
+            let (workspaces, order) = manox_agent::thread_store::try_global()
+                .map(|store| {
+                    store.read(|state| {
+                        let (groups, accounts) = state.sidebar_order();
+                        (groups.to_vec(), accounts.clone())
+                    })
+                })
                 .unwrap_or_default();
-            return serde_json::json!({ "workspaces": workspaces });
+            return serde_json::json!({ "workspaces": workspaces, "order": order });
         }
         if channel.starts_with(manox_ahp::ext::channels::COMMANDS) {
             // The command/skill catalogue is assembled by the runtime's
@@ -1066,6 +1075,56 @@ impl Backend for RuntimeBackend {
             // effect: the claim is the protocol's, and this host does not
             // arbitrate input between clients (see `ahp_terminal_state`).
             StateAction::TerminalClaimed(_) => DispatchOutcome::Ignored,
+            // ── x-manox: pin and manual ordering ──────────────────────────
+            //
+            // AHP has no pin bit and no ordering field (verified against
+            // `SessionStatus`, `SessionMetadata` and `SessionSummary`), so both
+            // ride the declared extension surface. Their durable authority is
+            // the store row plus `sidebar_order`, the same layers v2's
+            // `PinThread` / `InsertThreadBefore` use.
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::PINNED_CHANGED) =>
+            {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                let Some(pinned) = tag.get("pinned").and_then(Value::as_bool) else {
+                    return DispatchOutcome::Rejected(
+                        "x-manox/pinnedChanged needs a boolean `pinned`".to_string(),
+                    );
+                };
+                if self.server.ahp_inner().pin_session(session_id, pinned) {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
+                }
+            }
+            StateAction::Unknown(tag)
+                if tag.get("type").and_then(Value::as_str)
+                    == Some(manox_ahp::ext::actions::ORDER_CHANGED) =>
+            {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                // `before: null` means "to the head of its partition", which is
+                // what the store's `None` anchor means.
+                let before = match tag.get("before") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(anchor)) => Some(anchor.as_str()),
+                    Some(_) => {
+                        return DispatchOutcome::Rejected(
+                            "x-manox/orderChanged `before` must be a session id or null"
+                                .to_string(),
+                        );
+                    }
+                };
+                if self.server.ahp_inner().order_session(session_id, before) {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!("unknown session: {session_id}"))
+                }
+            }
             StateAction::SessionIsArchivedChanged(changed) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));

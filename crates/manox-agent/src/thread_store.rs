@@ -645,6 +645,17 @@ impl ThreadStore {
     pub fn known_projects(&self) -> &[String] {
         &self.known_projects
     }
+
+    /// The committed sidebar order: folder order plus each partition's ordered
+    /// thread ids.
+    ///
+    /// The account the user's manual moves write. A client that only *displays*
+    /// the sidebar needs this to render what the moves produced; the file's
+    /// other consumers go through `reconcile`, which additionally intersects
+    /// with the rows the store actually holds.
+    pub fn sidebar_order(&self) -> (&[String], &std::collections::HashMap<String, Vec<String>>) {
+        (&self.order.groups, &self.order.accounts)
+    }
     /// Register a project path: in-memory list + persisted to the db
     /// `projects` table so sidebar folders survive restarts even when all
     /// their threads are archived.

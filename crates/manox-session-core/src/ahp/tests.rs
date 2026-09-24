@@ -1613,6 +1613,126 @@ mod dispatch {
         uninstall();
     }
 
+    /// The capability router's AHP leg declines cleanly when the transport has
+    /// no capable client, so the v2 path still runs.
+    ///
+    /// The positive half — an AHP client that declared a capability is the one
+    /// asked — is pinned in `manox-ahp`'s `only_declared_client_requests_select_a_connection`,
+    /// where a `Conn` is reachable. What this covers is the other direction: a
+    /// subscription without a declaration must not make the AHP host look like
+    /// the owner, because the router would then ask a client that never claimed
+    /// the capability and wait out the deadline for an answer that cannot come.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capability_routing_declines_when_no_ahp_client_declared_it() {
+        use ahp::ClientConfig;
+        let _guards = install();
+        let (server, _backend) = fixture().await;
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.insert_summary_for_test("s-dispatch", None));
+
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let runtime = super::super::runtime::AhpRuntime::new(Arc::clone(&server), cwd);
+
+        // A client that subscribes without declaring anything.
+        let client = ahp::Client::connect(runtime.inproc(), ClientConfig::default())
+            .await
+            .expect("connects");
+        client
+            .initialize(
+                "silent".to_string(),
+                vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                vec![session::uri("s-dispatch")],
+            )
+            .await
+            .expect("initializes");
+
+        for method in [
+            manox_ahp::ext::requests::CLIPBOARD_READ,
+            manox_ahp::ext::requests::BROWSER_OP,
+            manox_ahp::ext::requests::OPEN_EXTERNAL,
+        ] {
+            assert!(
+                !runtime.has_capable_client("s-dispatch", method),
+                "an undeclared capability must not select this transport: {method}"
+            );
+        }
+        uninstall();
+    }
+
+    /// Pin and manual ordering are user-visible v2 features with no AHP slot, so
+    /// they ride the declared extension surface. Both must reach their durable
+    /// layer — a pin the sidebar shows and a cold restore forgets would be the
+    /// worst of both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pin_and_order_reach_their_durable_layers() {
+        use manox_agent::thread_store;
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        thread_store::global().with_mut(|s| {
+            s.insert_summary_for_test("s-dispatch", None);
+            s.insert_summary_for_test("s-other", None);
+        });
+
+        // Pin: the store row is the read-back surface.
+        let pin = StateAction::Unknown(json!({
+            "type": manox_ahp::ext::actions::PINNED_CHANGED,
+            "pinned": true,
+        }));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &pin, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let pinned =
+            thread_store::global().read(|s| s.summary_by_id("s-dispatch").map(|row| row.pinned));
+        assert_eq!(pinned, Some(true), "the pin lands on the durable row");
+
+        // Order: `before` names an anchor; null means the head.
+        let order = StateAction::Unknown(json!({
+            "type": manox_ahp::ext::actions::ORDER_CHANGED,
+            "before": "s-other",
+        }));
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &order, &origin()),
+            DispatchOutcome::Accepted
+        );
+
+        // Both refuse an unknown session rather than reporting a success the
+        // sidebar would not show.
+        assert!(matches!(
+            backend.dispatch(&session::uri("s-absent"), &pin, &origin()),
+            DispatchOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            backend.dispatch(&session::uri("s-absent"), &order, &origin()),
+            DispatchOutcome::Rejected(_)
+        ));
+
+        // A malformed payload is refused by name, not folded.
+        assert!(matches!(
+            backend.dispatch(
+                &session::uri("s-dispatch"),
+                &StateAction::Unknown(json!({
+                    "type": manox_ahp::ext::actions::PINNED_CHANGED,
+                    "pinned": "yes",
+                })),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            backend.dispatch(
+                &session::uri("s-dispatch"),
+                &StateAction::Unknown(json!({
+                    "type": manox_ahp::ext::actions::ORDER_CHANGED,
+                    "before": 42,
+                })),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+        uninstall();
+    }
+
     /// An action with no intent at all is refused loudly — the trait contract
     /// is that a refused write never looks accepted.
     #[tokio::test(flavor = "multi_thread")]

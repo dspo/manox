@@ -566,6 +566,25 @@ reconnect 快照腿、dispatch 句柄。
 
 ### H.3 尚未落地（续做清单，按 plan 的 W2→W3→W4→W5 顺序）
 
+### H.2i W4 准入账的第二轮补齐（2026-09-24）
+
+第二份验收意见（`/private/tmp/ahp-w3-review-and-next-2026-09-24.md`）指出四项，逐项处置：
+
+1. **四个 host→client 请求的调用点（已接）**。`route_session_capability` 现在先问 AHP：
+   `route_ahp_capability` 经 `AhpRuntime::has_capable_client` 判断该会话是否有**声明过**该能力的
+   AHP 订阅者，有则 `Host::request_client`，无则回退 v2 腿。
+   **这是传输选择而非兼容层**：v2 删除时第二条腿随之消失，第一条不变。
+   两处 fail-closed 已钉住：无合格声明者不误选本传输（`capability_routing_declines_when_no_ahp_client_declared_it`）；
+   只有声明的能力才选中该连接（`manox-ahp` 的 `only_declared_client_requests_select_a_connection`）。
+   **纠正审计者笔误**：第四个方法是 `x-manox/invokeTool`，不是 `invokeClientTool`。
+2. **pin + 手工排序（已补，走 `x-manox`）**。见上「W4 准入账」条。
+3. **`refs/agents/*` 14 个残留 ref（已清）**。删除前独立复核三条零风险依据：
+   `git log main --grep="^Agent host session"` = 0、`git ls-remote origin 'refs/agents/*'` = 0、
+   无分支引用。清理后主 checkout `git status` 干净、`main` 仍在 `f80f38a`。
+   **复发风险仍在**：hcode 当前分支 `experiment/manox-agent-host` 仍指向本仓运行，
+   只要它继续在本仓做 checkpoint 就会再累积——需在 hcode 侧关闭 checkpoint 或让它离开本仓（仓外决定）。
+4. **push + PR（已完成）**：PR #818，26 个提交，base `main`，head `ahp-host`（按用户裁决不用 `codex/` 前缀）。
+
 ### H.2h 版本注记
 
 - 本轮新增 `x-manox/baseline` 通知（扩展通道基线），已进 `_meta["x-manox"]` 声明。
@@ -597,7 +616,19 @@ reconnect 快照腿、dispatch 句柄。
    - ✅ 四个 `x-manox` server→client 请求（§H.2i）
    - ✅ `terminal` 写路径 `input`/`resized`/`data`（§H.2i）
    - ✅ 客户端贡献工具（`session/activeClientSet` → 既有 `embedder_tools` 路径，§H.2i）
-   - ⬜ `x-manox/fetchEntries`、pin + 手工排序 —— v2 在服务，W4 前需补齐或明确接受降级
+   - ✅ 四个 host→client 请求的**调用点**（`CapabilityClient` 的 browser/clipboard/
+     openExternal 经 `route_ahp_capability` 优先问 AHP，无合格声明者则回退 v2 腿；见 §H.2i）
+   - ✅ pin + 手工排序 —— **走 `x-manox`**（按「按能力查而非按命令查」的方法论核实了 AHP 全部
+     候选槽位：`SessionStatus` 位集 / `SessionMetadata` / `SessionSummary` / 全树
+     `pinned|sortOrder|displayOrder|reorder`，确认**无落点**）。
+     pin 写 store 行 + sidecar（与 v2 `PinThread` 同一层），且 journal 的 `PinnedArchived`
+     早已被 translator 折成 `x-manox/pinnedChanged`，读回路径本来就通；
+     排序写 `sidebar_order`，读回经 `x-manox-workspaces://` 基线的 `order`（文件夹序 +
+     每个 partition 的线程序）。
+     **实施期发现**：排序**不进 journal**——`sidebar_order` 是独立 durable 文件，v2 侧靠
+     `ThreadsUpdated` 快照广播。故 translator 无可发射的排序事件，排序是「客户端写 + 通道读回」
+     的状态，这与 pin 不同（pin 有 journal 行）。
+   - ⬜ `x-manox/fetchEntries` —— v2 在服务，W4 前需补齐或明确接受降级
    - ⬜ `resourceResolve`/`resourceCopy`/`if_match`（基础围栏已在；v2 未服务这三条，故非阻塞）
 
 1. **④b（独立立项）**：真 VS Code Agents window 的方言税（R5 五处）。前置条件是 hcode fork 里
