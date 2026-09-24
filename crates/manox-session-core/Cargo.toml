@@ -25,6 +25,9 @@ manox-workspace.workspace = true
 # runs the host's own translator + the shared `ahp` reducers over the
 # journal, and reads the durable vocabulary from the leaf journal crate.
 manox-ahp.workspace = true
+# The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
+# implements, so the adapter never names a gateway type.
+manox-ahp-runtime = { workspace = true, features = ["terminal"] }
 manox-journal.workspace = true
 ahp.workspace = true
 ahp-types.workspace = true

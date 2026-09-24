@@ -2604,6 +2604,7 @@ dependencies = [
  "libc",
  "manox-agent",
  "manox-ahp",
+ "manox-ahp-runtime",
  "manox-harness",
  "manox-journal",
  "manox-protocol",
