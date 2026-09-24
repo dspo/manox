@@ -19,7 +19,6 @@ async-trait = "0.1"
 chrono.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-manox-protocol.workspace = true
 manox-workspace.workspace = true
 # v3 (AHP) W2: the read-only journal → AHP channel-state fold (`src/ahp/`)
 # runs the host's own translator + the shared `ahp` reducers over the

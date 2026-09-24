@@ -5,9 +5,10 @@
 #                         sessions、tools + ext 扩展）
 #   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
 #                         + MCP/LSP 接线）
-#   - manox-session-core: 无上下文会话编排（AgentServer/AgentClient 协议网关、
-#                         journal 查询、projections、waterfall、ws 网关）
-#   - manox-protocol:     传输无关双向 RPC + journal/protocol v2 词汇
+#   - manox-journal:      会话磁盘格式（journal v4 条目词汇）的叶子 crate
+#   - manox-ahp:          Agent Host Protocol 宿主层（频道、JSON-RPC、传输）
+#   - manox-ahp-runtime:  AHP 宿主背后的运行时半边（SessionRuntime 缝）
+#   - manox-session-core: 无上下文会话编排（会话存储 + AHP 运行时缝的实现）
 #   - manox-napi:         napi-rs 绑定（dormant，为未来 TS host 保留）
 #   - manox-providers:    ~/.manox/cx.providers.config.yaml 解析的单一事实来源
 #   - supervisor / lsp:   进程总线与 LSP 客户端（manox-agent 的基础设施）
@@ -27,7 +28,6 @@ members = [
 	"crates/manox-providers",
 	"crates/manox-session-core",
 	"crates/manox-napi",
-	"crates/manox-protocol",
 	"crates/manox-journal",
 	"crates/manox-ahp",
 	"crates/manox-ahp-runtime",
@@ -54,7 +54,6 @@ manox-agent = { path = "crates/manox-agent", default-features = false }
 supervisor = { path = "crates/supervisor" }
 lsp = { path = "crates/lsp" }
 manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
-manox-protocol = { path = "crates/manox-protocol" }
 manox-workspace = { path = "crates/manox-workspace" }
 manox-journal = { path = "crates/manox-journal" }
 # manox-ahp —— AHP（Agent Host Protocol）宿主半边：JSON-RPC 路由、全局

@@ -45,6 +45,18 @@ pub struct ClientToolSpec {
     pub read_only: bool,
 }
 
+/// One image attached to a submission.
+///
+/// Plain data, like [`ClientToolSpec`]: the runtime hands the bytes to the
+/// kernel and nothing here describes a wire shape. It was a v2 protocol type.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ImageAttachment {
+    /// The image's raw bytes.
+    pub data: Vec<u8>,
+    /// The image's MIME type.
+    pub mime_type: String,
+}
+
 /// How to create one session.
 #[derive(Debug, Clone, Default)]
 pub struct SessionIntent {

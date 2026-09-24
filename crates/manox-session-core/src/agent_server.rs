@@ -22,18 +22,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use manox_protocol::answer_kind::AnswerKind;
-use manox_protocol::base64_bytes;
-use manox_protocol::client::{ClientToolSpec, ImageAttachment};
-use manox_protocol::handshake::{ClientHello, Initialize, PROTOCOL_EPOCH};
-use manox_protocol::journal::StreamId;
-#[cfg(feature = "terminal")]
-use manox_protocol::stream::StreamFrame;
-use manox_protocol::stream::{HostEvent, StreamEndReason, StreamKind};
-use manox_protocol::{
-    ClientCall, ClientNote, FromClient, FromServer, ModelInfo, MsgId, RpcConnection, RpcError,
-    RpcPeer, ServerCall, ServerNote, ThreadListItem,
-};
+use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
+use manox_journal::base64_bytes;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -356,27 +346,6 @@ impl AgentServerInner {
         })
     }
 
-    #[cfg(feature = "terminal")]
-    fn terminals_summary(&self) -> Vec<manox_protocol::stream::TerminalSummary> {
-        self.terminals
-            .lock()
-            .iter()
-            .map(|(id, entry)| {
-                let exited = *entry.exited.lock().unwrap();
-                manox_protocol::stream::TerminalSummary {
-                    id: id.clone(),
-                    title: entry.handle.read(|t| t.title.clone()),
-                    lifecycle: if exited.is_some() {
-                        "exited"
-                    } else {
-                        "running"
-                    }
-                    .into(),
-                    exit_code: exited,
-                }
-            })
-            .collect()
-    }
 
     #[cfg(feature = "terminal")]
     fn upsert_terminal_db(&self, entry: &TerminalEntry, exit: Option<i32>) {
@@ -720,117 +689,6 @@ impl AgentServerInner {
             .insert(client_id.to_string(), tools);
     }
 
-    // ── Snapshots (queries). ────────────────────────────────────────────────
-    //
-    // T10 (§D.6): the v1 `ThreadHistory`/`ThreadInfo` snapshot emitters are
-    // gone. History replays through the §D.1 follow stream's opening
-    // `Snapshot` frame; thread meta-info rides the projection baseline +
-    // P-face deltas (§E); `has_interacted` is a projection key.
-    fn threads_snapshot(&self) -> Vec<ThreadListItem> {
-        // Teardown-tolerant (cross-domain #5 side): the self-held rescan
-        // delayed list answers enough that a straggler dispatch task can
-        // outlive its test's store guard — a strict global() there panics
-        // a foreign worker thread and trips the gpui test scheduler of an
-        // UNRELATED test. Production initializes the store for the process
-        // lifetime; None answers an empty list.
-        let Some(store) = manox_agent::thread_store::try_global() else {
-            return Vec::new();
-        };
-        store.read(|s| {
-            s.summaries()
-                .iter()
-                // Superseded predecessors never lead a sidebar partition:
-                // the successor row is the conversation's identity now
-                // (review #805 [issue] 3-i).
-                .filter(|t| t.superseded_by.is_none())
-                .map(|t| ThreadListItem {
-                    id: t.id.clone(),
-                    title: t.display_title().to_string(),
-                    // U2-cross-domain #3: the wire column is documented as
-                    // the LAST INTERACTION — interacted_at advances on real
-                    // activity only, while updated_at advances on every
-                    // metadata save and would float stale threads in the
-                    // clients' recency ordering.
-                    updated_at: t.interacted_at as i32,
-                    running: s.is_running(&t.id),
-                    // GW5: unread is client-owned — the server keeps no
-                    // focus mirror, so the deprecated list field is always
-                    // false (clients derive unread from the
-                    // `SessionStatus.unread` settle deltas and clear it
-                    // locally on focus). C4 removes the field.
-                    unread: false,
-                    errored: t.errored,
-                    pending_auth: s.pending_auth_contains(&t.id),
-                    pending_plan: s.pending_plan_contains(&t.id),
-                    background_work: s.background_work_contains(&t.id),
-                    model_id: t.model_id.clone(),
-                    pinned: t.pinned,
-                    archived: t.archived,
-                    parent_id: t.parent_id.clone(),
-                    depth: t.depth,
-                    // U2 cross-domain #1: the grouping / label / approval
-                    // columns ride the wire row (the sidebar's decoration
-                    // push retires against them).
-                    project: (!t.project.is_empty()).then(|| t.project.clone()),
-                    tag: t.tag.clone(),
-                    approval_mode: Some(t.approval_mode),
-                })
-                .collect()
-        })
-    }
-
-    fn models_snapshot(&self) -> Vec<ModelInfo> {
-        deduped_models(manox_agent::provider_glue::global().models())
-            .iter()
-            .map(model_to_wire)
-            .collect()
-    }
-
-    fn commands_snapshot(&self) -> Value {
-        let mut commands = Vec::new();
-        for meta in manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS {
-            commands.push(json!({
-                "name": meta.name,
-                "description": meta.description,
-                "kind": "command",
-                "argument_hint": null,
-            }));
-        }
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::from_iter(
-            manox_agent::slash_builtins::BUILTIN_SLASH_COMMANDS
-                .iter()
-                .map(|m| m.name.to_string()),
-        );
-        if let Some(registry) = manox_agent::command::try_global() {
-            for (key, def) in registry.entries() {
-                if seen.contains(key.as_str()) {
-                    continue;
-                }
-                seen.insert(key.clone());
-                commands.push(json!({
-                    "name": key,
-                    "description": def.description,
-                    "kind": "command",
-                    "argument_hint": def.argument_hint,
-                }));
-            }
-        }
-        if let Some(registry) = manox_agent::skill::try_global() {
-            for (key, def) in registry.entries() {
-                if seen.contains(key.as_str()) {
-                    continue;
-                }
-                seen.insert(key.clone());
-                commands.push(json!({
-                    "name": key,
-                    "description": def.description,
-                    "kind": "skill",
-                    "argument_hint": null,
-                }));
-            }
-        }
-        json!(commands)
-    }
 }
 
 /// Open (or re-own) a live session: load its journal, insert the entry, and
@@ -1848,7 +1706,7 @@ impl AgentServerInner {
         let (model, approval, effort) = pred.read(|t| {
             (
                 t.model()
-                    .map(|m| manox_protocol::ModelRef::new(format!("{}/{}", m.provider, m.id))),
+                    .map(|m| manox_journal::ModelRef::new(format!("{}/{}", m.provider, m.id))),
                 t.permission_mode().wire().to_string(),
                 match t.reasoning_effort() {
                     manox_agent::language_model::ReasoningEffort::High => "high",
@@ -2285,39 +2143,6 @@ fn parse_slash(text: &str) -> Option<(String, String)> {
     let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
     let name = name.trim();
     (!name.is_empty()).then(|| (name.to_string(), args.trim_start().to_string()))
-}
-
-fn deduped_models(models: Vec<manox_harness::types::Model>) -> Vec<manox_harness::types::Model> {
-    let mut seen = std::collections::HashSet::new();
-    models
-        .into_iter()
-        .filter(|m| seen.insert((m.provider.clone(), m.id.clone())))
-        .collect()
-}
-
-fn model_to_wire(model: &manox_harness::types::Model) -> ModelInfo {
-    ModelInfo {
-        id: model.id.clone(),
-        name: manox_agent::provider_glue::display_name(model),
-        provider: model.provider.clone(),
-        provider_name: Some(manox_agent::provider_glue::display_provider_name(model)),
-        api: model.api.clone(),
-        context_window: model.context_window as u32,
-        max_tokens: Some(model.max_tokens as u32),
-        // U2 cross-domain #4: the config key + agents visibility — the
-        // external-CLI launch cascade's columns (config_id falls back to
-        // the model id; empty/absent agents = visible to all).
-        config_id: Some(manox_agent::provider_glue::config_id(model)),
-        agents: model
-            .metadata
-            .get("agents")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            }),
-    }
 }
 
 #[cfg(test)]

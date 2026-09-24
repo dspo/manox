@@ -12,8 +12,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi4"] }
 napi-derive = "2"
-manox-protocol.workspace = true
+manox-ahp.workspace = true
+manox-ahp-runtime.workspace = true
 manox-session-core.workspace = true
+ahp-types.workspace = true
+async-channel.workspace = true
 # The workspace root declares manox-agent / manox-session-core with
 # default-features = false so the CHOICE lives at each consumer edge; this
 # crate re-exposes every subsystem as a passthrough feature below. Plain
@@ -29,8 +32,7 @@ napi-build = "2"
 # that want a lean addon (the VS Code extension: no MCP, no LSP, no terminal
 # stack, no WS gateway) build with --no-default-features and re-enable only
 # what they need.
-default = ["lsp", "mcp", "terminal", "ws-gateway"]
+default = ["lsp", "mcp", "terminal"]
 mcp = ["manox-agent/mcp"]
 lsp = ["manox-agent/lsp"]
 terminal = ["manox-session-core/terminal"]
-ws-gateway = ["manox-session-core/ws-gateway"]
