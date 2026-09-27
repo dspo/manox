@@ -236,8 +236,13 @@ pub trait SessionRuntime: Send + Sync + 'static {
         approved: bool,
     ) -> Result<(), RuntimeError>;
 
-    /// Settle a question card.
-    fn answer_question(&self, session_id: &str, request_id: &str) -> Result<(), RuntimeError>;
+    /// Settle a question card with the answers the client submitted.
+    fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: Vec<manox_agent::permission::AskAnswer>,
+    ) -> Result<(), RuntimeError>;
 
     /// The session's live journal feed, when the runtime drives it.
     ///

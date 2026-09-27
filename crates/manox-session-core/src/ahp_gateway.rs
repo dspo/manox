@@ -357,13 +357,18 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn answer_question(&self, session_id: &str, request_id: &str) -> Result<(), RuntimeError> {
+    fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        answers: Vec<manox_agent::permission::AskAnswer>,
+    ) -> Result<(), RuntimeError> {
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| {
                     t.respond_question(
                         request_id,
-                        manox_agent::questions::AskOutcome::Answered(Vec::new()),
+                        manox_agent::questions::AskOutcome::Answered(answers),
                     )
                 });
                 Ok(())
