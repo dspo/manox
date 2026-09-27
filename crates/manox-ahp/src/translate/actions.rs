@@ -60,13 +60,14 @@ use ahp_types::actions::{
 };
 use ahp_types::common::{JsonObject, StringOrMarkdown, Uri};
 use ahp_types::state::{
-    ChatInputRequest, ChatInputResponseKind, ChatState, ConfirmationOption, ConfirmationOptionKind,
-    ErrorInfo, ErrorResponsePart, MarkdownResponsePart, Message, MessageAttachment,
-    MessageEmbeddedResourceAttachment, MessageKind, MessageOrigin, PendingMessageKind,
-    ReasoningResponsePart, ResponsePart, SessionInputRequest, SessionToolConfirmationRequest,
-    SystemNotificationResponsePart, ToolCallCancellationReason, ToolCallConfirmationReason,
-    ToolCallConfirmationState, ToolCallPendingConfirmationState, ToolCallResult, ToolCallState,
-    ToolResultContent, ToolResultTextContent, UsageInfo,
+    ChatInputMultiSelectQuestion, ChatInputOption, ChatInputQuestion, ChatInputRequest,
+    ChatInputResponseKind, ChatInputSingleSelectQuestion, ChatInputTextQuestion, ChatState,
+    ConfirmationOption, ConfirmationOptionKind, ErrorInfo, ErrorResponsePart, MarkdownResponsePart,
+    Message, MessageAttachment, MessageEmbeddedResourceAttachment, MessageKind, MessageOrigin,
+    PendingMessageKind, ReasoningResponsePart, ResponsePart, SessionInputRequest,
+    SessionToolConfirmationRequest, SystemNotificationResponsePart, ToolCallCancellationReason,
+    ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
+    ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
 use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload};
 use serde_json::{Value, json};
@@ -283,6 +284,9 @@ pub struct Translator {
     /// Directories already granted, so repeated `cwdChange` rows for the same path
     /// do not re-publish membership.
     granted: Vec<Uri>,
+    /// The open plan-review card's request id, so the `resolved` edge (which
+    /// carries no proposal id) can close the very part the proposal opened.
+    plan_review: Option<String>,
 }
 
 /// One transcript row's decoded fields.
@@ -305,6 +309,76 @@ struct AskRow<'a> {
     tool_name: Option<&'a str>,
     verdict: Option<&'a str>,
     reason: Option<&'a str>,
+    input: Option<&'a serde_json::Value>,
+}
+
+/// Map one AskUserQuestion's durable `{questions: [...]}` input onto AHP's
+/// elicitation question list. A question with options becomes single/multi
+/// select (free text still allowed); an option-less question is free text.
+fn map_ask_questions(input: &serde_json::Value) -> Option<Vec<ChatInputQuestion>> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut out = Vec::with_capacity(questions.len());
+    for (idx, q) in questions.iter().enumerate() {
+        let message = q.get("question")?.as_str()?.to_string();
+        let title = q.get("header").and_then(|v| v.as_str()).map(str::to_string);
+        let id = q
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{idx}"));
+        let multi = q
+            .get("multiSelect")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let options = q.get("options").and_then(|v| v.as_array()).map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    let label = o.get("label")?.as_str()?.to_string();
+                    Some(ChatInputOption {
+                        id: label.clone(),
+                        label: label.clone(),
+                        description: o
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
+                        recommended: o.get("recommended").and_then(|v| v.as_bool()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let question = match options {
+            Some(opts) if multi => ChatInputQuestion::MultiSelect(ChatInputMultiSelectQuestion {
+                id,
+                title,
+                message,
+                required: None,
+                options: opts,
+                allow_freeform_input: Some(true),
+                min: None,
+                max: None,
+            }),
+            Some(opts) => ChatInputQuestion::SingleSelect(ChatInputSingleSelectQuestion {
+                id,
+                title,
+                message,
+                required: None,
+                options: opts,
+                allow_freeform_input: Some(true),
+            }),
+            None => ChatInputQuestion::Text(ChatInputTextQuestion {
+                id,
+                title,
+                message,
+                required: None,
+                format: None,
+                min: None,
+                max: None,
+                default_value: None,
+            }),
+        };
+        out.push(question);
+    }
+    Some(out)
 }
 
 impl Translator {
@@ -324,6 +398,7 @@ impl Translator {
         self.open = None;
         self.pending_user.clear();
         self.granted.clear();
+        self.plan_review = None;
         let Some(active) = &chat.active_turn else {
             return;
         };
@@ -547,6 +622,7 @@ impl Translator {
                 tool_name,
                 verdict,
                 reason,
+                input,
                 ..
             } => self.on_question(
                 &chat,
@@ -557,6 +633,7 @@ impl Translator {
                     tool_name: tool_name.as_deref(),
                     verdict: verdict.as_deref(),
                     reason: reason.as_deref(),
+                    input: input.as_ref(),
                 },
                 &mut out,
             ),
@@ -679,16 +756,41 @@ impl Translator {
                 &at,
                 extension_action(ext::actions::PLAN_CHANGED, json!({"snapshot": snapshot})),
             )),
-            JournalWireEvent::PlanReview { state, plan_file } => {
+            JournalWireEvent::PlanReview {
+                state,
+                plan_file,
+                title,
+                content,
+            } => {
                 // The review's two edges: a verdict is owed, or one landed.
-                let name = match state.as_str() {
-                    "resolved" => ext::actions::PLAN_VERDICT,
-                    _ => ext::actions::PLAN_VERDICT_REQUESTED,
-                };
-                out.push(Emitted::new(
-                    &at,
-                    extension_action(name, json!({"state": state, "planFile": plan_file})),
-                ));
+                // The proposal opens VS Code's native plan-review card (a
+                // `chat/inputRequested` whose request carries the `planReview`
+                // block); the resolution closes that same part by its request
+                // id, so no separate `x-manox-plan` verdict card is needed.
+                if state == "resolved" {
+                    if let Some(request_id) = self.plan_review.take() {
+                        out.push(Emitted::new(
+                            &chat,
+                            StateAction::ChatInputCompleted(ChatInputCompletedAction {
+                                request_id,
+                                response: ChatInputResponseKind::Accept,
+                                answers: None,
+                            }),
+                        ));
+                    }
+                } else {
+                    let request_id = plan_review_request_id(&entry.id);
+                    self.plan_review = Some(request_id.clone());
+                    out.push(Emitted::new(
+                        &chat,
+                        plan_review_requested(
+                            &request_id,
+                            plan_file.as_deref(),
+                            title.as_deref(),
+                            content.as_deref(),
+                        ),
+                    ));
+                }
             }
             // ── work ─────────────────────────────────────────────────────
             JournalWireEvent::Goal { goal } => out.push(Emitted::new(
@@ -1294,6 +1396,7 @@ impl Translator {
             tool_name,
             verdict,
             reason,
+            input,
         } = ask;
         match kind {
             "request" => {
@@ -1308,11 +1411,12 @@ impl Translator {
                             id: auth_id.to_string(),
                             message: Some(message),
                             url: None,
-                            // The structured questions are not part of the durable
-                            // row (§C.2 carries the request/decision pair only), so
-                            // the fold shows the ask and its answer; the runtime
-                            // serves the payload on the host→client leg.
-                            questions: None,
+                            // The structured questions ride the durable row's
+                            // `input` payload (`{questions: [...]}`) and are folded
+                            // into the elicitation's question list here; an older
+                            // journal row without the payload still answers with
+                            // the bare ask.
+                            questions: input.and_then(map_ask_questions),
                             answers: None,
                         },
                     }),
@@ -1508,6 +1612,18 @@ impl Translator {
             }),
         ));
         self.open = Some(OpenTurn::new(id, entry.timestamp.clone(), true));
+    }
+
+    /// Resume the turn bookkeeping for a turn the client already opened, without
+    /// publishing a `turnStarted`: the client's own dispatch already set the
+    /// active turn, and a synthetic `turnStarted` would replace it (the reducer
+    /// overwrites `active_turn` unconditionally), severing the id the streamed
+    /// parts must address.
+    pub fn open_with_id(&mut self, id: String, started_at: String) {
+        if self.open.is_some() {
+            return;
+        }
+        self.open = Some(OpenTurn::new(id, started_at, false));
     }
 
     /// Announce a call the wire has not seen, so a later action has a part to move.
@@ -1775,6 +1891,68 @@ fn confirmation_prompt(title: &str, tool_name: &str) -> String {
     format!("{subject} — awaiting confirmation")
 }
 
+/// The deterministic request id for a plan-review card: the proposal journal
+/// entry's id, namespaced so the runtime can tell a plan verdict apart from an
+/// `AskUserQuestion` answer on the `chat/inputCompleted` path. The translator
+/// (which mints it) and the runtime (which resolves it) share this shape.
+pub fn plan_review_request_id(entry_id: &str) -> String {
+    format!("plan-review:{entry_id}")
+}
+
+/// The `chat/inputRequested` action that surfaces VS Code's native plan-review
+/// card. AHP's `ChatInputRequest` has no `planReview` field, so the action is
+/// built as raw JSON (`StateAction::Unknown`) rather than the typed variant —
+/// the upstream reducer does not fold it into the store, but the broadcast
+/// reaches the client verbatim, which is all the card needs.
+fn plan_review_requested(
+    request_id: &str,
+    plan_file: Option<&str>,
+    title: Option<&str>,
+    content: Option<&str>,
+) -> StateAction {
+    let question_id = format!("{request_id}:q");
+    let title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("Review Plan");
+    let content = content
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or("A plan is ready for review.");
+    let mut plan_review = json!({
+        "title": title,
+        "content": content,
+        "actions": [
+            { "id": "approve", "label": "Approve", "default": true },
+            { "id": "refine", "label": "Refine" },
+        ],
+        "canProvideFeedback": true,
+        "answerQuestionId": question_id,
+    });
+    if let Some(plan_file) = plan_file {
+        plan_review["planUri"] = json!(file_uri(plan_file));
+    }
+    let request = json!({
+        "id": request_id,
+        "planReview": plan_review,
+        "questions": [{
+            "kind": "single-select",
+            "id": question_id,
+            "title": title,
+            "message": "How would you like to proceed?",
+            "required": true,
+            "options": [
+                { "id": "approve", "label": "Approve", "recommended": true },
+                { "id": "refine", "label": "Refine" },
+            ],
+            "allowFreeformInput": true,
+        }],
+        "_meta": { "purpose": "planReview" },
+    });
+    StateAction::Unknown(json!({
+        "type": "chat/inputRequested",
+        "request": request,
+    }))
+}
+
 /// `{"x-manox": value}` — the one private metadata seat this crate writes.
 fn manox_meta(value: Value) -> JsonObject {
     let mut meta = JsonObject::new();
@@ -1943,4 +2121,85 @@ fn elapsed_ms(start: &str, end: &str) -> i64 {
 /// A journal token counter onto AHP's `i64` fields.
 fn whole(count: u64) -> Option<i64> {
     i64::try_from(count).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, event: JournalWireEvent) -> JournalWireEntry {
+        JournalWireEntry {
+            seq: 0,
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: "2026-09-27T00:00:00.000Z".to_string(),
+            event,
+        }
+    }
+
+    #[test]
+    fn plan_review_proposal_surfaces_the_vs_code_card() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-1",
+                JournalWireEvent::PlanReview {
+                    state: "proposed".into(),
+                    plan_file: Some("/plans/demo-plan.md".into()),
+                    title: Some("Demo plan".into()),
+                    content: Some("# Demo\n\n- step one".into()),
+                },
+            ),
+        );
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].channel, "ahp-chat:/c-1");
+        let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(value["type"], "chat/inputRequested");
+        let request = &value["request"];
+        assert_eq!(request["id"], "plan-review:e-1");
+        assert_eq!(request["planReview"]["title"], "Demo plan");
+        assert_eq!(request["planReview"]["actions"][0]["id"], "approve");
+        assert_eq!(
+            request["planReview"]["answerQuestionId"],
+            "plan-review:e-1:q"
+        );
+        assert_eq!(request["_meta"]["purpose"], "planReview");
+    }
+
+    #[test]
+    fn plan_review_resolution_closes_the_card() {
+        let mut translator = Translator::new();
+        translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-1",
+                JournalWireEvent::PlanReview {
+                    state: "proposed".into(),
+                    plan_file: Some("/p.md".into()),
+                    title: Some("T".into()),
+                    content: Some("# T".into()),
+                },
+            ),
+        );
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-2",
+                JournalWireEvent::PlanReview {
+                    state: "resolved".into(),
+                    plan_file: None,
+                    title: None,
+                    content: None,
+                },
+            ),
+        );
+        assert_eq!(emitted.len(), 1);
+        let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(value["type"], "chat/inputCompleted");
+        assert_eq!(value["requestId"], "plan-review:e-1");
+    }
 }

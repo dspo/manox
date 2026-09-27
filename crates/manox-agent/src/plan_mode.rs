@@ -467,6 +467,7 @@ impl AgentTool for ProposePlanTool {
             .send(BackendNotice::Event(Box::new(ThreadEvent::PlanReady {
                 plan_file: plan_file.clone(),
                 title: title.clone(),
+                content: content.clone(),
             })));
         Ok(AgentToolResult {
             content: vec![manox_harness::types::ContentBlock::Text {

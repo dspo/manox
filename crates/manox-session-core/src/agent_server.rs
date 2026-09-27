@@ -181,6 +181,32 @@ pub(crate) struct AgentServerInner {
     /// EmbedderToolProvider below each time the engine assembles a
     /// session's tools.
     embedder_tools: Mutex<HashMap<String, HashMap<String, Vec<ClientToolSpec>>>>,
+    /// Spawned team-member threads, indexed by thread id. This is the strong
+    /// holder that keeps a Steer-spawned member alive after the facade round
+    /// trip returns, and the lookup the `InjectMember`/`AbortMember` ops
+    /// resolve against (`ThreadRegistry`).
+    members: Mutex<HashMap<String, ThreadHandle>>,
+}
+
+/// Steer's process-wide team-member registry. The gateway holds the strong
+/// `ThreadHandle`s, so a spawned member outlives the facade round trip and
+/// resolves against `InjectMember`/`AbortMember`.
+impl manox_agent::thread::ThreadRegistry for AgentServerInner {
+    fn register(&self, id: &str, handle: &ThreadHandle) {
+        self.members.lock().insert(id.to_string(), handle.clone());
+    }
+
+    fn lookup(&self, id: &str) -> Option<ThreadHandle> {
+        self.members.lock().get(id).cloned()
+    }
+
+    fn refresh(&self) {
+        // Strong references mean nothing is ever stale to prune.
+    }
+
+    fn unregister(&self, id: &str) {
+        self.members.lock().remove(id);
+    }
 }
 
 impl AgentServerInner {
@@ -513,7 +539,13 @@ impl AgentServer {
             #[cfg(feature = "terminal")]
             terminals: Mutex::new(HashMap::new()),
             embedder_tools: Mutex::new(HashMap::new()),
+            members: Mutex::new(HashMap::new()),
         });
+        // Steer's team-member registry: the AgentServer owns the live threads,
+        // so it is the process-wide `ThreadRegistry`. First-wins, matching the
+        // process-singleton gateway.
+        let registry = Arc::clone(&inner) as Arc<dyn manox_agent::thread::ThreadRegistry>;
+        let _ = manox_agent::thread::set_thread_registry(registry);
         // U2 cross-domain #2 (§D.5 Models: pushed immediately on provider reload): a
         // provider reload broadcasts the fresh snapshot to every
         // connection. Weak, so a dropped server leaves an inert listener;
@@ -1406,6 +1438,13 @@ impl AgentServerInner {
             self.archive_thread(owner, session_id, true);
             return receipt(true, None);
         }
+        // A cold session (subscribed but never submitted) has seeded state but
+        // no live engine in the sessions table: open it first. `open_session`
+        // answers not-found for a genuinely unknown id, so this only widens the
+        // cold path, not the unknown one.
+        if !self.sessions.lock().contains_key(session_id) {
+            open_session(self, owner, session_id).await?;
+        }
         let Some(session) = self.sessions.lock().get(session_id).map(|s| {
             (
                 s.thread.clone(),
@@ -1962,6 +2001,10 @@ impl AgentServerInner {
                 author: Some(manox_agent::MessageAuthor::Harness),
                 ..Default::default()
             };
+            // The verdict is now landed: clear the pending review so a
+            // restarted session does not re-surface a card the user already
+            // answered (the `resolved` plan_review edge journals here).
+            t.set_plan_review_pending(false);
             t.seed_plan_execution(plan_file, seed_text, Some(ui));
         });
         Ok(())

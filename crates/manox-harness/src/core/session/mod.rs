@@ -194,6 +194,10 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         state: String,
         plan_file: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
     },
     /// A persisted UI note card (was the fire-and-forget AppendUiNote).
     #[serde(rename = "ui_note", rename_all = "camelCase")]

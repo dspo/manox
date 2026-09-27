@@ -577,12 +577,28 @@ fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde_json::Valu
                 "data": serde_json::to_value(metric).unwrap_or(serde_json::Value::Null),
             }),
         ),
+        // The plan-review edge is journal-first (§C.2): the review card's
+        // durable authority is the `plan_review` row (replay + the AHP
+        // translation both fold from it), so the proposal itself must journal
+        // here rather than ride a sidecar that replay would forget.
+        ThreadEvent::PlanReady {
+            plan_file,
+            title,
+            content,
+        } => (
+            "plan_review".into(),
+            json!({
+                "state": "proposed",
+                "planFile": plan_file,
+                "title": title,
+                "content": content,
+            }),
+        ),
         // Already durable through their owning flows / not journaled.
         ThreadEvent::ModelChanged { .. }
         | ThreadEvent::ReasoningEffortChanged { .. }
         | ThreadEvent::CwdChanged { .. }
         | ThreadEvent::Compaction { .. }
-        | ThreadEvent::PlanReady { .. }
         | ThreadEvent::HistoryProgress
         | ThreadEvent::HistoryRestored
         | ThreadEvent::SteerInjected { .. }
@@ -1804,7 +1820,7 @@ fn build_tools(
             {
                 wrapper = wrapper.with_auto_allow(Arc::clone(allow));
             }
-            if matches!(name.as_str(), "Write" | "Edit") {
+            if matches!(name.as_str(), "Write" | "Edit" | "TaskStop") {
                 wrapper = wrapper.with_escalation(
                     Arc::clone(&escalation_approver),
                     Arc::clone(&standing_resolver),
@@ -1889,7 +1905,11 @@ fn build_tools(
     ] {
         tools.push(Arc::new(
             ApprovalGatedTool::new(tool, Arc::clone(gate))
-                .with_plan_policy(Arc::clone(&plan_policy)),
+                .with_plan_policy(Arc::clone(&plan_policy))
+                .with_escalation(
+                    Arc::clone(&escalation_approver),
+                    Arc::clone(&standing_resolver),
+                ),
         ));
     }
     // ChromeUse (real Chrome via the in-process rustwright CDP engine): same
@@ -7048,6 +7068,11 @@ mod tests {
                     explanation: None,
                     steps: vec![],
                 },
+            },
+            ThreadEvent::PlanReady {
+                plan_file: "/plans/demo-plan.md".into(),
+                title: "Demo plan".into(),
+                content: "# Demo\n\n- step".into(),
             },
             ThreadEvent::GoalChanged { goal: None },
             ThreadEvent::TitleChanged { title: "t".into() },

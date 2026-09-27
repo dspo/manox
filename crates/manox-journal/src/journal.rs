@@ -223,10 +223,15 @@ pub enum JournalWireEvent {
     /// `state` = "proposed" (the review card is due) | "resolved" (a verdict
     /// landed, so it clears; the verdict discriminant rides the notice plane).
     /// `plan_file` names the reviewed plan (forensics; always serialized, null
-    /// when unknown).
+    /// when unknown). `title`/`content` ride the proposed edge so the review
+    /// card renders from the journal alone, without a file read at fold time.
     PlanReview {
         state: String,
         plan_file: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
     },
     /// Goal set / cleared (`None` = cleared).
     Goal { goal: Option<serde_json::Value> },
@@ -255,6 +260,9 @@ pub enum JournalWireEvent {
         tool_call_id: Option<String>,
         verdict: Option<String>,
         reason: Option<String>,
+        /// The full ask input (`{questions: [...]}`) when this is a request;
+        /// absent on the decision half.
+        input: Option<serde_json::Value>,
     },
     /// Pinned / archived flags changed.
     PinnedArchived { pinned: bool, archived: bool },

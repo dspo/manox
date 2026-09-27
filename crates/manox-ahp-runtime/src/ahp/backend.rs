@@ -72,6 +72,10 @@ pub struct RuntimeBackend {
     host: OnceLock<Weak<manox_ahp::Host>>,
     seeds: Mutex<HashMap<String, Arc<Seeded>>>,
     bridges: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// The plan file each open review card names, keyed by its request id. The
+    /// card's `chat/inputCompleted` carries only the request id and the verdict,
+    /// so the approve path recovers the file from here.
+    plan_reviews: Mutex<HashMap<String, String>>,
     /// The bridge task needs an `Arc` of this backend while the host holds only
     /// `&self` through the trait, so the backend keeps a weak handle to itself.
     me: OnceLock<Weak<RuntimeBackend>>,
@@ -91,6 +95,7 @@ impl RuntimeBackend {
             host: OnceLock::new(),
             seeds: Mutex::new(HashMap::new()),
             bridges: Mutex::new(HashMap::new()),
+            plan_reviews: Mutex::new(HashMap::new()),
             me: OnceLock::new(),
             resources,
             #[cfg(feature = "terminal")]
@@ -222,6 +227,41 @@ impl RuntimeBackend {
                     let Some(entry) = crate::translate::wire_entry(event.seq, &event.entry) else {
                         continue;
                     };
+                    // The client's own `turnStarted` dispatch already expressed the
+                    // user row and the turn boundary: re-folding them would publish a
+                    // second `pendingMessageSet` and a second `turnStarted`, and the
+                    // reducer overwrites `active_turn` unconditionally, orphaning the
+                    // streamed parts. Skip both; the parts that follow address the
+                    // client's turn id.
+                    if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
+                        || matches!(&entry.event, JournalWireEvent::TurnStart)
+                    {
+                        continue;
+                    }
+                    // Track the plan file behind each review card so the approve
+                    // path (which arrives as a bare `chat/inputCompleted`) can
+                    // recover it without re-reading the thread.
+                    if let JournalWireEvent::PlanReview {
+                        state, plan_file, ..
+                    } = &entry.event
+                    {
+                        let request_id = manox_ahp::translate::plan_review_request_id(&entry.id);
+                        if state == "resolved" {
+                            self.plan_reviews.lock().remove(&request_id);
+                        } else if let Some(plan_file) = plan_file {
+                            self.plan_reviews
+                                .lock()
+                                .insert(request_id, plan_file.clone());
+                        }
+                    }
+                    // Resume the turn bookkeeping against the active turn the client
+                    // opened, so streamed parts carry its id (and never publish a
+                    // synthetic `turnStarted` that would replace it).
+                    if let Some(state) = host.chat_state(&session_id) {
+                        if let Some(active) = &state.active_turn {
+                            translator.open_with_id(active.id.clone(), active.started_at.clone());
+                        }
+                    }
                     let thread_id = self
                         .seeds
                         .lock()
@@ -483,16 +523,48 @@ impl RuntimeBackend {
     ///
     /// AHP's elicitation plane answers by request id, which is the same
     /// `authId` the translator surfaced the card under, so the two protocols
-    /// name one identity.
-    fn answer_question(&self, channel: &str, request_id: &str) -> DispatchOutcome {
+    /// name one identity. The client's answers ride the completed card and are
+    /// mapped here onto the kernel's `AskAnswer` list.
+    fn answer_question(
+        &self,
+        channel: &str,
+        request_id: &str,
+        answers: Vec<manox_agent::permission::AskAnswer>,
+    ) -> DispatchOutcome {
         let Some(session_id) = chat::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
-        // The answers themselves are not carried here: AHP's `inputCompleted` is
-        // dispatched with the completed card's answers already on the part, and
-        // the kernel reads them from the same parked card. Completing the card
-        // is what the runtime is asked for.
-        match self.server.answer_question(session_id, request_id) {
+        match self.server.answer_question(session_id, request_id, answers) {
+            Ok(()) => DispatchOutcome::Accepted,
+            Err(error) => DispatchOutcome::Rejected(error.message),
+        }
+    }
+
+    /// Resolve a plan-review verdict (a `chat/inputCompleted` against a
+    /// `plan-review:` card). Approve seeds plan execution; any other answer is
+    /// the refine path — plan mode stays active and the user's next message
+    /// carries the feedback.
+    fn resolve_plan_review(
+        &self,
+        channel: &str,
+        completed: &ahp_types::actions::ChatInputCompletedAction,
+    ) -> DispatchOutcome {
+        let Some(session_id) = chat::id(channel) else {
+            return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+        };
+        let approved = map_answers(&completed.answers)
+            .iter()
+            .any(|a| a.selected.iter().any(|s| s == "approve"));
+        if !approved {
+            return DispatchOutcome::Accepted;
+        }
+        let plan_file = self.plan_reviews.lock().get(&completed.request_id).cloned();
+        let Some(plan_file) = plan_file else {
+            return DispatchOutcome::Rejected(
+                "plan review answered without a known plan file".to_string(),
+            );
+        };
+        match self.server.plan_seed(session_id, &plan_file) {
             Ok(()) => DispatchOutcome::Accepted,
             Err(error) => DispatchOutcome::Rejected(error.message),
         }
@@ -697,8 +769,8 @@ fn summary_from_row(
         working_directories: directories,
         annotations: None,
         resource: session::uri(&row.id),
-        created_at: String::new(),
-        modified_at: String::new(),
+        created_at: unix_to_rfc3339(row.created_at),
+        modified_at: unix_to_rfc3339(row.updated_at),
         changes: None,
         meta: None,
     }
@@ -980,8 +1052,12 @@ impl Backend for RuntimeBackend {
                 match self.server.submit(&owner, &target, text) {
                     Ok(_) => {
                         // A submit materializes the engine, so a session that was
-                        // cold when the client subscribed has no bridge yet.
+                        // cold when the client subscribed has no bridge yet: the
+                        // first `seeded` ran before the engine existed and its
+                        // `ensure_bridge` bailed. Re-seed (cached) and start the
+                        // bridge now that the engine is live.
                         let _ = block_on(self.seeded(&session_id));
+                        self.ensure_bridge(&session_id);
                         DispatchOutcome::Accepted
                     }
                     Err(error) => DispatchOutcome::Rejected(error.message),
@@ -1047,7 +1123,15 @@ impl Backend for RuntimeBackend {
                 confirmed.approved,
             ),
             StateAction::ChatInputCompleted(completed) => {
-                self.answer_question(channel, &completed.request_id)
+                if completed.request_id.starts_with("plan-review:") {
+                    self.resolve_plan_review(channel, &completed)
+                } else {
+                    self.answer_question(
+                        channel,
+                        &completed.request_id,
+                        map_answers(&completed.answers),
+                    )
+                }
             }
             // ── session actions ────────────────────────────────────────────
             StateAction::SessionConfigChanged(changed) => {
@@ -1414,4 +1498,73 @@ pub(crate) fn is_journal_event(event: &JournalWireEvent) -> bool {
 #[allow(dead_code)]
 pub(crate) fn cwd_of(backend: &RuntimeBackend) -> &std::path::Path {
     &backend.cwd
+}
+
+/// Map AHP's completed-card answers onto the kernel's `AskAnswer` list.
+///
+/// A select answer carries its label; a selected-many answer its labels; a
+/// text/number/boolean answer becomes free-form `custom`. A skipped question
+/// contributes nothing (it was not answered).
+fn map_answers(
+    answers: &Option<std::collections::HashMap<String, ahp_types::state::ChatInputAnswer>>,
+) -> Vec<manox_agent::permission::AskAnswer> {
+    let Some(answers) = answers else {
+        return Vec::new();
+    };
+    answers
+        .iter()
+        .filter_map(|(id, answer)| {
+            let value = match answer {
+                ahp_types::state::ChatInputAnswer::Draft(a)
+                | ahp_types::state::ChatInputAnswer::Submitted(a) => &a.value,
+                ahp_types::state::ChatInputAnswer::Skipped(_) => return None,
+            };
+            match value {
+                ahp_types::state::ChatInputAnswerValue::Selected(v) => {
+                    Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: vec![v.value.clone()],
+                        custom: v.freeform_values.as_ref().and_then(|f| f.first().cloned()),
+                    })
+                }
+                ahp_types::state::ChatInputAnswerValue::SelectedMany(v) => {
+                    Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: v.value.clone(),
+                        custom: v.freeform_values.as_ref().and_then(|f| f.first().cloned()),
+                    })
+                }
+                ahp_types::state::ChatInputAnswerValue::Text(v) => {
+                    Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: Vec::new(),
+                        custom: Some(v.value.clone()),
+                    })
+                }
+                ahp_types::state::ChatInputAnswerValue::Number(v) => {
+                    Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: Vec::new(),
+                        custom: Some(v.value.to_string()),
+                    })
+                }
+                ahp_types::state::ChatInputAnswerValue::Boolean(v) => {
+                    Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: Vec::new(),
+                        custom: Some(v.value.to_string()),
+                    })
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// A store timestamp (Unix seconds) as RFC 3339, or empty when out of range.
+fn unix_to_rfc3339(secs: i64) -> String {
+    chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, 0)
+        .single()
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_default()
 }

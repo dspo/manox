@@ -17,7 +17,7 @@
 
 pub mod actions;
 
-pub use actions::{Emitted, Translator, config_keys};
+pub use actions::{Emitted, Translator, config_keys, plan_review_request_id};
 
 use manox_journal::JournalWireEvent;
 
@@ -28,7 +28,7 @@ pub enum Target {
     Chat,
     /// `ahp-session:/<id>` — title, working directories, config, catalog.
     Session,
-    /// `x-manox-plan:/<chat-id>` — plan mode, plan document, plan review.
+    /// `x-manox-plan:/<chat-id>` — plan mode, plan document.
     Plan,
     /// `x-manox-work:/<session-id>` — goal, background work, sub-agents, suites.
     Work,
@@ -83,17 +83,15 @@ pub fn target_of(event: &JournalWireEvent) -> Target {
         | E::SessionInfo { .. }
         | E::Leaf { .. } => Target::Session,
         // ── plan ─────────────────────────────────────────────────────
-        E::PlanModeChange { .. }
-        | E::PlanModeRequest { .. }
-        | E::PlanUpdate { .. }
-        | E::PlanReview { .. } => Target::Plan,
+        E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
         // ── extension work surface ───────────────────────────────────
         E::Goal { .. }
         | E::BrowserSuites { .. }
         | E::BackgroundTask { .. }
         | E::ActiveToolsChange { .. } => Target::Work,
-        // ── approvals / questions ride the chat's tool-call + input state ──
-        E::Approval { .. } | E::Question { .. } => Target::Chat,
+        // ── approvals / questions / plan review ride the chat's tool-call +
+        //    input state (the plan-review card is a `chat/inputRequested`) ──
+        E::Approval { .. } | E::Question { .. } | E::PlanReview { .. } => Target::Chat,
         // ── compaction and branch summaries surface in the transcript ──
         E::Compaction { .. } | E::CompactionStarted { .. } | E::BranchSummary { .. } => {
             Target::Chat
@@ -142,6 +140,15 @@ mod tests {
             (
                 JournalWireEvent::PlanModeChange { enabled: true },
                 Target::Plan,
+            ),
+            (
+                JournalWireEvent::PlanReview {
+                    state: "proposed".into(),
+                    plan_file: Some("/p.md".into()),
+                    title: Some("T".into()),
+                    content: Some("# T".into()),
+                },
+                Target::Chat,
             ),
             (
                 JournalWireEvent::Title { title: "t".into() },

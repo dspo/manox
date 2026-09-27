@@ -198,10 +198,16 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
             snapshot: snapshot.clone(),
         },
         SessionTreeEntry::PlanReview {
-            state, plan_file, ..
+            state,
+            plan_file,
+            title,
+            content,
+            ..
         } => W::PlanReview {
             state: state.clone(),
             plan_file: plan_file.clone(),
+            title: title.clone(),
+            content: content.clone(),
         },
         SessionTreeEntry::Goal { goal, .. } => W::Goal { goal: goal.clone() },
         SessionTreeEntry::Title { title, .. } => W::Title {
@@ -262,6 +268,7 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
                 .get("reason")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            input: payload.get("input").cloned(),
         },
         SessionTreeEntry::PinnedArchived {
             pinned, archived, ..
