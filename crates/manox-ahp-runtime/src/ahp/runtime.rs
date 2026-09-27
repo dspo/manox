@@ -148,13 +148,22 @@ impl AhpRuntime {
     /// client end; the host end is accepted here.
     pub fn inproc(&self) -> InprocClientTransport {
         let (host_side, client_side) = manox_ahp::transport::inproc::pair();
-        self.host.accept(host_side);
+        self.accept(host_side);
         client_side
     }
 
     /// Accept an already-framed transport (the WebSocket route uses this).
+    ///
+    /// The host spawns its connection tasks with `tokio::spawn`, which needs a
+    /// reactor on the calling thread. The napi edge calls this from the Node
+    /// main thread (no runtime), so enter the global runtime there; callers
+    /// already on a runtime (axum, in-process hosts) pass straight through.
     pub fn accept(&self, transport: HostTransport) {
-        self.host.accept(transport);
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.host.accept(transport);
+        } else {
+            manox_agent::runtime::handle().block_on(async { self.host.accept(transport) });
+        }
     }
 
     /// The gateway router carrying `/ahp` alongside the v2 route.
