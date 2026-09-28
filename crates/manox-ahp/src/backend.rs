@@ -140,7 +140,7 @@ pub trait Backend: Send + Sync + 'static {
 
     /// Baselines for the stateless extension channels (`x-manox-plan:/…`).
     /// `None` means the runtime has nothing to say for that channel yet.
-    fn extension_baseline(&self, _channel: &str) -> Option<(String, Value)> {
+    fn extension_baseline(&self, _channel: &str) -> Option<Value> {
         None
     }
 

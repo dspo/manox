@@ -1733,7 +1733,7 @@ impl Backend for RuntimeBackend {
     /// A channel with no folded state still answers: an empty object is "this
     /// channel is served and currently has nothing", which is a different and
     /// actionable statement from silence.
-    fn extension_baseline(&self, channel: &str) -> Option<(String, Value)> {
+    fn extension_baseline(&self, channel: &str) -> Option<Value> {
         if !manox_ahp::ext::is_extension_channel(channel) {
             return None;
         }
@@ -1751,8 +1751,11 @@ impl Backend for RuntimeBackend {
                 Some(seeded) => seeded
                     .extensions
                     .get(channel)
-                    .map(|state| serde_json::to_value(state).unwrap_or(Value::Null))
-                    .unwrap_or(Value::Null),
+                    .map(|state| serde_json::to_value(state).unwrap_or_else(|_| Value::Null))
+                    // A declared channel with no rows yet answers its (empty)
+                    // state, not `null`: the client replaces what it holds,
+                    // and `null` would claim the channel says nothing at all.
+                    .unwrap_or_else(|| serde_json::json!({})),
                 // An unknown session is not a served channel: answering an
                 // empty baseline would claim state for a session that has none.
                 None => return None,
@@ -1760,10 +1763,7 @@ impl Backend for RuntimeBackend {
         } else {
             self.catalogue_baseline(channel)
         };
-        Some((
-            manox_ahp::ext::BASELINE_NOTIFICATION.to_string(),
-            serde_json::json!({ "channel": channel, "state": state }),
-        ))
+        Some(state)
     }
 
     fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {

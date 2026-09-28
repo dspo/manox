@@ -1581,10 +1581,9 @@ mod dispatch {
             let baseline = backend
                 .extension_baseline(&channel)
                 .unwrap_or_else(|| panic!("{channel} is declared and must answer"));
-            assert_eq!(baseline.0, manox_ahp::ext::BASELINE_NOTIFICATION);
-            assert_eq!(
-                baseline.1["channel"], channel,
-                "the baseline names the channel it describes"
+            assert!(
+                baseline.is_object(),
+                "the baseline carries the channel state for {channel}"
             );
         }
 
@@ -1619,7 +1618,7 @@ mod dispatch {
         let baseline = backend
             .extension_baseline(manox_ahp::ext::channels::COMMANDS)
             .expect("the command catalogue is declared and must answer");
-        let commands = baseline.1["state"]["commands"]
+        let commands = baseline["commands"]
             .as_array()
             .expect("the catalogue carries a commands array");
         assert!(
@@ -1687,12 +1686,11 @@ mod dispatch {
         let backend = manox_ahp_runtime::ahp::backend::RuntimeBackend::new(gateway, cwd);
 
         let channel = format!("{}{session_id}", manox_ahp::ext::channels::PLAN);
-        let (method, payload) = backend
+        let payload = backend
             .extension_baseline(&channel)
             .expect("the plan channel answers");
-        assert_eq!(method, manox_ahp::ext::BASELINE_NOTIFICATION);
         assert_eq!(
-            payload["state"]["planMode"], true,
+            payload["planMode"], true,
             "the baseline is the journal's fold, not an empty placeholder: {payload}"
         );
         uninstall();
