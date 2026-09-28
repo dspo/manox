@@ -494,16 +494,24 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
     );
 }
 
-/// The plan-review card reaches a subscribed client, verbatim.
+/// A plan proposal reaches a subscribed client — content and question alike.
 ///
-/// The card is the one place this host emits an action AHP's own reducers do
-/// not know (`StateAction::Unknown` is `OutOfScope` on every channel upstream),
-/// because `ChatInputRequest` has no `planReview` field in 0.9. So the card can
-/// only work by being broadcast and read verbatim, and the convergence gate
-/// cannot tell the difference: both ends fold it to nothing and agree. That
-/// makes this the one action whose delivery needs an assertion of its own.
+/// This is the one place the host emits an action AHP's own reducers do not know,
+/// because `ChatInputRequest` has no `planReview` field in 0.9. An earlier
+/// attempt put the whole card in a raw-JSON `chat/inputRequested`; it could not
+/// work. `StateAction::Unknown` is an untagged serde fallback, so any parse
+/// resolves the tag to the *typed* variant and drops the undeclared fields — and
+/// the SDK client parses every inbound action, so the plan block was stripped on
+/// arrival on both transports. The convergence gate cannot catch that (both ends
+/// fold the raw action to nothing and agree), which is why the delivery needs an
+/// assertion of its own.
+///
+/// The split asserted here is the fix: the plan's content rides the
+/// `x-manox-plan` channel, whose payload survives because it is a *declared*
+/// extension action rather than an unknown standard one, and the interactive
+/// half is a real typed `chat/inputRequested` the host folds into the turn.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_plan_review_card_reaches_a_subscribed_client() {
+async fn a_plan_proposal_reaches_a_subscribed_client() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
     let (host_side, client_side) = manox_ahp::transport::inproc::pair();
     host.accept(host_side);
@@ -520,9 +528,8 @@ async fn the_plan_review_card_reaches_a_subscribed_client() {
         .expect("initializes");
     let mut sub = client.attach_subscription(&TestBackend::chat_uri()).await;
 
-    // The proposal edge, as the runtime journals it.
     let mut translator = Translator::new();
-    let mut emitted_count = 0usize;
+    let mut published = 0usize;
     for (seq, event) in [
         TurnStart,
         PlanReview {
@@ -543,15 +550,16 @@ async fn the_plan_review_card_reaches_a_subscribed_client() {
             event,
         };
         for emitted in translator.on_entry("c-1", "s-1", &entry) {
-            emitted_count += 1;
+            published += 1;
             host.publish(&emitted.channel, emitted.action, None);
         }
     }
-    assert!(emitted_count > 0, "the proposal must emit something");
+    assert!(published > 0, "the proposal must emit something");
 
-    // What the client actually receives, unmodified.
+    // Only the chat channel is subscribed here, so this is the question the
+    // client is asked; the plan block is asserted through the host below.
     let mut card = None;
-    for _ in 0..emitted_count.max(1) {
+    for _ in 0..published {
         match tokio::time::timeout(Duration::from_secs(5), sub.recv()).await {
             Ok(Some(SubscriptionEvent::Action(envelope))) => {
                 let value = serde_json::to_value(&envelope.action).expect("serializes");
@@ -560,49 +568,53 @@ async fn the_plan_review_card_reaches_a_subscribed_client() {
                 }
             }
             Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) | Err(_) => break,
         }
     }
-
-    let card = card.expect("the plan-review card must reach a subscribed client");
-    let request = &card["request"];
-    // The in-process leg carries typed messages, so this asserts the action the
-    // translator built. The WS leg re-parses text, which is where the card's
-    // `planReview` block is lost — see the WS case below.
-    assert_eq!(request["id"], "plan-review:pentry-1");
-    assert_eq!(request["planReview"]["title"], "Demo plan");
-    assert_eq!(request["planReview"]["actions"][0]["id"], "approve");
-    assert_eq!(request["planReview"]["actions"][1]["id"], "refine");
-    assert_eq!(request["planReview"]["canProvideFeedback"], true);
-    assert!(
-        request["planReview"]["planUri"].as_str().is_some(),
-        "the card names the reviewed plan: {request}"
-    );
+    let card = card.expect("the plan question must reach a subscribed client");
     assert_eq!(
-        request["planReview"]["answerQuestionId"],
-        "plan-review:pentry-1:q"
+        card["request"]["id"], "plan-review:pentry-1",
+        "the question is addressed by the id the runtime resolves: {card}"
     );
-    assert_eq!(request["_meta"]["purpose"], "planReview");
-    let question = &request["questions"][0];
-    assert_eq!(question["kind"], "single-select");
-    assert_eq!(question["required"], true);
+    assert_eq!(card["request"]["questions"][0]["kind"], "single-select");
+    assert_eq!(
+        card["request"]["questions"][0]["options"][0]["id"],
+        "approve"
+    );
 
-    // …and the HOST must hold it too, or the card exists only as a one-shot
-    // broadcast: a client that reconnects and re-subscribes is seeded from this
-    // state, and upstream documents the request as durable and backfillable via
-    // `fetchTurns`. An action the reducer discards cannot be either.
-    let host_chat = host.chat_state("c-1").expect("host chat state");
-    let folded: Vec<&ahp_types::state::ResponsePart> = host_chat
-        .turns
-        .last()
-        .map(|turn| turn.response_parts.iter().collect())
-        .unwrap_or_default();
+    // The plan's content is on the extension channel, where the host folds it
+    // and a reconnecting client is backfilled from.
+    let plan = host
+        .extension_state("x-manox-plan:/c-1")
+        .expect("the plan channel holds the proposal");
+    let plan = serde_json::to_value(&plan).expect("state serializes");
+    let review = &plan["planReview"];
+    assert_eq!(review["title"], "Demo plan", "held state is {plan}");
+    assert_eq!(review["content"], "# Demo\n\n- step one");
+    assert_eq!(review["actions"][0]["id"], "approve");
+    assert_eq!(review["actions"][1]["id"], "refine");
+    assert_eq!(review["canProvideFeedback"], true);
     assert!(
-        folded
+        review["planUri"]
+            .as_str()
+            .is_some_and(|u| u.contains("demo-plan")),
+        "the block names the reviewed plan: {review}"
+    );
+
+    // …and the question is folded into the OPEN turn, not merely broadcast, so
+    // the client can answer it through `chat/inputCompleted` and a reconnect is
+    // backfilled from this state.
+    let folded = host.chat_state("c-1").expect("host chat state");
+    let active = folded
+        .active_turn
+        .as_ref()
+        .expect("the proposal arrives while a turn is open");
+    assert!(
+        active
+            .response_parts
             .iter()
-            .any(|part| matches!(part, ahp_types::state::ResponsePart::InputRequest(_))),
-        "the plan-review request must be folded into the turn, not only \
-         broadcast; the host holds {folded:?}"
+            .any(|part| matches!(part, ResponsePart::InputRequest(_))),
+        "the question must be folded into the turn: {:?}",
+        active.response_parts
     );
 }

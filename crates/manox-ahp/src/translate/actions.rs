@@ -781,14 +781,32 @@ impl Translator {
                 } else {
                     let request_id = plan_review_request_id(&entry.id);
                     self.plan_review = Some(request_id.clone());
+                    // The plan block rides the `x-manox-plan` channel, which is
+                    // the one place it can survive: AHP's `ChatInputRequest` has
+                    // no `planReview` field, and a raw-JSON action cannot carry
+                    // one either — `StateAction::Unknown` loses to the typed
+                    // variant on any parse, and the SDK client parses every
+                    // inbound action. That channel folds the payload into its
+                    // own state (durable, and backfillable to a client that
+                    // reconnects), which the one-shot broadcast was not.
+                    out.push(Emitted::new(
+                        &crate::translate::Target::Plan.uri(chat_id, session_id),
+                        extension_action(
+                            ext::actions::PLAN_VERDICT_REQUESTED,
+                            plan_review_payload(
+                                &request_id,
+                                plan_file.as_deref(),
+                                title.as_deref(),
+                                content.as_deref(),
+                            ),
+                        ),
+                    ));
+                    // …and the interactive half is a real typed input request,
+                    // so the client can answer it through the protocol's own
+                    // `chat/inputCompleted` path.
                     out.push(Emitted::new(
                         &chat,
-                        plan_review_requested(
-                            &request_id,
-                            plan_file.as_deref(),
-                            title.as_deref(),
-                            content.as_deref(),
-                        ),
+                        plan_review_requested(&request_id, title.as_deref()),
                     ));
                 }
             }
@@ -1899,25 +1917,32 @@ pub fn plan_review_request_id(entry_id: &str) -> String {
     format!("plan-review:{entry_id}")
 }
 
-/// The `chat/inputRequested` action that surfaces VS Code's native plan-review
-/// card. AHP's `ChatInputRequest` has no `planReview` field, so the action is
-/// built as raw JSON (`StateAction::Unknown`) rather than the typed variant —
-/// the upstream reducer does not fold it into the store, but the broadcast
-/// reaches the client verbatim, which is all the card needs.
-fn plan_review_requested(
+/// The plan-review block, for the `x-manox-plan` channel.
+///
+/// This is where the plan's title, content and actions live. It cannot ride
+/// `chat/inputRequested`: AHP's `ChatInputRequest` has no `planReview` field,
+/// and a raw-JSON action cannot smuggle one in either — `StateAction::Unknown`
+/// is an untagged fallback, so any parse resolves the tag to the *typed*
+/// variant and drops the fields that variant does not declare. The SDK client
+/// parses every inbound action, so the block was being stripped on arrival.
+///
+/// The extension channel takes it instead: it folds the payload into its own
+/// state (so a client reads it back from the channel baseline, and a
+/// reconnecting client is backfilled), which a one-shot broadcast could not do.
+fn plan_review_payload(
     request_id: &str,
     plan_file: Option<&str>,
     title: Option<&str>,
     content: Option<&str>,
-) -> StateAction {
-    let question_id = format!("{request_id}:q");
+) -> Value {
     let title = title
         .filter(|t| !t.trim().is_empty())
         .unwrap_or("Review Plan");
     let content = content
         .filter(|c| !c.trim().is_empty())
         .unwrap_or("A plan is ready for review.");
-    let mut plan_review = json!({
+    let mut payload = json!({
+        "requestId": request_id,
         "title": title,
         "content": content,
         "actions": [
@@ -1925,32 +1950,58 @@ fn plan_review_requested(
             { "id": "refine", "label": "Refine" },
         ],
         "canProvideFeedback": true,
-        "answerQuestionId": question_id,
     });
     if let Some(plan_file) = plan_file {
-        plan_review["planUri"] = json!(file_uri(plan_file));
+        payload["planUri"] = json!(file_uri(plan_file));
     }
-    let request = json!({
-        "id": request_id,
-        "planReview": plan_review,
-        "questions": [{
-            "kind": "single-select",
-            "id": question_id,
-            "title": title,
-            "message": "How would you like to proceed?",
-            "required": true,
-            "options": [
-                { "id": "approve", "label": "Approve", "recommended": true },
-                { "id": "refine", "label": "Refine" },
-            ],
-            "allowFreeformInput": true,
-        }],
-        "_meta": { "purpose": "planReview" },
-    });
-    StateAction::Unknown(json!({
-        "type": "chat/inputRequested",
-        "request": request,
-    }))
+    payload
+}
+
+/// The interactive half: a typed `chat/inputRequested` asking the user to
+/// approve or refine.
+///
+/// Typed deliberately, and only the question rides it. AHP folds this into the
+/// turn as an `InputRequest` response part, so the client can answer through
+/// `chat/inputCompleted` and the request is durable and backfillable — none of
+/// which holds for a hand-rolled action. The plan's *content* is not here
+/// because the protocol has no field for it; it rides
+/// [`plan_review_payload`].
+fn plan_review_requested(request_id: &str, title: Option<&str>) -> StateAction {
+    let question_id = format!("{request_id}:q");
+    let title = title
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or("Review Plan");
+    StateAction::ChatInputRequested(ChatInputRequestedAction {
+        request: ChatInputRequest {
+            id: request_id.to_string(),
+            message: Some("A plan is ready for review.".to_string()),
+            url: None,
+            questions: Some(vec![ChatInputQuestion::SingleSelect(
+                ChatInputSingleSelectQuestion {
+                    id: question_id,
+                    title: Some(title.to_string()),
+                    message: "How would you like to proceed?".to_string(),
+                    required: Some(true),
+                    options: vec![
+                        ChatInputOption {
+                            id: "approve".to_string(),
+                            label: "Approve".to_string(),
+                            description: None,
+                            recommended: Some(true),
+                        },
+                        ChatInputOption {
+                            id: "refine".to_string(),
+                            label: "Refine".to_string(),
+                            description: None,
+                            recommended: None,
+                        },
+                    ],
+                    allow_freeform_input: Some(true),
+                },
+            )]),
+            answers: None,
+        },
+    })
 }
 
 /// `{"x-manox": value}` — the one private metadata seat this crate writes.
@@ -2138,7 +2189,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_review_proposal_surfaces_the_vs_code_card() {
+    fn plan_review_proposal_splits_content_from_the_question() {
         let mut translator = Translator::new();
         let emitted = translator.on_entry(
             "c-1",
@@ -2153,19 +2204,50 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(emitted.len(), 1);
-        assert_eq!(emitted[0].channel, "ahp-chat:/c-1");
-        let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
-        assert_eq!(value["type"], "chat/inputRequested");
-        let request = &value["request"];
-        assert_eq!(request["id"], "plan-review:e-1");
-        assert_eq!(request["planReview"]["title"], "Demo plan");
-        assert_eq!(request["planReview"]["actions"][0]["id"], "approve");
         assert_eq!(
-            request["planReview"]["answerQuestionId"],
-            "plan-review:e-1:q"
+            emitted.len(),
+            2,
+            "the proposal emits the plan block and the question: {emitted:?}"
         );
-        assert_eq!(request["_meta"]["purpose"], "planReview");
+
+        // The plan's own content rides the extension channel — the only place
+        // it survives a parse, and the only place a reconnect is backfilled
+        // from.
+        let plan = emitted
+            .iter()
+            .find(|e| e.channel == "x-manox-plan:/c-1")
+            .expect("the plan block rides the plan channel");
+        let value = serde_json::to_value(&plan.action).expect("action serializes");
+        assert_eq!(value["type"], "x-manox-plan/verdictRequested");
+        assert_eq!(value["requestId"], "plan-review:e-1");
+        assert_eq!(value["title"], "Demo plan");
+        assert_eq!(value["content"], "# Demo\n\n- step one");
+        assert_eq!(value["actions"][0]["id"], "approve");
+        assert_eq!(value["actions"][1]["id"], "refine");
+        assert_eq!(value["canProvideFeedback"], true);
+        assert!(
+            value["planUri"]
+                .as_str()
+                .is_some_and(|u| u.contains("demo-plan")),
+            "the block names the reviewed plan: {value}"
+        );
+
+        // The question is a real typed `chat/inputRequested`, so the client
+        // answers it through the protocol's own completion path and the host
+        // folds it into the turn.
+        let card = emitted
+            .iter()
+            .find(|e| e.channel == "ahp-chat:/c-1")
+            .expect("the question rides the chat channel");
+        let card = serde_json::to_value(&card.action).expect("action serializes");
+        assert_eq!(card["type"], "chat/inputRequested");
+        assert_eq!(card["request"]["id"], "plan-review:e-1");
+        assert_eq!(card["request"]["questions"][0]["kind"], "single-select");
+        assert_eq!(card["request"]["questions"][0]["id"], "plan-review:e-1:q");
+        assert_eq!(
+            card["request"]["questions"][0]["options"][0]["id"],
+            "approve"
+        );
     }
 
     #[test]

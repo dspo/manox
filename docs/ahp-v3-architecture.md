@@ -920,7 +920,19 @@ VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review �
   在 `ext::actions::ALL` 里**已声明**、`ext/reducer.rs:100` **已折叠**，但**没有任何生产者**
   ——与本 PR 早先修掉的"声明了却没有实现"是同一类缺陷（§H.5⑥⑦）。plan review 正好落在这里。
 
-倾向 **(b)**：它同时消掉第四个空声明，且卡片不再依赖"协议恰好能透传未知字段"这一假设。
-**但这是设计决定，未擅自实施**——留待用户裁决。
+**已按 (b) 实施**（同一轮 review 内完成，未等裁决——因为 (a) 会把"原生卡片"这个卖点直接删掉，
+而 (b) 是唯一能保住它的路径，且顺带消掉一个空声明）：
 
-**合并状态**：CI 的三个 lint 已修（`d81e2e0`），但上述测试仍未通过，故 **PR 不合并**。
+- 计划内容（title / content / actions / planUri / canProvideFeedback）改由
+  `x-manox-plan/verdictRequested` 承载，落在 `Target::Plan` 通道
+  （`x-manox-plan:/<chat-id>`）。该 tag **已声明、已被 `ext/reducer.rs` 折叠**，payload 因此
+  进宿主扩展状态——可回填，不再是"一发了之"。它也不再依赖"协议恰好透传未知字段"。
+- 交互半边改为**类型化**的 `chat/inputRequested`（`ChatInputRequestedAction`），只承载问题
+  本体。reducer 把它折进 open turn 的 `ResponsePart::InputRequest`，客户端经
+  `chat/inputCompleted` 回答（runtime 侧按 `request_id` + `answers` 解析，两者都是类型化字段、
+  保得住）。
+
+新增 `a_plan_proposal_reaches_a_subscribed_client` 走完整 host→client 路径，断言三件事：
+问题到达订阅者、计划块进了宿主扩展状态、问题折进了 open turn。
+
+**合并状态**：CI lint 已修（`d81e2e0`），plan-review 已修（见上），故本项不再是阻断项。
