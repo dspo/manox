@@ -661,7 +661,16 @@ impl RuntimeBackend {
                         supports_vision: None,
                         policy_state: None,
                         config_schema: None,
-                        meta: None,
+                        // The wire api ("anthropic" / "openai_responses" /
+                        // "openai_completions") is the discriminator clients
+                        // tag model rows with; AHP has no native slot, so it
+                        // rides the extension meta namespace.
+                        meta: Some(
+                            serde_json::json!({ "x-manox": { "api": model.api } })
+                                .as_object()
+                                .cloned()
+                                .expect("a literal object"),
+                        ),
                     })
                     .collect();
                 AgentInfo {
