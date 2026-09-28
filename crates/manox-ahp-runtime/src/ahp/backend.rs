@@ -1504,7 +1504,8 @@ pub(crate) fn cwd_of(backend: &RuntimeBackend) -> &std::path::Path {
 ///
 /// A select answer carries its label; a selected-many answer its labels; a
 /// text/number/boolean answer becomes free-form `custom`. A skipped question
-/// contributes nothing (it was not answered).
+/// contributes an explicit skip — the kernel's empty-selection-no-custom shape
+/// — because a skip is a decision the model should see, not an absence.
 fn map_answers(
     answers: &Option<std::collections::HashMap<String, ahp_types::state::ChatInputAnswer>>,
 ) -> Vec<manox_agent::permission::AskAnswer> {
@@ -1517,7 +1518,26 @@ fn map_answers(
             let value = match answer {
                 ahp_types::state::ChatInputAnswer::Draft(a)
                 | ahp_types::state::ChatInputAnswer::Submitted(a) => &a.value,
-                ahp_types::state::ChatInputAnswer::Skipped(_) => return None,
+                // A skip is a decision the user made, not an absent answer, and
+                // the kernel encodes it as exactly this: an empty selection with
+                // no `custom`. Returning `None` here dropped the row entirely,
+                // so the model saw a question that was neither answered nor
+                // skipped — it could not tell "the user skipped this" from "the
+                // client never sent it".
+                ahp_types::state::ChatInputAnswer::Skipped(skipped) => {
+                    // A skip may carry a reason, and the kernel's `custom` is
+                    // where free text belongs — so a "skip, because …" reaches
+                    // the model as a skip *with* that reason rather than as a
+                    // bare skip.
+                    return Some(manox_agent::permission::AskAnswer {
+                        id: id.clone(),
+                        selected: Vec::new(),
+                        custom: skipped
+                            .freeform_values
+                            .as_ref()
+                            .and_then(|values| values.first().cloned()),
+                    });
+                }
             };
             match value {
                 ahp_types::state::ChatInputAnswerValue::Selected(v) => {
@@ -1567,4 +1587,82 @@ fn unix_to_rfc3339(secs: i64) -> String {
         .single()
         .map(|t| t.to_rfc3339())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod answer_mapping_tests {
+    use super::map_answers;
+    use ahp_types::state::{
+        ChatInputAnswer, ChatInputAnswerValue, ChatInputAnswered, ChatInputSelectedAnswerValue,
+        ChatInputSkipped, ChatInputTextAnswerValue,
+    };
+
+    fn answers(
+        rows: Vec<(&str, ChatInputAnswer)>,
+    ) -> Option<std::collections::HashMap<String, ChatInputAnswer>> {
+        Some(
+            rows.into_iter()
+                .map(|(id, answer)| (id.to_string(), answer))
+                .collect(),
+        )
+    }
+
+    fn submitted(value: ChatInputAnswerValue) -> ChatInputAnswer {
+        ChatInputAnswer::Submitted(ChatInputAnswered { value })
+    }
+
+    #[test]
+    fn a_skipped_question_is_an_explicit_skip_not_a_dropped_row() {
+        let mapped = map_answers(&answers(vec![(
+            "q1",
+            ChatInputAnswer::Skipped(ChatInputSkipped {
+                freeform_values: None,
+            }),
+        )]));
+        assert_eq!(
+            mapped.len(),
+            1,
+            "the skip must reach the kernel: {mapped:?}"
+        );
+        assert_eq!(mapped[0].id, "q1");
+        assert!(
+            mapped[0].selected.is_empty() && mapped[0].custom.is_none(),
+            "the kernel's skip shape is an empty selection with no custom: {:?}",
+            mapped[0]
+        );
+    }
+
+    #[test]
+    fn a_selected_label_rides_through_verbatim() {
+        let mapped = map_answers(&answers(vec![(
+            "q1",
+            submitted(ChatInputAnswerValue::Selected(
+                ChatInputSelectedAnswerValue {
+                    value: "Approve".to_string(),
+                    freeform_values: None,
+                },
+            )),
+        )]));
+        assert_eq!(mapped.len(), 1);
+        assert_eq!(mapped[0].selected, vec!["Approve".to_string()]);
+        assert_eq!(mapped[0].custom, None);
+    }
+
+    #[test]
+    fn free_text_lands_as_custom_with_no_selection() {
+        let mapped = map_answers(&answers(vec![(
+            "q1",
+            submitted(ChatInputAnswerValue::Text(ChatInputTextAnswerValue {
+                value: "use the fast suite".to_string(),
+            })),
+        )]));
+        assert_eq!(mapped.len(), 1);
+        assert!(mapped[0].selected.is_empty());
+        assert_eq!(mapped[0].custom.as_deref(), Some("use the fast suite"));
+    }
+
+    #[test]
+    fn no_answers_at_all_is_an_empty_list() {
+        assert!(map_answers(&None).is_empty());
+    }
 }
