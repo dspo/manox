@@ -377,4 +377,33 @@ impl SessionRuntime for GatewayRuntime {
                 .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
         }
     }
+
+    // MCP servers are process-global; the session id rides the trait for
+    // symmetry with every other seam but carries no per-session scoping.
+    // Both calls are synchronous intents: the registry settles the lifecycle
+    // detached and the AHP face learns the outcome from the event stream.
+
+    fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+        #[cfg(feature = "mcp")]
+        {
+            manox_agent::mcp::start(id).map_err(RuntimeError::new)
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            let _ = id;
+            Err(RuntimeError::new("MCP support is not built into this host"))
+        }
+    }
+
+    fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+        #[cfg(feature = "mcp")]
+        {
+            manox_agent::mcp::stop(id).map_err(RuntimeError::new)
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            let _ = id;
+            Err(RuntimeError::new("MCP support is not built into this host"))
+        }
+    }
 }

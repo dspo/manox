@@ -65,7 +65,7 @@ futures.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-default = ["terminal", "ws-gateway"]
+default = ["terminal", "mcp", "ws-gateway"]
 # In-process PTY + grid terminals (#13): the follow-terminal streams, attach/
 # snapshot/input/resize arms, and the TerminalsUpdated host mirror. Lean
 # embedders (the VS Code napi edge) opt out; the arms then answer GW7's
@@ -74,3 +74,10 @@ terminal = ["dep:manox-terminal"]
 # The `cx web` loopback WS gateway (axum). The in-process hosts (gpui, napi)
 # never serve HTTP; opting out drops the axum/hyper server stack.
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
+# The MCP face of the gateway: the agent-side registry *and* the ahp-runtime
+# half that seeds customizations and serves start/stop. The two halves are
+# co-elected — seeding without the gateway arms gives clients a server list
+# they cannot drive, and the gateway arms without the registry refuse every
+# request. Opting out turns the requests into refusals and keeps rmcp out of
+# lean builds entirely.
+mcp = ["manox-agent/mcp", "manox-ahp-runtime/mcp"]

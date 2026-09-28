@@ -273,6 +273,28 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// notification, because only the adapter knows the protocol's delta
     /// vocabulary. A backend with no host attached does nothing.
     fn catalogue_changed(&self) {}
+
+    /// Start (or restart) an MCP server by registry key.
+    ///
+    /// The AHP reducer has already folded the optimistic `starting` state by
+    /// the time this is called; the settled lifecycle (`ready`/`error`)
+    /// reaches subscribers through the runtime's MCP event stream, not
+    /// through this call's return. The default is a refusal: a runtime
+    /// without the MCP plane must not accept a start it can never honour.
+    fn mcp_start(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::new(
+            "MCP start is not supported by this runtime",
+        ))
+    }
+
+    /// Stop an MCP server by registry key. See [`SessionRuntime::mcp_start`]
+    /// for the acceptance/refusal split; the settled `stopped` (or `error`)
+    /// state travels the same event stream.
+    fn mcp_stop(&self, _session_id: &str, _id: &str) -> Result<(), RuntimeError> {
+        Err(RuntimeError::new(
+            "MCP stop is not supported by this runtime",
+        ))
+    }
 }
 
 /// What a rename did.

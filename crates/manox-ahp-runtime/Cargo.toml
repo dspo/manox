@@ -27,8 +27,14 @@ axum = { workspace = true, optional = true }
 libc.workspace = true
 
 [features]
-default = ["terminal"]
+default = ["terminal", "mcp"]
 terminal = ["dep:manox-terminal"]
+# The MCP face: the process-global registry snapshot mirrors into every
+# session's `customizations`, start/stop requests drive the registry, and
+# lifecycle transitions republish as `session/mcpServerStateChanged`. Lean
+# embedders opt out; sessions then carry no customizations and the start/stop
+# actions are refused.
+mcp = ["manox-agent/mcp"]
 # The loopback gateway's `/ahp` route. Off by default so a headless embedder
 # does not link the HTTP stack it never serves.
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]

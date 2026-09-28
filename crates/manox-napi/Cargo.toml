@@ -33,6 +33,9 @@ napi-build = "2"
 # stack, no WS gateway) build with --no-default-features and re-enable only
 # what they need.
 default = ["lsp", "mcp", "terminal"]
-mcp = ["manox-agent/mcp"]
+# The full MCP face: the agent-side registry *and* the session-core gateway
+# that serves start/stop. Forwarding only the agent half left a host whose
+# clients could see the servers but could not drive them.
+mcp = ["manox-agent/mcp", "manox-session-core/mcp"]
 lsp = ["manox-agent/lsp"]
 terminal = ["manox-session-core/terminal"]
