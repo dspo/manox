@@ -54,9 +54,10 @@ use ahp_types::actions::{
     ChatResponsePartAction, ChatToolCallCompleteAction, ChatToolCallConfirmedAction,
     ChatToolCallContentChangedAction, ChatToolCallDeltaAction, ChatToolCallReadyAction,
     ChatToolCallStartAction, ChatTurnCancelledAction, ChatTurnCompleteAction,
-    ChatTurnStartedAction, ChatUsageAction, SessionConfigChangedAction,
-    SessionInputNeededRemovedAction, SessionInputNeededSetAction, SessionIsArchivedChangedAction,
-    SessionTitleChangedAction, SessionWorkingDirectorySetAction, StateAction,
+    ChatTurnStartedAction, ChatUsageAction, PartialChatSummary, SessionActivityChangedAction,
+    SessionChatUpdatedAction, SessionConfigChangedAction, SessionInputNeededRemovedAction,
+    SessionInputNeededSetAction, SessionIsArchivedChangedAction, SessionTitleChangedAction,
+    SessionWorkingDirectorySetAction, StateAction,
 };
 use ahp_types::common::{JsonObject, StringOrMarkdown, Uri};
 use ahp_types::state::{
@@ -117,6 +118,43 @@ impl Emitted {
     /// stored copy could only drift from the action it labels.
     pub fn tag(&self) -> String {
         crate::wire::action_tag(&self.action)
+    }
+}
+
+/// Mirror a chat activity edge onto the session channel, per the spec's
+/// "producers SHOULD also update the parent session's chat catalog" guidance:
+/// the session-level activity string follows the active chat's, and the chat's
+/// catalogue entry rides `session/chatUpdated`.
+///
+/// A cleared edge (`None`) cannot clear the catalogue entry —
+/// `PartialChatSummary.activity` is `None`-means-*unchanged*, not *cleared* —
+/// so the catalogue keeps its last description until the next set edge, while
+/// the session-level string (whose reducer treats `None` as *clear*) does
+/// reset.
+///
+/// Assumes one active chat per session: the mirror writes any chat's edge
+/// straight onto the session-level field, so two concurrently active chats
+/// in one session would overwrite each other. True today (manox runs one
+/// journal per session, and compaction is the only producer); revisit if a
+/// second activity producer appears.
+fn mirror_activity(chat: &str, session: &str, activity: Option<String>, out: &mut Vec<Emitted>) {
+    out.push(Emitted::new(
+        session,
+        StateAction::SessionActivityChanged(SessionActivityChangedAction {
+            activity: activity.clone(),
+        }),
+    ));
+    if let Some(activity) = activity {
+        out.push(Emitted::new(
+            session,
+            StateAction::SessionChatUpdated(SessionChatUpdatedAction {
+                chat: chat.to_string(),
+                changes: PartialChatSummary {
+                    activity: Some(activity),
+                    ..PartialChatSummary::default()
+                },
+            }),
+        ));
     }
 }
 
@@ -850,6 +888,7 @@ impl Translator {
                     &chat,
                     StateAction::ChatActivityChanged(ChatActivityChangedAction { activity: None }),
                 ));
+                mirror_activity(&chat, &session, None, &mut out);
                 self.push_note(
                     &chat,
                     entry,
@@ -865,12 +904,14 @@ impl Translator {
             }
             JournalWireEvent::CompactionStarted { tokens_before } => {
                 // Activity, not transcript: a spinner edge carries no content.
+                let activity = format!("compacting ({tokens_before} tokens)");
                 out.push(Emitted::new(
                     &chat,
                     StateAction::ChatActivityChanged(ChatActivityChangedAction {
-                        activity: Some(format!("compacting ({tokens_before} tokens)")),
+                        activity: Some(activity.clone()),
                     }),
                 ));
+                mirror_activity(&chat, &session, Some(activity), &mut out);
             }
             JournalWireEvent::BranchSummary { text } => self.push_note(
                 &chat,
@@ -2186,6 +2227,81 @@ mod tests {
             timestamp: "2026-09-27T00:00:00.000Z".to_string(),
             event,
         }
+    }
+
+    #[test]
+    fn a_set_activity_edge_mirrors_onto_the_session_channel_twice() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-1",
+                JournalWireEvent::CompactionStarted {
+                    tokens_before: 4200,
+                },
+            ),
+        );
+        let session: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-session:/s-1")
+            .collect();
+        assert_eq!(
+            session.len(),
+            2,
+            "the set edge owes the session-level string and the catalogue delta: {session:?}"
+        );
+        let activity = serde_json::to_value(&session[0].action).unwrap();
+        assert_eq!(activity["type"], "session/activityChanged");
+        assert_eq!(activity["activity"], "compacting (4200 tokens)");
+        let catalog = serde_json::to_value(&session[1].action).unwrap();
+        assert_eq!(catalog["type"], "session/chatUpdated");
+        assert_eq!(catalog["chat"], "ahp-chat:/c-1");
+        assert_eq!(catalog["changes"]["activity"], "compacting (4200 tokens)");
+        // The chat-level edge itself is unchanged.
+        let chat = emitted
+            .iter()
+            .find(|e| e.channel == "ahp-chat:/c-1")
+            .expect("the chat edge stays");
+        assert_eq!(
+            serde_json::to_value(&chat.action).unwrap()["type"],
+            "chat/activityChanged"
+        );
+    }
+
+    #[test]
+    fn a_cleared_activity_edge_resets_the_session_string_but_not_the_catalog() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-1",
+                JournalWireEvent::Compaction {
+                    summary: "done".into(),
+                    messages_compacted: 3,
+                    tokens_before: 10,
+                    retained_tail: vec![],
+                    first_kept_entry_id: None,
+                },
+            ),
+        );
+        let session: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.channel == "ahp-session:/s-1")
+            .collect();
+        assert_eq!(
+            session.len(),
+            1,
+            "a cleared edge owes only the session-level reset: {session:?}"
+        );
+        let activity = serde_json::to_value(&session[0].action).unwrap();
+        assert_eq!(activity["type"], "session/activityChanged");
+        assert_eq!(
+            activity["activity"],
+            serde_json::Value::Null,
+            "None serializes as an absent/null activity — the reducer's clear edge"
+        );
     }
 
     #[test]

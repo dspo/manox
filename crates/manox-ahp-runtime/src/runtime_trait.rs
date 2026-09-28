@@ -129,6 +129,16 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// The live terminal's snapshot, when this runtime owns that terminal.
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalSnapshot>;
 
+    /// The root channel's terminal catalogue: one `TerminalInfo` per terminal
+    /// this runtime owns, in display order. Deliberately metadata-only — the
+    /// per-channel state ([`SessionRuntime::terminal_state`]) is what carries
+    /// the grid, and rebuilding whole screens to list three fields is the
+    /// cost this seam exists to avoid. The default is an empty catalogue: a
+    /// runtime without the terminal plane has no terminals to name.
+    fn terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
+        Vec::new()
+    }
+
     /// The raw PTY byte stream of a terminal, for the `terminal/data` pump.
     fn terminal_raw_tap(
         &self,

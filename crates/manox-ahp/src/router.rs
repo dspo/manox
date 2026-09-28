@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, StateAction};
+use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, SessionReadyAction, StateAction};
 use ahp_types::commands::{
     CompletionsParams, CompletionsResult, CreateChatParams, CreateSessionParams,
     CreateTerminalParams, DispatchActionParams, DisposeChatParams, DisposeSessionParams,
@@ -435,6 +435,15 @@ async fn create_session(
     if let Some(summary) = inner.backend.session_summary(&session_id) {
         inner.session_added(summary);
     }
+    // The lifecycle edge the session-channel spec puts right after
+    // `createSession`. The seed already carries `lifecycle: ready`, so this
+    // changes no folded state — it exists for clients that follow the action
+    // stream rather than snapshots and expect the explicit transition.
+    inner.publish(
+        &params.channel,
+        StateAction::SessionReady(SessionReadyAction {}),
+        None,
+    );
     Ok(Value::Null)
 }
 

@@ -366,6 +366,56 @@ impl AgentServerInner {
         })
     }
 
+    /// Every live wire terminal's root-channel catalogue entry, in insertion
+    /// order — the list `RootState.terminals` seeds from and
+    /// `root/terminalsChanged` replaces with.
+    ///
+    /// Deliberately *not* a projection of [`Self::ahp_terminal_state`]: the
+    /// catalogue wants three metadata fields per terminal, and going through
+    /// the channel state would format and copy every terminal's whole grid on
+    /// every root snapshot and every create/dispose fan-out.
+    ///
+    /// Known gap (pre-existing, shared with the per-channel state): the exit
+    /// write path is not wired, so `lifecycle` is `running` for every live
+    /// entry and an exited process stays in the catalogue until dispose.
+    #[cfg(feature = "terminal")]
+    pub(crate) fn ahp_terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
+        use ahp_types::state as ahp;
+        let entries: Vec<_> = self
+            .terminals
+            .lock()
+            .iter()
+            .map(|(id, entry)| {
+                let title = entry.handle.read(|t| t.title.clone());
+                let exited = *entry.exited.lock().unwrap();
+                (id.clone(), entry.session_id.clone(), title, exited)
+            })
+            .collect();
+        entries
+            .into_iter()
+            .map(|(id, session_id, title, exited)| ahp::TerminalInfo {
+                resource: manox_ahp::channels::terminal::uri(&id),
+                title: title.unwrap_or_default(),
+                claim: ahp::TerminalClaim::Session(ahp::TerminalSessionClaim {
+                    session: manox_ahp_runtime::ahp::session_uri_of_terminal(&session_id),
+                    chat: manox_ahp_runtime::ahp::session_uri_of_terminal(&session_id),
+                    turn_id: None,
+                    tool_call_id: None,
+                }),
+                lifecycle: match exited {
+                    Some(code) => {
+                        ahp::TerminalLifecycleState::Exited(ahp::TerminalExitedLifecycleState {
+                            exit_code: Some(code as i64),
+                        })
+                    }
+                    None => {
+                        ahp::TerminalLifecycleState::Running(ahp::TerminalRunningLifecycleState {})
+                    }
+                },
+            })
+            .collect()
+    }
+
     /// The AHP view of one live terminal, for the `ahp-terminal:/<id>` channel.
     ///
     /// Unlike the v2 summary this is the channel's *state*, so it carries the
