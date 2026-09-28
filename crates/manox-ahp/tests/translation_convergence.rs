@@ -493,3 +493,116 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
          host's removal matches on"
     );
 }
+
+/// The plan-review card reaches a subscribed client, verbatim.
+///
+/// The card is the one place this host emits an action AHP's own reducers do
+/// not know (`StateAction::Unknown` is `OutOfScope` on every channel upstream),
+/// because `ChatInputRequest` has no `planReview` field in 0.9. So the card can
+/// only work by being broadcast and read verbatim, and the convergence gate
+/// cannot tell the difference: both ends fold it to nothing and agree. That
+/// makes this the one action whose delivery needs an assertion of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_plan_review_card_reaches_a_subscribed_client() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let (host_side, client_side) = manox_ahp::transport::inproc::pair();
+    host.accept(host_side);
+    let client = Client::connect(client_side, ClientConfig::default())
+        .await
+        .expect("client connects");
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![TestBackend::chat_uri()],
+        )
+        .await
+        .expect("initializes");
+    let mut sub = client.attach_subscription(&TestBackend::chat_uri()).await;
+
+    // The proposal edge, as the runtime journals it.
+    let mut translator = Translator::new();
+    let mut emitted_count = 0usize;
+    for (seq, event) in [
+        TurnStart,
+        PlanReview {
+            state: "proposed".to_string(),
+            plan_file: Some("/plans/demo-plan.md".to_string()),
+            title: Some("Demo plan".to_string()),
+            content: Some("# Demo\n\n- step one".to_string()),
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entry = JournalWireEntry {
+            seq: seq as u64 + 500,
+            id: format!("pentry-{seq}"),
+            parent_id: (seq > 0).then(|| format!("pentry-{}", seq - 1)),
+            timestamp: format!("2026-09-23T02:00:{seq:02}.000Z"),
+            event,
+        };
+        for emitted in translator.on_entry("c-1", "s-1", &entry) {
+            emitted_count += 1;
+            host.publish(&emitted.channel, emitted.action, None);
+        }
+    }
+    assert!(emitted_count > 0, "the proposal must emit something");
+
+    // What the client actually receives, unmodified.
+    let mut card = None;
+    for _ in 0..emitted_count.max(1) {
+        match tokio::time::timeout(Duration::from_secs(5), sub.recv()).await {
+            Ok(Some(SubscriptionEvent::Action(envelope))) => {
+                let value = serde_json::to_value(&envelope.action).expect("serializes");
+                if value["type"] == "chat/inputRequested" {
+                    card = Some(value);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    let card = card.expect("the plan-review card must reach a subscribed client");
+    let request = &card["request"];
+    // The in-process leg carries typed messages, so this asserts the action the
+    // translator built. The WS leg re-parses text, which is where the card's
+    // `planReview` block is lost — see the WS case below.
+    assert_eq!(request["id"], "plan-review:pentry-1");
+    assert_eq!(request["planReview"]["title"], "Demo plan");
+    assert_eq!(request["planReview"]["actions"][0]["id"], "approve");
+    assert_eq!(request["planReview"]["actions"][1]["id"], "refine");
+    assert_eq!(request["planReview"]["canProvideFeedback"], true);
+    assert!(
+        request["planReview"]["planUri"].as_str().is_some(),
+        "the card names the reviewed plan: {request}"
+    );
+    assert_eq!(
+        request["planReview"]["answerQuestionId"],
+        "plan-review:pentry-1:q"
+    );
+    assert_eq!(request["_meta"]["purpose"], "planReview");
+    let question = &request["questions"][0];
+    assert_eq!(question["kind"], "single-select");
+    assert_eq!(question["required"], true);
+
+    // …and the HOST must hold it too, or the card exists only as a one-shot
+    // broadcast: a client that reconnects and re-subscribes is seeded from this
+    // state, and upstream documents the request as durable and backfillable via
+    // `fetchTurns`. An action the reducer discards cannot be either.
+    let host_chat = host.chat_state("c-1").expect("host chat state");
+    let folded: Vec<&ahp_types::state::ResponsePart> = host_chat
+        .turns
+        .last()
+        .map(|turn| turn.response_parts.iter().collect())
+        .unwrap_or_default();
+    assert!(
+        folded
+            .iter()
+            .any(|part| matches!(part, ahp_types::state::ResponsePart::InputRequest(_))),
+        "the plan-review request must be folded into the turn, not only \
+         broadcast; the host holds {folded:?}"
+    );
+}

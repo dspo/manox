@@ -878,3 +878,49 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 **⑨ 门禁**：`script/gates.sh` 六腿全绿；grep 门禁（生产区零
 `manox_protocol|FromClient|FromServer|ClientCall|ClientNote|ServerCall|ServerNote|PROTOCOL_EPOCH|StreamFrame`）
 零命中。`prod-libs` 腿的 crate 列表同步为 `manox-ahp`/`manox-ahp-runtime`/`manox-journal`。
+
+### H.6 自我对抗 review：plan-review 卡片到不了客户端（2026-09-28，**阻断合并**）
+
+对 PR #818 逐提交做对抗性复核时发现：`c9522b8`（plan review 面）声称
+"`StateAction::Unknown` 走 broadcast 会 verbatim 到达客户端"，**该断言不成立**。
+
+**根因（实测，非推断）**：`ahp-types` 的 `StateAction::Unknown(Value)` 是
+`#[serde(untagged)]` 兜底变体，而 untagged 兜底**打不过已知 tag**——当 `type` 是
+`chat/inputRequested` 这种已注册变体时，serde 反序列化会走**类型化**的
+`ChatInputRequestedAction`，把该类型没有的字段**静默丢弃**。实测往返：
+
+```
+输入:  {"type":"chat/inputRequested","request":{"id":"pr-1","planReview":{"title":"Demo plan"}}}
+序列化:  保留 planReview              ← 单元测试停在这一步，所以它绿
+反序列化: {"request":{"id":"pr-1"}}   ← planReview 消失
+```
+
+丢失点在**客户端 SDK 自己**：`ahp-0.9.0/src/client.rs:965` 对每条入站 action 都做
+`serde_json::from_value::<ActionNotificationParams>`。所以 in-proc 与 WS **两条腿都丢**——
+不是传输问题，是类型系统问题，宿主侧无法绕过。
+
+**实际到达客户端的东西**：
+```json
+{"type":"chat/inputRequested","request":{"id":"plan-review:e-1","questions":[{"id":"q","kind":"single-select"}]}}
+```
+`planReview`（title / content / actions / planUri / answerQuestionId）与 `_meta` **全部丢失**。
+VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review 卡片——即该提交的核心目的未达成。
+（评测本身仍可工作：`request_id` 与 `answers` 是类型化字段，保得住。）
+
+**为什么原单元测试没抓到**：它调用 `serde_json::to_value(&emitted[0].action)`，断言的是
+**进程内**动作，从未做一次往返。新增的
+`the_plan_review_card_reaches_a_subscribed_client` 走完整 host→client 路径，因此会红。
+
+**AHP 0.9 确实没有这个槽位**（已核实，不是选型疏忽）：`ChatInputRequest` 与
+`InputRequestResponsePart` 都**没有** `_meta` 之类的私有座位，所以类型化路径同样装不下
+`planReview`。这使问题从"用错了 API"升级为设计选择：
+
+- **(a)** 接受降级：用类型化 `ChatInputRequest` 发普通提问，放弃"原生卡片"这一说法，文档同步；
+- **(b)** 走已经为它准备好的通道：`x-manox-plan/verdictRequested` 与 `x-manox-plan/verdict`
+  在 `ext::actions::ALL` 里**已声明**、`ext/reducer.rs:100` **已折叠**，但**没有任何生产者**
+  ——与本 PR 早先修掉的"声明了却没有实现"是同一类缺陷（§H.5⑥⑦）。plan review 正好落在这里。
+
+倾向 **(b)**：它同时消掉第四个空声明，且卡片不再依赖"协议恰好能透传未知字段"这一假设。
+**但这是设计决定，未擅自实施**——留待用户裁决。
+
+**合并状态**：CI 的三个 lint 已修（`d81e2e0`），但上述测试仍未通过，故 **PR 不合并**。
