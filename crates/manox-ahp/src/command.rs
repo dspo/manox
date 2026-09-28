@@ -201,6 +201,7 @@ impl Command {
             | Self::ResourceWrite
             | Self::ResourceList
             | Self::ResourceDelete
+            | Self::InvokeChangesetOperation
             | Self::Extension => CommandIntent::Implemented,
             // Declared upstream, not served by this build. The router does not
             // route them, so a client sees `MethodNotFound` and treats the
@@ -218,7 +219,6 @@ impl Command {
             | Self::ResourceRequest
             | Self::Authenticate
             | Self::SessionConfigCompletions
-            | Self::InvokeChangesetOperation
             | Self::ListAutomationTriggerDefinitions
             | Self::RunAutomation
             | Self::FetchAutomationRuns => CommandIntent::Declined,
@@ -287,7 +287,6 @@ mod tests {
                 "resourceRequest",
                 "authenticate",
                 "sessionConfigCompletions",
-                "invokeChangesetOperation",
                 "listAutomationTriggerDefinitions",
                 "runAutomation",
                 "fetchAutomationRuns",

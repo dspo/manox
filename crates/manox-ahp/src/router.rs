@@ -106,6 +106,7 @@ async fn dispatch_request(
         "createChat" => create_chat(inner, conn, params).await,
         "disposeChat" => dispose_chat(inner, params),
         "fetchTurns" => fetch_turns(inner, params),
+        "invokeChangesetOperation" => invoke_changeset_operation(inner, params).await,
         "resourceRead" => resource_read(inner, params),
         "resourceWrite" => resource_write(inner, params),
         "resourceList" => resource_list(inner, params),
@@ -196,6 +197,12 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
         }
         Channel::Terminal(id) => {
             if let Err(err) = inner.ensure_terminal(id) {
+                inner.reject(uri, params.action, Some(origin), err.message());
+                return;
+            }
+        }
+        Channel::Changeset(_) => {
+            if let Err(err) = inner.ensure_changeset(uri) {
                 inner.reject(uri, params.action, Some(origin), err.message());
                 return;
             }
@@ -320,6 +327,7 @@ fn subscribe_uri(
             inner.ensure_chat(id)?;
         }
         Channel::Terminal(id) => inner.ensure_terminal(id)?,
+        Channel::Changeset(_) => inner.ensure_changeset(uri)?,
         // The side-channel is not subscribable — a client's MCP surface is
         // the customization's `channel` field, and its traffic is
         // request/response. A subscribe lands as `NotFound`, the same answer
@@ -444,6 +452,27 @@ fn list_sessions(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> 
         None
     };
     to_value(ListSessionsResult { items, next_cursor })
+}
+
+/// `invokeChangesetOperation`: the operation must exist on the changeset's
+/// current list and the target's kind must be in its declared scopes — the
+/// wire's validation contract. Scope/target agreement is the runtime's to
+/// enforce; a mismatch here is a `-32602` before any work starts.
+async fn invoke_changeset_operation(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
+    let params: ahp_types::commands::InvokeChangesetOperationParams = parse_params(params)?;
+    if !matches!(
+        params.target,
+        None | Some(ahp_types::commands::ChangesetOperationTarget::Resource { .. })
+    ) {
+        return Err(HostError::InvalidParams(
+            "the target kind is not in the operation's declared scopes".to_string(),
+        ));
+    }
+    inner.backend.invoke_changeset_operation(
+        params.channel.as_str(),
+        &params.operation_id,
+        params.target.as_ref(),
+    )
 }
 
 /// The `mcp://` side-channel: forward one MCP request to the runtime's

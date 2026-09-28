@@ -144,6 +144,27 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
+    /// The changeset view of one `ahp-changeset:/…` channel, computed on
+    /// first sight by the runtime's changeset engine. `None` = not found.
+    fn changeset_state(&self, _channel: &str) -> Option<ahp_types::state::ChangesetState> {
+        None
+    }
+
+    /// Execute one `invokeChangesetOperation` on a changeset channel. The
+    /// router has validated the command shape; the runtime validates the
+    /// operation id and target against the changeset's live list. The
+    /// returned value is an `InvokeChangesetOperationResult`.
+    fn invoke_changeset_operation(
+        &self,
+        channel: &str,
+        operation_id: &str,
+        _target: Option<&ahp_types::commands::ChangesetOperationTarget>,
+    ) -> Result<Value, HostError> {
+        Err(HostError::Unimplemented(format!(
+            "changeset operation {operation_id} on {channel}"
+        )))
+    }
+
     /// One request on the `mcp://` side-channel: `channel` names the server
     /// (`mcp://<key>`), `method` is the upstream MCP method (the router has
     /// already gated it to the advertised `tools/*` / `resources/*`

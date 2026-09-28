@@ -11,6 +11,7 @@
 //! action envelopes and a subscriber's baseline is pushed right after
 //! `subscribe` (see `ext::actions`).
 
+pub mod changeset;
 pub mod chat;
 pub mod mcp;
 pub mod root;
@@ -41,6 +42,10 @@ pub enum Channel {
     /// Not state-bearing: its traffic is raw MCP JSON-RPC forwarded to the
     /// upstream server, not AHP reducer state.
     Mcp(String),
+    /// `ahp-changeset:/<session-id>/<key>` — one changeset view. Reducer
+    /// state lives here (`ahp::reducers::apply_action_to_changeset`), seeded
+    /// from the runtime's changeset engine.
+    Changeset(String),
     /// `x-manox-*` extension channel, carried verbatim.
     Extension(String),
 }
@@ -54,6 +59,7 @@ impl Channel {
             Self::Chat(id) => chat::uri(id),
             Self::Terminal(id) => terminal::uri(id),
             Self::Mcp(key) => format!("mcp://{key}"),
+            Self::Changeset(_) => unreachable!("changeset channels carry their full URI"),
             Self::Extension(uri) => uri.clone(),
         }
     }
@@ -84,6 +90,9 @@ pub fn parse(uri: &str) -> Option<Channel> {
     if let Some(key) = mcp::server(uri) {
         return Some(Channel::Mcp(key.to_string()));
     }
+    if changeset::parse(uri).is_some() {
+        return Some(Channel::Changeset(uri.to_string()));
+    }
     if ext::channels::ALL
         .iter()
         .any(|prefix| uri.starts_with(prefix))
@@ -104,6 +113,9 @@ pub struct ChannelStore {
     /// chat id → owning session id (kept in step with each session's `chats`).
     chat_owner: HashMap<String, String>,
     terminals: HashMap<String, TerminalState>,
+    /// Changeset views by channel URI, folded with the SDK's changeset
+    /// reducer and seeded from the runtime's changeset engine.
+    changesets: HashMap<String, ahp_types::state::ChangesetState>,
     /// `x-manox-*` channels: their state has no slot in AHP's `SnapshotState`
     /// (nine arms, no generic one), so it is folded here and delivered to
     /// subscribers as extension action envelopes.
@@ -119,6 +131,7 @@ impl ChannelStore {
             chats: HashMap::new(),
             chat_owner: HashMap::new(),
             terminals: HashMap::new(),
+            changesets: HashMap::new(),
             extensions: HashMap::new(),
         }
     }
@@ -152,6 +165,7 @@ impl ChannelStore {
             // The MCP side-channel is a request/response proxy, not
             // reducer state: nothing to snapshot, nothing to subscribe to.
             Channel::Mcp(_) => None,
+            Channel::Changeset(_) => self.changesets_snapshot(channel),
             Channel::Extension(_) => None,
         }
     }
@@ -190,6 +204,10 @@ impl ChannelStore {
             // No reducer state lives on the side-channel; an action routed
             // there is a routing bug and must not be folded silently.
             Channel::Mcp(_) => ReduceOutcome::OutOfScope,
+            Channel::Changeset(uri) => match self.changesets.get_mut(uri) {
+                Some(state) => ahp::reducers::apply_action_to_changeset(state, action),
+                None => ReduceOutcome::OutOfScope,
+            },
         };
         if let Channel::Session(id) = channel {
             self.reindex_chats(id);
@@ -218,6 +236,26 @@ impl ChannelStore {
 
     pub fn insert_terminal(&mut self, id: &str, state: TerminalState) {
         self.terminals.insert(id.to_string(), state);
+    }
+
+    /// Seed (or replace) one changeset view.
+    pub fn insert_changeset(&mut self, uri: &str, state: ahp_types::state::ChangesetState) {
+        self.changesets.insert(uri.to_string(), state);
+    }
+
+    /// One changeset view, when this channel has been ensured.
+    pub fn changeset(&self, uri: &str) -> Option<&ahp_types::state::ChangesetState> {
+        self.changesets.get(uri)
+    }
+
+    fn changesets_snapshot(&self, channel: &Channel) -> Option<SnapshotState> {
+        match channel {
+            Channel::Changeset(uri) => self
+                .changesets
+                .get(uri)
+                .map(|state| SnapshotState::Changeset(Box::new(state.clone()))),
+            _ => None,
+        }
     }
 
     /// Drop a session and every chat it owned.
@@ -318,8 +356,15 @@ mod tests {
             parse("x-manox-plan:/c-1"),
             Some(Channel::Extension("x-manox-plan:/c-1".into()))
         );
+        // A changeset URI needs both a session and a key; the bare scheme is
+        // not a channel.
         assert_eq!(parse("ahp-changeset:/x"), None);
+        assert_eq!(
+            parse("ahp-changeset:/s-1/uncommitted"),
+            Some(Channel::Changeset("ahp-changeset:/s-1/uncommitted".into()))
+        );
         assert!(!Channel::Extension("x".into()).is_state_bearing());
+        assert!(Channel::Changeset("ahp-changeset:/s-1/uncommitted".into()).is_state_bearing());
     }
 
     #[test]

@@ -565,6 +565,19 @@ impl Inner {
         self.store.write().insert_terminal(terminal_id, state);
         Ok(())
     }
+
+    /// Make sure a changeset view is loaded, computing it on first sight.
+    pub(crate) fn ensure_changeset(&self, uri: &str) -> Result<(), HostError> {
+        if self.store.read().changeset(uri).is_some() {
+            return Ok(());
+        }
+        let state = self
+            .backend
+            .changeset_state(uri)
+            .ok_or_else(|| HostError::NotFound(uri.to_string()))?;
+        self.store.write().insert_changeset(uri, state);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

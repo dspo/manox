@@ -44,3 +44,4 @@ ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 
 [dev-dependencies]
 manox-terminal.workspace = true
+tempfile = "3"
