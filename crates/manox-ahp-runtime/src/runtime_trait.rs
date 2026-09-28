@@ -129,6 +129,14 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// The live terminal's snapshot, when this runtime owns that terminal.
     fn terminal_state(&self, terminal_id: &str) -> Option<TerminalSnapshot>;
 
+    /// Every terminal id this runtime currently owns, in display order —
+    /// the catalogue the root channel's terminal list is built from. The
+    /// default is an empty catalogue: a runtime without the terminal plane
+    /// has no terminals to name.
+    fn terminal_ids(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The raw PTY byte stream of a terminal, for the `terminal/data` pump.
     fn terminal_raw_tap(
         &self,

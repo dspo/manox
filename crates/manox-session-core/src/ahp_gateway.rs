@@ -90,6 +90,17 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
+    fn terminal_ids(&self) -> Vec<String> {
+        #[cfg(feature = "terminal")]
+        {
+            self.server.ahp_inner().ahp_terminal_ids()
+        }
+        #[cfg(not(feature = "terminal"))]
+        {
+            Vec::new()
+        }
+    }
+
     fn terminal_raw_tap(
         &self,
         terminal_id: &str,

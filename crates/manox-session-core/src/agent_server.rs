@@ -366,6 +366,14 @@ impl AgentServerInner {
         })
     }
 
+    /// Every live wire terminal's id, in insertion order — the catalogue the
+    /// root channel's terminal list and `root/terminalsChanged` are built
+    /// from. (States are fetched per id through [`Self::ahp_terminal_state`].)
+    #[cfg(feature = "terminal")]
+    pub(crate) fn ahp_terminal_ids(&self) -> Vec<String> {
+        self.terminals.lock().keys().cloned().collect()
+    }
+
     /// The AHP view of one live terminal, for the `ahp-terminal:/<id>` channel.
     ///
     /// Unlike the v2 summary this is the channel's *state*, so it carries the

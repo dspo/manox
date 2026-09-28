@@ -117,6 +117,43 @@ impl RuntimeBackend {
         self.host.get().and_then(Weak::upgrade)
     }
 
+    /// The root channel's terminal catalogue: one `TerminalInfo` per live
+    /// terminal, carrying the claim and lifecycle the per-channel state
+    /// carries (a catalogue entry without its claim would advertise a
+    /// terminal a client cannot tell is owned).
+    fn terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
+        use ahp_types::state::TerminalInfo;
+        self.server
+            .terminal_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let state = self.terminal_state(&id)?;
+                Some(TerminalInfo {
+                    resource: manox_ahp::channels::terminal::uri(&id),
+                    title: state.title,
+                    claim: state.claim,
+                    lifecycle: state.lifecycle,
+                })
+            })
+            .collect()
+    }
+
+    /// `root/terminalsChanged` with the full replacement catalogue. A no-op
+    /// until a host is attached (a terminal spawned before the host exists is
+    /// picked up by the next root seed instead).
+    fn publish_terminals_changed(&self) {
+        let Some(host) = self.host() else {
+            return;
+        };
+        host.publish(
+            manox_ahp::channels::root::URI,
+            StateAction::RootTerminalsChanged(ahp_types::actions::RootTerminalsChangedAction {
+                terminals: self.terminal_infos(),
+            }),
+            None,
+        );
+    }
+
     /// The folded state of one session, seeding the host and starting the bridge
     /// on first sight.
     async fn seeded(&self, session_id: &str) -> Option<Arc<Seeded>> {
@@ -778,7 +815,7 @@ fn summary_from_row(
 
 impl Backend for RuntimeBackend {
     fn root_state(&self) -> RootState {
-        root::with_agents(self.agents(), None)
+        root::with_agents(self.agents(), Some(self.terminal_infos()))
     }
 
     fn list_sessions(&self) -> Vec<SessionSummary> {
@@ -881,6 +918,7 @@ impl Backend for RuntimeBackend {
             .create_terminal(session_id, terminal_id, cols, rows)
             .map_err(|error| HostError::Backend(error.message))?;
         self.ensure_terminal_pump(terminal_id);
+        self.publish_terminals_changed();
         Ok(())
     }
 
@@ -888,7 +926,9 @@ impl Backend for RuntimeBackend {
     fn dispose_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
         self.server
             .dispose_terminal(terminal_id)
-            .map_err(|_| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))
+            .map_err(|_| HostError::NotFound(manox_ahp::channels::terminal::uri(terminal_id)))?;
+        self.publish_terminals_changed();
+        Ok(())
     }
 
     #[cfg(not(feature = "terminal"))]
