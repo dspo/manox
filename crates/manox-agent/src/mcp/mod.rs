@@ -78,6 +78,12 @@ struct ServerSlot {
     state: ServerState,
     client: Option<McpClientHandle>,
     tools: Vec<rmcp::model::Tool>,
+    /// Bumped by every [`McpRegistry::begin_start`] and every stop. A connect
+    /// that lands under a stale generation is discarded (its client
+    /// cancelled) rather than applied — that is what keeps a stop from being
+    /// silently overwritten by an in-flight start, and two overlapping
+    /// starts from leaving an orphan client behind.
+    generation: u64,
 }
 
 impl ServerSlot {
@@ -116,7 +122,9 @@ impl McpRegistry {
             .collect()
     }
 
-    /// Every configured server with its lifecycle, in config order.
+    /// Every configured server with its lifecycle, in name (lexicographic)
+    /// order — the config layers merge into a `BTreeMap`, so that *is* the
+    /// config's canonical order.
     pub fn slots(&self) -> Vec<SlotView> {
         self.slots.read().iter().map(ServerSlot::view).collect()
     }
@@ -142,28 +150,57 @@ impl McpRegistry {
             .map(|slot| slot.config.clone())
     }
 
-    fn mark_ready(&self, name: &str, server: ConnectedServer) {
+    /// Begin a start: refuse unknown names synchronously, cancel any live
+    /// client (restart semantics), and bump the generation the eventual
+    /// connect is validated against.
+    fn begin_start(&self, name: &str) -> Option<u64> {
         let mut slots = self.slots.write();
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
-            slot.state = ServerState::Ready;
-            slot.client = Some(server.client);
-            slot.tools = server.tools;
+        let slot = slots.iter_mut().find(|slot| slot.name == name)?;
+        slot.generation += 1;
+        if let Some(client) = slot.client.take() {
+            client.cancellation_token().cancel();
         }
+        slot.tools = Vec::new();
+        Some(slot.generation)
     }
 
-    fn mark_error(&self, name: &str, message: String) {
+    /// Apply a settled lifecycle under the slot's current generation.
+    ///
+    /// A connect that lands after a newer start/stop bumped the generation is
+    /// discarded — its client, when there is one, is cancelled so a superseded
+    /// start never leaves an orphan process behind.
+    fn settle(
+        &self,
+        name: &str,
+        generation: u64,
+        state: ServerState,
+        client: Option<McpClientHandle>,
+        tools: Vec<rmcp::model::Tool>,
+    ) -> bool {
         let mut slots = self.slots.write();
-        if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
-            slot.state = ServerState::Error(message);
-            slot.client = None;
-            slot.tools = Vec::new();
+        let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) else {
+            if let Some(client) = client {
+                client.cancellation_token().cancel();
+            }
+            return false;
+        };
+        if slot.generation != generation {
+            if let Some(client) = client {
+                client.cancellation_token().cancel();
+            }
+            return false;
         }
+        slot.state = state;
+        slot.client = client;
+        slot.tools = tools;
+        true
     }
 
     fn mark_stopped(&self, name: &str) -> bool {
         let mut slots = self.slots.write();
         match slots.iter_mut().find(|slot| slot.name == name) {
             Some(slot) => {
+                slot.generation += 1;
                 if let Some(client) = slot.client.take() {
                     client.cancellation_token().cancel();
                 }
@@ -203,8 +240,9 @@ fn fire(name: &str, state: ServerState) {
 /// slots, keeping the server visible to the AHP face and restartable via
 /// [`start`].
 pub fn init() {
-    let config = match crate::paths::manox_config_dir() {
-        Ok(dir) => McpConfig::load(&dir).unwrap_or_else(|e| {
+    let dir = crate::paths::manox_config_dir();
+    let config = match &dir {
+        Ok(dir) => McpConfig::load(dir).unwrap_or_else(|e| {
             tracing::warn!("Failed to load MCP config, skipped: {e:#}");
             McpConfig::default()
         }),
@@ -213,7 +251,11 @@ pub fn init() {
             McpConfig::default()
         }
     };
-    let registry = build_registry(resolved_config(config, &crate::settings::mcp_disabled()));
+    let registry = build_registry(resolved_config(
+        config,
+        dir.ok().as_deref(),
+        &crate::settings::mcp_disabled(),
+    ));
     let count = registry.tool_count();
     if count > 0 {
         tracing::info!("MCP registry ready: {count} tools");
@@ -258,6 +300,10 @@ pub fn load_merged_config() -> McpConfig {
 /// The server key becomes `<plugin>__<server>` so plugin servers never
 /// collide with each other or with user-declared `mcp.toml` entries (the
 /// user's `mcp.toml` wins on an exact key clash by being inserted first).
+///
+/// Layering parity with [`resolved_config`], which repeats this fold with one
+/// extra dimension (the declaring file, published as the AHP customization's
+/// source URI) — a change to the merge rules must land in both.
 pub fn merge_plugin_declarations(config: &mut McpConfig) {
     for record in config::list_plugin_declared_servers() {
         let key = format!("{}__{}", record.plugin, record.name);
@@ -406,23 +452,24 @@ fn header_map(
 /// servers the user disabled in settings. User `mcp.toml` entries win on an
 /// exact key clash by being inserted first; each entry records the file that
 /// declares it, which is the source URI the AHP face publishes.
+///
+/// Layering parity with [`merge_plugin_declarations`] (same merge rules, plus
+/// the source-URI dimension). When `config_dir` is `None` the user layer has
+/// nowhere to come from and contributes nothing — the AHP customization's
+/// `uri` is a required field, so an entry without a resolvable source is
+/// skipped rather than published with an empty URI.
 fn resolved_config(
     config: McpConfig,
+    config_dir: Option<&std::path::Path>,
     disabled: &[String],
 ) -> BTreeMap<String, (McpServerConfig, String)> {
-    let toml_uri = crate::paths::manox_config_dir()
-        .ok()
-        .map(|dir| format!("file://{}", dir.join("mcp.toml").display()));
-    let mut resolved: BTreeMap<String, (McpServerConfig, String)> = config
-        .mcp_servers
-        .iter()
-        .map(|(name, cfg)| {
-            (
-                name.clone(),
-                (cfg.clone(), toml_uri.clone().unwrap_or_default()),
-            )
-        })
-        .collect();
+    let mut resolved: BTreeMap<String, (McpServerConfig, String)> = BTreeMap::new();
+    if let Some(dir) = config_dir {
+        let toml_uri = format!("file://{}", dir.join("mcp.toml").display());
+        for (name, cfg) in &config.mcp_servers {
+            resolved.insert(name.clone(), (cfg.clone(), toml_uri.clone()));
+        }
+    }
     for record in config::list_plugin_declared_servers() {
         let key = format!("{}__{}", record.plugin, record.name);
         resolved
@@ -441,10 +488,17 @@ fn resolved_config(
     resolved
 }
 
-/// Start (or restart) one configured server. Existence is checked
-/// synchronously so a caller gets an immediate refusal for an unknown name;
-/// the connect runs detached and its outcome lands in the slot and the event
-/// stream (`Ready` or `Error`).
+/// Start (or restart) one configured server.
+///
+/// Existence is checked synchronously so a caller gets an immediate refusal
+/// for an unknown name; the connect runs detached and its outcome lands in
+/// the slot and the event stream (`Ready` or `Error`) — validated against
+/// the generation taken here, so a stop or a newer start that lands first
+/// wins and the late connect is discarded with its client cancelled.
+///
+/// A settled `Ready` does **not** remount tools into live sessions: the
+/// engine assembles a session's tools at open/create, so a session that was
+/// open through the lifecycle sees the change on its next open.
 pub fn start(name: &str) -> Result<(), String> {
     let Some(registry) = try_global() else {
         return Err("MCP registry is not initialized".to_string());
@@ -452,38 +506,57 @@ pub fn start(name: &str) -> Result<(), String> {
     let Some(config) = registry.config_of(name) else {
         return Err(format!("unknown MCP server: {name}"));
     };
+    let Some(generation) = registry.begin_start(name) else {
+        return Err(format!("unknown MCP server: {name}"));
+    };
     let name = name.to_string();
     crate::runtime::handle().spawn(async move {
-        if let Some(registry) = try_global() {
-            // Restart semantics: a live client for this name is cancelled
-            // before the fresh connect so two clients never coexist.
-            registry.cancel_client(&name);
-        }
         match connect_one(&name, &config).await {
             Ok(server) => {
                 let tools = server.tools.len();
-                if let Some(registry) = try_global() {
-                    registry.mark_ready(&name, server);
+                let applied = try_global().is_some_and(|r| {
+                    r.settle(
+                        &name,
+                        generation,
+                        ServerState::Ready,
+                        Some(server.client),
+                        server.tools,
+                    )
+                });
+                if applied {
+                    tracing::info!("MCP server `{name}` started: {tools} tools");
+                    fire(&name, ServerState::Ready);
+                } else {
+                    tracing::warn!(
+                        "MCP server `{name}` connected but a newer start/stop superseded it; client dropped"
+                    );
                 }
-                tracing::info!("MCP server `{name}` started: {tools} tools");
-                fire(&name, ServerState::Ready);
             }
             Err(e) => {
                 let message = format!("{e:#}");
                 tracing::warn!("MCP server `{name}` failed to start: {message}");
-                if let Some(registry) = try_global() {
-                    registry.mark_error(&name, message.clone());
+                let applied = try_global().is_some_and(|r| {
+                    r.settle(
+                        &name,
+                        generation,
+                        ServerState::Error(message.clone()),
+                        None,
+                        Vec::new(),
+                    )
+                });
+                if applied {
+                    fire(&name, ServerState::Error(message));
                 }
-                fire(&name, ServerState::Error(message));
             }
         }
     });
     Ok(())
 }
 
-/// Stop one configured server: the live client is cancelled and the slot
-/// lands in `Stopped` (config kept for a later [`start`]). Unknown names are
-/// a synchronous refusal.
+/// Stop one configured server: the live client is cancelled, the generation
+/// bumps (so an in-flight start's connect is discarded when it lands), and
+/// the slot lands in `Stopped` (config kept for a later [`start`]). Unknown
+/// names are a synchronous refusal.
 pub fn stop(name: &str) -> Result<(), String> {
     let Some(registry) = try_global() else {
         return Err("MCP registry is not initialized".to_string());
@@ -494,21 +567,6 @@ pub fn stop(name: &str) -> Result<(), String> {
     tracing::info!("MCP server `{name}` stopped");
     fire(name, ServerState::Stopped);
     Ok(())
-}
-
-impl McpRegistry {
-    /// Cancel a slot's live client, if any, without touching its state.
-    fn cancel_client(&self, name: &str) {
-        if let Some(client) = self
-            .slots
-            .write()
-            .iter_mut()
-            .find(|slot| slot.name == name)
-            .and_then(|slot| slot.client.take())
-        {
-            client.cancellation_token().cancel();
-        }
-    }
 }
 
 /// Connect every configured server concurrently and build the slot list.
@@ -526,29 +584,33 @@ fn build_registry(servers: BTreeMap<String, (McpServerConfig, String)>) -> McpRe
         // worker.
         handle.block_on(async {
             let mut tasks = Vec::new();
+            let mut tasks_identity = Vec::new();
             for (name, (cfg, source_uri)) in servers {
+                // The identity rides outside the task too: a panicked task's
+                // join handle yields nothing, and the fallback slot still owes
+                // the server's real name and source — an `unknown` slot with an
+                // empty URI would publish a customization the AHP face cannot
+                // render.
+                let identity = (name.clone(), source_uri.clone(), cfg.clone());
                 tasks.push(handle.spawn(async move {
                     let result = connect_one(&name, &cfg).await;
                     (name, source_uri, cfg, result)
                 }));
+                tasks_identity.push(identity);
             }
             let mut slots = Vec::new();
-            for task in tasks {
+            for (task, identity) in tasks.into_iter().zip(tasks_identity) {
                 let (name, source_uri, config, result) = match task.await {
                     Ok(outcome) => outcome,
-                    Err(e) => (
-                        "unknown".to_string(),
-                        String::new(),
-                        McpServerConfig {
-                            transport: McpServerTransportConfig::Stdio {
-                                command: String::new(),
-                                args: Vec::new(),
-                                env: None,
-                                cwd: None,
-                            },
-                        },
-                        Err(anyhow::anyhow!("MCP server task panicked: {e}")),
-                    ),
+                    Err(e) => {
+                        let (name, source_uri, config) = identity;
+                        (
+                            name,
+                            source_uri,
+                            config,
+                            Err(anyhow::anyhow!("MCP server task panicked: {e}")),
+                        )
+                    }
                 };
                 match result {
                     Ok(server) => slots.push(ServerSlot {
@@ -558,6 +620,7 @@ fn build_registry(servers: BTreeMap<String, (McpServerConfig, String)>) -> McpRe
                         config,
                         name,
                         source_uri,
+                        generation: 0,
                     }),
                     Err(e) => {
                         let message = format!("{e:#}");
@@ -569,6 +632,7 @@ fn build_registry(servers: BTreeMap<String, (McpServerConfig, String)>) -> McpRe
                             config,
                             name,
                             source_uri,
+                            generation: 0,
                         });
                     }
                 }
@@ -597,13 +661,17 @@ mod tests {
         }
     }
 
+    fn config_dir() -> Option<&'static std::path::Path> {
+        Some(std::path::Path::new("/cfg"))
+    }
+
     #[test]
     fn resolved_config_drops_disabled_servers_only() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
         config.mcp_servers.insert("beta".into(), stdio_cfg());
         config.mcp_servers.insert("gamma".into(), stdio_cfg());
-        let resolved = resolved_config(config, &["beta".to_string()]);
+        let resolved = resolved_config(config, config_dir(), &["beta".to_string()]);
         let names: Vec<&String> = resolved.keys().collect();
         assert_eq!(names, ["alpha", "gamma"]);
     }
@@ -612,31 +680,37 @@ mod tests {
     fn resolved_config_noop_on_empty_disabled_list() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
-        assert_eq!(resolved_config(config, &[]).len(), 1);
+        assert_eq!(resolved_config(config, config_dir(), &[]).len(), 1);
     }
 
     #[test]
     fn resolved_config_user_entry_wins_over_plugin_and_keeps_its_source() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
-        let mut resolved = resolved_config(config, &[]);
+        let mut resolved = resolved_config(config, config_dir(), &[]);
         // A plugin declaring the same key must not displace the user entry:
-        // the source stays whatever the user entry recorded (the real
-        // mcp.toml path, or empty when no config dir exists in the sandbox).
-        let before = resolved.get("alpha").unwrap().1.clone();
+        // the source stays the user's mcp.toml, never a plugin manifest.
         resolved
             .entry("alpha".to_string())
             .or_insert_with(|| (stdio_cfg(), "file:///plugin/.mcp.json".into()));
         let (config, source) = &resolved["alpha"];
-        assert_eq!(source, &before);
         assert!(
-            source.is_empty() || source.ends_with("mcp.toml"),
-            "a user entry's source is mcp.toml, never a plugin manifest: {source}"
+            source.ends_with("mcp.toml"),
+            "a user entry's source is mcp.toml: {source}"
         );
         assert!(matches!(
             &config.transport,
             McpServerTransportConfig::Stdio { command, .. } if command == "true"
         ));
+    }
+
+    #[test]
+    fn a_user_entry_without_a_resolvable_config_dir_is_skipped_not_published_uri_less() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert("alpha".into(), stdio_cfg());
+        // The AHP customization's `uri` is required; an entry with no
+        // resolvable source must not become an empty-URI customization.
+        assert!(resolved_config(config, None, &[]).is_empty());
     }
 
     #[test]
@@ -649,6 +723,7 @@ mod tests {
                 state: ServerState::Error("boom".into()),
                 client: None,
                 tools: Vec::new(),
+                generation: 0,
             }]),
         };
         assert_eq!(
@@ -660,6 +735,49 @@ mod tests {
         assert_eq!(registry.slot("alpha").unwrap().state, ServerState::Stopped);
         assert!(!registry.mark_stopped("missing"));
         assert!(registry.slot("missing").is_none());
+    }
+
+    #[test]
+    fn a_settled_start_under_a_stale_generation_is_discarded() {
+        let registry = McpRegistry {
+            slots: RwLock::new(vec![ServerSlot {
+                name: "alpha".into(),
+                source_uri: "file:///mcp.toml".into(),
+                config: stdio_cfg(),
+                state: ServerState::Stopped,
+                client: None,
+                tools: Vec::new(),
+                generation: 1,
+            }]),
+        };
+        // A connect from generation 0 landing after the slot moved on must
+        // not flip it to Ready — a stop (or a newer start) owns the slot.
+        assert!(!registry.settle("alpha", 0, ServerState::Ready, None, Vec::new()));
+        assert_eq!(registry.slot("alpha").unwrap().state, ServerState::Stopped);
+        assert!(registry.settle("alpha", 1, ServerState::Ready, None, Vec::new()));
+        assert_eq!(registry.slot("alpha").unwrap().state, ServerState::Ready);
+    }
+
+    #[test]
+    fn a_stop_invalidates_an_in_flight_start() {
+        let registry = McpRegistry {
+            slots: RwLock::new(vec![ServerSlot {
+                name: "alpha".into(),
+                source_uri: "file:///mcp.toml".into(),
+                config: stdio_cfg(),
+                state: ServerState::Stopped,
+                client: None,
+                tools: Vec::new(),
+                generation: 0,
+            }]),
+        };
+        let generation = registry.begin_start("alpha").unwrap();
+        assert!(generation > 0);
+        // The user stops while the connect is in flight; the late connect
+        // lands under the pre-stop generation and is discarded.
+        assert!(registry.mark_stopped("alpha"));
+        assert!(!registry.settle("alpha", generation, ServerState::Ready, None, Vec::new()));
+        assert_eq!(registry.slot("alpha").unwrap().state, ServerState::Stopped);
     }
 
     #[test]

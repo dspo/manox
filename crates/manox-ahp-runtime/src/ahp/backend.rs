@@ -139,8 +139,15 @@ impl RuntimeBackend {
                         let Some(backend) = me.as_ref() else {
                             continue;
                         };
-                        for session_id in backend.seeds.lock().keys().cloned().collect::<Vec<_>>() {
-                            if host.session_state(&session_id).is_some() {
+                        // Collect the ids before looping: the `for` head's
+                        // temporary would otherwise hold the seeds read lock
+                        // across every publish (which takes the store write
+                        // lock) — a new lock-holding-across-work pattern with
+                        // no benefit.
+                        let session_ids: Vec<String> =
+                            backend.seeds.lock().keys().cloned().collect();
+                        for session_id in session_ids {
+                            if host.has_session(&session_id) {
                                 host.publish(
                                     &manox_ahp::channels::session::uri(&session_id),
                                     action.clone(),

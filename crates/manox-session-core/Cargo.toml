@@ -26,7 +26,7 @@ manox-workspace.workspace = true
 manox-ahp.workspace = true
 # The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
 # implements, so the adapter never names a gateway type.
-manox-ahp-runtime = { workspace = true, features = ["terminal", "mcp", "ws-gateway"] }
+manox-ahp-runtime = { workspace = true, features = ["terminal", "ws-gateway"] }
 manox-journal.workspace = true
 ahp.workspace = true
 ahp-types.workspace = true
@@ -74,6 +74,10 @@ terminal = ["dep:manox-terminal"]
 # The `cx web` loopback WS gateway (axum). The in-process hosts (gpui, napi)
 # never serve HTTP; opting out drops the axum/hyper server stack.
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
-# The MCP face of the gateway: start/stop requests drive the process-global
-# registry. Opting out turns the requests into refusals.
-mcp = ["manox-agent/mcp"]
+# The MCP face of the gateway: the agent-side registry *and* the ahp-runtime
+# half that seeds customizations and serves start/stop. The two halves are
+# co-elected — seeding without the gateway arms gives clients a server list
+# they cannot drive, and the gateway arms without the registry refuse every
+# request. Opting out turns the requests into refusals and keeps rmcp out of
+# lean builds entirely.
+mcp = ["manox-agent/mcp", "manox-ahp-runtime/mcp"]

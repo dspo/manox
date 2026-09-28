@@ -176,6 +176,12 @@ impl Host {
         self.inner.store.read().session(session_id).cloned()
     }
 
+    /// Whether the host holds state for `session_id` — the existence check
+    /// without the clone, for publish fan-out over many sessions.
+    pub fn has_session(&self, session_id: &str) -> bool {
+        self.inner.store.read().session(session_id).is_some()
+    }
+
     /// Install the runtime's folded session state as this channel's state.
     ///
     /// The runtime seeds a session when it first serves one (and re-seeds it
