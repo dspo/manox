@@ -1665,4 +1665,29 @@ mod answer_mapping_tests {
     fn no_answers_at_all_is_an_empty_list() {
         assert!(map_answers(&None).is_empty());
     }
+
+    /// The approve path keys on the option's **identifier**, which is what a
+    /// client echoes back in `selected` (`ChatInputOption::id` is documented as
+    /// the stable option identifier). The plan-review card's option id and the
+    /// runtime's comparison have to stay the same string or an approved plan
+    /// silently fails to seed — a mismatch here is invisible, because the
+    /// dispatch still answers `Accepted`.
+    #[test]
+    fn an_approved_plan_selection_is_recognised_by_option_id() {
+        let mapped = map_answers(&answers(vec![(
+            "plan-review:e-1:q",
+            submitted(ChatInputAnswerValue::Selected(
+                ChatInputSelectedAnswerValue {
+                    value: "approve".to_string(),
+                    freeform_values: None,
+                },
+            )),
+        )]));
+        assert!(
+            mapped
+                .iter()
+                .any(|a| a.selected.iter().any(|s| s == "approve")),
+            "the runtime's approve test must match what the card offers: {mapped:?}"
+        );
+    }
 }
