@@ -133,7 +133,7 @@ manox 的 harness 已切换到 manox-harness 内核（`crates/manox-harness/src/
 
 - 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
 - 每 PR 门禁：以 `script/gates.sh` 的输出为唯一权威（含 `--quick` 之外的完整四腿），不做手挑 `cargo test` 的假绿声明。
-- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、IPC socket 测试）记录在案、不计回归；整机并发 timing flake（`manox_agent::monitor_bridge::monitor_spawn_bridges_snapshots`：全量跑偶发失败、单独跑恒过）同样不计回归。
+- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、IPC socket 测试）记录在案、不计回归；整机并发 timing flake（`manox_agent::monitor_bridge::monitor_spawn_bridges_snapshots`：全量跑偶发失败、单独跑恒过）同样不计回归。**再记一条**（2026-09-28，CI ubuntu-latest 实测）：`manox_harness::core::session::jsonl::tests::test_message_entry_writes_camel_case_parent_id` 在 CI 全量跑中偶发 `Option::unwrap() on a None value`（`jsonl.rs` 的 `.find(...)` 找不到刚写的 `child` 行），单独跑与本地全量跑恒过、同 job 重跑即绿。该测试用独立 `tempfile::tempdir`，不共享状态，失败点是「写完立刻从另一路径读回」的可见性窗口，非逻辑缺陷；同一 job 在本仓历史上也出现过别的并发类 flake（`concurrent_open_session_yields_one_entry_one_pump`、`concurrent_cold_appends_land_a_linear_chain`）。判定：环境性，不计回归；若再次命中且重跑不绿，则升级为真缺陷排查。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
 
 ## 项目规则
