@@ -15,14 +15,32 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
     src/core/              # TS Pi 内核移植（纯内核，无业务逻辑）
     src/ext/               # 经内核拓展点扩展的业务能力
-  manox-protocol/          # 协议定义
-  manox-session-core/      # 会话核心（AgentServer/Client 网关、journal、ws）
+  manox-journal/           # 会话磁盘格式（journal v4 条目词汇）的叶子 crate
+  manox-ahp/               # AHP 宿主层（频道、JSON-RPC、传输、x-manox 扩展面）
+  manox-ahp-runtime/       # AHP 宿主背后的运行时半边（SessionRuntime 缝 + 适配器）
+  manox-session-core/      # 会话核心（会话存储 + SessionRuntime 缝的实现 + loopback ws）
   manox-terminal/          # 终端仿真核心（自 manox-app 回流，UI 层 terminal-ui 在下游仓）
   hyperlinks/              # 终端超链接检测（随 manox-terminal 一同回流）
   supervisor/              # 子进程监督
   lsp/                     # LSP 集成
   manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
 ```
+
+### 协议（AHP）
+
+对外协议是 **AHP**（`ahp` / `ahp-types`，pin `=0.9.0`）：宿主层在 `manox-ahp`，
+运行时半边在 `manox-ahp-runtime`，会话存储在 `manox-session-core`。
+**自研的 "protocol v2" 已整体删除**（含 `crates/manox-protocol`）——v2 能做的
+能力必须全部落在 AHP 面上（AHP 没有的那部分由 `x-manox/*` 扩展面承载），
+否则该能力就是缺的，不是"v2 里还有"。
+
+- `manox-agent` 永不认识 AHP：它只经 `ThreadHandle` / `BackendNotice` /
+  `CapabilityClient` 暴露能力，协议适配一律在其上层。
+- 依赖方向单向：`manox-ahp` → `manox-ahp-runtime` → `manox-session-core`。
+  runtime 半边不得命名具体的会话运行时（进程单例的 builder 由拥有会话存储
+  的一方安装），也不得反向依赖会话核心。
+- 写操作 fail-closed：AHP 的 action 已被 reducer 折叠进订阅者状态，所以运行时
+  拒绝必须回报为 refusal —— 静默 no-op 会让每个客户端收敛到一个从未发生的状态。
 
 ### 仓库边界（manox / manox-app 拆分）
 

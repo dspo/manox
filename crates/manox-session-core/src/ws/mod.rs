@@ -1,20 +1,15 @@
 //! The gateway's WebSocket transport arm: a loopback HTTP listener whose
-//! `/ws` route upgrades token-authenticated clients into
-//! [`WebSocketConnection`] bridges handed straight to the shared
-//! [`AgentServer`](crate::agent_server::AgentServer). Every client speaks the
-//! typed `FromClient`/`FromServer` protocol directly — no translation layer.
+//! `/ahp` route upgrades token-authenticated clients onto the process's AHP
+//! host. Every client speaks the protocol directly — no translation layer.
 //!
 //! History: this listener was the `manox-webui` crate's network face, serving
 //! the embedded browser frontend; the frontend-removal decision deleted the
 //! product face and kept the transport (the "keep the implemented http/ws
-//! interfaces" ruling), moved here next to the gateway it feeds. The desktop
-//! binary does not start it; `cx web` runs it headless, and out-of-process
-//! clients discover the endpoint through `<config>/gateway-ws.json` (0600).
+//! interfaces" ruling). The desktop binary does not start it; `cx web` runs it
+//! headless, and out-of-process clients discover the endpoint through
+//! `<config>/gateway-ws.json` (0600).
 
-mod connection;
 mod listener;
-
-pub use connection::WebSocketConnection;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -106,7 +101,7 @@ fn release_gateway_lease() {
 /// `<config>/gateway-ws.json`. Fire-and-forget: a bind failure surfaces as a
 /// tracing error and a `None` endpoint until a later `start` retries
 /// (callers waiting on [`service_endpoint`] should bound their wait).
-pub fn start(cwd: PathBuf, port: u16) {
+pub fn start(_cwd: PathBuf, port: u16) {
     // Second-start guard (§三.2): the slot is RESERVED under one lock hold
     // before the bind is spawned, so neither a sequential nor a racing
     // second `start` can bind a second listener or overwrite the published
@@ -135,9 +130,8 @@ pub fn start(cwd: PathBuf, port: u16) {
         *GATEWAY_LEASE.lock().unwrap() = Some(lease);
         *slot = Some(ListenerState::Starting);
     }
-    let server = crate::agent_server::global(cwd);
     manox_agent::runtime::handle().spawn(async move {
-        if let Err(e) = listener::bind_and_serve(server, port).await {
+        if let Err(e) = listener::bind_and_serve(port).await {
             tracing::error!(error = %e, "gateway WS listener failed to start");
             // A failed bind leaves the reservation pointing at nothing —
             // release the slot AND the lease so a later start can retry
@@ -206,31 +200,31 @@ pub(crate) fn publish(endpoint: GatewayEndpoint) {
 mod tests {
     use super::*;
 
-    /// §三.2 / OPEN-2, the transport e2e: bind → publish (0600 file) →
-    /// no-token upgrade rejected 401 → token upgrade succeeds. This is the
-    /// face `cx web` serves; until W7 it had no integration coverage at all.
-    // The globals guard is the suite's test-serialization mutex; the
-    // current-thread test runtime has no re-entrant taker, so holding it
-    // across the test's own awaits is safe.
-    #[allow(clippy::await_holding_lock)]
+    /// The `/ahp` face rides the *same* gateway listener, and therefore the
+    /// same token and origin gates as `/ws`. The conformance suite binds its
+    /// own listener, so without this the gateway's own gate on the AHP route
+    /// would be the one path with no coverage — and it is the security
+    /// boundary: the token is what stands between a local page and the host.
+    ///
+    /// Also asserts the route is really mounted: a tokenless 401 could equally
+    /// come from a 404 handler that rejects everything.
+    #[allow(clippy::await_holding_lock)] // same test-guard rationale as above
     #[tokio::test]
-    async fn ws_end_to_end_binds_publishes_and_authenticates() {
+    async fn ahp_route_rides_the_gateway_token_gate() {
         let _g = crate::test_support::lock_globals();
         crate::test_support::hermetic_home();
         crate::test_support::init_globals();
         manox_agent::thread_store::init();
-        // The endpoint slot is process-global; own it for this test and
-        // leave it empty again on the way out.
         *endpoint_slot().lock().unwrap() = None;
+        // The listener builds the process AHP runtime, which needs the session
+        // runtime builder installed — that is `global()`'s job, and it is also
+        // what a real `cx web` boot does.
+        let _server = crate::agent_server::global(PathBuf::from("/"));
 
-        let server = std::sync::Arc::new(
-            crate::agent_server::AgentServer::new_without_store_watcher(PathBuf::from("/")),
-        );
         let serve = tokio::spawn(async move {
-            let _ = listener::bind_and_serve(server, 0).await;
+            let _ = listener::bind_and_serve(0).await;
         });
 
-        // Bind + publish (bounded wait).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let endpoint = loop {
             if let Some(endpoint) = service_endpoint() {
@@ -243,39 +237,82 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         };
 
-        // The published file exists and carries the token at mode 0600.
-        let file = manox_agent::paths::manox_config_dir()
-            .expect("config dir")
-            .join("gateway-ws.json");
-        let text = std::fs::read_to_string(&file).expect("gateway-ws.json written");
-        assert!(text.contains(&endpoint.token), "the file carries the token");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "gateway-ws.json stays user-only");
-        }
-
-        // No token → 401 (the HTTP rejection surfaces as tungstenite's
-        // Http error carrying the status).
+        // No token → 401, exactly as `/ws` answers.
         let denied =
-            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ws", endpoint.port)).await;
-        assert!(denied.is_err(), "a tokenless upgrade must be rejected");
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/ahp", endpoint.port)).await;
+        assert!(denied.is_err(), "a tokenless /ahp upgrade must be rejected");
         match denied.unwrap_err() {
             tokio_tungstenite::tungstenite::Error::Http(resp) => {
-                assert_eq!(resp.status(), 401, "the tokenless leg answers 401");
+                assert_eq!(resp.status(), 401, "the tokenless /ahp leg answers 401");
             }
             other => panic!("expected the HTTP 401 rejection, got {other:?}"),
         }
 
-        // With the token → the upgrade succeeds (then close).
-        let allowed = tokio_tungstenite::connect_async(format!(
-            "ws://127.0.0.1:{}/ws?token={}",
-            endpoint.port, endpoint.token
-        ))
-        .await;
-        assert!(allowed.is_ok(), "the tokened upgrade must succeed");
-        let (mut socket, _resp) = allowed.unwrap();
+        // A *foreign browser* origin is refused even with the right token
+        // (DNS-rebinding / CSWSH), while a non-browser origin passes on the
+        // token alone — the reference client dials `vscode-file://vscode-app`.
+        let request =
+            tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+                format!(
+                    "ws://127.0.0.1:{}/ahp?token={}",
+                    endpoint.port, endpoint.token
+                ),
+            )
+            .expect("request builds");
+        let mut foreign = request.clone();
+        foreign.headers_mut().insert(
+            "Origin",
+            "http://evil.example".parse().expect("header value"),
+        );
+        let refused = tokio_tungstenite::connect_async(foreign).await;
+        match refused {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status(), 403, "a foreign browser origin is refused");
+            }
+            other => panic!("expected the HTTP 403 rejection, got {other:?}"),
+        }
+
+        // With the token and a non-browser origin → the upgrade succeeds and an
+        // AHP `initialize` is answered over it: the route serves the host, not
+        // just a socket.
+        let mut client = request;
+        client.headers_mut().insert(
+            "Origin",
+            "vscode-file://vscode-app".parse().expect("header value"),
+        );
+        let (mut socket, _resp) = tokio_tungstenite::connect_async(client)
+            .await
+            .expect("the tokened /ahp upgrade succeeds");
+        use futures::{SinkExt, StreamExt};
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::text(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "channel": ahp_types::common::ROOT_RESOURCE_URI,
+                        "clientId": "gateway-test",
+                        "protocolVersions": [ahp_types::version::PROTOCOL_VERSION],
+                        "initialSubscriptions": [],
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("initialize sends");
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
+            .await
+            .expect("initialize is answered")
+            .expect("socket stays open")
+            .expect("frame reads");
+        let text = reply.into_text().expect("a text frame");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("JSON-RPC");
+        assert_eq!(value["id"], 1, "the reply is correlated: {value}");
+        assert!(
+            value.get("error").is_none(),
+            "the gateway leg completes the handshake: {value}"
+        );
         let _ = socket.close(None).await;
 
         serve.abort();

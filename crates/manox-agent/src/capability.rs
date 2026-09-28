@@ -8,10 +8,10 @@
 //! fallback, so a tool surfaces "capability unavailable" instead of a fake
 //! success.
 //!
-//! This is the in-process precursor of the protocol's capability negotiation
-//! (`manox_protocol::ClientHello::capabilities` + `ServerCall` routing): when
-//! the AgentServer lands, the provider's implementations become the client side
-//! of those `ServerCall`s and this seam is rewired without touching call sites.
+//! The provider is registered by whoever owns the frontend (the session
+//! gateway): its implementations route each capability call to a client that
+//! declared it, and a host with no such client refuses rather than faking a
+//! success.
 
 use std::sync::{Arc, Mutex};
 
@@ -73,8 +73,8 @@ pub fn drop_provider_for_test() {
 
 // The session id whose turn invoked the current capability call. Set by the
 // kernel (`handle_browser_request`) on the spawn task that runs `browser_op`,
-// so the AgentServer's CapabilityClient impl can route the ServerCall to the
-// owning client. Absent (`None`) in headless contexts with no turn.
+// so the gateway's `CapabilityClient` impl can address the request to a client
+// watching that session. Absent (`None`) in headless contexts with no turn.
 tokio::task_local! {
     pub static CURRENT_SESSION: Option<String>;
 }

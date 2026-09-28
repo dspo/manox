@@ -4,9 +4,9 @@
 //! Each tool rides the same round-trip architecture as the permission gate
 //! and the web tools: the tool (tokio) sends a `BackendNotice` with a
 //! responder channel, the facade executes the capability against the
-//! registered provider (scoping the session task-local so the
-//! AgentServer's provider can route the `ServerCall` to the owning client)
-//! and replies through the channel. The tools themselves are registered
+//! registered provider (scoping the session task-local so the provider can
+//! address the request to a client watching that session) and replies
+//! through the channel. The tools themselves are registered
 //! only when a capability provider is present — a headless context with no
 //! host surface exposes neither tool rather than failing at call time.
 

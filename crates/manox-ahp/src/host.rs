@@ -1,0 +1,604 @@
+//! The host: one per process, owning the `serverSeq` domain, the channel store,
+//! the live connections and host → client requests.
+//!
+//! Publishing is synchronous on purpose. The runtime appends a journal entry on
+//! its own thread and must be able to turn it into an action envelope without
+//! an async hop: [`Host::publish`] stamps the sequence, reduces the action into
+//! the host's authoritative state and queues the envelope to every subscriber.
+//! Nothing in that path awaits, so a stalled client can never stall the runtime.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ahp_types::actions::{ActionEnvelope, ActionOrigin, StateAction};
+use ahp_types::common::Uri;
+use ahp_types::messages::{JsonRpcError, JsonRpcMessage};
+use ahp_types::notifications::{
+    PartialSessionSummary, SessionAddedParams, SessionRemovedParams, SessionSummaryChangedParams,
+};
+use ahp_types::state::{RootState, SessionSummary, Snapshot, SnapshotState};
+use parking_lot::RwLock;
+use serde_json::Value;
+
+use crate::backend::Backend;
+use crate::channels::{Channel, ChannelStore, parse, root};
+use crate::connection::Conn;
+use crate::error::HostError;
+use crate::jsonrpc::MsgId;
+use crate::sequencer::Sequencer;
+use crate::transport::HostTransport;
+use crate::wire;
+
+/// The manox AHP host.
+#[derive(Clone)]
+pub struct Host {
+    inner: Arc<Inner>,
+}
+
+/// Host state shared by every connection.
+pub(crate) struct Inner {
+    pub(crate) backend: Arc<dyn Backend>,
+    pub(crate) seq: Sequencer,
+    pub(crate) store: RwLock<ChannelStore>,
+    pub(crate) conns: RwLock<Vec<Arc<Conn>>>,
+    next_request: AtomicU64,
+    next_conn: AtomicU64,
+}
+
+/// A host → client request is answered by a human in the loop (an approval, a
+/// question, a browser operation), so the default deadline is generous — and the
+/// issuer owns it, never the correlation layer. [`Host::request_within`] takes
+/// an explicit deadline for callers that should not wait that long.
+const CLIENT_ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl Host {
+    /// A host serving `backend`, with the root channel seeded from it.
+    pub fn new(backend: Arc<dyn Backend>) -> Self {
+        let root: RootState = backend.root_state();
+        Self {
+            inner: Arc::new(Inner {
+                backend,
+                seq: Sequencer::default(),
+                store: RwLock::new(ChannelStore::new(root)),
+                conns: RwLock::new(Vec::new()),
+                next_request: AtomicU64::new(0),
+                next_conn: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// The runtime behind this host.
+    pub fn backend(&self) -> &Arc<dyn Backend> {
+        &self.inner.backend
+    }
+
+    /// The highest stamped `serverSeq`.
+    pub fn server_seq(&self) -> i64 {
+        self.inner.seq.watermark()
+    }
+
+    /// Number of live connections.
+    pub fn connection_count(&self) -> usize {
+        self.inner.conns.read().len()
+    }
+
+    /// Accept a transport whose peer speaks a non-standard dialect.
+    pub fn accept_with_dialect(
+        &self,
+        transport: HostTransport,
+        dialect: Box<dyn crate::connection::Dialect>,
+    ) {
+        self.accept_inner(transport, Some(dialect));
+    }
+
+    /// Accept a transport: one reader task and one writer task, until the peer
+    /// closes.
+    pub fn accept(&self, transport: HostTransport) {
+        self.accept_inner(transport, None);
+    }
+
+    fn accept_inner(
+        &self,
+        transport: HostTransport,
+        dialect: Option<Box<dyn crate::connection::Dialect>>,
+    ) {
+        let (tx, rx) = async_channel::unbounded::<JsonRpcMessage>();
+        // The dialect is installed before the connection is shared, which is
+        // what keeps the seam per-connection rather than per-host.
+        let mut conn = Conn::new(self.inner.next_conn.fetch_add(1, Ordering::SeqCst) + 1, tx);
+        if let Some(dialect) = dialect {
+            conn.set_dialect(dialect);
+        }
+        let conn = Arc::new(conn);
+        self.inner.conns.write().push(conn.clone());
+
+        let (mut sink, mut source) = transport.split();
+        let writer_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(msg) = rx.recv().await {
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            writer_conn.kill();
+        });
+
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(Some(msg)) => {
+                        let msg = conn.interpret(msg);
+                        crate::router::handle(&inner, &conn, msg).await
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::debug!(connection = conn.id(), "transport closed: {err}");
+                        break;
+                    }
+                }
+            }
+            conn.cancel_waiters(JsonRpcError {
+                code: crate::codes::X_MANOX_BACKEND,
+                message: "client connection closed".to_string(),
+                data: None,
+            });
+            conn.kill();
+            inner.conns.write().retain(|live| live.id() != conn.id());
+        });
+    }
+
+    /// Publish one host-originated action (see [`Inner::publish`]).
+    pub fn publish(
+        &self,
+        uri: &str,
+        action: StateAction,
+        origin: Option<ActionOrigin>,
+    ) -> ActionEnvelope {
+        self.inner.publish(uri, action, origin)
+    }
+
+    /// `root/sessionAdded` to root subscribers.
+    pub fn session_added(&self, summary: SessionSummary) {
+        self.inner.session_added(summary);
+    }
+
+    /// The host's authoritative chat state, as its own reducer fold left it.
+    ///
+    /// Convergence gate entry point: a client that reduced the envelopes it was
+    /// handed must land on exactly this value.
+    pub fn chat_state(&self, chat_id: &str) -> Option<ahp_types::state::ChatState> {
+        self.inner.store.read().chat(chat_id).cloned()
+    }
+
+    /// The host's authoritative session state. See [`Host::chat_state`].
+    pub fn session_state(&self, session_id: &str) -> Option<ahp_types::state::SessionState> {
+        self.inner.store.read().session(session_id).cloned()
+    }
+
+    /// Install the runtime's folded session state as this channel's state.
+    ///
+    /// The runtime seeds a session when it first serves one (and re-seeds it
+    /// after a feed gap): the fold is the same function clients would reach by
+    /// reducing every action, so seeding is not a second source of truth.
+    pub fn seed_session(&self, session_id: &str, state: ahp_types::state::SessionState) {
+        self.inner.store.write().insert_session(session_id, state);
+    }
+
+    /// Install the runtime's folded chat state (see [`Host::seed_session`]).
+    pub fn seed_chat(&self, session_id: &str, chat_id: &str, state: ahp_types::state::ChatState) {
+        self.inner
+            .store
+            .write()
+            .insert_chat(session_id, chat_id, state);
+    }
+
+    /// Install the runtime's folded terminal state (see [`Host::seed_session`]).
+    pub fn seed_terminal(&self, terminal_id: &str, state: ahp_types::state::TerminalState) {
+        self.inner.store.write().insert_terminal(terminal_id, state);
+    }
+
+    /// The host's folded `x-manox` state for one extension channel.
+    pub fn extension_state(&self, uri: &str) -> Option<crate::ext::XManoxState> {
+        self.inner.store.read().extension(uri).cloned()
+    }
+
+    /// `root/sessionRemoved` to root subscribers.
+    pub fn session_removed(&self, session_id: &str) {
+        self.inner.session_removed(session_id);
+    }
+
+    /// `root/sessionSummaryChanged` to root subscribers.
+    pub fn summary_changed(&self, session_id: &str, changes: PartialSessionSummary) {
+        self.inner.summary_changed(session_id, changes);
+    }
+
+    /// Ask one client to do something (AHP allows host-initiated requests; the
+    /// `resource*` family is the standard precedent, `x-manox/*` our extension).
+    ///
+    /// Fail-closed: a dropped or unanswered request is an error, never a silent
+    /// success.
+    pub async fn request(
+        &self,
+        conn: &Arc<Conn>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HostError> {
+        self.request_within(conn, method, params, CLIENT_ANSWER_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::request`] against one session's subscribers, choosing a client
+    /// that declared it can answer `method`.
+    ///
+    /// A host-initiated request is session-scoped: the capability belongs to the
+    /// client watching that session (its clipboard, its browser, its window), so
+    /// the candidate set is the session channel's subscribers filtered by their
+    /// own declaration — never "any connected client", which would ask a client
+    /// that never claimed the capability and then wait out the deadline for an
+    /// answer that cannot come.
+    ///
+    /// Fail-closed at both ends: no declared-and-subscribed client is an error
+    /// before anything goes on the wire, and a silent client is an error after
+    /// the deadline. Nothing here invents a default value.
+    pub async fn request_client(
+        &self,
+        session_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, HostError> {
+        let uri = crate::channels::session::uri(session_id);
+        let candidates: Vec<Arc<Conn>> = self
+            .inner
+            .subscribers(&uri)
+            .into_iter()
+            .filter(|conn| conn.can_answer(method))
+            .collect();
+        let Some(conn) = candidates.first() else {
+            return Err(HostError::Backend(format!(
+                "no client subscribed to {uri} declared it can answer {method}"
+            )));
+        };
+        self.request(conn, method, params).await
+    }
+
+    /// Whether any subscriber of this session declared it can answer `method`.
+    ///
+    /// The router's gate: it must be able to tell "no AHP client owns this
+    /// capability" (fall through to another transport) from "an AHP client owns
+    /// it and failed" (an error), and only this can distinguish them.
+    pub fn has_capable_client(&self, session_id: &str, method: &str) -> bool {
+        let uri = crate::channels::session::uri(session_id);
+        self.inner
+            .subscribers(&uri)
+            .iter()
+            .any(|conn| conn.can_answer(method))
+    }
+
+    /// [`Self::request`] with an explicit deadline.
+    ///
+    /// The deadline is a parameter rather than a knob because the issuer owns
+    /// it: production waits minutes (a human answers), a test waits
+    /// milliseconds, and neither should be able to change the other's.
+    pub async fn request_within(
+        &self,
+        conn: &Arc<Conn>,
+        method: &str,
+        params: Value,
+        within: std::time::Duration,
+    ) -> Result<Value, HostError> {
+        let id = MsgId::next(&self.inner.next_request);
+        let Some(waiter) = conn.register_waiter(id) else {
+            // A duplicate id is our own bookkeeping bug: fail this delivery
+            // closed instead of clobbering a live waiter.
+            return Err(HostError::Backend(format!(
+                "duplicate request id {id} for {method}"
+            )));
+        };
+        conn.send(wire::request(id.0, method, params));
+        match tokio::time::timeout(within, waiter.recv()).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(error))) => Err(HostError::Backend(error.message)),
+            Ok(Err(_)) => Err(HostError::Backend(format!(
+                "client connection closed before answering {method}"
+            ))),
+            Err(_) => {
+                let _ = conn.complete_waiter(
+                    id,
+                    Err(JsonRpcError {
+                        code: crate::codes::X_MANOX_BACKEND,
+                        message: format!("client did not answer {method} in time"),
+                        data: None,
+                    }),
+                );
+                Err(HostError::Backend(format!(
+                    "client did not answer {method}"
+                )))
+            }
+        }
+    }
+}
+
+impl Inner {
+    /// Connections observing `uri`.
+    pub(crate) fn subscribers(&self, uri: &str) -> Vec<Arc<Conn>> {
+        self.conns
+            .read()
+            .iter()
+            .filter(|conn| conn.alive() && conn.is_subscribed(uri))
+            .cloned()
+            .collect()
+    }
+
+    /// Queue one envelope to every subscriber of its channel.
+    pub(crate) fn broadcast(&self, envelope: &ActionEnvelope) {
+        let msg = wire::action_notification(envelope.clone());
+        for conn in self.subscribers(&envelope.channel) {
+            conn.send(msg.clone());
+        }
+    }
+
+    /// The live connection carrying `client_id`.
+    pub(crate) fn connection_for_client(&self, client_id: &str) -> Option<Arc<Conn>> {
+        self.conns
+            .read()
+            .iter()
+            .find(|conn| conn.alive() && conn.client_id().as_deref() == Some(client_id))
+            .cloned()
+    }
+
+    /// Re-seat a client id onto `conn`: a reconnecting client takes over its
+    /// previous connection, which is dropped (its transport tasks end when its
+    /// queue closes).
+    pub(crate) fn reseat(&self, conn: &Arc<Conn>, client_id: &str) {
+        if let Some(previous) = self.connection_for_client(client_id)
+            && previous.id() != conn.id()
+        {
+            // The previous connection's waiters die with it; the error says so,
+            // so a sender can tell a connection swap from a delivery failure.
+            previous.cancel_waiters(JsonRpcError {
+                code: crate::codes::X_MANOX_BACKEND,
+                message: "client/reseated".to_string(),
+                data: None,
+            });
+            previous.kill();
+            self.conns.write().retain(|live| live.id() != previous.id());
+        }
+    }
+
+    /// Publish one host-originated action: stamp it, fold it into the host's
+    /// state and broadcast it to the channel's subscribers.
+    ///
+    /// A rejected reduction is a host bug — the action came from our own
+    /// translation — so it is logged loudly and still broadcast: clients reduce
+    /// the same envelope, and the convergence gate turns a mismatch into a test
+    /// failure rather than a silent divergence.
+    pub(crate) fn publish(
+        &self,
+        uri: &str,
+        action: StateAction,
+        origin: Option<ActionOrigin>,
+    ) -> ActionEnvelope {
+        let envelope = self.stamp_and_fold(uri, action, origin);
+        self.broadcast(&envelope);
+        envelope
+    }
+
+    /// Stamp and fold without broadcasting (the dispatch path answers the
+    /// originator through the broadcast of the accepted envelope).
+    pub(crate) fn stamp_and_fold(
+        &self,
+        uri: &str,
+        action: StateAction,
+        origin: Option<ActionOrigin>,
+    ) -> ActionEnvelope {
+        let server_seq = self.seq.stamp() as u64;
+        let tag = wire::action_tag(&action);
+        if let Some(channel) = parse(uri) {
+            let is_extension = crate::ext::is_extension_action(&tag);
+            let outcome = self.store.write().apply(&channel, &action);
+            // Extension actions have no upstream reducer by construction, so a
+            // no-op there is normal; a standard action that does not apply is a
+            // translation bug and must be loud.
+            if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
+                tracing::warn!(channel = uri, action = %tag, "host action reduced to {outcome:?}");
+            }
+        } else {
+            tracing::warn!(channel = uri, "host action on an unknown channel scheme");
+        }
+        ActionEnvelope {
+            channel: uri.to_string(),
+            action,
+            server_seq,
+            origin,
+            rejection_reason: None,
+        }
+    }
+
+    /// Echo a refused client action back to everyone observing the channel, so
+    /// the originator learns its write did not land (AHP's rejection contract).
+    pub(crate) fn reject(
+        &self,
+        uri: &str,
+        action: StateAction,
+        origin: Option<ActionOrigin>,
+        reason: String,
+    ) -> ActionEnvelope {
+        let server_seq = self.seq.stamp() as u64;
+        let envelope = ActionEnvelope {
+            channel: uri.to_string(),
+            action,
+            server_seq,
+            origin,
+            rejection_reason: Some(reason),
+        };
+        self.broadcast(&envelope);
+        envelope
+    }
+
+    /// The highest stamped `serverSeq`.
+    pub(crate) fn watermark(&self) -> i64 {
+        self.seq.watermark()
+    }
+
+    /// A snapshot for `channel`, or `None` for stateless channels.
+    pub(crate) fn snapshot(&self, channel: &Channel) -> Option<Snapshot> {
+        let state: SnapshotState = self.store.read().snapshot(channel)?;
+        Some(Snapshot {
+            resource: channel.uri(),
+            state,
+            from_seq: self.seq.watermark(),
+        })
+    }
+
+    /// Send one protocol notification to a channel's subscribers.
+    pub(crate) fn notify(&self, uri: &str, method: &str, params: Value) {
+        let msg = wire::notification(method, params);
+        for conn in self.subscribers(uri) {
+            conn.send(msg.clone());
+        }
+    }
+
+    /// Send one protocol notification to root subscribers.
+    pub(crate) fn notify_root(&self, method: &str, params: Value) {
+        self.notify(root::URI, method, params);
+    }
+
+    /// `root/sessionAdded` to root subscribers.
+    pub(crate) fn session_added(&self, summary: SessionSummary) {
+        let params = SessionAddedParams {
+            channel: root::URI.to_string(),
+            summary,
+        };
+        self.notify_root(
+            "root/sessionAdded",
+            serde_json::to_value(params).unwrap_or(Value::Null),
+        );
+    }
+
+    /// `root/sessionRemoved` to root subscribers.
+    pub(crate) fn session_removed(&self, session_id: &str) {
+        let params = SessionRemovedParams {
+            channel: root::URI.to_string(),
+            session: crate::channels::session::uri(session_id),
+        };
+        self.notify_root(
+            "root/sessionRemoved",
+            serde_json::to_value(params).unwrap_or(Value::Null),
+        );
+    }
+
+    /// `root/sessionSummaryChanged` to root subscribers — the session list
+    /// stays in sync without every client subscribing to every session.
+    pub(crate) fn summary_changed(&self, session_id: &str, changes: PartialSessionSummary) {
+        let params = SessionSummaryChangedParams {
+            channel: root::URI.to_string(),
+            session: crate::channels::session::uri(session_id),
+            changes,
+        };
+        self.notify_root(
+            "root/sessionSummaryChanged",
+            serde_json::to_value(params).unwrap_or(Value::Null),
+        );
+    }
+
+    /// Make sure a session's state is loaded, seeding from the backend.
+    pub(crate) fn ensure_session(&self, session_id: &str) -> Result<(), HostError> {
+        if self.store.read().session(session_id).is_some() {
+            return Ok(());
+        }
+        let state = self
+            .backend
+            .session_state(session_id)
+            .ok_or_else(|| HostError::SessionNotFound(session_id.to_string()))?;
+        let chats: Vec<Uri> = state
+            .chats
+            .iter()
+            .map(|chat| chat.resource.clone())
+            .collect();
+        self.store.write().insert_session(session_id, state);
+        for uri in chats {
+            if let Some(chat_id) = crate::channels::chat::id(&uri)
+                && let Some(chat) = self.backend.chat_state(chat_id)
+            {
+                self.store.write().insert_chat(session_id, chat_id, chat);
+            }
+        }
+        Ok(())
+    }
+
+    /// Make sure a chat's state and its session link are loaded.
+    pub(crate) fn ensure_chat(&self, chat_id: &str) -> Result<String, HostError> {
+        if let Some(owner) = self.store.read().chat_session(chat_id).map(str::to_string) {
+            return Ok(owner);
+        }
+        let session_id = self
+            .backend
+            .session_state_for_chat(chat_id)
+            .ok_or_else(|| HostError::NotFound(crate::channels::chat::uri(chat_id)))?;
+        self.ensure_session(&session_id)?;
+        if self.store.read().chat(chat_id).is_none() {
+            let state = self
+                .backend
+                .chat_state(chat_id)
+                .ok_or_else(|| HostError::NotFound(crate::channels::chat::uri(chat_id)))?;
+            self.store.write().insert_chat(&session_id, chat_id, state);
+        }
+        Ok(session_id)
+    }
+
+    /// Make sure a terminal's state is loaded.
+    pub(crate) fn ensure_terminal(&self, terminal_id: &str) -> Result<(), HostError> {
+        if self.store.read().terminal(terminal_id).is_some() {
+            return Ok(());
+        }
+        let state = self
+            .backend
+            .terminal_state(terminal_id)
+            .ok_or_else(|| HostError::NotFound(crate::channels::terminal::uri(terminal_id)))?;
+        self.store.write().insert_terminal(terminal_id, state);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A connection is a candidate only for the methods it declared.
+    ///
+    /// This is the gate that decides whether the AHP transport owns a
+    /// host-initiated request at all. If it answered "yes" for everything, the
+    /// capability router would hand this transport a request no client can
+    /// serve and then wait out the 300-second deadline for an answer that cannot
+    /// come — while the transport that did own it was never asked.
+    #[test]
+    fn only_declared_client_requests_select_a_connection() {
+        let (tx, _rx) = async_channel::unbounded();
+        let conn = Conn::new(1, tx);
+
+        // A client that declared nothing owns nothing.
+        assert!(!conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+
+        conn.set_client_requests(vec![
+            crate::ext::requests::CLIPBOARD_READ.to_string(),
+            crate::ext::requests::OPEN_EXTERNAL.to_string(),
+        ]);
+        assert!(conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+        assert!(conn.can_answer(crate::ext::requests::OPEN_EXTERNAL));
+        assert!(
+            !conn.can_answer(crate::ext::requests::BROWSER_OP),
+            "a method the client did not declare is not owed to it"
+        );
+        assert!(
+            !conn.can_answer("x-manox/unknownFutureMethod"),
+            "an undeclared method of any name is refused"
+        );
+
+        // Re-declaring replaces rather than accumulates: a client that dropped a
+        // capability must stop being asked for it.
+        conn.set_client_requests(vec![crate::ext::requests::BROWSER_OP.to_string()]);
+        assert!(!conn.can_answer(crate::ext::requests::CLIPBOARD_READ));
+        assert!(conn.can_answer(crate::ext::requests::BROWSER_OP));
+    }
+}

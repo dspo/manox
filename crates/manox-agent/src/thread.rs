@@ -261,10 +261,12 @@ pub enum ThreadEvent {
         retained_tail: Vec<crate::message::Message>,
     },
     /// The model submitted a plan file for the user's review verdict via
-    /// the `ProposePlan` tool.
+    /// the `ProposePlan` tool. `content` is the plan file's text so the
+    /// durable journal can serve the review card without a file read.
     PlanReady {
         plan_file: String,
         title: String,
+        content: String,
     },
     /// The model published/updated its execution task list via `UpdatePlan`;
     /// the context rail renders it as the plan overview.
@@ -610,6 +612,22 @@ impl ThreadHandle {
                     t.insert_user_message_with_ui_metadata(prompt, Some(ui));
                     t.run_turn();
                 });
+                // Reap the member once its turn finishes: the registry is the
+                // strong holder, so without this the entry (and the thread) leak
+                // until the gateway drops.
+                if let Some(reg) = thread_registry() {
+                    let reg = Arc::clone(reg);
+                    let mid2 = mid.clone();
+                    let events = member.subscribe();
+                    crate::runtime::handle().spawn(async move {
+                        while let Ok(event) = events.recv().await {
+                            if matches!(&*event, ThreadEvent::TurnFinished { .. }) {
+                                reg.unregister(&mid2);
+                                break;
+                            }
+                        }
+                    });
+                }
                 Ok(mid)
             }
             BusOp::InjectMember { thread_id, payload } => {
@@ -1089,8 +1107,11 @@ impl Thread {
                         .trim_end_matches("-plan")
                         .to_string();
                     let title = crate::plan_mode::resolve_plan_title(None, &content, &slug);
-                    self.pending_events
-                        .push(ThreadEvent::PlanReady { plan_file, title });
+                    self.pending_events.push(ThreadEvent::PlanReady {
+                        plan_file,
+                        title,
+                        content,
+                    });
                 }
                 let was_loading = self.history_phase.is_loading();
                 self.history_phase = HistoryPhase::Ready;
