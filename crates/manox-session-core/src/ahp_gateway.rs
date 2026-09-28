@@ -417,4 +417,36 @@ impl SessionRuntime for GatewayRuntime {
             Err(RuntimeError::new("MCP support is not built into this host"))
         }
     }
+
+    fn mcp_set_enabled(
+        &self,
+        _session_id: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "mcp")]
+        {
+            // Persist first: the user's decision survives even when the live
+            // start then fails (a failed start is a visible Error slot the
+            // client can retry, not a silently reverted toggle).
+            let mut disabled = manox_agent::settings::mcp_disabled();
+            if enabled {
+                disabled.retain(|name| name != id);
+            } else if !disabled.iter().any(|name| name == id) {
+                disabled.push(id.to_string());
+            }
+            manox_agent::settings::set_mcp_disabled(disabled)
+                .map_err(|e| RuntimeError::new(format!("persisting MCP enablement: {e:#}")))?;
+            if enabled {
+                manox_agent::mcp::start(id).map_err(RuntimeError::new)
+            } else {
+                manox_agent::mcp::stop(id).map_err(RuntimeError::new)
+            }
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            let _ = (id, enabled);
+            Err(RuntimeError::new("MCP support is not built into this host"))
+        }
+    }
 }

@@ -150,6 +150,25 @@ impl McpRegistry {
             .map(|slot| slot.config.clone())
     }
 
+    /// Create a fresh `Stopped` slot for a server that has none — the
+    /// enable path for a server the startup filter dropped. A duplicate
+    /// insert is a no-op: the existing slot's config and lifecycle win.
+    fn insert_slot(&self, name: &str, source_uri: String, config: McpServerConfig) {
+        let mut slots = self.slots.write();
+        if slots.iter().any(|slot| slot.name == name) {
+            return;
+        }
+        slots.push(ServerSlot {
+            name: name.to_string(),
+            source_uri,
+            config,
+            state: ServerState::Stopped,
+            client: None,
+            tools: Vec::new(),
+            generation: 0,
+        });
+    }
+
     /// Begin a start: refuse unknown names synchronously, cancel any live
     /// client (restart semantics), and bump the generation the eventual
     /// connect is validated against.
@@ -503,6 +522,20 @@ pub fn start(name: &str) -> Result<(), String> {
     let Some(registry) = try_global() else {
         return Err("MCP registry is not initialized".to_string());
     };
+    // A server the startup filter dropped (settings-disabled) has no slot;
+    // its config still lives in the merged layers, and enabling it creates
+    // the slot here.
+    if registry.slot(name).is_none() {
+        let resolved = resolved_config(
+            config::load_global(),
+            crate::paths::manox_config_dir().ok().as_deref(),
+            &[],
+        );
+        let Some((config, source_uri)) = resolved.get(name) else {
+            return Err(format!("unknown MCP server: {name}"));
+        };
+        registry.insert_slot(name, source_uri.clone(), config.clone());
+    }
     let Some(config) = registry.config_of(name) else {
         return Err(format!("unknown MCP server: {name}"));
     };

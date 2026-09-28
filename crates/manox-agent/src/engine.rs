@@ -2284,6 +2284,88 @@ async fn refresh_embedder_tools(
     }
 }
 
+/// Re-mount the `mcp__`-prefixed tools when the registry's inventory has
+/// drifted from the mounted table — a start/stop (from the AHP face or the
+/// settings panel) landed since assembly. Same per-prompt shape as
+/// [`refresh_embedder_tools`]: the registry is consulted on every run and
+/// only real drift pays for a rebuild.
+///
+/// A rebuilt set changes the request's tool schema, which transparently
+/// breaks the provider prefix cache once — accepted; history is never
+/// rewritten.
+#[cfg(feature = "mcp")]
+async fn refresh_mcp_tools(session: &mut AgentSession, gate: &Arc<ApprovalGate>) {
+    let Some(registry) = crate::mcp::try_global() else {
+        return;
+    };
+    let mounted = session.mounted_tools();
+    // Same name contract `build_tools` mounted (`mcp__<server>__<tool>`), so
+    // prefix-stripping the old set cannot disturb a built-in or a client
+    // tool.
+    let mut fresh: Vec<Arc<dyn PiAgentTool>> = Vec::new();
+    for server in registry.servers() {
+        for tool in server.tools {
+            let mcp_tool = Arc::new(crate::mcp::napi_tool::PiMcpTool::new(
+                server.name.clone(),
+                tool,
+                Arc::clone(&server.client),
+            ));
+            fresh.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate)))
+                as Arc<dyn PiAgentTool>);
+        }
+    }
+    let old_mcp: Vec<String> = mounted
+        .iter()
+        .filter(|t| t.name().starts_with("mcp__"))
+        .map(|t| t.name().to_string())
+        .collect();
+    let new_mcp: Vec<String> = fresh.iter().map(|t| t.name().to_string()).collect();
+    if old_mcp == new_mcp {
+        return;
+    }
+    let mut tools = Vec::with_capacity(mounted.len() + fresh.len());
+    let mut injected = false;
+    for tool in mounted {
+        if tool.name().starts_with("mcp__") {
+            if !injected {
+                tools.extend(fresh.iter().cloned());
+                injected = true;
+            }
+        } else {
+            tools.push(tool);
+        }
+    }
+    if !injected && !fresh.is_empty() {
+        tools.extend(fresh);
+    }
+    if let Err(err) = session.set_tools(tools) {
+        tracing::warn!(error = %err, "mcp tool refresh rejected; using the existing table");
+        return;
+    }
+    // A narrowed active selection was computed against the OLD set: carry
+    // the non-MCP names over and substitute the fresh ones.
+    if let Some(active) = session.active_tool_names() {
+        let mut next: Vec<String> = active
+            .iter()
+            .filter(|n| !n.starts_with("mcp__"))
+            .cloned()
+            .collect();
+        next.extend(new_mcp);
+        let mut cur_sorted = active.clone();
+        let mut next_sorted = next.clone();
+        cur_sorted.sort_unstable();
+        next_sorted.sort_unstable();
+        if cur_sorted != next_sorted
+            && let Err(err) = session.set_active_tools(next).await
+        {
+            tracing::warn!(
+                error = %err,
+                "mcp tool active-selection update rejected; model may not see an mcp tool"
+            );
+        }
+    }
+}
+
 /// Bind the orchestrators to a freshly built session: the monitor steerer
 /// lands events in the session's steering queue and the background manager
 /// subscribes to the session's lifecycle.
@@ -4045,6 +4127,8 @@ async fn run_actor(
                 // unchanged) instead of trusting the one-time assembly
                 // snapshot.
                 refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
+                #[cfg(feature = "mcp")]
+                refresh_mcp_tools(&mut session, &state.gate).await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the

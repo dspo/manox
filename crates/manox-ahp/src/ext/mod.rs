@@ -238,6 +238,10 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     // travels as `session/mcpServerStateChanged`)
     "session/mcpServerStartRequested",
     "session/mcpServerStopRequested",
+    // session MCP enablement (the toggle persists to settings and drives
+    // start/stop; customizationUpdated/Removed stay refused — the config is
+    // file-owned)
+    "session/customizationToggled",
     // chat working directories
     "chat/workingDirectorySet",
     "chat/workingDirectoryRemoved",
@@ -370,6 +374,28 @@ mod tests {
         assert!(accepts_action(
             "x-manox-plan:/c-1",
             actions::PLAN_MODE_CHANGED
+        ));
+    }
+
+    #[test]
+    fn mcp_enablement_toggle_is_accepted_on_the_session_channel_only() {
+        assert!(accepts_action(
+            "ahp-session:/s-1",
+            "session/customizationToggled"
+        ));
+        assert!(!accepts_action(
+            "ahp-chat:/c-1",
+            "session/customizationToggled"
+        ));
+        // Mutations beyond enablement stay outside the table: the config is
+        // file-owned.
+        assert!(!accepts_action(
+            "ahp-session:/s-1",
+            "session/customizationUpdated"
+        ));
+        assert!(!accepts_action(
+            "ahp-session:/s-1",
+            "session/customizationRemoved"
         ));
     }
 

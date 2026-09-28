@@ -143,4 +143,18 @@ pub trait Backend: Send + Sync + 'static {
     fn extension_baseline(&self, _channel: &str) -> Option<(String, Value)> {
         None
     }
+
+    /// One request on the `mcp://` side-channel: `channel` names the server
+    /// (`mcp://<key>`), `method` is the upstream MCP method (the router has
+    /// already gated it to the advertised `tools/*` / `resources/*`
+    /// families), `params` is the request minus the routing envelope. The
+    /// default refuses — a backend without the MCP plane serves no channel.
+    fn mcp_channel_request(
+        &self,
+        _channel: &str,
+        method: &str,
+        _params: &Value,
+    ) -> Result<Value, HostError> {
+        Err(HostError::Unimplemented(format!("mcp channel: {method}")))
+    }
 }

@@ -46,6 +46,56 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 }
 use crate::runtime_trait::SessionRuntime;
 
+/// Forward one gated MCP method to the upstream server over the registry's
+/// rmcp client. Params decode straight into the rmcp request types (MCP wire
+/// shapes) and the typed result serializes back — the proxy adds nothing.
+#[cfg(feature = "mcp")]
+async fn proxy_mcp_method(
+    peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, HostError> {
+    use rmcp::model as mcp_model;
+    let invalid = |err: serde_json::Error| HostError::InvalidParams(err.to_string());
+    let upstream = |err: rmcp::service::ServiceError| HostError::Backend(err.to_string());
+    let encode = |err: serde_json::Error| HostError::Backend(err.to_string());
+    match method {
+        "tools/list" => {
+            let p: Option<mcp_model::PaginatedRequestParams> =
+                serde_json::from_value(params.clone()).map_err(invalid)?;
+            let result = peer.list_tools(p).await.map_err(upstream)?;
+            serde_json::to_value(result).map_err(encode)
+        }
+        "tools/call" => {
+            let p: mcp_model::CallToolRequestParams =
+                serde_json::from_value(params.clone()).map_err(invalid)?;
+            let result = peer.call_tool(p).await.map_err(upstream)?;
+            serde_json::to_value(result).map_err(encode)
+        }
+        "resources/list" => {
+            let p: Option<mcp_model::PaginatedRequestParams> =
+                serde_json::from_value(params.clone()).map_err(invalid)?;
+            let result = peer.list_resources(p).await.map_err(upstream)?;
+            serde_json::to_value(result).map_err(encode)
+        }
+        "resources/templates/list" => {
+            let p: Option<mcp_model::PaginatedRequestParams> =
+                serde_json::from_value(params.clone()).map_err(invalid)?;
+            let result = peer.list_resource_templates(p).await.map_err(upstream)?;
+            serde_json::to_value(result).map_err(encode)
+        }
+        "resources/read" => {
+            let p: mcp_model::ReadResourceRequestParams =
+                serde_json::from_value(params.clone()).map_err(invalid)?;
+            let result = peer.read_resource(p).await.map_err(upstream)?;
+            serde_json::to_value(result).map_err(encode)
+        }
+        other => Err(HostError::MethodNotFound(format!(
+            "{other} is not in the served mcp:// capability set"
+        ))),
+    }
+}
+
 /// One session's folded state plus the journal tail it was taken at.
 struct Seeded {
     thread_id: String,
@@ -116,7 +166,8 @@ impl RuntimeBackend {
     }
 
     /// Republish MCP registry transitions as `session/mcpServerStateChanged`
-    /// on every seeded session channel.
+    /// and the resulting `session/serverToolsChanged` on every seeded session
+    /// channel.
     ///
     /// Publishing is unconditional on subscribers because the publish *is*
     /// the host store's update: a session that sits seeded-but-unwatched
@@ -133,9 +184,36 @@ impl RuntimeBackend {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        let action = ahp_types::actions::StateAction::SessionMcpServerStateChanged(
-                            Box::new(super::mcp::state_changed(event)),
-                        );
+                        let state_action =
+                            ahp_types::actions::StateAction::SessionMcpServerStateChanged(
+                                Box::new(super::mcp::state_changed(event)),
+                            );
+                        // Every transition moves the inventory: ready adds a
+                        // server's tools, error/stop removes them. Full
+                        // replacement, straight from the registry snapshot.
+                        let tools_action =
+                            ahp_types::actions::StateAction::SessionServerToolsChanged(
+                                ahp_types::actions::SessionServerToolsChangedAction {
+                                    tools: super::mcp::server_tools(),
+                                },
+                            );
+                        // A toggle that enables a previously filtered-out
+                        // server *creates* a slot, which no narrower action
+                        // expresses: the full-replacement catalogue covers
+                        // appearance and disappearance alike.
+                        let catalogue_action =
+                            ahp_types::actions::StateAction::SessionCustomizationsChanged(
+                                ahp_types::actions::SessionCustomizationsChangedAction {
+                                    customizations: super::mcp::customizations()
+                                        .into_iter()
+                                        .map(|server| {
+                                            ahp_types::state::Customization::McpServer(Box::new(
+                                                server,
+                                            ))
+                                        })
+                                        .collect(),
+                                },
+                            );
                         let Some(backend) = me.as_ref() else {
                             continue;
                         };
@@ -148,11 +226,10 @@ impl RuntimeBackend {
                             backend.seeds.lock().keys().cloned().collect();
                         for session_id in session_ids {
                             if host.has_session(&session_id) {
-                                host.publish(
-                                    &manox_ahp::channels::session::uri(&session_id),
-                                    action.clone(),
-                                    None,
-                                );
+                                let channel = manox_ahp::channels::session::uri(&session_id);
+                                host.publish(&channel, state_action.clone(), None);
+                                host.publish(&channel, tools_action.clone(), None);
+                                host.publish(&channel, catalogue_action.clone(), None);
                             }
                         }
                     }
@@ -1296,6 +1373,41 @@ impl Backend for RuntimeBackend {
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
+            // The toggle's decisive decision is its first entry (senders sort
+            // enablement by descending specificity, and the spec names
+            // `enablement[0]` decisive). manox's registry is process-global,
+            // so a session- or workspace-scoped decision degrades to the
+            // same global toggle — recorded in the PR's Assumptions.
+            StateAction::SessionCustomizationToggled(toggled) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                use ahp_types::state::CustomizationEnablement;
+                let enabled = toggled
+                    .enablement
+                    .first()
+                    .map(|decision| match decision {
+                        CustomizationEnablement::Global { enabled }
+                        | CustomizationEnablement::Workspace { enabled, .. }
+                        | CustomizationEnablement::Session { enabled } => *enabled,
+                        CustomizationEnablement::Unknown(_) => true,
+                    })
+                    .unwrap_or(true);
+                match self
+                    .server
+                    .mcp_set_enabled(session_id, &toggled.id, enabled)
+                {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
+                }
+            }
+            // The config is file-owned (mcp.toml / plugin manifests); a
+            // client-side mutation of anything beyond enablement would fold a
+            // customization the next launch would not reproduce.
+            StateAction::SessionCustomizationUpdated(_)
+            | StateAction::SessionCustomizationRemoved(_) => DispatchOutcome::Rejected(
+                "MCP customization entries are file-owned; only enablement is mutable".to_string(),
+            ),
             // ── terminal actions ───────────────────────────────────────────
             //
             // A build without the terminal plane has no PTY to drive; it refuses
@@ -1415,6 +1527,38 @@ impl Backend for RuntimeBackend {
                 "no runtime intent yet: {}",
                 manox_ahp::wire::action_tag(other)
             )),
+        }
+    }
+
+    fn mcp_channel_request(
+        &self,
+        channel: &str,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, HostError> {
+        #[cfg(feature = "mcp")]
+        {
+            let Some(key) = manox_ahp::channels::mcp::server(channel) else {
+                return Err(HostError::InvalidParams(format!(
+                    "not an mcp:// channel: {channel}"
+                )));
+            };
+            let Some(connected) = manox_agent::mcp::try_global().and_then(|registry| {
+                registry
+                    .servers()
+                    .into_iter()
+                    .find(|server| server.name == key)
+            }) else {
+                // A stopped or never-started server has no channel — the
+                // customization's cleared `channel` is the honest signal.
+                return Err(HostError::NotFound(channel.to_string()));
+            };
+            block_on(async { proxy_mcp_method(connected.client.peer(), method, params).await })
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            let _ = (channel, method, params);
+            Err(HostError::Unimplemented(format!("mcp channel: {method}")))
         }
     }
 
@@ -1809,6 +1953,7 @@ mod mcp_dispatch_tests {
         served: bool,
         started: Mutex<Vec<String>>,
         stopped: Mutex<Vec<String>>,
+        enabled: Mutex<Vec<(String, bool)>>,
     }
 
     impl McpOnlyRuntime {
@@ -1817,6 +1962,7 @@ mod mcp_dispatch_tests {
                 served: false,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(Vec::new()),
+                enabled: Mutex::new(Vec::new()),
             })
         }
 
@@ -1825,6 +1971,7 @@ mod mcp_dispatch_tests {
                 served: true,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(Vec::new()),
+                enabled: Mutex::new(Vec::new()),
             })
         }
     }
@@ -1986,6 +2133,21 @@ mod mcp_dispatch_tests {
             self.stopped.lock().push(id.to_string());
             Ok(())
         }
+
+        fn mcp_set_enabled(
+            &self,
+            _session_id: &str,
+            id: &str,
+            enabled: bool,
+        ) -> Result<(), RuntimeError> {
+            if !self.served {
+                return Err(RuntimeError::new(
+                    "MCP enablement is not supported by this runtime",
+                ));
+            }
+            self.enabled.lock().push((id.to_string(), enabled));
+            Ok(())
+        }
     }
 
     fn dispatch_start(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
@@ -2064,5 +2226,103 @@ mod mcp_dispatch_tests {
             dispatch_start(&backend, "ahp-root://", "github"),
             DispatchOutcome::Rejected(_)
         ));
+    }
+
+    fn dispatch_toggle(backend: &RuntimeBackend, id: &str, enabled: bool) -> DispatchOutcome {
+        use ahp_types::state::CustomizationEnablement;
+        backend.dispatch(
+            "ahp-session:/s-1",
+            &StateAction::SessionCustomizationToggled(
+                ahp_types::actions::SessionCustomizationToggledAction {
+                    id: id.to_string(),
+                    enablement: vec![CustomizationEnablement::Global { enabled }],
+                },
+            ),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 3,
+            },
+        )
+    }
+
+    #[test]
+    fn a_toggle_reaches_the_runtime_with_its_decisive_value() {
+        let runtime = McpOnlyRuntime::serving();
+        let backend = backend(Arc::clone(&runtime));
+        assert_eq!(
+            dispatch_toggle(&backend, "github", false),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(*runtime.enabled.lock(), vec![("github".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_toggle_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+        let backend = backend(McpOnlyRuntime::refusing());
+        assert!(matches!(
+            dispatch_toggle(&backend, "github", true),
+            DispatchOutcome::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn a_session_scoped_decision_still_carries_its_enabled_value() {
+        use ahp_types::state::CustomizationEnablement;
+        let runtime = McpOnlyRuntime::serving();
+        let backend = backend(Arc::clone(&runtime));
+        backend.dispatch(
+            "ahp-session:/s-1",
+            &StateAction::SessionCustomizationToggled(
+                ahp_types::actions::SessionCustomizationToggledAction {
+                    id: "fs".to_string(),
+                    enablement: vec![
+                        CustomizationEnablement::Session { enabled: false },
+                        CustomizationEnablement::Global { enabled: true },
+                    ],
+                },
+            ),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 4,
+            },
+        );
+        // The first entry is decisive per the wire contract (descending
+        // specificity); manox degrades the scope to global but honors the
+        // value.
+        assert_eq!(*runtime.enabled.lock(), vec![("fs".to_string(), false)]);
+    }
+
+    #[test]
+    fn customization_mutations_beyond_enablement_are_refused() {
+        use ahp_types::state::{
+            Customization, McpServerCustomization, McpServerReadyState, McpServerState,
+        };
+        let backend = backend(McpOnlyRuntime::serving());
+        let customization = Customization::McpServer(Box::new(McpServerCustomization {
+            id: "fs".to_string(),
+            uri: "file:///mcp.toml".to_string(),
+            name: "fs".to_string(),
+            icons: None,
+            range: None,
+            meta: None,
+            enablement: None,
+            state: McpServerState::Ready(McpServerReadyState {}),
+            channel: None,
+            mcp_app: None,
+        }));
+        let outcome = backend.dispatch(
+            "ahp-session:/s-1",
+            &StateAction::SessionCustomizationUpdated(Box::new(
+                ahp_types::actions::SessionCustomizationUpdatedAction { customization },
+            )),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 5,
+            },
+        );
+        assert!(
+            matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("file-owned")),
+            "the refusal must name the ownership rule: {outcome:?}"
+        );
     }
 }
