@@ -458,6 +458,25 @@ impl RuntimeBackend {
                     for emitted in translator.on_entry(&session_id, &thread_id, &entry) {
                         host.publish(&emitted.channel, emitted.action, None);
                     }
+                    // A landed assistant row changes the Q face: republish the
+                    // aggregate so the metrics channel stays a read model of
+                    // the journal, not a stream of per-call rows the client
+                    // would have to re-aggregate (the v2 `GetConversationInfo`
+                    // contract, now push).
+                    if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "assistant")
+                        && let Some(metrics) = self.server.conversation_metrics(&session_id)
+                    {
+                        let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
+                        host.publish(
+                            &channel,
+                            StateAction::Unknown(serde_json::json!({
+                                "type": manox_ahp::ext::actions::METRICS_CHANGED,
+                                "kind": "conversation",
+                                "data": metrics,
+                            })),
+                            None,
+                        );
+                    }
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
                     translator = Translator::new();
@@ -1740,29 +1759,39 @@ impl Backend for RuntimeBackend {
         // The per-session channels fold one session's journal; the catalogue
         // channels (`x-manox-workspaces://`, `x-manox-commands://`) describe the
         // host and carry no session id.
-        let state = if manox_ahp::ext::is_session_scoped_channel(channel) {
-            let session_id = channel
-                .split_once(":/")?
-                .1
-                .split('/')
-                .next()
-                .filter(|id| !id.is_empty())?;
-            match block_on(self.seeded(session_id)) {
-                Some(seeded) => seeded
-                    .extensions
-                    .get(channel)
-                    .map(|state| serde_json::to_value(state).unwrap_or_else(|_| Value::Null))
-                    // A declared channel with no rows yet answers its (empty)
-                    // state, not `null`: the client replaces what it holds,
-                    // and `null` would claim the channel says nothing at all.
-                    .unwrap_or_else(|| serde_json::json!({})),
-                // An unknown session is not a served channel: answering an
-                // empty baseline would claim state for a session that has none.
-                None => return None,
-            }
-        } else {
-            self.catalogue_baseline(channel)
-        };
+        let state =
+            if let Some(session_id) = channel.strip_prefix(manox_ahp::ext::channels::METRICS) {
+                // The metrics channel's baseline is the Q-face aggregate, not the
+                // per-row ext fold: a subscriber must see the same read model the
+                // bridge pushes, from the first frame on. A cold session (no live
+                // engine) has no fold yet — an empty aggregate, not a refusal:
+                // the channel is served, the first bridge frame fills it.
+                self.server
+                    .conversation_metrics(session_id)
+                    .unwrap_or_else(|| serde_json::json!({}))
+            } else if manox_ahp::ext::is_session_scoped_channel(channel) {
+                let session_id = channel
+                    .split_once(":/")?
+                    .1
+                    .split('/')
+                    .next()
+                    .filter(|id| !id.is_empty())?;
+                match block_on(self.seeded(session_id)) {
+                    Some(seeded) => seeded
+                        .extensions
+                        .get(channel)
+                        .map(|state| serde_json::to_value(state).unwrap_or_else(|_| Value::Null))
+                        // A declared channel with no rows yet answers its (empty)
+                        // state, not `null`: the client replaces what it holds,
+                        // and `null` would claim the channel says nothing at all.
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    // An unknown session is not a served channel: answering an
+                    // empty baseline would claim state for a session that has none.
+                    None => return None,
+                }
+            } else {
+                self.catalogue_baseline(channel)
+            };
         Some(state)
     }
 

@@ -175,6 +175,15 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// Whether the runtime currently drives this session.
     fn has_session(&self, session_id: &str) -> bool;
 
+    /// The conversation-info Q face for a live session: per-model usage,
+    /// cumulative totals and cost, folded from the journal (the retired v2
+    /// `GetConversationInfo`). `None` for a cold session — a session without
+    /// a materialized engine has no thread to fold, and its metrics channel
+    /// baseline stays empty until the first submit.
+    fn conversation_metrics(&self, _session_id: &str) -> Option<Value> {
+        None
+    }
+
     /// Submit a user turn.
     fn submit(&self, owner: &str, session_id: &str, text: String) -> Result<Value, RuntimeError>;
 
