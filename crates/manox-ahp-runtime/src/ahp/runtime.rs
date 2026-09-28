@@ -212,3 +212,182 @@ pub fn runtime(cwd: PathBuf) -> Arc<AhpRuntime> {
         AhpRuntime::new(build(cwd.clone()), cwd)
     }))
 }
+
+#[cfg(test)]
+mod accept_without_a_reactor_tests {
+    use super::AhpRuntime;
+    use std::sync::Arc;
+
+    /// A session runtime these tests never reach: accepting a transport only
+    /// spawns the connection tasks. Every method is unreachable because nothing
+    /// in the test drives a session.
+    struct UnusedRuntime;
+
+    #[async_trait::async_trait]
+    impl crate::runtime_trait::SessionRuntime for UnusedRuntime {
+        fn terminal_state(&self, _: &str) -> Option<crate::runtime_trait::TerminalSnapshot> {
+            None
+        }
+        fn terminal_raw_tap(
+            &self,
+            _: &str,
+        ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
+            None
+        }
+        fn create_terminal(
+            &self,
+            _: &str,
+            _: &str,
+            _: u16,
+            _: u16,
+        ) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn dispose_terminal(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn terminal_input(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn terminal_resize(
+            &self,
+            _: &str,
+            _: u16,
+            _: u16,
+        ) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn create_session(
+            &self,
+            _: &str,
+            _: crate::runtime_trait::SessionIntent,
+        ) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn fork_session(
+            &self,
+            _: &str,
+            _: crate::runtime_trait::ForkIntent,
+        ) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn dispose_session(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn has_session(&self, _: &str) -> bool {
+            false
+        }
+        fn submit(
+            &self,
+            _: &str,
+            _: &str,
+            _: String,
+        ) -> Result<serde_json::Value, crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn steer(
+            &self,
+            _: &str,
+            _: &str,
+            _: String,
+        ) -> Result<serde_json::Value, crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn drop_queued(&self, _: &str, _: &str) {}
+        fn cancel_turn(&self, _: &str) -> Result<(), crate::error::RuntimeError> {
+            unreachable!("unused")
+        }
+        fn set_model(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn set_reasoning_effort(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn set_approval_mode(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn set_cwd(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn archive_session(&self, _: &str, _: &str, _: bool) {}
+        fn rename_session(&self, _: &str, _: &str) -> crate::runtime_trait::RenameOutcome {
+            crate::runtime_trait::RenameOutcome::UnknownSession
+        }
+        fn pin_session(&self, _: &str, _: bool) -> bool {
+            false
+        }
+        fn order_session(&self, _: &str, _: Option<&str>) -> bool {
+            false
+        }
+        fn compact(&self, _: &str, _: Option<String>) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn plan_seed(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn goal(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<String>,
+            _: Option<u64>,
+            _: Option<u64>,
+        ) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn confirm_tool_call(
+            &self,
+            _: &str,
+            _: &str,
+            _: bool,
+        ) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn answer_question(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<manox_agent::permission::AskAnswer>,
+        ) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
+        fn journal_feed(&self, _: &str) -> Option<manox_agent::thread::ThreadHandle> {
+            None
+        }
+        fn set_embedder_tools(
+            &self,
+            _: &str,
+            _: &str,
+            _: Vec<crate::runtime_trait::ClientToolSpec>,
+        ) {
+        }
+    }
+
+    /// `accept` must work when the caller has no tokio reactor.
+    ///
+    /// The napi edge calls it from the Node main thread, which has none, and
+    /// `Host::accept` asserts a reactor — so the guard has to live in
+    /// `AhpRuntime::accept`. A panic on a foreign thread is invisible to a
+    /// normal Rust test, so this pins the branch nothing else exercises.
+    #[test]
+    fn accept_works_off_the_reactor() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        let runtime = AhpRuntime::new(
+            Arc::new(UnusedRuntime) as Arc<dyn crate::runtime_trait::SessionRuntime>,
+            std::path::PathBuf::from("/"),
+        );
+        let accept = std::thread::spawn(move || {
+            assert!(
+                tokio::runtime::Handle::try_current().is_err(),
+                "this thread must have no reactor for the test to mean anything"
+            );
+            runtime.accept(manox_ahp::transport::inproc::pair().0);
+        });
+        assert!(
+            accept.join().is_ok(),
+            "accepting a transport without a reactor must not panic"
+        );
+    }
+}
