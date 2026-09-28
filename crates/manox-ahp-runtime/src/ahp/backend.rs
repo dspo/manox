@@ -257,10 +257,10 @@ impl RuntimeBackend {
                     // Resume the turn bookkeeping against the active turn the client
                     // opened, so streamed parts carry its id (and never publish a
                     // synthetic `turnStarted` that would replace it).
-                    if let Some(state) = host.chat_state(&session_id) {
-                        if let Some(active) = &state.active_turn {
-                            translator.open_with_id(active.id.clone(), active.started_at.clone());
-                        }
+                    if let Some(state) = host.chat_state(&session_id)
+                        && let Some(active) = &state.active_turn
+                    {
+                        translator.open_with_id(active.id.clone(), active.started_at.clone());
                     }
                     let thread_id = self
                         .seeds
@@ -1124,7 +1124,7 @@ impl Backend for RuntimeBackend {
             ),
             StateAction::ChatInputCompleted(completed) => {
                 if completed.request_id.starts_with("plan-review:") {
-                    self.resolve_plan_review(channel, &completed)
+                    self.resolve_plan_review(channel, completed)
                 } else {
                     self.answer_question(
                         channel,

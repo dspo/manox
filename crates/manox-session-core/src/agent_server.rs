@@ -545,7 +545,7 @@ impl AgentServer {
         // so it is the process-wide `ThreadRegistry`. First-wins, matching the
         // process-singleton gateway.
         let registry = Arc::clone(&inner) as Arc<dyn manox_agent::thread::ThreadRegistry>;
-        let _ = manox_agent::thread::set_thread_registry(registry);
+        manox_agent::thread::set_thread_registry(registry);
         // U2 cross-domain #2 (§D.5 Models: pushed immediately on provider reload): a
         // provider reload broadcasts the fresh snapshot to every
         // connection. Weak, so a dropped server leaves an inert listener;
