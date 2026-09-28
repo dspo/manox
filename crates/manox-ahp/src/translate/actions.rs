@@ -131,6 +131,12 @@ impl Emitted {
 /// so the catalogue keeps its last description until the next set edge, while
 /// the session-level string (whose reducer treats `None` as *clear*) does
 /// reset.
+///
+/// Assumes one active chat per session: the mirror writes any chat's edge
+/// straight onto the session-level field, so two concurrently active chats
+/// in one session would overwrite each other. True today (manox runs one
+/// journal per session, and compaction is the only producer); revisit if a
+/// second activity producer appears.
 fn mirror_activity(chat: &str, session: &str, activity: Option<String>, out: &mut Vec<Emitted>) {
     out.push(Emitted::new(
         session,
@@ -2231,7 +2237,9 @@ mod tests {
             "s-1",
             &entry(
                 "e-1",
-                JournalWireEvent::CompactionStarted { tokens_before: 4200 },
+                JournalWireEvent::CompactionStarted {
+                    tokens_before: 4200,
+                },
             ),
         );
         let session: Vec<_> = emitted
@@ -2267,7 +2275,16 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry("e-1", JournalWireEvent::Compaction { summary: "done".into(), messages_compacted: 3, tokens_before: 10, retained_tail: vec![], first_kept_entry_id: None }),
+            &entry(
+                "e-1",
+                JournalWireEvent::Compaction {
+                    summary: "done".into(),
+                    messages_compacted: 3,
+                    tokens_before: 10,
+                    retained_tail: vec![],
+                    first_kept_entry_id: None,
+                },
+            ),
         );
         let session: Vec<_> = emitted
             .iter()
@@ -2281,7 +2298,8 @@ mod tests {
         let activity = serde_json::to_value(&session[0].action).unwrap();
         assert_eq!(activity["type"], "session/activityChanged");
         assert_eq!(
-            activity["activity"], serde_json::Value::Null,
+            activity["activity"],
+            serde_json::Value::Null,
             "None serializes as an absent/null activity — the reducer's clear edge"
         );
     }

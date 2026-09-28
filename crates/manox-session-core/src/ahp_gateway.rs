@@ -90,10 +90,10 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
-    fn terminal_ids(&self) -> Vec<String> {
+    fn terminal_infos(&self) -> Vec<ahp_types::state::TerminalInfo> {
         #[cfg(feature = "terminal")]
         {
-            self.server.ahp_inner().ahp_terminal_ids()
+            self.server.ahp_inner().ahp_terminal_infos()
         }
         #[cfg(not(feature = "terminal"))]
         {
