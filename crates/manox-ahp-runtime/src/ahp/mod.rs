@@ -28,11 +28,14 @@
 //! carry, and absent fields stay absent rather than being fabricated:
 //!
 //! - `SessionState.annotations`, `server_tools`, `activeClients`,
-//!   `customizations`, `changesets`, `origin`, and the `config` *schema*:
-//!   live connection/host facts with no durable journal row. The fold's
-//!   `config` **values** (model / effort / approval mode / project /
-//!   effective cwd) do arrive, via the translator's `session/configChanged`
-//!   actions, on an empty schema the values merge into.
+//!   `changesets`, `origin`, and the `config` *schema*: live connection/host
+//!   facts with no durable journal row. The fold's `config` **values**
+//!   (model / effort / approval mode / project / effective cwd) do arrive,
+//!   via the translator's `session/configChanged` actions, on an empty
+//!   schema the values merge into. `customizations` is the one exception:
+//!   the MCP registry is a live *process* fact, so its snapshot overlays the
+//!   fold at seed time and the registry's event stream keeps it current —
+//!   see [`mcp`].
 //! - Pin and label: AHP mints no standard bit for them, so the translator
 //!   routes them to the declared `x-manox` extension surface; this fold
 //!   applies only standard-channel actions and ignores extension channels.
@@ -59,6 +62,9 @@ use ahp_types::state::{
 use manox_ahp::channels::{chat, session};
 use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
+
+#[cfg(feature = "mcp")]
+pub(crate) mod mcp;
 
 /// The AHP chat state of one manox session, folded from its journal.
 ///
@@ -120,6 +126,23 @@ pub async fn session_state(thread_id: &str) -> Option<SessionState> {
         state.project = Some(project_info(&row.project));
     }
     state.lifecycle = SessionLifecycle::Ready;
+
+    // MCP servers are a live process fact, not journal state: the registry
+    // snapshot overlays the fold so a fresh seed and the running pump speak
+    // from the same source (§C's determinism is journal-scoped; this overlay
+    // is the registry's own state at seed time).
+    #[cfg(feature = "mcp")]
+    {
+        let customizations = mcp::customizations();
+        if !customizations.is_empty() {
+            state.customizations = Some(
+                customizations
+                    .into_iter()
+                    .map(|server| ahp_types::state::Customization::McpServer(Box::new(server)))
+                    .collect(),
+            );
+        }
+    }
 
     // Fold every member journal; the session-channel actions are the part
     // of each fold that belongs to the thread. Deterministic order (§C

@@ -234,6 +234,10 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     "session/workingDirectoryReplaced",
     "session/activeClientSet",
     "session/activeClientRemoved",
+    // session MCP lifecycle (the registry is the authority; the settled state
+    // travels as `session/mcpServerStateChanged`)
+    "session/mcpServerStartRequested",
+    "session/mcpServerStopRequested",
     // chat working directories
     "chat/workingDirectorySet",
     "chat/workingDirectoryRemoved",
@@ -366,6 +370,26 @@ mod tests {
         assert!(accepts_action(
             "x-manox-plan:/c-1",
             actions::PLAN_MODE_CHANGED
+        ));
+    }
+
+    #[test]
+    fn mcp_lifecycle_requests_are_accepted_on_the_session_channel_only() {
+        assert!(accepts_action(
+            "ahp-session:/s-1",
+            "session/mcpServerStartRequested"
+        ));
+        assert!(accepts_action(
+            "ahp-session:/s-1",
+            "session/mcpServerStopRequested"
+        ));
+        assert!(!accepts_action(
+            "ahp-chat:/c-1",
+            "session/mcpServerStartRequested"
+        ));
+        assert!(!accepts_action(
+            "ahp-root://",
+            "session/mcpServerStopRequested"
         ));
     }
 

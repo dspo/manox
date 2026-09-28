@@ -26,7 +26,7 @@ manox-workspace.workspace = true
 manox-ahp.workspace = true
 # The AHP runtime half: its `SessionRuntime` trait is the seam this gateway
 # implements, so the adapter never names a gateway type.
-manox-ahp-runtime = { workspace = true, features = ["terminal", "ws-gateway"] }
+manox-ahp-runtime = { workspace = true, features = ["terminal", "mcp", "ws-gateway"] }
 manox-journal.workspace = true
 ahp.workspace = true
 ahp-types.workspace = true
@@ -65,7 +65,7 @@ futures.workspace = true
 tracing-subscriber.workspace = true
 
 [features]
-default = ["terminal", "ws-gateway"]
+default = ["terminal", "mcp", "ws-gateway"]
 # In-process PTY + grid terminals (#13): the follow-terminal streams, attach/
 # snapshot/input/resize arms, and the TerminalsUpdated host mirror. Lean
 # embedders (the VS Code napi edge) opt out; the arms then answer GW7's
@@ -74,3 +74,6 @@ terminal = ["dep:manox-terminal"]
 # The `cx web` loopback WS gateway (axum). The in-process hosts (gpui, napi)
 # never serve HTTP; opting out drops the axum/hyper server stack.
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
+# The MCP face of the gateway: start/stop requests drive the process-global
+# registry. Opting out turns the requests into refusals.
+mcp = ["manox-agent/mcp"]

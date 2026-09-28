@@ -8,8 +8,13 @@
 //! tool type. Configuration is file-only (no UI writes) in both.
 //!
 //! `init` blocks until all servers finish connecting (per-server timeout);
-//! a failed server is warn-logged and skipped — MCP is an optional
-//! enhancement and never blocks the rest of startup.
+//! MCP is an optional enhancement and never blocks the rest of startup.
+//! A failed server is **tracked**, not dropped: every configured server keeps
+//! a slot with its lifecycle ([`ServerState`]), so the AHP face can render
+//! `error`/`stopped` entries instead of pretending the server does not exist.
+//! [`start`] / [`stop`] drive a slot across lifecycles at runtime (restart =
+//! cancel the live client, reconnect from the stored config), and every
+//! terminal transition is broadcast on [`subscribe_events`].
 
 pub mod config;
 pub mod napi_tool;
@@ -18,8 +23,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use parking_lot::RwLock;
 use rmcp::model::CallToolResult;
 use rmcp::service::{RoleClient, RunningService};
+use tokio::sync::broadcast;
 
 use crate::mcp::config::{McpConfig, McpServerConfig, McpServerTransportConfig};
 
@@ -36,29 +43,167 @@ pub struct ConnectedServer {
     pub tools: Vec<rmcp::model::Tool>,
 }
 
-/// Process-global MCP registry: the connected servers (clients kept alive)
-/// plus the tool inventory for the active harness bridge.
+/// Lifecycle of one configured MCP server, as the registry sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerState {
+    /// Connected and serving tools.
+    Ready,
+    /// Last connect attempt failed; the config is kept for a later `start`.
+    Error(String),
+    /// Deliberately stopped (`stop`); the config is kept for a later `start`.
+    Stopped,
+}
+
+/// Point-in-time identity + lifecycle of one configured server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotView {
+    pub name: String,
+    /// `file://` URI of the file that declares this server (mcp.toml or a
+    /// plugin's `.mcp.json`) — the AHP customization's source URI.
+    pub source_uri: String,
+    pub state: ServerState,
+}
+
+/// A slot moved to a new terminal lifecycle state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerEvent {
+    pub name: String,
+    pub state: ServerState,
+}
+
+struct ServerSlot {
+    name: String,
+    source_uri: String,
+    config: McpServerConfig,
+    state: ServerState,
+    client: Option<McpClientHandle>,
+    tools: Vec<rmcp::model::Tool>,
+}
+
+impl ServerSlot {
+    fn view(&self) -> SlotView {
+        SlotView {
+            name: self.name.clone(),
+            source_uri: self.source_uri.clone(),
+            state: self.state.clone(),
+        }
+    }
+
+    fn connected(&self) -> Option<ConnectedServer> {
+        let client = self.client.as_ref()?;
+        Some(ConnectedServer {
+            name: self.name.clone(),
+            client: Arc::clone(client),
+            tools: self.tools.clone(),
+        })
+    }
+}
+
+/// Process-global MCP registry: one slot per configured server (clients of
+/// ready servers kept alive) plus the event stream for lifecycle changes.
 pub struct McpRegistry {
-    servers: Vec<ConnectedServer>,
+    slots: RwLock<Vec<ServerSlot>>,
 }
 
 impl McpRegistry {
-    pub fn servers(&self) -> &[ConnectedServer] {
-        &self.servers
+    /// The ready servers — the tool-bridging view the engine builds tools
+    /// from.
+    pub fn servers(&self) -> Vec<ConnectedServer> {
+        self.slots
+            .read()
+            .iter()
+            .filter_map(ServerSlot::connected)
+            .collect()
+    }
+
+    /// Every configured server with its lifecycle, in config order.
+    pub fn slots(&self) -> Vec<SlotView> {
+        self.slots.read().iter().map(ServerSlot::view).collect()
+    }
+
+    /// One server's lifecycle view, by config key.
+    pub fn slot(&self, name: &str) -> Option<SlotView> {
+        self.slots
+            .read()
+            .iter()
+            .find(|slot| slot.name == name)
+            .map(ServerSlot::view)
     }
 
     pub fn tool_count(&self) -> usize {
-        self.servers.iter().map(|s| s.tools.len()).sum()
+        self.slots.read().iter().map(|slot| slot.tools.len()).sum()
+    }
+
+    fn config_of(&self, name: &str) -> Option<McpServerConfig> {
+        self.slots
+            .read()
+            .iter()
+            .find(|slot| slot.name == name)
+            .map(|slot| slot.config.clone())
+    }
+
+    fn mark_ready(&self, name: &str, server: ConnectedServer) {
+        let mut slots = self.slots.write();
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
+            slot.state = ServerState::Ready;
+            slot.client = Some(server.client);
+            slot.tools = server.tools;
+        }
+    }
+
+    fn mark_error(&self, name: &str, message: String) {
+        let mut slots = self.slots.write();
+        if let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) {
+            slot.state = ServerState::Error(message);
+            slot.client = None;
+            slot.tools = Vec::new();
+        }
+    }
+
+    fn mark_stopped(&self, name: &str) -> bool {
+        let mut slots = self.slots.write();
+        match slots.iter_mut().find(|slot| slot.name == name) {
+            Some(slot) => {
+                if let Some(client) = slot.client.take() {
+                    client.cancellation_token().cancel();
+                }
+                slot.tools = Vec::new();
+                slot.state = ServerState::Stopped;
+                true
+            }
+            None => false,
+        }
     }
 }
 
 static REGISTRY: OnceLock<McpRegistry> = OnceLock::new();
+static EVENTS: OnceLock<broadcast::Sender<McpServerEvent>> = OnceLock::new();
+
+fn events() -> &'static broadcast::Sender<McpServerEvent> {
+    EVENTS.get_or_init(|| broadcast::channel(64).0)
+}
+
+/// Subscribe to slot lifecycle transitions. Events carry the terminal state
+/// (`Ready`/`Error`/`Stopped`); the optimistic `starting` edge of an AHP
+/// start request is the reducer's, not the registry's.
+pub fn subscribe_events() -> broadcast::Receiver<McpServerEvent> {
+    events().subscribe()
+}
+
+fn fire(name: &str, state: ServerState) {
+    let _ = events().send(McpServerEvent {
+        name: name.to_string(),
+        state,
+    });
+}
 
 /// Read the config (mcp.toml + plugin `.mcp.json` layers), connect every
 /// server, list tools. Call at startup after `runtime::init`. Blocks until
-/// all connections settle (per-server timeout); failures are isolated.
+/// all connections settle (per-server timeout); failures become `Error`
+/// slots, keeping the server visible to the AHP face and restartable via
+/// [`start`].
 pub fn init() {
-    let mut config = match crate::paths::manox_config_dir() {
+    let config = match crate::paths::manox_config_dir() {
         Ok(dir) => McpConfig::load(&dir).unwrap_or_else(|e| {
             tracing::warn!("Failed to load MCP config, skipped: {e:#}");
             McpConfig::default()
@@ -68,10 +213,7 @@ pub fn init() {
             McpConfig::default()
         }
     };
-    merge_plugin_declarations(&mut config);
-    retain_enabled(&mut config, &crate::settings::mcp_disabled());
-
-    let registry = build_registry(config);
+    let registry = build_registry(resolved_config(config, &crate::settings::mcp_disabled()));
     let count = registry.tool_count();
     if count > 0 {
         tracing::info!("MCP registry ready: {count} tools");
@@ -93,6 +235,11 @@ pub fn global() -> &'static McpRegistry {
         .expect("McpRegistry not initialized; call manox_agent::init first")
 }
 
+/// Non-panicking accessor for callers that may run before `init`.
+pub fn try_global() -> Option<&'static McpRegistry> {
+    REGISTRY.get()
+}
+
 /// The merged MCP config (mcp.toml + plugin `.mcp.json` layers) without
 /// connecting — the settings panel lists configured servers from it.
 pub fn load_merged_config() -> McpConfig {
@@ -104,65 +251,22 @@ pub fn load_merged_config() -> McpConfig {
     config
 }
 
-/// Drop servers the user disabled in settings (persisted `[mcp] disabled`);
-/// the registry is built once at startup, so the switch applies on the next
-/// launch.
-fn retain_enabled(config: &mut McpConfig, disabled: &[String]) {
-    if disabled.is_empty() {
-        return;
+/// Merge every installed plugin's `.mcp.json` declarations into `config`.
+///
+/// The plugin file uses the Claude Code shape `{ "mcpServers": { <name>: <cfg> } }`
+/// (camelCase key); each entry deserializes straight into `McpServerConfig`.
+/// The server key becomes `<plugin>__<server>` so plugin servers never
+/// collide with each other or with user-declared `mcp.toml` entries (the
+/// user's `mcp.toml` wins on an exact key clash by being inserted first).
+pub fn merge_plugin_declarations(config: &mut McpConfig) {
+    for record in config::list_plugin_declared_servers() {
+        let key = format!("{}__{}", record.plugin, record.name);
+        config.mcp_servers.entry(key).or_insert(record.config);
     }
-    config.mcp_servers.retain(|name, _| {
-        let keep = !disabled.iter().any(|d| d == name);
-        if !keep {
-            tracing::info!("MCP server `{name}` disabled in settings, skipped");
-        }
-        keep
-    });
-}
-
-/// Non-panicking accessor for callers that may run before `init`.
-pub fn try_global() -> Option<&'static McpRegistry> {
-    REGISTRY.get()
-}
-
-fn build_registry(config: McpConfig) -> McpRegistry {
-    if config.mcp_servers.is_empty() {
-        return McpRegistry {
-            servers: Vec::new(),
-        };
-    }
-    let handle = crate::runtime::handle();
-    // Block on connecting all servers. The tokio runtime is multi-threaded
-    // and lives for the process; init runs on the gpui main thread before
-    // any UI. `handle.block_on` (not bare `tokio::spawn`) makes the runtime
-    // handle explicit — we are on the gpui main thread, not inside a tokio
-    // worker.
-    let servers = handle.block_on(async { connect_all(handle.clone(), config.mcp_servers).await });
-    McpRegistry { servers }
-}
-
-/// Connect every server concurrently. Per-server failures are isolated.
-pub async fn connect_all(
-    handle: tokio::runtime::Handle,
-    servers: BTreeMap<String, McpServerConfig>,
-) -> Vec<ConnectedServer> {
-    let mut tasks = Vec::new();
-    for (name, cfg) in servers {
-        tasks.push(handle.spawn(async move { connect_one(&name, cfg).await }));
-    }
-    let mut connected = Vec::new();
-    for task in tasks {
-        match task.await {
-            Ok(Ok(server)) => connected.push(server),
-            Ok(Err(e)) => tracing::warn!("MCP server connection failed: {e:#}"),
-            Err(e) => tracing::warn!("MCP server task panicked: {e}"),
-        }
-    }
-    connected
 }
 
 /// Connect a single server and list its tools.
-pub async fn connect_one(name: &str, cfg: McpServerConfig) -> anyhow::Result<ConnectedServer> {
+pub async fn connect_one(name: &str, cfg: &McpServerConfig) -> anyhow::Result<ConnectedServer> {
     let client = tokio::time::timeout(CONNECT_TIMEOUT, connect_transport(name, &cfg.transport))
         .await
         .map_err(|_| {
@@ -245,20 +349,6 @@ pub async fn connect_transport(
     Ok(service)
 }
 
-/// Merge every installed plugin's `.mcp.json` declarations into `config`.
-///
-/// The plugin file uses the Claude Code shape `{ "mcpServers": { <name>: <cfg> } }`
-/// (camelCase key); each entry deserializes straight into `McpServerConfig`.
-/// The server key becomes `<plugin>__<server>` so plugin servers never
-/// collide with each other or with user-declared `mcp.toml` entries (the
-/// user's `mcp.toml` wins on an exact key clash by being inserted first).
-pub fn merge_plugin_declarations(config: &mut McpConfig) {
-    for record in config::list_plugin_declared_servers() {
-        let key = format!("{}__{}", record.plugin, record.name);
-        config.mcp_servers.entry(key).or_insert(record.config);
-    }
-}
-
 /// Concatenated text content from an MCP tool result. Non-text blocks
 /// (image/audio/resource) are skipped with a warn.
 pub fn flatten_call_tool_result(result: &CallToolResult) -> McpToolOutput {
@@ -312,6 +402,185 @@ fn header_map(
     Ok(map)
 }
 
+/// Fold the config layers into one name → (config, source URI) map, dropping
+/// servers the user disabled in settings. User `mcp.toml` entries win on an
+/// exact key clash by being inserted first; each entry records the file that
+/// declares it, which is the source URI the AHP face publishes.
+fn resolved_config(
+    config: McpConfig,
+    disabled: &[String],
+) -> BTreeMap<String, (McpServerConfig, String)> {
+    let toml_uri = crate::paths::manox_config_dir()
+        .ok()
+        .map(|dir| format!("file://{}", dir.join("mcp.toml").display()));
+    let mut resolved: BTreeMap<String, (McpServerConfig, String)> = config
+        .mcp_servers
+        .iter()
+        .map(|(name, cfg)| {
+            (
+                name.clone(),
+                (cfg.clone(), toml_uri.clone().unwrap_or_default()),
+            )
+        })
+        .collect();
+    for record in config::list_plugin_declared_servers() {
+        let key = format!("{}__{}", record.plugin, record.name);
+        resolved
+            .entry(key)
+            .or_insert_with(|| (record.config, format!("file://{}", record.source.display())));
+    }
+    if !disabled.is_empty() {
+        resolved.retain(|name, _| {
+            let keep = !disabled.iter().any(|d| d == name);
+            if !keep {
+                tracing::info!("MCP server `{name}` disabled in settings, skipped");
+            }
+            keep
+        });
+    }
+    resolved
+}
+
+/// Start (or restart) one configured server. Existence is checked
+/// synchronously so a caller gets an immediate refusal for an unknown name;
+/// the connect runs detached and its outcome lands in the slot and the event
+/// stream (`Ready` or `Error`).
+pub fn start(name: &str) -> Result<(), String> {
+    let Some(registry) = try_global() else {
+        return Err("MCP registry is not initialized".to_string());
+    };
+    let Some(config) = registry.config_of(name) else {
+        return Err(format!("unknown MCP server: {name}"));
+    };
+    let name = name.to_string();
+    crate::runtime::handle().spawn(async move {
+        if let Some(registry) = try_global() {
+            // Restart semantics: a live client for this name is cancelled
+            // before the fresh connect so two clients never coexist.
+            registry.cancel_client(&name);
+        }
+        match connect_one(&name, &config).await {
+            Ok(server) => {
+                let tools = server.tools.len();
+                if let Some(registry) = try_global() {
+                    registry.mark_ready(&name, server);
+                }
+                tracing::info!("MCP server `{name}` started: {tools} tools");
+                fire(&name, ServerState::Ready);
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                tracing::warn!("MCP server `{name}` failed to start: {message}");
+                if let Some(registry) = try_global() {
+                    registry.mark_error(&name, message.clone());
+                }
+                fire(&name, ServerState::Error(message));
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Stop one configured server: the live client is cancelled and the slot
+/// lands in `Stopped` (config kept for a later [`start`]). Unknown names are
+/// a synchronous refusal.
+pub fn stop(name: &str) -> Result<(), String> {
+    let Some(registry) = try_global() else {
+        return Err("MCP registry is not initialized".to_string());
+    };
+    if !registry.mark_stopped(name) {
+        return Err(format!("unknown MCP server: {name}"));
+    }
+    tracing::info!("MCP server `{name}` stopped");
+    fire(name, ServerState::Stopped);
+    Ok(())
+}
+
+impl McpRegistry {
+    /// Cancel a slot's live client, if any, without touching its state.
+    fn cancel_client(&self, name: &str) {
+        if let Some(client) = self
+            .slots
+            .write()
+            .iter_mut()
+            .find(|slot| slot.name == name)
+            .and_then(|slot| slot.client.take())
+        {
+            client.cancellation_token().cancel();
+        }
+    }
+}
+
+/// Connect every configured server concurrently and build the slot list.
+/// Per-server failures are isolated into `Error` slots; the declaring config
+/// rides with every slot so a failed server stays restartable via [`start`].
+fn build_registry(servers: BTreeMap<String, (McpServerConfig, String)>) -> McpRegistry {
+    let slots = if servers.is_empty() {
+        Vec::new()
+    } else {
+        let handle = crate::runtime::handle();
+        // Block on connecting all servers. The tokio runtime is multi-threaded
+        // and lives for the process; init runs on the gpui main thread before
+        // any UI. `handle.block_on` (not bare `tokio::spawn`) makes the runtime
+        // handle explicit — we are on the gpui main thread, not inside a tokio
+        // worker.
+        handle.block_on(async {
+            let mut tasks = Vec::new();
+            for (name, (cfg, source_uri)) in servers {
+                tasks.push(handle.spawn(async move {
+                    let result = connect_one(&name, &cfg).await;
+                    (name, source_uri, cfg, result)
+                }));
+            }
+            let mut slots = Vec::new();
+            for task in tasks {
+                let (name, source_uri, config, result) = match task.await {
+                    Ok(outcome) => outcome,
+                    Err(e) => (
+                        "unknown".to_string(),
+                        String::new(),
+                        McpServerConfig {
+                            transport: McpServerTransportConfig::Stdio {
+                                command: String::new(),
+                                args: Vec::new(),
+                                env: None,
+                                cwd: None,
+                            },
+                        },
+                        Err(anyhow::anyhow!("MCP server task panicked: {e}")),
+                    ),
+                };
+                match result {
+                    Ok(server) => slots.push(ServerSlot {
+                        state: ServerState::Ready,
+                        client: Some(server.client),
+                        tools: server.tools,
+                        config,
+                        name,
+                        source_uri,
+                    }),
+                    Err(e) => {
+                        let message = format!("{e:#}");
+                        tracing::warn!("MCP server connection failed: {message}");
+                        slots.push(ServerSlot {
+                            state: ServerState::Error(message),
+                            client: None,
+                            tools: Vec::new(),
+                            config,
+                            name,
+                            source_uri,
+                        });
+                    }
+                }
+            }
+            slots
+        })
+    };
+    McpRegistry {
+        slots: RwLock::new(slots),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +588,7 @@ mod tests {
 
     fn stdio_cfg() -> McpServerConfig {
         McpServerConfig {
-            transport: crate::mcp::config::McpServerTransportConfig::Stdio {
+            transport: McpServerTransportConfig::Stdio {
                 command: "true".into(),
                 args: vec![],
                 env: None,
@@ -329,24 +598,78 @@ mod tests {
     }
 
     #[test]
-    fn retain_enabled_drops_disabled_servers_only() {
+    fn resolved_config_drops_disabled_servers_only() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
         config.mcp_servers.insert("beta".into(), stdio_cfg());
         config.mcp_servers.insert("gamma".into(), stdio_cfg());
-        retain_enabled(&mut config, &["beta".to_string()]);
-        let names: Vec<&String> = config.mcp_servers.keys().collect();
-        assert_eq!(names.len(), 2);
-        assert!(config.mcp_servers.contains_key("alpha"));
-        assert!(config.mcp_servers.contains_key("gamma"));
+        let resolved = resolved_config(config, &["beta".to_string()]);
+        let names: Vec<&String> = resolved.keys().collect();
+        assert_eq!(names, ["alpha", "gamma"]);
     }
 
     #[test]
-    fn retain_enabled_noop_on_empty_disabled_list() {
+    fn resolved_config_noop_on_empty_disabled_list() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
-        retain_enabled(&mut config, &[]);
-        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(resolved_config(config, &[]).len(), 1);
+    }
+
+    #[test]
+    fn resolved_config_user_entry_wins_over_plugin_and_keeps_its_source() {
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert("alpha".into(), stdio_cfg());
+        let mut resolved = resolved_config(config, &[]);
+        // A plugin declaring the same key must not displace the user entry:
+        // the source stays whatever the user entry recorded (the real
+        // mcp.toml path, or empty when no config dir exists in the sandbox).
+        let before = resolved.get("alpha").unwrap().1.clone();
+        resolved
+            .entry("alpha".to_string())
+            .or_insert_with(|| (stdio_cfg(), "file:///plugin/.mcp.json".into()));
+        let (config, source) = &resolved["alpha"];
+        assert_eq!(source, &before);
+        assert!(
+            source.is_empty() || source.ends_with("mcp.toml"),
+            "a user entry's source is mcp.toml, never a plugin manifest: {source}"
+        );
+        assert!(matches!(
+            &config.transport,
+            McpServerTransportConfig::Stdio { command, .. } if command == "true"
+        ));
+    }
+
+    #[test]
+    fn registry_slot_lifecycle_transitions() {
+        let registry = McpRegistry {
+            slots: RwLock::new(vec![ServerSlot {
+                name: "alpha".into(),
+                source_uri: "file:///mcp.toml".into(),
+                config: stdio_cfg(),
+                state: ServerState::Error("boom".into()),
+                client: None,
+                tools: Vec::new(),
+            }]),
+        };
+        assert_eq!(
+            registry.slot("alpha").unwrap().state,
+            ServerState::Error("boom".into())
+        );
+        // stop() on a slot with no live client still lands in Stopped.
+        assert!(registry.mark_stopped("alpha"));
+        assert_eq!(registry.slot("alpha").unwrap().state, ServerState::Stopped);
+        assert!(!registry.mark_stopped("missing"));
+        assert!(registry.slot("missing").is_none());
+    }
+
+    #[test]
+    fn events_carry_terminal_transitions() {
+        let mut rx = subscribe_events();
+        fire("alpha", ServerState::Ready);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.name, "alpha");
+        assert_eq!(event.state, ServerState::Ready);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

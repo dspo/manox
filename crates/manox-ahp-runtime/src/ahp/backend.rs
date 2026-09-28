@@ -111,6 +111,53 @@ impl RuntimeBackend {
 
     pub fn attach_host(&self, host: &Arc<manox_ahp::Host>) {
         let _ = self.host.set(Arc::downgrade(host));
+        #[cfg(feature = "mcp")]
+        self.spawn_mcp_pump(host);
+    }
+
+    /// Republish MCP registry transitions as `session/mcpServerStateChanged`
+    /// on every seeded session channel.
+    ///
+    /// Publishing is unconditional on subscribers because the publish *is*
+    /// the host store's update: a session that sits seeded-but-unwatched
+    /// must still fold the transition, or its next subscriber is handed a
+    /// stale snapshot. A session the host has never seeded is skipped — its
+    /// first seed overlays the registry snapshot directly, and folding into
+    /// a state that does not exist yet would only be reducer noise.
+    #[cfg(feature = "mcp")]
+    fn spawn_mcp_pump(&self, host: &Arc<manox_ahp::Host>) {
+        let mut events = manox_agent::mcp::subscribe_events();
+        let host = Arc::clone(host);
+        let me = self.me();
+        manox_agent::runtime::handle().spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        let action = ahp_types::actions::StateAction::SessionMcpServerStateChanged(
+                            Box::new(super::mcp::state_changed(event)),
+                        );
+                        let Some(backend) = me.as_ref() else {
+                            continue;
+                        };
+                        for session_id in backend.seeds.lock().keys().cloned().collect::<Vec<_>>() {
+                            if host.session_state(&session_id).is_some() {
+                                host.publish(
+                                    &manox_ahp::channels::session::uri(&session_id),
+                                    action.clone(),
+                                    None,
+                                );
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Missed transitions are corrected by the next seed
+                        // (the overlay always wins); the lag is worth a line.
+                        tracing::warn!("MCP event pump lagged, {n} transitions replayed from seed");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
     }
 
     fn host(&self) -> Option<Arc<manox_ahp::Host>> {
@@ -1197,6 +1244,31 @@ impl Backend for RuntimeBackend {
                     ),
                 }
             }
+            // MCP start/stop: the acceptance is the *intent*, not the outcome.
+            // The reducer has already folded the optimistic `starting`/`stopped`
+            // edge, so the runtime owes the settled state through the MCP event
+            // stream — a failure there publishes `session/mcpServerStateChanged`
+            // (error/stopped) rather than retroactively rejecting what every
+            // subscriber already folded. Only an unknown server id or a runtime
+            // without the MCP plane is refused up front.
+            StateAction::SessionMcpServerStartRequested(requested) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match self.server.mcp_start(session_id, &requested.id) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
+                }
+            }
+            StateAction::SessionMcpServerStopRequested(requested) => {
+                let Some(session_id) = session::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match self.server.mcp_stop(session_id, &requested.id) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(error) => DispatchOutcome::Rejected(error.message),
+                }
+            }
             // ── terminal actions ───────────────────────────────────────────
             //
             // A build without the terminal plane has no PTY to drive; it refuses
@@ -1689,5 +1761,281 @@ mod answer_mapping_tests {
                 .any(|a| a.selected.iter().any(|s| s == "approve")),
             "the runtime's approve test must match what the card offers: {mapped:?}"
         );
+    }
+}
+
+/// The dispatch arms for MCP start/stop answer from the runtime seam, so the
+/// contract lives at the seam: an unknown id (or a runtime without the MCP
+/// plane, whose trait defaults refuse) is a refusal, a served intent is
+/// accepted and forwarded verbatim.
+#[cfg(test)]
+mod mcp_dispatch_tests {
+    use super::*;
+    use crate::error::RuntimeError;
+    use crate::runtime_trait::{
+        ClientToolSpec, ForkIntent, RenameOutcome, SessionIntent, TerminalSnapshot,
+    };
+
+    /// A runtime that answers only the MCP seam and records what it was asked;
+    /// every other method is unreachable from these tests.
+    struct McpOnlyRuntime {
+        served: bool,
+        started: Mutex<Vec<String>>,
+        stopped: Mutex<Vec<String>>,
+    }
+
+    impl McpOnlyRuntime {
+        fn refusing() -> Arc<Self> {
+            Arc::new(Self {
+                served: false,
+                started: Mutex::new(Vec::new()),
+                stopped: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn serving() -> Arc<Self> {
+            Arc::new(Self {
+                served: true,
+                started: Mutex::new(Vec::new()),
+                stopped: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl SessionRuntime for McpOnlyRuntime {
+        fn terminal_state(&self, _terminal_id: &str) -> Option<TerminalSnapshot> {
+            None
+        }
+        fn terminal_raw_tap(
+            &self,
+            _terminal_id: &str,
+        ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
+            None
+        }
+        fn create_terminal(
+            &self,
+            _session_id: &str,
+            _terminal_id: &str,
+            _cols: u16,
+            _rows: u16,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn dispose_terminal(&self, _terminal_id: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn terminal_input(&self, _terminal_id: &str, _data: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn terminal_resize(
+            &self,
+            _terminal_id: &str,
+            _cols: u16,
+            _rows: u16,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn create_session(&self, _owner: &str, _intent: SessionIntent) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn fork_session(&self, _owner: &str, _intent: ForkIntent) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn dispose_session(&self, _owner: &str, _session_id: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn has_session(&self, _session_id: &str) -> bool {
+            false
+        }
+        fn submit(
+            &self,
+            _owner: &str,
+            _session_id: &str,
+            _text: String,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn steer(
+            &self,
+            _session_id: &str,
+            _message_id: &str,
+            _text: String,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn drop_queued(&self, _session_id: &str, _message_id: &str) {}
+        fn cancel_turn(&self, _session_id: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn set_model(&self, _session_id: &str, _model: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn set_reasoning_effort(
+            &self,
+            _session_id: &str,
+            _effort: &str,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn set_approval_mode(&self, _session_id: &str, _mode: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn set_cwd(&self, _session_id: &str, _cwd: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn archive_session(&self, _owner: &str, _session_id: &str, _archived: bool) {}
+        fn rename_session(&self, _session_id: &str, _title: &str) -> RenameOutcome {
+            RenameOutcome::UnknownSession
+        }
+        fn pin_session(&self, _session_id: &str, _pinned: bool) -> bool {
+            false
+        }
+        fn order_session(&self, _session_id: &str, _before: Option<&str>) -> bool {
+            false
+        }
+        fn compact(
+            &self,
+            _session_id: &str,
+            _instructions: Option<String>,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn plan_seed(&self, _session_id: &str, _plan_file: &str) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn goal(
+            &self,
+            _session_id: &str,
+            _action: &str,
+            _objective: Option<String>,
+            _budget: Option<u64>,
+            _max_rounds: Option<u64>,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn confirm_tool_call(
+            &self,
+            _session_id: &str,
+            _auth_id: &str,
+            _approved: bool,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn answer_question(
+            &self,
+            _session_id: &str,
+            _request_id: &str,
+            _answers: Vec<manox_agent::permission::AskAnswer>,
+        ) -> Result<(), RuntimeError> {
+            Err(RuntimeError::new("unused"))
+        }
+        fn journal_feed(&self, _session_id: &str) -> Option<manox_agent::thread::ThreadHandle> {
+            None
+        }
+        fn set_embedder_tools(
+            &self,
+            _session_id: &str,
+            _client_id: &str,
+            _tools: Vec<ClientToolSpec>,
+        ) {
+        }
+
+        fn mcp_start(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+            if !self.served {
+                return Err(RuntimeError::new(
+                    "MCP start is not supported by this runtime",
+                ));
+            }
+            self.started.lock().push(id.to_string());
+            Ok(())
+        }
+
+        fn mcp_stop(&self, _session_id: &str, id: &str) -> Result<(), RuntimeError> {
+            if !self.served {
+                return Err(RuntimeError::new(
+                    "MCP stop is not supported by this runtime",
+                ));
+            }
+            self.stopped.lock().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    fn dispatch_start(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
+        backend.dispatch(
+            channel,
+            &StateAction::SessionMcpServerStartRequested(
+                ahp_types::actions::SessionMcpServerStartRequestedAction { id: id.to_string() },
+            ),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 1,
+            },
+        )
+    }
+
+    fn dispatch_stop(backend: &RuntimeBackend, channel: &str, id: &str) -> DispatchOutcome {
+        backend.dispatch(
+            channel,
+            &StateAction::SessionMcpServerStopRequested(
+                ahp_types::actions::SessionMcpServerStopRequestedAction { id: id.to_string() },
+            ),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 2,
+            },
+        )
+    }
+
+    fn backend(runtime: Arc<McpOnlyRuntime>) -> Arc<RuntimeBackend> {
+        RuntimeBackend::new(runtime as Arc<dyn SessionRuntime>, std::env::temp_dir())
+    }
+
+    #[test]
+    fn a_start_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+        let backend = backend(McpOnlyRuntime::refusing());
+        let outcome = dispatch_start(&backend, "ahp-session:/s-1", "github");
+        assert!(
+            matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("not supported")),
+            "the refusal must reach the client: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_stop_on_a_runtime_without_the_mcp_plane_is_a_refusal() {
+        let backend = backend(McpOnlyRuntime::refusing());
+        let outcome = dispatch_stop(&backend, "ahp-session:/s-1", "github");
+        assert!(matches!(outcome, DispatchOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn a_start_intent_is_accepted_and_forwarded_with_its_id() {
+        let runtime = McpOnlyRuntime::serving();
+        let backend = backend(Arc::clone(&runtime));
+        assert_eq!(
+            dispatch_start(&backend, "ahp-session:/s-1", "github"),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(*runtime.started.lock(), vec!["github".to_string()]);
+    }
+
+    #[test]
+    fn a_stop_intent_is_accepted_and_forwarded_with_its_id() {
+        let runtime = McpOnlyRuntime::serving();
+        let backend = backend(Arc::clone(&runtime));
+        assert_eq!(
+            dispatch_stop(&backend, "ahp-session:/s-1", "github"),
+            DispatchOutcome::Accepted
+        );
+        assert_eq!(*runtime.stopped.lock(), vec!["github".to_string()]);
+    }
+
+    #[test]
+    fn an_mcp_intent_off_the_session_channel_is_rejected() {
+        let backend = backend(McpOnlyRuntime::serving());
+        assert!(matches!(
+            dispatch_start(&backend, "ahp-root://", "github"),
+            DispatchOutcome::Rejected(_)
+        ));
     }
 }
