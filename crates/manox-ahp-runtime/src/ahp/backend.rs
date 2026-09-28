@@ -646,10 +646,20 @@ impl RuntimeBackend {
             .provider_names()
             .into_iter()
             .map(|provider| {
-                let models = registry
+                let raw: Vec<manox_harness::types::Model> = registry
                     .models()
                     .into_iter()
                     .filter(|model| model.provider == provider)
+                    .collect();
+                // The human display name (metadata `provider_display_name`,
+                // e.g. "Packy API") — one submenu per display name, so wire
+                // variants of one provider merge with their own tags.
+                let display_name = raw
+                    .first()
+                    .map(manox_agent::provider_glue::display_provider_name)
+                    .unwrap_or_else(|| provider.clone());
+                let models = raw
+                    .into_iter()
                     .map(|model| SessionModelInfo {
                         // L8: the wire never carries a bare model id.
                         id: format!("{}/{}", model.provider, model.id),
@@ -675,7 +685,7 @@ impl RuntimeBackend {
                     .collect();
                 AgentInfo {
                     provider: provider.clone(),
-                    display_name: provider.clone(),
+                    display_name,
                     description: String::new(),
                     models,
                     protected_resources: None,
