@@ -691,14 +691,13 @@ impl Translator {
                 &mut out,
             ),
             // ── sub-agent activity ───────────────────────────────────────
-            JournalWireEvent::SubagentChild { agent_id, event } => {
+            JournalWireEvent::SubagentChild { .. } => {
                 // One child session's lifecycle event, in the parent
-                // transcript's order. Nothing is pushed to the transcript:
-                // the sub-agent tree is `x-manox-work` state (the Progress
-                // rows below maintain it), and a notice per event flooded
-                // the transcript with a card per spawn/exit the moment the
-                // bridge streamed again.
-                let _ = (&agent_id, &event);
+                // transcript's order — and nothing to push for it: the
+                // sub-agent tree is `x-manox-work` state (the Progress rows
+                // below maintain it), and a notice per event flooded the
+                // transcript with a card per spawn/exit the moment the bridge
+                // streamed again.
             }
             JournalWireEvent::SubagentProgress {
                 agent_id,
