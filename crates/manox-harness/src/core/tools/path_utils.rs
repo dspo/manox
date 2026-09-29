@@ -19,14 +19,29 @@ single-element `cwd` with the target expressed in `path` relative to it; add ele
 when this call's working directory is a distinct subdirectory of the anchor.";
 
 /// The rejection text for a missing or malformed `cwd` argument — it doubles
-/// as the model-facing how-to. Every rejection funnels here: the schema
-/// leaves `cwd` unconstrained on purpose, so this text (not a generic
-/// jsonschema message) is what the model sees.
-const CWD_REQUIRED_DOC: &str = "cwd is required: pass [anchor, ...route] — the first element \
+/// as the model-facing how-to. Every cwd rejection funnels here: a MISSING
+/// cwd passes the (deliberately unrequired) schema property and is rejected
+/// at resolution — by the tool, or by the approval fence for the gated
+/// tools; a present-but-malformed shape is caught by the schema, and the
+/// pipeline rewrites that generic validation message to this text.
+pub const CWD_REQUIRED_DOC: &str = "cwd is required: pass [anchor, ...route] — the first element \
 is the session's new anchor directory (\"\" keeps the current one; a relative anchor \
 resolves against the current anchor, so use an absolute path to start from a known root), \
 later elements locate this call without re-anchoring. Example: \
 [\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+
+/// Whether `value` is a present, well-formed `cwd` argument. The pipeline's
+/// schema-failure path uses this to tell a cwd-caused validation failure
+/// (present but malformed — rewritten to [`CWD_REQUIRED_DOC`]) from a
+/// failure in some other property (left as-is). A missing `cwd` is not
+/// shaped either, but it never reaches that path: the property is not
+/// `required`, so the schema admits the call and resolution rejects it.
+pub fn cwd_is_shaped(value: Option<&JsonValue>) -> bool {
+    match value.and_then(|v| v.as_array()) {
+        Some(items) => !items.is_empty() && items.iter().all(|v| v.is_string()),
+        None => false,
+    }
+}
 
 /// The parsed `cwd` argument: `[anchor, ...route]`.
 struct CwdArg {

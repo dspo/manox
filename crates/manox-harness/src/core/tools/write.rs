@@ -39,6 +39,9 @@ impl AgentTool for WriteTool {
                     "description": "Path to the file"
                 },
                 "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "content": {

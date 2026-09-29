@@ -107,6 +107,9 @@ impl AgentTool for BashTool {
                     "description": "The command to execute"
                 },
                 "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "timeout": {

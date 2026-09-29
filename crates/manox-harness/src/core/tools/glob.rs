@@ -60,6 +60,9 @@ impl AgentTool for GlobTool {
                     "description": "Directory to search (default: cwd)"
                 },
                 "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "limit": {
@@ -317,11 +320,15 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("pattern")));
-        // `cwd` is semantically required but deliberately unconstrained in
-        // the schema: every malformed shape must reach `parse_cwd_arg` so
-        // the model sees the instructional how-to, not a generic jsonschema
-        // validation message.
+        // `cwd` is semantically required but deliberately absent from
+        // `required`: a MISSING cwd passes validation so the model sees the
+        // instructional how-to (from the tool, or the approval fence for the
+        // gated tools) instead of a generic jsonschema message. The shape
+        // itself is still declared — a present-but-malformed cwd is caught
+        // by the schema, and the pipeline rewrites that failure to the same
+        // how-to.
         assert!(!required.iter().any(|v| v.as_str() == Some("cwd")));
-        assert!(schema["properties"]["cwd"].get("type").is_none());
+        assert_eq!(schema["properties"]["cwd"]["type"], "array");
+        assert_eq!(schema["properties"]["cwd"]["items"]["type"], "string");
     }
 }

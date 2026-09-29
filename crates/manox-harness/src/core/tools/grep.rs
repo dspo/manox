@@ -64,6 +64,9 @@ impl AgentTool for GrepTool {
                     "description": "Directory or file to search (default: cwd)"
                 },
                 "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "glob": {

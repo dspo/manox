@@ -107,6 +107,9 @@ impl AgentTool for EditTool {
                     "description": PATCH_DOC
                 },
                 "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 }
             },

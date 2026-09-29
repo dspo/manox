@@ -714,7 +714,20 @@ async fn execute_one(
 
     // Validate arguments against the tool's JSON Schema.
     if let Err(e) = validate_tool_args(tool.parameters_schema(), args.clone()) {
-        let result = AgentToolResult::error(format!("Invalid arguments: {e}"));
+        // A present-but-malformed `cwd` dies here at the shape level; every
+        // cwd rejection is the instructional how-to, so rewrite the generic
+        // jsonschema message. A MISSING `cwd` passes validation — the
+        // property is deliberately not `required` — and is rejected with
+        // the same text at resolution (by the tool, or by the approval
+        // fence for the gated tools).
+        let message = if args.get("cwd").is_some()
+            && !crate::tools::path_utils::cwd_is_shaped(args.get("cwd"))
+        {
+            crate::tools::path_utils::CWD_REQUIRED_DOC.to_string()
+        } else {
+            e
+        };
+        let result = AgentToolResult::error(format!("Invalid arguments: {message}"));
         let result_message = make_tool_result_message(&id, &name, &result);
         sink.emit(AgentEvent::ToolExecutionEnd {
             tool_call_id: id.clone(),
@@ -1049,6 +1062,48 @@ mod tests {
             assert_eq!(tool_name, "echo");
         } else {
             panic!("expected ToolResult message");
+        }
+    }
+
+    /// Every cwd rejection reaches the model as the instructional how-to,
+    /// end to end through the pipeline: a MISSING cwd passes the
+    /// deliberately-unrequired schema and dies at resolution; a
+    /// present-but-malformed one is caught by the schema and rewritten —
+    /// neither surfaces a generic jsonschema message.
+    #[tokio::test]
+    async fn test_every_cwd_rejection_surfaces_the_howto() {
+        let tools: Vec<Arc<dyn AgentTool>> = vec![Arc::new(crate::tools::read::ReadTool)];
+        let ctx = MockCtx {
+            state: ToolState::new(),
+        };
+        let cases = [
+            serde_json::json!({ "path": "f.txt" }),
+            serde_json::json!({ "path": "f.txt", "cwd": "/tmp" }),
+            serde_json::json!({ "path": "f.txt", "cwd": [] }),
+            serde_json::json!({ "path": "f.txt", "cwd": ["", 3] }),
+        ];
+        for args in cases {
+            let (executed, _) = execute_tool_calls(
+                &[("c1", "Read", args)],
+                &tools,
+                CancellationToken::new(),
+                &ctx,
+                &AgentLoopConfig::default(),
+                &NullSink,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(executed[0].result.is_error);
+            let crate::types::ContentBlock::Text { text, .. } = &executed[0].result.content[0]
+            else {
+                panic!("expected a text block");
+            };
+            assert!(
+                text.contains(crate::tools::path_utils::CWD_REQUIRED_DOC),
+                "{text}"
+            );
+            assert!(!text.contains("not of type"), "{text}");
         }
     }
 
