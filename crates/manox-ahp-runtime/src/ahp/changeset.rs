@@ -201,6 +201,16 @@ fn scan(git: &dyn GitRunner, dirs: &[PathBuf]) -> Result<Scan, String> {
     for root in &roots {
         files.extend(scan_root(git, root)?);
     }
+    // The granted roots are the session's fence: git scans whole repos, but
+    // a monorepo-style grant (a subdirectory) must not expose — let alone
+    // offer to revert — changes elsewhere in the repo. Filtering here keeps
+    // the view, the patch contents and the revert target set consistent
+    // with the resource plane's fence (an out-of-grant file's content ref
+    // would be unfetchable through `resourceRead` anyway).
+    files.retain(|file| {
+        let path = Path::new(file.id.strip_prefix("file://").unwrap_or(&file.id));
+        dirs.iter().any(|dir| path.starts_with(dir))
+    });
     files.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(Scan {
         files,
@@ -425,11 +435,18 @@ impl Engine {
             let mut sessions = self.sessions.lock();
             match sessions.get_mut(session_id) {
                 Some(entry) => {
-                    if entry.dirs != dirs {
+                    // Order-insensitive: the seed's directory order is stable
+                    // today, but a reorder is not a move and must not pay a
+                    // rescan.
+                    let mut next = dirs.clone();
+                    next.sort();
+                    let mut stored = entry.dirs.clone();
+                    stored.sort();
+                    if next != stored {
                         // The session's directory set moved (a cwd change, a
                         // new grant, or a repository appearing where none
                         // was): rescan against the new set.
-                        entry.dirs = dirs.clone();
+                        entry.dirs = next;
                         entry.status = ChangesetStatus::Computing;
                     }
                     entry.status == ChangesetStatus::Computing
@@ -805,7 +822,9 @@ mod tests {
     #[test]
     fn a_repo_session_advertises_the_catalogue_and_answers_a_ready_state() {
         let engine = one_file_git();
-        let dirs = vec![PathBuf::from("/work")];
+        // The grant IS the repo root here (the dir == repo-root case); the
+        // subdirectory-grant case has its own dedicated tests below.
+        let dirs = vec![PathBuf::from("/repo")];
         let entry = engine.catalogue("s-1", dirs.clone()).expect("repo present");
         assert_eq!(entry.label, "Uncommitted Changes");
         assert_eq!(entry.change_kind, KEY);
@@ -850,7 +869,7 @@ mod tests {
     #[test]
     fn an_unknown_key_is_not_served() {
         let engine = one_file_git();
-        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
         assert!(engine.state("s-1", "turn").is_none());
         assert!(engine.review("s-1", "turn", &[], true).is_err());
     }
@@ -880,7 +899,7 @@ mod tests {
             }
             _ => ok(""),
         });
-        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
         engine
             .review("s-1", KEY, &["file:///repo/f.rs".to_string()], true)
             .expect("the file exists");
@@ -910,7 +929,7 @@ mod tests {
     #[test]
     fn recompute_emits_content_then_status_on_the_changeset_channel() {
         let engine = one_file_git();
-        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
         let emissions = engine.recompute("s-1");
         assert_eq!(emissions.len(), 2);
         assert!(matches!(
@@ -1053,7 +1072,7 @@ mod tests {
             "diff" => ok("+copy body\n"),
             _ => ok(""),
         });
-        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
         let state = engine.state("s-1", KEY).unwrap();
         let ids: Vec<&str> = state.files.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
@@ -1074,7 +1093,7 @@ mod tests {
             "status" => ok(" D f.rs\0"),
             _ => ok(""),
         });
-        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
         engine
             .review("s-1", KEY, &["file:///repo/f.rs".to_string()], true)
             .expect("the deletion entry exists");
@@ -1214,6 +1233,43 @@ mod tests {
             .expect("the repo appears on the moved directory set");
         assert_eq!(entry.uri_template, uri("s-1"));
         assert_eq!(engine.state("s-1", KEY).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn a_monorepo_subdirectory_grant_never_lists_out_of_grant_files() {
+        // Probe-D shape: the grant is /repo/sub but the repo also carries
+        // /repo/other/secret.rs. git scans whole repos; the fence filters
+        // the view — the out-of-grant file must not be listed (its patch
+        // would cross the resource fence, and revert could never act on it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let sub = repo.join("sub");
+        let other = repo.join("other");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        std::fs::create_dir_all(&other).expect("otherdir");
+        let repo_canon = repo
+            .canonicalize()
+            .expect("canonical repo")
+            .display()
+            .to_string();
+        let engine = script(move |args| match args.first().copied().unwrap_or("") {
+            "rev-parse" => ok(&format!("{repo_canon}\n")),
+            "status" => ok(" M sub/f.rs\0 M other/secret.rs\0"),
+            "diff" if args.contains(&"--numstat") => ok("1\t1\tsub/f.rs\n"),
+            "diff" => ok("+sub change\n"),
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![sub.canonicalize().unwrap()]);
+        let state = engine.state("s-1", KEY).unwrap();
+        let ids: Vec<&str> = state.files.iter().map(|f| f.id.as_str()).collect();
+        // The assertion compares against the CANONICAL grant path: the wire
+        // id is built from the git-reported (resolved) repo root.
+        let sub_canon = sub.canonicalize().unwrap();
+        assert_eq!(
+            ids,
+            vec![format!("file://{}", sub_canon.join("f.rs").display())],
+            "only the in-grant file is listed; the out-of-grant change is fenced out"
+        );
     }
 
     #[test]
