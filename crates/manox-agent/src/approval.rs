@@ -500,18 +500,16 @@ impl ApprovalGatedTool {
 
     /// The nearest existing ancestor directory of the call's write target —
     /// the root an approved escalation covers. Resolved with the same chain
-    /// the tool itself will use (explicit `cwd` → sticky → session cwd),
-    /// read-only: the fence must not advance the sticky cwd.
+    /// the tool itself will use (the `cwd` `[anchor, ...route]` array, peeked
+    /// read-only so the fence neither advances the sticky cwd nor re-anchors
+    /// it).
     fn call_target_root(
         &self,
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Option<std::path::PathBuf> {
-        let cwd = manox_harness::tools::path_utils::peek_effective_cwd(
-            ctx,
-            params.get("cwd").and_then(|v| v.as_str()),
-        )
-        .ok()?;
+        let cwd =
+            manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")).ok()?;
         let target = match self.inner.name() {
             "Write" => {
                 let path = params.get("path")?.as_str()?;
@@ -550,16 +548,17 @@ impl ApprovalGatedTool {
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
-        // The call's effective cwd — the same chain the tool itself will
-        // resolve (explicit `cwd` → sticky → session cwd), peeked read-only
-        // so the fence does not advance the sticky cwd. A missing directory
-        // is a denial: the tool would fail the same way.
-        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(
-            ctx,
-            params.get("cwd").and_then(|v| v.as_str()),
-        ) {
+        // The call's effective cwd — the same `cwd` `[anchor, ...route]`
+        // resolution the tool itself will perform, peeked read-only so the
+        // fence does not advance the sticky cwd. A malformed or unresolvable
+        // `cwd` is an argument error, not a permission problem: surface the
+        // same instructional text the tool itself would return next instead
+        // of dressing it up as a sandbox denial that lures the model into an
+        // escalation it cannot benefit from.
+        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd"))
+        {
             Ok(cwd) => cwd,
-            Err(_) => return deny(),
+            Err(e) => return Err(ToolError::InvalidArguments(e)),
         };
         // Containment against the shared writable-root set (workspace + manox
         // home + /tmp + tmpdir) plus the granted roots derived from the
@@ -899,7 +898,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -948,7 +947,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -963,7 +962,7 @@ mod tests {
         let err = tool2
             .execute(
                 "c2",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1027,7 +1026,7 @@ mod tests {
                 "c1",
                 serde_json::json!({
                     "path": target,
-                    "cwd": wt.to_string_lossy(),
+                    "cwd": [wt.to_string_lossy()],
                     "content": "x",
                 }),
                 CancellationToken::new(),
@@ -1076,7 +1075,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1093,7 +1092,7 @@ mod tests {
         let result = tool
             .execute(
                 "c2",
-                serde_json::json!({"patch": patch}),
+                serde_json::json!({"patch": patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1112,7 +1111,7 @@ mod tests {
         let err = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": "/etc/manox-gate-test/x.txt", "content": "x"}),
+                serde_json::json!({"path": "/etc/manox-gate-test/x.txt", "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1133,7 +1132,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"patch": ok_patch}),
+                serde_json::json!({"patch": ok_patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1147,7 +1146,7 @@ mod tests {
         let err = tool
             .execute(
                 "c2",
-                serde_json::json!({"patch": escape_patch}),
+                serde_json::json!({"patch": escape_patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1158,7 +1157,9 @@ mod tests {
     }
 
     /// Fail-closed: a gated mutating tool the path policy cannot classify
-    /// (no path target) is denied under WorkspaceWrite.
+    /// (no path target) is denied under WorkspaceWrite. The `cwd` carries a
+    /// well-formed anchor so the case isolates target classification — a
+    /// missing/malformed `cwd` is an argument error, not a denial.
     #[tokio::test]
     async fn workspace_write_denies_unclassifiable_targets() {
         let (gate, _rx) = gate_with_events();
@@ -1166,10 +1167,43 @@ mod tests {
         let (tool, ran) = gated(true, false, Arc::clone(&gate));
         let ctx = tool_ctx();
         let err = tool
-            .execute("c1", serde_json::json!({}), CancellationToken::new(), &ctx)
+            .execute(
+                "c1",
+                serde_json::json!({ "cwd": [""] }),
+                CancellationToken::new(),
+                &ctx,
+            )
             .await
             .unwrap_err();
         assert!(err.to_string().contains(DENY_OUT_OF_WORKSPACE));
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+    }
+
+    /// A gated Write whose `cwd` is missing reaches the fence (the schema
+    /// deliberately does not require the property) and must surface the
+    /// instructional argument error — not a sandbox denial luring the model
+    /// into an escalation — without running the tool.
+    #[tokio::test]
+    async fn workspace_write_missing_cwd_surfaces_the_instructional_error() {
+        let (gate, _rx) = gate_with_events();
+        gate.set_mode(PermissionMode::WorkspaceWrite);
+        let (tool, ran) = gated_named("Write", true, false, Arc::clone(&gate));
+        let ctx = tool_ctx();
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::json!({ "path": "x.txt", "content": "y" }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(manox_harness::tools::path_utils::CWD_REQUIRED_DOC),
+            "{err}"
+        );
+        assert!(!err.to_string().contains(DENY_OUT_OF_WORKSPACE));
         assert_eq!(ran.load(Ordering::SeqCst), 0);
     }
 
@@ -1233,6 +1267,7 @@ mod tests {
         // Call 1: escalate to workspace-write for an out-of-workspace target.
         let args = serde_json::json!({
             "path": "/etc/manox-grant-leak-test/x.txt",
+            "cwd": [""],
             "content": "x",
             "sandbox_permissions": "workspace-write",
             "justification": "need it"
@@ -1249,6 +1284,7 @@ mod tests {
         // back to read-only, NOT the stale workspace-write grant.
         let args2 = serde_json::json!({
             "path": "/etc/manox-grant-leak-test/x.txt",
+            "cwd": [""],
             "content": "x"
         });
         let err2 = tool
@@ -1286,12 +1322,14 @@ mod tests {
         let ctx = tool_ctx();
         let escalated = serde_json::json!({
             "path": "/etc/manox-parallel-race/x.txt",
+            "cwd": [""],
             "content": "x",
             "sandbox_permissions": "workspace-write",
             "justification": "need it"
         });
         let plain = serde_json::json!({
             "path": "/etc/manox-parallel-race/y.txt",
+            "cwd": [""],
             "content": "y"
         });
         let (a, b) = tokio::join!(

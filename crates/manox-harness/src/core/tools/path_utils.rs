@@ -5,7 +5,74 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value as JsonValue;
+
 use crate::tool::ToolContext;
+
+/// Schema description shared by every FS/Bash tool's `cwd` property.
+pub const CWD_SCHEMA_DOC: &str = "Working directory for this call as `[anchor, ...route]` \
+(required — the call is rejected without it). The first element re-anchors the session's \
+default directory (\"\" keeps the current one); a RELATIVE anchor resolves against the \
+current anchor, so pass an absolute path to start from a known root. The remaining elements \
+locate this call without re-anchoring. A single element re-anchors and runs there. Prefer a \
+single-element `cwd` with the target expressed in `path` relative to it; add elements only \
+when this call's working directory is a distinct subdirectory of the anchor.";
+
+/// The rejection text for a missing or malformed `cwd` argument — it doubles
+/// as the model-facing how-to. Every cwd rejection funnels here: a MISSING
+/// cwd passes the (deliberately unrequired) schema property and is rejected
+/// at resolution — by the tool, or by the approval fence for the gated
+/// tools; a present-but-malformed shape is caught by the schema, and the
+/// pipeline rewrites that generic validation message to this text.
+pub const CWD_REQUIRED_DOC: &str = "cwd is required: pass [anchor, ...route] — the first element \
+is the session's new anchor directory (\"\" keeps the current one; a relative anchor \
+resolves against the current anchor, so use an absolute path to start from a known root), \
+later elements locate this call without re-anchoring. Example: \
+[\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+
+/// Whether `value` is a present, well-formed `cwd` argument. The pipeline's
+/// schema-failure path uses this to tell a cwd-caused validation failure
+/// (present but malformed — rewritten to [`CWD_REQUIRED_DOC`]) from a
+/// failure in some other property (left as-is). A missing `cwd` is not
+/// shaped either, but it never reaches that path: the property is not
+/// `required`, so the schema admits the call and resolution rejects it.
+pub fn cwd_is_shaped(value: Option<&JsonValue>) -> bool {
+    match value.and_then(|v| v.as_array()) {
+        Some(items) => !items.is_empty() && items.iter().all(|v| v.is_string()),
+        None => false,
+    }
+}
+
+/// The parsed `cwd` argument: `[anchor, ...route]`.
+struct CwdArg {
+    /// First element: `""` keeps the current anchor; non-empty re-anchors the
+    /// session's default directory.
+    anchor: String,
+    /// Remaining elements: joined onto the anchor to locate this call only.
+    route: Vec<String>,
+}
+
+/// Parse the `cwd` argument. It must be a non-empty JSON array of strings;
+/// anything else (missing, non-array, empty array, non-string element) is
+/// rejected with the same instructional error.
+fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
+    let Some(items) = value.and_then(|v| v.as_array()) else {
+        return Err(CWD_REQUIRED_DOC.to_string());
+    };
+    let mut elements = items.iter();
+    let anchor = elements
+        .next()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
+    let route = elements
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
+    Ok(CwdArg {
+        anchor: anchor.to_string(),
+        route,
+    })
+}
 
 /// Resolve the effective working directory for one tool call without
 /// advancing the sticky cwd — the read-only half of
@@ -14,8 +81,28 @@ use crate::tool::ToolContext;
 /// tool's own resolution).
 pub fn peek_effective_cwd(
     ctx: &dyn ToolContext,
-    explicit: Option<&str>,
+    value: Option<&JsonValue>,
 ) -> Result<PathBuf, String> {
+    Ok(resolve_dirs(ctx, value)?.1)
+}
+
+/// Resolve `(anchor_dir, call_dir)` for one `cwd` argument. `anchor_dir` is
+/// `None` when the anchor element is `""` — the session's default directory
+/// stays where it is.
+///
+/// The anchor resolves against the sticky cwd (the directory the last
+/// non-empty anchor set), falling back to the tool context's baseline (the
+/// session cwd); `~` expands to the home directory and a relative anchor
+/// resolves against that base. Route elements join onto the anchor in order
+/// with `PathBuf::join` semantics — an absolute element resets the base. The
+/// anchor and the joined call directory must both exist: every consumer
+/// (path joins, shell spawns) needs a real directory, and a missing target
+/// (a removed worktree) must not poison the sticky cwd.
+fn resolve_dirs(
+    ctx: &dyn ToolContext,
+    value: Option<&JsonValue>,
+) -> Result<(Option<PathBuf>, PathBuf), String> {
+    let arg = parse_cwd_arg(value)?;
     let tool_state = ctx.tool_state();
     let sticky = tool_state
         .sticky_cwd
@@ -23,46 +110,62 @@ pub fn peek_effective_cwd(
         .expect("sticky cwd poisoned")
         .clone();
     let base = sticky.unwrap_or_else(|| ctx.cwd().to_path_buf());
-    let effective = match explicit.map(expand_tilde) {
-        Some(cwd) => {
-            let path = Path::new(&cwd);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                base.join(path)
-            }
+    let anchor_dir = if arg.anchor.is_empty() {
+        None
+    } else {
+        let expanded = expand_tilde(&arg.anchor);
+        let path = Path::new(&expanded);
+        let dir = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base.join(path)
+        };
+        if !dir.is_dir() {
+            return Err(format!(
+                "working directory does not exist: {}",
+                dir.display()
+            ));
         }
-        None => base,
+        Some(dir)
     };
-    if !effective.is_dir() {
+    let mut call_dir = anchor_dir.clone().unwrap_or_else(|| base.clone());
+    for element in &arg.route {
+        let expanded = expand_tilde(element);
+        let path = Path::new(&expanded);
+        call_dir = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            call_dir.join(path)
+        };
+    }
+    if !call_dir.is_dir() {
         return Err(format!(
             "working directory does not exist: {}",
-            effective.display()
+            call_dir.display()
         ));
     }
-    Ok(effective)
+    Ok((anchor_dir, call_dir))
 }
 
 /// Resolve the effective working directory for one tool call and advance the
-/// session's sticky cwd to it.
+/// session's sticky cwd to the call's anchor directory.
 ///
-/// Resolution chain: an explicit `cwd` argument → the sticky cwd (the
-/// directory the last tool call ran in) → the tool context's baseline (the
-/// session cwd). An explicit relative `cwd` resolves against the sticky cwd
-/// (or the session cwd before any tool call moved it). `~` expands to the
-/// home directory. A resolved directory that does not exist is an error —
-/// every consumer (path joins, shell spawns) needs a real directory, and a
-/// missing target (a removed worktree) must not poison the sticky cwd.
+/// `cwd` is the array `[anchor, ...route]`: a non-empty anchor re-anchors the
+/// sticky cwd (to the anchor directory itself — route elements only locate
+/// this call); an empty anchor keeps it. The returned directory is where this
+/// call runs (anchor joined with the route). See [`resolve_dirs`].
 pub fn resolve_effective_cwd(
     ctx: &dyn ToolContext,
-    explicit: Option<&str>,
+    value: Option<&JsonValue>,
 ) -> Result<PathBuf, String> {
-    let effective = peek_effective_cwd(ctx, explicit)?;
-    *ctx.tool_state()
-        .sticky_cwd
-        .lock()
-        .expect("sticky cwd poisoned") = Some(effective.clone());
-    Ok(effective)
+    let (anchor_dir, call_dir) = resolve_dirs(ctx, value)?;
+    if let Some(anchor_dir) = anchor_dir {
+        *ctx.tool_state()
+            .sticky_cwd
+            .lock()
+            .expect("sticky cwd poisoned") = Some(anchor_dir);
+    }
+    Ok(call_dir)
 }
 
 /// Resolve a potentially relative path against the working directory.
@@ -195,50 +298,129 @@ mod tests {
         (base, work)
     }
 
-    #[test]
-    fn effective_cwd_starts_at_session_cwd_without_sticky() {
-        let (base, _work) = setup_dirs();
-        let (ctx, state) = ctx_at(base.path());
-        let effective = resolve_effective_cwd(&ctx, None).unwrap();
-        assert_eq!(effective, base.path());
-        // The first resolution advances the sticky to the session cwd.
-        assert_eq!(sticky(&state), Some(base.path().to_path_buf()));
+    fn cwd_arg(items: &[&str]) -> Option<serde_json::Value> {
+        Some(serde_json::json!(items))
     }
 
     #[test]
-    fn effective_cwd_explicit_absolute_overrides_and_advances_sticky() {
+    fn missing_malformed_or_empty_cwd_is_rejected() {
+        let (base, _work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        // Missing.
+        let err = resolve_effective_cwd(&ctx, None).unwrap_err();
+        assert!(err.contains("cwd is required"), "{err}");
+        // Non-array.
+        let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!("/abs"))).unwrap_err();
+        assert!(err.contains("cwd is required"), "{err}");
+        // Empty array.
+        let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!([]))).unwrap_err();
+        assert!(err.contains("cwd is required"), "{err}");
+        // Non-string element.
+        let err = resolve_effective_cwd(&ctx, Some(&serde_json::json!(["", 3]))).unwrap_err();
+        assert!(err.contains("cwd is required"), "{err}");
+        assert_eq!(sticky(&state), None);
+    }
+
+    #[test]
+    fn empty_anchor_keeps_the_base_and_never_advances_sticky() {
+        let (base, _work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        let effective = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
+        assert_eq!(effective, base.path());
+        assert_eq!(sticky(&state), None, "an empty anchor never re-anchors");
+        // Peek agrees and stays read-only.
+        let peeked = peek_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
+        assert_eq!(peeked, base.path());
+    }
+
+    #[test]
+    fn single_element_anchor_reanchors_and_advances_sticky() {
         let (base, work) = setup_dirs();
         let (ctx, state) = ctx_at(base.path());
-        let effective = resolve_effective_cwd(&ctx, Some(work.path().to_str().unwrap())).unwrap();
+        let arg = cwd_arg(&[work.path().to_str().unwrap()]);
+        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
         assert_eq!(effective, work.path());
         assert_eq!(sticky(&state), Some(work.path().to_path_buf()));
-        // The next call without an argument inherits the advanced sticky.
-        let inherited = resolve_effective_cwd(&ctx, None).unwrap();
+        // The next call with an empty anchor inherits the advanced sticky.
+        let inherited = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
         assert_eq!(inherited, work.path());
     }
 
     #[test]
-    fn effective_cwd_explicit_relative_resolves_against_sticky() {
+    fn relative_anchor_resolves_against_sticky() {
         let (base, work) = setup_dirs();
         let sub = work.path().join("nested");
         std::fs::create_dir(&sub).unwrap();
         let (ctx, state) = ctx_at(base.path());
-        resolve_effective_cwd(&ctx, Some(work.path().to_str().unwrap())).unwrap();
-        let effective = resolve_effective_cwd(&ctx, Some("nested")).unwrap();
+        resolve_effective_cwd(&ctx, cwd_arg(&[work.path().to_str().unwrap()]).as_ref()).unwrap();
+        let effective = resolve_effective_cwd(&ctx, cwd_arg(&["nested"]).as_ref()).unwrap();
         assert_eq!(effective, sub);
         assert_eq!(sticky(&state), Some(sub));
     }
 
     #[test]
-    fn effective_cwd_rejects_missing_directory_and_keeps_sticky() {
+    fn route_locates_the_call_without_moving_sticky() {
+        let (base, work) = setup_dirs();
+        let nested = work.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let (ctx, state) = ctx_at(base.path());
+        let arg = cwd_arg(&[work.path().to_str().unwrap(), "nested"]);
+        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
+        assert_eq!(effective, nested, "the call runs in anchor + route");
+        assert_eq!(
+            sticky(&state),
+            Some(work.path().to_path_buf()),
+            "the sticky advances to the anchor, not the route directory"
+        );
+    }
+
+    #[test]
+    fn empty_anchor_with_absolute_route_keeps_the_anchor() {
         let (base, work) = setup_dirs();
         let (ctx, state) = ctx_at(base.path());
+        let arg = cwd_arg(&["", work.path().to_str().unwrap()]);
+        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
+        assert_eq!(effective, work.path());
+        assert_eq!(sticky(&state), None, "an empty anchor never re-anchors");
+    }
+
+    #[test]
+    fn absolute_route_element_resets_the_base() {
+        let (base, work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        let arg = cwd_arg(&[base.path().to_str().unwrap(), work.path().to_str().unwrap()]);
+        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
+        assert_eq!(effective, work.path(), "the absolute route resets the base");
+        assert_eq!(sticky(&state), Some(base.path().to_path_buf()));
+    }
+
+    #[test]
+    fn nonempty_anchor_advances_even_with_an_absolute_route() {
+        let (base, work) = setup_dirs();
+        let anchor = base.path().join("anchor");
+        std::fs::create_dir(&anchor).unwrap();
+        let (ctx, state) = ctx_at(base.path());
+        let arg = cwd_arg(&["anchor", work.path().to_str().unwrap()]);
+        let effective = resolve_effective_cwd(&ctx, arg.as_ref()).unwrap();
+        assert_eq!(effective, work.path());
+        assert_eq!(sticky(&state), Some(anchor), "the anchor still re-anchors");
+    }
+
+    #[test]
+    fn missing_directory_is_rejected_and_keeps_sticky() {
+        let (base, work) = setup_dirs();
+        let (ctx, state) = ctx_at(base.path());
+        // A missing anchor.
         let gone = work.path().join("gone");
-        let err = resolve_effective_cwd(&ctx, Some(gone.to_str().unwrap())).unwrap_err();
+        let err =
+            resolve_effective_cwd(&ctx, cwd_arg(&[gone.to_str().unwrap()]).as_ref()).unwrap_err();
+        assert!(err.contains("working directory does not exist"), "{err}");
+        // A missing route segment.
+        let err = resolve_effective_cwd(&ctx, cwd_arg(&["", "gone"]).as_ref()).unwrap_err();
         assert!(err.contains("working directory does not exist"), "{err}");
         // A failed resolution must not advance the sticky.
         assert_eq!(sticky(&state), None);
-        let effective = resolve_effective_cwd(&ctx, None).unwrap();
+        let effective = resolve_effective_cwd(&ctx, cwd_arg(&[""]).as_ref()).unwrap();
         assert_eq!(effective, base.path());
     }
 }

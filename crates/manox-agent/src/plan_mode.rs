@@ -213,11 +213,22 @@ fn resolve_with_existing_prefix(path: &Path) -> PathBuf {
 /// actually consumes — Write reads `{path}`; Edit reads `{patch}`
 /// (hashline) and ignores any decoy `path` field, so every `[path#TAG]`
 /// section target must be writable, with relative paths resolved against
-/// the session cwd. Missing or unparseable fields fail closed. Plans-dir
-/// containment is checked symlink-aware: the longest existing prefix is
-/// canonicalized, so a symlinked directory cannot smuggle a write out of
-/// (or into) the plans dir; the not-yet-created tail (the plan file
-/// itself) is appended lexically after resolution.
+/// `cwd` (the session cwd captured when the engine was built). Missing or
+/// unparseable fields fail closed. Plans-dir containment is checked
+/// symlink-aware: the longest existing prefix is canonicalized, so a
+/// symlinked directory cannot smuggle a write out of (or into) the plans
+/// dir; the not-yet-created tail (the plan file itself) is appended
+/// lexically after resolution.
+///
+/// Known divergence from the tools' own resolution: the call's `cwd`
+/// `[anchor, ...route]` array is NOT applied here — the `ToolCall` hook is
+/// synchronous and carries no `ToolContext`, so the sticky cwd that a
+/// relative anchor would resolve against is unreachable. A relative target
+/// is therefore judged against the captured session cwd while the tool may
+/// land it elsewhere. The failure direction is fail-closed (a plan-file
+/// write through a different anchor is rejected, never smuggled in);
+/// follow-up: thread the session's anchor state into the hook for
+/// same-source resolution.
 pub fn is_plan_mode_writable_param(
     tool_name: &str,
     params: &serde_json::Value,

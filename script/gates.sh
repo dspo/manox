@@ -21,6 +21,11 @@
 #   6. test-clean — the same under a pristine temp HOME (the CI-equivalent
 #                   hermeticity leg: no ~/.manox config, no provider
 #                   registry, no session journals)
+#   7. examples   — the offline example smoke (crates/manox-harness/scripts/
+#                   check_examples.sh): cargo test only COMPILES examples,
+#                   so a synthesized tool call that no longer satisfies a
+#                   tool's schema stays green here and only dies in CI's
+#                   example gate (the PR 826 lesson).
 #
 # Usage: script/gates.sh [--quick]
 #   --quick  fmt + clippy + test-real only (iteration; a commit gate still
@@ -89,6 +94,7 @@ if [[ "$QUICK" -eq 0 ]]; then
     run_leg "test-clean" env HOME="$CLEAN_HOME" \
         cargo test --workspace --all-targets --no-fail-fast
     rm -rf "$CLEAN_HOME"
+    run_leg "examples" ./crates/manox-harness/scripts/check_examples.sh
 fi
 
 echo ""

@@ -49,8 +49,10 @@ impl AgentTool for ReadTool {
                     "description": "Path to the file"
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "offset": {
                     "type": "integer",
@@ -78,7 +80,7 @@ impl AgentTool for ReadTool {
         let offset = params["offset"].as_u64().map(|v| v as usize);
         let limit = params["limit"].as_u64().map(|v| v as usize);
 
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
         let path = cwd.join(path_str);
 
@@ -248,8 +250,9 @@ mod tests {
         .await
     }
 
-    /// A relative path resolves against the call's explicit `cwd`, and the
-    /// sticky advances so the next call without `cwd` inherits it.
+    /// An anchor-only `cwd` resolves the relative path against the anchored
+    /// directory and advances the sticky, so the next call with an empty
+    /// anchor inherits it.
     #[tokio::test]
     async fn explicit_cwd_resolves_relative_paths_and_advances_sticky() {
         let base = tempfile::tempdir().unwrap();
@@ -262,7 +265,7 @@ mod tests {
             &ctx,
             serde_json::json!({
                 "path": "note.txt",
-                "cwd": work.path().to_string_lossy(),
+                "cwd": [work.path().to_string_lossy()],
             }),
         )
         .await
@@ -274,11 +277,15 @@ mod tests {
             other => panic!("expected text block, got {other:?}"),
         }
 
-        // Sticky advanced: the same relative path resolves in the worktree
-        // without repeating the cwd argument.
-        let inherited = read(&ReadTool, &ctx, serde_json::json!({"path": "note.txt"}))
-            .await
-            .unwrap();
+        // Sticky advanced: an empty anchor keeps the worktree directory for
+        // the next call.
+        let inherited = read(
+            &ReadTool,
+            &ctx,
+            serde_json::json!({"path": "note.txt", "cwd": [""]}),
+        )
+        .await
+        .unwrap();
         assert!(!inherited.is_error);
         assert_eq!(
             ctx.state.sticky_cwd.lock().unwrap().as_deref(),
@@ -286,8 +293,8 @@ mod tests {
         );
     }
 
-    /// A cwd pointing at a directory that does not exist fails before any
-    /// file access and leaves the sticky untouched.
+    /// A cwd anchor pointing at a directory that does not exist fails before
+    /// any file access and leaves the sticky untouched.
     #[tokio::test]
     async fn missing_cwd_fails_without_advancing_sticky() {
         let base = tempfile::tempdir().unwrap();
@@ -296,7 +303,7 @@ mod tests {
         let err = read(
             &ReadTool,
             &ctx,
-            serde_json::json!({"path": "any.txt", "cwd": gone.to_string_lossy()}),
+            serde_json::json!({"path": "any.txt", "cwd": [gone.to_string_lossy()]}),
         )
         .await
         .unwrap_err();
@@ -307,5 +314,21 @@ mod tests {
             other => panic!("expected InvalidArguments, got {other:?}"),
         }
         assert!(ctx.state.sticky_cwd.lock().unwrap().is_none());
+    }
+
+    /// A call without `cwd` is rejected with the instructional error.
+    #[tokio::test]
+    async fn missing_cwd_argument_is_rejected_as_invalid_arguments() {
+        let base = tempfile::tempdir().unwrap();
+        let ctx = ctx_at(base.path().to_path_buf());
+        let err = read(&ReadTool, &ctx, serde_json::json!({"path": "any.txt"}))
+            .await
+            .unwrap_err();
+        match err {
+            crate::tool::ToolError::InvalidArguments(msg) => {
+                assert!(msg.contains("cwd is required"), "{msg}");
+            }
+            other => panic!("expected InvalidArguments, got {other:?}"),
+        }
     }
 }
