@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use ahp_types::actions::{ActionOrigin, ChatPendingMessageRemovedAction, StateAction};
@@ -30,6 +31,7 @@ use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
 use manox_ahp::resource::ResourcePlane;
 use manox_ahp::translate::Translator;
+use manox_journal::JournalWireEntry;
 use manox_journal::JournalWireEvent;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -135,7 +137,10 @@ pub struct RuntimeBackend {
     /// handing the weak reference over after both exist.
     host: OnceLock<Weak<manox_ahp::Host>>,
     seeds: Mutex<HashMap<String, Arc<Seeded>>>,
-    bridges: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-session bridge task plus its shared forward watermark (the highest
+    /// journal seq forwarded to the host). The watermark survives a restart so
+    /// the fresh bridge can replay exactly the rows the dead one missed.
+    bridges: Mutex<HashMap<String, (tokio::task::JoinHandle<()>, Arc<AtomicU64>)>>,
     /// The plan file each open review card names, keyed by its request id. The
     /// card's `chat/inputCompleted` carries only the request id and the verdict,
     /// so the approve path recovers the file from here.
@@ -305,17 +310,6 @@ impl RuntimeBackend {
             }
             None => (chat::initial(session_id), 0, HashMap::new()),
         };
-        // The host's live chat state is the client-visible mirror and wins
-        // over a fresh fold: the fold re-mints turn ids under fresh synthetic
-        // names that the connected clients — and the bridge resuming against
-        // them — have never seen. The fold stays the authority only where
-        // the host has no state yet (a cold session, a fresh process); a
-        // snapshot answered from the host state is exactly what the live
-        // stream continues from, so late subscribers and the bridge agree.
-        let chat = match self.host().and_then(|host| host.chat_state(session_id)) {
-            Some(live) if live.active_turn.is_some() || !live.turns.is_empty() => live,
-            _ => chat,
-        };
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
         // refresh scans its file, and `createSession` seeds it immediately —
@@ -346,14 +340,17 @@ impl RuntimeBackend {
     }
 
     /// Start the live bridge for `session_id` (idempotent; restarts a bridge
-    /// that already exited).
+    /// that already exited, resuming from its last forwarded seq).
     fn ensure_bridge(&self, session_id: &str) {
         let mut bridges = self.bridges.lock();
-        if let Some(task) = bridges.get(session_id)
-            && !task.is_finished()
-        {
-            return;
-        }
+        let resume_from = match bridges.get(session_id) {
+            // Alive: nothing to do. Dead: restart above the watermark the dead
+            // bridge last forwarded — the fresh bridge replays the rows it
+            // missed from the durable journal.
+            Some((task, watermark)) if !task.is_finished() => return,
+            Some((_, watermark)) => watermark.load(Ordering::SeqCst) + 1,
+            None => self.first_bridge_seq(session_id),
+        };
         bridges.remove(session_id);
         let Some(thread) = self.server.journal_feed(session_id) else {
             // A cold session (no live engine) has no feed to bridge; its state
@@ -368,182 +365,102 @@ impl RuntimeBackend {
         let Some(backend) = self.me() else {
             return;
         };
-        tracing::info!(session = %session_id, "bridge: starting");
+        tracing::debug!(session = %session_id, resume_from, "bridge: starting");
         let id = session_id.to_string();
+        let watermark = Arc::new(AtomicU64::new(resume_from.saturating_sub(1)));
+        let task_watermark = Arc::clone(&watermark);
         let task = manox_agent::runtime::handle().spawn(async move {
-            backend.bridge(host, thread, id).await;
+            backend.bridge(host, thread, id, resume_from, task_watermark).await;
         });
-        bridges.insert(session_id.to_string(), task);
+        bridges.insert(session_id.to_string(), (task, watermark));
+    }
+
+    /// The seq a brand-new bridge starts from: the seed's snapshot tail (the
+    /// state a first subscriber was answered from). Zero when no seed exists —
+    /// the fresh bridge replays the whole journal.
+    fn first_bridge_seq(&self, session_id: &str) -> u64 {
+        self.seeds
+            .lock()
+            .get(session_id)
+            .map(|seeded| seeded.tail)
+            .unwrap_or_default()
     }
 
     /// Abort and restart the bridge unconditionally: the engine
     /// materialization swaps the journal broadcast channel, so a bridge that
     /// subscribed earlier hangs on a channel nobody sends to anymore — alive
     /// but deaf, which the finished-task check in [`Self::ensure_bridge`]
-    /// cannot see.
+    /// cannot see. The fresh bridge resumes from the dead one's watermark and
+    /// replays the journal rows above it, so the abort loses nothing.
     fn force_bridge_restart(&self, session_id: &str) {
-        if let Some(task) = self.bridges.lock().remove(session_id) {
+        let dead = self.bridges.lock().remove(session_id);
+        if let Some((task, _)) = &dead {
             task.abort();
         }
+        drop(dead);
         self.ensure_bridge(session_id);
     }
 
-    /// Forward journal feed events into the host, from the seeded tail onward.
+    /// Forward journal feed events into the host, from the resume point on.
     ///
-    /// A lagged feed (the kernel's bounded window) is a resync: re-fold, re-seed
-    /// the host state from the journal, and continue above the new tail. The fold
-    /// is deterministic, so a resync cannot invent state — it restates what the
-    /// journal already says.
+    /// A restarted bridge subscribes FIRST (buffering whatever lands), then
+    /// replays the durable journal rows above its resume point through the
+    /// same translator — so the rows the previous bridge missed are forwarded
+    /// after all, folded into the client's own active turn. The live loop's
+    /// `seq <= tail` filter then drops the broadcast duplicates of the
+    /// replayed range.
+    ///
+    /// A lagged broadcast (the bounded window outrun by a delta flood) is the
+    /// same resync: the missed rows are read back from the journal and
+    /// forwarded — they reach the client as fresh parts continuing its turn
+    /// (the translator resets, so part ids are new), not as a silently empty
+    /// span. What is NOT recomputed is the turn id itself: the host's chat
+    /// state stays as the client last saw it, because a re-fold would re-mint
+    /// the active turn under a fresh synthetic id that `open_with_id` would
+    /// adopt without announcing — every part from then on would carry an id
+    /// the client's reducer drops.
     async fn bridge(
         &self,
         host: Arc<manox_ahp::Host>,
         thread: manox_agent::thread::ThreadHandle,
         session_id: String,
+        resume_from: u64,
+        watermark: Arc<AtomicU64>,
     ) {
+        // Subscribe before replaying: the broadcast receiver buffers whatever
+        // lands while the replay reads the journal, and the `seq <= tail`
+        // filter drops the overlap.
         let mut feed = thread.subscribe_journal_feed();
         let mut translator = Translator::new();
-        let mut tail = self
-            .seeds
-            .lock()
-            .get(&session_id)
-            .map(|seeded| seeded.tail)
-            .unwrap_or_default();
-        let mut first_event = true;
-        tracing::info!(session = %session_id, tail, "bridge: subscribed to the journal feed");
+        let mut tail = resume_from.saturating_sub(1);
+        tracing::info!(session = %session_id, resume_from, "bridge: subscribed to the journal feed");
+        self.replay_journal(&session_id, &host, &mut translator, &mut tail, resume_from)
+            .await;
         loop {
             match feed.recv().await {
                 Ok(manox_agent::engine::JournalFeed::Event(event)) => {
-                    if first_event {
-                        first_event = false;
-                        tracing::info!(
-                            session = %session_id,
-                            seq = event.seq,
-                            "bridge: first journal event"
-                        );
-                    }
                     if event.seq <= tail {
                         continue;
                     }
-                    tail = event.seq;
                     let Some(entry) = crate::translate::wire_entry(event.seq, &event.entry) else {
                         continue;
                     };
-                    // A finished turn is when the agent's file changes settle:
-                    // recompute the changeset so subscribers watch one stream
-                    // instead of polling. Detached — the scan is synchronous
-                    // and cheap, but it must not stall the journal pump.
-                    if matches!(&entry.event, JournalWireEvent::TurnFinish { .. })
-                        && let Some(backend) = self.me()
-                    {
-                        let session = session_id.clone();
-                        manox_agent::runtime::handle().spawn_blocking(move || {
-                            for (channel, action) in
-                                super::changeset::Engine::global().recompute(&session)
-                            {
-                                // Only channels the host has ensured (a
-                                // subscriber or a dispatch landed): the
-                                // publish *is* the store update, and folding
-                                // into a state that does not exist would
-                                // just log OutOfScope noise each turn.
-                                if let Some(host) = backend.host()
-                                    && host.has_changeset(&channel)
-                                {
-                                    host.publish(&channel, action, None);
-                                }
-                            }
-                        });
-                    }
-                    // The client's own `turnStarted` dispatch already expressed the
-                    // user row and the turn boundary: re-folding them would publish a
-                    // second `pendingMessageSet` and a second `turnStarted`, and the
-                    // reducer overwrites `active_turn` unconditionally, orphaning the
-                    // streamed parts. Skip both; the parts that follow address the
-                    // client's turn id.
-                    if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
-                        || matches!(&entry.event, JournalWireEvent::TurnStart)
-                    {
-                        continue;
-                    }
-                    // Track the plan file behind each review card so the approve
-                    // path (which arrives as a bare `chat/inputCompleted`) can
-                    // recover it without re-reading the thread.
-                    if let JournalWireEvent::PlanReview {
-                        state, plan_file, ..
-                    } = &entry.event
-                    {
-                        let request_id = manox_ahp::translate::plan_review_request_id(&entry.id);
-                        if state == "resolved" {
-                            self.plan_reviews.lock().remove(&request_id);
-                        } else if let Some(plan_file) = plan_file {
-                            self.plan_reviews
-                                .lock()
-                                .insert(request_id, plan_file.clone());
-                        }
-                    }
-                    // Resume the turn bookkeeping against the active turn the client
-                    // opened, so streamed parts carry its id (and never publish a
-                    // synthetic `turnStarted` that would replace it).
-                    if let Some(state) = host.chat_state(&session_id)
-                        && let Some(active) = &state.active_turn
-                    {
-                        translator.open_with_id(active.id.clone(), active.started_at.clone());
-                    }
-                    let thread_id = self
-                        .seeds
-                        .lock()
-                        .get(&session_id)
-                        .map(|seeded| seeded.thread_id.clone())
-                        .unwrap_or_else(|| session_id.clone());
-                    for emitted in translator.on_entry(&session_id, &thread_id, &entry) {
-                        if matches!(&emitted.action, StateAction::ChatInputRequested(_)) {
-                            tracing::info!(
-                                session = %session_id,
-                                seq = entry.seq,
-                                "bridge: publishing chat/inputRequested"
-                            );
-                        }
-                        host.publish(&emitted.channel, emitted.action, None);
-                    }
-                    // A landed assistant row changes the Q face: republish the
-                    // aggregate so the metrics channel stays a read model of
-                    // the journal, not a stream of per-call rows the client
-                    // would have to re-aggregate (the v2 `GetConversationInfo`
-                    // contract, now push).
-                    if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "assistant")
-                        && let Some(metrics) = self.server.conversation_metrics(&session_id)
-                    {
-                        let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
-                        host.publish(
-                            &channel,
-                            StateAction::Unknown(serde_json::json!({
-                                "type": manox_ahp::ext::actions::METRICS_CHANGED,
-                                "kind": "conversation",
-                                "data": metrics,
-                            })),
-                            None,
-                        );
-                    }
+                    self.forward_entry(&host, &session_id, &mut translator, &entry)
+                        .await;
+                    tail = event.seq;
+                    watermark.store(event.seq, Ordering::SeqCst);
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
+                    // Rows the window dropped are read back from the journal
+                    // and forwarded; they reach the client as fresh parts
+                    // continuing its current turn (new part ids — a tool round
+                    // inside the gap can appear twice), which beats a silently
+                    // empty span.
+                    tracing::warn!(session = %session_id, "bridge: feed lagged, replaying the gap");
                     translator = Translator::new();
-                    if let Some(fold) = fold_journal(&session_id, &session_id).await {
-                        let Some(session_state) = super::session_state(&session_id).await else {
-                            continue;
-                        };
-                        tail = fold.tail;
-                        host.seed_session(&session_id, session_state);
-                        // The host's chat state stays as the client last saw it —
-                        // deliberately NOT re-seeded from the fold. The fold
-                        // re-mints the active turn under a fresh synthetic id, and
-                        // the resumed bridge would adopt it (`open_with_id`)
-                        // without announcing it: every streamed part from here on
-                        // carries an id the client's active turn doesn't match, so
-                        // its reducer drops them all while the stale turn keeps
-                        // the UI "running" forever. Keeping the client-visible id
-                        // lets the reset translator resume against the turn the
-                        // client actually holds; the fold remains the durable
-                        // authority (a fresh subscriber's snapshot recomputes it).
-                    }
+                    let replay_from = tail + 1;
+                    self.replay_journal(&session_id, &host, &mut translator, &mut tail, replay_from)
+                        .await;
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -554,6 +471,147 @@ impl RuntimeBackend {
                     break;
                 }
             }
+        }
+    }
+
+    /// Read the durable journal rows at and above `from` and forward them
+    /// through the translator — the replay leg shared by bridge startup and
+    /// lag recovery.
+    async fn replay_journal(
+        &self,
+        session_id: &str,
+        host: &Arc<manox_ahp::Host>,
+        translator: &mut Translator,
+        tail: &mut u64,
+        from: u64,
+    ) {
+        let thread_id = self
+            .seeds
+            .lock()
+            .get(session_id)
+            .map(|seeded| seeded.thread_id.clone())
+            .unwrap_or_else(|| session_id.to_string());
+        match crate::journal_query::cold_read(session_id).await {
+            crate::journal_query::ColdRead::Data(snapshot) => {
+                for record in &snapshot.records {
+                    if record.seq < from {
+                        continue;
+                    }
+                    let Some(entry) = crate::translate::wire_entry(record.seq, &record.entry)
+                    else {
+                        continue;
+                    };
+                    self.forward_entry(host, session_id, translator, &entry)
+                        .await;
+                    *tail = record.seq;
+                }
+            }
+            crate::journal_query::ColdRead::NotFound
+            | crate::journal_query::ColdRead::Corrupt(_) => {}
+        }
+        let _ = thread_id;
+    }
+
+    /// Translate one journal row and publish everything it emits: lifecycle
+    /// skips, the plan-review file ledger, the streamed parts, and the Q-face
+    /// aggregate refresh after an assistant row.
+    async fn forward_entry(
+        &self,
+        host: &Arc<manox_ahp::Host>,
+        session_id: &str,
+        translator: &mut Translator,
+        entry: &JournalWireEntry,
+    ) {
+        // A finished turn is when the agent's file changes settle: recompute
+        // the changeset so subscribers watch one stream instead of polling.
+        // Detached — the scan is synchronous and cheap, but it must not stall
+        // the journal pump.
+        if matches!(&entry.event, JournalWireEvent::TurnFinish { .. })
+            && let Some(backend) = self.me()
+        {
+            let session = session_id.to_string();
+            manox_agent::runtime::handle().spawn_blocking(move || {
+                for (channel, action) in super::changeset::Engine::global().recompute(&session) {
+                    // Only channels the host has ensured (a subscriber or a
+                    // dispatch landed): the publish *is* the store update, and
+                    // folding into a state that does not exist would just log
+                    // OutOfScope noise each turn.
+                    if let Some(host) = backend.host()
+                        && host.has_changeset(&channel)
+                    {
+                        host.publish(&channel, action, None);
+                    }
+                }
+            });
+        }
+        // The client's own `turnStarted` dispatch already expressed the user
+        // row and the turn boundary: re-folding them would publish a second
+        // `pendingMessageSet` and a second `turnStarted`, and the reducer
+        // overwrites `active_turn` unconditionally, orphaning the streamed
+        // parts. Skip both; the parts that follow address the client's turn
+        // id.
+        if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
+            || matches!(&entry.event, JournalWireEvent::TurnStart)
+        {
+            return;
+        }
+        // Track the plan file behind each review card so the approve path
+        // (which arrives as a bare `chat/inputCompleted`) can recover it
+        // without re-reading the thread.
+        if let JournalWireEvent::PlanReview {
+            state, plan_file, ..
+        } = &entry.event
+        {
+            let request_id = manox_ahp::translate::plan_review_request_id(&entry.id);
+            if state == "resolved" {
+                self.plan_reviews.lock().remove(&request_id);
+            } else if let Some(plan_file) = plan_file {
+                self.plan_reviews
+                    .lock()
+                    .insert(request_id, plan_file.clone());
+            }
+        }
+        // Resume the turn bookkeeping against the active turn the client
+        // opened, so streamed parts carry its id (and never publish a
+        // synthetic `turnStarted` that would replace it).
+        if let Some(state) = host.chat_state(session_id)
+            && let Some(active) = &state.active_turn
+        {
+            translator.open_with_id(active.id.clone(), active.started_at.clone());
+        }
+        let thread_id = self
+            .seeds
+            .lock()
+            .get(session_id)
+            .map(|seeded| seeded.thread_id.clone())
+            .unwrap_or_else(|| session_id.to_string());
+        for emitted in translator.on_entry(session_id, &thread_id, entry) {
+            if matches!(&emitted.action, StateAction::ChatInputRequested(_)) {
+                tracing::debug!(
+                    session = %session_id,
+                    seq = entry.seq,
+                    "bridge: publishing chat/inputRequested"
+                );
+            }
+            host.publish(&emitted.channel, emitted.action, None);
+        }
+        // A landed assistant row changes the Q face: republish the aggregate
+        // so the metrics channel stays a read model of the journal, not a
+        // stream of per-call rows the client would have to re-aggregate (the
+        // v2 `GetConversationInfo` contract, now push).
+        if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "assistant")
+            && let Some(metrics) = self.server.conversation_metrics(session_id)
+        {
+            let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
+            host.publish(
+                &channel,
+                StateAction::Unknown(serde_json::json!({
+                    "type": manox_ahp::ext::actions::METRICS_CHANGED,
+                    "kind": "conversation",
+                    "data": metrics,
+                })),
+                None,
+            );
         }
     }
 
@@ -1345,28 +1403,25 @@ impl Backend for RuntimeBackend {
                 let session_id = target.clone();
                 match self.server.submit(&owner, &target, text) {
                     Ok(_) => {
-                        // The host folds the client's turn-start so the turn id
-                        // the client holds IS the host's active turn: the bridge
-                        // then streams every part against it (`open_with_id`),
-                        // and the dispatching client gets the echo its
-                        // optimistic UI retires against. Without this the bridge
-                        // had to mint its own synthetic turnStarted whenever the
-                        // host had no active turn — a race against the engine's
-                        // first content row, which the client's reducer silently
-                        // dropped on every loss (a whole turn invisible).
-                        if let Some(host) = self.host() {
-                            host.publish(channel, action.clone(), None);
-                        }
-                        // A submit materializes the engine — and the
+                        // The router folds and broadcasts this very action when
+                        // the dispatch returns Accepted (host.rs: "the dispatch
+                        // path answers the originator through the broadcast of
+                        // the accepted envelope") — so the host's active turn
+                        // becomes the id the client holds, the client gets its
+                        // echo, and the bridge's `open_with_id` aligns with
+                        // both. No second publish here: a duplicate
+                        // `chat/turnStarted` would hit the reducer's
+                        // unconditional active-turn replace and could wipe
+                        // parts the bridge has already streamed.
+                        //
+                        // A submit also materializes the engine — and the
                         // materialized engine carries a NEW journal broadcast
                         // channel, while the bridge (spawned at create time,
                         // possibly subscribed to the pre-engine channel) hangs
-                        // on the old one: alive but deaf. Every journal event
-                        // after that never reaches the host and the turn runs
-                        // invisible. Restart the bridge so it subscribes to
-                        // the live channel; it resumes from the seeded tail,
-                        // replaying what was missed into the client's own
-                        // active turn.
+                        // on the old one: alive but deaf. Restart it; the
+                        // fresh bridge re-subscribes to the live channel and
+                        // replays the journal rows above the dead one's
+                        // watermark, so nothing the old bridge missed is lost.
                         self.force_bridge_restart(&session_id);
                         DispatchOutcome::Accepted
                     }

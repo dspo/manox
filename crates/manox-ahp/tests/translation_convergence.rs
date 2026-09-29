@@ -571,11 +571,13 @@ fn a_stop_row_is_metadata_and_never_ends_the_turn() {
     );
 }
 
-/// The v1 AskUserQuestion payload states the question in `header` alone —
-/// no `question` field. The elicitation must still carry the structured
-/// questions; an unanswerable bare ask leaves the model waiting forever.
+/// Journals written by older engine builds state the AskUserQuestion text in
+/// `header` alone — the `question` field is a later schema addition (a device
+/// journal carries exactly this shape). The elicitation must still carry the
+/// structured questions; an unanswerable bare ask leaves the model waiting
+/// forever.
 #[test]
-fn a_v1_ask_payload_folds_its_questions_through_the_header() {
+fn an_older_build_ask_payload_folds_its_questions_through_the_header() {
     let entry = JournalWireEntry {
         seq: 7,
         id: "e7".to_string(),
@@ -629,6 +631,46 @@ fn a_v1_ask_payload_folds_its_questions_through_the_header() {
         "the header IS the question text"
     );
     assert_eq!(single.options.len(), 2, "both options survive");
+}
+
+/// A question row carrying neither `question` nor `header` has nothing to
+/// ask: the fold must degrade to the accepted bare ask (`questions: None`),
+/// never to a silent textless card.
+#[test]
+fn an_ask_row_without_any_question_text_degrades_to_a_bare_ask() {
+    let entry = JournalWireEntry {
+        seq: 8,
+        id: "e8".to_string(),
+        parent_id: None,
+        timestamp: "2026-09-29T06:20:00.000Z".to_string(),
+        event: Question {
+            kind: "request".to_string(),
+            auth_id: "call_bare".to_string(),
+            tool_name: Some("AskUserQuestion".to_string()),
+            tool_call_id: None,
+            verdict: None,
+            reason: None,
+            input: Some(serde_json::json!({
+                "questions": [{"multiSelect": false, "options": []}],
+            })),
+        },
+    };
+    let mut translator = Translator::new();
+    let actions: Vec<_> = translator
+        .on_entry("c-1", "s-1", &entry)
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    let request = actions.iter().find_map(|a| match a {
+        ahp_types::actions::StateAction::ChatInputRequested(r) => Some(&r.request),
+        _ => None,
+    });
+    let request = request.expect("the bare ask still reaches the client");
+    assert_eq!(
+        request.questions.as_ref(),
+        None,
+        "no text means no fabricated question card"
+    );
 }
 
 /// A plan proposal reaches a subscribed client — content and question alike.

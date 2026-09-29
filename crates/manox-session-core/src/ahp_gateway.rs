@@ -395,7 +395,7 @@ impl SessionRuntime for GatewayRuntime {
         request_id: &str,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> Result<(), RuntimeError> {
-        tracing::info!(
+        tracing::debug!(
             session = %session_id,
             request_id = %request_id,
             answers = answers.len(),

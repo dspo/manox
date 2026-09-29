@@ -438,6 +438,10 @@ fn probe_real_journal_fold() {
             .trim_end_matches(".jsonl");
         match chat_state(session_id).await {
             Some(state) => {
+                assert!(
+                    state.active_turn.is_some() || !state.turns.is_empty(),
+                    "a journal with content must fold to a non-empty chat"
+                );
                 println!(
                     "PROBE turns={} active={} title={:?}",
                     state.turns.len(),
@@ -664,7 +668,9 @@ mod dispatch {
         ChatTurnStartedAction, SessionConfigChangedAction, StateAction,
     };
     use ahp_types::common::JsonObject;
-    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+    use ahp_types::state::{
+        Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart,
+    };
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
@@ -711,6 +717,22 @@ mod dispatch {
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        // Register the session, so an answer routes through the gateway's
+        // session table (the device always has a session at answer time).
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some("s-ask".to_string()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
         // The journal the engine writes for an open ask: content, the
         // pending-approval tool call, and the question row itself.
         let _ = std::fs::remove_file(
@@ -803,19 +825,46 @@ mod dispatch {
             )
             .await
             .expect("dispatch accepted");
-        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-            .await
-            .expect("an echo arrives")
-            .expect("subscription open");
-        match event {
-            ahp::SubscriptionEvent::Action(envelope) => match &envelope.action {
-                StateAction::ChatInputCompleted(done) => {
+        // The replay ahead of the answer re-delivers the ask itself; wait for
+        // the completion echo through whatever precedes it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let echoed = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("an echo arrives")
+                .expect("subscription open");
+            if let ahp::SubscriptionEvent::Action(envelope) = event {
+                if let StateAction::ChatInputCompleted(done) = &envelope.action {
                     assert_eq!(done.request_id, "toolu_probe");
+                    break true;
                 }
-                other => panic!("expected the inputCompleted echo, got {other:?}"),
-            },
-            other => panic!("expected an action, got {other:?}"),
-        }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert!(echoed, "the inputCompleted echo reached the subscriber");
+        // The echo alone proves nothing (a NoOp fold still broadcasts): the
+        // HOST fold must have recorded the answer on the ask's part — that
+        // recorded state is what a card's retirement reads back.
+        let host_chat = _runtime
+            .host()
+            .chat_state("s-ask")
+            .expect("the host holds the chat state");
+        let active = host_chat.active_turn.as_ref().expect("the turn is open");
+        let answered = active.response_parts.iter().find_map(|p| match p {
+            ResponsePart::InputRequest(input) if input.request.id == "toolu_probe" => {
+                Some(input.response.clone())
+            }
+            _ => None,
+        });
+        let verdict = answered.expect("the ask's part recorded a response");
+        assert_eq!(
+            verdict.as_ref(),
+            Some(&ahp_types::state::ChatInputResponseKind::Accept),
+            "the host fold recorded the verdict on the ask's part"
+        );
         uninstall();
     }
 
