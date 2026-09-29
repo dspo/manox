@@ -87,6 +87,21 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             parent_id: p,
             ..
         }
+        | E::AgentThinkingDelta {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::Question {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::Stop {
+            id: i,
+            parent_id: p,
+            ..
+        }
         | E::ToolCall {
             id: i,
             parent_id: p,
@@ -348,6 +363,144 @@ fn chat_fold_replays_the_journal_transcript() {
     uninstall();
 }
 
+/// A manox journal's first turn still open — no `turnStart`, no `turnFinish`
+/// — with deltas, a settled tool round and a stop row. The live bridge and
+/// every fresh subscriber's snapshot depend on this fold carrying the active
+/// turn with ALL its parts (the desktop attached to exactly this shape and
+/// rendered only the user bubble when the fold lost them).
+#[test]
+fn a_running_manox_turn_folds_all_its_parts() {
+    let _guards = install();
+    manox_agent::runtime::handle().block_on(async {
+        let events = vec![
+            ("e1", user("review dspo/manox pr #824")),
+            (
+                "e2",
+                E::AgentThinkingDelta {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    delta: "thinking".into(),
+                },
+            ),
+            ("e3", delta("partial answer")),
+            ("e4", assistant("settled", 10, 5)),
+            (
+                "e5",
+                E::Stop {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    reason: Some("tool_use".into()),
+                },
+            ),
+            ("e6", tool_call()),
+            ("e7", tool_result()),
+            (
+                "e8",
+                E::AgentThinkingDelta {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    delta: "more".into(),
+                },
+            ),
+        ];
+        seed_session("probe-1", "thread-P", "/", events).await;
+        let state = chat_state("probe-1").await.expect("chat state");
+        let active = state.active_turn.as_ref().expect("the turn is open");
+        assert_eq!(active.message.text, "review dspo/manox pr #824");
+        assert_eq!(
+            kinds(&active.response_parts),
+            vec!["reasoning", "markdown", "toolCall", "reasoning"],
+            "every streamed part survives the fold"
+        );
+    });
+    uninstall();
+}
+
+/// TEMP device probe: fold a real journal (PROBE_JOURNAL=path) and print the
+/// active turn's inventory. `#[ignore]`d — run explicitly with
+/// `cargo test -p manox-session-core probe_real_journal -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn probe_real_journal_fold() {
+    let src = std::path::PathBuf::from(std::env::var("PROBE_JOURNAL").expect("PROBE_JOURNAL"));
+    let _guards = install();
+    let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
+    std::fs::copy(&src, &dst).unwrap();
+    manox_agent::runtime::handle().block_on(async {
+        let session_id = src
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_end_matches(".jsonl");
+        match chat_state(session_id).await {
+            Some(state) => {
+                assert!(
+                    state.active_turn.is_some() || !state.turns.is_empty(),
+                    "a journal with content must fold to a non-empty chat"
+                );
+                println!(
+                    "PROBE turns={} active={} title={:?}",
+                    state.turns.len(),
+                    state.active_turn.is_some(),
+                    state.title
+                );
+                if let Some(active) = &state.active_turn {
+                    println!(
+                        "PROBE active id={} parts={}",
+                        active.id,
+                        active.response_parts.len()
+                    );
+                    for p in active.response_parts.iter().take(8) {
+                        println!(
+                            "PROBE part {}",
+                            match p {
+                                ResponsePart::Markdown(m) =>
+                                    format!("markdown len={}", m.content.len()),
+                                ResponsePart::Reasoning(r) =>
+                                    format!("reasoning len={}", r.content.len()),
+                                ResponsePart::ToolCall(t) => format!(
+                                    "toolCall {:?}",
+                                    match &t.tool_call {
+                                        ToolCallState::Streaming(_) => "streaming",
+                                        ToolCallState::PendingConfirmation(_) => "pending",
+                                        ToolCallState::Running(_) => "running",
+                                        ToolCallState::AuthRequired(_) => "auth-required",
+                                        ToolCallState::PendingResultConfirmation(_) =>
+                                            "pending-result",
+                                        ToolCallState::Completed(_) => "completed",
+                                        ToolCallState::Cancelled(_) => "cancelled",
+                                        ToolCallState::Unknown(_) => "unknown",
+                                    }
+                                ),
+                                ResponsePart::InputRequest(i) => format!(
+                                    "ask id={} answered={}",
+                                    i.request.id,
+                                    i.response.is_some()
+                                ),
+                                _ => "other".into(),
+                            }
+                        );
+                    }
+                }
+                for turn in state.turns.iter().rev().take(2) {
+                    println!(
+                        "PROBE settled turn id={} parts={} text={:?}",
+                        turn.id,
+                        turn.response_parts.len(),
+                        turn.message.text.chars().take(40).collect::<String>()
+                    );
+                }
+            }
+            None => println!("PROBE no chat state"),
+        }
+    });
+    uninstall();
+}
+
 #[test]
 fn session_fold_merges_thread_metadata_and_journal_facts() {
     let _guards = install();
@@ -508,15 +661,18 @@ fn folds_answer_none_for_absent_inputs() {
 mod dispatch {
     use super::install;
     use super::uninstall;
+    use super::{assistant, delta, seed_session, stamp, tool_call, user};
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
         ActionOrigin, ChatPendingMessageRemovedAction, ChatToolCallConfirmedAction,
         ChatTurnStartedAction, SessionConfigChangedAction, StateAction,
     };
     use ahp_types::common::JsonObject;
-    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart};
+    use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
+    use manox_harness::session::SessionTreeEntry as E;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -544,6 +700,170 @@ mod dispatch {
             .await
             .expect("session opens");
         (server, backend)
+    }
+
+    /// The full host assembly (AhpRuntime over a gateway), a connected SDK
+    /// client subscribed to the session's chat channel, and the journal of a
+    /// turn whose AskUserQuestion is still open — the exact shape the desktop
+    /// attaches to when it answers an ask.
+    async fn answered_ask_fixture() -> (
+        Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
+        ahp::Client,
+        ahp::SessionSubscription,
+    ) {
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        // Register the session, so an answer routes through the gateway's
+        // session table (the device always has a session at answer time).
+        let intent = crate::agent_server::SessionIntent {
+            session_id: Some("s-ask".to_string()),
+            cwd: None,
+            project: None,
+            initial_model: None,
+            approval_mode: None,
+            reasoning_effort: None,
+            seed: None,
+            working_directories: Vec::new(),
+        };
+        let inner = Arc::clone(server.ahp_inner());
+        crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
+            .await
+            .expect("session opens");
+        // The journal the engine writes for an open ask: content, the
+        // pending-approval tool call, and the question row itself.
+        let _ = std::fs::remove_file(
+            manox_agent::thread_store::global_sessions_dir().join("s-ask.jsonl"),
+        );
+        let events = vec![
+            ("e1", user("用 AskUserQuestion 随便问我个问题")),
+            ("e2", delta("working")),
+            ("e3", assistant("settled", 10, 5)),
+            (
+                "e4",
+                E::Stop {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    reason: Some("tool_use".into()),
+                },
+            ),
+            ("e5", tool_call()),
+            (
+                "e6",
+                E::Question {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    kind: "request".into(),
+                    auth_id: "toolu_probe".into(),
+                    payload: json!({
+                        "toolName": "AskUserQuestion",
+                        "summary": "Clarifying question",
+                        "input": {"questions": [
+                            {"header": "方向", "multiSelect": false,
+                             "options": [{"label": "A", "description": "a"},
+                                         {"label": "B", "description": "b"}]},
+                        ]},
+                    }),
+                },
+            ),
+        ];
+        seed_session("s-ask", "thread-ask", "/", events).await;
+
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, sub) = client
+            .subscribe(manox_ahp::channels::chat::uri("s-ask"))
+            .await
+            .expect("subscribes");
+        assert!(result.snapshot.is_some(), "the fold answers a snapshot");
+        (runtime, client, sub)
+    }
+
+    /// A dispatched answer must fold into the host chat (and broadcast the
+    /// completion back) — the desktop's card retirement rides exactly that
+    /// echo. Found on the device: every answer reduced to NoOp on the host
+    /// and the card never cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatched_answer_folds_into_the_host_chat() {
+        let _guards = install();
+        let (_runtime, client, mut sub) = answered_ask_fixture().await;
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "方向".to_string(),
+            ahp_types::state::ChatInputAnswer::Submitted(ahp_types::state::ChatInputAnswered {
+                value: ahp_types::state::ChatInputAnswerValue::Selected(
+                    ahp_types::state::ChatInputSelectedAnswerValue {
+                        value: "A".to_string(),
+                        freeform_values: None,
+                    },
+                ),
+            }),
+        );
+        client
+            .dispatch(
+                manox_ahp::channels::chat::uri("s-ask"),
+                StateAction::ChatInputCompleted(ahp_types::actions::ChatInputCompletedAction {
+                    request_id: "toolu_probe".to_string(),
+                    response: ahp_types::state::ChatInputResponseKind::Accept,
+                    answers: Some(answers),
+                }),
+            )
+            .await
+            .expect("dispatch accepted");
+        // The replay ahead of the answer re-delivers the ask itself; wait for
+        // the completion echo through whatever precedes it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let echoed = loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("an echo arrives")
+                .expect("subscription open");
+            if let ahp::SubscriptionEvent::Action(envelope) = event
+                && let StateAction::ChatInputCompleted(done) = &envelope.action
+            {
+                assert_eq!(done.request_id, "toolu_probe");
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+        };
+        assert!(echoed, "the inputCompleted echo reached the subscriber");
+        // The echo alone proves nothing (a NoOp fold still broadcasts): the
+        // HOST fold must have recorded the answer on the ask's part — that
+        // recorded state is what a card's retirement reads back.
+        let host_chat = _runtime
+            .host()
+            .chat_state("s-ask")
+            .expect("the host holds the chat state");
+        let active = host_chat.active_turn.as_ref().expect("the turn is open");
+        let answered = active.response_parts.iter().find_map(|p| match p {
+            ResponsePart::InputRequest(input) if input.request.id == "toolu_probe" => {
+                Some(input.response)
+            }
+            _ => None,
+        });
+        let verdict = answered.expect("the ask's part recorded a response");
+        assert_eq!(
+            verdict.as_ref(),
+            Some(&ahp_types::state::ChatInputResponseKind::Accept),
+            "the host fold recorded the verdict on the ask's part"
+        );
+        uninstall();
     }
 
     fn origin() -> ActionOrigin {
