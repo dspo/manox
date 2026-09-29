@@ -3,7 +3,7 @@
 //! asynchronously-dispatched subagents — each with an owner thread, status,
 //! stop routing, and a bounded output ring.
 //!
-//! Settlement is first-wins: `push_terminal` only
+//! Settlement is first-wins: `push_terminal` and `set_terminal_status` only
 //! transition a Running/Stopping task, so duplicate terminal reports from a
 //! kill path and a natural exit collapse into one terminal state. The
 //! terminal status doubles as the cause vocabulary (`Stopped` = explicit
@@ -185,12 +185,8 @@ impl TaskState {
     }
 }
 
-/// The hook that actually stops a proxy's underlying work (the pi-side
-/// kill). The second argument carries the stopping side's intent so the
-/// producer's kill site records the right [`SettlementCause`] — a host
-/// teardown (`SessionEnded`) forwards `Teardown`, a user-facing stop
-/// (`Stopped`) forwards `UserStop`.
-pub type OnStopHook = Arc<dyn Fn(&str, manox_harness::tasks::SettlementCause) + Send + Sync>;
+/// The hook that actually stops a proxy's underlying work (the pi-side kill).
+pub type OnStopHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// A registered background task.
 pub struct BackgroundTask {
@@ -307,6 +303,12 @@ impl BackgroundTask {
             .lock()
             .expect("task state poisoned")
             .failure_summary = Some(truncated);
+    }
+
+    /// Set terminal status. First-wins like `push_terminal`: a producer that
+    /// already settled the task cannot have its terminal state overwritten.
+    pub fn set_terminal_status(&self, status: TaskStatus) {
+        self.push_terminal(&TaskId(String::new()), status);
     }
 
     /// Atomically become the lifecycle owner for a stop. Concurrent callers
@@ -560,36 +562,6 @@ pub fn remove(id: &TaskId) {
         .remove(&id.0);
 }
 
-/// Record a harness settlement on a task: the one mapping from the unified
-/// lifecycle vocabulary to the wire-stable terminal status. First-wins like
-/// `push_terminal`; cause `Teardown` settles as `SessionEnded`.
-pub(crate) fn apply_settlement(
-    task: &BackgroundTask,
-    id: &TaskId,
-    settlement: &manox_harness::tasks::Settlement,
-) {
-    use manox_harness::tasks::{SettlementCause, SettlementKind};
-    if let Some(code) = settlement.exit_code {
-        task.set_exit_code(Some(code));
-    }
-    if let Some(reason) = &settlement.failure_summary {
-        task.set_failure_summary(reason.clone());
-    }
-    let status = match settlement.kind {
-        SettlementKind::Completed => TaskStatus::Completed,
-        SettlementKind::Failed => TaskStatus::Failed,
-        SettlementKind::TimedOut => TaskStatus::TimedOut,
-        SettlementKind::Stopped => {
-            if settlement.cause == SettlementCause::Teardown {
-                TaskStatus::SessionEnded
-            } else {
-                TaskStatus::Stopped
-            }
-        }
-    };
-    task.push_terminal(id, status);
-}
-
 /// Stop a task by id and return only after its stop hook has run and the task
 /// has settled. This is the semantic boundary used by TaskStop and shutdown.
 pub async fn stop(id: &str) -> Result<(), String> {
@@ -618,15 +590,9 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
     task.cancel();
 
     // Proxy tasks own no process here; the registered hook is the actual
-    // pi-side kill, forwarded with the stop's intent. It runs before the
-    // fallback terminal push below.
+    // pi-side kill. It runs before the fallback terminal push below.
     if let Some(on_stop) = task.on_stop() {
-        let cause = if terminal == TaskStatus::SessionEnded {
-            manox_harness::tasks::SettlementCause::Teardown
-        } else {
-            manox_harness::tasks::SettlementCause::UserStop
-        };
-        on_stop(id, cause);
+        on_stop(id);
     }
 
     // The pi-side producers normally settle the task themselves through their
@@ -811,12 +777,12 @@ mod tests {
     }
 
     #[test]
-    fn push_terminal_is_idempotent() {
+    fn set_terminal_is_idempotent() {
         let cancel = CancellationToken::new();
-        let (id, task) = register("thread-1".into(), "test".into(), cancel);
-        task.push_terminal(&id, TaskStatus::Completed);
+        let (_id, task) = register("thread-1".into(), "test".into(), cancel);
+        task.set_terminal_status(TaskStatus::Completed);
         assert_eq!(task.status(), TaskStatus::Completed);
-        task.push_terminal(&id, TaskStatus::Failed);
+        task.set_terminal_status(TaskStatus::Failed);
         assert_eq!(task.status(), TaskStatus::Completed);
     }
 
@@ -902,7 +868,7 @@ mod tests {
         );
         let called: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
         let called2 = Arc::clone(&called);
-        proxy.set_on_stop(Arc::new(move |id, _| {
+        proxy.set_on_stop(Arc::new(move |id| {
             *called2.lock().unwrap() = Some(id.to_string());
         }));
         stop(&id.0).await.expect("stop should succeed");

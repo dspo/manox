@@ -1,158 +1,406 @@
 //! Bridge pi-path background tasks (Monitor command/WebSocket + background
-//! Bash) into the host's `background_task` registry and the facade's
+//! Bash) into the legacy `background_task` registry and the facade's
 //! `BackgroundTaskUpdated` event stream.
 //!
-//! The bridge is the session producers' `TaskObserver`: each `Spawned`
-//! registers a proxy task under the pi task id (so `stop` and the host
-//! cards see one id space, with an on_stop hook back into the producer),
-//! each `Output` lands in the proxy's bounded ring (snapshots throttled),
-//! and each `Settled` maps onto the wire-stable terminal status (cause
-//! `Teardown` becomes `SessionEnded`). Output flows push-only — there is
-//! no polling and no lagged broadcast to survive.
+//! One bridge per session orchestrator pair, spawned next to
+//! `attach_orchestrators` in `pi_engine`. It subscribes to the monitor's
+//! lifecycle + raw-output broadcasts and the background manager's lifecycle
+//! broadcast, mirrors each pi task into the legacy registry (so `stop` and
+//! the gpui host's cards see one id space), and
+//! re-emits every state change as `ThreadEvent::BackgroundTaskUpdated` via the
+//! facade's `BackendNotice` channel. Exits when the orchestrator senders drop
+//! (session torn down or replaced by a `NewSession`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use manox_harness::bash::orchestration::BackgroundManager;
-use manox_harness::monitor::MonitorManager;
-use manox_harness::tasks::{Settlement, SettlementCause, SettlementKind, TaskFamily, TaskObserver};
+use manox_harness::bash::orchestration::{BackgroundEvent, BackgroundManager};
+use manox_harness::monitor::{
+    MonitorEvent, MonitorKind, MonitorManager, MonitorOutput, MonitorStatus,
+};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::background_task::{self, TaskId, TaskKind, TaskStatus};
+use crate::background_task::{self, BackgroundTask, TaskId, TaskKind, TaskStatus};
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
 
+/// How often the background-Bash poller diffs output.
+const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// Tail bytes the poller requests from the registry per poll.
+const POLL_TAIL_BYTES: usize = 32 * 1024;
 /// Output lines collected before a monitor task re-emits its snapshot.
 const OUTPUT_EMIT_THRESHOLD: u32 = 5;
 
-/// Shared bridge state: per-task output counters for emit throttling.
-#[derive(Default)]
+/// Shared bridge state: the legacy proxies keyed by pi task id, plus per-task
+/// output counters for emit throttling.
 struct BridgeState {
-    output_since_emit: Mutex<HashMap<String, u32>>,
+    proxies: HashMap<String, Arc<BackgroundTask>>,
+    output_since_emit: HashMap<String, u32>,
 }
 
-/// The host's lifecycle observer for one session's pi-path producers.
-struct BridgeObserver {
-    state: Arc<BridgeState>,
-    notice_tx: mpsc::UnboundedSender<BackendNotice>,
-    owner_thread_id: String,
-}
-
-impl TaskObserver for BridgeObserver {
-    fn on_spawned(
-        &self,
-        id: &str,
-        family: TaskFamily,
-        label: &str,
-        stop: manox_harness::tasks::StopHandle,
-    ) {
-        let proxy = background_task::register_with_id(
-            TaskId(id.to_string()),
-            map_kind(family),
-            self.owner_thread_id.clone(),
-            label.to_string(),
-            CancellationToken::new(),
-        );
-        proxy.set_on_stop(Arc::new(move |_, cause| stop(cause)));
-        self.emit_snapshot(&proxy, id);
-    }
-
-    fn on_output(&self, id: &str, line: String) {
-        let Some(proxy) = background_task::get_by_str(id) else {
-            return;
-        };
-        proxy.push_event(&TaskId(id.to_string()), line);
-        let emit = {
-            let mut st = self.state.output_since_emit.lock().expect("state poisoned");
-            let count = st.entry(id.to_string()).or_insert(0);
-            *count += 1;
-            if *count >= OUTPUT_EMIT_THRESHOLD {
-                *count = 0;
-                true
-            } else {
-                false
-            }
-        };
-        if emit {
-            self.emit_snapshot(&proxy, id);
-        }
-    }
-
-    fn on_settled(&self, id: &str, settlement: &Settlement) {
-        let Some(proxy) = background_task::get_by_str(id) else {
-            return;
-        };
-        if let Some(code) = settlement.exit_code {
-            proxy.set_exit_code(Some(code));
-        }
-        if let Some(reason) = &settlement.failure_summary {
-            proxy.set_failure_summary(reason.clone());
-        }
-        proxy.push_terminal(&TaskId(id.to_string()), map_status(settlement));
-        self.emit_snapshot(&proxy, id);
-    }
-}
-
-impl BridgeObserver {
-    /// Emit a `BackgroundTaskUpdated` notice for a proxy task.
-    fn emit_snapshot(&self, proxy: &background_task::BackgroundTask, id: &str) {
-        let snapshot = proxy.snapshot(&TaskId(id.to_string()));
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::BackgroundTaskUpdated { snapshot },
-        )));
-    }
-}
-
-fn map_kind(family: TaskFamily) -> TaskKind {
-    match family {
-        TaskFamily::MonitorCommand => TaskKind::MonitorCommand,
-        TaskFamily::MonitorWebSocket => TaskKind::MonitorWebSocket,
-        TaskFamily::BackgroundBash => TaskKind::BackgroundBash,
-        TaskFamily::Subagent => TaskKind::Subagent,
-    }
-}
-
-/// The wire-stable status mapping. Cause `Teardown` settles as
-/// `SessionEnded` — the session the card belonged to is going away.
-fn map_status(settlement: &Settlement) -> TaskStatus {
-    match settlement.kind {
-        SettlementKind::Completed => TaskStatus::Completed,
-        SettlementKind::Failed => TaskStatus::Failed,
-        SettlementKind::TimedOut => TaskStatus::TimedOut,
-        SettlementKind::Stopped => {
-            if settlement.cause == SettlementCause::Teardown {
-                TaskStatus::SessionEnded
-            } else {
-                TaskStatus::Stopped
-            }
+impl BridgeState {
+    fn new() -> Self {
+        Self {
+            proxies: HashMap::new(),
+            output_since_emit: HashMap::new(),
         }
     }
 }
 
-/// Bind the session's producers to a bridge observer. Called next to
-/// `attach_orchestrators` at session build/restore; the observer lives as
-/// long as the managers hold it.
+/// Spawn the bridge for one session's orchestrator pair.
 pub fn spawn(
     monitor: Arc<MonitorManager>,
     background: Arc<BackgroundManager>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     owner_thread_id: String,
 ) {
-    let observer = Arc::new(BridgeObserver {
-        state: Arc::new(BridgeState::default()),
-        notice_tx,
-        owner_thread_id,
+    crate::runtime::handle().spawn(run(monitor, background, notice_tx, owner_thread_id));
+}
+
+async fn run(
+    monitor: Arc<MonitorManager>,
+    background: Arc<BackgroundManager>,
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+    owner_thread_id: String,
+) {
+    let mut lifecycle = monitor.subscribe();
+    let mut output = monitor.subscribe_output();
+    let mut bg = background.subscribe();
+    let state: Arc<Mutex<BridgeState>> = Arc::new(Mutex::new(BridgeState::new()));
+
+    loop {
+        tokio::select! {
+            ev = lifecycle.recv() => {
+                // Lagged (the consumer fell behind an output flood) must not
+                // kill the bridge: skip the missed window and keep draining;
+                // only a closed sender ends the session's bridge.
+                match ev {
+                    Ok(ev) => handle_monitor_event(ev, &monitor, &state, &notice_tx, &owner_thread_id),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            out = output.recv() => {
+                match out {
+                    Ok(out) => handle_monitor_output(out, &state, &notice_tx),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            ev = bg.recv() => {
+                match ev {
+                    Ok(ev) => handle_background_event(ev, &background, &state, &notice_tx, &owner_thread_id),
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+}
+
+fn map_kind(kind: MonitorKind) -> TaskKind {
+    match kind {
+        MonitorKind::Command => TaskKind::MonitorCommand,
+        MonitorKind::WebSocket => TaskKind::MonitorWebSocket,
+    }
+}
+
+fn map_terminal(status: MonitorStatus) -> TaskStatus {
+    match status {
+        MonitorStatus::Running => TaskStatus::Running,
+        MonitorStatus::Completed => TaskStatus::Completed,
+        MonitorStatus::TimedOut => TaskStatus::TimedOut,
+        MonitorStatus::Stopped => TaskStatus::Stopped,
+        MonitorStatus::Failed => TaskStatus::Failed,
+    }
+}
+
+/// Emit a `BackgroundTaskUpdated` notice for a proxy task.
+fn emit_snapshot(
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    proxy: &Arc<BackgroundTask>,
+    id: &str,
+) {
+    let snapshot = proxy.snapshot(&TaskId(id.to_string()));
+    let _ = notice_tx.send(BackendNotice::Event(Box::new(
+        ThreadEvent::BackgroundTaskUpdated { snapshot },
+    )));
+}
+
+fn handle_monitor_event(
+    ev: MonitorEvent,
+    monitor: &Arc<MonitorManager>,
+    state: &Arc<Mutex<BridgeState>>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    owner_thread_id: &str,
+) {
+    match ev {
+        MonitorEvent::Spawned {
+            id,
+            description,
+            kind,
+        } => {
+            let monitor = Arc::clone(monitor);
+            let on_stop: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |id| monitor.stop(id));
+            let proxy = register_proxy(
+                &id,
+                map_kind(kind),
+                owner_thread_id,
+                description,
+                on_stop,
+                state,
+            );
+            emit_snapshot(notice_tx, &proxy, &id);
+        }
+        MonitorEvent::Completed { id, exit_code } => {
+            finish_monitor(
+                &id,
+                MonitorStatus::Completed,
+                exit_code,
+                None,
+                state,
+                notice_tx,
+            );
+        }
+        MonitorEvent::TimedOut { id } => {
+            finish_monitor(&id, MonitorStatus::TimedOut, None, None, state, notice_tx);
+        }
+        MonitorEvent::Stopped { id } => {
+            finish_monitor(&id, MonitorStatus::Stopped, None, None, state, notice_tx);
+        }
+        MonitorEvent::Failed { id, reason } => {
+            finish_monitor(
+                &id,
+                MonitorStatus::Failed,
+                None,
+                Some(reason),
+                state,
+                notice_tx,
+            );
+        }
+        MonitorEvent::Killed { id } => {
+            finish_monitor(&id, MonitorStatus::Stopped, None, None, state, notice_tx);
+        }
+    }
+}
+
+/// Register a proxy for a task and arm its stop hook.
+fn register_proxy(
+    id: &str,
+    kind: TaskKind,
+    owner_thread_id: &str,
+    description: String,
+    on_stop: Arc<dyn Fn(&str) + Send + Sync>,
+    state: &Arc<Mutex<BridgeState>>,
+) -> Arc<BackgroundTask> {
+    let proxy = background_task::register_with_id(
+        TaskId(id.to_string()),
+        kind,
+        owner_thread_id.to_string(),
+        description,
+        CancellationToken::new(),
+    );
+    proxy.set_on_stop(on_stop);
+    state
+        .lock()
+        .expect("bridge state poisoned")
+        .proxies
+        .insert(id.to_string(), Arc::clone(&proxy));
+    proxy
+}
+
+/// Drive a monitor task to its terminal state and emit the final snapshot.
+fn finish_monitor(
+    id: &str,
+    status: MonitorStatus,
+    exit_code: Option<i32>,
+    failure_summary: Option<String>,
+    state: &Arc<Mutex<BridgeState>>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let proxy = state
+        .lock()
+        .expect("bridge state poisoned")
+        .proxies
+        .remove(id);
+    let Some(proxy) = proxy else { return };
+    if let Some(code) = exit_code {
+        proxy.set_exit_code(Some(code));
+    }
+    if let Some(reason) = failure_summary {
+        proxy.set_failure_summary(reason);
+    }
+    proxy.push_terminal(&TaskId(id.to_string()), map_terminal(status));
+    emit_snapshot(notice_tx, &proxy, id);
+}
+
+fn handle_monitor_output(
+    out: MonitorOutput,
+    state: &Arc<Mutex<BridgeState>>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let proxy = state
+        .lock()
+        .expect("bridge state poisoned")
+        .proxies
+        .get(&out.id)
+        .cloned();
+    let Some(proxy) = proxy else { return };
+    proxy.push_event(&TaskId(out.id.clone()), out.line);
+    let emit = {
+        let mut st = state.lock().expect("bridge state poisoned");
+        let count = st.output_since_emit.entry(out.id.clone()).or_insert(0);
+        *count += 1;
+        if *count >= OUTPUT_EMIT_THRESHOLD {
+            *count = 0;
+            true
+        } else {
+            false
+        }
+    };
+    if emit {
+        emit_snapshot(notice_tx, &proxy, &out.id);
+    }
+}
+
+fn handle_background_event(
+    ev: BackgroundEvent,
+    background: &Arc<BackgroundManager>,
+    state: &Arc<Mutex<BridgeState>>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+    owner_thread_id: &str,
+) {
+    match ev {
+        BackgroundEvent::Spawned { id, command } => {
+            let tid = id.0.clone();
+            let bg_for_stop = Arc::clone(background);
+            let on_stop: Arc<dyn Fn(&str) + Send + Sync> =
+                Arc::new(move |id| bg_for_stop.kill(&manox_harness::TaskId(id.to_string())));
+            let proxy = register_proxy(
+                &tid,
+                TaskKind::BackgroundBash,
+                owner_thread_id,
+                format!("background bash: {command}"),
+                on_stop,
+                state,
+            );
+            emit_snapshot(notice_tx, &proxy, &tid);
+            // Poll output in a dedicated task; lifecycle terminals arrive via
+            // the broadcast below.
+            spawn_background_poller(
+                Arc::clone(background),
+                proxy,
+                tid,
+                Arc::clone(state),
+                notice_tx.clone(),
+            );
+        }
+        BackgroundEvent::Completed { id, exit_code } => {
+            let tid = id.0.clone();
+            finish_background(
+                &tid,
+                TaskStatus::Completed,
+                exit_code,
+                None,
+                state,
+                notice_tx,
+            );
+        }
+        BackgroundEvent::Killed { id } => {
+            let tid = id.0.clone();
+            finish_background(&tid, TaskStatus::Stopped, None, None, state, notice_tx);
+        }
+        BackgroundEvent::Failed { id, reason } => {
+            let tid = id.0.clone();
+            finish_background(
+                &tid,
+                TaskStatus::Failed,
+                None,
+                Some(reason),
+                state,
+                notice_tx,
+            );
+        }
+    }
+}
+
+fn finish_background(
+    id: &str,
+    status: TaskStatus,
+    exit_code: Option<i32>,
+    failure_summary: Option<String>,
+    state: &Arc<Mutex<BridgeState>>,
+    notice_tx: &mpsc::UnboundedSender<BackendNotice>,
+) {
+    let proxy = state
+        .lock()
+        .expect("bridge state poisoned")
+        .proxies
+        .remove(id);
+    let Some(proxy) = proxy else { return };
+    if let Some(code) = exit_code {
+        proxy.set_exit_code(Some(code));
+    }
+    if let Some(reason) = failure_summary {
+        proxy.set_failure_summary(reason);
+    }
+    proxy.push_terminal(&TaskId(id.to_string()), status);
+    emit_snapshot(notice_tx, &proxy, id);
+}
+
+/// Poll one background task's output on an interval and re-emit snapshots as
+/// new output appears; exits once the task reaches a terminal state (the
+/// terminal event is emitted by the lifecycle broadcast).
+fn spawn_background_poller(
+    background: Arc<BackgroundManager>,
+    proxy: Arc<BackgroundTask>,
+    id: String,
+    state: Arc<Mutex<BridgeState>>,
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+) {
+    crate::runtime::handle().spawn(async move {
+        let mut seen = 0usize;
+        loop {
+            if proxy.status().is_terminal() {
+                break;
+            }
+            tokio::time::sleep(BACKGROUND_POLL_INTERVAL).await;
+            let Ok(info) = background.status(&manox_harness::TaskId(id.clone()), POLL_TAIL_BYTES)
+            else {
+                continue;
+            };
+            let tail = info.output_tail;
+            if tail.len() < seen {
+                // The registry tail rotated past the cursor; re-sync from the
+                // current tail rather than stalling output forever.
+                if !tail.is_empty() {
+                    proxy.push_event(&TaskId(id.clone()), tail.clone());
+                    emit_snapshot(&notice_tx, &proxy, &id);
+                }
+                seen = tail.len();
+            } else if tail.len() > seen {
+                let new = tail[seen..].to_string();
+                proxy.push_event(&TaskId(id.clone()), new);
+                seen = tail.len();
+                emit_snapshot(&notice_tx, &proxy, &id);
+            }
+            if !info.is_running {
+                // Terminal bookkeeping is owned by the lifecycle broadcast;
+                // the poller just stops watching output.
+                break;
+            }
+        }
+        drop(state);
     });
-    monitor.set_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
-    background.set_observer(observer);
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use manox_harness::bash::background::BackgroundRegistry;
     use manox_harness::monitor::MonitorManager;
@@ -160,38 +408,38 @@ mod tests {
 
     use super::*;
 
-    /// A real command monitor surfaces in the host registry with its pi task
-    /// id, and the bridge emits running → completed snapshots carrying
-    /// output; a user stop routes through the proxy's on_stop hook into the
-    /// monitor manager.
+    /// A real command monitor surfaces in the legacy registry with its pi task
+    /// id, and the bridge emits running → completed snapshots carrying output.
     #[tokio::test]
     async fn monitor_spawn_bridges_snapshots() {
-        let monitor = MonitorManager::new(Arc::new(BackgroundRegistry::new()));
-        let background = BackgroundManager::new(Arc::new(BackgroundRegistry::new()));
+        let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
-        spawn(
+        tokio::spawn(run(
             Arc::clone(&monitor),
             Arc::clone(&background),
             notice_tx,
             "t1".into(),
-        );
+        ));
+        // Let the bridge subscribe to the broadcasts before any spawn.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let tid = monitor
             .spawn_command(
                 "bridge watcher".into(),
                 "echo bridge-line".into(),
                 &PathBuf::from("/tmp"),
-                Duration::from_secs(30),
+                std::time::Duration::from_secs(30),
                 false,
             )
             .unwrap();
 
         let mut saw_running = false;
         let mut saw_completed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while tokio::time::Instant::now() < deadline {
             let Ok(Some(notice)) =
-                tokio::time::timeout(Duration::from_millis(500), notice_rx.recv()).await
+                tokio::time::timeout(std::time::Duration::from_millis(500), notice_rx.recv()).await
             else {
                 break;
             };
@@ -216,7 +464,7 @@ mod tests {
         assert!(saw_running, "initial running snapshot observed");
         assert!(saw_completed, "terminal completed snapshot observed");
 
-        // The host registry sees the same id; a user stop routes through the
+        // The legacy registry sees the same id; a user stop routes through the
         // proxy's on_stop hook into the monitor manager.
         let proxy = background_task::get_by_str(&tid).expect("proxy registered");
         assert_eq!(proxy.owner_thread_id(), "t1");
@@ -224,15 +472,56 @@ mod tests {
         background_task::remove(&TaskId(tid.clone()));
     }
 
-    /// A settled teardown causes maps to `SessionEnded` on the wire — the
-    /// card belongs to a session that is going away.
-    #[test]
-    fn teardown_settlement_maps_to_session_ended() {
-        let settlement = Settlement::new(SettlementKind::Stopped, SettlementCause::Teardown);
-        assert_eq!(map_status(&settlement), TaskStatus::SessionEnded);
-        let user_stop = Settlement::new(SettlementKind::Stopped, SettlementCause::UserStop);
-        assert_eq!(map_status(&user_stop), TaskStatus::Stopped);
-        let completed = Settlement::new(SettlementKind::Completed, SettlementCause::Natural);
-        assert_eq!(map_status(&completed), TaskStatus::Completed);
+    /// An output flood past the output broadcast capacity (256) must not kill
+    /// the bridge: Lagged windows are skipped and the terminal snapshot still
+    /// arrives. A Lagged-as-fatal regression dies silently on the first flood.
+    #[tokio::test]
+    async fn bridge_survives_output_flood_past_broadcast_capacity() {
+        let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
+        let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        tokio::spawn(run(
+            Arc::clone(&monitor),
+            Arc::clone(&background),
+            notice_tx,
+            "t-flood".into(),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 500 lines > the output channel capacity.
+        let tid = monitor
+            .spawn_command(
+                "flood watcher".into(),
+                "seq 1 500".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(30),
+                false,
+            )
+            .unwrap();
+
+        let mut saw_completed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(notice)) =
+                tokio::time::timeout(Duration::from_millis(500), notice_rx.recv()).await
+            else {
+                continue;
+            };
+            let BackendNotice::Event(ev) = notice else {
+                continue;
+            };
+            let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev else {
+                continue;
+            };
+            if snapshot.task_id == tid && snapshot.status == TaskStatus::Completed {
+                saw_completed = true;
+                break;
+            }
+        }
+        assert!(
+            saw_completed,
+            "bridge stays alive across the flood and delivers the terminal snapshot"
+        );
+        background_task::remove(&TaskId(tid.clone()));
     }
 }

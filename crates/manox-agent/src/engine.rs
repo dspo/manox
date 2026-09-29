@@ -1715,8 +1715,8 @@ fn build_tools(
     let subagent_bash_ops: Arc<dyn manox_harness::tools::bash::BashOperations> =
         Arc::clone(&bash_ops);
     let subagent_background = Arc::new(BackgroundRegistry::new());
-    let manager = BackgroundManager::new(Arc::clone(&background));
-    let monitor = MonitorManager::new(Arc::clone(&background));
+    let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
+    let monitor = Arc::new(MonitorManager::new(Arc::clone(&background)));
     // Unsandboxed backend (no confinement): selected per call when the
     // effective mode is `danger-full-access` (the standing session mode, or
     // an approved `sandbox_permissions` grant). Installed only where a
