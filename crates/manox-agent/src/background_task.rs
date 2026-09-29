@@ -23,6 +23,19 @@
 //! terminal state; a periodic GC sweep removes long-dead entries. Task ids
 //! issued by the pi-side registries are process-unique (one shared ordinal);
 //! directly-registered tasks (subagents) draw from the registry counter.
+//!
+//! ## Known limits
+//!
+//! - The output ring evicts silently past the caps (no gap marker):
+//!   `output_tail` and `recent_events` are best-effort card bodies, not a
+//!   delivery channel — the model channel is steering.
+//! - `Stopping` is internal; cards see `Running` then the terminal status.
+//! - The stop path's synchronous terminal push wins first-wins over a
+//!   producer's later async settlement — a stopped task never shows a late
+//!   foreign status.
+//! - The registry is process-global; cross-process task visibility is out
+//!   of scope (each manox process owns its sessions exclusively via the
+//!   session write lease).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};

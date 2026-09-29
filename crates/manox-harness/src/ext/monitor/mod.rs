@@ -46,11 +46,39 @@
 //! denied outside DangerFullAccess. Monitor output is always framed as untrusted
 //! external data either way.
 //!
-//! ## Teardown semantics
+//! ## Teardown matrix (contract)
 //!
-//! A run `Abort` (user Esc) is not terminal — monitors survive it and keep
-//! queueing events for the next run. Monitors die with their session: the
-//! manager's `Drop` stops every active monitor synchronously.
+//! "Who kills a monitor, with which settlement" is defined at three levels,
+//! and the levels compose — the stricter one wins because host settlement
+//! is first-wins:
+//!
+//! | Trigger | Command/WS monitor | Background bash |
+//! |---|---|---|
+//! | Harness run `Abort` (mid-turn Esc) | **survives** — keeps queueing events for the next run | **killed**, settles `(Stopped, RunAbort)` |
+//! | Host `Thread::cancel` (explicit user cancel) | **killed**, settles `(Stopped, UserStop)` → wire `Stopped` | killed, wire `Stopped` |
+//! | Session teardown (`MonitorManager::drop` / `cancel_all_for_thread`) | killed, settles `(Stopped, Teardown)` → wire `SessionEnded`, no terminal steer | killed, wire `SessionEnded` |
+//!
+//! The harness-level "monitors survive Abort" row is real at this layer:
+//! `MonitorManager` does not subscribe to the abort event, and the session
+//! may be aborted and then used again. It does not promise survival past a
+//! host-level cancel or teardown — those kill monitors at their level.
+//!
+//! ## Known limits
+//!
+//! - Batching windows (20 lines / 4 KiB / 300 ms) mean sparse output can
+//!   wait up to one interval before steering; a WS frame arriving during a
+//!   terminal path is flushed by the residual flush, except under teardown.
+//! - The observer's output ring is a best-effort tail: eviction past the
+//!   caps is silent (no gap marker — the model channel is steering, and the
+//!   ring only feeds card bodies).
+//! - A monitor started with no observer bound (harness-standalone use)
+//!   emits nothing; steering still works.
+//! - A `persistent` monitor has no runtime deadline; only the WS connect
+//!   phase keeps a per-address timeout.
+//! - Via the host task center, a cancel during a stuck WS handshake is
+//!   interruption-safe (`abort` on the driver). Via the harness-standalone
+//!   kernel `TaskStopTool`, a token cancel without a recorded kill outcome
+//!   settles as `(Stopped, Natural)`.
 
 use std::collections::HashMap;
 use std::path::Path;
