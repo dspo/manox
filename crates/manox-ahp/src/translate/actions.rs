@@ -252,6 +252,9 @@ struct OpenTurn {
     reasoning_part: Option<String>,
     /// A text delta streamed since the last settled assistant row.
     streamed_text: bool,
+    /// The opening user message the turn currently carries: empty until a
+    /// user row lands (journal order puts `turnStart` before the user row).
+    message_text: String,
     /// Tool calls by handle, in a sorted map so turn-boundary settlement is
     /// deterministic.
     calls: BTreeMap<String, CallBook>,
@@ -263,6 +266,7 @@ impl OpenTurn {
             id,
             started_at,
             synthetic,
+            message_text: String::new(),
             text_part: None,
             reasoning_part: None,
             streamed_text: false,
@@ -562,22 +566,15 @@ impl Translator {
                 };
                 self.close_turn(&chat, entry, outcome, &mut out);
             }
-            JournalWireEvent::Stop { reason } => {
-                // The loop's own edge: it closes a turn the engine abandoned
-                // without a `turnFinish`, and is silent otherwise.
-                if self.open.is_some() {
-                    if let Some(text) = reason.as_deref() {
-                        self.push_note(
-                            &chat,
-                            entry,
-                            format!("stopped: {text}"),
-                            json!({"stop": {"reason": text}}),
-                            &mut out,
-                        );
-                    }
-                    self.close_turn(&chat, entry, Outcome::Complete, &mut out);
-                }
-            }
+            // A `stop` row is per-assistant-message metadata — the model's own
+            // stop reason (end_turn / tool_use / max_tokens / refusal /
+            // cancelled) — never turn lifecycle: `tool_use` and `max_tokens`
+            // are the loop's continue edges (the tool / continuation rows
+            // follow them), and a turn end always carries its `turnFinish`
+            // right behind the last stop. Closing the turn here split every
+            // agentic turn per tool round and minted a "stopped: …" notice
+            // per round.
+            JournalWireEvent::Stop { .. } => {}
             JournalWireEvent::Error { message } => self.close_turn(
                 &chat,
                 entry,
@@ -967,7 +964,43 @@ impl Translator {
                 //   as a fresh user message once this turn ends.
                 // - **No turn is open** — an ordinary queued submission, which
                 //   the next `turn_start` carries as its opening message.
+                let initiating = self.open.as_ref().is_some_and(|turn| {
+                    turn.message_text.is_empty()
+                        && !turn.streamed_text
+                        && turn.text_part.is_none()
+                        && turn.calls.is_empty()
+                });
                 let steering = self.open.is_some();
+                // The initiating user row: journal order puts `turnStart`
+                // before the user row, so the turn opened with an empty
+                // placeholder message. When nothing has been streamed yet,
+                // this row IS the opening message — re-issue the turnStarted
+                // with the text (the reducer replaces the still-empty active
+                // turn; no parts exist to orphan). Anything after real
+                // content is a steer.
+                if steering && initiating {
+                    let turn_id = self.turn_id();
+                    out.push(Emitted::new(
+                        chat,
+                        StateAction::ChatTurnStarted(ChatTurnStartedAction {
+                            turn_id,
+                            started_at: entry.timestamp.clone(),
+                            message: message.clone(),
+                            // The row's own id: the client retires its
+                            // optimistic echo against it.
+                            queued_message_id: Some(
+                                origin_rpc
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| format!("m-{}", entry.id)),
+                            ),
+                            meta: Some(manox_meta(json!({"entryId": entry.id}))),
+                        }),
+                    ));
+                    if let Some(turn) = self.open.as_mut() {
+                        turn.message_text = message.text.clone();
+                    }
+                    return;
+                }
                 // The steer id is the client's, not one this translator mints:
                 // the engine keys the injected row by it, the host's `steer`
                 // intent receives it as the pending id, and the client retires
@@ -990,6 +1023,10 @@ impl Translator {
                         message: message.clone(),
                     }),
                 ));
+                // Only a queued submission joins `pending_user`: the steer was
+                // consumed by the turn it interrupted, and enqueueing it would
+                // replay it as a later turn's opening message — retiring the
+                // steering slot the host's removal still has to match.
                 if !steering {
                     self.pending_user.push_back(PendingUser { id, message });
                 }
@@ -1660,13 +1697,22 @@ impl Translator {
             return;
         }
         let id = format!("t-{}", entry.id);
+        // Manox journals carry no `turnStart` rows: the queued submission
+        // (the user row that preceded this content) IS the opening message —
+        // without this, every replayed synthetic turn carried an empty
+        // message and the transcript lost its user bubbles.
+        let carried = self.pending_user.pop_front();
+        let (message, queued_message_id) = match carried {
+            Some(pending) => (pending.message, Some(pending.id)),
+            None => (no_user_row(entry), None),
+        };
         out.push(Emitted::new(
             chat,
             StateAction::ChatTurnStarted(ChatTurnStartedAction {
                 turn_id: id.clone(),
                 started_at: entry.timestamp.clone(),
-                message: no_user_row(entry),
-                queued_message_id: None,
+                message,
+                queued_message_id,
                 meta: Some(manox_meta(json!({"synthetic": true, "entryId": entry.id}))),
             }),
         ));
@@ -2399,5 +2445,51 @@ mod tests {
         let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
         assert_eq!(value["type"], "chat/inputCompleted");
         assert_eq!(value["requestId"], "plan-review:e-1");
+    }
+}
+
+#[cfg(test)]
+mod turn_message_tests {
+    use super::*;
+
+    #[test]
+    fn the_initiating_user_row_becomes_the_turns_opening_message() {
+        let mut t = Translator::new();
+        let row = |seq: u64, event: JournalWireEvent| JournalWireEntry {
+            seq,
+            id: format!("e-{seq}"),
+            parent_id: None,
+            timestamp: "2026-09-29T00:00:00.000Z".into(),
+            event,
+        };
+        let mut out = Vec::new();
+        for entry in [
+            row(1, JournalWireEvent::TurnStart),
+            row(
+                2,
+                JournalWireEvent::Message {
+                    role: "user".into(),
+                    content: vec![json!({"type": "text", "text": "hello"})],
+                    usage: None,
+                    origin_rpc: Some("rpc-1".into()),
+                    display: None,
+                },
+            ),
+            row(3, JournalWireEvent::AgentTextDelta { s: "hi".into() }),
+        ] {
+            out.extend(t.on_entry("c-1", "s-1", &entry));
+        }
+        let started = out.iter().find(
+            |e| matches!(&e.action, StateAction::ChatTurnStarted(a) if a.message.text == "hello"),
+        );
+        assert!(started.is_some(), "turnStarted with the user text: {out:?}");
+        assert!(
+            !out.iter().any(|e| matches!(
+                &e.action,
+                StateAction::ChatPendingMessageSet(p)
+                    if p.kind == PendingMessageKind::Steering
+            )),
+            "the initiating row is not a steer: {out:?}"
+        );
     }
 }

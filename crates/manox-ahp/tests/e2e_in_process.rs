@@ -582,3 +582,51 @@ async fn subscribing_to_the_changeset_channel_answers_a_snapshot() {
         "the snapshot is the changeset state"
     );
 }
+
+/// A stateless extension channel's baseline reaches the client as an action
+/// envelope (the Rust SDK client drops unknown notification methods, so the
+/// notification-shaped baseline never arrived).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_extension_channel_baseline_reaches_the_client_as_an_action() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+
+    // The baseline is pushed while the `subscribe` request is being answered,
+    // so the fan-in receiver must exist before the subscribe is sent.
+    let mut events = client.events();
+    let (result, _sub) = client
+        .subscribe("x-manox-workspaces://".to_string())
+        .await
+        .expect("subscribes to the stateless catalogue channel");
+    assert!(
+        result.snapshot.is_none(),
+        "stateless channels carry no snapshot"
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .expect("baseline arrives")
+        .expect("event stream open");
+    assert_eq!(event.channel, "x-manox-workspaces://");
+    match event.event {
+        ahp::SubscriptionEvent::Action(envelope) => match envelope.action {
+            StateAction::Unknown(value) => {
+                assert_eq!(value["type"], manox_ahp::ext::actions::BASELINE);
+                assert!(
+                    value["state"]["rows"].is_array(),
+                    "the baseline carries the channel state: {value}"
+                );
+            }
+            other => panic!("expected the raw baseline action, got {other:?}"),
+        },
+        other => panic!("expected an action envelope, got {other:?}"),
+    }
+}

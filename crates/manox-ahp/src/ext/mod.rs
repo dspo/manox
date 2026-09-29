@@ -32,7 +32,7 @@ pub const META_KEY: &str = "x-manox";
 /// `fetchEntries`/`modelChat`/`modelChatCancel`/`cancelDelivery`/`shutdown`
 /// commands off the surface. A client that caches version 1's declaration would
 /// otherwise keep offering names this build answers `unsupported` to.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
@@ -63,6 +63,11 @@ pub mod channels {
 /// A declaration row exists the moment the host *emits* the action; rows are
 /// grouped by channel in the declaration payload.
 pub mod actions {
+    /// A channel's baseline state (host-emitted, targeted at the subscribing
+    /// connection). It rides an `action` envelope rather than a bare
+    /// notification: the Rust SDK client drops unknown notification methods,
+    /// so a notification-shaped baseline never reaches an SDK client.
+    pub const BASELINE: &str = "x-manox/baseline";
     /// Plan mode toggled (client-dispatchable).
     pub const PLAN_MODE_CHANGED: &str = "x-manox-plan/planModeChanged";
     /// The plan document changed (host-emitted).
@@ -107,6 +112,7 @@ pub mod actions {
 
     /// Every declared action.
     pub const ALL: &[&str] = &[
+        BASELINE,
         PLAN_MODE_CHANGED,
         PLAN_CHANGED,
         PLAN_VERDICT_REQUESTED,
@@ -255,9 +261,6 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     "terminal/cleared",
 ];
 
-/// The notification method carrying an extension channel's baseline state.
-pub const BASELINE_NOTIFICATION: &str = "x-manox/baseline";
-
 /// Whether `uri` is a **per-session** extension channel (`…:/<session-id>`)
 /// rather than a connection-level catalogue.
 ///
@@ -328,10 +331,11 @@ pub fn declaration() -> Value {
         "commands": commands::ALL,
         "serverRequests": requests::ALL,
         // How a subscriber receives an extension channel's state: these channels
-        // are not state-bearing, so `subscribe` answers with this notification
-        // rather than a snapshot. Declared because a client cannot guess the
-        // method name, and a channel it cannot read is a channel not served.
-        "baselineNotification": BASELINE_NOTIFICATION,
+        // are not state-bearing, so `subscribe` answers with this action
+        // envelope (targeted at the subscribing connection) rather than a
+        // snapshot. Declared because a client cannot guess the tag, and a
+        // channel it cannot read is a channel not served.
+        "baselineAction": actions::BASELINE,
         "capabilities": {
             // Sessions are journals of branchable chats; the active-session
             // pointer is `SessionState.defaultChat`.

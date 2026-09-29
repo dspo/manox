@@ -494,6 +494,83 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
     );
 }
 
+/// An agentic tool loop: every assistant message is followed by a `stop` row
+/// carrying the model's stop reason, and the turn only really ends at its
+/// `turnFinish`. The stops are per-message metadata — no notice may surface
+/// and no turn may close until the `turnFinish` arrives.
+#[test]
+fn a_stop_row_is_metadata_and_never_ends_the_turn() {
+    let events = vec![
+        Message {
+            role: "user".to_string(),
+            content: vec![serde_json::json!({"type": "text", "text": "look around"})],
+            usage: None,
+            origin_rpc: Some("rpc-1".to_string()),
+            display: None,
+        },
+        AgentTextDelta {
+            s: "Working.".to_string(),
+        },
+        Stop {
+            reason: Some("tool_use".to_string()),
+        },
+        AgentTextDelta {
+            s: "Still working.".to_string(),
+        },
+        Stop {
+            reason: Some("end_turn".to_string()),
+        },
+        TurnFinish {
+            cancelled: false,
+            failed: false,
+            stranded_steer_ids: Vec::new(),
+        },
+    ];
+    let journal: Vec<JournalWireEntry> = events
+        .into_iter()
+        .enumerate()
+        .map(|(seq, event)| JournalWireEntry {
+            seq: seq as u64,
+            id: format!("sentry-{seq}"),
+            parent_id: (seq > 0).then(|| format!("sentry-{}", seq - 1)),
+            timestamp: format!("2026-09-29T01:00:{seq:02}.000Z"),
+            event,
+        })
+        .collect();
+
+    let mut translator = Translator::new();
+    let mut state = manox_ahp::channels::chat::initial("c-1");
+    let mut stop_notes = 0usize;
+    for entry in &journal {
+        for emitted in translator.on_entry("c-1", "s-1", entry) {
+            if let ahp_types::actions::StateAction::ChatResponsePart(part) = &emitted.action
+                && matches!(part.part, ResponsePart::SystemNotification(_))
+            {
+                stop_notes += 1;
+            }
+            ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+        }
+    }
+    assert_eq!(
+        stop_notes, 0,
+        "a stop row is the model's own metadata, not a notice for the user"
+    );
+    assert_eq!(
+        state.turns.len(),
+        1,
+        "the tool loop is one turn — the stops must not close it mid-round"
+    );
+    assert_eq!(
+        state.turns.last().map(|t| t.message.text.as_str()),
+        Some("look around"),
+        "the turn's opening message is the submission"
+    );
+    assert!(
+        state.active_turn.is_none(),
+        "the turnFinish closed the turn"
+    );
+}
+
 /// A plan proposal reaches a subscribed client — content and question alike.
 ///
 /// This is the one place the host emits an action AHP's own reducers do not know,

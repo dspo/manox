@@ -458,6 +458,25 @@ impl RuntimeBackend {
                     for emitted in translator.on_entry(&session_id, &thread_id, &entry) {
                         host.publish(&emitted.channel, emitted.action, None);
                     }
+                    // A landed assistant row changes the Q face: republish the
+                    // aggregate so the metrics channel stays a read model of
+                    // the journal, not a stream of per-call rows the client
+                    // would have to re-aggregate (the v2 `GetConversationInfo`
+                    // contract, now push).
+                    if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "assistant")
+                        && let Some(metrics) = self.server.conversation_metrics(&session_id)
+                    {
+                        let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
+                        host.publish(
+                            &channel,
+                            StateAction::Unknown(serde_json::json!({
+                                "type": manox_ahp::ext::actions::METRICS_CHANGED,
+                                "kind": "conversation",
+                                "data": metrics,
+                            })),
+                            None,
+                        );
+                    }
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
                     translator = Translator::new();
@@ -627,10 +646,20 @@ impl RuntimeBackend {
             .provider_names()
             .into_iter()
             .map(|provider| {
-                let models = registry
+                let raw: Vec<manox_harness::types::Model> = registry
                     .models()
                     .into_iter()
                     .filter(|model| model.provider == provider)
+                    .collect();
+                // The human display name (metadata `provider_display_name`,
+                // e.g. "Packy API") — one submenu per display name, so wire
+                // variants of one provider merge with their own tags.
+                let display_name = raw
+                    .first()
+                    .map(manox_agent::provider_glue::display_provider_name)
+                    .unwrap_or_else(|| provider.clone());
+                let models = raw
+                    .into_iter()
                     .map(|model| SessionModelInfo {
                         // L8: the wire never carries a bare model id.
                         id: format!("{}/{}", model.provider, model.id),
@@ -642,12 +671,21 @@ impl RuntimeBackend {
                         supports_vision: None,
                         policy_state: None,
                         config_schema: None,
-                        meta: None,
+                        // The wire api ("anthropic" / "openai_responses" /
+                        // "openai_completions") is the discriminator clients
+                        // tag model rows with; AHP has no native slot, so it
+                        // rides the extension meta namespace.
+                        meta: Some(
+                            serde_json::json!({ "x-manox": { "api": model.api } })
+                                .as_object()
+                                .cloned()
+                                .expect("a literal object"),
+                        ),
                     })
                     .collect();
                 AgentInfo {
                     provider: provider.clone(),
-                    display_name: provider.clone(),
+                    display_name,
                     description: String::new(),
                     models,
                     protected_resources: None,
@@ -1733,37 +1771,47 @@ impl Backend for RuntimeBackend {
     /// A channel with no folded state still answers: an empty object is "this
     /// channel is served and currently has nothing", which is a different and
     /// actionable statement from silence.
-    fn extension_baseline(&self, channel: &str) -> Option<(String, Value)> {
+    fn extension_baseline(&self, channel: &str) -> Option<Value> {
         if !manox_ahp::ext::is_extension_channel(channel) {
             return None;
         }
         // The per-session channels fold one session's journal; the catalogue
         // channels (`x-manox-workspaces://`, `x-manox-commands://`) describe the
         // host and carry no session id.
-        let state = if manox_ahp::ext::is_session_scoped_channel(channel) {
-            let session_id = channel
-                .split_once(":/")?
-                .1
-                .split('/')
-                .next()
-                .filter(|id| !id.is_empty())?;
-            match block_on(self.seeded(session_id)) {
-                Some(seeded) => seeded
-                    .extensions
-                    .get(channel)
-                    .map(|state| serde_json::to_value(state).unwrap_or(Value::Null))
-                    .unwrap_or(Value::Null),
-                // An unknown session is not a served channel: answering an
-                // empty baseline would claim state for a session that has none.
-                None => return None,
-            }
-        } else {
-            self.catalogue_baseline(channel)
-        };
-        Some((
-            manox_ahp::ext::BASELINE_NOTIFICATION.to_string(),
-            serde_json::json!({ "channel": channel, "state": state }),
-        ))
+        let state =
+            if let Some(session_id) = channel.strip_prefix(manox_ahp::ext::channels::METRICS) {
+                // The metrics channel's baseline is the Q-face aggregate, not the
+                // per-row ext fold: a subscriber must see the same read model the
+                // bridge pushes, from the first frame on. A cold session (no live
+                // engine) has no fold yet — an empty aggregate, not a refusal:
+                // the channel is served, the first bridge frame fills it.
+                self.server
+                    .conversation_metrics(session_id)
+                    .unwrap_or_else(|| serde_json::json!({}))
+            } else if manox_ahp::ext::is_session_scoped_channel(channel) {
+                let session_id = channel
+                    .split_once(":/")?
+                    .1
+                    .split('/')
+                    .next()
+                    .filter(|id| !id.is_empty())?;
+                match block_on(self.seeded(session_id)) {
+                    Some(seeded) => seeded
+                        .extensions
+                        .get(channel)
+                        .map(|state| serde_json::to_value(state).unwrap_or_else(|_| Value::Null))
+                        // A declared channel with no rows yet answers its (empty)
+                        // state, not `null`: the client replaces what it holds,
+                        // and `null` would claim the channel says nothing at all.
+                        .unwrap_or_else(|| serde_json::json!({})),
+                    // An unknown session is not a served channel: answering an
+                    // empty baseline would claim state for a session that has none.
+                    None => return None,
+                }
+            } else {
+                self.catalogue_baseline(channel)
+            };
+        Some(state)
     }
 
     fn extension(&self, method: &str, params: &Value) -> Result<Value, HostError> {

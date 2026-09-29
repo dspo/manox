@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
-use ahp_types::actions::{ActionOrigin, SessionChatAddedAction, SessionReadyAction, StateAction};
+use ahp_types::actions::{
+    ActionEnvelope, ActionOrigin, SessionChatAddedAction, SessionReadyAction, StateAction,
+};
 use ahp_types::commands::{
     CompletionsParams, CompletionsResult, CreateChatParams, CreateSessionParams,
     CreateTerminalParams, DispatchActionParams, DisposeChatParams, DisposeSessionParams,
@@ -339,9 +341,24 @@ fn subscribe_uri(
     let snapshot = inner.snapshot(&channel);
     if snapshot.is_none()
         && !channel.is_state_bearing()
-        && let Some((method, params)) = inner.backend.extension_baseline(uri)
+        && let Some(state) = inner.backend.extension_baseline(uri)
     {
-        conn.send(wire::notification(&method, params));
+        // The baseline rides an `action` envelope, not a bare notification:
+        // the Rust SDK client drops unknown notification methods, so a
+        // notification-shaped baseline never reaches an SDK client. It is
+        // targeted at this connection only — a broadcast would hand an
+        // earlier subscriber a stale payload carrying a fresh `serverSeq`
+        // and regress its state.
+        conn.send(wire::action_notification(ActionEnvelope {
+            channel: uri.to_string(),
+            action: StateAction::Unknown(serde_json::json!({
+                "type": ext::actions::BASELINE,
+                "state": state,
+            })),
+            server_seq: inner.seq.watermark().max(0) as u64,
+            origin: None,
+            rejection_reason: None,
+        }));
     }
     Ok(snapshot)
 }

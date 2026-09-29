@@ -161,6 +161,10 @@ impl Backend for TestBackend {
         DispatchOutcome::Accepted
     }
 
+    fn extension_baseline(&self, channel: &str) -> Option<Value> {
+        (channel == "x-manox-workspaces://").then(|| serde_json::json!({ "rows": [] }))
+    }
+
     fn extension(&self, _method: &str, _params: &Value) -> Result<Value, HostError> {
         Err(HostError::Unimplemented("extension".to_string()))
     }

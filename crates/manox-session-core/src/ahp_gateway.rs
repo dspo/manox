@@ -35,12 +35,16 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 /// The gateway as the AHP runtime.
 pub struct GatewayRuntime {
     server: Arc<AgentServer>,
+    metrics_cache: Arc<std::sync::Mutex<manox_ahp_runtime::journal_query::ConversationInfoCache>>,
 }
 
 impl GatewayRuntime {
     /// Wrap a live server.
     pub fn new(server: Arc<AgentServer>) -> Self {
-        Self { server }
+        Self {
+            server,
+            metrics_cache: Default::default(),
+        }
     }
 
     /// The wrapped server, for the gateway's own wiring (the `/ahp` route and
@@ -330,6 +334,23 @@ impl SessionRuntime for GatewayRuntime {
 
     fn journal_feed(&self, session_id: &str) -> Option<manox_agent::thread::ThreadHandle> {
         self.server.ahp_inner().session_thread(session_id)
+    }
+
+    fn conversation_metrics(&self, session_id: &str) -> Option<Value> {
+        let thread = self.server.ahp_inner().session_thread(session_id)?;
+        // `conversation_info` awaits the journal snapshot; the trait method is
+        // sync (the backend calls it from bridge and baseline paths), so ride
+        // the runtime handle the same way `accept` does on the napi edge.
+        let cache = Arc::clone(&self.metrics_cache);
+        let fold = manox_ahp_runtime::journal_query::conversation_info(&cache, &thread, session_id);
+        // Callers live on both sides of the runtime: the router's async tasks
+        // and the bridge run on it, cold callers don't. `block_in_place` is
+        // the only wait that is legal on a worker thread.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::block_in_place(|| manox_agent::runtime::handle().block_on(fold)).ok()
+        } else {
+            manox_agent::runtime::handle().block_on(fold).ok()
+        }
     }
 
     fn set_embedder_tools(
