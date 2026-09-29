@@ -361,7 +361,16 @@ fn map_ask_questions(input: &serde_json::Value) -> Option<Vec<ChatInputQuestion>
     let questions = input.get("questions")?.as_array()?;
     let mut out = Vec::with_capacity(questions.len());
     for (idx, q) in questions.iter().enumerate() {
-        let message = q.get("question")?.as_str()?.to_string();
+        // The v1 AskUserQuestion payload states the question in `header`
+        // alone (no `question` field), so the text falls back to it —
+        // without the fallback the whole question list dropped to `None`
+        // and the elicitation reached clients as an unanswerable bare ask.
+        let message = q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .or_else(|| q.get("header").and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_string();
         let title = q.get("header").and_then(|v| v.as_str()).map(str::to_string);
         let id = q
             .get("id")

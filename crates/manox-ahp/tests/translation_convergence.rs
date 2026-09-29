@@ -571,6 +571,66 @@ fn a_stop_row_is_metadata_and_never_ends_the_turn() {
     );
 }
 
+/// The v1 AskUserQuestion payload states the question in `header` alone —
+/// no `question` field. The elicitation must still carry the structured
+/// questions; an unanswerable bare ask leaves the model waiting forever.
+#[test]
+fn a_v1_ask_payload_folds_its_questions_through_the_header() {
+    let entry = JournalWireEntry {
+        seq: 7,
+        id: "e7".to_string(),
+        parent_id: Some("e6".to_string()),
+        timestamp: "2026-09-29T06:11:26.000Z".to_string(),
+        event: Question {
+            kind: "request".to_string(),
+            auth_id: "call_00_LZg8".to_string(),
+            tool_name: Some("AskUserQuestion".to_string()),
+            tool_call_id: Some("call_00_LZg8".to_string()),
+            verdict: None,
+            reason: None,
+            input: Some(serde_json::json!({
+                "questions": [
+                    {
+                        "header": "交付方式",
+                        "multiSelect": false,
+                        "options": [
+                            {"label": "发到 PR 评论区", "description": "gh pr comment"},
+                            {"label": "贴回对话", "description": "直接回复"},
+                        ],
+                    }
+                ],
+            })),
+        },
+    };
+    let mut translator = Translator::new();
+    let actions: Vec<_> = translator
+        .on_entry("c-1", "s-1", &entry)
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    let request = actions.iter().find_map(|a| match a {
+        ahp_types::actions::StateAction::ChatInputRequested(r) => Some(&r.request),
+        _ => None,
+    });
+    let request = request.expect("the ask reaches the client as chat/inputRequested");
+    assert_eq!(request.id, "call_00_LZg8");
+    let questions = request.questions.as_ref().expect("structured questions");
+    assert_eq!(
+        questions.len(),
+        1,
+        "the v1 payload still yields its question"
+    );
+    let single = match &questions[0] {
+        ahp_types::state::ChatInputQuestion::SingleSelect(s) => s,
+        other => panic!("expected a single-select question, got {other:?}"),
+    };
+    assert_eq!(
+        single.message, "交付方式",
+        "the header IS the question text"
+    );
+    assert_eq!(single.options.len(), 2, "both options survive");
+}
+
 /// A plan proposal reaches a subscribed client — content and question alike.
 ///
 /// This is the one place the host emits an action AHP's own reducers do not know,
