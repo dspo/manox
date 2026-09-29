@@ -395,6 +395,12 @@ impl SessionRuntime for GatewayRuntime {
         request_id: &str,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> Result<(), RuntimeError> {
+        tracing::info!(
+            session = %session_id,
+            request_id = %request_id,
+            answers = answers.len(),
+            "gateway: answering question"
+        );
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| {
