@@ -17,11 +17,15 @@ pub mod session_meta;
 pub mod session_stream;
 pub mod steer_bus;
 pub mod subagent;
+pub mod tasks;
 
 pub use bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use bash::persistent::PersistentShellOperations;
 pub use monitor::MonitorTool;
 pub use subagent::SubagentRuntime;
+pub use tasks::{
+    Settlement, SettlementCause, SettlementKind, TaskFamily, TaskLifecycle, TaskObserver,
+};
 
 /// Process-global ordinal for background task ids. Every registry
 /// (`BackgroundRegistry`, `WsMonitorRegistry`) draws from this one counter so

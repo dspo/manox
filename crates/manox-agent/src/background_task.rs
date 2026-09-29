@@ -562,6 +562,36 @@ pub fn remove(id: &TaskId) {
         .remove(&id.0);
 }
 
+/// Record a harness settlement on a task: the one mapping from the unified
+/// lifecycle vocabulary to the wire-stable terminal status. First-wins like
+/// `push_terminal`; cause `Teardown` settles as `SessionEnded`.
+pub(crate) fn apply_settlement(
+    task: &BackgroundTask,
+    id: &TaskId,
+    settlement: &manox_harness::tasks::Settlement,
+) {
+    use manox_harness::tasks::{SettlementCause, SettlementKind};
+    if let Some(code) = settlement.exit_code {
+        task.set_exit_code(Some(code));
+    }
+    if let Some(reason) = &settlement.failure_summary {
+        task.set_failure_summary(reason.clone());
+    }
+    let status = match settlement.kind {
+        SettlementKind::Completed => TaskStatus::Completed,
+        SettlementKind::Failed => TaskStatus::Failed,
+        SettlementKind::TimedOut => TaskStatus::TimedOut,
+        SettlementKind::Stopped => {
+            if settlement.cause == SettlementCause::Teardown {
+                TaskStatus::SessionEnded
+            } else {
+                TaskStatus::Stopped
+            }
+        }
+    };
+    task.push_terminal(id, status);
+}
+
 /// Stop a task by id and return only after its stop hook has run and the task
 /// has settled. This is the semantic boundary used by TaskStop and shutdown.
 pub async fn stop(id: &str) -> Result<(), String> {

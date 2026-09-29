@@ -149,7 +149,8 @@ impl BackgroundRegistry {
     /// Same process management as `spawn()` (process group, ring buffer, wait
     /// reaping), but each stdout line also triggers `on_output` and the exit
     /// triggers `on_exit`. The ring buffer still accumulates so the task
-    /// remains observable via `poll()` / `status()`.
+    /// remains observable via `poll()` / `status()`. Runs through the sandbox
+    /// wrapper when configured.
     pub fn spawn_with_line_events(
         &self,
         command: &str,
@@ -157,8 +158,37 @@ impl BackgroundRegistry {
         on_output: LineEventCallback,
         on_exit: ExitEventCallback,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
+        self.spawn_line_events_impl(command, cwd, true, "mon_", on_output, on_exit)
+    }
+
+    /// Line-event variant of the escalated (unconfined) `spawn` path.
+    pub fn spawn_escalated_with_line_events(
+        &self,
+        command: &str,
+        cwd: &Path,
+        on_output: LineEventCallback,
+        on_exit: ExitEventCallback,
+    ) -> Result<crate::core::TaskId, crate::core::TaskError> {
+        self.spawn_line_events_impl(command, cwd, false, "bg_", on_output, on_exit)
+    }
+
+    fn spawn_line_events_impl(
+        &self,
+        command: &str,
+        cwd: &Path,
+        sandboxed: bool,
+        prefix: &str,
+        on_output: LineEventCallback,
+        on_exit: ExitEventCallback,
+    ) -> Result<crate::core::TaskId, crate::core::TaskError> {
         self.gc();
-        let mut child = self.sandboxed_command(command, cwd);
+        let mut child = if sandboxed {
+            self.sandboxed_command(command, cwd)
+        } else {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(command).current_dir(cwd);
+            c
+        };
         child
             .process_group(0)
             .kill_on_drop(true)
@@ -169,7 +199,7 @@ impl BackgroundRegistry {
             .spawn()
             .map_err(|e| crate::core::TaskError::Spawn(format!("{e}")))?;
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        let id = crate::core::TaskId(format!("mon_{}", crate::ext::next_task_ordinal()));
+        let id = crate::core::TaskId(format!("{prefix}{}", crate::ext::next_task_ordinal()));
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let entry = Arc::new(TaskEntry::new(child, pid));
