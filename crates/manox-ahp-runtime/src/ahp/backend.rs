@@ -485,8 +485,18 @@ impl RuntimeBackend {
                             continue;
                         };
                         tail = fold.tail;
-                        host.seed_chat(&session_id, &session_id, fold.chat);
                         host.seed_session(&session_id, session_state);
+                        // The host's chat state stays as the client last saw it —
+                        // deliberately NOT re-seeded from the fold. The fold
+                        // re-mints the active turn under a fresh synthetic id, and
+                        // the resumed bridge would adopt it (`open_with_id`)
+                        // without announcing it: every streamed part from here on
+                        // carries an id the client's active turn doesn't match, so
+                        // its reducer drops them all while the stale turn keeps
+                        // the UI "running" forever. Keeping the client-visible id
+                        // lets the reset translator resume against the turn the
+                        // client actually holds; the fold remains the durable
+                        // authority (a fresh subscriber's snapshot recomputes it).
                     }
                 }
                 Err(_) => break,

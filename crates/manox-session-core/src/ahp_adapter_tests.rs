@@ -87,6 +87,16 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             parent_id: p,
             ..
         }
+        | E::AgentThinkingDelta {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::Stop {
+            id: i,
+            parent_id: p,
+            ..
+        }
         | E::ToolCall {
             id: i,
             parent_id: p,
@@ -344,6 +354,62 @@ fn chat_fold_replays_the_journal_transcript() {
             panic!("markdown");
         };
         assert_eq!(md.content, "bye");
+    });
+    uninstall();
+}
+
+/// A manox journal's first turn still open — no `turnStart`, no `turnFinish`
+/// — with deltas, a settled tool round and a stop row. The live bridge and
+/// every fresh subscriber's snapshot depend on this fold carrying the active
+/// turn with ALL its parts (the desktop attached to exactly this shape and
+/// rendered only the user bubble when the fold lost them).
+#[test]
+fn a_running_manox_turn_folds_all_its_parts() {
+    let _guards = install();
+    manox_agent::runtime::handle().block_on(async {
+        let events = vec![
+            ("e1", user("review dspo/manox pr #824")),
+            (
+                "e2",
+                E::AgentThinkingDelta {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    delta: "thinking".into(),
+                },
+            ),
+            ("e3", delta("partial answer")),
+            ("e4", assistant("settled", 10, 5)),
+            (
+                "e5",
+                E::Stop {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    reason: Some("tool_use".into()),
+                },
+            ),
+            ("e6", tool_call()),
+            ("e7", tool_result()),
+            (
+                "e8",
+                E::AgentThinkingDelta {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    delta: "more".into(),
+                },
+            ),
+        ];
+        seed_session("probe-1", "thread-P", "/", events).await;
+        let state = chat_state("probe-1").await.expect("chat state");
+        let active = state.active_turn.as_ref().expect("the turn is open");
+        assert_eq!(active.message.text, "review dspo/manox pr #824");
+        assert_eq!(
+            kinds(&active.response_parts),
+            vec!["reasoning", "markdown", "toolCall", "reasoning"],
+            "every streamed part survives the fold"
+        );
     });
     uninstall();
 }
