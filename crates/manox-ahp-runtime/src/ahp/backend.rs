@@ -116,6 +116,23 @@ async fn proxy_mcp_method(
 /// journal seq it has forwarded to the host) that a restart resumes above.
 type BridgeTask = (tokio::task::JoinHandle<()>, Arc<AtomicU64>);
 
+/// Whether a journal row carries state a client cannot afford to miss in a
+/// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
+/// facts. Delta rows (streamed text/thinking/output chunks) are consciously
+/// dropped from a gap — replaying them at flood rate re-lags the bridge.
+fn is_state_bearing(event: &JournalWireEvent) -> bool {
+    !matches!(
+        event,
+        JournalWireEvent::AgentTextDelta { .. }
+            | JournalWireEvent::AgentThinkingDelta { .. }
+            | JournalWireEvent::ToolOutputChunk { .. }
+            | JournalWireEvent::Stop { .. }
+            | JournalWireEvent::SubagentChild { .. }
+            | JournalWireEvent::SubagentProgress { .. }
+            | JournalWireEvent::BackgroundTask { .. }
+    )
+}
+
 /// One session's folded state plus the journal tail it was taken at.
 struct Seeded {
     thread_id: String,
@@ -440,8 +457,15 @@ impl RuntimeBackend {
         let mut translator = Translator::new();
         let mut tail = resume_from.saturating_sub(1);
         tracing::info!(session = %session_id, resume_from, "bridge: subscribed to the journal feed");
-        self.replay_journal(&session_id, &host, &mut translator, &mut tail, resume_from)
-            .await;
+        self.replay_journal(
+            &session_id,
+            &host,
+            &mut translator,
+            &mut tail,
+            resume_from,
+            false,
+        )
+        .await;
         loop {
             match feed.recv().await {
                 Ok(manox_agent::engine::JournalFeed::Event(event)) => {
@@ -457,12 +481,16 @@ impl RuntimeBackend {
                     watermark.store(event.seq, Ordering::SeqCst);
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
-                    // Rows the window dropped are read back from the journal
-                    // and forwarded; they reach the client as fresh parts
-                    // continuing its current turn (new part ids — a tool round
-                    // inside the gap can appear twice), which beats a silently
-                    // empty span.
-                    tracing::warn!(session = %session_id, "bridge: feed lagged, replaying the gap");
+                    // The flood outran the window. Skip the gap (its deltas are
+                    // gone) but re-forward the STATE-BEARING rows inside it —
+                    // an ask or a tool call dropped here leaves the model
+                    // waiting on an answer no UI ever shows. No full replay:
+                    // replaying a flood would re-lag the bridge into a
+                    // live-lock, each pass falling further behind.
+                    tracing::warn!(
+                        session = %session_id,
+                        "bridge: feed lagged, resyncing over the gap"
+                    );
                     translator = Translator::new();
                     let replay_from = tail + 1;
                     self.replay_journal(
@@ -471,6 +499,7 @@ impl RuntimeBackend {
                         &mut translator,
                         &mut tail,
                         replay_from,
+                        true,
                     )
                     .await;
                 }
@@ -488,7 +517,10 @@ impl RuntimeBackend {
 
     /// Read the durable journal rows at and above `from` and forward them
     /// through the translator — the replay leg shared by bridge startup and
-    /// lag recovery.
+    /// lag recovery. `state_only` forwards just the state-bearing rows (asks,
+    /// tool calls, plan reviews): a lag recovery uses it to jump the gap
+    /// without replaying a delta flood, which would re-lag the bridge into a
+    /// live-lock (each full replay falling further behind the flood).
     async fn replay_journal(
         &self,
         session_id: &str,
@@ -496,13 +528,8 @@ impl RuntimeBackend {
         translator: &mut Translator,
         tail: &mut u64,
         from: u64,
+        state_only: bool,
     ) {
-        let thread_id = self
-            .seeds
-            .lock()
-            .get(session_id)
-            .map(|seeded| seeded.thread_id.clone())
-            .unwrap_or_else(|| session_id.to_string());
         match crate::journal_query::cold_read(session_id).await {
             crate::journal_query::ColdRead::Data(snapshot) => {
                 for record in &snapshot.records {
@@ -513,15 +540,20 @@ impl RuntimeBackend {
                     else {
                         continue;
                     };
+                    if state_only && !is_state_bearing(&entry.event) {
+                        continue;
+                    }
                     self.forward_entry(host, session_id, translator, &entry)
                         .await;
                     *tail = record.seq;
                 }
+                // Jump past the gap regardless: rows below the cursor are
+                // either replayed (above) or consciously dropped (deltas).
+                *tail = (*tail).max(snapshot.cursor);
             }
             crate::journal_query::ColdRead::NotFound
             | crate::journal_query::ColdRead::Corrupt(_) => {}
         }
-        let _ = thread_id;
     }
 
     /// Translate one journal row and publish everything it emits: lifecycle
