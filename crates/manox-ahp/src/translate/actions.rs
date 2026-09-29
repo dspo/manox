@@ -1030,9 +1030,7 @@ impl Translator {
                         message: message.clone(),
                     }),
                 ));
-                if !steering {
-                    self.pending_user.push_back(PendingUser { id, message });
-                }
+                self.pending_user.push_back(PendingUser { id, message });
             }
             "assistant" => {
                 let text = blocks_text(content);
@@ -1700,13 +1698,22 @@ impl Translator {
             return;
         }
         let id = format!("t-{}", entry.id);
+        // Manox journals carry no `turnStart` rows: the queued submission
+        // (the user row that preceded this content) IS the opening message —
+        // without this, every replayed synthetic turn carried an empty
+        // message and the transcript lost its user bubbles.
+        let carried = self.pending_user.pop_front();
+        let (message, queued_message_id) = match carried {
+            Some(pending) => (pending.message, Some(pending.id)),
+            None => (no_user_row(entry), None),
+        };
         out.push(Emitted::new(
             chat,
             StateAction::ChatTurnStarted(ChatTurnStartedAction {
                 turn_id: id.clone(),
                 started_at: entry.timestamp.clone(),
-                message: no_user_row(entry),
-                queued_message_id: None,
+                message,
+                queued_message_id,
                 meta: Some(manox_meta(json!({"synthetic": true, "entryId": entry.id}))),
             }),
         ));
