@@ -4,7 +4,7 @@ Guidance for coding agents working in this repo.（本文件是 manox 仓库指�
 
 ## 项目概述
 
-manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（harness）、宿主层（agent）、会话编排（session-core）、协议（protocol）、provider 配置（providers）、进程基础设施（supervisor/lsp）、终端仿真核心（terminal/hyperlinks）与 napi 绑定。对外以 git 依赖形式提供给 host——gpui 桌面应用与 cx 启动器在独立仓库 **dspo/manox-app** 维护（拆分点 tag `pre-manox-app-split`）。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
+manox 是**自研 agent runtime 库仓**（gpui-free、headless）：内核（harness）、宿主层（agent）、会话编排（session-core）、协议（protocol）、provider 配置（providers）、进程基础设施（supervisor）、终端仿真核心（terminal/hyperlinks）与 napi 绑定。对外以 git 依赖形式提供给 host——gpui 桌面应用与 cx 启动器在独立仓库 **dspo/manox-app** 维护（拆分点 tag `pre-manox-app-split`）。逐文件架构靠读代码获得——本文件只承载不可从代码推导的约束。
 
 ### 代码结构
 
@@ -22,7 +22,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-terminal/          # 终端仿真核心（自 manox-app 回流，UI 层 terminal-ui 在下游仓）
   hyperlinks/              # 终端超链接检测（随 manox-terminal 一同回流）
   supervisor/              # 子进程监督
-  lsp/                     # LSP 集成
+  manox-lsp/               # LSP client 库（唯一零仓内消费者的成员，为宿主预留的积木：宿主层不集成，宿主 app 按需装配为工具或经 AHP session/activeClientSet 注册）
   manox-napi/              # napi 宿主绑定（休眠保留：VS Code 扩展已删除）
 ```
 

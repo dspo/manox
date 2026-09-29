@@ -1,5 +1,5 @@
 [package]
-name = "lsp"
+name = "manox-lsp"
 edition.workspace = true
 version.workspace = true
 publish.workspace = true

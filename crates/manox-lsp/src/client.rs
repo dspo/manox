@@ -610,8 +610,8 @@ impl LspClient {
             .unwrap_or_default()
     }
 
-    /// Every file path with cached `publishDiagnostics`, for the
-    /// whole-project `Diagnostics` tool (no `path` argument).
+    /// Every file path with cached `publishDiagnostics`, for a whole-project
+    /// diagnostics snapshot (no single `path`).
     pub fn cached_diagnostic_files(&self) -> Vec<PathBuf> {
         self.inner
             .diagnostics

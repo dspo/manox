@@ -92,12 +92,6 @@ pub struct CaptainConfig {
     pub cwd: PathBuf,
     pub today: String,
     pub skills: Vec<SkillSummary>,
-    /// Comma-separated LSP server spec ids that are ready (e.g.
-    /// "rust-analyzer, gopls"). Empty when no LSP servers are available.
-    /// Injected as a dynamic line in the system prompt so the model knows
-    /// which languages have code intelligence without needing explicit
-    /// LspEnsure/LspWaitReady calls.
-    pub lsp_ready_specs: String,
 }
 
 #[derive(Serialize)]
@@ -106,7 +100,6 @@ struct CaptainData {
     today: String,
     subagents_prose: &'static str,
     skills: Vec<SkillSummary>,
-    lsp_ready_specs: String,
 }
 
 /// A project-instruction file in the fold. `location` is XML-escaped,
@@ -189,7 +182,6 @@ pub fn captain_prompt_builder(config: CaptainConfig) -> crate::core::harness::Sy
             today: config.today,
             subagents_prose: SUBAGENTS_PROSE,
             skills: config.skills,
-            lsp_ready_specs: config.lsp_ready_specs,
         },
     );
     let cwd = config.cwd;
@@ -233,7 +225,6 @@ pub fn render_golden_fixture() -> String {
                 description: "delegate a stuck problem".into(),
             },
         ],
-        lsp_ready_specs: String::new(),
     });
     let resources = crate::core::harness::HarnessResources {
         skills: vec![],

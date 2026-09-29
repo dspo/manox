@@ -328,7 +328,6 @@ mod tests {
                     today: "2026-07-14".to_string(),
                     permission_mode: "danger-full-access",
                 },
-                lsp_ready_specs: String::new(),
             };
             assert_clean(
                 &render(PromptTemplate::SystemMain, &main).unwrap(),
@@ -510,7 +509,7 @@ mod tests {
     }
 
     /// W1 byte-freeze: one representative main system-prompt render with every
-    /// branch live (skills block, LSP line, project and worktree rows). This is
+    /// branch live (skills block, project and worktree rows). This is
     /// the head of the cached prefix of every request; the bytes are pinned
     /// exactly, whitespace-control newlines included.
     #[test]
@@ -538,7 +537,6 @@ mod tests {
                 today: "2026-07-14".to_string(),
                 permission_mode: "danger-full-access",
             },
-            lsp_ready_specs: "rust-analyzer".to_string(),
         };
         assert_eq!(
             render(PromptTemplate::SystemMain, &main).unwrap(),
@@ -547,9 +545,6 @@ mod tests {
 ## Available skills (consult their full body via the `skill` tool on demand)
 - n: d
 
-
-## LSP ready
-rust-analyzer
 
 ## Tool preferences
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).

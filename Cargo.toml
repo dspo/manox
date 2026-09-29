@@ -4,14 +4,15 @@
 #   - manox-harness:      agent 内核（pi 核心的 Rust 移植：agent loop、providers、
 #                         sessions、tools + ext 扩展）
 #   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
-#                         + MCP/LSP 接线）
+#                         + MCP 接线）
 #   - manox-journal:      会话磁盘格式（journal v4 条目词汇）的叶子 crate
 #   - manox-ahp:          Agent Host Protocol 宿主层（频道、JSON-RPC、传输）
 #   - manox-ahp-runtime:  AHP 宿主背后的运行时半边（SessionRuntime 缝）
 #   - manox-session-core: 无上下文会话编排（会话存储 + AHP 运行时缝的实现）
 #   - manox-napi:         napi-rs 绑定（dormant，为未来 TS host 保留）
 #   - manox-providers:    ~/.manox/cx.providers.config.yaml 解析的单一事实来源
-#   - supervisor / lsp:   进程总线与 LSP 客户端（manox-agent 的基础设施）
+#   - supervisor / manox-lsp: 进程总线与对外 LSP 客户端库（manox-lsp 是唯一
+#                         零仓内消费者的成员——为宿主预留的积木，宿主 app 按需装配）
 #
 # LLM 直连 ~/.manox/cx.providers.config.yaml 定义的 providers。
 #
@@ -24,7 +25,7 @@ members = [
 	"crates/manox-agent",
 	"crates/manox-harness",
 	"crates/supervisor",
-	"crates/lsp",
+	"crates/manox-lsp",
 	"crates/manox-providers",
 	"crates/manox-session-core",
 	"crates/manox-napi",
@@ -52,7 +53,6 @@ publish = false
 # declarations and keep the defaults.
 manox-agent = { path = "crates/manox-agent", default-features = false }
 supervisor = { path = "crates/supervisor" }
-lsp = { path = "crates/lsp" }
 manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
 manox-workspace = { path = "crates/manox-workspace" }
 manox-journal = { path = "crates/manox-journal" }
@@ -117,7 +117,7 @@ image = "0.25"
 
 rmcp = { version = "1.8", default-features = false }
 # lsp-types —— LSP protocol types (InitializeParams, Location, Hover, ...). The
-# wire framer is hand-rolled (see crates/lsp/src/proto.rs); this crate only
+# wire framer is hand-rolled (see crates/manox-lsp/src/proto.rs); this crate only
 # supplies typed structs for the params/results we send and parse.
 lsp-types = "0.97"
 toml = "0.8"

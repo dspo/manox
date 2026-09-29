@@ -24,8 +24,6 @@ pub mod host;
 pub mod host_tools;
 pub mod image;
 pub mod language_model;
-#[cfg(feature = "lsp")]
-pub mod lsp_tools;
 #[cfg(feature = "mcp")]
 pub mod mcp;
 pub mod message;
@@ -90,7 +88,7 @@ pub use thread_store::{
 /// command / hook registries. Call at App startup.
 pub fn init() {
     // Login-shell PATH install (background): GUI processes inherit a minimal
-    // launchd PATH, so bash/LSP/MCP/monitor subprocesses would lose Homebrew
+    // launchd PATH, so bash/MCP/monitor subprocesses would lose Homebrew
     // binaries. Resolved once and applied process-wide; first thing so later
     // init work (provider shell credentials, MCP spawns) benefits as soon as
     // the resolver lands.
@@ -102,10 +100,6 @@ pub fn init() {
     // connections settle (per-server timeout); failures are isolated.
     #[cfg(feature = "mcp")]
     mcp::init();
-    // LSP registry PATH probe on a background thread (sessions await it
-    // bounded before registering the read-only LSP tools).
-    #[cfg(feature = "lsp")]
-    lsp_tools::init_background();
     // Skill/command definition registries (markdown files from plugins and
     // the user config dir) — consumed by the slash-command dispatch and the
     // composer mention surface.
@@ -115,9 +109,6 @@ pub fn init() {
     // the engine (SessionStart/Stop/PreToolUse/PostToolUse) and the thread
     // store (SessionEnd on archive).
     plugin_hooks::init();
-    // LSP PATH detection (no spawn — servers start lazily on first code-intel
-    // call). Runs after MCP so the registry is settled before the first
-    // `main_registry` build picks up LSP tools.
     // Always initialize the global ThreadStore. In test-support builds the
     // real db is also opened, but `global()` checks `TEST_OVERRIDE` first —
     // tests that call `init_for_test` after `init` still get the in-memory

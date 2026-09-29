@@ -2380,23 +2380,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
-name = "lsp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-channel",
- "futures",
- "lsp-types",
- "serde",
- "serde_json",
- "supervisor",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "lsp-types"
 version = "0.97.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2430,8 +2413,6 @@ dependencies = [
  "ignore",
  "image",
  "libc",
- "lsp",
- "lsp-types",
  "manox-agent",
  "manox-harness",
  "manox-providers",
@@ -2552,6 +2533,23 @@ dependencies = [
  "base64",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "manox-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-channel",
+ "futures",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "supervisor",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

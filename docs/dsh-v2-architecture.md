@@ -27,7 +27,7 @@
 ## B. 分层拓扑与进程模型
 
 ```
-L6 域旁路   terminal(PTY 自有通道) · ModelChat 侧流 · MCP · LSP        ——不进会话日志
+L6 域旁路   terminal(PTY 自有通道) · ModelChat 侧流 · MCP · 宿主 LSP        ——不进会话日志
 L5 扩展面   webui slot registry · 插件 bundle 静态通道 · plugin routes · 宿主服务缝清单
 L4 UI       GPUI agent-ui（selector-only） · webui React（slots+hooks） · VS Code webview（复用 webui）
 L3 客户端SDK JournalStream 引擎(Rust 单实现；TS 双胞胎已随前端删除) · SessionStore · selector · echo/retire · 重连
