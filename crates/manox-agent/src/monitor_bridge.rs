@@ -54,7 +54,7 @@ impl TaskObserver for BridgeObserver {
             label.to_string(),
             CancellationToken::new(),
         );
-        proxy.set_on_stop(Arc::new(move |_| stop()));
+        proxy.set_on_stop(Arc::new(move |_, cause| stop(cause)));
         self.emit_snapshot(&proxy, id);
     }
 

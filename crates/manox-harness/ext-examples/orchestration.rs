@@ -38,8 +38,17 @@ impl StreamFn for Scripted {
     }
 }
 
-/// A minimal lifecycle observer: prints what the producers emit.
-struct PrintObserver;
+/// A minimal lifecycle observer: prints what the producers emit and counts
+/// the spawn notifications.
+struct PrintObserver {
+    spawned: std::sync::atomic::AtomicUsize,
+}
+
+impl PrintObserver {
+    fn spawned_count(&self) -> usize {
+        self.spawned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 impl TaskObserver for PrintObserver {
     fn on_spawned(
@@ -49,6 +58,7 @@ impl TaskObserver for PrintObserver {
         label: &str,
         _stop: manox_harness::tasks::StopHandle,
     ) {
+        self.spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         println!("spawned {id} ({family:?}): {label}");
     }
 
@@ -93,7 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Background orchestration ────────────────────────────────────────────
     let background = Arc::new(BackgroundRegistry::new());
     let manager = BackgroundManager::new(Arc::clone(&background));
-    manager.set_observer(Arc::new(PrintObserver));
+    let observer = Arc::new(PrintObserver {
+        spawned: std::sync::atomic::AtomicUsize::new(0),
+    });
+    manager.set_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
     let bash = BashTool::new(
         Arc::new(manox_harness::bash::persistent::PersistentShellOperations::new(dir.path())),
         background.clone(),
@@ -122,17 +135,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let id = manager.spawn("sleep 0.2; echo done", dir.path(), OutputShape::default())?;
     println!("spawned background task {id}");
 
-    // Poll the lifecycle observer's settled emission (the example has no
-    // shared recording state; the observer prints as events land).
+    // The spawned notification landed, and the task reached its terminal
+    // state (public status read; the example addresses the manager, not the
+    // registry).
     let mut saw_completed = false;
     for _ in 0..20 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if !manager.registry.status(&id, 0).unwrap().is_running {
+        if !manager.status(&id, 0).unwrap().is_running {
             saw_completed = true;
             break;
         }
     }
     assert!(saw_completed, "background task reached its terminal state");
+    assert!(
+        observer.spawned_count() > 0,
+        "the Spawned lifecycle notification reached the observer"
+    );
     println!("background orchestration closed: task settled");
 
     let steered = session.steering_messages();

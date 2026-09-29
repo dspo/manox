@@ -80,9 +80,11 @@ pub struct BackgroundManager {
     /// Tokio handle captured at construction, used to spawn the abort
     /// cleanup from the listener (which may run on any thread).
     runtime: Option<tokio::runtime::Handle>,
-    /// Tasks owned by this manager, with their output-shaping preference.
-    /// Drained by the completion watcher — the first-wins witness: a task
-    /// whose entry is gone was killed by a kill site, not run to its end.
+    /// Tasks owned by this manager awaiting settlement, with their
+    /// output-shaping preference. Removed at settlement time: by the
+    /// watcher on a natural completion, by the kill pass (`kill_all`) on
+    /// an abort/teardown, and by the watcher's killed branch after a
+    /// single-task kill. A task absent here is settled or dead.
     tasks: Arc<Mutex<HashMap<crate::core::TaskId, OutputShape>>>,
     /// Cause recorded by kill sites (user stop / run abort / teardown)
     /// before killing; the watcher settles killed tasks with it instead of
@@ -259,6 +261,7 @@ impl BackgroundManager {
             // the watcher settles with that cause and must not steer a
             // completion summary into the session.
             if let Some(cause) = killed.lock().expect("killed lock poisoned").remove(&tid) {
+                tasks.lock().expect("tasks lock poisoned").remove(&tid);
                 if let Some(obs) = &observer {
                     obs.on_settled(&tid.0, &Settlement::new(SettlementKind::Stopped, cause));
                 }
@@ -299,13 +302,21 @@ impl BackgroundManager {
     }
 
     /// Kill one task synchronously (user-facing stop). The completion watcher
-    /// settles the task with cause `UserStop`; first-wins keeps any terminal
-    /// status the host task center already pushed.
+    /// settles the task with the recorded cause; first-wins keeps any
+    /// terminal status the host task center already pushed.
     pub fn kill(&self, id: &crate::core::TaskId) {
+        self.kill_with_cause(id, SettlementCause::UserStop);
+    }
+
+    /// Kill one task with the stopping side's explicit cause. The cause map
+    /// is first-wins, matching `MonitorManager`: a stop racing a run abort
+    /// keeps the first label.
+    pub fn kill_with_cause(&self, id: &crate::core::TaskId, cause: SettlementCause) {
         self.killed
             .lock()
             .expect("killed lock poisoned")
-            .insert(id.clone(), SettlementCause::UserStop);
+            .entry(id.clone())
+            .or_insert(cause);
         let _ = self.registry.kill_sync(id);
     }
 
@@ -318,13 +329,14 @@ impl BackgroundManager {
         self.registry.status(id, tail_bytes)
     }
 
-    /// The kill path for one task id, for the lifecycle `Spawned` emission.
+    /// The kill path for one task id, for the lifecycle `Spawned` emission:
+    /// forwards the stopping side's cause so the kill site records it.
     fn stop_handle(&self, id: &str) -> StopHandle {
         let weak = self.self_weak.clone();
         let tid = crate::core::TaskId(id.to_string());
-        Arc::new(move || {
+        Arc::new(move |cause| {
             if let Some(manager) = weak.upgrade() {
-                manager.kill(&tid);
+                manager.kill_with_cause(&tid, cause);
             }
         })
     }
@@ -367,15 +379,20 @@ async fn kill_all_tasks(
     killed: &Mutex<HashMap<crate::core::TaskId, SettlementCause>>,
     cause: SettlementCause,
 ) {
-    let tasks: Vec<crate::core::TaskId> = {
-        let map = tasks.lock().expect("tasks lock poisoned");
-        map.keys().cloned().collect()
-    };
-    for id in tasks {
+    // Drain: a killed task's bookkeeping leaves the map here, so a later
+    // kill pass never re-touches (and re-GC-refreshes) historical ids.
+    let drained: Vec<crate::core::TaskId> = tasks
+        .lock()
+        .expect("tasks lock poisoned")
+        .drain()
+        .map(|(id, _)| id)
+        .collect();
+    for id in drained {
         killed
             .lock()
             .expect("killed lock poisoned")
-            .insert(id.clone(), cause);
+            .entry(id.clone())
+            .or_insert(cause);
         let _ = registry.kill(&id).await;
     }
 }
@@ -534,6 +551,11 @@ mod tests {
         assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
         assert_eq!(settled[0].cause, SettlementCause::Teardown);
         assert!(matches!(settled[0].kind, SettlementKind::Stopped));
+        // The kill path releases its bookkeeping: neither the task table
+        // nor the cause map may retain the killed id (a later kill pass
+        // would otherwise re-touch — and re-GC-refresh — historical ids).
+        assert!(manager.tasks.lock().unwrap().is_empty());
+        assert!(manager.killed.lock().unwrap().is_empty());
     }
 
     /// Regression: a task killed via `kill_all` must neither steer a
