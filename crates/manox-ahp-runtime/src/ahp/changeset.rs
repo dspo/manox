@@ -413,10 +413,27 @@ impl Engine {
     /// round trips) runs *outside* the session-table lock, so a first sight
     /// on one session never stalls another session's state read.
     pub fn catalogue(&self, session_id: &str, dirs: Vec<PathBuf>) -> Option<Changeset> {
+        // Canonicalize once at entry time: git reports resolved paths
+        // (`rev-parse --show-toplevel` resolves symlinks), while the
+        // session's recorded cwd may ride them — the restore path compares
+        // the two, so they must share one shape.
+        let dirs: Vec<PathBuf> = dirs
+            .into_iter()
+            .map(|dir| dir.canonicalize().unwrap_or(dir))
+            .collect();
         let needs_scan = {
             let mut sessions = self.sessions.lock();
-            match sessions.get(session_id) {
-                Some(entry) => entry.status == ChangesetStatus::Computing,
+            match sessions.get_mut(session_id) {
+                Some(entry) => {
+                    if entry.dirs != dirs {
+                        // The session's directory set moved (a cwd change, a
+                        // new grant, or a repository appearing where none
+                        // was): rescan against the new set.
+                        entry.dirs = dirs.clone();
+                        entry.status = ChangesetStatus::Computing;
+                    }
+                    entry.status == ChangesetStatus::Computing
+                }
                 None => {
                     sessions.insert(session_id.to_string(), SessionChangeset::new(dirs.clone()));
                     true
@@ -683,14 +700,23 @@ impl Engine {
                 continue;
             };
             let abs = PathBuf::from(path);
-            let Some(root) = dirs.iter().find(|dir| abs.starts_with(dir)) else {
+            // The most specific (longest) matching directory wins when grants
+            // nest — `/repo` and `/repo/sub` both contain `/repo/sub/f.rs`,
+            // and only the inner one gives a sane relative path.
+            let Some(root) = dirs
+                .iter()
+                .filter(|dir| abs.starts_with(dir))
+                .max_by_key(|dir| dir.components().count())
+            else {
                 failures.push(format!("{path}: outside the session's directories"));
                 continue;
             };
             // "In HEAD" — not "in the index": an index-only new file
             // (`git add` without a commit) passes ls-files but has no HEAD
-            // side, and `checkout HEAD --` fails on it. The HEAD test must
-            // use the repo-relative pathspec.
+            // side, and `checkout HEAD --` fails on it. `HEAD:<path>` is
+            // *repo-root*-relative while `rel` is relative to the granted
+            // directory (often a monorepo subdirectory) — the `./` form is
+            // cwd-relative, which is what the path actually is.
             let Ok(rel) = abs
                 .strip_prefix(root)
                 .map(|rest| rest.to_string_lossy().into_owned())
@@ -700,7 +726,7 @@ impl Engine {
             };
             let in_head = self
                 .git
-                .run(root, &["cat-file", "-e", &format!("HEAD:{rel}")])
+                .run(root, &["cat-file", "-e", &format!("HEAD:./{rel}")])
                 .map(|out| out.success)
                 .unwrap_or(false);
             if in_head {
@@ -905,7 +931,9 @@ mod tests {
         let untracked = work.join("scratch.txt");
         std::fs::write(&untracked, "delete me").expect("untracked file");
 
-        let root_display = work.display().to_string();
+        // git resolves symlinks, so the fake root must be the canonical
+        // shape — the engine canonicalizes the granted dirs to match.
+        let root_display = work.canonicalize().unwrap().display().to_string();
         let engine = script(move |args| match args.first().copied().unwrap_or("") {
             // The fake repo root IS the real tempdir, so the untracked
             // revert's delete lands on a real file.
@@ -978,7 +1006,7 @@ mod tests {
         std::fs::create_dir_all(&work).expect("workdir");
         let added = work.join("added.txt");
         std::fs::write(&added, "staged but never committed").expect("added file");
-        let root_display = work.display().to_string();
+        let root_display = work.canonicalize().unwrap().display().to_string();
         let checkouts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let checkouts_clone = Arc::clone(&checkouts);
         let engine = script(move |args| match args.first().copied().unwrap_or("") {
@@ -999,8 +1027,9 @@ mod tests {
             _ => ok(""),
         });
         engine.catalogue("s-1", vec![work.clone()]);
+        // The engine's ids carry the canonical (git-resolved) path.
         let target = ahp_types::commands::ChangesetOperationTarget::Resource {
-            resource: format!("file://{}", added.display()),
+            resource: format!("file://{}", added.canonicalize().unwrap().display()),
             side: None,
         };
         engine
@@ -1060,6 +1089,131 @@ mod tests {
             Some(Some(true)),
             "an unchanged deletion keeps its review flag"
         );
+    }
+
+    #[test]
+    fn a_tracked_file_under_a_subdirectory_grant_is_restored_not_deleted() {
+        // The session's granted directory sits INSIDE the repo (monorepo
+        // shape). `HEAD:<path>` is repo-root-relative, so the restore must
+        // use the cwd-relative `HEAD:./<path>` — the root-relative form
+        // misreads "in HEAD" and the "new file" branch would delete the
+        // user's modified tracked file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        let tracked = sub.join("f.rs");
+        std::fs::write(&tracked, "locally modified").expect("tracked file");
+        let repo_canon = repo
+            .canonicalize()
+            .expect("canonical repo")
+            .display()
+            .to_string();
+        let grant = sub.canonicalize().expect("canonical grant");
+        let engine = script(move |args| match args.first().copied().unwrap_or("") {
+            // git resolves the symlink-free real root, even when invoked
+            // from inside the granted subdirectory.
+            "rev-parse" => ok(&format!("{repo_canon}\n")),
+            "status" => ok(" M sub/f.rs\0"),
+            "diff" if args.contains(&"--numstat") => ok("1\t1\tsub/f.rs\n"),
+            "diff" => ok("--- a/sub/f.rs\n+++ b/sub/f.rs\n@@ -1 +1 @@\n-old\n+new\n"),
+            // The cwd-relative form finds it; the root-relative form (the
+            // bug) would not — script exactly that distinction.
+            "cat-file" if args.iter().any(|a| a.starts_with("HEAD:./")) => ok(""),
+            "cat-file" => {
+                Err("repo-root-relative path does not resolve from the subdir".to_string())
+            }
+            "checkout" => ok(""),
+            "rm" => {
+                panic!("the unstage branch must never run for a HEAD-tracked file");
+            }
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![grant]);
+        let target = ahp_types::commands::ChangesetOperationTarget::Resource {
+            resource: format!("file://{}", tracked.canonicalize().unwrap().display()),
+            side: None,
+        };
+        engine
+            .invoke_revert("s-1", KEY, Some(&target))
+            .expect("the subdir revert lands");
+        assert!(
+            tracked.exists(),
+            "a restored tracked file must survive its own revert"
+        );
+    }
+
+    #[test]
+    fn a_grant_recorded_through_a_symlink_still_restores() {
+        // macOS /tmp-style shapes: the session recorded a symlinked path,
+        // git reports the resolved one. Canonicalization at entry time puts
+        // both sides on the same shape; without it every revert would be
+        // refused with "outside the session's directories".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        let sub = repo.join("sub");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        let tracked = sub.join("f.rs");
+        std::fs::write(&tracked, "content").expect("tracked file");
+        let link = dir.path().join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&repo, &link).expect("symlink");
+        let repo_canon = repo
+            .canonicalize()
+            .expect("canonical repo")
+            .display()
+            .to_string();
+        let grant = link.join("sub");
+        let engine = script(move |args| match args.first().copied().unwrap_or("") {
+            "rev-parse" => ok(&format!("{repo_canon}\n")),
+            "status" => ok(" M sub/f.rs\0"),
+            "diff" if args.contains(&"--numstat") => ok("1\t0\tsub/f.rs\n"),
+            "diff" => ok("--- a/sub/f.rs\n+++ b/sub/f.rs\n@@ -1 +1 @@\n-old\n+new\n"),
+            "cat-file" if args.iter().any(|a| a.starts_with("HEAD:./")) => ok(""),
+            "cat-file" => Err("not in HEAD".to_string()),
+            "checkout" => ok(""),
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![grant]);
+        let target = ahp_types::commands::ChangesetOperationTarget::Resource {
+            resource: format!("file://{}", tracked.canonicalize().unwrap().display()),
+            side: None,
+        };
+        engine
+            .invoke_revert("s-1", KEY, Some(&target))
+            .expect("the symlinked grant resolves");
+    }
+
+    #[test]
+    fn a_repository_appearing_after_the_first_scan_is_picked_up() {
+        // Session starts outside any repo; cwd later moves into one. The
+        // entry already exists, so the catalogue must notice the directory
+        // set moved and rescan — otherwise the session never advertises.
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scans_clone = Arc::clone(&scans);
+        let engine = script(move |args| match args.first().copied().unwrap_or("") {
+            "rev-parse" => {
+                if scans_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                    Err("not a git repository".to_string())
+                } else {
+                    ok("/repo\n")
+                }
+            }
+            "status" => ok(" M f.rs\0"),
+            "diff" if args.contains(&"--numstat") => ok("1\t1\tf.rs\n"),
+            "diff" => ok("+x\n"),
+            _ => ok(""),
+        });
+        assert!(
+            engine
+                .catalogue("s-1", vec![PathBuf::from("/plain")])
+                .is_none()
+        );
+        let entry = engine
+            .catalogue("s-1", vec![PathBuf::from("/repo")])
+            .expect("the repo appears on the moved directory set");
+        assert_eq!(entry.uri_template, uri("s-1"));
+        assert_eq!(engine.state("s-1", KEY).unwrap().files.len(), 1);
     }
 
     #[test]
