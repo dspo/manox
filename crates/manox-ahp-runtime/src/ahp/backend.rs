@@ -345,12 +345,16 @@ impl RuntimeBackend {
         Some(seeded)
     }
 
-    /// Start the live bridge for `session_id` (idempotent).
+    /// Start the live bridge for `session_id` (idempotent; restarts a bridge
+    /// that already exited).
     fn ensure_bridge(&self, session_id: &str) {
         let mut bridges = self.bridges.lock();
-        if bridges.contains_key(session_id) {
+        if let Some(task) = bridges.get(session_id)
+            && !task.is_finished()
+        {
             return;
         }
+        bridges.remove(session_id);
         let Some(thread) = self.server.journal_feed(session_id) else {
             // A cold session (no live engine) has no feed to bridge; its state
             // still answers from the journal, and a submit materializes the
