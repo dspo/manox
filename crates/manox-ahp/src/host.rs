@@ -124,6 +124,14 @@ impl Host {
         });
 
         let inner = self.inner.clone();
+        // The read pump is one task per connection and handles messages
+        // strictly in arrival order: requests and dispatchAction
+        // notifications share that serial chain by design — it is what keeps
+        // state actions ordered. The invariant this imposes on `router`
+        // handlers: every await must be deadline-bounded (the mcp proxy's 30s
+        // and the client-answer 300s are the precedents), because one
+        // unbounded handler freezes every later message on the connection —
+        // a turn-cancel dispatch included, with no trace.
         tokio::spawn(async move {
             loop {
                 match source.recv().await {

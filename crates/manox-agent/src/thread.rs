@@ -1408,6 +1408,12 @@ impl Thread {
     /// member's own `cancel` recurses into its derivatives. Natural turn
     /// settle never reaches this path, so background work survives turns.
     pub fn cancel(&mut self) {
+        tracing::info!(
+            thread = %self.id.0,
+            running = self.running,
+            has_engine = self.engine.is_some(),
+            "cancel: thread facade aborting the engine and spawned members"
+        );
         if let Some(engine) = &self.engine {
             engine.abort();
             engine.abort_spawned_members();

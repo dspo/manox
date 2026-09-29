@@ -2919,6 +2919,11 @@ where
             }
             maybe_cmd = cmd_rx.recv() => match maybe_cmd {
                 Some(SessionCmd::Abort) => {
+                    tracing::info!(
+                        session = ?session_path,
+                        pending_questions = state.question_gate.pending_entries().len(),
+                        "abort: engine received the turn-cancel command mid-run"
+                    );
                     abort_requested = true;
                     handle.abort();
                 }
@@ -4380,6 +4385,14 @@ async fn run_actor(
                 session.handle().cancel_steer(&id);
             }
             SessionCmd::Abort => {
+                // No run is in flight: the cancel arrived between turns. The
+                // line is the #88 bisect marker — an absence here while the
+                // client logged the dispatch means the command never left the
+                // pump above.
+                tracing::info!(
+                    pending_questions = state.question_gate.pending_entries().len(),
+                    "abort: engine received the turn-cancel command while idle"
+                );
                 session.abort();
             }
             SessionCmd::SetModel(new_model) => {
