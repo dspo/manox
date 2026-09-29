@@ -12,6 +12,7 @@
 //! `subscribe` (see `ext::actions`).
 
 pub mod chat;
+pub mod mcp;
 pub mod root;
 pub mod session;
 pub mod terminal;
@@ -36,6 +37,10 @@ pub enum Channel {
     Chat(String),
     /// `ahp-terminal:/<id>` — one terminal.
     Terminal(String),
+    /// `mcp://<server-key>` — the MCP side-channel of one registry server.
+    /// Not state-bearing: its traffic is raw MCP JSON-RPC forwarded to the
+    /// upstream server, not AHP reducer state.
+    Mcp(String),
     /// `x-manox-*` extension channel, carried verbatim.
     Extension(String),
 }
@@ -48,14 +53,16 @@ impl Channel {
             Self::Session(id) => session::uri(id),
             Self::Chat(id) => chat::uri(id),
             Self::Terminal(id) => terminal::uri(id),
+            Self::Mcp(key) => format!("mcp://{key}"),
             Self::Extension(uri) => uri.clone(),
         }
     }
 
     /// Whether the channel carries state, i.e. whether `subscribe` answers with
-    /// a snapshot. Extension channels are stateless topics.
+    /// a snapshot. Extension channels and the MCP side-channel are not
+    /// reducer-state channels — the side-channel is a request/response proxy.
     pub fn is_state_bearing(&self) -> bool {
-        !matches!(self, Self::Extension(_))
+        !matches!(self, Self::Extension(_) | Self::Mcp(_))
     }
 }
 
@@ -73,6 +80,9 @@ pub fn parse(uri: &str) -> Option<Channel> {
     }
     if let Some(id) = terminal::id(uri) {
         return Some(Channel::Terminal(id.to_string()));
+    }
+    if let Some(key) = mcp::server(uri) {
+        return Some(Channel::Mcp(key.to_string()));
     }
     if ext::channels::ALL
         .iter()
@@ -139,6 +149,9 @@ impl ChannelStore {
                 .terminals
                 .get(id)
                 .map(|state| SnapshotState::Terminal(Box::new(state.clone()))),
+            // The MCP side-channel is a request/response proxy, not
+            // reducer state: nothing to snapshot, nothing to subscribe to.
+            Channel::Mcp(_) => None,
             Channel::Extension(_) => None,
         }
     }
@@ -174,6 +187,9 @@ impl ChannelStore {
                     crate::ext::ExtOutcome::Unrecognised => ReduceOutcome::NoOp,
                 }
             }
+            // No reducer state lives on the side-channel; an action routed
+            // there is a routing bug and must not be folded silently.
+            Channel::Mcp(_) => ReduceOutcome::OutOfScope,
         };
         if let Channel::Session(id) = channel {
             self.reindex_chats(id);
@@ -278,6 +294,13 @@ pub fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mcp_side_channel_parses_and_is_not_state_bearing() {
+        assert_eq!(parse("mcp://github"), Some(Channel::Mcp("github".into())));
+        assert!(!Channel::Mcp("github".into()).is_state_bearing());
+        assert_eq!(parse("mcp://"), None);
+    }
 
     #[test]
     fn parses_every_declared_scheme() {

@@ -142,6 +142,10 @@ pub async fn session_state(thread_id: &str) -> Option<SessionState> {
                     .collect(),
             );
         }
+        let server_tools = mcp::server_tools();
+        if !server_tools.is_empty() {
+            state.server_tools = Some(server_tools);
+        }
     }
 
     // Fold every member journal; the session-channel actions are the part

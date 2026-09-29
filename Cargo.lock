@@ -2497,6 +2497,7 @@ dependencies = [
  "manox-journal",
  "manox-terminal",
  "parking_lot",
+ "rmcp",
  "serde",
  "serde_json",
  "tokio",

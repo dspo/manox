@@ -86,7 +86,31 @@ struct ServerSlot {
     generation: u64,
 }
 
+/// A ready slot's identity for drift checks: the tool *names* plus the slot
+/// generation (a restart with an unchanged list still bumps it, so stale
+/// adapters holding the cancelled client are caught). The rebuild path
+/// fetches the tool bodies and clients separately via `servers()`.
+#[derive(Debug, Clone)]
+pub struct SlotOverview {
+    pub name: String,
+    pub generation: u64,
+    pub tool_names: Vec<String>,
+}
+
 impl ServerSlot {
+    fn overview(&self) -> Option<SlotOverview> {
+        self.client.as_ref()?;
+        Some(SlotOverview {
+            name: self.name.clone(),
+            generation: self.generation,
+            tool_names: self
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect(),
+        })
+    }
+
     fn view(&self) -> SlotView {
         SlotView {
             name: self.name.clone(),
@@ -129,6 +153,28 @@ impl McpRegistry {
         self.slots.read().iter().map(ServerSlot::view).collect()
     }
 
+    /// Cheap per-ready-slot overview: names and client identity without the
+    /// (schema-heavy) tool bodies — the drift pre-check a per-prompt refresh
+    /// pays for, instead of deep-cloning every tool list.
+    pub fn ready_overview(&self) -> Vec<SlotOverview> {
+        self.slots
+            .read()
+            .iter()
+            .filter_map(ServerSlot::overview)
+            .collect()
+    }
+
+    /// The highest slot generation alive — bumps on every start/stop, so a
+    /// restart with an unchanged tool list still reads as drift.
+    pub fn max_generation(&self) -> u64 {
+        self.slots
+            .read()
+            .iter()
+            .map(|slot| slot.generation)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// One server's lifecycle view, by config key.
     pub fn slot(&self, name: &str) -> Option<SlotView> {
         self.slots
@@ -148,6 +194,25 @@ impl McpRegistry {
             .iter()
             .find(|slot| slot.name == name)
             .map(|slot| slot.config.clone())
+    }
+
+    /// Create a fresh `Stopped` slot for a server that has none — the
+    /// enable path for a server the startup filter dropped. A duplicate
+    /// insert is a no-op: the existing slot's config and lifecycle win.
+    fn insert_slot(&self, name: &str, source_uri: String, config: McpServerConfig) {
+        let mut slots = self.slots.write();
+        if slots.iter().any(|slot| slot.name == name) {
+            return;
+        }
+        slots.push(ServerSlot {
+            name: name.to_string(),
+            source_uri,
+            config,
+            state: ServerState::Stopped,
+            client: None,
+            tools: Vec::new(),
+            generation: 0,
+        });
     }
 
     /// Begin a start: refuse unknown names synchronously, cancel any live
@@ -503,6 +568,20 @@ pub fn start(name: &str) -> Result<(), String> {
     let Some(registry) = try_global() else {
         return Err("MCP registry is not initialized".to_string());
     };
+    // A server the startup filter dropped (settings-disabled) has no slot;
+    // its config still lives in the merged layers, and enabling it creates
+    // the slot here.
+    if registry.slot(name).is_none() {
+        let resolved = resolved_config(
+            config::load_global(),
+            crate::paths::manox_config_dir().ok().as_deref(),
+            &[],
+        );
+        let Some((config, source_uri)) = resolved.get(name) else {
+            return Err(format!("unknown MCP server: {name}"));
+        };
+        registry.insert_slot(name, source_uri.clone(), config.clone());
+    }
     let Some(config) = registry.config_of(name) else {
         return Err(format!("unknown MCP server: {name}"));
     };

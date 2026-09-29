@@ -10,6 +10,9 @@ manox-harness.workspace = true
 manox-ahp.workspace = true
 manox-journal.workspace = true
 manox-terminal = { workspace = true, optional = true }
+# The mcp:// side-channel proxy: typed `Peer<RoleClient>` calls plus the
+# model types the wire round-trips. Only the client face is linked.
+rmcp = { workspace = true, optional = true, features = ["client"] }
 ahp.workspace = true
 ahp-types.workspace = true
 serde.workspace = true
@@ -34,7 +37,7 @@ terminal = ["dep:manox-terminal"]
 # lifecycle transitions republish as `session/mcpServerStateChanged`. Lean
 # embedders opt out; sessions then carry no customizations and the start/stop
 # actions are refused.
-mcp = ["manox-agent/mcp"]
+mcp = ["manox-agent/mcp", "dep:rmcp"]
 # The loopback gateway's `/ahp` route. Off by default so a headless embedder
 # does not link the HTTP stack it never serves.
 ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]

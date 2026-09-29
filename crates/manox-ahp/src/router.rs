@@ -63,6 +63,18 @@ async fn dispatch_request(
     request: &JsonRpcRequest,
 ) -> Result<Value, HostError> {
     let params = request.params.clone().unwrap_or(Value::Null);
+    // The mcp:// side-channel speaks MCP verbatim: the JSON-RPC method *is*
+    // the upstream MCP method, routed by the `channel` param rather than the
+    // command table. Intercepted ahead of the table lookup — none of these
+    // methods are AHP commands.
+    let mcp_channel = params
+        .get("channel")
+        .and_then(Value::as_str)
+        .filter(|uri| crate::channels::mcp::server(uri).is_some())
+        .map(str::to_string);
+    if let Some(channel) = mcp_channel {
+        return mcp_channel_request(inner, &channel, &request.method, params).await;
+    }
     // The declared surface is the gate: an unknown *or* a declined method is
     // answered `MethodNotFound`, which tells a client the capability is absent
     // rather than empty.
@@ -188,6 +200,17 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
                 return;
             }
         }
+        // No reducer state on the side-channel; an *action* dispatched to it
+        // has no runtime intent and is refused rather than echoed.
+        Channel::Mcp(_) => {
+            inner.reject(
+                uri,
+                params.action,
+                Some(origin),
+                "the mcp:// channel carries requests, not actions".to_string(),
+            );
+            return;
+        }
         Channel::Root | Channel::Extension(_) => {}
     }
 
@@ -297,6 +320,11 @@ fn subscribe_uri(
             inner.ensure_chat(id)?;
         }
         Channel::Terminal(id) => inner.ensure_terminal(id)?,
+        // The side-channel is not subscribable — a client's MCP surface is
+        // the customization's `channel` field, and its traffic is
+        // request/response. A subscribe lands as `NotFound`, the same answer
+        // the snapshot leg would give.
+        Channel::Mcp(_) => return Err(HostError::NotFound(uri.to_string())),
         Channel::Extension(_) => {}
     }
     conn.subscribe(uri);
@@ -416,6 +444,25 @@ fn list_sessions(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> 
         None
     };
     to_value(ListSessionsResult { items, next_cursor })
+}
+
+/// The `mcp://` side-channel: forward one MCP request to the runtime's
+/// proxy. The capability gate lives here because the refusal is a wire-level
+/// promise — anything outside the advertised families answers
+/// `MethodNotFound` without reaching the runtime.
+async fn mcp_channel_request(
+    inner: &Arc<Inner>,
+    channel: &str,
+    method: &str,
+    mut params: Value,
+) -> Result<Value, HostError> {
+    if !crate::channels::mcp::serves(method) {
+        return Err(HostError::MethodNotFound(format!(
+            "{method} is not in the served mcp:// capability set (tools/*, resources/*)"
+        )));
+    }
+    crate::channels::mcp::upstream_params(&mut params);
+    inner.backend.mcp_channel_request(channel, method, &params)
 }
 
 async fn create_session(

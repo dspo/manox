@@ -305,6 +305,22 @@ pub trait SessionRuntime: Send + Sync + 'static {
             "MCP stop is not supported by this runtime",
         ))
     }
+
+    /// Apply a client's enablement decision for one MCP server: persist it
+    /// to settings and drive the live registry (disable = stop, enable =
+    /// start, creating the slot from the merged config when the server was
+    /// filtered out at startup). The default is a refusal — a runtime
+    /// without the MCP plane has nothing to enable.
+    fn mcp_set_enabled(
+        &self,
+        _session_id: &str,
+        _id: &str,
+        _enabled: bool,
+    ) -> Result<(), RuntimeError> {
+        Err(RuntimeError::new(
+            "MCP enablement is not supported by this runtime",
+        ))
+    }
 }
 
 /// What a rename did.

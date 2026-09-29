@@ -297,7 +297,8 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### 附.1 显式不做（本期范围外）
 
-- AHP 的 changesets / annotations / comments（上游仍是空文件）/ automations / OTLP telemetry / `mcp://` channel / customizations(Open Plugins) / `MultiHostClient` / `protectedResources`+OAuth：不实现、不 advertise。changeset 的 diff-review 能力列入 W5 之后的候选（配合 git 面板再议）。
+- AHP 的 annotations / comments（上游仍是空文件）/ automations / OTLP telemetry / customizations(Open Plugins) / `MultiHostClient` / `protectedResources`+OAuth：不实现、不 advertise。
+- 已实现（本表原列"不做"，随实现更新）：`mcp://` channel（tools/*、resources/* 代理，见 `manox-ahp/src/channels/mcp.rs`）；changeset 频道的 `uncommitted` 静态视图 + revert + review（见 `manox-ahp-runtime/src/ahp/changeset.rs`）；customization 的 enablement toggle（写入 settings，其余 customization 变更仍 refusal）。changeset 的 turn/branch 切片仍不做（需 journal 文件写埋点）。
 - 除 VS Code / AHPX 之外客户端兼容性承诺；x-manox 扩展不承诺第三方 host 支持。
 - 多窗口（保持当前单窗口约束）。
 - **不做 v2→v3 兼容层、不写 `legacy_*`/双协议窗口、不做 fallback 兼容读**（激进开发纪律；剪切靠 rev 锁定完成）。

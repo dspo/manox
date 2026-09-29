@@ -417,4 +417,48 @@ impl SessionRuntime for GatewayRuntime {
             Err(RuntimeError::new("MCP support is not built into this host"))
         }
     }
+
+    fn mcp_set_enabled(
+        &self,
+        _session_id: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), RuntimeError> {
+        #[cfg(feature = "mcp")]
+        {
+            // Validate the id against the MCP face *before* touching the
+            // settings file: a refusal must not leave a phantom name in
+            // `[mcp] disabled` that would silently disable a future server.
+            // A real server whose live start then fails keeps its decision —
+            // a failed start is a visible Error slot the client can retry,
+            // not a silently reverted toggle.
+            let known = manox_agent::mcp::try_global()
+                .is_some_and(|registry| registry.slot(id).is_some())
+                || manox_agent::mcp::load_merged_config()
+                    .mcp_servers
+                    .contains_key(id);
+            if !known {
+                return Err(RuntimeError::new(format!("unknown MCP server: {id}")));
+            }
+            manox_agent::settings::modify_mcp_disabled(|mut disabled| {
+                if enabled {
+                    disabled.retain(|name| name != id);
+                } else if !disabled.iter().any(|name| name == id) {
+                    disabled.push(id.to_string());
+                }
+                disabled
+            })
+            .map_err(|e| RuntimeError::new(format!("persisting MCP enablement: {e:#}")))?;
+            if enabled {
+                manox_agent::mcp::start(id).map_err(RuntimeError::new)
+            } else {
+                manox_agent::mcp::stop(id).map_err(RuntimeError::new)
+            }
+        }
+        #[cfg(not(feature = "mcp"))]
+        {
+            let _ = (id, enabled);
+            Err(RuntimeError::new("MCP support is not built into this host"))
+        }
+    }
 }
