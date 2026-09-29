@@ -112,7 +112,7 @@ async fn main() {
             content: vec![ContentBlock::ToolUse {
                 id: "t1".into(),
                 name: "Read".into(),
-                input: serde_json::json!({ "path": "x".repeat(500) }),
+                input: serde_json::json!({ "path": "x".repeat(500), "cwd": [""] }),
                 thought_signature: None,
             }],
             model: "mock".into(),

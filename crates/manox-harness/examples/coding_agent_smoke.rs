@@ -53,7 +53,7 @@ impl StreamFn for FakeProvider {
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "Read".into(),
-                    input: serde_json::json!({ "path": "README.md" }),
+                    input: serde_json::json!({ "path": "README.md", "cwd": [""] }),
                     thought_signature: None,
                 }],
                 StopReason::ToolUse,

@@ -57,7 +57,7 @@ impl StreamFn for ToolLoopMock {
                 vec![ContentBlock::ToolUse {
                     id: "t1".into(),
                     name: "Read".into(),
-                    input: serde_json::json!({ "path": self.file_path }),
+                    input: serde_json::json!({ "path": self.file_path, "cwd": [""] }),
                     thought_signature: None,
                 }],
                 Some(StopReason::ToolUse),
