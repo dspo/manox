@@ -4804,7 +4804,7 @@ async fn run_actor(
     let _ = session.close().await;
     // Thread-lifetime cleanup: cancel (SessionEnded) every task this thread
     // owns — including in-flight asynchronously-dispatched Sailors — then
-    // release the legacy registry entries + mailbox. `cleanup_thread` alone
+    // release the task center's registry entries. `cleanup_thread` alone
     // only `retain`s (drops entries without cancelling tokens); the cancel
     // must run first or a deleted thread's Sailors become unfindable zombies
     // still burning tokens.

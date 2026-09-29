@@ -482,31 +482,29 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
     })
 }
 
-/// Allocate a unique id for the given kind.
-fn next_id(kind: &TaskKind) -> TaskId {
+/// Allocate a unique id for a directly-registered task. Direct registration
+/// is subagent-only (pi-path tasks enter through `register_with_id` under
+/// their harness-issued ids), so the prefix namespace never overlaps the
+/// harness registries' `mon_`/`bg_`/`ws_`.
+fn next_id() -> TaskId {
     let mut reg = registry().lock().expect("registry poisoned");
     let n = reg.next_id;
     reg.next_id += 1;
-    let prefix = match kind {
-        TaskKind::MonitorCommand => "monitor",
-        TaskKind::MonitorWebSocket => "ws",
-        TaskKind::BackgroundBash => "bash",
-        TaskKind::Subagent => "subagent",
-    };
-    TaskId::new(prefix, n)
+    TaskId::new("subagent", n)
 }
 
-/// Register a new background task and return its id and handle.
+/// Register an asynchronously-dispatched subagent and return its id and
+/// handle. Subagents are the only directly-registered tasks; every pi-path
+/// producer enters through `register_with_id` instead.
 pub fn register(
-    kind: TaskKind,
     owner_thread_id: String,
     description: String,
     cancel: CancellationToken,
 ) -> (TaskId, Arc<BackgroundTask>) {
     gc();
-    let id = next_id(&kind);
+    let id = next_id();
     let task = Arc::new(BackgroundTask::new(
-        kind,
+        TaskKind::Subagent,
         owner_thread_id,
         description,
         cancel,
@@ -727,13 +725,8 @@ mod tests {
     #[test]
     fn register_and_get() {
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-register".into(),
-            "watch build".into(),
-            cancel,
-        );
-        assert!(id.0.starts_with("monitor_"));
+        let (id, task) = register("thread-register".into(), "watch build".into(), cancel);
+        assert!(id.0.starts_with("subagent_"));
         assert_eq!(task.status(), TaskStatus::Running);
         assert_eq!(task.snapshot(&id).event_count, 0);
         let found = get_by_str(&id.0).expect("should find task");
@@ -744,12 +737,7 @@ mod tests {
     #[tokio::test]
     async fn stop_and_terminal() {
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-1".into(),
-            "test".into(),
-            cancel,
-        );
+        let (id, task) = register("thread-1".into(), "test".into(), cancel);
         assert_eq!(task.status(), TaskStatus::Running);
         stop(&id.0).await.expect("stop should succeed");
         assert!(task.status().is_terminal());
@@ -769,12 +757,7 @@ mod tests {
     #[test]
     fn push_event_updates_count() {
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-1".into(),
-            "test".into(),
-            cancel,
-        );
+        let (id, task) = register("thread-1".into(), "test".into(), cancel);
         task.push_event(&id, "hello".into());
         let snap = task.snapshot(&id);
         assert_eq!(snap.event_count, 1);
@@ -785,12 +768,7 @@ mod tests {
     #[test]
     fn oversized_single_event_does_not_break_task_ring_byte_cap() {
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-oversized".into(),
-            "oversized event".into(),
-            cancel,
-        );
+        let (id, task) = register("thread-oversized".into(), "oversized event".into(), cancel);
         task.push_event(&id, "x".repeat(MAX_BUFFER_BYTES + 1));
         let snap = task.snapshot(&id);
         assert!(snap.total_bytes >= MAX_BUFFER_BYTES as u64);
@@ -801,12 +779,7 @@ mod tests {
     #[test]
     fn set_terminal_is_idempotent() {
         let cancel = CancellationToken::new();
-        let (_id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-1".into(),
-            "test".into(),
-            cancel,
-        );
+        let (_id, task) = register("thread-1".into(), "test".into(), cancel);
         task.set_terminal_status(TaskStatus::Completed);
         assert_eq!(task.status(), TaskStatus::Completed);
         task.set_terminal_status(TaskStatus::Failed);
@@ -816,12 +789,7 @@ mod tests {
     #[test]
     fn ring_buffer_evicts_oldest_not_all() {
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::MonitorCommand,
-            "thread-1".into(),
-            "test".into(),
-            cancel,
-        );
+        let (id, task) = register("thread-1".into(), "test".into(), cancel);
         let big = "X".repeat(200 * 1024);
         task.push_event(&id, big.clone());
         task.push_event(&id, big.clone());
@@ -961,12 +929,7 @@ mod tests {
     async fn cancel_all_for_thread_cancels_owned_tasks() {
         use tokio_util::sync::CancellationToken;
         let cancel = CancellationToken::new();
-        let (_id, task) = register(
-            TaskKind::Subagent,
-            "t-x1".into(),
-            "test".into(),
-            cancel.clone(),
-        );
+        let (_id, task) = register("t-x1".into(), "test".into(), cancel.clone());
         assert!(!cancel.is_cancelled(), "pre: token not yet cancelled");
         cancel_all_for_thread("t-x1").await;
         assert!(cancel.is_cancelled(), "owned task's token was cancelled");
@@ -974,12 +937,7 @@ mod tests {
 
         // A different thread's task is not affected.
         let other = CancellationToken::new();
-        let (_id2, _task2) = register(
-            TaskKind::Subagent,
-            "t-other".into(),
-            "other".into(),
-            other.clone(),
-        );
+        let (_id2, _task2) = register("t-other".into(), "other".into(), other.clone());
         cancel_all_for_thread("t-x1").await; // already terminal — no-op
         assert!(!other.is_cancelled(), "other thread's task untouched");
     }
@@ -992,12 +950,7 @@ mod tests {
         use tokio_util::sync::CancellationToken;
         let thread_id = "t-stop-1";
         let cancel = CancellationToken::new();
-        let (id, task) = register(
-            TaskKind::Subagent,
-            thread_id.into(),
-            "test".into(),
-            cancel.clone(),
-        );
+        let (id, task) = register(thread_id.into(), "test".into(), cancel.clone());
         assert!(!cancel.is_cancelled(), "pre: token not yet cancelled");
         stop_all_for_thread(thread_id).await;
         assert!(cancel.is_cancelled(), "owned task's token was cancelled");
@@ -1007,12 +960,7 @@ mod tests {
 
         // A different thread's task is not affected.
         let other = CancellationToken::new();
-        let (_id2, task2) = register(
-            TaskKind::Subagent,
-            "t-stop-other".into(),
-            "other".into(),
-            other.clone(),
-        );
+        let (_id2, task2) = register("t-stop-other".into(), "other".into(), other.clone());
         stop_all_for_thread(thread_id).await; // already terminal — no-op
         assert!(!other.is_cancelled(), "other thread's task untouched");
         assert_eq!(task2.status(), TaskStatus::Running);
