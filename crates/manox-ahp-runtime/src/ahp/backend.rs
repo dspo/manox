@@ -359,6 +359,7 @@ impl RuntimeBackend {
             // A cold session (no live engine) has no feed to bridge; its state
             // still answers from the journal, and a submit materializes the
             // engine, which re-runs this path.
+            tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
             return;
         };
         let Some(host) = self.host() else {
@@ -367,6 +368,7 @@ impl RuntimeBackend {
         let Some(backend) = self.me() else {
             return;
         };
+        tracing::info!(session = %session_id, "bridge: starting");
         let id = session_id.to_string();
         let task = manox_agent::runtime::handle().spawn(async move {
             backend.bridge(host, thread, id).await;
@@ -394,9 +396,19 @@ impl RuntimeBackend {
             .get(&session_id)
             .map(|seeded| seeded.tail)
             .unwrap_or_default();
+        let mut first_event = true;
+        tracing::info!(session = %session_id, tail, "bridge: subscribed to the journal feed");
         loop {
             match feed.recv().await {
                 Ok(manox_agent::engine::JournalFeed::Event(event)) => {
+                    if first_event {
+                        first_event = false;
+                        tracing::info!(
+                            session = %session_id,
+                            seq = event.seq,
+                            "bridge: first journal event"
+                        );
+                    }
                     if event.seq <= tail {
                         continue;
                     }
@@ -521,7 +533,14 @@ impl RuntimeBackend {
                         // authority (a fresh subscriber's snapshot recomputes it).
                     }
                 }
-                Err(_) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        session = %session_id,
+                        %error,
+                        "bridge: journal feed closed, exiting"
+                    );
+                    break;
+                }
             }
         }
     }
