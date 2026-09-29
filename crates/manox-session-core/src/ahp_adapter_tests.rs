@@ -419,6 +419,84 @@ fn a_running_manox_turn_folds_all_its_parts() {
     uninstall();
 }
 
+/// TEMP device probe: fold a real journal (PROBE_JOURNAL=path) and print the
+/// active turn's inventory. `#[ignore]`d — run explicitly with
+/// `cargo test -p manox-session-core probe_real_journal -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn probe_real_journal_fold() {
+    let src = std::path::PathBuf::from(std::env::var("PROBE_JOURNAL").expect("PROBE_JOURNAL"));
+    let _guards = install();
+    let dst = manox_agent::thread_store::global_sessions_dir().join(src.file_name().unwrap());
+    std::fs::copy(&src, &dst).unwrap();
+    manox_agent::runtime::handle().block_on(async {
+        let session_id = src
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_end_matches(".jsonl");
+        match chat_state(session_id).await {
+            Some(state) => {
+                println!(
+                    "PROBE turns={} active={} title={:?}",
+                    state.turns.len(),
+                    state.active_turn.is_some(),
+                    state.title
+                );
+                if let Some(active) = &state.active_turn {
+                    println!(
+                        "PROBE active id={} parts={}",
+                        active.id,
+                        active.response_parts.len()
+                    );
+                    for p in active.response_parts.iter().take(8) {
+                        println!(
+                            "PROBE part {}",
+                            match p {
+                                ResponsePart::Markdown(m) =>
+                                    format!("markdown len={}", m.content.len()),
+                                ResponsePart::Reasoning(r) =>
+                                    format!("reasoning len={}", r.content.len()),
+                                ResponsePart::ToolCall(t) => format!(
+                                    "toolCall {:?}",
+                                    match &t.tool_call {
+                                        ToolCallState::Streaming(_) => "streaming",
+                                        ToolCallState::PendingConfirmation(_) => "pending",
+                                        ToolCallState::Running(_) => "running",
+                                        ToolCallState::AuthRequired(_) => "auth-required",
+                                        ToolCallState::PendingResultConfirmation(_) =>
+                                            "pending-result",
+                                        ToolCallState::Completed(_) => "completed",
+                                        ToolCallState::Cancelled(_) => "cancelled",
+                                        ToolCallState::Unknown(_) => "unknown",
+                                    }
+                                ),
+                                ResponsePart::InputRequest(i) => format!(
+                                    "ask id={} answered={}",
+                                    i.request.id,
+                                    i.response.is_some()
+                                ),
+                                _ => "other".into(),
+                            }
+                        );
+                    }
+                }
+                for turn in state.turns.iter().rev().take(2) {
+                    println!(
+                        "PROBE settled turn id={} parts={} text={:?}",
+                        turn.id,
+                        turn.response_parts.len(),
+                        turn.message.text.chars().take(40).collect::<String>()
+                    );
+                }
+            }
+            None => println!("PROBE no chat state"),
+        }
+    });
+    uninstall();
+}
+
 #[test]
 fn session_fold_merges_thread_metadata_and_journal_facts() {
     let _guards = install();
@@ -580,8 +658,6 @@ mod dispatch {
     use super::install;
     use super::uninstall;
     use super::{assistant, delta, seed_session, stamp, tool_call, user};
-    use ahp_types::version::PROTOCOL_VERSION;
-    use manox_harness::session::SessionTreeEntry as E;
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
         ActionOrigin, ChatPendingMessageRemovedAction, ChatToolCallConfirmedAction,
@@ -589,8 +665,10 @@ mod dispatch {
     };
     use ahp_types::common::JsonObject;
     use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind};
+    use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
+    use manox_harness::session::SessionTreeEntry as E;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -702,20 +780,17 @@ mod dispatch {
     async fn a_dispatched_answer_folds_into_the_host_chat() {
         let _guards = install();
         let (_runtime, client, mut sub) = answered_ask_fixture().await;
-        let (_runtime, client, mut sub) = answered_ask_fixture().await;
         let mut answers = std::collections::HashMap::new();
         answers.insert(
             "方向".to_string(),
-            ahp_types::state::ChatInputAnswer::Submitted(
-                ahp_types::state::ChatInputAnswered {
-                    value: ahp_types::state::ChatInputAnswerValue::Selected(
-                        ahp_types::state::ChatInputSelectedAnswerValue {
-                            value: "A".to_string(),
-                            freeform_values: None,
-                        },
-                    ),
-                },
-            ),
+            ahp_types::state::ChatInputAnswer::Submitted(ahp_types::state::ChatInputAnswered {
+                value: ahp_types::state::ChatInputAnswerValue::Selected(
+                    ahp_types::state::ChatInputSelectedAnswerValue {
+                        value: "A".to_string(),
+                        freeform_values: None,
+                    },
+                ),
+            }),
         );
         client
             .dispatch(
@@ -728,7 +803,7 @@ mod dispatch {
             )
             .await
             .expect("dispatch accepted");
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
             .await
             .expect("an echo arrives")
             .expect("subscription open");

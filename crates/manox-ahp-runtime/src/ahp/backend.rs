@@ -376,6 +376,18 @@ impl RuntimeBackend {
         bridges.insert(session_id.to_string(), task);
     }
 
+    /// Abort and restart the bridge unconditionally: the engine
+    /// materialization swaps the journal broadcast channel, so a bridge that
+    /// subscribed earlier hangs on a channel nobody sends to anymore — alive
+    /// but deaf, which the finished-task check in [`Self::ensure_bridge`]
+    /// cannot see.
+    fn force_bridge_restart(&self, session_id: &str) {
+        if let Some(task) = self.bridges.lock().remove(session_id) {
+            task.abort();
+        }
+        self.ensure_bridge(session_id);
+    }
+
     /// Forward journal feed events into the host, from the seeded tail onward.
     ///
     /// A lagged feed (the kernel's bounded window) is a resync: re-fold, re-seed
@@ -1345,13 +1357,17 @@ impl Backend for RuntimeBackend {
                         if let Some(host) = self.host() {
                             host.publish(channel, action.clone(), None);
                         }
-                        // A submit materializes the engine, so a session that was
-                        // cold when the client subscribed has no bridge yet: the
-                        // first `seeded` ran before the engine existed and its
-                        // `ensure_bridge` bailed. Re-seed (cached) and start the
-                        // bridge now that the engine is live.
-                        let _ = block_on(self.seeded(&session_id));
-                        self.ensure_bridge(&session_id);
+                        // A submit materializes the engine — and the
+                        // materialized engine carries a NEW journal broadcast
+                        // channel, while the bridge (spawned at create time,
+                        // possibly subscribed to the pre-engine channel) hangs
+                        // on the old one: alive but deaf. Every journal event
+                        // after that never reaches the host and the turn runs
+                        // invisible. Restart the bridge so it subscribes to
+                        // the live channel; it resumes from the seeded tail,
+                        // replaying what was missed into the client's own
+                        // active turn.
+                        self.force_bridge_restart(&session_id);
                         DispatchOutcome::Accepted
                     }
                     Err(error) => DispatchOutcome::Rejected(error.message),
