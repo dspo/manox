@@ -842,7 +842,7 @@ impl RuntimeBackend {
         };
         let approved = map_answers(&completed.answers)
             .iter()
-            .any(|a| a.selected.iter().any(|s| s == "approve"));
+            .any(|a| a.selected.iter().any(|s| s.eq_ignore_ascii_case("approve")));
         if !approved {
             return DispatchOutcome::Accepted;
         }
@@ -2220,7 +2220,7 @@ mod answer_mapping_tests {
         assert!(
             mapped
                 .iter()
-                .any(|a| a.selected.iter().any(|s| s == "approve")),
+                .any(|a| a.selected.iter().any(|s| s.eq_ignore_ascii_case("approve"))),
             "the runtime's approve test must match what the card offers: {mapped:?}"
         );
     }
