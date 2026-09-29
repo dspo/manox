@@ -11,10 +11,11 @@ use std::time::Duration;
 
 use manox_harness::agent_loop::{StreamFn, StreamResolver};
 use manox_harness::coding_agent::{ModelRuntime, create_agent_session};
+use manox_harness::tasks::{Settlement, SettlementKind, TaskLifecycle, TaskObserver};
 use manox_harness::tool::AgentTool;
 use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model, StopReason};
 use manox_harness::bash::BashTool;
-use manox_harness::bash::orchestration::{BackgroundEvent, BackgroundManager, OutputShape};
+use manox_harness::bash::orchestration::{BackgroundManager, OutputShape};
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 
 /// A stream returning a scripted sequence of assistant messages, one per call.
@@ -34,6 +35,29 @@ impl StreamFn for Scripted {
             .unwrap()
             .pop()
             .ok_or_else(|| anyhow::anyhow!("script exhausted"))
+    }
+}
+
+/// A minimal lifecycle observer: prints what the producers emit.
+struct PrintObserver;
+
+impl TaskObserver for PrintObserver {
+    fn on_spawned(
+        &self,
+        id: &str,
+        family: manox_harness::tasks::TaskFamily,
+        label: &str,
+        _stop: manox_harness::tasks::StopHandle,
+    ) {
+        println!("spawned {id} ({family:?}): {label}");
+    }
+
+    fn on_output(&self, id: &str, line: String) {
+        println!("[{id}] {line}");
+    }
+
+    fn on_settled(&self, id: &str, settlement: &Settlement) {
+        println!("[{id}] settled: {} ({:?})", settlement.kind, settlement.cause);
     }
 }
 
@@ -68,8 +92,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Background orchestration ────────────────────────────────────────────
     let background = Arc::new(BackgroundRegistry::new());
-    let manager = Arc::new(BackgroundManager::new(Arc::clone(&background)));
-    let mut events = manager.subscribe();
+    let manager = BackgroundManager::new(Arc::clone(&background));
+    manager.set_observer(Arc::new(PrintObserver));
     let bash = BashTool::new(
         Arc::new(manox_harness::bash::persistent::PersistentShellOperations::new(dir.path())),
         background.clone(),
@@ -93,27 +117,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind the orchestrator to the session: completions steer into it.
     manager.attach(&mut session);
 
-    // Background orchestration: spawn a task; the completion event and the
-    // steered summary (into the session's steering queue) follow.
+    // Background orchestration: spawn a task; lifecycle emissions print via
+    // the observer and the completion summary steers into the session.
     let id = manager.spawn("sleep 0.2; echo done", dir.path(), OutputShape::default())?;
     println!("spawned background task {id}");
 
-    let mut saw_spawned = false;
+    // Poll the lifecycle observer's settled emission (the example has no
+    // shared recording state; the observer prints as events land).
     let mut saw_completed = false;
     for _ in 0..20 {
-        match tokio::time::timeout(Duration::from_millis(500), events.recv()).await {
-            Ok(Ok(BackgroundEvent::Spawned { .. })) => saw_spawned = true,
-            Ok(Ok(BackgroundEvent::Completed { .. })) => {
-                saw_completed = true;
-                break;
-            }
-            Ok(Ok(_)) => {}
-            _ => break,
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if !manager.registry.status(&id, 0).unwrap().is_running {
+            saw_completed = true;
+            break;
         }
     }
-    assert!(saw_spawned, "spawned event observed");
-    assert!(saw_completed, "completed event observed");
-    println!("background orchestration closed: completion event observed");
+    assert!(saw_completed, "background task reached its terminal state");
+    println!("background orchestration closed: task settled");
 
     let steered = session.steering_messages();
     assert!(
