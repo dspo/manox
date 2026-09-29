@@ -478,10 +478,6 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
     for emitted in translator.on_entry("c-1", "s-1", &next) {
         ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
     }
-    println!(
-        "DBG after fold: steering={:?} queued={:?}",
-        state.steering_message, state.queued_messages
-    );
     let queued = state.queued_messages.clone().unwrap_or_default();
     assert!(
         !queued.iter().any(|m| m.id == "steer-1"),
@@ -514,38 +510,6 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
 /// `x-manox-plan` channel, whose payload survives because it is a *declared*
 /// extension action rather than an unknown standard one, and the interactive
 /// half is a real typed `chat/inputRequested` the host folds into the turn.
-#[test]
-fn debug_steer_state_trace() {
-    let mut translator = Translator::new();
-    let mut state = manox_ahp::channels::chat::initial("c-1");
-    for entry in mid_run_steer_journal() {
-        for emitted in translator.on_entry("c-1", "s-1", &entry) {
-            println!(
-                "EMIT {:?} qmid={:?}",
-                std::mem::discriminant(&emitted.action)
-                    == std::mem::discriminant(&ahp_types::actions::StateAction::ChatDelta(
-                        ahp_types::actions::ChatDeltaAction {
-                            turn_id: String::new(),
-                            part_id: String::new(),
-                            content: String::new(),
-                            meta: None
-                        }
-                    )),
-                serde_json::to_string(&emitted.action)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(160)
-                    .collect::<String>()
-            );
-            ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
-            println!(
-                "   steering={:?}",
-                state.steering_message.as_ref().map(|m| m.id.clone())
-            );
-        }
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_plan_proposal_reaches_a_subscribed_client() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);

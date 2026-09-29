@@ -1030,7 +1030,13 @@ impl Translator {
                         message: message.clone(),
                     }),
                 ));
-                self.pending_user.push_back(PendingUser { id, message });
+                // Only a queued submission joins `pending_user`: the steer was
+                // consumed by the turn it interrupted, and enqueueing it would
+                // replay it as a later turn's opening message — retiring the
+                // steering slot the host's removal still has to match.
+                if !steering {
+                    self.pending_user.push_back(PendingUser { id, message });
+                }
             }
             "assistant" => {
                 let text = blocks_text(content);
