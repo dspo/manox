@@ -444,25 +444,6 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(status) => format!("UpdateGoal {status}"),
             None => "UpdateGoal".to_string(),
         },
-        "GoToDefinition" | "FindReferences" | "Hover" => {
-            let line = args.get("line").and_then(|v| v.as_u64());
-            match (arg("path"), line, arg("symbol")) {
-                (Some(path), Some(line), Some(symbol)) => {
-                    format!("{name} {path}:{line} {symbol}")
-                }
-                (Some(path), Some(line), None) => format!("{name} {path}:{line}"),
-                (Some(path), None, _) => format!("{name} {path}"),
-                _ => name.to_string(),
-            }
-        }
-        "DocumentSymbols" | "Diagnostics" => match arg("path") {
-            Some(path) => format!("{name} {path}"),
-            None => name.to_string(),
-        },
-        "WorkspaceSymbols" => match arg("query") {
-            Some(query) => format!("WorkspaceSymbols {query}"),
-            None => "WorkspaceSymbols".to_string(),
-        },
         "WebExploreOpen" | "ChromeUseOpen" => match arg("url").or_else(|| arg("cdp_endpoint")) {
             Some(target) => format!("{name} {target}"),
             None => name.to_string(),
@@ -887,21 +868,6 @@ mod tests {
         assert_eq!(
             tool_title("TaskStop", &json!({"task_id": "mon_2"})),
             "TaskStop mon_2"
-        );
-        assert_eq!(
-            tool_title(
-                "GoToDefinition",
-                &json!({"path": "src/main.rs", "line": 12, "symbol": "run"})
-            ),
-            "GoToDefinition src/main.rs:12 run"
-        );
-        assert_eq!(
-            tool_title("DocumentSymbols", &json!({"path": "src/main.rs"})),
-            "DocumentSymbols src/main.rs"
-        );
-        assert_eq!(
-            tool_title("WorkspaceSymbols", &json!({"query": "tool_title"})),
-            "WorkspaceSymbols tool_title"
         );
     }
 

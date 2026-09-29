@@ -10,8 +10,8 @@
 ///   This catches shims such as a rustup proxy whose component is not installed.
 /// - `spawn`: argv for the stdio server (pyright / ts-language-server need
 ///   `--stdio` to enter LSP mode; rust-analyzer / gopls are stdio by default).
-/// - `extensions`: file extensions routed to this server. `GoToDefinition`
-///   etc. pick the server by the path's extension.
+/// - `extensions`: file extensions routed to this server. `LspRegistry::
+///   client_for_path` picks the server by the path's extension.
 /// - `root_hints`: markers used to locate the workspace root (walk up from the
 ///   target file until one of these exists).
 pub struct LspServerSpec {

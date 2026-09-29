@@ -4,9 +4,9 @@
 # VSCODE_AGENT_HOST_MANOX_SDK_ROOT should point at.
 #
 # Usage: script/build-napi [--debug] [--full]
-#   --full    build the complete runtime (MCP + LSP + terminal + WS gateway);
+#   --full    build the complete runtime (MCP + terminal + WS gateway);
 #             the default stages the lean VS Code-harness addon (the engine's
-#             documented no-MCP/no-LSP fallbacks and the GW7 feature/
+#             documented no-MCP fallbacks and the GW7 feature/
 #             unavailable arms cover the omitted subsystems).
 set -euo pipefail
 

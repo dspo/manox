@@ -10,7 +10,7 @@
 //!
 //! The manox harness has a single injection point: the process environment itself.
 //! Every spawn site inherits it — the pi kernel's bash tool
-//! (`TokioExecutionEnv`), LSP servers (`crates/lsp`), MCP stdio servers
+//! (`TokioExecutionEnv`), MCP stdio servers
 //! (supervisor bus), and monitor/background commands (pi-extensions).
 //! [`install`] resolves the login shell's PATH once on a background thread
 //! and applies it process-wide, so no kernel or extension changes are
@@ -36,7 +36,7 @@ pub const DEFAULT_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The PATH resolution is done; `setenv` has been applied process-wide.
-/// Used by downstream init (LSP probe, MCP spawns) to wait for the correct
+/// Used by downstream init (MCP spawns) to wait for the correct
 /// PATH before probing.
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
@@ -52,8 +52,8 @@ pub fn resolved_login_path() -> &'static str {
 /// Install the login shell's PATH process-wide from a background thread.
 ///
 /// Called once from `manox_agent::init`. When the resolver returns, the process
-/// `PATH` is replaced, so every later subprocess spawn (bash tool, LSP
-/// servers, MCP stdio servers, monitors) inherits the user's environment.
+/// `PATH` is replaced, so every later subprocess spawn (bash tool,
+/// MCP stdio servers, monitors) inherits the user's environment.
 /// Subprocesses spawned before the resolver lands inherit the launcher's
 /// minimal PATH — the pre-install situation, never worse.
 pub fn install() {
@@ -84,7 +84,7 @@ pub fn install() {
 
 /// Block until the login-shell PATH is installed (bounded by the
 /// [`RESOLVE_TIMEOUT`] inside the install thread).  Used by init steps
-/// that probe PATH (LSP registry, MCP server discovery) and must not
+/// that probe PATH (MCP server discovery) and must not
 /// see the launchd minimal PATH.
 pub fn wait_installed() {
     while INSTALLED.get().is_none() {

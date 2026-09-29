@@ -26,11 +26,10 @@
 //! payload cannot express it: object keys are ordered by the encoder, so an
 //! appended message shifts every byte after the array and a pure append would
 //! read as a divergence. Divergences the runtime *intends* — compaction
-//! rewriting history, a model switch, a permission-mode change, the LSP-ready
-//! line appearing, the `today` date rolling over, a tool becoming visible or
-//! invisible — are attributed to the [`Whitelist`] and reported without a
-//! cache-miss estimate; only an unattributed divergence also emits
-//! [`ThreadEvent::CacheInvalidation`].
+//! rewriting history, a model switch, a permission-mode change, the `today`
+//! date rolling over, a tool becoming visible or invisible — are attributed to
+//! the [`Whitelist`] and reported without a cache-miss estimate; only an
+//! unattributed divergence also emits [`ThreadEvent::CacheInvalidation`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -58,8 +57,6 @@ pub enum Whitelist {
     ModelSwitch,
     /// The permission mode changed, re-rendering a mode line.
     PermissionMode,
-    /// The LSP-ready line entered or left the system prompt.
-    LspReadyLine,
     /// The `today` date rolled over inside the system prompt.
     TodayRollover,
     /// A tool became visible or invisible: the catalog changed shape, not
@@ -272,23 +269,11 @@ fn visibility_only_change(prev: &serde_json::Value, cur: &serde_json::Value) -> 
 /// The volatile lines the runtime legitimately re-renders between
 /// requests, folded away so a pure-prose system change still reads as a
 /// divergence. Redaction is line-scoped and deterministic: a `today`
-/// date, the LSP-ready section, and any permission-mode line.
+/// date and any permission-mode line.
 fn normalize_system(system: &str) -> String {
     let mut out = String::new();
-    let mut in_lsp_section = false;
     for line in system.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("## LSP ready") {
-            in_lsp_section = true;
-            continue;
-        }
-        if in_lsp_section {
-            if trimmed.starts_with("## ") || trimmed.starts_with("# ") {
-                in_lsp_section = false;
-            } else {
-                continue;
-            }
-        }
         if trimmed.starts_with("Date:") || trimmed.to_ascii_lowercase().contains("permission mode")
         {
             continue;
@@ -385,11 +370,7 @@ fn classify(prev: &PayloadView, cur: &PayloadView) -> PrefixSample {
         {
             // The system text moved only through the volatile lines.
             attributed = Some(
-                if prev.system_text.contains("## LSP ready")
-                    != cur.system_text.contains("## LSP ready")
-                {
-                    Whitelist::LspReadyLine
-                } else if prev.system_text.contains("permission mode")
+                if prev.system_text.contains("permission mode")
                     || cur.system_text.contains("permission mode")
                 {
                     Whitelist::PermissionMode

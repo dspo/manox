@@ -1,4 +1,4 @@
-//! Lightweight LSP client for manox.
+//! Lightweight LSP client library for host apps.
 //!
 //! Lazily spawns an already-installed language server (rust-analyzer / gopls /
 //! pyright / typescript-language-server) as a child process via the
@@ -6,10 +6,14 @@
 //! code-intel requests. The wire framer is hand-rolled (`proto.rs`); `lsp-types`
 //! supplies typed params/results only.
 //!
-//! This crate is pure tokio — no `agent`/`gpui` dependency — so the JSON-RPC
-//! framer and client stay unit-testable without the GPUI runtime. The
-//! `AgentTool` adapters that wrap these clients live in the `agent` crate
-//! (`manox_agent::lsp`), avoiding a dependency cycle.
+//! This crate is a standalone building block: pure tokio — no `agent`/`gpui`
+//! dependency — so the JSON-RPC framer and client stay unit-testable without
+//! the GPUI runtime. Nothing inside the manox workspace integrates it; the
+//! host app decides whether and how to surface LSP capability — by wrapping
+//! these clients in its own agent tools, or (over AHP) contributing them via
+//! `session/activeClientSet` (which lands in the runtime's
+//! `register_client_tools`) or, in-process, via
+//! `manox_agent::embedder_tools::set_provider`.
 
 pub mod client;
 pub mod proto;

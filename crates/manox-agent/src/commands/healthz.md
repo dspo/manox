@@ -27,7 +27,6 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 
 **Out of scope** — do NOT test (skip silently, do not report):
 
-- LSP tools: GoToDefinition, FindReferences, Hover, DocumentSymbols, WorkspaceSymbols, Diagnostics
 - Conditional tools: Code, ToolSearch
 - External plugin subagents: remora:remora-task
 - Plugin commands: gitwork:*
