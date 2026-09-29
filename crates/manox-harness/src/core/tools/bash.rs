@@ -107,9 +107,6 @@ impl AgentTool for BashTool {
                     "description": "The command to execute"
                 },
                 "cwd": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "timeout": {
@@ -117,7 +114,7 @@ impl AgentTool for BashTool {
                     "description": "Timeout in milliseconds (default: 120000)"
                 }
             },
-            "required": ["command", "cwd"]
+            "required": ["command"]
         })
     }
 

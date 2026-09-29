@@ -53,9 +53,6 @@ impl AgentTool for LsTool {
                     "description": "Directory to list (default: cwd)"
                 },
                 "cwd": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "limit": {
@@ -74,8 +71,7 @@ impl AgentTool for LsTool {
                     "type": "integer",
                     "description": "Recursion depth for subdirectories (0 = no recursion, 1 = immediate children, etc.)"
                 }
-            },
-            "required": ["cwd"]
+            }
         })
     }
 

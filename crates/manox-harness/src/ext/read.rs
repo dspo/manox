@@ -89,7 +89,7 @@ impl AgentTool for SelectorReadTool {
                     "description": "Maximum number of lines to read"
                 }
             },
-            "required": ["path", "cwd"]
+            "required": ["path"]
         })
     }
 

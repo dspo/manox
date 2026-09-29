@@ -60,9 +60,6 @@ impl AgentTool for GlobTool {
                     "description": "Directory to search (default: cwd)"
                 },
                 "cwd": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 1,
                     "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "limit": {
@@ -84,7 +81,7 @@ impl AgentTool for GlobTool {
                     "description": "Sort results by modification time, ascending or descending"
                 }
             },
-            "required": ["pattern", "cwd"]
+            "required": ["pattern"]
         })
     }
 
@@ -320,9 +317,11 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("pattern")));
-        assert!(
-            required.iter().any(|v| v.as_str() == Some("cwd")),
-            "cwd is required"
-        );
+        // `cwd` is semantically required but deliberately unconstrained in
+        // the schema: every malformed shape must reach `parse_cwd_arg` so
+        // the model sees the instructional how-to, not a generic jsonschema
+        // validation message.
+        assert!(!required.iter().any(|v| v.as_str() == Some("cwd")));
+        assert!(schema["properties"]["cwd"].get("type").is_none());
     }
 }

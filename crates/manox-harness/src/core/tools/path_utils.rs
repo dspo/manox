@@ -11,48 +11,50 @@ use crate::tool::ToolContext;
 
 /// Schema description shared by every FS/Bash tool's `cwd` property.
 pub const CWD_SCHEMA_DOC: &str = "Working directory for this call as `[anchor, ...route]` \
-(required). The first element re-anchors the session's default directory (\"\" keeps the \
-current one); the remaining elements locate this call without re-anchoring. A single element \
-re-anchors and runs there. Prefer a single-element `cwd` with the target expressed in `path` \
-relative to it; add elements only when this call's working directory is a distinct \
-subdirectory of the anchor.";
+(required — the call is rejected without it). The first element re-anchors the session's \
+default directory (\"\" keeps the current one); a RELATIVE anchor resolves against the \
+current anchor, so pass an absolute path to start from a known root. The remaining elements \
+locate this call without re-anchoring. A single element re-anchors and runs there. Prefer a \
+single-element `cwd` with the target expressed in `path` relative to it; add elements only \
+when this call's working directory is a distinct subdirectory of the anchor.";
 
 /// The rejection text for a missing or malformed `cwd` argument — it doubles
-/// as the model-facing how-to.
+/// as the model-facing how-to. Every rejection funnels here: the schema
+/// leaves `cwd` unconstrained on purpose, so this text (not a generic
+/// jsonschema message) is what the model sees.
 const CWD_REQUIRED_DOC: &str = "cwd is required: pass [anchor, ...route] — the first element \
-is the session's new anchor directory (\"\" keeps the current one), later elements locate \
-this call without re-anchoring. Example: [\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
+is the session's new anchor directory (\"\" keeps the current one; a relative anchor \
+resolves against the current anchor, so use an absolute path to start from a known root), \
+later elements locate this call without re-anchoring. Example: \
+[\"~/projects/dspo/manox\", \"crates/manox-harness\"]";
 
 /// The parsed `cwd` argument: `[anchor, ...route]`.
-pub struct CwdArg {
+struct CwdArg {
     /// First element: `""` keeps the current anchor; non-empty re-anchors the
     /// session's default directory.
-    pub anchor: String,
+    anchor: String,
     /// Remaining elements: joined onto the anchor to locate this call only.
-    pub route: Vec<String>,
+    route: Vec<String>,
 }
 
 /// Parse the `cwd` argument. It must be a non-empty JSON array of strings;
 /// anything else (missing, non-array, empty array, non-string element) is
 /// rejected with the same instructional error.
-pub fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
+fn parse_cwd_arg(value: Option<&JsonValue>) -> Result<CwdArg, String> {
     let Some(items) = value.and_then(|v| v.as_array()) else {
         return Err(CWD_REQUIRED_DOC.to_string());
     };
-    let mut iter = items.iter().map(|v| v.as_str());
-    let anchor = iter.next().ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
-    let mut route = Vec::with_capacity(items.len().saturating_sub(1));
-    for element in iter {
-        route.push(
-            element
-                .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?
-                .to_string(),
-        );
-    }
+    let mut elements = items.iter();
+    let anchor = elements
+        .next()
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
+    let route = elements
+        .map(|v| v.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?;
     Ok(CwdArg {
-        anchor: anchor
-            .ok_or_else(|| CWD_REQUIRED_DOC.to_string())?
-            .to_string(),
+        anchor: anchor.to_string(),
         route,
     })
 }
