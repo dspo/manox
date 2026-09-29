@@ -5,8 +5,8 @@
 //! One bridge per session orchestrator pair, spawned next to
 //! `attach_orchestrators` in `pi_engine`. It subscribes to the monitor's
 //! lifecycle + raw-output broadcasts and the background manager's lifecycle
-//! broadcast, mirrors each pi task into the legacy registry (so `stop`,
-//! `snapshots_for_thread`, and the gpui host's cards see one id space), and
+//! broadcast, mirrors each pi task into the legacy registry (so `stop` and
+//! the gpui host's cards see one id space), and
 //! re-emits every state change as `ThreadEvent::BackgroundTaskUpdated` via the
 //! facade's `BackendNotice` channel. Exits when the orchestrator senders drop
 //! (session torn down or replaced by a `NewSession`).
@@ -287,7 +287,6 @@ fn handle_background_event(
                 on_stop,
                 state,
             );
-            proxy.set_command(command.clone());
             emit_snapshot(notice_tx, &proxy, &tid);
             // Poll output in a dedicated task; lifecycle terminals arrive via
             // the broadcast below.
@@ -409,16 +408,10 @@ mod tests {
 
     use super::*;
 
-    /// The legacy background-task registry is process-global while monitor
-    /// task ids are per-manager counters (`mon_1`, …), so concurrent
-    /// real-spawn tests would collide inside `register_with_id`.
-    static REAL_SPAWN_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// A real command monitor surfaces in the legacy registry with its pi task
     /// id, and the bridge emits running → completed snapshots carrying output.
     #[tokio::test]
     async fn monitor_spawn_bridges_snapshots() {
-        let _guard = REAL_SPAWN_GUARD.lock().await;
         let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
         let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
@@ -484,7 +477,6 @@ mod tests {
     /// arrives. A Lagged-as-fatal regression dies silently on the first flood.
     #[tokio::test]
     async fn bridge_survives_output_flood_past_broadcast_capacity() {
-        let _guard = REAL_SPAWN_GUARD.lock().await;
         let monitor = Arc::new(MonitorManager::new(Arc::new(BackgroundRegistry::new())));
         let background = Arc::new(BackgroundManager::new(Arc::new(BackgroundRegistry::new())));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
@@ -531,6 +523,5 @@ mod tests {
             "bridge stays alive across the flood and delivers the terminal snapshot"
         );
         background_task::remove(&TaskId(tid.clone()));
-        background_task::remove_thread_mailbox("t-flood");
     }
 }

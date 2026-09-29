@@ -7,12 +7,12 @@ publish.workspace = true
 [features]
 default = ["mcp"]
 # MCP client (~/.manox/mcp.toml + plugin .mcp.json servers). The gpui app and
-# the cx CLI keep it; lean embedders (the VS Code napi edge) may opt out —
-# sessions then run without MCP tools (the registry simply never initializes).
+# the cx CLI keep it; lean embedders may opt out — sessions then run without
+# MCP tools (the registry simply never initializes).
 mcp = ["dep:rmcp"]
 # ChromeUse: the in-process rustwright CDP engine + ChromeUse* tools. The
-# gpui app enables it; the VS Code host (manox-napi) builds without it so the
-# engine never links into the shipped extension.
+# gpui app enables it; lean embedders build without it so the engine never
+# links the CDP driver.
 chrome-use = ["dep:rustwright_core"]
 # Exposes `thread_store::init_for_test` / `drop_for_test` (and the `TEST_OVERRIDE`
 # slot they mutate) to downstream crates' test suites. Production builds keep
