@@ -23,6 +23,25 @@
 //! terminal state; a periodic GC sweep removes long-dead entries. Task ids
 //! issued by the pi-side registries are process-unique (one shared ordinal);
 //! directly-registered tasks (subagents) draw from the registry counter.
+//!
+//! ## Known limits
+//!
+//! - The output ring evicts silently past the caps (no gap marker):
+//!   `output_tail` and `recent_events` are best-effort card bodies, not a
+//!   delivery channel — the model channel is steering.
+//! - `Stopping` is a transient state inside the stop window. Consumers
+//!   should not assume they never see it: a snapshot emitted in that
+//!   window (output is throttled, not suppressed) can still observe it on
+//!   the wire.
+//! - First-wins covers the terminal *status* only: a settlement arriving
+//!   after the stop path's synchronous push still writes its exit code and
+//!   failure summary into the record (and the card), though the status
+//!   stays the host's.
+//! - The registry itself is not driven across processes (each manox
+//!   process owns its sessions exclusively via the session write lease),
+//!   but the snapshots are not private: they project one-way onto the
+//!   journal and the AHP wire, so other processes' clients do observe
+//!   task state.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
