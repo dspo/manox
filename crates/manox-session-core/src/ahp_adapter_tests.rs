@@ -668,9 +668,7 @@ mod dispatch {
         ChatTurnStartedAction, SessionConfigChangedAction, StateAction,
     };
     use ahp_types::common::JsonObject;
-    use ahp_types::state::{
-        Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart,
-    };
+    use ahp_types::state::{Message, MessageKind, MessageOrigin, PendingMessageKind, ResponsePart};
     use ahp_types::version::PROTOCOL_VERSION;
     use manox_ahp::backend::{Backend, DispatchOutcome};
     use manox_ahp::channels::{chat, session};
@@ -834,11 +832,11 @@ mod dispatch {
                 .await
                 .expect("an echo arrives")
                 .expect("subscription open");
-            if let ahp::SubscriptionEvent::Action(envelope) = event {
-                if let StateAction::ChatInputCompleted(done) = &envelope.action {
-                    assert_eq!(done.request_id, "toolu_probe");
-                    break true;
-                }
+            if let ahp::SubscriptionEvent::Action(envelope) = event
+                && let StateAction::ChatInputCompleted(done) = &envelope.action
+            {
+                assert_eq!(done.request_id, "toolu_probe");
+                break true;
             }
             if tokio::time::Instant::now() >= deadline {
                 break false;
@@ -855,7 +853,7 @@ mod dispatch {
         let active = host_chat.active_turn.as_ref().expect("the turn is open");
         let answered = active.response_parts.iter().find_map(|p| match p {
             ResponsePart::InputRequest(input) if input.request.id == "toolu_probe" => {
-                Some(input.response.clone())
+                Some(input.response)
             }
             _ => None,
         });

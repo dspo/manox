@@ -112,6 +112,10 @@ async fn proxy_mcp_method(
     })?
 }
 
+/// A live bridge: its task and the shared forward watermark (the highest
+/// journal seq it has forwarded to the host) that a restart resumes above.
+type BridgeTask = (tokio::task::JoinHandle<()>, Arc<AtomicU64>);
+
 /// One session's folded state plus the journal tail it was taken at.
 struct Seeded {
     thread_id: String,
@@ -140,7 +144,7 @@ pub struct RuntimeBackend {
     /// Per-session bridge task plus its shared forward watermark (the highest
     /// journal seq forwarded to the host). The watermark survives a restart so
     /// the fresh bridge can replay exactly the rows the dead one missed.
-    bridges: Mutex<HashMap<String, (tokio::task::JoinHandle<()>, Arc<AtomicU64>)>>,
+    bridges: Mutex<HashMap<String, BridgeTask>>,
     /// The plan file each open review card names, keyed by its request id. The
     /// card's `chat/inputCompleted` carries only the request id and the verdict,
     /// so the approve path recovers the file from here.
@@ -370,7 +374,9 @@ impl RuntimeBackend {
         let watermark = Arc::new(AtomicU64::new(resume_from.saturating_sub(1)));
         let task_watermark = Arc::clone(&watermark);
         let task = manox_agent::runtime::handle().spawn(async move {
-            backend.bridge(host, thread, id, resume_from, task_watermark).await;
+            backend
+                .bridge(host, thread, id, resume_from, task_watermark)
+                .await;
         });
         bridges.insert(session_id.to_string(), (task, watermark));
     }
@@ -459,8 +465,14 @@ impl RuntimeBackend {
                     tracing::warn!(session = %session_id, "bridge: feed lagged, replaying the gap");
                     translator = Translator::new();
                     let replay_from = tail + 1;
-                    self.replay_journal(&session_id, &host, &mut translator, &mut tail, replay_from)
-                        .await;
+                    self.replay_journal(
+                        &session_id,
+                        &host,
+                        &mut translator,
+                        &mut tail,
+                        replay_from,
+                    )
+                    .await;
                 }
                 Err(error) => {
                     tracing::warn!(
