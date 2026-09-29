@@ -109,8 +109,9 @@ impl BashOperations for PersistentShellOperations {
 
         let outcome = {
             let sh = reap.shell_mut();
-            // A cwd override re-pins the shell; `None` keeps the current
-            // directory so `cd` persists across calls.
+            // Every command re-pins the shell to the request's directory, so
+            // a `cd` inside a command lasts only for that command. `None`
+            // (no harness caller passes it) leaves the shell where it sits.
             if let Some(cwd) = request.cwd {
                 sh.set_working_dir(cwd).map_err(brush_err)?;
             }

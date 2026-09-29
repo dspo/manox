@@ -37,7 +37,7 @@ This test MUST NOT assume any particular project layout. Do NOT read project-spe
 2. **Self-contained fixtures.** Create all test files in a temp directory (via `Bash` → `mktemp -d`). Never read project-specific files.
 3. **Clean up side effects.** Tools with persistent state must be cleaned up after verification:
    - Write/Edit: write to the temp dir, verify, then delete.
-   - Per-call cwd: run a Bash call with `cwd` set to a scratch directory, verify a relative-path Read resolves there, and verify the sticky cwd is inherited by the next call without `cwd`.
+   - Per-call cwd: every FS/Bash call takes `cwd: [anchor, ...route]` (required). Run a Bash call with `cwd: ["", "<scratch>"]`, verify a relative-path Read with the same `cwd` resolves there, and verify a following Read with `cwd: ["<scratch>"]` re-anchors the session's directory and still resolves.
    - CreateGoal: create a goal, verify, then clear it via UpdateGoal(complete) and verify.
    - Browser: open a tab, exercise read-only tools, then close it with WebExploreClose.
 4. **Parallel calls.** When tools in the same group are independent (e.g. Read + List + Grep + Glob), call them in parallel in one turn.
@@ -129,7 +129,7 @@ This temp dir is the base for all FS tests. Clean it up at the end.
 
 | # | Tool | Action | PASS criterion |
 |---|------|--------|-----------------|
-| 20 | **Bash+Read per-call cwd** | `mkdir -p <tmp>/healthz-cwd && echo hi > <tmp>/healthz-cwd/f` via Bash with `cwd`; Read `f` without `cwd` | Bash runs in the directory; Read resolves `f` through the sticky cwd |
+| 20 | **Bash+Read per-call cwd** | `mkdir -p <tmp>/healthz-cwd && echo hi > <tmp>/healthz-cwd/f` via Bash with `cwd: ["", "<tmp>/healthz-cwd"]`; Read `f` with the same `cwd`; Read `f` again with `cwd: ["<tmp>/healthz-cwd"]` | Bash runs in the directory; the empty-anchor Read resolves `f` (inherits), the single-element Read re-anchors and also resolves |
 
 ### Group: Browser (sequential, clean up after)
 
