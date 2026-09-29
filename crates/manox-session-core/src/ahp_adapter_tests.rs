@@ -661,7 +661,9 @@ fn folds_answer_none_for_absent_inputs() {
 mod dispatch {
     use super::install;
     use super::uninstall;
-    use super::{assistant, delta, seed_session, stamp, tool_call, user};
+    use super::{
+        JsonlSessionStorage, assistant, delta, seed_session, stamp, tool_call, user, with_chain,
+    };
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
         ActionOrigin, ChatPendingMessageRemovedAction, ChatToolCallConfirmedAction,
@@ -702,11 +704,30 @@ mod dispatch {
         (server, backend)
     }
 
-    /// The full host assembly (AhpRuntime over a gateway), a connected SDK
-    /// client subscribed to the session's chat channel, and the journal of a
-    /// turn whose AskUserQuestion is still open — the exact shape the desktop
-    /// attaches to when it answers an ask.
-    async fn answered_ask_fixture() -> (
+    /// Append rows to a seeded session's journal — the durable half of what a
+    /// live engine's own writes do, without the broadcast. The bridge's
+    /// cold read is the reader these tests exercise.
+    async fn append_session(id: &str, events: Vec<(&str, Option<&str>, E)>) {
+        let path = manox_agent::thread_store::global_sessions_dir().join(format!("{id}.jsonl"));
+        let storage = JsonlSessionStorage::open(&path)
+            .await
+            .expect("the seeded journal opens");
+        let entries: Vec<E> = events
+            .into_iter()
+            .map(|(eid, parent, event)| with_chain(eid, parent.map(str::to_string), event))
+            .collect();
+        storage.append_entries(&entries).await.expect("appends");
+    }
+
+    /// The full host assembly (AhpRuntime over a gateway) seeded with one
+    /// session's journal, plus a connected SDK client subscribed to that
+    /// session's chat channel — so the bridge runs against the journal and the
+    /// host state it folds to is inspectable.
+    async fn host_fixture(
+        session_id: &str,
+        thread_id: &str,
+        events: Vec<(&str, E)>,
+    ) -> (
         Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
         ahp::Client,
         ahp::SessionSubscription,
@@ -715,10 +736,10 @@ mod dispatch {
         let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
         let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
         let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
-        // Register the session, so an answer routes through the gateway's
-        // session table (the device always has a session at answer time).
+        // Register the session, so a dispatch routes through the gateway's
+        // session table (the device always has a session by then).
         let intent = crate::agent_server::SessionIntent {
-            session_id: Some("s-ask".to_string()),
+            session_id: Some(session_id.to_string()),
             cwd: None,
             project: None,
             initial_model: None,
@@ -731,11 +752,88 @@ mod dispatch {
         crate::agent_server::AgentServerInner::create_session_request(&inner, "owner", intent)
             .await
             .expect("session opens");
+        let _ = std::fs::remove_file(
+            manox_agent::thread_store::global_sessions_dir().join(format!("{session_id}.jsonl")),
+        );
+        seed_session(session_id, thread_id, "/", events).await;
+
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, sub) = client
+            .subscribe(manox_ahp::channels::chat::uri(session_id))
+            .await
+            .expect("subscribes");
+        assert!(result.snapshot.is_some(), "the fold answers a snapshot");
+        (runtime, client, sub)
+    }
+
+    /// The markdown runs the host's chat holds for the open turn, by content.
+    fn open_markdown(
+        runtime: &Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
+        id: &str,
+    ) -> Vec<String> {
+        runtime
+            .host()
+            .chat_state(id)
+            .and_then(|chat| chat.active_turn.map(|turn| turn.response_parts))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|part| match part {
+                ResponsePart::Markdown(m) => Some(m.content),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Start a fresh turn from the client — the dispatch that restarts the
+    /// session's bridge (the engine materialization swaps the journal
+    /// broadcast channel, so the bridge must re-subscribe).
+    async fn dispatch_turn_start(client: &ahp::Client, session_id: &str, text: &str) {
+        let started = ahp_types::actions::ChatTurnStartedAction {
+            turn_id: format!("t-{text}"),
+            started_at: stamp().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            message: Message {
+                text: text.to_string(),
+                origin: MessageOrigin {
+                    kind: MessageKind::User,
+                },
+                attachments: None,
+                model: None,
+                agent: None,
+                meta: None,
+            },
+            queued_message_id: None,
+            meta: None,
+        };
+        client
+            .dispatch(
+                manox_ahp::channels::chat::uri(session_id),
+                StateAction::ChatTurnStarted(started),
+            )
+            .await
+            .expect("the turn start is dispatched");
+    }
+
+    /// The full host assembly plus the journal of a turn whose AskUserQuestion
+    /// is still open — the exact shape the desktop attaches to when it answers
+    /// an ask.
+    async fn answered_ask_fixture() -> (
+        Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
+        ahp::Client,
+        ahp::SessionSubscription,
+    ) {
         // The journal the engine writes for an open ask: content, the
         // pending-approval tool call, and the question row itself.
-        let _ = std::fs::remove_file(
-            manox_agent::thread_store::global_sessions_dir().join("s-ask.jsonl"),
-        );
         let events = vec![
             ("e1", user("用 AskUserQuestion 随便问我个问题")),
             ("e2", delta("working")),
@@ -770,26 +868,74 @@ mod dispatch {
                 },
             ),
         ];
-        seed_session("s-ask", "thread-ask", "/", events).await;
+        host_fixture("s-ask", "thread-ask", events).await
+    }
 
-        let transport = runtime.inproc();
-        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
-            .await
-            .expect("client connects");
-        client
-            .initialize(
-                "probe".to_string(),
-                vec![PROTOCOL_VERSION.to_string()],
-                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
-            )
-            .await
-            .expect("initializes");
-        let (result, sub) = client
-            .subscribe(manox_ahp::channels::chat::uri("s-ask"))
-            .await
-            .expect("subscribes");
-        assert!(result.snapshot.is_some(), "the fold answers a snapshot");
-        (runtime, client, sub)
+    /// A bridge start must resume ABOVE the seed's snapshot tail. That row was
+    /// already folded into the state the subscriber's snapshot came from, and a
+    /// streamed delta's part id is `p-<entry id>` — so forwarding it twice
+    /// appends the same text onto the part the fold already filled, and the
+    /// transcript shows the chunk twice behind a stray empty part.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bridge_start_never_refolds_the_seeded_tail_row() {
+        let _guards = install();
+        let (runtime, _client, _sub) = host_fixture(
+            "s-tail",
+            "thread-tail",
+            vec![("e1", user("hello")), ("e2", delta("AAA"))],
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert_eq!(
+            open_markdown(&runtime, "s-tail"),
+            vec!["AAA".to_string()],
+            "the tail row is folded once, not replayed on top of itself"
+        );
+        uninstall();
+    }
+
+    /// A restarted bridge resumes above everything the previous one accounted
+    /// for. The resume point rides the watermark, which the replay must move
+    /// with its cursor — a replay that advanced only the tail left a restart
+    /// re-forwarding rows the client had already been shown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_bridge_resumes_above_what_it_forwarded() {
+        let _guards = install();
+        let (runtime, client, _sub) = host_fixture(
+            "s-resume",
+            "thread-resume",
+            vec![("e1", user("hello")), ("e2", delta("AAA"))],
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // A row the bridge has not seen (no broadcast accompanies a test's own
+        // write), then the restart that must deliver it.
+        append_session("s-resume", vec![("e3", Some("e2"), delta("BBB"))]).await;
+        dispatch_turn_start(&client, "s-resume", "first").await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(
+            open_markdown(&runtime, "s-resume")
+                .iter()
+                .any(|content| content.contains("BBB")),
+            "the replay delivers the row the dead bridge never forwarded"
+        );
+
+        // A second row and a second restart: the resume point is what the first
+        // replay accounted for, so only the new row is forwarded.
+        append_session("s-resume", vec![("e4", Some("e3"), delta("CCC"))]).await;
+        dispatch_turn_start(&client, "s-resume", "second").await;
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let markdown = open_markdown(&runtime, "s-resume");
+        assert!(
+            !markdown.iter().any(|content| content.contains("BBB")),
+            "the second replay must not re-forward what the first already did: {markdown:?}"
+        );
+        assert!(
+            markdown.iter().any(|content| content.contains("CCC")),
+            "the second replay delivers its own row: {markdown:?}"
+        );
+        uninstall();
     }
 
     /// A dispatched answer must fold into the host chat (and broadcast the

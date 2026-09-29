@@ -113,8 +113,27 @@ async fn proxy_mcp_method(
 }
 
 /// A live bridge: its task and the shared forward watermark (the highest
-/// journal seq it has forwarded to the host) that a restart resumes above.
+/// journal seq the bridge has accounted for — forwarded, or consciously
+/// dropped as a delta) that a restart resumes above.
 type BridgeTask = (tokio::task::JoinHandle<()>, Arc<AtomicU64>);
+
+/// How far a bridge has got through the journal: `tail` is the last seq it
+/// handled (the live loop's `seq <= tail` filter drops the broadcast copies of
+/// anything a replay already forwarded), and `watermark` publishes the same
+/// fact to whoever starts the next bridge. A row is accounted for when both
+/// have seen it, so they travel — and move — as one value.
+struct Cursor {
+    tail: u64,
+    watermark: Arc<AtomicU64>,
+}
+
+impl Cursor {
+    /// Everything at or below `seq` is accounted for.
+    fn accounted(&mut self, seq: u64) {
+        self.tail = self.tail.max(seq);
+        self.watermark.store(self.tail, Ordering::SeqCst);
+    }
+}
 
 /// Whether a journal row carries state a client cannot afford to miss in a
 /// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
@@ -363,20 +382,33 @@ impl RuntimeBackend {
     /// Start the live bridge for `session_id` (idempotent; restarts a bridge
     /// that already exited, resuming from its last forwarded seq).
     fn ensure_bridge(&self, session_id: &str) {
+        self.start_bridge(session_id, None);
+    }
+
+    /// Start the live bridge for `session_id` from `resume` — the first seq it
+    /// must forward. `None` derives the point from what the session already
+    /// has: nothing at all when the bridge is alive, the dead bridge's
+    /// watermark, or the seed's tail when no bridge has run. Every arm means
+    /// the same thing, since the replay's rows are inclusive.
+    fn start_bridge(&self, session_id: &str, resume: Option<u64>) {
         let mut bridges = self.bridges.lock();
-        let resume_from = match bridges.get(session_id) {
-            // Alive: nothing to do. Dead: restart above the watermark the dead
-            // bridge last forwarded — the fresh bridge replays the rows it
-            // missed from the durable journal.
-            Some((task, watermark)) if !task.is_finished() => return,
-            Some((_, watermark)) => watermark.load(Ordering::SeqCst) + 1,
-            None => self.first_bridge_seq(session_id),
+        let resume_from = match resume {
+            Some(seq) => seq,
+            None => match bridges.get(session_id) {
+                // Alive: nothing to do. Dead: restart above the watermark the
+                // dead bridge last forwarded — the fresh bridge replays the rows
+                // it missed from the durable journal.
+                Some((task, _)) if !task.is_finished() => return,
+                Some((_, watermark)) => watermark.load(Ordering::SeqCst) + 1,
+                None => self.first_bridge_resume(session_id),
+            },
         };
-        bridges.remove(session_id);
         let Some(thread) = self.server.journal_feed(session_id) else {
             // A cold session (no live engine) has no feed to bridge; its state
             // still answers from the journal, and a submit materializes the
-            // engine, which re-runs this path.
+            // engine, which re-runs this path. The entry (and the watermark it
+            // carries) stays, so that later start still resumes where this one
+            // meant to.
             tracing::debug!(session = %session_id, "bridge: no live feed yet (cold session)");
             return;
         };
@@ -395,33 +427,49 @@ impl RuntimeBackend {
                 .bridge(host, thread, id, resume_from, task_watermark)
                 .await;
         });
+        // Whatever held the slot is superseded: a finished task is already
+        // dead, and a live one can only be a concurrent restart's — two bridges
+        // on one session would forward the same rows twice.
+        if let Some((superseded, _)) = bridges.remove(session_id) {
+            superseded.abort();
+        }
         bridges.insert(session_id.to_string(), (task, watermark));
     }
 
-    /// The seq a brand-new bridge starts from: the seed's snapshot tail (the
-    /// state a first subscriber was answered from). Zero when no seed exists —
-    /// the fresh bridge replays the whole journal.
-    fn first_bridge_seq(&self, session_id: &str) -> u64 {
+    /// The seq a brand-new bridge starts from: ONE PAST the seed's snapshot
+    /// tail. The fold consumed that tail row into the state a subscriber was
+    /// answered with, so forwarding it again would land it twice — for a
+    /// streamed delta, whose part id is `p-<entry id>`, the reducers append the
+    /// same text onto the part the fold already filled. Zero when no seed
+    /// exists — the fresh bridge replays the whole journal.
+    fn first_bridge_resume(&self, session_id: &str) -> u64 {
         self.seeds
             .lock()
             .get(session_id)
-            .map(|seeded| seeded.tail)
+            .map(|seeded| seeded.tail + 1)
             .unwrap_or_default()
     }
 
     /// Abort and restart the bridge unconditionally: the engine
     /// materialization swaps the journal broadcast channel, so a bridge that
     /// subscribed earlier hangs on a channel nobody sends to anymore — alive
-    /// but deaf, which the finished-task check in [`Self::ensure_bridge`]
+    /// but deaf, which the finished-task check in [`Self::start_bridge`]
     /// cannot see. The fresh bridge resumes from the dead one's watermark and
     /// replays the journal rows above it, so the abort loses nothing.
     fn force_bridge_restart(&self, session_id: &str) {
-        let dead = self.bridges.lock().remove(session_id);
-        if let Some((task, _)) = &dead {
-            task.abort();
-        }
-        drop(dead);
-        self.ensure_bridge(session_id);
+        // The watermark IS the resume point, so it has to be read while the
+        // entry is being taken: a restart that only dropped the entry would
+        // fall back to the seed's tail and replay the whole session — every
+        // part of every turn since the seed — into the client's fresh turn.
+        let resumed = self
+            .bridges
+            .lock()
+            .remove(session_id)
+            .map(|(task, watermark)| {
+                task.abort();
+                watermark.load(Ordering::SeqCst) + 1
+            });
+        self.start_bridge(session_id, resumed);
     }
 
     /// Forward journal feed events into the host, from the resume point on.
@@ -455,13 +503,16 @@ impl RuntimeBackend {
         // filter drops the overlap.
         let mut feed = thread.subscribe_journal_feed();
         let mut translator = Translator::new();
-        let mut tail = resume_from.saturating_sub(1);
+        let mut cursor = Cursor {
+            tail: resume_from.saturating_sub(1),
+            watermark,
+        };
         tracing::info!(session = %session_id, resume_from, "bridge: subscribed to the journal feed");
         self.replay_journal(
             &session_id,
             &host,
             &mut translator,
-            &mut tail,
+            &mut cursor,
             resume_from,
             false,
         )
@@ -469,7 +520,7 @@ impl RuntimeBackend {
         loop {
             match feed.recv().await {
                 Ok(manox_agent::engine::JournalFeed::Event(event)) => {
-                    if event.seq <= tail {
+                    if event.seq <= cursor.tail {
                         continue;
                     }
                     let Some(entry) = crate::translate::wire_entry(event.seq, &event.entry) else {
@@ -477,8 +528,7 @@ impl RuntimeBackend {
                     };
                     self.forward_entry(&host, &session_id, &mut translator, &entry)
                         .await;
-                    tail = event.seq;
-                    watermark.store(event.seq, Ordering::SeqCst);
+                    cursor.accounted(event.seq);
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
                     // The flood outran the window. Skip the gap (its deltas are
@@ -492,12 +542,12 @@ impl RuntimeBackend {
                         "bridge: feed lagged, resyncing over the gap"
                     );
                     translator = Translator::new();
-                    let replay_from = tail + 1;
+                    let replay_from = cursor.tail + 1;
                     self.replay_journal(
                         &session_id,
                         &host,
                         &mut translator,
-                        &mut tail,
+                        &mut cursor,
                         replay_from,
                         true,
                     )
@@ -521,12 +571,17 @@ impl RuntimeBackend {
     /// tool calls, plan reviews): a lag recovery uses it to jump the gap
     /// without replaying a delta flood, which would re-lag the bridge into a
     /// live-lock (each full replay falling further behind the flood).
+    ///
+    /// Every row this leg reads is accounted for, forwarded or not: a restart
+    /// resuming below the replayed range would forward those rows a second
+    /// time, and a row the bridge consciously dropped (a delta in a lagged gap)
+    /// is not repaired by replaying it, only duplicated.
     async fn replay_journal(
         &self,
         session_id: &str,
         host: &Arc<manox_ahp::Host>,
         translator: &mut Translator,
-        tail: &mut u64,
+        cursor: &mut Cursor,
         from: u64,
         state_only: bool,
     ) {
@@ -545,14 +600,24 @@ impl RuntimeBackend {
                     }
                     self.forward_entry(host, session_id, translator, &entry)
                         .await;
-                    *tail = record.seq;
+                    cursor.accounted(record.seq);
                 }
                 // Jump past the gap regardless: rows below the cursor are
                 // either replayed (above) or consciously dropped (deltas).
-                *tail = (*tail).max(snapshot.cursor);
+                cursor.accounted(snapshot.cursor);
             }
-            crate::journal_query::ColdRead::NotFound
-            | crate::journal_query::ColdRead::Corrupt(_) => {}
+            crate::journal_query::ColdRead::NotFound => {}
+            // A corrupt journal is where a resync is needed most and can least
+            // be performed; say so rather than resuming on a stale tail as if
+            // the gap had been repaired.
+            crate::journal_query::ColdRead::Corrupt(error) => {
+                tracing::warn!(
+                    session = %session_id,
+                    from,
+                    %error,
+                    "bridge: journal unreadable, resync skipped"
+                );
+            }
         }
     }
 
