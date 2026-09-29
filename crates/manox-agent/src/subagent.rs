@@ -28,7 +28,7 @@ use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::background_task;
+use crate::background_task::{self, TaskStatus};
 use crate::subagent_watchdog::SubagentWatchdog;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
@@ -435,30 +435,19 @@ impl AgentTool for DelegationTool {
             let stats = observer.stats_of(&run_id_for_delivery);
             let delivery = background_delivery(&result, stats);
             observer.retire(&run_id_for_delivery);
-            // One settlement vocabulary for every producer: map the run's
-            // stop reason onto it, and let the shared mapper write the
-            // wire-stable terminal status.
-            let settlement = match result.stop_reason {
-                StopReason::Aborted => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Stopped,
-                    manox_harness::tasks::SettlementCause::UserStop,
-                ),
-                StopReason::Completed => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Completed,
-                    manox_harness::tasks::SettlementCause::Natural,
-                ),
-                _ => manox_harness::tasks::Settlement::new(
-                    manox_harness::tasks::SettlementKind::Failed,
-                    manox_harness::tasks::SettlementCause::Natural,
-                )
-                .with_failure_summary(Some(
-                    result
-                        .diagnostic
-                        .clone()
-                        .unwrap_or_else(|| "failed".to_string()),
-                )),
-            };
-            background_task::apply_settlement(&task, &task_id, &settlement);
+            match result.stop_reason {
+                StopReason::Aborted => task.set_terminal_status(TaskStatus::Stopped),
+                StopReason::Completed => task.set_terminal_status(TaskStatus::Completed),
+                _ => {
+                    task.set_failure_summary(
+                        result
+                            .diagnostic
+                            .clone()
+                            .unwrap_or_else(|| "failed".to_string()),
+                    );
+                    task.set_terminal_status(TaskStatus::Failed);
+                }
+            }
             let _ = notice_tx.send(BackendNotice::Event(Box::new(
                 ThreadEvent::BackgroundTaskUpdated {
                     snapshot: task.snapshot(&task_id),

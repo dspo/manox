@@ -1182,7 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn background_summary_honors_tail_lines() {
         let registry = Arc::new(BackgroundRegistry::new());
-        let manager = BackgroundManager::new(Arc::clone(&registry));
+        let manager = Arc::new(BackgroundManager::new(Arc::clone(&registry)));
         let seen: Arc<Mutex<Vec<crate::core::types::AgentMessage>>> =
             Arc::new(Mutex::new(Vec::new()));
         let seen2 = Arc::clone(&seen);

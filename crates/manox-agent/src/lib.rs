@@ -69,6 +69,7 @@ pub mod thread_store;
 
 pub mod approval;
 pub mod engine;
+pub mod monitor_bridge;
 
 pub use db::ThreadSummary;
 pub use language_model::{ReasoningEffort, TokenUsage};

@@ -48,7 +48,6 @@ pub use ext::session_meta;
 pub use ext::session_stream;
 pub use ext::steer_bus;
 pub use ext::subagent;
-pub use ext::tasks;
 
 // `provider` exists in both core and ext. Route `manox_harness::provider` to
 // ext::provider (the provider-registration extension) since that's what
