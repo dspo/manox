@@ -66,6 +66,17 @@ pub fn set_mcp_disabled(names: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Atomically apply one mutation to the disabled-MCP list: the read-modify-
+/// write (file + cache) is serialized behind a process-wide lock, so two
+/// concurrent toggles can no longer drop each other's entry.
+pub fn modify_mcp_disabled(f: impl FnOnce(Vec<String>) -> Vec<String>) -> Result<Vec<String>> {
+    static MODIFY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = MODIFY_LOCK.lock();
+    let next = f(mcp_disabled());
+    set_mcp_disabled(next.clone())?;
+    Ok(next)
+}
+
 /// Build the [`crate::claude_md::LoadContext`] for instruction loading.
 ///
 /// Production reads the real home dir, the platform managed-policy path, and

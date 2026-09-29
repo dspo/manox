@@ -440,14 +440,15 @@ impl SessionRuntime for GatewayRuntime {
             if !known {
                 return Err(RuntimeError::new(format!("unknown MCP server: {id}")));
             }
-            let mut disabled = manox_agent::settings::mcp_disabled();
-            if enabled {
-                disabled.retain(|name| name != id);
-            } else if !disabled.iter().any(|name| name == id) {
-                disabled.push(id.to_string());
-            }
-            manox_agent::settings::set_mcp_disabled(disabled)
-                .map_err(|e| RuntimeError::new(format!("persisting MCP enablement: {e:#}")))?;
+            manox_agent::settings::modify_mcp_disabled(|mut disabled| {
+                if enabled {
+                    disabled.retain(|name| name != id);
+                } else if !disabled.iter().any(|name| name == id) {
+                    disabled.push(id.to_string());
+                }
+                disabled
+            })
+            .map_err(|e| RuntimeError::new(format!("persisting MCP enablement: {e:#}")))?;
             if enabled {
                 manox_agent::mcp::start(id).map_err(RuntimeError::new)
             } else {

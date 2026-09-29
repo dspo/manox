@@ -1973,6 +1973,22 @@ fn build_tools(
                 tools.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate))));
             }
         }
+        // The assembly *is* a mount: record the per-slot generations now so
+        // the per-prompt refresh's first drift check on this session sees a
+        // matching watermark instead of rebuilding an identical set once.
+        #[cfg(feature = "mcp")]
+        {
+            let mut fingerprint: Vec<(String, u64)> = registry
+                .ready_overview()
+                .into_iter()
+                .map(|slot| (slot.name, slot.generation))
+                .collect();
+            fingerprint.sort();
+            MCP_MOUNT_WATERMARKS
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), fingerprint);
+        }
     }
     // Embedder-registered tools (the hosting editor's contributions —
     // RegisterSessionTools): the provider is the AgentServer's registry;
@@ -2284,13 +2300,36 @@ async fn refresh_embedder_tools(
     }
 }
 
-/// Per-session watermark of the registry generation at the last MCP tool
-/// rebuild. A restart with an unchanged tool list still bumps the registry's
-/// generation — the mounted adapters would keep calling the *cancelled*
-/// client — so the watermark, not the names, is what catches that drift.
+/// Per-session snapshot of the per-slot generations at the last MCP tool
+/// mount/rebuild. Generations are **per slot**, so a single max is not a
+/// fingerprint — restarting the lower-generation server while a
+/// higher-generation one exists would leave a max-based watermark unchanged
+/// and the stale adapters on the cancelled client would survive. The
+/// fingerprint is the full `(server, generation)` list.
 #[cfg(feature = "mcp")]
-static MCP_MOUNT_WATERMARKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+type MountFingerprint = Vec<(String, u64)>;
+#[cfg(feature = "mcp")]
+static MCP_MOUNT_WATERMARKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, MountFingerprint>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Whether the mounted MCP tool set needs a rebuild: the bridged names moved,
+/// or any slot's generation changed since the last mount (a restart with an
+/// unchanged list still invalidates the mounted adapters — they hold the
+/// cancelled client).
+#[cfg(feature = "mcp")]
+fn mcp_tool_drift(
+    old_names: &[String],
+    new_names: &[String],
+    seen: &[(String, u64)],
+    fingerprint: &[(String, u64)],
+) -> bool {
+    let mut old_sorted = old_names.to_vec();
+    let mut new_sorted = new_names.to_vec();
+    old_sorted.sort();
+    new_sorted.sort();
+    old_sorted != new_sorted || seen != fingerprint
+}
 
 /// Re-mount the `mcp__`-prefixed tools when the registry's inventory has
 /// drifted from the mounted table — a start/stop (from the AHP face or the
@@ -2326,16 +2365,18 @@ async fn refresh_mcp_tools(session: &mut AgentSession, thread_id: &str, gate: &A
         })
         .collect();
     new_mcp.sort();
-    let watermark = registry.max_generation();
+    let mut fingerprint: Vec<(String, u64)> = overview
+        .iter()
+        .map(|slot| (slot.name.clone(), slot.generation))
+        .collect();
+    fingerprint.sort();
     let seen = MCP_MOUNT_WATERMARKS
         .lock()
         .unwrap()
         .get(thread_id)
-        .copied()
-        .unwrap_or(0);
-    let mut sorted_old = old_mcp.clone();
-    sorted_old.sort();
-    if sorted_old == new_mcp && seen == watermark {
+        .cloned()
+        .unwrap_or_default();
+    if !mcp_tool_drift(&old_mcp, &new_mcp, &seen, &fingerprint) {
         // No drift: skip the rebuild entirely (and the tool-body clones it
         // would pay).
         return;
@@ -2374,7 +2415,7 @@ async fn refresh_mcp_tools(session: &mut AgentSession, thread_id: &str, gate: &A
     MCP_MOUNT_WATERMARKS
         .lock()
         .unwrap()
-        .insert(thread_id.to_string(), watermark);
+        .insert(thread_id.to_string(), fingerprint);
     // A narrowed active selection was computed against the OLD set: carry
     // the non-MCP names over verbatim, keep every MCP name the user had
     // active (a deliberate narrowing must survive a refresh), and add only
@@ -2405,6 +2446,64 @@ async fn refresh_mcp_tools(session: &mut AgentSession, thread_id: &str, gate: &A
                 "mcp tool active-selection update rejected; model may not see an mcp tool"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "mcp"))]
+mod mcp_drift_tests {
+    use super::mcp_tool_drift;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_restart_of_the_lower_generation_slot_still_reads_as_drift() {
+        // Two servers; A was restarted twice (gen 2), B once (gen 1). The
+        // max-based watermark equalled 2; restarting B (gen 1 → 2) leaves
+        // the max untouched — the per-slot fingerprint is what catches it.
+        let seen = vec![("a".to_string(), 2u64), ("b".to_string(), 1u64)];
+        let after_b_restart = vec![("a".to_string(), 2u64), ("b".to_string(), 2u64)];
+        let same_names = names(&["mcp__a__x", "mcp__b__y"]);
+        assert!(
+            mcp_tool_drift(&same_names, &same_names, &seen, &after_b_restart),
+            "an unchanged name list with a per-slot generation change is drift"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_fingerprint_is_not_drift() {
+        let seen = vec![("a".to_string(), 2u64), ("b".to_string(), 1u64)];
+        let same = seen.clone();
+        let same_names = names(&["mcp__a__x", "mcp__b__y"]);
+        assert!(!mcp_tool_drift(&same_names, &same_names, &seen, &same));
+    }
+
+    #[test]
+    fn a_name_change_is_drift_regardless_of_generations() {
+        let seen = vec![("a".to_string(), 1u64)];
+        let fingerprint = seen.clone();
+        assert!(mcp_tool_drift(
+            &names(&["mcp__a__x"]),
+            &names(&["mcp__a__x", "mcp__a__y"]),
+            &seen,
+            &fingerprint
+        ));
+    }
+
+    #[test]
+    fn a_newly_enabled_server_is_drift_even_at_generation_zero() {
+        // The enable path creates the slot at generation 0 and start bumps
+        // it — but even a generation-0 slot must count against a fingerprint
+        // that did not carry the server at all.
+        let seen: Vec<(String, u64)> = Vec::new();
+        let fingerprint = vec![("b".to_string(), 0u64)];
+        assert!(mcp_tool_drift(
+            &[],
+            &names(&["mcp__b__y"]),
+            &seen,
+            &fingerprint
+        ));
     }
 }
 

@@ -88,18 +88,18 @@ struct ServerSlot {
 
 /// A ready slot's identity for drift checks: the tool *names* plus the slot
 /// generation (a restart with an unchanged list still bumps it, so stale
-/// adapters holding the cancelled client are caught).
+/// adapters holding the cancelled client are caught). The rebuild path
+/// fetches the tool bodies and clients separately via `servers()`.
 #[derive(Debug, Clone)]
 pub struct SlotOverview {
     pub name: String,
     pub generation: u64,
     pub tool_names: Vec<String>,
-    pub client: McpClientHandle,
 }
 
 impl ServerSlot {
     fn overview(&self) -> Option<SlotOverview> {
-        let client = self.client.as_ref()?;
+        self.client.as_ref()?;
         Some(SlotOverview {
             name: self.name.clone(),
             generation: self.generation,
@@ -108,7 +108,6 @@ impl ServerSlot {
                 .iter()
                 .map(|tool| tool.name.to_string())
                 .collect(),
-            client: Arc::clone(client),
         })
     }
 
