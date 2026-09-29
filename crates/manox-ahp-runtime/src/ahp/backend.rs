@@ -467,6 +467,13 @@ impl RuntimeBackend {
                         .map(|seeded| seeded.thread_id.clone())
                         .unwrap_or_else(|| session_id.clone());
                     for emitted in translator.on_entry(&session_id, &thread_id, &entry) {
+                        if matches!(&emitted.action, StateAction::ChatInputRequested(_)) {
+                            tracing::info!(
+                                session = %session_id,
+                                seq = entry.seq,
+                                "bridge: publishing chat/inputRequested"
+                            );
+                        }
                         host.publish(&emitted.channel, emitted.action, None);
                     }
                     // A landed assistant row changes the Q face: republish the
