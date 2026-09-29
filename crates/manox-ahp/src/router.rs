@@ -454,10 +454,12 @@ fn list_sessions(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> 
     to_value(ListSessionsResult { items, next_cursor })
 }
 
-/// `invokeChangesetOperation`: the operation must exist on the changeset's
-/// current list and the target's kind must be in its declared scopes — the
-/// wire's validation contract. Scope/target agreement is the runtime's to
-/// enforce; a mismatch here is a `-32602` before any work starts.
+/// `invokeChangesetOperation`: the target's kind must be within the kinds
+/// the router understands at this layer (`None` for changeset-scope,
+/// `resource` for a single file) — a `range` target is a `-32602` before any
+/// work starts. The operation id's existence and the resource's membership
+/// in the changeset are the runtime's to validate against the live list
+/// (this host serves exactly one operation, `revert`).
 async fn invoke_changeset_operation(inner: &Arc<Inner>, params: Value) -> Result<Value, HostError> {
     let params: ahp_types::commands::InvokeChangesetOperationParams = parse_params(params)?;
     if !matches!(

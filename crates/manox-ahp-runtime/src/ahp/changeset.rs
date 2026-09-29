@@ -221,9 +221,13 @@ fn scan_root(git: &dyn GitRunner, root: &Path) -> Result<Vec<RawFile>, String> {
         };
         let path = &field[3..];
         if matches!(x, 'R' | 'C') {
-            // The rename source rides as the next NUL field: a rename is a
-            // deletion of the old path plus the new file's entry below.
-            if let Some(from) = fields.next() {
+            // The rename/copy source rides as the next NUL field. A rename's
+            // source is gone (a deletion entry); a copy's source still
+            // exists — only the new file belongs in the changeset.
+            let from = fields.next();
+            if x == 'R'
+                && let Some(from) = from
+            {
                 raw.push(raw_file(root.join(from), String::new(), 0, 0, true));
             }
         }
@@ -323,7 +327,7 @@ fn wire_file(raw: &RawFile, reviewed: Option<bool>) -> ChangesetFile {
         diff["patch"] = Value::String(raw.patch.clone());
     }
     let mut meta = JsonObject::new();
-    if raw.patch.len() >= PATCH_CAP {
+    if raw.patch.len() > PATCH_CAP {
         meta.insert("patchTruncated".to_string(), Value::Bool(true));
     }
     ChangesetFile {
@@ -404,35 +408,58 @@ impl Engine {
 
     /// The session's catalogue entry, running the first scan when needed.
     /// `None` for a session whose directories hold no git repository.
+    ///
+    /// Two-phase like [`Engine::recompute`]: the git scan (several process
+    /// round trips) runs *outside* the session-table lock, so a first sight
+    /// on one session never stalls another session's state read.
     pub fn catalogue(&self, session_id: &str, dirs: Vec<PathBuf>) -> Option<Changeset> {
-        let mut sessions = self.sessions.lock();
-        let entry = sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionChangeset::new(dirs.clone()));
-        if entry.status == ChangesetStatus::Computing {
-            let scan = scan(&*self.git, &entry.dirs.clone());
-            match scan {
-                Ok(scan) => {
-                    entry.has_repo = scan.repos > 0;
-                    entry.files = scan
-                        .files
-                        .into_iter()
-                        .map(|raw| wire_file(&raw, None))
-                        .collect();
-                    entry.status = ChangesetStatus::Ready;
+        let needs_scan = {
+            let mut sessions = self.sessions.lock();
+            match sessions.get(session_id) {
+                Some(entry) => entry.status == ChangesetStatus::Computing,
+                None => {
+                    sessions.insert(session_id.to_string(), SessionChangeset::new(dirs.clone()));
+                    true
                 }
-                Err(message) => {
-                    entry.status = ChangesetStatus::Error;
-                    entry.error = Some(ErrorInfo {
-                        error_type: "changeset".to_string(),
-                        message,
-                        stack: None,
-                        meta: None,
-                    });
+            }
+        };
+        if needs_scan {
+            let scan = scan(&*self.git, &dirs);
+            let mut sessions = self.sessions.lock();
+            if let Some(entry) = sessions.get_mut(session_id) {
+                match scan {
+                    Ok(scan) => {
+                        entry.has_repo = scan.repos > 0;
+                        entry.files = scan
+                            .files
+                            .into_iter()
+                            .map(|raw| wire_file(&raw, None))
+                            .collect();
+                        entry.status = ChangesetStatus::Ready;
+                    }
+                    Err(message) => {
+                        entry.status = ChangesetStatus::Error;
+                        entry.error = Some(ErrorInfo {
+                            error_type: "changeset".to_string(),
+                            message,
+                            stack: None,
+                            meta: None,
+                        });
+                    }
                 }
             }
         }
-        entry.has_repo.then(|| catalogue_entry(session_id))
+        let sessions = self.sessions.lock();
+        sessions
+            .get(session_id)
+            .and_then(|entry| entry.has_repo.then(|| catalogue_entry(session_id)))
+    }
+
+    /// Drop one session's cached changeset (its directories and full patch
+    /// bodies) — the dispose path; without it the table only ever grows on a
+    /// long-running host.
+    pub fn forget(&self, session_id: &str) {
+        self.sessions.lock().remove(session_id);
     }
 
     /// The full changeset state, answered from the last scan. Unknown
@@ -443,6 +470,12 @@ impl Engine {
         }
         let sessions = self.sessions.lock();
         let entry = sessions.get(session_id)?;
+        // A session with no repository never advertised the channel; its
+        // state answers NotFound like any other absent resource — "absent",
+        // not "empty", is the honest shape (same wording as the catalogue).
+        if !entry.has_repo {
+            return None;
+        }
         // The review set is live authority: overlay it so a state read
         // between the toggle and the next recompute still shows the flags.
         let files = entry
@@ -510,24 +543,32 @@ impl Engine {
         match scan {
             Ok(scan) => {
                 entry.has_repo = scan.repos > 0;
-                let previous_patches: HashMap<&str, &str> = entry
+                // Previous patch *presence*, not just content: a deletion
+                // entry has no patch at all, and comparing it against a
+                // missing map slot would reset its review on every recompute
+                // even though nothing about it changed.
+                let previous_patches: HashMap<&str, Option<&str>> = entry
                     .files
                     .iter()
-                    .filter_map(|file| {
-                        file.edit
-                            .diff
-                            .as_ref()
-                            .and_then(|diff| diff.get("patch").and_then(Value::as_str))
-                            .map(|patch| (file.id.as_str(), patch))
+                    .map(|file| {
+                        (
+                            file.id.as_str(),
+                            file.edit
+                                .diff
+                                .as_ref()
+                                .and_then(|diff| diff.get("patch").and_then(Value::as_str)),
+                        )
                     })
                     .collect();
                 entry.files = scan
                     .files
                     .iter()
                     .map(|raw| {
-                        let unchanged = previous_patches
-                            .get(raw.id.as_str())
-                            .is_some_and(|old| *old == raw.patch);
+                        // Compare the *wire* presence: an empty patch body is
+                        // omitted on the wire, so a deletion (always
+                        // patch-less) compares equal to its previous self.
+                        let new_patch = (!raw.patch.is_empty()).then_some(raw.patch.as_str());
+                        let unchanged = previous_patches.get(raw.id.as_str()) == Some(&new_patch);
                         let reviewed = if unchanged && entry.reviewed.contains(raw.id.as_str()) {
                             Some(true)
                         } else {
@@ -646,17 +687,35 @@ impl Engine {
                 failures.push(format!("{path}: outside the session's directories"));
                 continue;
             };
-            let tracked = self
+            // "In HEAD" — not "in the index": an index-only new file
+            // (`git add` without a commit) passes ls-files but has no HEAD
+            // side, and `checkout HEAD --` fails on it. The HEAD test must
+            // use the repo-relative pathspec.
+            let Ok(rel) = abs
+                .strip_prefix(root)
+                .map(|rest| rest.to_string_lossy().into_owned())
+            else {
+                failures.push(format!("{path}: not under its repo root"));
+                continue;
+            };
+            let in_head = self
                 .git
-                .run(root, &["ls-files", "--error-unmatch", path])
+                .run(root, &["cat-file", "-e", &format!("HEAD:{rel}")])
                 .map(|out| out.success)
                 .unwrap_or(false);
-            if tracked {
-                if let Err(e) = self.git.stdout(root, &["checkout", "HEAD", "--", path]) {
+            if in_head {
+                if let Err(e) = self.git.stdout(root, &["checkout", "HEAD", "--", &rel]) {
                     failures.push(format!("{path}: {e}"));
                 }
-            } else if let Err(e) = std::fs::remove_file(&abs) {
-                failures.push(format!("{path}: {e}"));
+            } else {
+                // New relative to HEAD: unstage it first when it was added
+                // to the index (a no-op for plain untracked files), then
+                // delete the worktree copy — reverting a new file means it
+                // should not exist.
+                let _ = self.git.run(root, &["rm", "-f", "--cached", "--", &rel]);
+                if let Err(e) = std::fs::remove_file(&abs) {
+                    failures.push(format!("{path}: {e}"));
+                }
             }
         }
         if failures.is_empty() {
@@ -757,11 +816,9 @@ mod tests {
                 .catalogue("s-1", vec![PathBuf::from("/plain")])
                 .is_none()
         );
-        // First sight still creates the entry (an empty changeset), but the
-        // catalogue — the chip a client renders — stays absent: that is the
-        // honest answer for "no repository here".
-        let state = engine.state("s-1", KEY).expect("the entry exists");
-        assert!(state.files.is_empty());
+        // And the channel state answers *absent* — "no repository here" is
+        // the same shape as "no such resource", never an empty changeset.
+        assert!(engine.state("s-1", KEY).is_none());
     }
 
     #[test]
@@ -857,11 +914,18 @@ mod tests {
             "diff" if args.contains(&"--numstat") => ok("1\t1\tf.rs\n"),
             "diff" if args.contains(&"/dev/null") => ok("+delete me\n"),
             "diff" => ok(A_PATCH),
+            // `cat-file -e HEAD:<path>` decides the restore branch: the
+            // tracked file is in HEAD, the untracked one is not.
+            "cat-file" if args.iter().any(|a| a.contains("scratch")) => {
+                Err("no HEAD side".to_string())
+            }
+            "cat-file" => ok(""),
             "ls-files" if args.iter().any(|a| a.contains("scratch")) => {
                 Err("untracked".to_string())
             }
             "ls-files" => ok("f.rs\n"),
             "checkout" => ok(""),
+            "rm" => ok(""),
             _ => ok(""),
         });
         engine.catalogue("s-1", vec![work.clone()]);
@@ -905,6 +969,97 @@ mod tests {
             },
         };
         assert!(engine.invoke_revert("s-1", KEY, Some(&range)).is_err());
+    }
+
+    #[test]
+    fn revert_restores_an_index_only_new_file_by_unstaging_then_deleting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("workdir");
+        let added = work.join("added.txt");
+        std::fs::write(&added, "staged but never committed").expect("added file");
+        let root_display = work.display().to_string();
+        let checkouts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checkouts_clone = Arc::clone(&checkouts);
+        let engine = script(move |args| match args.first().copied().unwrap_or("") {
+            // The fake repo root IS the real tempdir, so the worktree delete
+            // lands on a real file.
+            "rev-parse" => ok(&format!("{root_display}\n")),
+            "status" => ok("A  added.txt\0"),
+            "diff" if args.contains(&"--numstat") => ok("1\t0\tadded.txt\n"),
+            "diff" => ok("+staged but never committed\n"),
+            // `cat-file -e HEAD:added.txt` fails: the file has no HEAD side —
+            // exactly the index-only case `ls-files` could not distinguish.
+            "cat-file" => Err("path does not exist in HEAD".to_string()),
+            "rm" => ok(""),
+            "checkout" => {
+                checkouts_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ok("")
+            }
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![work.clone()]);
+        let target = ahp_types::commands::ChangesetOperationTarget::Resource {
+            resource: format!("file://{}", added.display()),
+            side: None,
+        };
+        engine
+            .invoke_revert("s-1", KEY, Some(&target))
+            .expect("the index-only revert lands");
+        assert!(!added.exists(), "reverting a new file deletes it");
+        assert_eq!(
+            checkouts.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "checkout HEAD would fail on an index-only path; the restore must take the unstage+delete branch"
+        );
+    }
+
+    #[test]
+    fn a_copied_file_does_not_list_its_source_as_deleted() {
+        let engine = script(|args| match args.first().copied().unwrap_or("") {
+            "rev-parse" => ok("/repo\n"),
+            // `C ` carries two NUL fields: the new path, then the source.
+            "status" => ok("C  copy.rs\0original.rs\0"),
+            "diff" if args.contains(&"--numstat") => ok("5\t0\tcopy.rs\n"),
+            "diff" => ok("+copy body\n"),
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        let state = engine.state("s-1", KEY).unwrap();
+        let ids: Vec<&str> = state.files.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["file:///repo/copy.rs"],
+            "the copy's source still exists in the worktree — it is not a deletion"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_keeps_its_review_flag_across_recomputes() {
+        // A deletion entry carries no patch at all; "no patch" is its stable
+        // content, so the review flag must survive (the old patch-string
+        // comparison read the missing patch as "changed" and reset it every
+        // turn).
+        let engine = script(|args| match args.first().copied().unwrap_or("") {
+            "rev-parse" => ok("/repo\n"),
+            "status" => ok(" D f.rs\0"),
+            _ => ok(""),
+        });
+        engine.catalogue("s-1", vec![PathBuf::from("/work")]);
+        engine
+            .review("s-1", KEY, &["file:///repo/f.rs".to_string()], true)
+            .expect("the deletion entry exists");
+        let mut carried = None;
+        for (_, action) in engine.recompute("s-1") {
+            if let StateAction::ChangesetContentChanged(content) = action {
+                carried = Some(content.files[0].reviewed);
+            }
+        }
+        assert_eq!(
+            carried,
+            Some(Some(true)),
+            "an unchanged deletion keeps its review flag"
+        );
     }
 
     #[test]

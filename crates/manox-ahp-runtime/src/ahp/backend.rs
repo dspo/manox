@@ -401,7 +401,14 @@ impl RuntimeBackend {
                             for (channel, action) in
                                 super::changeset::Engine::global().recompute(&session)
                             {
-                                if let Some(host) = backend.host() {
+                                // Only channels the host has ensured (a
+                                // subscriber or a dispatch landed): the
+                                // publish *is* the store update, and folding
+                                // into a state that does not exist would
+                                // just log OutOfScope noise each turn.
+                                if let Some(host) = backend.host()
+                                    && host.has_changeset(&channel)
+                                {
                                     host.publish(&channel, action, None);
                                 }
                             }
@@ -1119,6 +1126,9 @@ impl Backend for RuntimeBackend {
 
     fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
         let _ = self.server.dispose_session("ahp", session_id);
+        // The engine caches this session's directories and full patch
+        // bodies; a disposed session must not keep them.
+        super::changeset::Engine::global().forget(session_id);
         Ok(())
     }
 

@@ -553,3 +553,32 @@ async fn list_sessions_pages_and_root_notifications_flow() {
         other => panic!("expected a summary change, got {other:?}"),
     }
 }
+
+/// A changeset channel is state-bearing and subscribable: its snapshot rides
+/// the same envelope path as every other channel. This is the regression for
+/// the snapshot arm that panicked (`unreachable!` in `Channel::uri`) on the
+/// first subscribe — the feature's primary read path.
+#[tokio::test]
+async fn subscribing_to_the_changeset_channel_answers_a_snapshot() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+    // The seeded session's changeset channel.
+    let uri = "ahp-changeset:/s-1/uncommitted".to_string();
+    let (result, _sub) = client.subscribe(uri).await.expect("subscribes");
+    let snapshot = result.snapshot.expect("changeset channels carry state");
+    assert!(
+        matches!(
+            snapshot.state,
+            ahp_types::state::SnapshotState::Changeset(_)
+        ),
+        "the snapshot is the changeset state"
+    );
+}

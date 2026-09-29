@@ -59,7 +59,10 @@ impl Channel {
             Self::Chat(id) => chat::uri(id),
             Self::Terminal(id) => terminal::uri(id),
             Self::Mcp(key) => format!("mcp://{key}"),
-            Self::Changeset(_) => unreachable!("changeset channels carry their full URI"),
+            // Changeset channels carry their full URI verbatim (the parse
+            // arm stored it) — `uri()` runs on the snapshot path, so a
+            // panic here would kill the connection task mid-subscribe.
+            Self::Changeset(uri) => uri.clone(),
             Self::Extension(uri) => uri.clone(),
         }
     }
