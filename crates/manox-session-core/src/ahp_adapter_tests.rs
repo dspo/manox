@@ -92,6 +92,11 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             parent_id: p,
             ..
         }
+        | E::Question {
+            id: i,
+            parent_id: p,
+            ..
+        }
         | E::Stop {
             id: i,
             parent_id: p,
@@ -574,6 +579,9 @@ fn folds_answer_none_for_absent_inputs() {
 mod dispatch {
     use super::install;
     use super::uninstall;
+    use super::{assistant, delta, seed_session, stamp, tool_call, user};
+    use ahp_types::version::PROTOCOL_VERSION;
+    use manox_harness::session::SessionTreeEntry as E;
     use crate::agent_server::AgentServer;
     use ahp_types::actions::{
         ActionOrigin, ChatPendingMessageRemovedAction, ChatToolCallConfirmedAction,
@@ -610,6 +618,130 @@ mod dispatch {
             .await
             .expect("session opens");
         (server, backend)
+    }
+
+    /// The full host assembly (AhpRuntime over a gateway), a connected SDK
+    /// client subscribed to the session's chat channel, and the journal of a
+    /// turn whose AskUserQuestion is still open — the exact shape the desktop
+    /// attaches to when it answers an ask.
+    async fn answered_ask_fixture() -> (
+        Arc<manox_ahp_runtime::ahp::runtime::AhpRuntime>,
+        ahp::Client,
+        ahp::SessionSubscription,
+    ) {
+        let cwd = manox_agent::paths::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let server = Arc::new(AgentServer::new_without_store_watcher(cwd.clone()));
+        let gateway = Arc::new(crate::ahp_gateway::GatewayRuntime::new(Arc::clone(&server)));
+        let runtime = manox_ahp_runtime::ahp::runtime::AhpRuntime::new(gateway, cwd);
+        // The journal the engine writes for an open ask: content, the
+        // pending-approval tool call, and the question row itself.
+        let _ = std::fs::remove_file(
+            manox_agent::thread_store::global_sessions_dir().join("s-ask.jsonl"),
+        );
+        let events = vec![
+            ("e1", user("用 AskUserQuestion 随便问我个问题")),
+            ("e2", delta("working")),
+            ("e3", assistant("settled", 10, 5)),
+            (
+                "e4",
+                E::Stop {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    reason: Some("tool_use".into()),
+                },
+            ),
+            ("e5", tool_call()),
+            (
+                "e6",
+                E::Question {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    kind: "request".into(),
+                    auth_id: "toolu_probe".into(),
+                    payload: json!({
+                        "toolName": "AskUserQuestion",
+                        "summary": "Clarifying question",
+                        "input": {"questions": [
+                            {"header": "方向", "multiSelect": false,
+                             "options": [{"label": "A", "description": "a"},
+                                         {"label": "B", "description": "b"}]},
+                        ]},
+                    }),
+                },
+            ),
+        ];
+        seed_session("s-ask", "thread-ask", "/", events).await;
+
+        let transport = runtime.inproc();
+        let client = ahp::Client::connect(transport, ahp::ClientConfig::default())
+            .await
+            .expect("client connects");
+        client
+            .initialize(
+                "probe".to_string(),
+                vec![PROTOCOL_VERSION.to_string()],
+                vec![ahp_types::common::ROOT_RESOURCE_URI.to_string()],
+            )
+            .await
+            .expect("initializes");
+        let (result, sub) = client
+            .subscribe(manox_ahp::channels::chat::uri("s-ask"))
+            .await
+            .expect("subscribes");
+        assert!(result.snapshot.is_some(), "the fold answers a snapshot");
+        (runtime, client, sub)
+    }
+
+    /// A dispatched answer must fold into the host chat (and broadcast the
+    /// completion back) — the desktop's card retirement rides exactly that
+    /// echo. Found on the device: every answer reduced to NoOp on the host
+    /// and the card never cleared.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatched_answer_folds_into_the_host_chat() {
+        let _guards = install();
+        let (_runtime, client, mut sub) = answered_ask_fixture().await;
+        let (_runtime, client, mut sub) = answered_ask_fixture().await;
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "方向".to_string(),
+            ahp_types::state::ChatInputAnswer::Submitted(
+                ahp_types::state::ChatInputAnswered {
+                    value: ahp_types::state::ChatInputAnswerValue::Selected(
+                        ahp_types::state::ChatInputSelectedAnswerValue {
+                            value: "A".to_string(),
+                            freeform_values: None,
+                        },
+                    ),
+                },
+            ),
+        );
+        client
+            .dispatch(
+                manox_ahp::channels::chat::uri("s-ask"),
+                StateAction::ChatInputCompleted(ahp_types::actions::ChatInputCompletedAction {
+                    request_id: "toolu_probe".to_string(),
+                    response: ahp_types::state::ChatInputResponseKind::Accept,
+                    answers: Some(answers),
+                }),
+            )
+            .await
+            .expect("dispatch accepted");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
+            .await
+            .expect("an echo arrives")
+            .expect("subscription open");
+        match event {
+            ahp::SubscriptionEvent::Action(envelope) => match &envelope.action {
+                StateAction::ChatInputCompleted(done) => {
+                    assert_eq!(done.request_id, "toolu_probe");
+                }
+                other => panic!("expected the inputCompleted echo, got {other:?}"),
+            },
+            other => panic!("expected an action, got {other:?}"),
+        }
+        uninstall();
     }
 
     fn origin() -> ActionOrigin {

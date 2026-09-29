@@ -413,9 +413,53 @@ impl Inner {
             let outcome = self.store.write().apply(&channel, &action);
             // Extension actions have no upstream reducer by construction, so a
             // no-op there is normal; a standard action that does not apply is a
-            // translation bug and must be loud.
+            // translation bug and must be loud. For a chat answer the fold
+            // state decides whether the client's card can ever clear — dump
+            // the active turn's ask inventory with the verdict.
             if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
-                tracing::warn!(channel = uri, action = %tag, "host action reduced to {outcome:?}");
+                let mut asks = String::new();
+                if let StateAction::ChatInputCompleted(done) = &action {
+                    asks = crate::channels::chat::id(uri)
+                        .and_then(|id| {
+                            let store = self.store.read();
+                            store.chat(id).cloned()
+                        })
+                        .map(|chat| {
+                            let open_asks: Vec<String> = chat
+                                .active_turn
+                                .iter()
+                                .flat_map(|turn| turn.response_parts.iter())
+                                .filter_map(|p| match p {
+                                    ahp_types::state::ResponsePart::InputRequest(input) => {
+                                        Some(format!(
+                                            "{} answered={}",
+                                            input.request.id,
+                                            input.response.is_some()
+                                        ))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            match &chat.active_turn {
+                                Some(turn) => format!(
+                                    "active={} settled={} open_asks={open_asks:?} want={}",
+                                    turn.id,
+                                    chat.turns.len(),
+                                    done.request_id
+                                ),
+                                None => format!(
+                                    "active=None settled={} want={}",
+                                    chat.turns.len(),
+                                    done.request_id
+                                ),
+                            }
+                        })
+                        .unwrap_or_else(|| " chat state absent".to_string());
+                }
+                tracing::warn!(
+                    channel = uri, action = %tag, asks = %asks,
+                    "host action reduced to {outcome:?}"
+                );
             }
         } else {
             tracing::warn!(channel = uri, "host action on an unknown channel scheme");
