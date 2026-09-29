@@ -566,22 +566,15 @@ impl Translator {
                 };
                 self.close_turn(&chat, entry, outcome, &mut out);
             }
-            JournalWireEvent::Stop { reason } => {
-                // The loop's own edge: it closes a turn the engine abandoned
-                // without a `turnFinish`, and is silent otherwise.
-                if self.open.is_some() {
-                    if let Some(text) = reason.as_deref() {
-                        self.push_note(
-                            &chat,
-                            entry,
-                            format!("stopped: {text}"),
-                            json!({"stop": {"reason": text}}),
-                            &mut out,
-                        );
-                    }
-                    self.close_turn(&chat, entry, Outcome::Complete, &mut out);
-                }
-            }
+            // A `stop` row is per-assistant-message metadata — the model's own
+            // stop reason (end_turn / tool_use / max_tokens / refusal /
+            // cancelled) — never turn lifecycle: `tool_use` and `max_tokens`
+            // are the loop's continue edges (the tool / continuation rows
+            // follow them), and a turn end always carries its `turnFinish`
+            // right behind the last stop. Closing the turn here split every
+            // agentic turn per tool round and minted a "stopped: …" notice
+            // per round.
+            JournalWireEvent::Stop { .. } => {}
             JournalWireEvent::Error { message } => self.close_turn(
                 &chat,
                 entry,
