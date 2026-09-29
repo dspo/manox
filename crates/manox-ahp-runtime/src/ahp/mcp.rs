@@ -16,6 +16,7 @@
 //! headers, keychain keys — so no OAuth challenge ever reaches the AHP face).
 
 use ahp_types::actions::SessionMcpServerStateChangedAction;
+use ahp_types::common::JsonObject;
 use ahp_types::state::{
     AhpMcpUiHostCapabilities, ErrorInfo, McpServerCustomization, McpServerCustomizationApps,
     McpServerErrorState, McpServerReadyState, McpServerState, McpServerStoppedState,
@@ -31,7 +32,10 @@ pub fn channel_uri(server: &str) -> String {
 
 /// The side-channel advertisement for a ready server: `tools/*` and
 /// `resources/*` are proxied (the flags are presence markers — the empty
-/// object means "served").
+/// object means "served"). In 0.9.0 this Apps capability set is the only
+/// defined carrier for a side-channel advertisement — manox borrows its
+/// `serverTools`/`serverResources` flags (and only those; it is not an Apps
+/// host and never serves `ui/*`), a point recorded in the PR's Assumptions.
 fn ready_apps() -> McpServerCustomizationApps {
     McpServerCustomizationApps {
         capabilities: AhpMcpUiHostCapabilities {
@@ -50,12 +54,19 @@ pub fn customizations() -> Vec<McpServerCustomization> {
     let Some(registry) = manox_agent::mcp::try_global() else {
         return Vec::new();
     };
+    let disabled = manox_agent::settings::mcp_disabled();
     registry
         .slots()
         .into_iter()
         .map(|slot| {
             let ready = slot.state == manox_agent::mcp::ServerState::Ready;
             let channel = ready.then(|| channel_uri(&slot.name));
+            // The host publishes the resolved enablement so a client can
+            // tell "the user disabled this" (stopped + enabled:false) from
+            // "it failed" (error / stopped with enabled:true).
+            let enablement = Some(vec![ahp_types::state::CustomizationEnablement::Global {
+                enabled: !disabled.contains(&slot.name),
+            }]);
             McpServerCustomization {
                 id: slot.name.clone(),
                 uri: slot.source_uri,
@@ -63,7 +74,7 @@ pub fn customizations() -> Vec<McpServerCustomization> {
                 icons: None,
                 range: None,
                 meta: None,
-                enablement: None,
+                enablement,
                 state: ahp_state(&slot.state),
                 channel,
                 mcp_app: ready.then(ready_apps),
@@ -87,9 +98,11 @@ pub fn state_changed(
 }
 
 /// The session's `serverTools`: the tool inventory of every ready server,
-/// flattened. The MCP tool set is exactly what the model sees through the
-/// `mcp__<server>__<tool>` bridge, so the list a client renders here matches
-/// what a turn can actually call.
+/// flattened. Each entry carries the **bridged** id — `mcp__<server>__<tool>`,
+/// the name the model dispatches against and unique across servers — and the
+/// originating server in `_meta`, so two servers exposing the same upstream
+/// tool name stay distinguishable. (The bridged id is the wire contract's
+/// "unique tool identifier"; the upstream name is not unique.)
 pub fn server_tools() -> Vec<ToolDefinition> {
     let Some(registry) = manox_agent::mcp::try_global() else {
         return Vec::new();
@@ -97,14 +110,25 @@ pub fn server_tools() -> Vec<ToolDefinition> {
     registry
         .servers()
         .into_iter()
-        .flat_map(|server| server.tools.into_iter().map(|tool| tool_definition(&tool)))
+        .flat_map(|server| {
+            let name = server.name.clone();
+            server
+                .tools
+                .into_iter()
+                .map(move |tool| tool_definition(&name, &tool))
+        })
         .collect()
 }
 
-/// `rmcp::model::Tool` → wire `ToolDefinition`.
-fn tool_definition(tool: &rmcp::model::Tool) -> ToolDefinition {
+/// `rmcp::model::Tool` → wire `ToolDefinition`, keyed by the bridged id.
+fn tool_definition(server: &str, tool: &rmcp::model::Tool) -> ToolDefinition {
+    let mut meta = JsonObject::new();
+    meta.insert(
+        "server".to_string(),
+        serde_json::Value::String(server.to_string()),
+    );
     ToolDefinition {
-        name: tool.name.to_string(),
+        name: manox_agent::mcp::napi_tool::bridged_tool_name(server, &tool.name),
         title: tool.title.clone(),
         description: tool.description.as_ref().map(|d| d.to_string()),
         input_schema: Some(serde_json::Value::Object((*tool.input_schema).clone())),
@@ -122,7 +146,7 @@ fn tool_definition(tool: &rmcp::model::Tool) -> ToolDefinition {
                 idempotent_hint: a.idempotent_hint,
                 open_world_hint: a.open_world_hint,
             }),
-        meta: None,
+        meta: Some(meta),
     }
 }
 
@@ -203,8 +227,15 @@ mod tests {
         .unwrap();
         let wire_schema = serde_json::Value::Object(schema.clone());
         let tool = rmcp::model::Tool::new("read_file", "Read a file", Arc::new(schema));
-        let wire = tool_definition(&tool);
-        assert_eq!(wire.name, "read_file");
+        let wire = tool_definition("fs", &tool);
+        assert_eq!(wire.name, "mcp__fs__read_file");
+        assert_eq!(
+            wire.meta
+                .as_ref()
+                .and_then(|m| m.get("server"))
+                .and_then(serde_json::Value::as_str),
+            Some("fs")
+        );
         assert_eq!(wire.description.as_deref(), Some("Read a file"));
         assert_eq!(wire.input_schema, Some(wire_schema));
         assert_eq!(wire.output_schema, None);

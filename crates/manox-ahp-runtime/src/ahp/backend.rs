@@ -59,41 +59,55 @@ async fn proxy_mcp_method(
     let invalid = |err: serde_json::Error| HostError::InvalidParams(err.to_string());
     let upstream = |err: rmcp::service::ServiceError| HostError::Backend(err.to_string());
     let encode = |err: serde_json::Error| HostError::Backend(err.to_string());
-    match method {
-        "tools/list" => {
-            let p: Option<mcp_model::PaginatedRequestParams> =
-                serde_json::from_value(params.clone()).map_err(invalid)?;
-            let result = peer.list_tools(p).await.map_err(upstream)?;
-            serde_json::to_value(result).map_err(encode)
+    // The proxy runs on a synchronous seam (`block_in_place`); rmcp's
+    // convenience methods carry no default timeout, so a stuck upstream
+    // would park the worker and hang the client's request forever. Every
+    // forwarded call rides the same explicit deadline.
+    let deadline = std::time::Duration::from_secs(30);
+    tokio::time::timeout(deadline, async {
+        match method {
+            "tools/list" => {
+                let p: Option<mcp_model::PaginatedRequestParams> =
+                    serde_json::from_value(params.clone()).map_err(invalid)?;
+                let result = peer.list_tools(p).await.map_err(upstream)?;
+                serde_json::to_value(result).map_err(encode)
+            }
+            "tools/call" => {
+                let p: mcp_model::CallToolRequestParams =
+                    serde_json::from_value(params.clone()).map_err(invalid)?;
+                let result = peer.call_tool(p).await.map_err(upstream)?;
+                serde_json::to_value(result).map_err(encode)
+            }
+            "resources/list" => {
+                let p: Option<mcp_model::PaginatedRequestParams> =
+                    serde_json::from_value(params.clone()).map_err(invalid)?;
+                let result = peer.list_resources(p).await.map_err(upstream)?;
+                serde_json::to_value(result).map_err(encode)
+            }
+            "resources/templates/list" => {
+                let p: Option<mcp_model::PaginatedRequestParams> =
+                    serde_json::from_value(params.clone()).map_err(invalid)?;
+                let result = peer.list_resource_templates(p).await.map_err(upstream)?;
+                serde_json::to_value(result).map_err(encode)
+            }
+            "resources/read" => {
+                let p: mcp_model::ReadResourceRequestParams =
+                    serde_json::from_value(params.clone()).map_err(invalid)?;
+                let result = peer.read_resource(p).await.map_err(upstream)?;
+                serde_json::to_value(result).map_err(encode)
+            }
+            other => Err(HostError::MethodNotFound(format!(
+                "{other} is not in the served mcp:// capability set"
+            ))),
         }
-        "tools/call" => {
-            let p: mcp_model::CallToolRequestParams =
-                serde_json::from_value(params.clone()).map_err(invalid)?;
-            let result = peer.call_tool(p).await.map_err(upstream)?;
-            serde_json::to_value(result).map_err(encode)
-        }
-        "resources/list" => {
-            let p: Option<mcp_model::PaginatedRequestParams> =
-                serde_json::from_value(params.clone()).map_err(invalid)?;
-            let result = peer.list_resources(p).await.map_err(upstream)?;
-            serde_json::to_value(result).map_err(encode)
-        }
-        "resources/templates/list" => {
-            let p: Option<mcp_model::PaginatedRequestParams> =
-                serde_json::from_value(params.clone()).map_err(invalid)?;
-            let result = peer.list_resource_templates(p).await.map_err(upstream)?;
-            serde_json::to_value(result).map_err(encode)
-        }
-        "resources/read" => {
-            let p: mcp_model::ReadResourceRequestParams =
-                serde_json::from_value(params.clone()).map_err(invalid)?;
-            let result = peer.read_resource(p).await.map_err(upstream)?;
-            serde_json::to_value(result).map_err(encode)
-        }
-        other => Err(HostError::MethodNotFound(format!(
-            "{other} is not in the served mcp:// capability set"
-        ))),
-    }
+    })
+    .await
+    .map_err(|_| {
+        HostError::Backend(format!(
+            "mcp upstream timed out after {}s: {method}",
+            deadline.as_secs()
+        ))
+    })?
 }
 
 /// One session's folded state plus the journal tail it was taken at.
@@ -1377,22 +1391,26 @@ impl Backend for RuntimeBackend {
             // enablement by descending specificity, and the spec names
             // `enablement[0]` decisive). manox's registry is process-global,
             // so a session- or workspace-scoped decision degrades to the
-            // same global toggle — recorded in the PR's Assumptions.
+            // same global toggle — recorded in the PR's Assumptions. An
+            // absent or unrecognised decision is refused, not defaulted:
+            // this is a write path, and guessing "enable" would fold a state
+            // the client did not ask for.
             StateAction::SessionCustomizationToggled(toggled) => {
                 let Some(session_id) = session::id(channel) else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
                 use ahp_types::state::CustomizationEnablement;
-                let enabled = toggled
-                    .enablement
-                    .first()
-                    .map(|decision| match decision {
-                        CustomizationEnablement::Global { enabled }
-                        | CustomizationEnablement::Workspace { enabled, .. }
-                        | CustomizationEnablement::Session { enabled } => *enabled,
-                        CustomizationEnablement::Unknown(_) => true,
-                    })
-                    .unwrap_or(true);
+                let decision = match toggled.enablement.first() {
+                    Some(CustomizationEnablement::Global { enabled })
+                    | Some(CustomizationEnablement::Workspace { enabled, .. })
+                    | Some(CustomizationEnablement::Session { enabled }) => Some(*enabled),
+                    Some(CustomizationEnablement::Unknown(_)) | None => None,
+                };
+                let Some(enabled) = decision else {
+                    return DispatchOutcome::Rejected(
+                        "the toggle carries no recognisable enablement decision".to_string(),
+                    );
+                };
                 match self
                     .server
                     .mcp_set_enabled(session_id, &toggled.id, enabled)
@@ -2290,6 +2308,28 @@ mod mcp_dispatch_tests {
         // specificity); manox degrades the scope to global but honors the
         // value.
         assert_eq!(*runtime.enabled.lock(), vec![("fs".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_toggle_without_a_recognisable_decision_is_refused_not_defaulted() {
+        let backend = backend(McpOnlyRuntime::serving());
+        let outcome = backend.dispatch(
+            "ahp-session:/s-1",
+            &StateAction::SessionCustomizationToggled(
+                ahp_types::actions::SessionCustomizationToggledAction {
+                    id: "github".to_string(),
+                    enablement: Vec::new(),
+                },
+            ),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 6,
+            },
+        );
+        assert!(
+            matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("no recognisable")),
+            "an empty decision is a refusal, never a defaulted enable: {outcome:?}"
+        );
     }
 
     #[test]

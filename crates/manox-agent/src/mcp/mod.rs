@@ -86,7 +86,32 @@ struct ServerSlot {
     generation: u64,
 }
 
+/// A ready slot's identity for drift checks: the tool *names* plus the slot
+/// generation (a restart with an unchanged list still bumps it, so stale
+/// adapters holding the cancelled client are caught).
+#[derive(Debug, Clone)]
+pub struct SlotOverview {
+    pub name: String,
+    pub generation: u64,
+    pub tool_names: Vec<String>,
+    pub client: McpClientHandle,
+}
+
 impl ServerSlot {
+    fn overview(&self) -> Option<SlotOverview> {
+        let client = self.client.as_ref()?;
+        Some(SlotOverview {
+            name: self.name.clone(),
+            generation: self.generation,
+            tool_names: self
+                .tools
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect(),
+            client: Arc::clone(client),
+        })
+    }
+
     fn view(&self) -> SlotView {
         SlotView {
             name: self.name.clone(),
@@ -127,6 +152,28 @@ impl McpRegistry {
     /// config's canonical order.
     pub fn slots(&self) -> Vec<SlotView> {
         self.slots.read().iter().map(ServerSlot::view).collect()
+    }
+
+    /// Cheap per-ready-slot overview: names and client identity without the
+    /// (schema-heavy) tool bodies — the drift pre-check a per-prompt refresh
+    /// pays for, instead of deep-cloning every tool list.
+    pub fn ready_overview(&self) -> Vec<SlotOverview> {
+        self.slots
+            .read()
+            .iter()
+            .filter_map(ServerSlot::overview)
+            .collect()
+    }
+
+    /// The highest slot generation alive — bumps on every start/stop, so a
+    /// restart with an unchanged tool list still reads as drift.
+    pub fn max_generation(&self) -> u64 {
+        self.slots
+            .read()
+            .iter()
+            .map(|slot| slot.generation)
+            .max()
+            .unwrap_or(0)
     }
 
     /// One server's lifecycle view, by config key.

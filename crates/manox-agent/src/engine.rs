@@ -2284,17 +2284,26 @@ async fn refresh_embedder_tools(
     }
 }
 
+/// Per-session watermark of the registry generation at the last MCP tool
+/// rebuild. A restart with an unchanged tool list still bumps the registry's
+/// generation — the mounted adapters would keep calling the *cancelled*
+/// client — so the watermark, not the names, is what catches that drift.
+#[cfg(feature = "mcp")]
+static MCP_MOUNT_WATERMARKS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// Re-mount the `mcp__`-prefixed tools when the registry's inventory has
 /// drifted from the mounted table — a start/stop (from the AHP face or the
 /// settings panel) landed since assembly. Same per-prompt shape as
-/// [`refresh_embedder_tools`]: the registry is consulted on every run and
+/// [`refresh_embedder_tools`]: the registry is consulted on every run, the
+/// drift check is names + generation watermark (no tool-body clones), and
 /// only real drift pays for a rebuild.
 ///
 /// A rebuilt set changes the request's tool schema, which transparently
 /// breaks the provider prefix cache once — accepted; history is never
 /// rewritten.
 #[cfg(feature = "mcp")]
-async fn refresh_mcp_tools(session: &mut AgentSession, gate: &Arc<ApprovalGate>) {
+async fn refresh_mcp_tools(session: &mut AgentSession, thread_id: &str, gate: &Arc<ApprovalGate>) {
     let Some(registry) = crate::mcp::try_global() else {
         return;
     };
@@ -2302,6 +2311,35 @@ async fn refresh_mcp_tools(session: &mut AgentSession, gate: &Arc<ApprovalGate>)
     // Same name contract `build_tools` mounted (`mcp__<server>__<tool>`), so
     // prefix-stripping the old set cannot disturb a built-in or a client
     // tool.
+    let old_mcp: Vec<String> = mounted
+        .iter()
+        .filter(|t| t.name().starts_with("mcp__"))
+        .map(|t| t.name().to_string())
+        .collect();
+    let overview = registry.ready_overview();
+    let mut new_mcp: Vec<String> = overview
+        .iter()
+        .flat_map(|slot| {
+            slot.tool_names
+                .iter()
+                .map(|tool| crate::mcp::napi_tool::bridged_tool_name(&slot.name, tool))
+        })
+        .collect();
+    new_mcp.sort();
+    let watermark = registry.max_generation();
+    let seen = MCP_MOUNT_WATERMARKS
+        .lock()
+        .unwrap()
+        .get(thread_id)
+        .copied()
+        .unwrap_or(0);
+    let mut sorted_old = old_mcp.clone();
+    sorted_old.sort();
+    if sorted_old == new_mcp && seen == watermark {
+        // No drift: skip the rebuild entirely (and the tool-body clones it
+        // would pay).
+        return;
+    }
     let mut fresh: Vec<Arc<dyn PiAgentTool>> = Vec::new();
     for server in registry.servers() {
         for tool in server.tools {
@@ -2313,15 +2351,6 @@ async fn refresh_mcp_tools(session: &mut AgentSession, gate: &Arc<ApprovalGate>)
             fresh.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate)))
                 as Arc<dyn PiAgentTool>);
         }
-    }
-    let old_mcp: Vec<String> = mounted
-        .iter()
-        .filter(|t| t.name().starts_with("mcp__"))
-        .map(|t| t.name().to_string())
-        .collect();
-    let new_mcp: Vec<String> = fresh.iter().map(|t| t.name().to_string()).collect();
-    if old_mcp == new_mcp {
-        return;
     }
     let mut tools = Vec::with_capacity(mounted.len() + fresh.len());
     let mut injected = false;
@@ -2342,15 +2371,28 @@ async fn refresh_mcp_tools(session: &mut AgentSession, gate: &Arc<ApprovalGate>)
         tracing::warn!(error = %err, "mcp tool refresh rejected; using the existing table");
         return;
     }
+    MCP_MOUNT_WATERMARKS
+        .lock()
+        .unwrap()
+        .insert(thread_id.to_string(), watermark);
     // A narrowed active selection was computed against the OLD set: carry
-    // the non-MCP names over and substitute the fresh ones.
+    // the non-MCP names over verbatim, keep every MCP name the user had
+    // active (a deliberate narrowing must survive a refresh), and add only
+    // the *newly appeared* MCP tools.
     if let Some(active) = session.active_tool_names() {
+        let active_set: std::collections::HashSet<&str> =
+            active.iter().map(String::as_str).collect();
+        let old_set: std::collections::HashSet<&str> = old_mcp.iter().map(String::as_str).collect();
         let mut next: Vec<String> = active
             .iter()
             .filter(|n| !n.starts_with("mcp__"))
             .cloned()
             .collect();
-        next.extend(new_mcp);
+        for name in &new_mcp {
+            if active_set.contains(name.as_str()) || !old_set.contains(name.as_str()) {
+                next.push(name.clone());
+            }
+        }
         let mut cur_sorted = active.clone();
         let mut next_sorted = next.clone();
         cur_sorted.sort_unstable();
@@ -4128,7 +4170,7 @@ async fn run_actor(
                 // snapshot.
                 refresh_embedder_tools(&mut session, &thread_id, &state.gate).await;
                 #[cfg(feature = "mcp")]
-                refresh_mcp_tools(&mut session, &state.gate).await;
+                refresh_mcp_tools(&mut session, &thread_id, &state.gate).await;
                 // K5: the prompt's user entry is on disk before the run
                 // starts — persisted at Submit acceptance (the gateway
                 // awaited the append before its receipt and passes the

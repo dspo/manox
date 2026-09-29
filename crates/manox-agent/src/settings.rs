@@ -10,6 +10,7 @@
 //! which owns the `ui_language` key in the same file independently.
 
 use anyhow::{Context as _, Result};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -18,14 +19,19 @@ use crate::paths;
 static CONTEXT_OPT: OnceLock<ContextOptimizationSettings> = OnceLock::new();
 static EDIT: OnceLock<EditSettings> = OnceLock::new();
 static SIDE_CALLS: OnceLock<SideCallsSettings> = OnceLock::new();
-static MCP_DISABLED: OnceLock<Vec<String>> = OnceLock::new();
+/// Unlike the other tables, this one is **mutable at runtime**: the AHP
+/// enablement toggle writes it after every decision, so a read-modify-write
+/// cycle must see the previous toggle, not the startup snapshot. (A
+/// `OnceLock` here silently dropped every write after init — the second
+/// toggle in a session resurrected the first one on next launch.)
+static MCP_DISABLED: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
 /// Cache the optimization and side-call tables at startup.
 pub fn init_optimization() {
     let s = load();
     let _ = CONTEXT_OPT.set(s.context_optimization);
     let _ = SIDE_CALLS.set(s.side_calls);
-    let _ = MCP_DISABLED.set(s.mcp.disabled.clone());
+    *MCP_DISABLED.write() = s.mcp.disabled.clone();
     let _ = EDIT.set(s.edit);
 }
 
@@ -47,7 +53,7 @@ pub fn side_calls() -> SideCallsSettings {
 /// Cached list of disabled MCP server names (settings `[mcp] disabled`).
 /// Read by `mcp::init` at startup; empty when not yet initialized.
 pub fn mcp_disabled() -> Vec<String> {
-    MCP_DISABLED.get().cloned().unwrap_or_default()
+    MCP_DISABLED.read().clone()
 }
 
 /// Persist the disabled-MCP-server list to `settings.toml` and refresh the
@@ -56,7 +62,7 @@ pub fn set_mcp_disabled(names: Vec<String>) -> Result<()> {
     let mut settings = load();
     settings.mcp.disabled = names.clone();
     save(&settings)?;
-    let _ = MCP_DISABLED.set(names);
+    *MCP_DISABLED.write() = names;
     Ok(())
 }
 

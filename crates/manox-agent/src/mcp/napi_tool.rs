@@ -28,6 +28,18 @@ fn sanitize_id_segment(segment: &str) -> String {
         .collect()
 }
 
+/// The bridged tool id, `mcp__<server>__<tool>` — the name the model
+/// dispatches against and the one identifier that is unique across servers.
+/// Shared with the AHP face so a client-rendered tool list names the same
+/// tools a turn can call.
+pub fn bridged_tool_name(server: &str, tool: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        sanitize_id_segment(server),
+        sanitize_id_segment(tool)
+    )
+}
+
 pub struct PiMcpTool {
     /// Cached `mcp__<server>__<tool>` id; returned by `name()` without leaking.
     name: String,
@@ -39,11 +51,7 @@ pub struct PiMcpTool {
 
 impl PiMcpTool {
     pub fn new(server_name: String, tool: rmcp::model::Tool, client: McpClientHandle) -> Self {
-        let name = format!(
-            "mcp__{}__{}",
-            sanitize_id_segment(&server_name),
-            sanitize_id_segment(&tool.name)
-        );
+        let name = bridged_tool_name(&server_name, &tool.name);
         let description = tool
             .description
             .as_ref()

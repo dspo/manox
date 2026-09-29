@@ -426,9 +426,20 @@ impl SessionRuntime for GatewayRuntime {
     ) -> Result<(), RuntimeError> {
         #[cfg(feature = "mcp")]
         {
-            // Persist first: the user's decision survives even when the live
-            // start then fails (a failed start is a visible Error slot the
-            // client can retry, not a silently reverted toggle).
+            // Validate the id against the MCP face *before* touching the
+            // settings file: a refusal must not leave a phantom name in
+            // `[mcp] disabled` that would silently disable a future server.
+            // A real server whose live start then fails keeps its decision —
+            // a failed start is a visible Error slot the client can retry,
+            // not a silently reverted toggle.
+            let known = manox_agent::mcp::try_global()
+                .is_some_and(|registry| registry.slot(id).is_some())
+                || manox_agent::mcp::load_merged_config()
+                    .mcp_servers
+                    .contains_key(id);
+            if !known {
+                return Err(RuntimeError::new(format!("unknown MCP server: {id}")));
+            }
             let mut disabled = manox_agent::settings::mcp_disabled();
             if enabled {
                 disabled.retain(|name| name != id);
