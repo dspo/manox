@@ -7,20 +7,26 @@
 //   1. task → model: a completed task steers a summary into the agent's
 //      context at the next tool-call boundary, shaped by the task's head/tail
 //      line preference (the model can still fetch the full output via
-//      `BashOutput`, whose read cursor is untouched).
-//   2. run → task: an aborted run kills its background tasks; a settled run
-//      keeps them so a long task survives across turns. The caller kills
-//      everything on session teardown via [`BackgroundManager::kill_all`].
-//   3. task → events: a `BackgroundEvent` stream for UI / audit consumers.
+//      `BashOutput`, whose read cursor is untouched); every stdout line is
+//      emitted to the observer as an `Output` lifecycle event.
+//   2. run → task: an aborted run kills this manager's tasks with cause
+//      `RunAbort`; a settled run keeps them so a long task survives across
+//      turns. Session teardown goes through the host task center, whose stop
+//      hook lands here as `kill` — first-wins settlement keeps the host's
+//      terminal status.
+//   3. task → host: the [`TaskObserver`] receives `Spawned` / `Output` /
+//      `Settled` emissions directly — one lifecycle vocabulary, no mirror.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::core::BackgroundTaskRegistry;
 use crate::core::coding_agent::AgentSession;
 use crate::core::harness::{HarnessListener, HarnessSubscription};
 use crate::core::types::AgentMessage;
-use tokio::sync::broadcast;
+use crate::ext::tasks::{
+    Settlement, SettlementCause, SettlementKind, StopHandle, TaskFamily, TaskObserver,
+};
 
 use super::background::{BackgroundRegistry, TaskStatusInfo};
 
@@ -58,33 +64,13 @@ fn status_tail_bytes(shape: &OutputShape) -> usize {
     }
 }
 
-/// Lifecycle events of a background task, for UI / audit consumers.
-#[derive(Debug, Clone)]
-pub enum BackgroundEvent {
-    Spawned {
-        id: crate::core::TaskId,
-        command: String,
-    },
-    Completed {
-        id: crate::core::TaskId,
-        exit_code: Option<i32>,
-    },
-    Killed {
-        id: crate::core::TaskId,
-    },
-    Failed {
-        id: crate::core::TaskId,
-        reason: String,
-    },
-}
-
 /// Orchestrates background tasks against one agent session.
 ///
 /// Not `Clone`-cheap by design: one manager per session. `spawn` goes
 /// through the registry but also registers the task with this run, watches
 /// for completion, steers a summary into the bound session, and emits
-/// events. Without a bound steerer the task still runs and emits events —
-/// only the model injection is skipped.
+/// lifecycle events to the observer. Without a bound steerer the task still
+/// runs and emits — only the model injection is skipped.
 pub struct BackgroundManager {
     pub(crate) registry: Arc<BackgroundRegistry>,
     /// How a completion summary reaches the model (`HarnessHandle::steer`).
@@ -94,10 +80,18 @@ pub struct BackgroundManager {
     /// Tokio handle captured at construction, used to spawn the abort
     /// cleanup from the listener (which may run on any thread).
     runtime: Option<tokio::runtime::Handle>,
-    event_tx: broadcast::Sender<BackgroundEvent>,
-    /// Tasks owned by this manager, with their output-shaping preference;
-    /// killed together on abort / teardown.
+    /// Tasks owned by this manager awaiting settlement, with their
+    /// output-shaping preference. Removed at settlement time: by the
+    /// watcher on a natural completion, by the kill pass (`kill_all`) on
+    /// an abort/teardown, and by the watcher's killed branch after a
+    /// single-task kill. A task absent here is settled or dead.
     tasks: Arc<Mutex<HashMap<crate::core::TaskId, OutputShape>>>,
+    /// Cause recorded by kill sites (user stop / run abort / teardown)
+    /// before killing; the watcher settles killed tasks with it instead of
+    /// a natural completion.
+    killed: Arc<Mutex<HashMap<crate::core::TaskId, SettlementCause>>>,
+    observer: Mutex<Option<Arc<dyn TaskObserver>>>,
+    self_weak: Weak<BackgroundManager>,
     /// Lifecycle subscription; dropped with the manager. Guarded so the
     /// manager can be shared behind an `Arc` (a bash tool holds it) while
     /// still attaching to a session.
@@ -105,16 +99,23 @@ pub struct BackgroundManager {
 }
 
 impl BackgroundManager {
-    pub fn new(registry: Arc<BackgroundRegistry>) -> Self {
-        let (event_tx, _) = broadcast::channel(64);
-        BackgroundManager {
+    pub fn new(registry: Arc<BackgroundRegistry>) -> Arc<Self> {
+        Arc::new_cyclic(|weak| BackgroundManager {
             registry,
             steerer: Arc::new(Mutex::new(None)),
             runtime: tokio::runtime::Handle::try_current().ok(),
-            event_tx,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            killed: Arc::new(Mutex::new(HashMap::new())),
+            observer: Mutex::new(None),
+            self_weak: weak.clone(),
             _lifecycle: Arc::new(Mutex::new(None)),
-        }
+        })
+    }
+
+    /// Bind the lifecycle sink. Spawns before this call emit nothing; the
+    /// host binds it during assembly, before any tool can run.
+    pub fn set_observer(&self, observer: Arc<dyn TaskObserver>) {
+        *self.observer.lock().expect("observer lock poisoned") = Some(observer);
     }
 
     /// Bind an agent session: steer completions into it and cancel this
@@ -129,7 +130,7 @@ impl BackgroundManager {
         }));
         let registry = Arc::clone(&self.registry);
         let tasks = Arc::clone(&self.tasks);
-        let event_tx = self.event_tx.clone();
+        let killed = Arc::clone(&self.killed);
         // Refresh the handle in case construction happened outside a runtime;
         // the listener itself may run on any thread.
         let runtime = self
@@ -140,11 +141,12 @@ impl BackgroundManager {
             if matches!(event, crate::core::harness::HarnessEvent::Abort { .. }) {
                 let registry = Arc::clone(&registry);
                 let tasks = Arc::clone(&tasks);
-                let event_tx = event_tx.clone();
+                let killed = Arc::clone(&killed);
                 match &runtime {
                     Some(runtime) => {
                         runtime.spawn(async move {
-                            kill_all_tasks(&registry, &tasks, &event_tx).await;
+                            kill_all_tasks(&registry, &tasks, &killed, SettlementCause::RunAbort)
+                                .await;
                         });
                     }
                     None => tracing::warn!(
@@ -158,15 +160,14 @@ impl BackgroundManager {
     }
 
     /// Start a background task under this manager and watch it to completion.
+    /// Escalated (unconfined) path.
     pub fn spawn(
         &self,
         command: &str,
         cwd: &std::path::Path,
         shape: OutputShape,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
-        // Bare spawn: used for escalated background tasks (no confinement).
-        let id = self.registry.spawn(command, cwd)?;
-        self.track_and_observe(id, command, shape)
+        self.spawn_impl(command, cwd, shape, false)
     }
 
     /// Spawn a background task through the registry's sandbox wrapper (when
@@ -178,71 +179,144 @@ impl BackgroundManager {
         cwd: &std::path::Path,
         shape: OutputShape,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
-        let id = self.registry.spawn_sandboxed(command, cwd)?;
-        self.track_and_observe(id, command, shape)
+        self.spawn_impl(command, cwd, shape, true)
     }
 
-    /// Register the task with this run, emit the spawned event, and arm the
-    /// completion observer (steer a summary / emit Completed exactly once).
-    fn track_and_observe(
+    /// Common spawn core: line-event spawn, lifecycle registration, and the
+    /// completion watcher.
+    fn spawn_impl(
         &self,
-        id: crate::core::TaskId,
         command: &str,
+        cwd: &std::path::Path,
         shape: OutputShape,
+        sandboxed: bool,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
+        let observer = self
+            .observer
+            .lock()
+            .expect("observer lock poisoned")
+            .clone();
+        let id = if sandboxed {
+            self.registry.spawn_with_line_events(
+                command,
+                cwd,
+                Box::new({
+                    let observer = observer.clone();
+                    move |id, line| {
+                        if let Some(obs) = &observer {
+                            obs.on_output(&id.0, line);
+                        }
+                    }
+                }),
+                Box::new(|_, _| {}),
+            )?
+        } else {
+            self.registry.spawn_escalated_with_line_events(
+                command,
+                cwd,
+                Box::new({
+                    let observer = observer.clone();
+                    move |id, line| {
+                        if let Some(obs) = &observer {
+                            obs.on_output(&id.0, line);
+                        }
+                    }
+                }),
+                Box::new(|_, _| {}),
+            )?
+        };
         self.tasks
             .lock()
             .expect("tasks lock poisoned")
             .insert(id.clone(), shape);
-        let _ = self.event_tx.send(BackgroundEvent::Spawned {
-            id: id.clone(),
-            command: command.to_string(),
-        });
+        if let Some(obs) = &observer {
+            obs.on_spawned(
+                &id.0,
+                TaskFamily::BackgroundBash,
+                &format!("background bash: {command}"),
+                self.stop_handle(&id.0),
+            );
+        }
 
         let registry = Arc::clone(&self.registry);
         let steerer = Arc::clone(&self.steerer);
-        let event_tx = self.event_tx.clone();
         let tasks = Arc::clone(&self.tasks);
+        let killed = Arc::clone(&self.killed);
         let tid = id.clone();
         tokio::spawn(async move {
             // Event-driven: the drain task notifies the moment the exit is
             // recorded, so no polling interval delays the completion.
             if registry.wait_exit(&tid).await.is_err() {
-                let _ = event_tx.send(BackgroundEvent::Failed {
-                    id: tid.clone(),
-                    reason: "task disappeared before exit".into(),
-                });
+                if let Some(obs) = &observer {
+                    obs.on_settled(
+                        &tid.0,
+                        &Settlement::new(SettlementKind::Failed, SettlementCause::Natural)
+                            .with_failure_summary(Some("task disappeared before exit".into())),
+                    );
+                }
+                return;
+            }
+            // First-wins witness: a kill site (user stop / run abort /
+            // teardown) drained the task's entry and recorded the cause, so
+            // the watcher settles with that cause and must not steer a
+            // completion summary into the session.
+            if let Some(cause) = killed.lock().expect("killed lock poisoned").remove(&tid) {
+                tasks.lock().expect("tasks lock poisoned").remove(&tid);
+                if let Some(obs) = &observer {
+                    obs.on_settled(&tid.0, &Settlement::new(SettlementKind::Stopped, cause));
+                }
                 return;
             }
             let status = match registry.status(&tid, status_tail_bytes(&shape)) {
                 Ok(status) => status,
                 Err(e) => {
-                    let _ = event_tx.send(BackgroundEvent::Failed {
-                        id: tid.clone(),
-                        reason: e.to_string(),
-                    });
+                    if let Some(obs) = &observer {
+                        obs.on_settled(
+                            &tid.0,
+                            &Settlement::new(SettlementKind::Failed, SettlementCause::Natural)
+                                .with_failure_summary(Some(e.to_string())),
+                        );
+                    }
                     return;
                 }
             };
-            // Exactly-once: `kill_all` (abort / teardown) drains the map
-            // first, so a killed task must not steer a "completed" summary
-            // into the session.
             if let Some(shape) = tasks.lock().expect("tasks lock poisoned").remove(&tid) {
                 let steerer = steerer.lock().expect("steerer lock poisoned").clone();
-                finish_task(&tid, &status, shape, steerer.as_ref(), &event_tx);
+                let settlement =
+                    Settlement::new(SettlementKind::Completed, SettlementCause::Natural)
+                        .with_exit_code(status.exit_code.flatten());
+                if let Some(steer) = steerer {
+                    steer(AgentMessage::user(format_summary(&tid, &status, shape)));
+                }
+                if let Some(obs) = &observer {
+                    obs.on_settled(&tid.0, &settlement);
+                }
             }
         });
         Ok(id)
     }
 
-    /// Cancel every task this manager owns and emit `Killed` for each.
-    pub async fn kill_all(&self) {
-        kill_all_tasks(&self.registry, &self.tasks, &self.event_tx).await;
+    /// Cancel every task this manager owns with an explicit cause.
+    pub async fn kill_all(&self, cause: SettlementCause) {
+        kill_all_tasks(&self.registry, &self.tasks, &self.killed, cause).await;
     }
 
-    /// Kill one task synchronously (user-facing stop). The task's exit path
-    /// emits `Killed` exactly once.
+    /// Kill one task synchronously (user-facing stop). The completion watcher
+    /// settles the task with the recorded cause; first-wins keeps any
+    /// terminal status the host task center already pushed.
     pub fn kill(&self, id: &crate::core::TaskId) {
+        self.kill_with_cause(id, SettlementCause::UserStop);
+    }
+
+    /// Kill one task with the stopping side's explicit cause. The cause map
+    /// is first-wins, matching `MonitorManager`: a stop racing a run abort
+    /// keeps the first label.
+    pub fn kill_with_cause(&self, id: &crate::core::TaskId, cause: SettlementCause) {
+        self.killed
+            .lock()
+            .expect("killed lock poisoned")
+            .entry(id.clone())
+            .or_insert(cause);
         let _ = self.registry.kill_sync(id);
     }
 
@@ -255,9 +329,16 @@ impl BackgroundManager {
         self.registry.status(id, tail_bytes)
     }
 
-    /// Subscribe to background events; dropping the receiver unsubscribes.
-    pub fn subscribe(&self) -> broadcast::Receiver<BackgroundEvent> {
-        self.event_tx.subscribe()
+    /// The kill path for one task id, for the lifecycle `Spawned` emission:
+    /// forwards the stopping side's cause so the kill site records it.
+    fn stop_handle(&self, id: &str) -> StopHandle {
+        let weak = self.self_weak.clone();
+        let tid = crate::core::TaskId(id.to_string());
+        Arc::new(move |cause| {
+            if let Some(manager) = weak.upgrade() {
+                manager.kill_with_cause(&tid, cause);
+            }
+        })
     }
 
     /// Test-only injection point for a recording steerer without a session.
@@ -265,26 +346,14 @@ impl BackgroundManager {
     pub(crate) fn set_test_steerer(&self, f: impl Fn(AgentMessage) + Send + Sync + 'static) {
         *self.steerer.lock().expect("steerer lock poisoned") = Some(Arc::new(f));
     }
-}
 
-/// Steer a completion summary into the bound session and emit the event.
-fn finish_task(
-    id: &crate::core::TaskId,
-    status: &TaskStatusInfo,
-    shape: OutputShape,
-    steerer: Option<&Steerer>,
-    event_tx: &broadcast::Sender<BackgroundEvent>,
-) {
-    if let Some(steer) = steerer {
-        steer(AgentMessage::user(format_summary(id, status, shape)));
+    /// Test-only injection point for a recording observer.
+    #[cfg(test)]
+    pub(crate) fn set_test_observer(&self, observer: Arc<dyn TaskObserver>) {
+        self.set_observer(observer);
     }
-    let _ = event_tx.send(BackgroundEvent::Completed {
-        id: id.clone(),
-        exit_code: status.exit_code.flatten(),
-    });
 }
 
-/// Build the model-facing completion notice.
 fn format_summary(id: &crate::core::TaskId, status: &TaskStatusInfo, shape: OutputShape) -> String {
     let code = match status.exit_code {
         Some(Some(code)) => format!("exit code {code}"),
@@ -307,13 +376,24 @@ fn format_summary(id: &crate::core::TaskId, status: &TaskStatusInfo, shape: Outp
 async fn kill_all_tasks(
     registry: &BackgroundRegistry,
     tasks: &Mutex<HashMap<crate::core::TaskId, OutputShape>>,
-    event_tx: &broadcast::Sender<BackgroundEvent>,
+    killed: &Mutex<HashMap<crate::core::TaskId, SettlementCause>>,
+    cause: SettlementCause,
 ) {
-    let tasks: Vec<(crate::core::TaskId, OutputShape)> =
-        tasks.lock().expect("tasks lock poisoned").drain().collect();
-    for (id, _shape) in tasks {
+    // Drain: a killed task's bookkeeping leaves the map here, so a later
+    // kill pass never re-touches (and re-GC-refreshes) historical ids.
+    let drained: Vec<crate::core::TaskId> = tasks
+        .lock()
+        .expect("tasks lock poisoned")
+        .drain()
+        .map(|(id, _)| id)
+        .collect();
+    for id in drained {
+        killed
+            .lock()
+            .expect("killed lock poisoned")
+            .entry(id.clone())
+            .or_insert(cause);
         let _ = registry.kill(&id).await;
-        let _ = event_tx.send(BackgroundEvent::Killed { id });
     }
 }
 
@@ -322,10 +402,11 @@ mod tests {
     use super::*;
     use crate::bash::test_helpers::wait_for_steered;
     use crate::core::types::ContentBlock;
+    use crate::ext::tasks::TaskLifecycle;
     use std::path::Path;
     use std::time::Duration;
 
-    fn new_manager() -> BackgroundManager {
+    fn new_manager() -> Arc<BackgroundManager> {
         BackgroundManager::new(Arc::new(BackgroundRegistry::new()))
     }
 
@@ -363,16 +444,17 @@ mod tests {
         assert!(!summary.contains("Recent output"));
     }
 
+    /// A spawn emits Spawned + Output lines + exactly one Settled, and the
+    /// completion summary reaches the steerer.
     #[tokio::test]
-    async fn spawn_emits_events_and_completion_steers() {
+    async fn spawn_emits_lifecycle_and_completion_steers() {
         let manager = new_manager();
-        // Inject a recording steerer (tests run without an agent session).
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
         let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = Arc::clone(&seen);
-        let steerer: Steerer = Arc::new(move |m| seen2.lock().unwrap().push(m));
-        *manager.steerer.lock().unwrap() = Some(steerer);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
 
-        let mut rx = manager.subscribe();
         let id = manager
             .spawn(
                 "echo hello; sleep 0.1",
@@ -381,22 +463,41 @@ mod tests {
             )
             .unwrap();
 
-        // Blocking receives let the async watcher run; bound each wait.
-        let mut saw_spawned = false;
-        let mut saw_completed = false;
-        for _ in 0..10 {
-            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(BackgroundEvent::Spawned { .. })) => saw_spawned = true,
-                Ok(Ok(BackgroundEvent::Completed { .. })) => {
-                    saw_completed = true;
-                    break;
-                }
-                Ok(Ok(_)) => {}
-                _ => break,
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let settled = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| matches!(ev, TaskLifecycle::Settled { id: sid, .. } if sid == &id.0));
+            if settled || tokio::time::Instant::now() >= deadline {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(saw_spawned, "spawned event observed");
-        assert!(saw_completed, "completed event observed");
+        let events = observer.events.lock().unwrap().clone();
+        assert!(
+            events
+                .iter()
+                .any(|ev| matches!(ev, TaskLifecycle::Spawned { .. })),
+            "spawned event observed: {events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |ev| matches!(ev, TaskLifecycle::Output { line, .. } if line.contains("hello"))
+            ),
+            "output lines observed: {events:?}"
+        );
+        let settled: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                TaskLifecycle::Settled { settlement, .. } => Some(settlement.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
+        assert!(matches!(settled[0].kind, SettlementKind::Completed));
 
         // The completion summary reached the steerer.
         let messages = seen.lock().unwrap();
@@ -413,72 +514,82 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_all_cancels_tasks_and_emits_killed() {
+    async fn kill_all_cancels_tasks_and_settles_killed() {
         let manager = new_manager();
-        let mut rx = manager.subscribe();
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
         let id = manager
             .spawn("sleep 30", Path::new("/tmp"), OutputShape::default())
             .unwrap();
         assert!(manager.registry.status(&id, 0).unwrap().is_running);
 
-        manager.kill_all().await;
+        manager.kill_all(SettlementCause::Teardown).await;
 
-        let mut saw_killed = false;
-        for _ in 0..10 {
-            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-                Ok(Ok(BackgroundEvent::Killed { .. })) => {
-                    saw_killed = true;
-                    break;
-                }
-                Ok(Ok(_)) => {}
-                _ => break,
-            }
-        }
-        assert!(saw_killed, "killed event observed");
-        // The registry entry lingers until GC; the process exit is recorded
-        // asynchronously by the drain task, so wait for it.
-        let mut cancelled = false;
-        for _ in 0..50 {
-            if !manager.registry.status(&id, 0).unwrap().is_running {
-                cancelled = true;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let settled = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| matches!(ev, TaskLifecycle::Settled { id: sid, .. } if sid == &id.0));
+            if settled || tokio::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(cancelled, "task cancelled");
+        let settled: Vec<_> = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match ev {
+                TaskLifecycle::Settled { settlement, .. } => Some(settlement.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
+        assert_eq!(settled[0].cause, SettlementCause::Teardown);
+        assert!(matches!(settled[0].kind, SettlementKind::Stopped));
+        // The kill path releases its bookkeeping: neither the task table
+        // nor the cause map may retain the killed id (a later kill pass
+        // would otherwise re-touch — and re-GC-refresh — historical ids).
+        assert!(manager.tasks.lock().unwrap().is_empty());
+        assert!(manager.killed.lock().unwrap().is_empty());
     }
 
     /// Regression: a task killed via `kill_all` must neither steer a
-    /// completion summary nor emit `Completed` — the exactly-once witness in
-    /// the watcher drains the same set.
+    /// completion summary nor settle Completed — the cause recorded by the
+    /// kill site routes the settlement to Stopped.
     #[tokio::test]
     async fn killed_task_does_not_steer_or_complete() {
         let manager = new_manager();
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
         let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = Arc::clone(&seen);
-        let steerer: Steerer = Arc::new(move |m| seen2.lock().unwrap().push(m));
-        *manager.steerer.lock().unwrap() = Some(steerer);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
 
-        let mut rx = manager.subscribe();
         let _id = manager
             .spawn("sleep 30", Path::new("/tmp"), OutputShape::default())
             .unwrap();
-        manager.kill_all().await;
+        manager.kill_all(SettlementCause::RunAbort).await;
         // Give the watcher a poll cycle to observe the exit.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut saw_completed = false;
-        for _ in 0..5 {
-            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
-                Ok(Ok(BackgroundEvent::Completed { .. })) => {
-                    saw_completed = true;
-                    break;
-                }
-                Ok(Ok(_)) => {}
-                _ => break,
-            }
-        }
-        assert!(!saw_completed, "killed task must not emit Completed");
+        let settled: Vec<_> = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match ev {
+                TaskLifecycle::Settled { settlement, .. } => Some(settlement.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
+        assert_eq!(settled[0].cause, SettlementCause::RunAbort);
+        assert!(matches!(settled[0].kind, SettlementKind::Stopped));
         assert!(
             seen.lock().unwrap().is_empty(),
             "killed task must not steer a completion summary"
@@ -580,6 +691,8 @@ mod tests {
     #[tokio::test]
     async fn spawn_steers_shaped_summary() {
         let manager = new_manager();
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
         let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let seen2 = Arc::clone(&seen);
         manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
