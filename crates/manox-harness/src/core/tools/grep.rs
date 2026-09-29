@@ -64,8 +64,10 @@ impl AgentTool for GrepTool {
                     "description": "Directory or file to search (default: cwd)"
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "glob": {
                     "type": "string",
@@ -100,7 +102,7 @@ impl AgentTool for GrepTool {
                     "description": "Stop searching each file after this many matches (per-file limit)"
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "cwd"]
         })
     }
 
@@ -150,7 +152,7 @@ impl AgentTool for GrepTool {
         };
 
         // Resolve the effective cwd and the search path against it.
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
         let search_path = resolve_path(path_str, &cwd);
 

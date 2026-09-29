@@ -107,11 +107,13 @@ impl AgentTool for EditTool {
                     "description": PATCH_DOC
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call; relative paths in the patch resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 }
             },
-            "required": ["patch"]
+            "required": ["patch", "cwd"]
         })
     }
 
@@ -137,7 +139,7 @@ impl AgentTool for EditTool {
             .expect("hashline clipboard poisoned")
             .clear();
 
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
 
         // All-or-nothing execution: every section is fully prepared (read,

@@ -45,15 +45,6 @@ pub struct BashExecRequest<'a> {
 pub trait BashOperations: Send + Sync {
     /// Execute a command, returning the aggregated output.
     async fn exec(&self, request: BashExecRequest<'_>) -> Result<CommandResult, ExecutionError>;
-
-    /// The backend's current working directory, when it keeps one across
-    /// calls (a persistent shell). `None` for one-shot backends — their
-    /// directory is fully described by each request's `cwd`. The bash tool
-    /// writes this back as the session's sticky cwd after a run, so a `cd`
-    /// inside a command moves the default directory for every tool.
-    async fn current_dir(&self) -> Option<std::path::PathBuf> {
-        None
-    }
 }
 
 pub struct BashTool {
@@ -116,15 +107,17 @@ impl AgentTool for BashTool {
                     "description": "The command to execute"
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in milliseconds (default: 120000)"
                 }
             },
-            "required": ["command"]
+            "required": ["command", "cwd"]
         })
     }
 
@@ -178,7 +171,7 @@ impl BashTool {
         };
 
         let timeout = Duration::from_millis(timeout_ms);
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
         let result = match &self.operations {
             None => ctx
@@ -333,7 +326,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "echo hi"}),
+                serde_json::json!({"command": "echo hi", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx_with_env(env),
             )
@@ -397,7 +390,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "echo hi", "timeout": 5000}),
+                serde_json::json!({"command": "echo hi", "cwd": [""], "timeout": 5000}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -409,7 +402,7 @@ mod tests {
         assert_eq!(calls.len(), 1);
         // The prefix is folded into the command before dispatch.
         assert_eq!(calls[0].0, "export A=1 echo hi");
-        // Without an explicit `cwd` the call inherits the context baseline.
+        // An empty anchor keeps the context baseline as the call directory.
         assert_eq!(calls[0].1, ctx.cwd().to_path_buf());
         assert_eq!(calls[0].2, Some(Duration::from_millis(5000)));
     }
@@ -435,7 +428,7 @@ mod tests {
         let _ = tool
             .execute_with_progress(
                 "c1",
-                serde_json::json!({"command": "echo hi"}),
+                serde_json::json!({"command": "echo hi", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx_with_env(Arc::new(MockEnv {
                     result: CommandResult {

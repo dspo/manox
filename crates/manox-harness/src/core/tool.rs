@@ -25,6 +25,8 @@ pub mod nudge {
     pub const POLL_LOOP: u8 = 1 << 2;
     /// Bit 3: gh run watch / gh pr checks --watch → background shown.
     pub const GH_WATCH: u8 = 1 << 3;
+    /// Bit 4: bare `cd` in a Bash command → pass the location via `cwd`.
+    pub const CD_PREFERENCE: u8 = 1 << 4;
 
     /// Check whether `flag` has been shown in this session.
     pub fn has(nudge_flags: &std::sync::Mutex<u8>, flag: u8) -> bool {
@@ -62,16 +64,16 @@ pub struct ToolState {
     /// again produces no change increments the count so the edit tool can
     /// escalate out of a spin.
     pub noop_edits: std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u32)>>,
-    /// The directory the last tool call ran in — the `sticky cwd` every path
-    /// tool inherits when its call omits an explicit `cwd`. Advanced by
-    /// `path_utils::resolve_effective_cwd` (and by the bash shell's
-    /// post-command directory); `None` until the first tool call resolves, so
-    /// resolution starts from the session cwd.
+    /// The directory the last non-empty `cwd` anchor set — the `sticky cwd`
+    /// every path tool inherits as the base for anchor/route resolution.
+    /// Advanced only by `path_utils::resolve_effective_cwd` when a call's
+    /// anchor element is non-empty; `None` until then, so resolution starts
+    /// from the session cwd.
     pub sticky_cwd: std::sync::Mutex<Option<std::path::PathBuf>>,
     /// Per-session nudge flags: each bit marks a nudge type that has been shown
     /// this session, so nudges fire at most once per session. Bit 0 = grep
     /// native tool preference, bit 1 = sleep nudge, bit 2 = poll loop nudge,
-    /// bit 3 = gh watch nudge.
+    /// bit 3 = gh watch nudge, bit 4 = cd preference nudge.
     pub nudge_flags: std::sync::Mutex<u8>,
 }
 

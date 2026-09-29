@@ -74,6 +74,12 @@ impl AgentTool for SelectorReadTool {
                     "type": "string",
                     "description": "Path to the file, optionally with a line selector after the last colon (e.g. `src/a.rs:50-100`, `src/a.rs:5-16,960-973`, `src/a.rs:raw`)"
                 },
+                "cwd": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::core::tools::path_utils::CWD_SCHEMA_DOC
+                },
                 "offset": {
                     "type": "integer",
                     "description": "Line number to start reading from (1-based)"
@@ -83,7 +89,7 @@ impl AgentTool for SelectorReadTool {
                     "description": "Maximum number of lines to read"
                 }
             },
-            "required": ["path"]
+            "required": ["path", "cwd"]
         })
     }
 
@@ -104,8 +110,12 @@ impl AgentTool for SelectorReadTool {
             return self.inner.execute(tool_call_id, params, signal, ctx).await;
         };
         // Selector reads ignore offset/limit — the selector is the explicit
-        // range statement (old manox semantics).
-        let path = ctx.cwd().join(base);
+        // range statement (old manox semantics). The base resolves through
+        // the same cwd chain the kernel tool uses.
+        let base_dir =
+            crate::core::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
+                .map_err(ToolError::InvalidArguments)?;
+        let path = base_dir.join(base);
         let raw = ctx
             .env()
             .read_file(&path, None, None)
@@ -229,7 +239,7 @@ mod tests {
     }
 
     fn params(path: &str) -> JsonValue {
-        serde_json::json!({ "path": path })
+        serde_json::json!({ "path": path, "cwd": [""] })
     }
 
     async fn read(dir: &std::path::Path, path: &str) -> String {
@@ -317,7 +327,7 @@ mod tests {
         let err = tool
             .execute(
                 "t1",
-                serde_json::json!({ "path": "a.txt:xyz" }),
+                serde_json::json!({ "path": "a.txt:xyz", "cwd": [""] }),
                 CancellationToken::new(),
                 &ctx,
             )

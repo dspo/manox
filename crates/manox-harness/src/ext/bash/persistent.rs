@@ -1,10 +1,12 @@
 // Persistent shell backend for the bash tool.
 //
-// A `brush_core::Shell` lives for the lifetime of this backend: `cd`,
-// `export`, and function definitions persist across commands, so the model
-// does not have to re-pin the cwd on every call. Commands are serialized
-// through the one shell; each external command runs in its own process group
-// so cancel/timeout can reap the whole tree.
+// A `brush_core::Shell` lives for the lifetime of this backend: `export`
+// and function definitions persist across commands, and each exec re-pins
+// the shell to its request's `cwd` (the harness resolves the `[anchor,
+// ...route]` array per call), so a `cd` inside a command lasts only for
+// that command. Commands are serialized through the one shell; each
+// external command runs in its own process group so cancel/timeout can reap
+// the whole tree.
 
 use std::io::Read as _;
 use std::path::PathBuf;
@@ -205,15 +207,6 @@ impl BashOperations for PersistentShellOperations {
             Outcome::TimedOut => Err(ExecutionError::Timeout(request.timeout.unwrap_or_default())),
             Outcome::Cancelled => Err(ExecutionError::Aborted),
         }
-    }
-
-    /// The shell's live working directory — what a `cd` inside the last
-    /// command left behind. `None` before the first command initializes the
-    /// shell, when the seeded `base_cwd` is still the truth.
-    async fn current_dir(&self) -> Option<PathBuf> {
-        let guard = Arc::clone(&self.shell);
-        let lock = guard.lock().await;
-        lock.as_ref().map(|sh| sh.working_dir().to_path_buf())
     }
 }
 

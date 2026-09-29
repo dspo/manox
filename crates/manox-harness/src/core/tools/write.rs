@@ -39,15 +39,17 @@ impl AgentTool for WriteTool {
                     "description": "Path to the file"
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "content": {
                     "type": "string",
                     "description": "Content to write"
                 }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content", "cwd"]
         })
     }
 
@@ -65,7 +67,7 @@ impl AgentTool for WriteTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("content is required".into()))?;
 
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
         let path = cwd.join(path_str);
 

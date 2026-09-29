@@ -548,6 +548,7 @@ mod tests {
 
 ## Tool preferences
 Prefer Grep/Glob/Ls over raw grep/find/ls in Bash — no sandbox, no approval in read-only mode, bounded structured output. Use Bash shell commands only when the tool's feature set is insufficient (pipes, complex flags, chained commands).
+Every file-system and Bash call must carry `cwd` as an array `[anchor, ...route]`: the first element re-anchors the session's default directory (`""` keeps the current one — anchor it to the repo/worktree root once and leave it there), the remaining elements only locate this call. Express the target in `path` relative to the anchor rather than stacking route elements. Never `cd` inside a Bash command to reach a directory — `cd` does not move the session's working directory; pass `cwd`.
 
 ## Concurrency model
 Foreground tool calls (Bash without `run_in_background`) block this turn. Background Bash (`run_in_background: true`) returns immediately and wakes the idle session on completion — never use `sleep` or poll loops to wait for a background task. `Monitor` streams events continuously for long-running observation (log tail, event stream). Use `BashOutput` to fetch full output and `TaskStop` to cancel.

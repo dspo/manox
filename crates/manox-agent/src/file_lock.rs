@@ -140,11 +140,16 @@ impl FileLockedTool {
     fn resolve_path(&self, params: &serde_json::Value, ctx: &dyn ToolContext) -> Option<PathBuf> {
         let raw = params.get("path")?.as_str()?;
         let p = Path::new(raw);
-        Some(if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            ctx.cwd().join(p)
-        })
+        if p.is_absolute() {
+            return Some(p.to_path_buf());
+        }
+        // The lock key rides the same `cwd` `[anchor, ...route]` resolution
+        // the tool will perform. A malformed cwd falls open to the session
+        // cwd here — key derivation only; the real path resolution inside
+        // the tool still fails closed.
+        let cwd = manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd"))
+            .unwrap_or_else(|_| ctx.cwd().to_path_buf());
+        Some(cwd.join(p))
     }
 }
 

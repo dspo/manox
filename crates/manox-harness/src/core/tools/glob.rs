@@ -60,8 +60,10 @@ impl AgentTool for GlobTool {
                     "description": "Directory to search (default: cwd)"
                 },
                 "cwd": {
-                    "type": "string",
-                    "description": "Working directory for this call; relative paths resolve against it. Omit to reuse the previous tool call's directory (the session's start directory initially)."
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": crate::tools::path_utils::CWD_SCHEMA_DOC
                 },
                 "limit": {
                     "type": "integer",
@@ -82,7 +84,7 @@ impl AgentTool for GlobTool {
                     "description": "Sort results by modification time, ascending or descending"
                 }
             },
-            "required": ["pattern"]
+            "required": ["pattern", "cwd"]
         })
     }
 
@@ -105,7 +107,7 @@ impl AgentTool for GlobTool {
         let kind = params["kind"].as_str();
         let sort_by_mtime = params["sort_by_mtime"].as_str();
 
-        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
+        let cwd = crate::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
             .map_err(ToolError::InvalidArguments)?;
         let search_path = resolve_path(path_str, &cwd);
 
@@ -296,7 +298,7 @@ mod tests {
         let result = GlobTool
             .execute(
                 "t1",
-                serde_json::json!({ "pattern": "*.rs", "path": "target.rs" }),
+                serde_json::json!({ "pattern": "*.rs", "path": "target.rs", "cwd": [""] }),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -318,5 +320,9 @@ mod tests {
         let schema = tool.parameters_schema();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v.as_str() == Some("pattern")));
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("cwd")),
+            "cwd is required"
+        );
     }
 }

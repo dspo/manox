@@ -1676,7 +1676,7 @@ mod tests {
         let result = tool
             .execute(
                 "t1",
-                serde_json::json!({ "path": "only-in-project.txt" }),
+                serde_json::json!({ "path": "only-in-project.txt", "cwd": [""] }),
                 signal,
                 &*ctx,
             )
@@ -2028,7 +2028,7 @@ mod tests {
         let result = read
             .execute(
                 "t1",
-                serde_json::json!({ "path": "only-in-project.txt" }),
+                serde_json::json!({ "path": "only-in-project.txt", "cwd": [""] }),
                 tokio_util::sync::CancellationToken::new(),
                 &*ctx,
             )
@@ -2100,7 +2100,7 @@ mod tests {
         let result = read
             .execute(
                 "t1",
-                serde_json::json!({ "path": "marker.txt" }),
+                serde_json::json!({ "path": "marker.txt", "cwd": [""] }),
                 tokio_util::sync::CancellationToken::new(),
                 &*ctx,
             )
@@ -2163,7 +2163,7 @@ mod tests {
         let result = read
             .execute(
                 "t1",
-                serde_json::json!({ "path": "only-in-work.txt" }),
+                serde_json::json!({ "path": "only-in-work.txt", "cwd": [""] }),
                 tokio_util::sync::CancellationToken::new(),
                 &*ctx,
             )

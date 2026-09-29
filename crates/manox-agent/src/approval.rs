@@ -500,18 +500,16 @@ impl ApprovalGatedTool {
 
     /// The nearest existing ancestor directory of the call's write target —
     /// the root an approved escalation covers. Resolved with the same chain
-    /// the tool itself will use (explicit `cwd` → sticky → session cwd),
-    /// read-only: the fence must not advance the sticky cwd.
+    /// the tool itself will use (the `cwd` `[anchor, ...route]` array, peeked
+    /// read-only so the fence neither advances the sticky cwd nor re-anchors
+    /// it).
     fn call_target_root(
         &self,
         params: &serde_json::Value,
         ctx: &dyn ToolContext,
     ) -> Option<std::path::PathBuf> {
-        let cwd = manox_harness::tools::path_utils::peek_effective_cwd(
-            ctx,
-            params.get("cwd").and_then(|v| v.as_str()),
-        )
-        .ok()?;
+        let cwd =
+            manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd")).ok()?;
         let target = match self.inner.name() {
             "Write" => {
                 let path = params.get("path")?.as_str()?;
@@ -550,14 +548,12 @@ impl ApprovalGatedTool {
         ctx: &dyn ToolContext,
     ) -> Result<(), ToolError> {
         let deny = || Err(fs_denial(DENY_OUT_OF_WORKSPACE));
-        // The call's effective cwd — the same chain the tool itself will
-        // resolve (explicit `cwd` → sticky → session cwd), peeked read-only
-        // so the fence does not advance the sticky cwd. A missing directory
-        // is a denial: the tool would fail the same way.
-        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(
-            ctx,
-            params.get("cwd").and_then(|v| v.as_str()),
-        ) {
+        // The call's effective cwd — the same `cwd` `[anchor, ...route]`
+        // resolution the tool itself will perform, peeked read-only so the
+        // fence does not advance the sticky cwd. A missing directory or a
+        // malformed argument is a denial: the tool would fail the same way.
+        let cwd = match manox_harness::tools::path_utils::peek_effective_cwd(ctx, params.get("cwd"))
+        {
             Ok(cwd) => cwd,
             Err(_) => return deny(),
         };
@@ -899,7 +895,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -948,7 +944,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -963,7 +959,7 @@ mod tests {
         let err = tool2
             .execute(
                 "c2",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1027,7 +1023,7 @@ mod tests {
                 "c1",
                 serde_json::json!({
                     "path": target,
-                    "cwd": wt.to_string_lossy(),
+                    "cwd": [wt.to_string_lossy()],
                     "content": "x",
                 }),
                 CancellationToken::new(),
@@ -1076,7 +1072,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"path": target, "content": "x"}),
+                serde_json::json!({"path": target, "cwd": [""], "content": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1093,7 +1089,7 @@ mod tests {
         let result = tool
             .execute(
                 "c2",
-                serde_json::json!({"patch": patch}),
+                serde_json::json!({"patch": patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1133,7 +1129,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"patch": ok_patch}),
+                serde_json::json!({"patch": ok_patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1147,7 +1143,7 @@ mod tests {
         let err = tool
             .execute(
                 "c2",
-                serde_json::json!({"patch": escape_patch}),
+                serde_json::json!({"patch": escape_patch, "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )

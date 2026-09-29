@@ -68,7 +68,7 @@ async fn read_edit_reedit_roundtrip() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "main.rs"}),
+            json!({"cwd": [""], "path": "main.rs"}),
             CancellationToken::new(),
             &ctx,
         )
@@ -87,7 +87,12 @@ async fn read_edit_reedit_roundtrip() {
         tag
     );
     let edit_out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!edit_out.is_error, "edit failed: {}", text_of(&edit_out));
@@ -103,7 +108,7 @@ async fn read_edit_reedit_roundtrip() {
     let edit_out2 = EditTool::default()
         .execute(
             "3",
-            json!({"patch": patch2}),
+            json!({"cwd": [""], "patch": patch2}),
             CancellationToken::new(),
             &ctx,
         )
@@ -129,7 +134,12 @@ async fn stale_tag_recovers_via_snapshot() {
     let ctx = TestCtx::new(dir.path());
 
     let read_out = ReadTool
-        .execute("1", json!({"path": "a.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "a.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let tag = tag_of(text_of(&read_out)).to_string();
@@ -139,7 +149,12 @@ async fn stale_tag_recovers_via_snapshot() {
 
     let patch = format!("[{}#{}]\nSWAP 2.=2:\n+    y();", file.display(), tag);
     let edit_out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -163,7 +178,7 @@ async fn write_strips_pasted_read_output() {
     let out = WriteTool
         .execute(
             "1",
-            json!({"path": "pasted.rs", "content": pasted}),
+            json!({"cwd": [""], "path": "pasted.rs", "content": pasted}),
             CancellationToken::new(),
             &ctx,
         )
@@ -190,7 +205,12 @@ async fn write_strips_pasted_read_output() {
         head
     );
     let edit_out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -210,7 +230,7 @@ async fn grep_snapshots_matched_files_for_direct_edit() {
     let out = GrepTool
         .execute(
             "1",
-            json!({"pattern": "needle", "path": dir.path().to_str().unwrap()}),
+            json!({"cwd": [""], "pattern": "needle", "path": dir.path().to_str().unwrap()}),
             CancellationToken::new(),
             &ctx,
         )
@@ -235,7 +255,12 @@ async fn grep_snapshots_matched_files_for_direct_edit() {
         tag
     );
     let edit_out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -259,7 +284,7 @@ async fn edit_restores_crlf_and_trailing_newline() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "win.rs"}),
+            json!({"cwd": [""], "path": "win.rs"}),
             CancellationToken::new(),
             &ctx,
         )
@@ -269,7 +294,12 @@ async fn edit_restores_crlf_and_trailing_newline() {
 
     let patch = format!("[{}#{}]\nSWAP 2.=2:\n+    y();", file.display(), tag);
     let edit_out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!edit_out.is_error, "edit failed: {}", text_of(&edit_out));
@@ -297,7 +327,7 @@ async fn seen_line_gate_is_off_by_default() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "d.rs", "offset": 1, "limit": 3}),
+            json!({"cwd": [""], "path": "d.rs", "offset": 1, "limit": 3}),
             CancellationToken::new(),
             &ctx,
         )
@@ -309,7 +339,12 @@ async fn seen_line_gate_is_off_by_default() {
     // the host has not opted in — the shipped default, matching upstream.
     let patch = format!("[{}#{}]\nSWAP 20.=20:\n+edited", file.display(), tag);
     let out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!out.is_error, "default must not gate: {}", text_of(&out));
@@ -329,7 +364,7 @@ async fn partial_read_gates_unseen_lines_then_reveal_retry_succeeds() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "p.rs", "offset": 1, "limit": 3}),
+            json!({"cwd": [""], "path": "p.rs", "offset": 1, "limit": 3}),
             CancellationToken::new(),
             &ctx,
         )
@@ -340,7 +375,12 @@ async fn partial_read_gates_unseen_lines_then_reveal_retry_succeeds() {
     // Edit line 20 — never displayed — the gate rejects with a reveal.
     let patch = format!("[{}#{}]\nSWAP 20.=20:\n+edited", file.display(), tag);
     let err = gated_edit()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .expect_err("unseen line must be gated")
         .to_string();
@@ -351,7 +391,12 @@ async fn partial_read_gates_unseen_lines_then_reveal_retry_succeeds() {
     // The full-width reveal merged line 20 into seen_lines: the same patch
     // retries straight through without a re-read.
     let retried = gated_edit()
-        .execute("3", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "3",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -376,7 +421,7 @@ async fn displayed_context_lines_pass_the_gate() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "c.rs", "offset": 1, "limit": 3}),
+            json!({"cwd": [""], "path": "c.rs", "offset": 1, "limit": 3}),
             CancellationToken::new(),
             &ctx,
         )
@@ -386,7 +431,12 @@ async fn displayed_context_lines_pass_the_gate() {
 
     let patch = format!("[{}#{}]\nSWAP 5.=5:\n+edited 5", file.display(), tag);
     let out = gated_edit()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -408,7 +458,7 @@ async fn grep_provenance_gates_non_matched_lines() {
     let out = GrepTool
         .execute(
             "1",
-            json!({"pattern": "row 5", "path": dir.path().to_str().unwrap()}),
+            json!({"cwd": [""], "pattern": "row 5", "path": dir.path().to_str().unwrap()}),
             CancellationToken::new(),
             &ctx,
         )
@@ -432,7 +482,7 @@ async fn grep_provenance_gates_non_matched_lines() {
     let gated = gated_edit()
         .execute(
             "3",
-            json!({"patch": gate_patch}),
+            json!({"cwd": [""], "patch": gate_patch}),
             CancellationToken::new(),
             &ctx,
         )
@@ -447,7 +497,7 @@ async fn grep_provenance_gates_non_matched_lines() {
     let retried = gated_edit()
         .execute(
             "4",
-            json!({"patch": gate_patch}),
+            json!({"cwd": [""], "patch": gate_patch}),
             CancellationToken::new(),
             &ctx,
         )
@@ -464,7 +514,7 @@ async fn grep_provenance_gates_non_matched_lines() {
     let out2 = GrepTool
         .execute(
             "5",
-            json!({"pattern": "row 5", "path": dir.path().to_str().unwrap()}),
+            json!({"cwd": [""], "pattern": "row 5", "path": dir.path().to_str().unwrap()}),
             CancellationToken::new(),
             &ctx2,
         )
@@ -484,7 +534,7 @@ async fn grep_provenance_gates_non_matched_lines() {
     let ok = gated_edit()
         .execute(
             "6",
-            json!({"patch": ok_patch}),
+            json!({"cwd": [""], "patch": ok_patch}),
             CancellationToken::new(),
             &ctx2,
         )
@@ -503,7 +553,7 @@ async fn edit_chain_after_full_seen_recording_passes() {
     WriteTool
         .execute(
             "1",
-            json!({"path": "w.rs", "content": "a\nb\nc\n"}),
+            json!({"cwd": [""], "path": "w.rs", "content": "a\nb\nc\n"}),
             CancellationToken::new(),
             &ctx,
         )
@@ -522,7 +572,12 @@ async fn edit_chain_after_full_seen_recording_passes() {
     // A follow-up edit on any line passes the gate.
     let patch = format!("[{}#{}]\nSWAP 2.=2:\n+B", file.display(), tag);
     let out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(
@@ -542,7 +597,12 @@ async fn cross_file_tag_names_its_real_owner() {
     let ctx = TestCtx::new(dir.path());
 
     let read_a = ReadTool
-        .execute("1", json!({"path": "a.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "a.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let wrong_tag = tag_of(text_of(&read_a)).to_string();
@@ -551,7 +611,12 @@ async fn cross_file_tag_names_its_real_owner() {
     // name the mix-up, not blame a fabricated tag.
     let patch = format!("[{}#{}]\nSWAP 1.=1:\n+uno", b.display(), wrong_tag);
     let err = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .expect_err("cross-file tag must be rejected")
         .to_string();
@@ -575,7 +640,12 @@ async fn position_free_insert_lands_despite_drift() {
     let ctx = TestCtx::new(dir.path());
 
     let read_out = ReadTool
-        .execute("1", json!({"path": "p.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "p.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let stale_tag = tag_of(text_of(&read_out)).to_string();
@@ -589,7 +659,12 @@ async fn position_free_insert_lands_despite_drift() {
         stale_tag
     );
     let out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!out.is_error, "{}", text_of(&out));
@@ -613,7 +688,7 @@ async fn move_applies_section_ops_before_relocating() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "src.rs"}),
+            json!({"cwd": [""], "path": "src.rs"}),
             CancellationToken::new(),
             &ctx,
         )
@@ -629,7 +704,12 @@ async fn move_applies_section_ops_before_relocating() {
         dst.display()
     );
     let out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!out.is_error, "{}", text_of(&out));
@@ -649,7 +729,7 @@ async fn move_to_source_is_rejected() {
     let read_out = ReadTool
         .execute(
             "1",
-            json!({"path": "same.rs"}),
+            json!({"cwd": [""], "path": "same.rs"}),
             CancellationToken::new(),
             &ctx,
         )
@@ -659,7 +739,12 @@ async fn move_to_source_is_rejected() {
 
     let patch = format!("[{}#{}]\nMV {}", src.display(), tag, src.display());
     let err = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .expect_err("MV onto itself must be rejected")
         .to_string();
@@ -675,7 +760,12 @@ async fn same_path_sections_merge_and_apply_together() {
     let ctx = TestCtx::new(dir.path());
 
     let read_out = ReadTool
-        .execute("1", json!({"path": "m.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "m.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let tag = tag_of(text_of(&read_out)).to_string();
@@ -691,7 +781,12 @@ async fn same_path_sections_merge_and_apply_together() {
         tag
     );
     let out = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     assert!(!out.is_error, "{}", text_of(&out));
@@ -709,7 +804,12 @@ async fn conflicting_same_path_tags_are_rejected_at_parse() {
     std::fs::write(&file, "a\nb\n").unwrap();
     let ctx = TestCtx::new(dir.path());
     let read_out = ReadTool
-        .execute("1", json!({"path": "c.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "c.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let tag = tag_of(text_of(&read_out)).to_string();
@@ -721,7 +821,12 @@ async fn conflicting_same_path_tags_are_rejected_at_parse() {
         file.display()
     );
     let err = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .expect_err("mixed tags must be rejected")
         .to_string();
@@ -740,7 +845,12 @@ async fn multi_file_patch_is_atomic_on_rejection() {
     let ctx = TestCtx::new(dir.path());
 
     let read_a = ReadTool
-        .execute("1", json!({"path": "a.rs"}), CancellationToken::new(), &ctx)
+        .execute(
+            "1",
+            json!({"cwd": [""], "path": "a.rs"}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .unwrap();
     let tag_a = tag_of(text_of(&read_a)).to_string();
@@ -753,7 +863,12 @@ async fn multi_file_patch_is_atomic_on_rejection() {
         b.display()
     );
     let err = EditTool::default()
-        .execute("2", json!({"patch": patch}), CancellationToken::new(), &ctx)
+        .execute(
+            "2",
+            json!({"cwd": [""], "patch": patch}),
+            CancellationToken::new(),
+            &ctx,
+        )
         .await
         .expect_err("second section must reject")
         .to_string();

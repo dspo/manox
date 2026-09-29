@@ -34,8 +34,8 @@ const DEFAULT_MAX_LINES: usize = 2000;
 /// Wall-clock limit before a hung command is killed.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
-/// The bash tool with the manox product surface: optional `cwd`, background
-/// execution via the registry, head/tail line filters, and a
+/// The bash tool with the manox product surface: array-form `cwd`,
+/// background execution via the registry, head/tail line filters, and a
 /// `sandbox_permissions` escalation slot. The per-call effective mode
 /// (read-only / workspace-write / danger-full-access) selects the backend:
 /// `danger-full-access` runs through `unsandboxed_operations` (no
@@ -159,7 +159,8 @@ impl AgentTool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a shell command. \
-         State (cwd, exported vars, functions) persists across calls. \
+         Exported vars and functions persist across calls; each call runs at \
+         its `cwd`. \
          \
          **Concurrency model**: foreground calls block this turn; \
          `run_in_background: true` starts the command in a fresh shell (no \
@@ -225,7 +226,12 @@ impl AgentTool for BashTool {
         );
         properties.insert(
             "cwd".into(),
-            serde_json::json!({"type": "string", "description": "Working directory for this call. Omit to reuse the previous tool call's directory (the session's start directory initially); a `cd` inside the command moves it for every tool"}),
+            serde_json::json!({
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1,
+                "description": crate::core::tools::path_utils::CWD_SCHEMA_DOC
+            }),
         );
         properties.insert(
             "run_in_background".into(),
@@ -259,7 +265,7 @@ impl AgentTool for BashTool {
         serde_json::json!({
             "type": "object",
             "properties": properties,
-            "required": ["command"]
+            "required": ["command", "cwd"]
         })
     }
 
@@ -304,14 +310,13 @@ impl BashTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidArguments("command is required".into()))?;
         let timeout_ms = params["timeout"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MS);
-        // Sticky-cwd resolution: an explicit `cwd` → the directory the last
-        // tool call ran in → the session cwd. Resolving advances the sticky
-        // cwd, so every tool (path tools included) inherits this call's
-        // directory; the shell's post-command directory is written back
-        // after the run.
-        let run_cwd =
-            crate::core::tools::path_utils::resolve_effective_cwd(ctx, params["cwd"].as_str())
-                .map_err(ToolError::InvalidArguments)?;
+        // Sticky-cwd resolution: `cwd` is `[anchor, ...route]` — a non-empty
+        // anchor re-anchors the session's default directory, the route
+        // locates this call only. The persistent shell re-pins to the
+        // resolved directory before each exec, so a `cd` inside a command
+        // never leaks into the session's working directory.
+        let run_cwd = crate::core::tools::path_utils::resolve_effective_cwd(ctx, params.get("cwd"))
+            .map_err(ToolError::InvalidArguments)?;
         let run_in_background = params["run_in_background"].as_bool().unwrap_or(false);
         let head_lines = params["head_lines"].as_u64().map(|v| v as usize);
         let tail_lines = params["tail_lines"].as_u64().map(|v| v as usize);
@@ -377,24 +382,15 @@ impl BashTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("{e}")))?;
 
-        // Write the shell's post-command directory back as the sticky cwd:
-        // a `cd` inside the command moves the session's default directory
-        // for every tool, matching a developer's terminal. Backends without
-        // a live directory report `None` — the resolved `run_cwd` stands.
-        if let Some(dir) = backend.current_dir().await {
-            *ctx.tool_state()
-                .sticky_cwd
-                .lock()
-                .expect("sticky cwd poisoned") = Some(dir);
-        }
-
         let mut output = assemble_output(result, head_lines, tail_lines);
 
         // Per-session-once nudges: suggest native tools when the model reaches
-        // for raw grep/rg/find/ls, and suggest background for long waits.
+        // for raw grep/rg/find/ls, suggest background for long waits, and
+        // point at `cwd` when the command relies on a bare `cd`.
         if !run_in_background {
             output.push_str(&nudge_tool_preference(&command, ctx));
             output.push_str(&nudge_sleep_loop(&command, ctx));
+            output.push_str(&nudge_cd_preference(&command, ctx));
         }
 
         Ok(AgentToolResult::text(output))
@@ -559,6 +555,26 @@ fn nudge_tool_preference(command: &str, ctx: &dyn ToolContext) -> String {
         "\n\n[tip: prefer the `{native}` tool over raw `{}` — no sandbox, no approval in read-only mode]",
         trimmed.split_whitespace().next().unwrap_or("cmd")
     )
+}
+
+/// Per-session-once nudge: a bare `cd` command (or one starting with `cd`)
+/// suggests the `cwd` array instead — the shell's `cd` does not move the
+/// session's working directory, so the model must carry locations in `cwd`.
+fn nudge_cd_preference(command: &str, ctx: &dyn ToolContext) -> String {
+    let trimmed = command.trim();
+    if !(trimmed.starts_with("cd ") || trimmed == "cd") {
+        return String::new();
+    }
+    let nf = &ctx.tool_state().nudge_flags;
+    if crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::CD_PREFERENCE) {
+        return String::new(); // already shown this session
+    }
+    "\n\n[harness] tip: a `cd` inside a Bash command does not move this session's working \
+     directory. Pass the location with `cwd` instead — array form [anchor, ...route]: the \
+     first element re-anchors the session (\"\" keeps it), the rest locate just this call. \
+     Example: {\"command\": \"cargo test\", \"cwd\": [\"~/projects/dspo/manox\", \
+     \"crates/manox-harness\"]}."
+        .to_string()
 }
 
 /// Per-session-once nudges for long-running foreground patterns.
@@ -822,7 +838,7 @@ mod tests {
                 "c1",
                 serde_json::json!({
                     "command": "echo hi",
-                    "cwd": work.path().to_string_lossy(),
+                    "cwd": [work.path().to_string_lossy()],
                 }),
                 CancellationToken::new(),
                 &ctx,
@@ -836,69 +852,12 @@ mod tests {
             "cwd override reaches the backend"
         );
         assert!(!result.is_error);
-        // Resolving an explicit cwd advances the sticky cwd, so the next
-        // call without one inherits it.
+        // A single-element cwd re-anchors the session: the sticky advances to
+        // the anchor directory.
         assert_eq!(
             ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
             Some(work.path()),
-            "sticky cwd follows the explicit override"
-        );
-    }
-
-    /// A backend whose live directory differs from the request cwd — the
-    /// shape a persistent shell has after the command's own `cd`.
-    struct DriftingOps {
-        calls: Mutex<Vec<Option<PathBuf>>>,
-        dir: PathBuf,
-    }
-    #[async_trait::async_trait]
-    impl BashOperations for DriftingOps {
-        async fn exec(
-            &self,
-            request: BashExecRequest<'_>,
-        ) -> Result<CommandResult, crate::core::env::ExecutionError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(request.cwd.map(|c| c.to_path_buf()));
-            Ok(CommandResult {
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: 0,
-            })
-        }
-        async fn current_dir(&self) -> Option<PathBuf> {
-            Some(self.dir.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn shell_drift_writeback_moves_the_sticky_cwd() {
-        let drifted = tempfile::tempdir().expect("tempdir");
-        let ops = Arc::new(DriftingOps {
-            calls: Mutex::new(Vec::new()),
-            dir: drifted.path().to_path_buf(),
-        });
-        let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry));
-        let (ctx, _dir) = ctx();
-        tool.execute(
-            "c1",
-            serde_json::json!({"command": "cd somewhere && build"}),
-            CancellationToken::new(),
-            &ctx,
-        )
-        .await
-        .unwrap();
-        // The backend ran at the resolved base, but its post-command
-        // directory — what a `cd` left behind — becomes the sticky cwd.
-        assert_eq!(
-            ops.calls.lock().unwrap()[0],
-            Some(_dir.path().to_path_buf())
-        );
-        assert_eq!(
-            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
-            Some(drifted.path()),
-            "the shell's post-command directory wins over the request cwd"
+            "sticky cwd follows the anchor"
         );
     }
 
@@ -909,7 +868,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "sleep 5", "run_in_background": true}),
+                serde_json::json!({"command": "sleep 5", "cwd": [""], "run_in_background": true}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -922,6 +881,86 @@ mod tests {
         assert!(
             text.contains("bg_test"),
             "returns the background id: {text}"
+        );
+    }
+
+    /// A `cd` inside a command moves only the shell's directory for that
+    /// command — the session's sticky cwd never follows it.
+    #[tokio::test]
+    async fn cd_inside_a_command_does_not_move_the_sticky_cwd() {
+        let ops = Arc::new(RecordingOps {
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(ops, Arc::new(NoopRegistry));
+        let (ctx, dir) = ctx();
+        // Anchor once so the sticky holds a real value to protect.
+        tool.execute(
+            "c1",
+            serde_json::json!({
+                "command": "echo start",
+                "cwd": [dir.path().to_string_lossy()],
+            }),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        tool.execute(
+            "c2",
+            serde_json::json!({"command": "cd somewhere && pwd", "cwd": [""]}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ctx.tool_state().sticky_cwd.lock().unwrap().as_deref(),
+            Some(dir.path()),
+            "the sticky stays at the anchor; the command's `cd` does not leak"
+        );
+    }
+
+    /// A `cd` command appends the cwd nudge exactly once per session.
+    #[tokio::test]
+    async fn cd_command_nudges_once_per_session() {
+        let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry));
+        let (ctx, _dir) = ctx();
+        const TIP: &str = "[harness] tip: a `cd` inside a Bash command";
+        let first = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": "cd sub && pwd", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(output_text(&first).contains(TIP), "first cd nudges");
+        let second = tool
+            .execute(
+                "c2",
+                serde_json::json!({"command": "cd other", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !output_text(&second).contains(TIP),
+            "the nudge fires once per session"
+        );
+        let unrelated = tool
+            .execute(
+                "c3",
+                serde_json::json!({"command": "echo hi", "cwd": [""]}),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !output_text(&unrelated).contains(TIP),
+            "a non-cd command never carries the nudge"
         );
     }
 
@@ -978,7 +1017,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "echo hi"}),
+                serde_json::json!({"command": "echo hi", "cwd": [""]}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1051,7 +1090,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "git push", "sandbox_permissions": "danger-full-access", "justification": "need to push"}),
+                serde_json::json!({"command": "git push", "cwd": [""], "sandbox_permissions": "danger-full-access", "justification": "need to push"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1079,7 +1118,7 @@ mod tests {
         let result = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "ls", "sandbox_permissions": "workspace-write", "justification": "x"}),
+                serde_json::json!({"command": "ls", "cwd": [""], "sandbox_permissions": "workspace-write", "justification": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1103,7 +1142,7 @@ mod tests {
         let err = tool
             .execute(
                 "c1",
-                serde_json::json!({"command": "ls", "sandbox_permissions": "workspace-write", "justification": "x"}),
+                serde_json::json!({"command": "ls", "cwd": [""], "sandbox_permissions": "workspace-write", "justification": "x"}),
                 CancellationToken::new(),
                 &ctx,
             )
@@ -1157,6 +1196,7 @@ mod tests {
                 "c1",
                 serde_json::json!({
                     "command": "printf 'a\nb\nc\nd\ne\n'",
+                    "cwd": [""],
                     "run_in_background": true,
                     "tail_lines": 2,
                 }),
