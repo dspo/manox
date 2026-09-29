@@ -63,6 +63,7 @@ use manox_ahp::channels::{chat, session};
 use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
 
+pub(crate) mod changeset;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;
 
@@ -145,6 +146,23 @@ pub async fn session_state(thread_id: &str) -> Option<SessionState> {
         let server_tools = mcp::server_tools();
         if !server_tools.is_empty() {
             state.server_tools = Some(server_tools);
+        }
+    }
+
+    // The uncommitted-changeset catalogue is engine truth like the registry:
+    // overlay the entry when the session's directories hold a git repo. The
+    // scan is a handful of git invocations and this is the subscribe-seed
+    // path, not the list path.
+    if let Some(directories) = seed_working_directories(thread_id).await {
+        let dirs: Vec<std::path::PathBuf> = directories
+            .iter()
+            .filter_map(|directory| crate::ahp::backend::file_uri_to_path(directory))
+            .map(std::path::PathBuf::from)
+            .collect();
+        if !dirs.is_empty()
+            && let Some(entry) = changeset::Engine::global().catalogue(thread_id, dirs)
+        {
+            state.changesets = Some(vec![entry]);
         }
     }
 

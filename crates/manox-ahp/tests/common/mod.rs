@@ -97,6 +97,19 @@ impl Backend for TestBackend {
         None
     }
 
+    fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
+        // The runtime answers a git session with a real (possibly empty)
+        // state — exactly what exercised the snapshot path's changeset arm.
+        channel
+            .ends_with("/uncommitted")
+            .then(|| ahp_types::state::ChangesetState {
+                status: ahp_types::state::ChangesetStatus::Ready,
+                error: None,
+                files: Vec::new(),
+                operations: None,
+            })
+    }
+
     fn create_session(
         &self,
         session_id: &str,

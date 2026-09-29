@@ -245,6 +245,9 @@ pub const ACCEPTED_ACTIONS: &[&str] = &[
     // chat working directories
     "chat/workingDirectorySet",
     "chat/workingDirectoryRemoved",
+    // changeset (the engine is the review authority; unknown file ids are
+    // ignored there, matching the reducer)
+    "changeset/filesReviewChanged",
     // terminal
     "terminal/input",
     "terminal/resized",
@@ -304,6 +307,7 @@ pub fn accepts_action(channel_uri: &str, action_type: &str) -> bool {
         "chat" => channel_uri.starts_with("ahp-chat:/"),
         "session" => channel_uri.starts_with("ahp-session:/"),
         "terminal" => channel_uri.starts_with("ahp-terminal:/"),
+        "changeset" => channel_uri.starts_with("ahp-changeset:/"),
         _ => false,
     }
 }
@@ -374,6 +378,23 @@ mod tests {
         assert!(accepts_action(
             "x-manox-plan:/c-1",
             actions::PLAN_MODE_CHANGED
+        ));
+    }
+
+    #[test]
+    fn the_changeset_review_toggle_is_accepted_on_changeset_channels_only() {
+        assert!(accepts_action(
+            "ahp-changeset:/s-1/uncommitted",
+            "changeset/filesReviewChanged"
+        ));
+        assert!(!accepts_action(
+            "ahp-session:/s-1",
+            "changeset/filesReviewChanged"
+        ));
+        // Every other changeset action is server-originated only.
+        assert!(!accepts_action(
+            "ahp-changeset:/s-1/uncommitted",
+            "changeset/fileSet"
         ));
     }
 

@@ -182,6 +182,14 @@ impl Host {
         self.inner.store.read().session(session_id).is_some()
     }
 
+    /// Whether the host holds state for one changeset channel — the same
+    /// existence check for the engine's recompute fan-out, which would
+    /// otherwise log an OutOfScope fold for every never-subscribed session
+    /// on every turn edge.
+    pub fn has_changeset(&self, uri: &str) -> bool {
+        self.inner.store.read().changeset(uri).is_some()
+    }
+
     /// Install the runtime's folded session state as this channel's state.
     ///
     /// The runtime seeds a session when it first serves one (and re-seeds it
@@ -563,6 +571,19 @@ impl Inner {
             .terminal_state(terminal_id)
             .ok_or_else(|| HostError::NotFound(crate::channels::terminal::uri(terminal_id)))?;
         self.store.write().insert_terminal(terminal_id, state);
+        Ok(())
+    }
+
+    /// Make sure a changeset view is loaded, computing it on first sight.
+    pub(crate) fn ensure_changeset(&self, uri: &str) -> Result<(), HostError> {
+        if self.store.read().changeset(uri).is_some() {
+            return Ok(());
+        }
+        let state = self
+            .backend
+            .changeset_state(uri)
+            .ok_or_else(|| HostError::NotFound(uri.to_string()))?;
+        self.store.write().insert_changeset(uri, state);
         Ok(())
     }
 }

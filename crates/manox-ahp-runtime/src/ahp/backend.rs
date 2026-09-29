@@ -389,6 +389,31 @@ impl RuntimeBackend {
                     let Some(entry) = crate::translate::wire_entry(event.seq, &event.entry) else {
                         continue;
                     };
+                    // A finished turn is when the agent's file changes settle:
+                    // recompute the changeset so subscribers watch one stream
+                    // instead of polling. Detached — the scan is synchronous
+                    // and cheap, but it must not stall the journal pump.
+                    if matches!(&entry.event, JournalWireEvent::TurnFinish { .. })
+                        && let Some(backend) = self.me()
+                    {
+                        let session = session_id.clone();
+                        manox_agent::runtime::handle().spawn_blocking(move || {
+                            for (channel, action) in
+                                super::changeset::Engine::global().recompute(&session)
+                            {
+                                // Only channels the host has ensured (a
+                                // subscriber or a dispatch landed): the
+                                // publish *is* the store update, and folding
+                                // into a state that does not exist would
+                                // just log OutOfScope noise each turn.
+                                if let Some(host) = backend.host()
+                                    && host.has_changeset(&channel)
+                                {
+                                    host.publish(&channel, action, None);
+                                }
+                            }
+                        });
+                    }
                     // The client's own `turnStarted` dispatch already expressed the
                     // user row and the turn boundary: re-folding them would publish a
                     // second `pendingMessageSet` and a second `turnStarted`, and the
@@ -1101,6 +1126,9 @@ impl Backend for RuntimeBackend {
 
     fn dispose_session(&self, session_id: &str) -> Result<(), HostError> {
         let _ = self.server.dispose_session("ahp", session_id);
+        // The engine caches this session's directories and full patch
+        // bodies; a disposed session must not keep them.
+        super::changeset::Engine::global().forget(session_id);
         Ok(())
     }
 
@@ -1362,6 +1390,24 @@ impl Backend for RuntimeBackend {
                     ),
                 }
             }
+            // Review is client-dispatchable and the engine is the authority:
+            // record the flags so a recompute carries (or resets) them
+            // correctly. An unknown changeset or file set is a refusal, never
+            // a folded phantom.
+            StateAction::ChangesetFilesReviewChanged(changed) => {
+                let Some((session_id, key)) = super::changeset::parse(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                match super::changeset::Engine::global().review(
+                    &session_id,
+                    key,
+                    &changed.files,
+                    changed.reviewed,
+                ) {
+                    Ok(()) => DispatchOutcome::Accepted,
+                    Err(reason) => DispatchOutcome::Rejected(reason),
+                }
+            }
             // MCP start/stop: the acceptance is the *intent*, not the outcome.
             // The reducer has already folded the optimistic `starting`/`stopped`
             // edge, so the runtime owes the settled state through the MCP event
@@ -1545,6 +1591,94 @@ impl Backend for RuntimeBackend {
                 "no runtime intent yet: {}",
                 manox_ahp::wire::action_tag(other)
             )),
+        }
+    }
+
+    fn changeset_state(&self, channel: &str) -> Option<ahp_types::state::ChangesetState> {
+        let (session_id, key) = super::changeset::parse(channel)?;
+        // First sight: run the scan (the catalogue call ensures the engine
+        // entry), then answer from it.
+        let dirs = block_on(async { seed_directories(&session_id).await });
+        if let Some(dirs) = dirs {
+            super::changeset::Engine::global().catalogue(&session_id, dirs);
+        }
+        super::changeset::Engine::global().state(&session_id, key)
+    }
+
+    fn invoke_changeset_operation(
+        &self,
+        channel: &str,
+        operation_id: &str,
+        target: Option<&ahp_types::commands::ChangesetOperationTarget>,
+    ) -> Result<Value, HostError> {
+        use ahp_types::commands::InvokeChangesetOperationResult;
+        let (session_id, key) = super::changeset::parse(channel)
+            .ok_or_else(|| HostError::NotFound(channel.to_string()))?;
+        if operation_id != "revert" {
+            return Err(HostError::InvalidParams(format!(
+                "unknown changeset operation: {operation_id}"
+            )));
+        }
+        let Some(host) = self.host() else {
+            return Err(HostError::Unimplemented(
+                "changeset without a host".to_string(),
+            ));
+        };
+        // Running → work → settled, every edge on the changeset channel so
+        // all subscribers see the same spinner and the same outcome.
+        host.publish(
+            channel,
+            StateAction::ChangesetOperationStatusChanged(
+                ahp_types::actions::ChangesetOperationStatusChangedAction {
+                    operation_id: operation_id.to_string(),
+                    status: ahp_types::state::ChangesetOperationStatus::Running,
+                    error: None,
+                },
+            ),
+            None,
+        );
+        let outcome = super::changeset::Engine::global().invoke_revert(&session_id, key, target);
+        match outcome {
+            Ok(message) => {
+                for (channel, action) in super::changeset::Engine::global().recompute(&session_id) {
+                    host.publish(&channel, action, None);
+                }
+                host.publish(
+                    channel,
+                    StateAction::ChangesetOperationStatusChanged(
+                        ahp_types::actions::ChangesetOperationStatusChangedAction {
+                            operation_id: operation_id.to_string(),
+                            status: ahp_types::state::ChangesetOperationStatus::Idle,
+                            error: None,
+                        },
+                    ),
+                    None,
+                );
+                serde_json::to_value(InvokeChangesetOperationResult {
+                    message: Some(message.into()),
+                    follow_up: None,
+                })
+                .map_err(|e| HostError::Backend(e.to_string()))
+            }
+            Err(reason) => {
+                host.publish(
+                    channel,
+                    StateAction::ChangesetOperationStatusChanged(
+                        ahp_types::actions::ChangesetOperationStatusChangedAction {
+                            operation_id: operation_id.to_string(),
+                            status: ahp_types::state::ChangesetOperationStatus::Error,
+                            error: Some(ahp_types::state::ErrorInfo {
+                                error_type: "changeset".to_string(),
+                                message: reason.clone(),
+                                stack: None,
+                                meta: None,
+                            }),
+                        },
+                    ),
+                    None,
+                );
+                Err(HostError::Backend(reason))
+            }
         }
     }
 
@@ -1744,8 +1878,20 @@ fn extension_session(params: &Value) -> Result<String, HostError> {
 }
 
 /// `file://` URI → filesystem path (`None` for other schemes).
-fn file_uri_to_path(uri: &str) -> Option<String> {
+pub(crate) fn file_uri_to_path(uri: &str) -> Option<String> {
     uri.strip_prefix("file://").map(str::to_string)
+}
+
+/// The session's working directories as paths — the changeset engine's scan
+/// roots, resolved the same way the seed's `workingDirectories` are.
+async fn seed_directories(session_id: &str) -> Option<Vec<std::path::PathBuf>> {
+    let dirs = super::seed_working_directories(session_id).await?;
+    Some(
+        dirs.iter()
+            .filter_map(|directory| file_uri_to_path(directory))
+            .map(std::path::PathBuf::from)
+            .collect(),
+    )
 }
 
 /// The journal's own last-entry vocabulary marker, re-exported for the tests'
