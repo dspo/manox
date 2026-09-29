@@ -16,11 +16,6 @@
 //      terminal status.
 //   3. task → host: the [`TaskObserver`] receives `Spawned` / `Output` /
 //      `Settled` emissions directly — one lifecycle vocabulary, no mirror.
-//
-// Kill-level semantics: this manager implements the bash column of
-// `ext::monitor`'s teardown matrix — a run Abort kills with cause
-// `RunAbort`, a user stop settles `(Stopped, UserStop)`, and a host
-// teardown wins first-wins at the task center.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

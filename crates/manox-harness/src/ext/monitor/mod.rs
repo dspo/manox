@@ -46,49 +46,11 @@
 //! denied outside DangerFullAccess. Monitor output is always framed as untrusted
 //! external data either way.
 //!
-//! ## Teardown matrix (contract)
+//! ## Teardown semantics
 //!
-//! "Who kills a monitor, with which settlement" is defined at three levels,
-//! and the levels compose — the stricter one wins because host settlement
-//! is first-wins:
-//!
-//! | Trigger | Command/WS monitor | Background bash |
-//! |---|---|---|
-//! | Harness run `Abort` (mid-turn Esc) | **survives** — keeps queueing events for the next run | **killed**, settles `(Stopped, RunAbort)` → wire `Stopped` |
-//! | Host thread cancel (explicit user cancel) | **killed**, settles `(Stopped, UserStop)` → wire `Stopped` | killed, wire `Stopped` |
-//! | Session teardown (manager `Drop`; the host's teardown stop forwards the same intent) | killed, settles `(Stopped, Teardown)` → wire `SessionEnded`, no terminal steer | killed, wire `SessionEnded` |
-//!
-//! The stopping side's intent travels with the kill (the `StopHandle` /
-//! on-stop hook carry a `SettlementCause`), so a host teardown records
-//! `Teardown` while a user cancel records `UserStop` — the last two rows
-//! differ only through what the caller forwards. The harness-level
-//! "monitors survive Abort" row is real at this layer: `MonitorManager`
-//! does not subscribe to the abort event, and the session may be aborted
-//! and then used again. It does not promise survival past a host-level
-//! cancel or teardown — those kill monitors at their level. (The bash
-//! column's Abort row requires `BackgroundManager::attach` to run inside a
-//! tokio runtime; outside one, the abort listener warns and does nothing.)
-//!
-//! ## Known limits
-//!
-//! - Batching windows (20 lines / 4 KiB / 300 ms) mean sparse output can
-//!   wait up to one interval before steering; a WS frame arriving during a
-//!   terminal path is flushed by the residual flush, except under teardown.
-//!   A line larger than the 4 KiB event cap is silently dropped (neither
-//!   steered nor ringed, no gap marker) — the cap flushes when a batch
-//!   *exceeds* the budget, so "4 KiB" is an over-limit, not an
-//!   at-limit, bound.
-//! - The observer's output ring is a best-effort tail: eviction past the
-//!   caps is silent (no gap marker — the model channel is steering, and the
-//!   ring only feeds card bodies).
-//! - A monitor started with no observer bound (harness-standalone use)
-//!   emits nothing; steering still works.
-//! - A `persistent` monitor has no runtime deadline; only the WS connect
-//!   phase keeps a per-address timeout.
-//! - Via the host task center, a cancel during a stuck WS handshake is
-//!   interruption-safe (`abort` on the driver). Via the harness-standalone
-//!   kernel `TaskStopTool`, a token cancel without a recorded kill outcome
-//!   settles as `(Stopped, Natural)`.
+//! A run `Abort` (user Esc) is not terminal — monitors survive it and keep
+//! queueing events for the next run. Monitors die with their session: the
+//! manager's `Drop` stops every active monitor synchronously.
 
 use std::collections::HashMap;
 use std::path::Path;

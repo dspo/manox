@@ -12,17 +12,6 @@
 //!
 //! Model-facing injection (steering) stays with each producer; this module
 //! only carries what UI / audit consumers and the host task center need.
-//!
-//! ## Known limits
-//!
-//! - A producer spawned before an observer is bound emits nothing
-//!   ([`NopObserver`] semantics) — the host binds during assembly, before
-//!   any tool can run; harness-standalone consumers that never bind simply
-//!   get no lifecycle stream.
-//! - A WebSocket cancel through the harness-standalone kernel `TaskStopTool`
-//!   bypasses the monitor manager, so no kill outcome is recorded and the
-//!   run settles as `(Stopped, Natural)`; the host path records
-//!   `UserStop` first.
 
 use std::sync::Arc;
 
