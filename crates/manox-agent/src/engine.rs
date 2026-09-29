@@ -23,7 +23,7 @@ use manox_harness::subagent::spawn::register_defaults;
 use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
 use manox_harness::tool::AgentTool as PiAgentTool;
 use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiModel};
-use manox_harness::{BackgroundRegistry, BashOutputTool};
+use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 use tokio::sync::mpsc;
 
 use crate::approval::{ApprovalGate, ApprovalGatedTool};
@@ -1483,18 +1483,24 @@ impl manox_harness::tool::AgentTool for SubagentBashTool {
     }
 }
 
-/// The host `TaskStop`: one registry covers every task kind (Sailors
-/// register directly; bash/monitor/ws register through the session's host
-/// observer with an on_stop hook into the producer), so one lookup stops
-/// anything the model can name. Unknown ids list the running tasks.
-struct HostTaskStop;
+/// Host wrapper around `manox_harness::bash::TaskStopTool` that also stops
+/// legacy-registry tasks (asynchronously-dispatched Sailors). The kernel
+/// `TaskStopTool` only knows the pi-extensions bash/monitor registries; a
+/// Sailor registers in the legacy `background_task` registry, so the model
+/// could not stop a runaway Sailor. This wrapper checks the legacy registry
+/// first (calling `background_task::stop`, the same path the UI card uses),
+/// and falls back to the kernel tool for bash/monitor/ws ids — one
+/// `TaskStop` for every task kind.
+struct LegacyAwareTaskStop {
+    inner: Arc<TaskStopTool>,
+}
 
 const TASKSTOP_DESCRIPTION: &str = "Stop a background task by id — a background bash, a monitor, \
     or an asynchronously-dispatched Sailor subagent (`sailor_id`). Cancels the task's token; the \
     task settles to Stopped. Idempotent for an already-terminal task.";
 
 #[async_trait::async_trait]
-impl manox_harness::tool::AgentTool for HostTaskStop {
+impl manox_harness::tool::AgentTool for LegacyAwareTaskStop {
     fn name(&self) -> &str {
         "TaskStop"
     }
@@ -1504,37 +1510,33 @@ impl manox_harness::tool::AgentTool for HostTaskStop {
     fn is_read_only(&self) -> bool {
         false
     }
+    fn requires_approval(&self, params: &serde_json::Value) -> bool {
+        self.inner.requires_approval(params)
+    }
     fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "The background task id to stop"
-                }
-            },
-            "required": ["task_id"]
-        })
+        self.inner.parameters_schema()
     }
 
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         params: serde_json::Value,
-        _signal: tokio_util::sync::CancellationToken,
-        _ctx: &dyn manox_harness::tool::ToolContext,
+        signal: tokio_util::sync::CancellationToken,
+        ctx: &dyn manox_harness::tool::ToolContext,
     ) -> Result<manox_harness::tool::AgentToolResult, manox_harness::tool::ToolError> {
-        let Some(id) = params["task_id"].as_str() else {
-            return Err(manox_harness::tool::ToolError::InvalidArguments(
-                "`task_id` is required.".into(),
-            ));
-        };
-        crate::background_task::stop(id)
-            .await
-            .map_err(manox_harness::tool::ToolError::ExecutionFailed)?;
-        Ok(manox_harness::tool::AgentToolResult::text(format!(
-            "Stopped background task `{id}`"
-        )))
+        // Legacy tasks (Sailors) live in background_task; stop there first.
+        if let Some(id) = params["task_id"].as_str()
+            && crate::background_task::get_by_str(id).is_some()
+        {
+            crate::background_task::stop(id)
+                .await
+                .map_err(manox_harness::tool::ToolError::ExecutionFailed)?;
+            return Ok(manox_harness::tool::AgentToolResult::text(format!(
+                "Stopped background task `{id}`"
+            )));
+        }
+        // Else bash/monitor/ws — delegate to the kernel TaskStop.
+        self.inner.execute(tool_call_id, params, signal, ctx).await
     }
 
     async fn execute_with_progress(
@@ -1769,7 +1771,9 @@ fn build_tools(
         Arc::new(bash),
         Arc::new(MonitorTool::new(Arc::clone(&monitor))),
         Arc::new(BashOutputTool::new(background.clone())),
-        Arc::new(HostTaskStop),
+        Arc::new(LegacyAwareTaskStop {
+            inner: Arc::new(TaskStopTool::new(background).with_ws_registry(monitor.ws_registry())),
+        }),
         Arc::new(crate::web_fetch::WebFetchTool::new()),
     ];
     // Plan-mode gate exemption: plan-file writes stay ungated while
@@ -3651,15 +3655,6 @@ fn session_builder(
         granted_roots,
         bus,
     );
-    // One observer wiring per orchestrator pair: the host task center sees
-    // every producer lifecycle from this session (card snapshots + stop
-    // routing), no per-open re-attach.
-    crate::background_task::attach(
-        Arc::clone(&orchestrators.monitor),
-        Arc::clone(&orchestrators.background),
-        notice_tx.clone(),
-        thread_id.to_string(),
-    );
     let default_active = default_active_tool_names(&tools);
     let mut builder = create_agent_session()
         .with_cwd(cwd.to_path_buf())
@@ -3917,6 +3912,12 @@ async fn run_actor(
         match builder.open(session_path).await {
             Ok(mut s) => {
                 attach_orchestrators(&mut s, &orchestrators);
+                crate::monitor_bridge::spawn(
+                    Arc::clone(&orchestrators.monitor),
+                    Arc::clone(&orchestrators.background),
+                    notice_tx.clone(),
+                    thread_id.clone(),
+                );
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -3955,6 +3956,12 @@ async fn run_actor(
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
                     attach_orchestrators(&mut s, &orchestrators);
+                    crate::monitor_bridge::spawn(
+                        Arc::clone(&orchestrators.monitor),
+                        Arc::clone(&orchestrators.background),
+                        notice_tx.clone(),
+                        thread_id.clone(),
+                    );
                     attach_plan_hooks(&mut s, &state.plan, &cwd, read_only_subagent);
                     attach_plugin_hooks(&mut s, &cwd);
                     attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -4864,6 +4871,12 @@ async fn rebuild_session(
     match builder.open(path.to_path_buf()).await {
         Ok(mut s) => {
             attach_orchestrators(&mut s, &orchestrators);
+            crate::monitor_bridge::spawn(
+                Arc::clone(&orchestrators.monitor),
+                Arc::clone(&orchestrators.background),
+                notice_tx.clone(),
+                thread_id.to_string(),
+            );
             attach_plan_hooks(&mut s, plan, &cwd, read_only_subagent);
             // Session swaps (Open) must carry the
             // same plugin lifecycle hooks as fresh builds, or the swapped

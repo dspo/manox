@@ -3,17 +3,8 @@
 //! asynchronously-dispatched subagents — each with an owner thread, status,
 //! stop routing, and a bounded output ring.
 //!
-//! This is the host's single source of truth for task cards: the session
-//! producers report their lifecycle straight into it through `attach`
-//! (the host `TaskObserver`), Sailors register directly, and the
-//! observer-driven paths re-emit each change as a
-//! `ThreadEvent::BackgroundTaskUpdated` snapshot. The stop path's own
-//! synchronous terminal push is the one exception — it settles the
-//! registry without a snapshot; the producers' settlements carry the
-//! notices.
-//!
-//! Settlement is first-wins: `push_terminal` transitions a Running/Stopping
-//! task, so duplicate terminal reports from a
+//! Settlement is first-wins: `push_terminal` only
+//! transition a Running/Stopping task, so duplicate terminal reports from a
 //! kill path and a natural exit collapse into one terminal state. The
 //! terminal status doubles as the cause vocabulary (`Stopped` = explicit
 //! TaskStop / user cancel, `SessionEnded` = thread or app teardown,
@@ -25,14 +16,11 @@
 //! directly-registered tasks (subagents) draw from the registry counter.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-
-use crate::thread::ThreadEvent;
-use crate::thread_engine::BackendNotice;
 
 /// How long a completed task stays in the registry before GC sweeps it.
 const GC_AFTER_EXIT: Duration = Duration::from_secs(300);
@@ -602,110 +590,6 @@ pub(crate) fn apply_settlement(
     task.push_terminal(id, status);
 }
 
-/// Output lines collected before a task's snapshot re-emits to the UI.
-const OUTPUT_EMIT_THRESHOLD: u32 = 5;
-
-/// The host's [`TaskObserver`]: binds the session producers (monitors,
-/// background bash) to this registry. Each `Spawned` registers a proxy task
-/// under the pi task id (one id space for `stop` and the UI cards, with an
-/// on_stop hook back into the producer), each `Output` lands in the proxy's
-/// bounded ring (snapshots throttled), and each `Settled` records the
-/// wire-stable terminal status through `apply_settlement`.
-struct HostTaskObserver {
-    notice_tx: mpsc::UnboundedSender<BackendNotice>,
-    owner_thread_id: String,
-    output_since_emit: Mutex<HashMap<String, u32>>,
-}
-
-impl manox_harness::tasks::TaskObserver for HostTaskObserver {
-    fn on_spawned(
-        &self,
-        id: &str,
-        family: manox_harness::tasks::TaskFamily,
-        label: &str,
-        stop: manox_harness::tasks::StopHandle,
-    ) {
-        let proxy = register_with_id(
-            TaskId(id.to_string()),
-            map_kind(family),
-            self.owner_thread_id.clone(),
-            label.to_string(),
-            CancellationToken::new(),
-        );
-        proxy.set_on_stop(Arc::new(move |_, cause| stop(cause)));
-        self.emit_snapshot(&proxy, id);
-    }
-
-    fn on_output(&self, id: &str, line: String) {
-        let Some(proxy) = get_by_str(id) else {
-            return;
-        };
-        proxy.push_event(&TaskId(id.to_string()), line);
-        let emit = {
-            let mut counts = self
-                .output_since_emit
-                .lock()
-                .expect("output counter poisoned");
-            let count = counts.entry(id.to_string()).or_insert(0);
-            *count += 1;
-            if *count >= OUTPUT_EMIT_THRESHOLD {
-                *count = 0;
-                true
-            } else {
-                false
-            }
-        };
-        if emit {
-            self.emit_snapshot(&proxy, id);
-        }
-    }
-
-    fn on_settled(&self, id: &str, settlement: &manox_harness::tasks::Settlement) {
-        let Some(proxy) = get_by_str(id) else {
-            return;
-        };
-        apply_settlement(&proxy, &TaskId(id.to_string()), settlement);
-        self.emit_snapshot(&proxy, id);
-    }
-}
-
-impl HostTaskObserver {
-    /// Emit a `BackgroundTaskUpdated` notice for a task.
-    fn emit_snapshot(&self, task: &BackgroundTask, id: &str) {
-        let snapshot = task.snapshot(&TaskId(id.to_string()));
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::BackgroundTaskUpdated { snapshot },
-        )));
-    }
-}
-
-fn map_kind(family: manox_harness::tasks::TaskFamily) -> TaskKind {
-    match family {
-        manox_harness::tasks::TaskFamily::MonitorCommand => TaskKind::MonitorCommand,
-        manox_harness::tasks::TaskFamily::MonitorWebSocket => TaskKind::MonitorWebSocket,
-        manox_harness::tasks::TaskFamily::BackgroundBash => TaskKind::BackgroundBash,
-        manox_harness::tasks::TaskFamily::Subagent => TaskKind::Subagent,
-    }
-}
-
-/// Bind the session's producers to the host observer. Called next to
-/// `attach_orchestrators` at session build/restore; the observer lives as
-/// long as the managers hold it.
-pub fn attach(
-    monitor: Arc<manox_harness::monitor::MonitorManager>,
-    background: Arc<manox_harness::bash::orchestration::BackgroundManager>,
-    notice_tx: mpsc::UnboundedSender<BackendNotice>,
-    owner_thread_id: String,
-) {
-    let observer = Arc::new(HostTaskObserver {
-        notice_tx,
-        owner_thread_id,
-        output_since_emit: Mutex::new(HashMap::new()),
-    });
-    monitor.set_observer(Arc::clone(&observer) as Arc<dyn manox_harness::tasks::TaskObserver>);
-    background.set_observer(observer);
-}
-
 /// Stop a task by id and return only after its stop hook has run and the task
 /// has settled. This is the semantic boundary used by TaskStop and shutdown.
 pub async fn stop(id: &str) -> Result<(), String> {
@@ -871,175 +755,6 @@ pub fn cleanup_thread(thread_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The wire-stable golden serialization of a snapshot: field names and
-    /// status strings are consumed by the journal and the AHP wire
-    /// (`x-manox-work/backgroundTasksChanged`); any drift here is a
-    /// cross-repo breaking change and must be annotated as such.
-    #[test]
-    fn task_snapshot_serialization_is_wire_stable() {
-        let snapshot = TaskSnapshot {
-            task_id: "mon_7".into(),
-            kind: TaskKind::MonitorCommand,
-            owner_thread_id: "t-golden".into(),
-            description: "watch the build".into(),
-            status: TaskStatus::Completed,
-            created_at_ms: 1_000,
-            ended_at_ms: Some(2_000),
-            event_count: 42,
-            total_bytes: 4_096,
-            exit_code: Some(0),
-            failure_summary: Some("nope".into()),
-            anchor_message_id: Some("m1".into()),
-            output_tail: "last line".into(),
-        };
-        let json = serde_json::to_string(&snapshot).unwrap();
-        assert_eq!(
-            json,
-            "{\"task_id\":\"mon_7\",\"kind\":\"MonitorCommand\",\
-             \"owner_thread_id\":\"t-golden\",\"description\":\"watch the build\",\
-             \"status\":\"Completed\",\"created_at_ms\":1000,\"ended_at_ms\":2000,\
-             \"event_count\":42,\"total_bytes\":4096,\"exit_code\":0,\
-             \"failure_summary\":\"nope\",\"anchor_message_id\":\"m1\",\
-             \"output_tail\":\"last line\"}"
-        );
-        // Empty/None optionals stay omitted, matching the historic shape.
-        let sparse = TaskSnapshot {
-            anchor_message_id: None,
-            failure_summary: None,
-            output_tail: String::new(),
-            ..snapshot
-        };
-        let json = serde_json::to_string(&sparse).unwrap();
-        assert!(
-            !json.contains("anchor_message_id")
-                && !json.contains("failure_summary")
-                && !json.contains("output_tail"),
-            "optionals must stay omitted: {json}"
-        );
-    }
-
-    /// The settlement mapping: cause `Teardown` settles as `SessionEnded`
-    /// (the card belongs to a session going away); a user stop stays
-    /// `Stopped`; a natural completion stays `Completed`.
-    #[test]
-    fn settlement_cause_maps_to_wire_status() {
-        use manox_harness::tasks::{Settlement, SettlementCause, SettlementKind};
-        let id = TaskId("map_1".into());
-        let teardown = register_with_id(
-            id.clone(),
-            TaskKind::MonitorCommand,
-            "t-map".into(),
-            "map".into(),
-            CancellationToken::new(),
-        );
-        apply_settlement(
-            &teardown,
-            &id,
-            &Settlement::new(SettlementKind::Stopped, SettlementCause::Teardown),
-        );
-        assert_eq!(teardown.status(), TaskStatus::SessionEnded);
-        remove(&id);
-
-        let id = TaskId("map_2".into());
-        let user_stop = register_with_id(
-            id.clone(),
-            TaskKind::MonitorWebSocket,
-            "t-map".into(),
-            "map".into(),
-            CancellationToken::new(),
-        );
-        apply_settlement(
-            &user_stop,
-            &id,
-            &Settlement::new(SettlementKind::Stopped, SettlementCause::UserStop),
-        );
-        assert_eq!(user_stop.status(), TaskStatus::Stopped);
-        remove(&id);
-    }
-
-    /// The host observer bridges a real command monitor end-to-end: the
-    /// proxy registers under the pi task id, snapshots flow as
-    /// `BackgroundTaskUpdated` notices (running → completed with output),
-    /// and a user stop routes through the on_stop hook into the monitor
-    /// manager.
-    #[tokio::test]
-    async fn host_observer_bridges_monitor_snapshots() {
-        use std::path::PathBuf;
-
-        let monitor = manox_harness::monitor::MonitorManager::new(Arc::new(
-            manox_harness::BackgroundRegistry::new(),
-        ));
-        let background = manox_harness::bash::orchestration::BackgroundManager::new(Arc::new(
-            manox_harness::BackgroundRegistry::new(),
-        ));
-        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
-        attach(
-            Arc::clone(&monitor),
-            Arc::clone(&background),
-            notice_tx,
-            "t1".into(),
-        );
-
-        let tid = monitor
-            .spawn_command(
-                "bridge watcher".into(),
-                "echo bridge-line".into(),
-                &PathBuf::from("/tmp"),
-                Duration::from_secs(30),
-                false,
-            )
-            .unwrap();
-
-        let mut saw_running = false;
-        let mut saw_completed = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < deadline {
-            let Ok(Some(notice)) =
-                tokio::time::timeout(Duration::from_millis(500), notice_rx.recv()).await
-            else {
-                break;
-            };
-            let BackendNotice::Event(ev) = notice else {
-                continue;
-            };
-            let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev else {
-                continue;
-            };
-            assert_eq!(snapshot.task_id, tid);
-            assert_eq!(snapshot.owner_thread_id, "t1");
-            match snapshot.status {
-                TaskStatus::Running => saw_running = true,
-                TaskStatus::Completed => {
-                    assert!(snapshot.output_tail.contains("bridge-line"));
-                    saw_completed = true;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_running, "initial running snapshot observed");
-        assert!(saw_completed, "terminal completed snapshot observed");
-        remove(&TaskId(tid.clone()));
-
-        // A user stop routes through the proxy's on_stop hook into the
-        // monitor manager, and the stop path's settlement records Stopped.
-        // (A long-running monitor: the echo task above is already terminal.)
-        let tid = monitor
-            .spawn_command(
-                "long watcher".into(),
-                "sleep 30".into(),
-                &std::path::PathBuf::from("/tmp"),
-                Duration::from_secs(60),
-                false,
-            )
-            .unwrap();
-        let proxy = get_by_str(&tid).expect("proxy registered");
-        assert_eq!(proxy.owner_thread_id(), "t1");
-        stop(&tid).await.ok();
-        assert_eq!(proxy.status(), TaskStatus::Stopped);
-        remove(&TaskId(tid.clone()));
-    }
 
     #[test]
     fn register_and_get() {
