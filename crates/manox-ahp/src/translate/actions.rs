@@ -361,7 +361,20 @@ fn map_ask_questions(input: &serde_json::Value) -> Option<Vec<ChatInputQuestion>
     let questions = input.get("questions")?.as_array()?;
     let mut out = Vec::with_capacity(questions.len());
     for (idx, q) in questions.iter().enumerate() {
-        let message = q.get("question")?.as_str()?.to_string();
+        // Journals written by older engine builds state the question in
+        // `header` alone (the `question` field is a later schema addition;
+        // device journals carry both shapes), so the text falls back to it.
+        // A row missing BOTH has no question to ask: it is skipped, and a
+        // list that empties this way degrades to the accepted bare ask
+        // (`questions: None` below) rather than a silent textless card.
+        let message = match q
+            .get("question")
+            .and_then(|v| v.as_str())
+            .or_else(|| q.get("header").and_then(|v| v.as_str()))
+        {
+            Some(text) => text.to_string(),
+            None => continue,
+        };
         let title = q.get("header").and_then(|v| v.as_str()).map(str::to_string);
         let id = q
             .get("id")
@@ -419,6 +432,11 @@ fn map_ask_questions(input: &serde_json::Value) -> Option<Vec<ChatInputQuestion>
             }),
         };
         out.push(question);
+    }
+    // A list that emptied (every row skipped for having no question text)
+    // degrades to the accepted bare ask, not to an empty question card.
+    if out.is_empty() {
+        return None;
     }
     Some(out)
 }
@@ -673,16 +691,13 @@ impl Translator {
                 &mut out,
             ),
             // ── sub-agent activity ───────────────────────────────────────
-            JournalWireEvent::SubagentChild { agent_id, event } => {
-                // One child session's event, in the parent transcript's order; the
-                // sub-agent *tree* is `x-manox-work` state.
-                self.push_note(
-                    &chat,
-                    entry,
-                    format!("subagent {agent_id}"),
-                    json!({"subagentChild": {"agentId": agent_id, "event": event}}),
-                    &mut out,
-                );
+            JournalWireEvent::SubagentChild { .. } => {
+                // One child session's lifecycle event, in the parent
+                // transcript's order — and nothing to push for it: the
+                // sub-agent tree is `x-manox-work` state (the Progress rows
+                // below maintain it), and a notice per event flooded the
+                // transcript with a card per spawn/exit the moment the bridge
+                // streamed again.
             }
             JournalWireEvent::SubagentProgress {
                 agent_id,
