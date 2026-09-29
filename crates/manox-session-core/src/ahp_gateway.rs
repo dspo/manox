@@ -254,6 +254,7 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
+        tracing::info!(session = %session_id, "gateway: cancelling the turn");
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| t.cancel());
