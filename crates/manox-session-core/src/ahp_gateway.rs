@@ -254,6 +254,7 @@ impl SessionRuntime for GatewayRuntime {
     }
 
     fn cancel_turn(&self, session_id: &str) -> Result<(), RuntimeError> {
+        tracing::info!(session = %session_id, "gateway: cancelling the turn");
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| t.cancel());
@@ -395,6 +396,12 @@ impl SessionRuntime for GatewayRuntime {
         request_id: &str,
         answers: Vec<manox_agent::permission::AskAnswer>,
     ) -> Result<(), RuntimeError> {
+        tracing::debug!(
+            session = %session_id,
+            request_id = %request_id,
+            answers = answers.len(),
+            "gateway: answering question"
+        );
         match self.server.ahp_inner().session_thread(session_id) {
             Some(thread) => {
                 thread.with_mut(|t| {

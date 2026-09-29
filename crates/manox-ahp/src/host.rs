@@ -398,6 +398,42 @@ impl Inner {
         envelope
     }
 
+    /// The active turn's ask inventory on `uri`, for the no-op warn in
+    /// [`Inner::stamp_and_fold`]: a chat answer that does not reduce leaves the
+    /// client's card open forever, and the ask the fold holds — answered or not
+    /// — is what decides that.
+    fn ask_inventory(&self, uri: &str, request_id: &str) -> String {
+        crate::channels::chat::id(uri)
+            .and_then(|id| {
+                let store = self.store.read();
+                store.chat(id).cloned()
+            })
+            .map(|chat| {
+                let open_asks: Vec<String> = chat
+                    .active_turn
+                    .iter()
+                    .flat_map(|turn| turn.response_parts.iter())
+                    .filter_map(|p| match p {
+                        ahp_types::state::ResponsePart::InputRequest(input) => Some(format!(
+                            "{} answered={}",
+                            input.request.id,
+                            input.response.is_some()
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                match &chat.active_turn {
+                    Some(turn) => format!(
+                        "active={} settled={} open_asks={open_asks:?} want={request_id}",
+                        turn.id,
+                        chat.turns.len()
+                    ),
+                    None => format!("active=None settled={} want={request_id}", chat.turns.len()),
+                }
+            })
+            .unwrap_or_else(|| "chat state absent".to_string())
+    }
+
     /// Stamp and fold without broadcasting (the dispatch path answers the
     /// originator through the broadcast of the accepted envelope).
     pub(crate) fn stamp_and_fold(
@@ -415,7 +451,16 @@ impl Inner {
             // no-op there is normal; a standard action that does not apply is a
             // translation bug and must be loud.
             if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
-                tracing::warn!(channel = uri, action = %tag, "host action reduced to {outcome:?}");
+                let asks = match &action {
+                    StateAction::ChatInputCompleted(done) => {
+                        self.ask_inventory(uri, &done.request_id)
+                    }
+                    _ => String::new(),
+                };
+                tracing::warn!(
+                    channel = uri, action = %tag, asks = %asks,
+                    "host action reduced to {outcome:?}"
+                );
             }
         } else {
             tracing::warn!(channel = uri, "host action on an unknown channel scheme");
