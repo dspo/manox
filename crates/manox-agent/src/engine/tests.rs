@@ -1,4 +1,5 @@
-//! Engine tests (moved verbatim from `engine::mod`; same-parent resolution).
+//! Engine tests. The modules under test re-export their items through
+//! `engine::mod`, so `use super::*` reaches everything.
 
 use super::*;
 

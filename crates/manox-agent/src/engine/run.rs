@@ -1,8 +1,16 @@
-//! Split out of `engine::mod` verbatim (pure movement; the items keep their
-//! semantics — only the module boundary and visibility changed).
+//! Engine run plumbing: driving a run to settlement, goal chaining,
+//! steering resume, live-history sync, and harness subscriptions.
 
 use super::*;
 
+/// Drive one session run to completion while still servicing mid-run
+/// commands (abort/steer/cancel/shutdown) through the session handle.
+/// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
+/// Returns the run result and whether an abort was requested.
+///
+/// While the run is in flight, a periodic tick refreshes the engine's
+/// history mirror from the live transcript (`LiveHistory` notice) so a
+/// thread switched back to mid-turn rebuilds from current progress.
 #[allow(clippy::too_many_arguments)] // drive plumbing: each input is a distinct sink
 pub(super) async fn drive_run<F>(
     run: F,

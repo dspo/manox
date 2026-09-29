@@ -1,5 +1,5 @@
-//! Split out of `engine::mod` verbatim (pure movement; the items keep their
-//! semantics — only the module boundary and visibility changed).
+//! Engine journal plumbing: the durable-payload projection, the
+//! per-thread engine routes, and the cold-append path.
 
 use super::*;
 

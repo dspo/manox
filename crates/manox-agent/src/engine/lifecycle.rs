@@ -1,5 +1,5 @@
-//! Split out of `engine::mod` verbatim (pure movement; the items keep their
-//! semantics — only the module boundary and visibility changed).
+//! Engine session lifecycle: orchestrator attachment, ui-note persistence,
+//! the session builder and its hook attachers, and session rebuild.
 
 use super::*;
 
@@ -303,14 +303,8 @@ pub(super) async fn record_journal_loss(
     }
 }
 
-/// Drive one session run to completion while still servicing mid-run
-/// commands (abort/steer/cancel/shutdown) through the session handle.
-/// Shared by user prompts, monitor idle-wakeups, and plan-approval seeds.
-/// Returns the run result and whether an abort was requested.
-///
-/// While the run is in flight, a periodic tick refreshes the engine's
-/// history mirror from the live transcript (`LiveHistory` notice) so a
-/// thread switched back to mid-turn rebuilds from current progress.
+/// Build the session builder against the given project dir, using the shared
+/// runtime and model.
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 pub(super) fn session_builder(
     cwd: &Path,
@@ -487,6 +481,9 @@ pub(super) fn attach_prefix_gate(
     crate::prefix_gate::attach_prefix_gate(session, notice_tx, thread_id);
 }
 
+/// Close the current session and open the given jsonl file in its place. The
+/// project dir comes from the session's own record so tools re-pin to the
+/// project the session was started in.
 #[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 pub(super) async fn rebuild_session(
     session: &mut AgentSession,

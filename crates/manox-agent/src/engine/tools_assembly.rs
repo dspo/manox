@@ -1,5 +1,6 @@
-//! Split out of `engine::mod` verbatim (pure movement; the items keep their
-//! semantics — only the module boundary and visibility changed).
+//! Engine tool assembly: the subagent/monitor/task-stop tools, browser
+//! suites, `build_tools`, the session orchestrators, and the embedder/MCP
+//! refresh paths.
 
 use super::*;
 

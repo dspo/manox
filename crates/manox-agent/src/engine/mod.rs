@@ -367,6 +367,13 @@ impl PiEngine {
     }
 }
 
+/// Spawn the pi actor and return the engine handle plus its notice receiver.
+/// The facade drains the receiver on the gpui thread. `initial_path`, when
+/// given, opens that session file instead of restoring the newest one.
+/// `lease` is the driven session's write lease (None for fresh sessions —
+/// a new id has no contender); the ACTOR holds it, not the facade: final
+/// rows settle after the facade drops, and a lease outliving the actor
+/// would keep a closed session locked against other processes.
 #[allow(clippy::too_many_arguments)] // engine spawn: startup options stay explicit
 pub fn spawn_engine(
     cwd: PathBuf,
@@ -1840,10 +1847,6 @@ async fn run_actor(
     crate::background_task::cleanup_thread(&thread_id);
 }
 
-/// Close the current session and open the given jsonl file in its place. The
-/// project dir comes from the session's own record so tools re-pin to the
-/// project the session was started in.
-#[allow(clippy::too_many_arguments)] // actor plumbing: each input is distinct session state
 #[derive(Debug, Default)]
 struct TitleSchedulerState {
     title: Option<String>,
