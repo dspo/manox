@@ -305,6 +305,17 @@ impl RuntimeBackend {
             }
             None => (chat::initial(session_id), 0, HashMap::new()),
         };
+        // The host's live chat state is the client-visible mirror and wins
+        // over a fresh fold: the fold re-mints turn ids under fresh synthetic
+        // names that the connected clients — and the bridge resuming against
+        // them — have never seen. The fold stays the authority only where
+        // the host has no state yet (a cold session, a fresh process); a
+        // snapshot answered from the host state is exactly what the live
+        // stream continues from, so late subscribers and the bridge agree.
+        let chat = match self.host().and_then(|host| host.chat_state(session_id)) {
+            Some(live) if live.active_turn.is_some() || !live.turns.is_empty() => live,
+            _ => chat,
+        };
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
         // refresh scans its file, and `createSession` seeds it immediately —
@@ -1292,6 +1303,18 @@ impl Backend for RuntimeBackend {
                 let session_id = target.clone();
                 match self.server.submit(&owner, &target, text) {
                     Ok(_) => {
+                        // The host folds the client's turn-start so the turn id
+                        // the client holds IS the host's active turn: the bridge
+                        // then streams every part against it (`open_with_id`),
+                        // and the dispatching client gets the echo its
+                        // optimistic UI retires against. Without this the bridge
+                        // had to mint its own synthetic turnStarted whenever the
+                        // host had no active turn — a race against the engine's
+                        // first content row, which the client's reducer silently
+                        // dropped on every loss (a whole turn invisible).
+                        if let Some(host) = self.host() {
+                            host.publish(channel, action.clone(), None);
+                        }
                         // A submit materializes the engine, so a session that was
                         // cold when the client subscribed has no bridge yet: the
                         // first `seeded` ran before the engine existed and its
