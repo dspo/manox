@@ -100,7 +100,6 @@ pub type SandboxCommandBuilder = Arc<dyn Fn(&str, &Path) -> tokio::process::Comm
 /// choice (an escalated background task runs without confinement).
 pub struct BackgroundRegistry {
     tasks: Mutex<std::collections::HashMap<String, Arc<TaskEntry>>>,
-    next_id: AtomicU64,
     /// Optional seatbelt wrapper for sandboxed background tasks.
     sandbox: Option<SandboxCommandBuilder>,
 }
@@ -109,7 +108,6 @@ impl BackgroundRegistry {
     pub fn new() -> Self {
         BackgroundRegistry {
             tasks: Mutex::new(std::collections::HashMap::new()),
-            next_id: AtomicU64::new(0),
             sandbox: None,
         }
     }
@@ -171,10 +169,7 @@ impl BackgroundRegistry {
             .spawn()
             .map_err(|e| crate::core::TaskError::Spawn(format!("{e}")))?;
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        let id = crate::core::TaskId(format!(
-            "mon_{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
+        let id = crate::core::TaskId(format!("mon_{}", crate::ext::next_task_ordinal()));
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let entry = Arc::new(TaskEntry::new(child, pid));
@@ -485,10 +480,7 @@ impl BackgroundRegistry {
             .spawn()
             .map_err(|e| crate::core::TaskError::Spawn(format!("{e}")))?;
         let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        let id = crate::core::TaskId(format!(
-            "bg_{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
+        let id = crate::core::TaskId(format!("bg_{}", crate::ext::next_task_ordinal()));
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let entry = Arc::new(TaskEntry::new(child, pid));

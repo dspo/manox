@@ -69,11 +69,6 @@ pub struct ThreadStore {
     /// icon, not a spinner, while a verdict is due); cleared on verdict,
     /// terminal events, and error.
     pending_plan: HashSet<String>,
-    /// Threads with live monitors or background bash: no turn is in flight,
-    /// but the loop can still self-advance on external events. Populated
-    /// from `BackgroundTaskUpdated` via the legacy registry's per-thread
-    /// running-task check.
-    background_work: HashSet<String>,
     /// Canonical entity lookup without retaining idle threads indefinitely.
     live_threads: HashMap<String, std::sync::Weak<ThreadCore>>,
     sessions_dir: PathBuf,
@@ -385,7 +380,6 @@ pub fn init() {
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         pending_plan: HashSet::new(),
-        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         db,
@@ -856,26 +850,6 @@ impl ThreadStore {
         };
         if changed {
             self.pending_events.push(ThreadStoreEvent::SummariesUpdated);
-        }
-    }
-
-    /// Whether a thread has live monitors or background bash (the loop can
-    /// still self-advance even with no turn in flight).
-    pub fn background_work_contains(&self, id: &str) -> bool {
-        self.background_work.contains(id)
-    }
-
-    /// Mark/unmark a thread as carrying live background work. Fires
-    /// `RunningChanged` (the spinner-driving event) so the sidebar re-evaluates
-    /// the rotating state without a list rescan.
-    pub fn mark_background_work(&mut self, id: &str, active: bool) {
-        let changed = if active {
-            self.background_work.insert(id.to_string())
-        } else {
-            self.background_work.remove(id)
-        };
-        if changed {
-            self.pending_events.push(ThreadStoreEvent::RunningChanged);
         }
     }
 
@@ -2050,7 +2024,6 @@ pub fn standalone_for_test(db: Arc<crate::db::ThreadsDatabase>) -> StoreHandle {
         running: HashSet::new(),
         pending_auth: HashSet::new(),
         pending_plan: HashSet::new(),
-        background_work: HashSet::new(),
         live_threads: HashMap::new(),
         sessions_dir: dir,
         decision_overlay: HashMap::new(),
@@ -2245,7 +2218,6 @@ mod tests {
             running: HashSet::new(),
             pending_auth: HashSet::new(),
             pending_plan: HashSet::new(),
-            background_work: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir: std::env::temp_dir(),
             decision_overlay: HashMap::new(),
@@ -2457,7 +2429,6 @@ mod tests {
             running: HashSet::new(),
             pending_auth: HashSet::new(),
             pending_plan: HashSet::new(),
-            background_work: HashSet::new(),
             live_threads: HashMap::new(),
             sessions_dir: dir,
             decision_overlay: HashMap::new(),
@@ -2564,38 +2535,26 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
-    /// The plan-review and background-work markers (the blue-static vs
-    /// spinner distinction) toggle per thread id and are idempotent under
-    /// repeated marks.
+    /// The plan-review marker (the blue-static vs spinner distinction)
+    /// toggles per thread id and is idempotent under repeated marks.
     #[test]
-    fn plan_and_background_markers_toggle() {
+    fn plan_marker_toggles() {
         let (db, path) = temp_db();
         let store = store_handle(db.clone());
         let events = store.subscribe();
-        store.with_mut(|s| {
-            s.mark_pending_plan("t1", true);
-            s.mark_background_work("t1", true);
-        });
+        store.with_mut(|s| s.mark_pending_plan("t1", true));
         assert!(store.read(|s| s.pending_plan_contains("t1")));
-        assert!(store.read(|s| s.background_work_contains("t1")));
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 1);
         // Idempotent marks: no duplicate events.
-        store.with_mut(|s| {
-            s.mark_pending_plan("t1", true);
-            s.mark_background_work("t1", true);
-        });
-        assert_eq!(events.len(), 2);
+        store.with_mut(|s| s.mark_pending_plan("t1", true));
+        assert_eq!(events.len(), 1);
         // A second thread marks independently; clearing only removes its own.
         store.with_mut(|s| s.mark_pending_plan("t2", true));
-        assert_eq!(events.len(), 3);
-        store.with_mut(|s| {
-            s.mark_pending_plan("t1", false);
-            s.mark_background_work("t1", false);
-        });
+        assert_eq!(events.len(), 2);
+        store.with_mut(|s| s.mark_pending_plan("t1", false));
         assert!(!store.read(|s| s.pending_plan_contains("t1")));
-        assert!(!store.read(|s| s.background_work_contains("t1")));
         assert!(store.read(|s| s.pending_plan_contains("t2")));
-        assert_eq!(events.len(), 5);
+        assert_eq!(events.len(), 3);
         std::fs::remove_file(path).ok();
     }
 

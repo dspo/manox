@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::task::{AbortHandle, JoinHandle};
@@ -58,24 +57,20 @@ struct WsEntry {
 /// Registry of WebSocket monitors.
 pub struct WsMonitorRegistry {
     entries: Mutex<HashMap<String, WsEntry>>,
-    next_id: AtomicU64,
 }
 
 impl WsMonitorRegistry {
     pub fn new() -> Self {
         WsMonitorRegistry {
             entries: Mutex::new(HashMap::new()),
-            next_id: AtomicU64::new(0),
         }
     }
 
-    /// Allocate a new task id and register it as Running.
+    /// Allocate a new task id and register it as Running. The ordinal is
+    /// process-global so ids stay unique across concurrently-live sessions.
     pub fn register(&self, url: String, cancel: tokio_util::sync::CancellationToken) -> WsTaskId {
         self.gc();
-        let id = WsTaskId(format!(
-            "ws_{}",
-            self.next_id.fetch_add(1, Ordering::Relaxed)
-        ));
+        let id = WsTaskId(format!("ws_{}", crate::ext::next_task_ordinal()));
         self.entries.lock().expect("entries lock poisoned").insert(
             id.0.clone(),
             WsEntry {

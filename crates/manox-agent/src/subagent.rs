@@ -28,7 +28,7 @@ use manox_harness::tool::{AgentTool, AgentToolResult, ToolContext, ToolError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::background_task::{self, TaskKind, TaskStatus};
+use crate::background_task::{self, TaskStatus};
 use crate::subagent_watchdog::SubagentWatchdog;
 use crate::thread::ThreadEvent;
 use crate::thread_engine::BackendNotice;
@@ -419,12 +419,7 @@ impl AgentTool for DelegationTool {
         // title is the dispatch's `description` (the run label), not a
         // watchdog activity line.
         let cancel = run.dispose_token().clone();
-        let (task_id, task) = background_task::register(
-            TaskKind::Subagent,
-            self.owner_thread_id(),
-            card_title,
-            cancel,
-        );
+        let (task_id, task) = background_task::register(self.owner_thread_id(), card_title, cancel);
         let _ = self.notice_tx().send(BackendNotice::Event(Box::new(
             ThreadEvent::BackgroundTaskUpdated {
                 snapshot: task.snapshot(&task_id),

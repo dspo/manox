@@ -1865,9 +1865,6 @@ impl Thread {
         drain_engine_notices(handle.clone(), events);
         handle
     }
-    pub fn background_task_snapshots(&self) -> Vec<TaskSnapshot> {
-        Vec::new()
-    }
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
