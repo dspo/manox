@@ -8,10 +8,13 @@
 //! task calls for that knowledge. This mirrors Claude Code's Skill mechanism.
 //!
 //! Discovery mirrors the marketplace layout: each installed plugin's
-//! `skills/<skill-name>/SKILL.md` is registered under `plugin:skill-name`, and
-//! user-authored `~/.claude/skills/<name>/SKILL.md` files use the bare
-//! name. A plugin may also carry a root-level `SKILL.md` (the plugin's own
-//! overview) — registered under the bare plugin name.
+//! `skills/<skill-name>/SKILL.md` is registered under the plugin's full
+//! registry key, `name@marketplace:skill-name`, and user-authored
+//! `~/.claude/skills/<name>/SKILL.md` files use the bare name. A plugin may
+//! also carry a root-level `SKILL.md` (the plugin's own overview) —
+//! registered under the key alone. The key, not the bare plugin name, is
+//! the namespace: same-name installs from two marketplaces must stay
+//! addressable instead of shadowing each other (#851).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,18 +91,21 @@ impl SkillRegistry {
         if let Ok(dir) = paths::skills_dir() {
             scan_skills_root(&dir, None, &mut skills);
         }
-        // Plugin skills: `plugin:name` namespace + a bare-name root SKILL.md.
+        // Plugin skills: namespaced by the plugin's full registry key
+        // (`name@marketplace:skill`) + a bare-name root SKILL.md — the key,
+        // not the bare name, keeps same-name installs from two marketplaces
+        // from shadowing each other (#851).
         for plugin in PluginManager::installed() {
             let root = plugin.root.join("skills");
             if root.exists() {
-                scan_skills_root(&root, Some(&plugin.name), &mut skills);
+                scan_skills_root(&root, Some(&plugin.key), &mut skills);
             }
             // A plugin-level root SKILL.md is the plugin's overview skill.
             let overview = plugin.root.join("SKILL.md");
             if overview.is_file()
                 && let Ok(s) = load_skill_file(&overview)
             {
-                skills.insert(plugin.name.clone(), Arc::new(s));
+                skills.insert(plugin.key.clone(), Arc::new(s));
             }
         }
         Self { skills }
@@ -114,9 +120,10 @@ impl SkillRegistry {
     }
 
     /// `(registry_key, definition)` pairs. The key is the full lookup name
-    /// (`plugin:skill` or bare `skill`), distinct from `SkillDefinition::name`
-    /// (the bare frontmatter name) — needed by callers that mirror skills into
-    /// other registries keyed by the lookup form (e.g. the slash-command mirror).
+    /// (`name@marketplace:skill` or bare `skill`), distinct from
+    /// `SkillDefinition::name` (the bare frontmatter name) — needed by
+    /// callers that mirror skills into other registries keyed by the lookup
+    /// form (e.g. the slash-command mirror).
     pub fn entries(&self) -> Vec<(&String, &Arc<SkillDefinition>)> {
         self.skills.iter().collect()
     }
@@ -412,10 +419,10 @@ mod tests {
     }
 
     /// `summaries()` must advertise the full registry key (e.g.
-    /// `plugin:skill-name`), not the bare frontmatter `name`, so the model
-    /// can pass it back to `get()` and resolve the skill. A bare name for a
-    /// plugin skill would miss the lookup — the same bug class as plugin
-    /// subagent types.
+    /// `name@marketplace:skill-name`), not the bare frontmatter `name`, so
+    /// the model can pass it back to `get()` and resolve the skill. A bare
+    /// name for a plugin skill would miss the lookup — the same bug class as
+    /// plugin subagent types.
     #[test]
     fn summaries_use_registry_key_not_bare_name() {
         let mut skills = BTreeMap::new();

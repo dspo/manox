@@ -60,7 +60,10 @@ fn load_dir(dir: &Path) -> Vec<(String, AgentDef)> {
 /// Register user-authored definitions (same-name overrides built-ins), then
 /// the project layer (`<project_cwd>/.claude/agents/`, overriding user on
 /// name clashes — Claude Code's project-over-user precedence), then plugin
-/// definitions namespaced `<plugin>:<name>`.
+/// definitions namespaced by the plugin's full registry key
+/// `<name>@<marketplace>:<name>` — the key, not the bare name, is what keeps
+/// same-name installs from two marketplaces from shadowing each other
+/// (register order would otherwise decide the winner).
 pub fn register_user_and_plugin(registry: &mut AgentRegistry, project_cwd: Option<&Path>) {
     register_from_dirs(
         registry,
@@ -93,7 +96,7 @@ fn register_from_dirs(
     }
     for plugin in plugins {
         for (label, mut def) in load_dir(&plugin.root.join("agents")) {
-            def.name = format!("{}:{}", plugin.name, def.name);
+            def.name = format!("{}:{}", plugin.key, def.name);
             tracing::debug!(agent = %def.name, source = %label, "registered plugin agent definition");
             registry.register(def);
         }
@@ -174,7 +177,40 @@ mod tests {
                 key: "gitwork@test".to_string(),
             }],
         );
-        assert_eq!(registry.names(), vec!["gitwork:Reviewer"]);
+        assert_eq!(registry.names(), vec!["gitwork@test:Reviewer"]);
+    }
+
+    /// Same plugin name, two marketplaces: the registry-key namespace keeps
+    /// both definitions addressable — the bare-name namespace would let
+    /// register order silently decide the winner (#851).
+    #[test]
+    fn same_name_plugins_do_not_shadow_each_other() {
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        for root in [&root_a, &root_b] {
+            let agents = root.path().join("agents");
+            std::fs::create_dir_all(&agents).unwrap();
+            write(&agents, "reviewer.md", VALID_DEF);
+        }
+        let plugins = [
+            crate::plugin::InstalledPlugin {
+                name: "gitwork".to_string(),
+                root: root_a.path().to_path_buf(),
+                marketplace: "one".to_string(),
+                key: "gitwork@one".to_string(),
+            },
+            crate::plugin::InstalledPlugin {
+                name: "gitwork".to_string(),
+                root: root_b.path().to_path_buf(),
+                marketplace: "two".to_string(),
+                key: "gitwork@two".to_string(),
+            },
+        ];
+        let mut registry = AgentRegistry::new();
+        register_from_dirs(&mut registry, None, None, &plugins);
+        let mut names = registry.names();
+        names.sort();
+        assert_eq!(names, vec!["gitwork@one:Reviewer", "gitwork@two:Reviewer"]);
     }
 
     #[test]
