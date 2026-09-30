@@ -1214,7 +1214,18 @@ fn summary_from_row(
         created_at: unix_to_rfc3339(row.created_at),
         modified_at: unix_to_rfc3339(row.updated_at),
         changes: None,
-        meta: None,
+        // The store row is the pin authority (pin_session journals through
+        // it): ride the summary's `_meta` extension slot so a client's list
+        // render sees the pin without subscribing the thread channel. Always
+        // present — clients read the field uniformly, and a pinned=false is
+        // as much a fact as a pinned=true.
+        meta: Some({
+            let mut xmanox = serde_json::Map::new();
+            xmanox.insert("pinned".to_string(), serde_json::json!(row.pinned));
+            let mut meta = ahp_types::common::JsonObject::new();
+            meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
+            meta
+        }),
     }
 }
 
@@ -2810,5 +2821,42 @@ mod mcp_dispatch_tests {
             matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("file-owned")),
             "the refusal must name the ownership rule: {outcome:?}"
         );
+    }
+
+    /// The list rides the store rows, and the store row is the pin
+    /// authority (pin_session journals through it) — so every summary must
+    /// carry the pin in its `_meta` extension slot: a client's sidebar then
+    /// renders the pin for rows whose thread channel it never subscribed.
+    #[test]
+    fn summaries_carry_the_pin_in_the_meta_slot() {
+        // pin_thread's drained sidecar writes spawn on the process runtime.
+        crate::test_support::init_globals();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
+                .expect("open temp threads db"),
+        );
+        let store = manox_agent::thread_store::standalone_for_test(db);
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-pinned", None);
+            st.insert_summary_for_test("s-plain", None);
+            st.pin_thread("s-pinned", true);
+        });
+
+        let read_pin = |id: &str| {
+            store.read(|state| {
+                let row = state.summary_by_id(id).expect("the seeded row exists");
+                let summary = summary_from_row(row, state, None);
+                summary
+                    .meta
+                    .expect("the meta slot is always populated")
+                    .get("x-manox")
+                    .and_then(|x| x.get("pinned"))
+                    .and_then(serde_json::Value::as_bool)
+                    .expect("the meta carries x-manox.pinned as a bool")
+            })
+        };
+        assert!(read_pin("s-pinned"), "the pinned row reads pinned");
+        assert!(!read_pin("s-plain"), "the unpinned row reads unpinned");
     }
 }
