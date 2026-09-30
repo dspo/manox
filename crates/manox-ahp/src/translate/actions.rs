@@ -819,6 +819,25 @@ impl Translator {
                 // id, so no separate `x-manox-plan` verdict card is needed.
                 if state == "resolved" {
                     if let Some(request_id) = self.plan_review.take() {
+                        // The verdict rides the plan channel in its own right:
+                        // the chat-level `ChatInputCompleted` below only folds
+                        // when the request's turn is still ACTIVE, and a plan
+                        // review legitimately outlives its turn (the turn
+                        // finishes the moment the plan is proposed) — the
+                        // reducer then no-ops on both sides and the client's
+                        // card can never retire (#88's composer lock). The
+                        // plan-channel state is where the settlement is
+                        // fold-visible regardless of turn lifecycle.
+                        out.push(Emitted::new(
+                            &crate::translate::Target::Plan.uri(chat_id, session_id),
+                            extension_action(
+                                ext::actions::PLAN_VERDICT,
+                                json!({
+                                    "requestId": request_id,
+                                    "planFile": plan_file,
+                                }),
+                            ),
+                        ));
                         out.push(Emitted::new(
                             &chat,
                             StateAction::ChatInputCompleted(ChatInputCompletedAction {
@@ -2456,8 +2475,12 @@ mod tests {
                 },
             ),
         );
-        assert_eq!(emitted.len(), 1);
-        let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(emitted.len(), 2);
+        let verdict = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(verdict["type"], ext::actions::PLAN_VERDICT);
+        assert_eq!(verdict["requestId"], "plan-review:e-1");
+        assert!(emitted[0].channel.starts_with("x-manox-plan"));
+        let value = serde_json::to_value(&emitted[1].action).expect("action serializes");
         assert_eq!(value["type"], "chat/inputCompleted");
         assert_eq!(value["requestId"], "plan-review:e-1");
     }
