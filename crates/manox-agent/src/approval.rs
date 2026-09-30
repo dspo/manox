@@ -150,6 +150,22 @@ impl ApprovalGate {
         rx
     }
 
+    /// Re-park a replayed card only when the id is not already parked. The
+    /// restore path re-parks the journal's unsettled rows, and a re-open
+    /// racing a LIVE card must keep the live responder — displacing it
+    /// would drop the user's verdict on the floor. There is no awaiting
+    /// tool future behind a replayed park, so the settle receiver goes
+    /// straight to the drop.
+    pub(crate) fn register_if_absent(&self, id: &str, meta: PendingAuthMeta) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.contains_key(id) {
+            return false;
+        }
+        let (tx, _rx) = oneshot::channel();
+        pending.insert(id.to_string(), PendingAuth { tx, meta });
+        true
+    }
+
     /// Drop a pending interaction without answering (turn cancelled).
     pub(crate) fn discard(&self, id: &str) {
         // K3 (L3): a cancelled card journals its decision too — the
@@ -1497,5 +1513,35 @@ mod tests {
             cmd_rx.try_recv().is_err(),
             "a settled card must not journal a second decision"
         );
+    }
+
+    /// The restore path's re-park never displaces a LIVE park: a re-open
+    /// racing a live card keeps the live responder, so the user's verdict
+    /// reaches the awaiting tool future instead of dying with a dropped
+    /// receiver.
+    #[test]
+    fn register_if_absent_keeps_the_live_park() {
+        let meta = || PendingAuthMeta {
+            tool_name: "Bash".into(),
+            summary: "s".into(),
+            input: serde_json::json!({}),
+        };
+        let gate = gate();
+        let mut rx = gate.register("call-1", meta());
+        assert!(
+            !gate.register_if_absent("call-1", meta()),
+            "a live park keeps its responder"
+        );
+        assert!(gate.register_if_absent("call-2", meta()));
+        gate.respond(
+            "call-1",
+            ToolAuthorizationResponse::Decision(PermissionDecision::Deny),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ToolAuthorizationResponse::Decision(
+                PermissionDecision::Deny
+            ))
+        ));
     }
 }

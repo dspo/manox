@@ -155,6 +155,20 @@ impl UserQuestionGate {
         rx
     }
 
+    /// Re-park a replayed card only when the id is not already parked (the
+    /// approval gate's same rule: a re-open racing a live card keeps the
+    /// live responder). No awaiting tool future sits behind a replayed
+    /// park, so the settle receiver is dropped on the spot.
+    pub(crate) fn register_if_absent(&self, id: &str, meta: PendingAuthMeta) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if pending.contains_key(id) {
+            return false;
+        }
+        let (tx, _rx) = oneshot::channel();
+        pending.insert(id.to_string(), PendingQuestion { tx, meta });
+        true
+    }
+
     /// Drop a parked question without an answer (turn cancelled). The
     /// cancelled card still journals its decision, or the `pending_auth` fold
     /// would keep a card alive that no client can ever answer.

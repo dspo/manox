@@ -824,6 +824,68 @@ impl AgentServerInner {
     }
 }
 
+/// Cold-open a session the gateway must settle an interaction verdict on.
+///
+/// A subscribed-but-never-submitted session has served state without a
+/// live engine in the sessions table (the submit path opens it; nothing
+/// else does), so a verdict for it would die as `unknown session` —
+/// exactly the replayed park the engine restore re-parks. The owner is
+/// the session's first live owner, or the synthetic [`SETTLE_OWNER`] when
+/// no client ever opened it; a synthetic owner is never disposed, so the
+/// entry (and its write lease) lives until the process ends or the
+/// session is archived — the same residency a submitted session already
+/// has, minus a client to release it.
+///
+/// Every path — warm and cold — awaits the engine's restore-completion
+/// watch before returning: the re-park rides the restore's tail, so a
+/// verdict issued before it lands would hit an empty gate and silently
+/// no-op (the user's click eaten, the card still up). The wait is
+/// bounded; on timeout the verdict proceeds and the settle path's own
+/// warning marks the anomaly.
+pub(crate) async fn ensure_opened_for_settle(
+    inner: &Arc<AgentServerInner>,
+    session_id: &str,
+) -> Result<ThreadHandle, manox_ahp_runtime::error::RuntimeError> {
+    let thread = if let Some(thread) = inner.session_thread(session_id) {
+        thread
+    } else {
+        let id = inner.resolve_redirect(session_id);
+        let owner = inner
+            .owners(&id)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| SETTLE_OWNER.to_string());
+        open_session(inner, &owner, &id).await?;
+        inner
+            .session_thread(&id)
+            .ok_or_else(|| unknown_session(&id))?
+    };
+    // The restore readiness watch: `true` once the actor's restore — and
+    // the re-park riding its tail — has landed. Instantly ready for a
+    // long-lived engine; the real wait happens only in the restore window.
+    let mut restored = thread.restore_ready();
+    let wait = async {
+        loop {
+            if *restored.borrow_and_update() {
+                return;
+            }
+            if restored.changed().await.is_err() {
+                return; // the actor is gone; the verdict will warn below
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            session = %session_id,
+            "settle: the engine restore never landed within 10s; the verdict may no-op"
+        );
+    }
+    Ok(thread)
+}
+
 /// Open (or re-own) a live session: load its journal, insert the entry, and
 /// make `owner` an owner of it.
 ///
@@ -899,6 +961,10 @@ fn unknown_session(session_id: &str) -> manox_ahp_runtime::error::RuntimeError {
     manox_ahp_runtime::error::RuntimeError::new(format!("unknown session: {session_id}"))
         .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)
 }
+
+/// The synthetic owner [`AgentServer::ensure_opened_for_settle`] mints when
+/// no client ever opened the session it must settle a verdict on.
+pub(crate) const SETTLE_OWNER: &str = "settle";
 
 /// No registered model answers to this id.
 fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
