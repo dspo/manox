@@ -3,8 +3,18 @@
 //! asynchronously-dispatched subagents — each with an owner thread, status,
 //! stop routing, and a bounded output ring.
 //!
-//! Settlement is first-wins: `push_terminal` only
-//! transition a Running/Stopping task, so duplicate terminal reports from a
+//! This is the host's single source of truth for task cards: the session
+//! producers report their lifecycle straight into it through `attach`
+//! (the host `TaskObserver`), Sailors register directly, and every state
+//! change a path can observe is re-emitted as a
+//! `ThreadEvent::BackgroundTaskUpdated` snapshot — producer emissions via
+//! the observer, and the stop path's own synchronous terminal push via the
+//! per-task notifier the observer registers. Output snapshots are
+//! throttled (every fifth line), so "each change" means each lifecycle
+//! change plus sampled output.
+//!
+//! Settlement is first-wins: `push_terminal` transitions a Running/Stopping
+//! task, so duplicate terminal reports from a
 //! kill path and a natural exit collapse into one terminal state. The
 //! terminal status doubles as the cause vocabulary (`Stopped` = explicit
 //! TaskStop / user cancel, `SessionEnded` = thread or app teardown,
@@ -16,11 +26,14 @@
 //! directly-registered tasks (subagents) draw from the registry counter.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
+
+use crate::thread::ThreadEvent;
+use crate::thread_engine::BackendNotice;
 
 /// How long a completed task stays in the registry before GC sweeps it.
 const GC_AFTER_EXIT: Duration = Duration::from_secs(300);
@@ -152,6 +165,11 @@ struct TaskState {
     /// The hook that actually stops the underlying pi-side work. Registered
     /// by whoever proxies the task (monitor manager / background manager).
     on_stop: Option<OnStopHook>,
+    /// Notice sink for snapshots this registry pushes itself (the stop
+    /// path's synchronous terminal status). Producer-driven changes emit
+    /// through the observer instead; tasks registered without an observer
+    /// (Sailors) deliver their own notices.
+    notifier: Option<mpsc::UnboundedSender<BackendNotice>>,
     exit_code: Option<i32>,
     /// Truncated failure/stderr summary.
     failure_summary: Option<String>,
@@ -179,6 +197,7 @@ impl TaskState {
             exited_at: None,
             exited_at_ms: None,
             on_stop: None,
+            notifier: None,
             exit_code: None,
             failure_summary: None,
         }
@@ -263,11 +282,15 @@ impl BackgroundTask {
         }
     }
 
-    /// Push a terminal event. First-wins: only Running/Stopping can transition.
-    pub fn push_terminal(&self, task_id: &TaskId, status: TaskStatus) {
+    /// Push a terminal event. First-wins: only Running/Stopping can
+    /// transition. Returns whether THIS call performed the transition —
+    /// callers that emit notices use it to skip duplicates (a kill-site
+    /// settlement and the stop path's fallback share one channel, so the
+    /// loser emitting again would double every journal line).
+    pub fn push_terminal(&self, task_id: &TaskId, status: TaskStatus) -> bool {
         let mut s = self.state.lock().expect("task state poisoned");
         if s.status.is_terminal() {
-            return;
+            return false;
         }
         s.status = status;
         s.exited_at = Some(Instant::now());
@@ -288,6 +311,7 @@ impl BackgroundTask {
         s.events.push_back(event);
         drop(s);
         self.completion.notify_waiters();
+        true
     }
 
     /// Set the exit code (for command/Bash tasks).
@@ -364,6 +388,27 @@ impl BackgroundTask {
         self.state.lock().expect("task state poisoned").on_stop = Some(on_stop);
     }
 
+    /// Register the notice sink for snapshots this registry pushes itself
+    /// (the stop path's synchronous terminal status). Called by the host
+    /// observer at proxy registration.
+    pub fn set_notifier(&self, notifier: mpsc::UnboundedSender<BackendNotice>) {
+        self.state.lock().expect("task state poisoned").notifier = Some(notifier);
+    }
+
+    /// Emit a snapshot through the registered notifier, if any. The
+    /// snapshot is built and sent under the state lock: a read-then-send
+    /// window would let a sampled `Running` snapshot land after a terminal
+    /// one and flip the card backwards.
+    fn emit_snapshot(&self, task_id: &TaskId) {
+        let s = self.state.lock().expect("task state poisoned");
+        let snapshot = build_snapshot(&s, task_id);
+        if let Some(tx) = s.notifier.as_ref() {
+            let _ = tx.send(BackendNotice::Event(Box::new(
+                ThreadEvent::BackgroundTaskUpdated { snapshot },
+            )));
+        }
+    }
+
     pub fn owner_thread_id(&self) -> String {
         self.state
             .lock()
@@ -375,21 +420,28 @@ impl BackgroundTask {
     /// Build a serializable snapshot for UI cards.
     pub fn snapshot(&self, task_id: &TaskId) -> TaskSnapshot {
         let s = self.state.lock().expect("task state poisoned");
-        TaskSnapshot {
-            task_id: task_id.0.clone(),
-            kind: s.kind,
-            owner_thread_id: s.owner_thread_id.clone(),
-            description: s.description.clone(),
-            status: s.status,
-            created_at_ms: s.created_at_ms,
-            ended_at_ms: s.exited_at_ms,
-            event_count: s.event_count,
-            total_bytes: s.total_bytes,
-            exit_code: s.exit_code,
-            failure_summary: s.failure_summary.clone(),
-            anchor_message_id: None,
-            output_tail: output_tail_from_ring(&s),
-        }
+        build_snapshot(&s, task_id)
+    }
+}
+
+/// Build a snapshot from an already-locked state (shared by the UI
+/// projection and the notifier emission, which must read and send under
+/// one lock hold).
+fn build_snapshot(s: &TaskState, task_id: &TaskId) -> TaskSnapshot {
+    TaskSnapshot {
+        task_id: task_id.0.clone(),
+        kind: s.kind,
+        owner_thread_id: s.owner_thread_id.clone(),
+        description: s.description.clone(),
+        status: s.status,
+        created_at_ms: s.created_at_ms,
+        ended_at_ms: s.exited_at_ms,
+        event_count: s.event_count,
+        total_bytes: s.total_bytes,
+        exit_code: s.exit_code,
+        failure_summary: s.failure_summary.clone(),
+        anchor_message_id: None,
+        output_tail: output_tail_from_ring(s),
     }
 }
 
@@ -590,6 +642,113 @@ pub(crate) fn apply_settlement(
     task.push_terminal(id, status);
 }
 
+/// Output lines collected before a task's snapshot re-emits to the UI.
+const OUTPUT_EMIT_THRESHOLD: u32 = 5;
+
+/// The host's [`TaskObserver`]: binds the session producers (monitors,
+/// background bash) to this registry. Each `Spawned` registers a proxy task
+/// under the pi task id (one id space for `stop` and the UI cards, with an
+/// on_stop hook back into the producer), each `Output` lands in the proxy's
+/// bounded ring (snapshots throttled), and each `Settled` records the
+/// wire-stable terminal status through `apply_settlement`.
+struct HostTaskObserver {
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+    owner_thread_id: String,
+    output_since_emit: Mutex<HashMap<String, u32>>,
+}
+
+impl manox_harness::tasks::TaskObserver for HostTaskObserver {
+    fn on_spawned(
+        &self,
+        id: &str,
+        family: manox_harness::tasks::TaskFamily,
+        label: &str,
+        stop: manox_harness::tasks::StopHandle,
+    ) {
+        let proxy = register_with_id(
+            TaskId(id.to_string()),
+            map_kind(family),
+            self.owner_thread_id.clone(),
+            label.to_string(),
+            CancellationToken::new(),
+        );
+        proxy.set_on_stop(Arc::new(move |_, cause| stop(cause)));
+        proxy.set_notifier(self.notice_tx.clone());
+        self.emit_snapshot(&proxy, id);
+    }
+
+    fn on_output(&self, id: &str, line: String) {
+        let Some(proxy) = get_by_str(id) else {
+            tracing::warn!(target: "tasks", id, "output for unregistered task; dropping line");
+            return;
+        };
+        proxy.push_event(&TaskId(id.to_string()), line);
+        let emit = {
+            let mut counts = self
+                .output_since_emit
+                .lock()
+                .expect("output counter poisoned");
+            let count = counts.entry(id.to_string()).or_insert(0);
+            *count += 1;
+            if *count >= OUTPUT_EMIT_THRESHOLD {
+                *count = 0;
+                true
+            } else {
+                false
+            }
+        };
+        if emit {
+            self.emit_snapshot(&proxy, id);
+        }
+    }
+
+    fn on_settled(&self, id: &str, settlement: &manox_harness::tasks::Settlement) {
+        let Some(proxy) = get_by_str(id) else {
+            tracing::warn!(target: "tasks", id, "settled task has no host proxy; dropping settlement");
+            return;
+        };
+        apply_settlement(&proxy, &TaskId(id.to_string()), settlement);
+        self.emit_snapshot(&proxy, id);
+    }
+}
+
+impl HostTaskObserver {
+    /// Emit a `BackgroundTaskUpdated` notice for a task. Built and sent
+    /// under the task's state lock (see `BackgroundTask::emit_snapshot`):
+    /// the notifier registered here is the same channel, so both paths
+    /// share one stale-window-free primitive.
+    fn emit_snapshot(&self, task: &BackgroundTask, id: &str) {
+        task.emit_snapshot(&TaskId(id.to_string()));
+    }
+}
+
+fn map_kind(family: manox_harness::tasks::TaskFamily) -> TaskKind {
+    match family {
+        manox_harness::tasks::TaskFamily::MonitorCommand => TaskKind::MonitorCommand,
+        manox_harness::tasks::TaskFamily::MonitorWebSocket => TaskKind::MonitorWebSocket,
+        manox_harness::tasks::TaskFamily::BackgroundBash => TaskKind::BackgroundBash,
+        manox_harness::tasks::TaskFamily::Subagent => TaskKind::Subagent,
+    }
+}
+
+/// Bind the session's producers to the host observer. Called next to
+/// `attach_orchestrators` at session build/restore; the observer lives as
+/// long as the managers hold it.
+pub fn attach(
+    monitor: Arc<manox_harness::monitor::MonitorManager>,
+    background: Arc<manox_harness::bash::orchestration::BackgroundManager>,
+    notice_tx: mpsc::UnboundedSender<BackendNotice>,
+    owner_thread_id: String,
+) {
+    let observer = Arc::new(HostTaskObserver {
+        notice_tx,
+        owner_thread_id,
+        output_since_emit: Mutex::new(HashMap::new()),
+    });
+    monitor.set_observer(Arc::clone(&observer) as Arc<dyn manox_harness::tasks::TaskObserver>);
+    background.set_observer(observer);
+}
+
 /// Stop a task by id and return only after its stop hook has run and the task
 /// has settled. This is the semantic boundary used by TaskStop and shutdown.
 pub async fn stop(id: &str) -> Result<(), String> {
@@ -631,7 +790,14 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
 
     // The pi-side producers normally settle the task themselves through their
     // own settlement path; this fallback covers hooks that cannot report.
-    task.push_terminal(&TaskId(id.to_string()), terminal);
+    // Either way the terminal status must reach the cards: the notifier (a
+    // host-side copy of the observer's notice channel) emits the snapshot
+    // when this push is the one that transitioned the task — a producer
+    // settlement has already emitted through the same channel, and the
+    // fallback would only duplicate it (one journal line per copy).
+    if task.push_terminal(&TaskId(id.to_string()), terminal) {
+        task.emit_snapshot(&TaskId(id.to_string()));
+    }
 
     Ok(())
 }
@@ -755,6 +921,272 @@ pub fn cleanup_thread(thread_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire-stable golden serialization of a snapshot: field names and
+    /// status strings are consumed by the journal and the AHP wire
+    /// (`x-manox-work/backgroundTasksChanged`); any drift here is a
+    /// cross-repo breaking change and must be annotated as such.
+    #[test]
+    fn task_snapshot_serialization_is_wire_stable() {
+        let snapshot = TaskSnapshot {
+            task_id: "mon_7".into(),
+            kind: TaskKind::MonitorCommand,
+            owner_thread_id: "t-golden".into(),
+            description: "watch the build".into(),
+            status: TaskStatus::Completed,
+            created_at_ms: 1_000,
+            ended_at_ms: Some(2_000),
+            event_count: 42,
+            total_bytes: 4_096,
+            exit_code: Some(0),
+            failure_summary: Some("nope".into()),
+            anchor_message_id: Some("m1".into()),
+            output_tail: "last line".into(),
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(
+            json,
+            "{\"task_id\":\"mon_7\",\"kind\":\"MonitorCommand\",\
+             \"owner_thread_id\":\"t-golden\",\"description\":\"watch the build\",\
+             \"status\":\"Completed\",\"created_at_ms\":1000,\"ended_at_ms\":2000,\
+             \"event_count\":42,\"total_bytes\":4096,\"exit_code\":0,\
+             \"failure_summary\":\"nope\",\"anchor_message_id\":\"m1\",\
+             \"output_tail\":\"last line\"}"
+        );
+        // Empty/None optionals stay omitted, matching the historic shape.
+        let sparse = TaskSnapshot {
+            anchor_message_id: None,
+            failure_summary: None,
+            output_tail: String::new(),
+            ..snapshot
+        };
+        let json = serde_json::to_string(&sparse).unwrap();
+        assert!(
+            !json.contains("anchor_message_id")
+                && !json.contains("failure_summary")
+                && !json.contains("output_tail"),
+            "optionals must stay omitted: {json}"
+        );
+    }
+
+    /// The settlement mapping: cause `Teardown` settles as `SessionEnded`
+    /// (the card belongs to a session going away); a user stop stays
+    /// `Stopped`; a natural completion stays `Completed`.
+    #[test]
+    fn settlement_cause_maps_to_wire_status() {
+        use manox_harness::tasks::{Settlement, SettlementCause, SettlementKind};
+        let id = TaskId("map_1".into());
+        let teardown = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-map".into(),
+            "map".into(),
+            CancellationToken::new(),
+        );
+        apply_settlement(
+            &teardown,
+            &id,
+            &Settlement::new(SettlementKind::Stopped, SettlementCause::Teardown),
+        );
+        assert_eq!(teardown.status(), TaskStatus::SessionEnded);
+        remove(&id);
+
+        let id = TaskId("map_2".into());
+        let user_stop = register_with_id(
+            id.clone(),
+            TaskKind::MonitorWebSocket,
+            "t-map".into(),
+            "map".into(),
+            CancellationToken::new(),
+        );
+        apply_settlement(
+            &user_stop,
+            &id,
+            &Settlement::new(SettlementKind::Stopped, SettlementCause::UserStop),
+        );
+        assert_eq!(user_stop.status(), TaskStatus::Stopped);
+        remove(&id);
+    }
+
+    /// The host observer bridges a real command monitor end-to-end: the
+    /// proxy registers under the pi task id, snapshots flow as
+    /// `BackgroundTaskUpdated` notices (running → completed with output),
+    /// and a user stop routes through the on_stop hook into the monitor
+    /// manager.
+    #[tokio::test]
+    async fn host_observer_bridges_monitor_snapshots() {
+        use std::path::PathBuf;
+
+        let monitor = manox_harness::monitor::MonitorManager::new(Arc::new(
+            manox_harness::BackgroundRegistry::new(),
+        ));
+        let background = manox_harness::bash::orchestration::BackgroundManager::new(Arc::new(
+            manox_harness::BackgroundRegistry::new(),
+        ));
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        attach(
+            Arc::clone(&monitor),
+            Arc::clone(&background),
+            notice_tx,
+            "t1".into(),
+        );
+
+        let tid = monitor
+            .spawn_command(
+                "bridge watcher".into(),
+                "echo bridge-line".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(30),
+                false,
+            )
+            .unwrap();
+
+        let mut saw_running = false;
+        let mut saw_completed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let Ok(Some(notice)) =
+                tokio::time::timeout(Duration::from_millis(500), notice_rx.recv()).await
+            else {
+                break;
+            };
+            let BackendNotice::Event(ev) = notice else {
+                continue;
+            };
+            let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev else {
+                continue;
+            };
+            assert_eq!(snapshot.task_id, tid);
+            assert_eq!(snapshot.owner_thread_id, "t1");
+            match snapshot.status {
+                TaskStatus::Running => saw_running = true,
+                TaskStatus::Completed => {
+                    assert!(snapshot.output_tail.contains("bridge-line"));
+                    saw_completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_running, "initial running snapshot observed");
+        assert!(saw_completed, "terminal completed snapshot observed");
+        remove(&TaskId(tid.clone()));
+
+        // A user stop routes through the proxy's on_stop hook into the
+        // monitor manager, and the stop path's settlement records Stopped.
+        // (A long-running monitor: the echo task above is already terminal.)
+        let tid = monitor
+            .spawn_command(
+                "long watcher".into(),
+                "sleep 30".into(),
+                &std::path::PathBuf::from("/tmp"),
+                Duration::from_secs(60),
+                false,
+            )
+            .unwrap();
+        let proxy = get_by_str(&tid).expect("proxy registered");
+        assert_eq!(proxy.owner_thread_id(), "t1");
+        stop(&tid).await.ok();
+        assert_eq!(proxy.status(), TaskStatus::Stopped);
+        remove(&TaskId(tid.clone()));
+    }
+
+    /// The stop path's own terminal push must reach the cards: stopping a
+    /// proxy emits a terminal snapshot through the notifier even if the
+    /// producer side (whose observer owns the other notice path) is gone.
+    /// This is the host half of the "card stuck on Running" guard.
+    #[tokio::test]
+    async fn host_stop_emits_terminal_snapshot() {
+        let id = TaskId("notified_stop".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-notify".into(),
+            "watch".into(),
+            CancellationToken::new(),
+        );
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        proxy.set_notifier(notice_tx);
+
+        stop(&id.0).await.expect("stop succeeds");
+        assert_eq!(proxy.status(), TaskStatus::Stopped);
+
+        let mut saw_terminal = false;
+        for _ in 0..50 {
+            match notice_rx.try_recv() {
+                Ok(BackendNotice::Event(ev)) => {
+                    if let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev
+                        && snapshot.task_id == id.0
+                        && snapshot.status == TaskStatus::Stopped
+                    {
+                        saw_terminal = true;
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            saw_terminal,
+            "the host stop path must emit a terminal snapshot"
+        );
+        remove(&id);
+    }
+
+    /// The stop path must not duplicate a producer's terminal snapshot:
+    /// kill-point settlements emit through the same channel the notifier
+    /// writes to, so a stop arriving after such a settlement pushes no
+    /// second terminal snapshot (one journal line per stop, not two).
+    #[tokio::test]
+    async fn host_stop_after_producer_settlement_emits_no_duplicate() {
+        let id = TaskId("dup_stop".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-dup".into(),
+            "watch".into(),
+            CancellationToken::new(),
+        );
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        proxy.set_notifier(notice_tx);
+
+        // Producer-side settlement, exactly as the observer's kill-point
+        // path does it: apply the settlement, then emit through the locked
+        // primitive on the shared channel.
+        apply_settlement(
+            &proxy,
+            &id,
+            &manox_harness::tasks::Settlement::new(
+                manox_harness::tasks::SettlementKind::Stopped,
+                manox_harness::tasks::SettlementCause::UserStop,
+            ),
+        );
+        proxy.emit_snapshot(&id);
+        let terminal_notices = |rx: &mut mpsc::UnboundedReceiver<BackendNotice>| {
+            let mut n = 0;
+            while let Ok(BackendNotice::Event(ev)) = rx.try_recv() {
+                if let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev
+                    && snapshot.task_id == id.0
+                    && snapshot.status == TaskStatus::Stopped
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(terminal_notices(&mut notice_rx), 1, "producer emitted once");
+
+        // The late host stop finds the task already terminal: no second
+        // terminal snapshot may be emitted.
+        stop(&id.0).await.expect("stop succeeds");
+        assert_eq!(
+            terminal_notices(&mut notice_rx),
+            0,
+            "the stop fallback must not duplicate the producer's snapshot"
+        );
+        remove(&id);
+    }
 
     #[test]
     fn register_and_get() {
