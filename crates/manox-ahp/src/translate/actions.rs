@@ -781,7 +781,10 @@ impl Translator {
             )),
             JournalWireEvent::SessionInfo { data } => out.push(Emitted::new(
                 &session,
-                extension_action(ext::actions::SESSION_INFO_CHANGED, data.clone()),
+                // The row rides nested under `data`: the fold reads that key,
+                // and a bare flatten would scatter the row's fields across the
+                // action envelope where no arm looks for them.
+                extension_action(ext::actions::SESSION_INFO_CHANGED, json!({"data": data})),
             )),
             JournalWireEvent::Leaf { target_id } => out.push(Emitted::new(
                 &session,
@@ -2463,17 +2466,14 @@ mod tests {
     }
 
     #[test]
-    fn a_background_task_snapshot_reaches_the_reducer_state_intact() {
-        let snapshot = json!({
-            "task_id": "mon_7",
-            "kind": "MonitorCommand",
-            "owner_thread_id": "t-1",
-            "description": "watch build",
-            "status": "running",
-            "created_at_ms": 1_000,
-            "event_count": 0,
-            "total_bytes": 0
-        });
+    fn a_background_task_row_rides_the_snapshot_key_into_the_registry_state() {
+        // Minimal payload on purpose: this test pins the wire KEY (the row
+        // rides nested under `snapshot`) and its route into the fold — not
+        // the row's shape. The shape's authority is the host golden
+        // (`task_snapshot_serialization_is_wire_stable`), and the chain from
+        // that real shape runs in manox-ahp-runtime's
+        // `background_task_snapshot_flows_from_host_shape_to_extension_state`.
+        let snapshot = json!({"task_id": "mon_7", "status": "Completed"});
         let mut translator = Translator::new();
         let emitted = translator.on_entry(
             "c-1",
@@ -2501,20 +2501,27 @@ mod tests {
             "the canonical payload key is `snapshot`"
         );
 
-        // The reference client fold: the declared `backgroundTasks` state must
-        // actually receive the snapshot this action carried.
+        // The reference client fold: the row lands in the registry view
+        // keyed by its task id.
         let mut state = crate::ext::XManoxState::default();
         assert_eq!(
             crate::ext::reducer::apply(&mut state, &action),
             crate::ext::ExtOutcome::Applied
         );
-        assert_eq!(state.background_tasks, Some(snapshot.clone()));
+        assert_eq!(
+            state.background_tasks,
+            Some(
+                [("mon_7".to_string(), snapshot.clone())]
+                    .into_iter()
+                    .collect()
+            )
+        );
         // …and the field survives a state round-trip for reconnecting clients.
         let encoded = serde_json::to_value(&state).expect("state serializes");
-        assert_eq!(encoded["backgroundTasks"], snapshot);
+        assert_eq!(encoded["backgroundTasks"]["mon_7"], snapshot);
         let decoded: crate::ext::XManoxState =
             serde_json::from_value(encoded).expect("state round-trips");
-        assert_eq!(decoded.background_tasks, Some(snapshot));
+        assert_eq!(decoded.background_tasks, state.background_tasks);
     }
 }
 

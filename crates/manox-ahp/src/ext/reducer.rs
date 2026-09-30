@@ -20,6 +20,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Everything manox carries that AHP has no native slot for, per session.
 ///
@@ -44,12 +45,19 @@ pub struct XManoxState {
     /// Active browser suites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_suites: Option<Vec<String>>,
-    /// Background-task registry snapshot.
+    /// Background-task registry view: task id → the task's latest wire
+    /// snapshot. Journal rows carry one task's snapshot each, so the fold
+    /// upserts by `task_id` and has no clear edge — `None` means no task row
+    /// has been folded, and terminal tasks keep their row (bounded by the
+    /// session's distinct task count).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background_tasks: Option<Value>,
-    /// The sub-agent tree and its progress ticks.
+    pub background_tasks: Option<BTreeMap<String, Value>>,
+    /// Sub-agent registry view: agent id → the agent's latest progress row
+    /// (envelope tag stripped). Progress rows carry one agent's tick each
+    /// (nesting is structurally off this iteration), so the fold upserts by
+    /// `agentId`; `None` means no row has been folded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<Value>,
+    pub subagents: Option<BTreeMap<String, Value>>,
     /// Compaction state (started / finished with its summary facts).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<Value>,
@@ -119,16 +127,34 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 });
         }
         super::actions::WORK_BACKGROUND_TASKS => {
-            state.background_tasks = action
-                .get("snapshot")
-                .or_else(|| action.get("task"))
-                .cloned();
+            // A whole-field replace would leave a late subscriber's registry
+            // view holding only the last-changed task, so rows upsert by
+            // `task_id`. A row without a string `task_id` cannot be keyed and
+            // is dropped; the producer shape is pinned by the host's
+            // `task_snapshot_serialization_is_wire_stable` golden test.
+            if let Some(snapshot) = action.get("snapshot")
+                && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
+            {
+                state
+                    .background_tasks
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(task_id.to_string(), snapshot.clone());
+            }
         }
         super::actions::WORK_SUBAGENTS => {
-            state.subagents = action
-                .get("tree")
-                .cloned()
-                .or_else(|| action.get("snapshot").cloned());
+            // Same registry shape as background tasks: progress rows carry
+            // one agent's tick each, keyed upsert by `agentId`; a row
+            // without a string `agentId` cannot be keyed and is dropped.
+            if let Some(agent_id) = action.get("agentId").and_then(Value::as_str) {
+                let mut row = action.clone();
+                if let Some(fields) = row.as_object_mut() {
+                    fields.remove("type");
+                    state
+                        .subagents
+                        .get_or_insert_with(BTreeMap::new)
+                        .insert(agent_id.to_string(), row);
+                }
+            }
         }
         super::actions::WORK_ACTIVE_TOOLS => {
             state.active_tools = action.get("tools").and_then(Value::as_array).map(|tools| {
@@ -240,27 +266,241 @@ mod tests {
     }
 
     #[test]
-    fn background_task_snapshots_fold_under_both_payload_keys() {
-        let snapshot = json!({"task_id": "bg_3", "status": "running"});
-        // The canonical key this host emits.
+    fn background_task_rows_upsert_the_registry_view_by_task_id() {
+        let snapshot = json!({"task_id": "bg_3", "status": "Running"});
+        let action_for = |snapshot: Value| json!({"type": "x-manox-work/backgroundTasksChanged", "snapshot": snapshot});
         let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &action_for(snapshot.clone())),
+            Outcome::Applied
+        );
+        assert_eq!(
+            state.background_tasks,
+            Some(
+                [("bg_3".to_string(), snapshot.clone())]
+                    .into_iter()
+                    .collect()
+            )
+        );
+
+        // A second task joins; a later tick of the first task replaces only
+        // its own entry. The view is a registry, not last-writer-wins.
+        let other = json!({"task_id": "mon_4", "status": "Running"});
+        assert_eq!(apply(&mut state, &action_for(other)), Outcome::Applied);
+        let tick = json!({"task_id": "bg_3", "status": "Completed"});
+        assert_eq!(apply(&mut state, &action_for(tick)), Outcome::Applied);
+        let registry = state
+            .background_tasks
+            .as_ref()
+            .expect("registry view populated");
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry["bg_3"]["status"], "Completed");
+
+        // A row without a keyable `task_id` cannot enter the view and does
+        // not disturb it (there is no clear edge on this action).
         assert_eq!(
             apply(
                 &mut state,
-                &json!({"type": "x-manox-work/backgroundTasksChanged", "snapshot": snapshot})
+                &json!({"type": "x-manox-work/backgroundTasksChanged"})
             ),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            apply(&mut state, &action_for(json!({"status": "Running"}))),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            state
+                .background_tasks
+                .as_ref()
+                .expect("still populated")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn subagent_progress_rows_upsert_the_registry_view_by_agent_id() {
+        let row_for = |agent: &str, status: &str| {
+            json!({
+                "type": "x-manox-work/subagentsChanged",
+                "agentId": agent,
+                "agentType": "explore",
+                "status": status
+            })
+        };
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &row_for("sub-0", "running")),
             Outcome::Applied
         );
-        assert_eq!(state.background_tasks, Some(snapshot.clone()));
-        // The pre-fix key an older translation layer may still carry.
-        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &row_for("sub-1", "running")),
+            Outcome::Applied
+        );
+        assert_eq!(
+            apply(&mut state, &row_for("sub-0", "completed")),
+            Outcome::Applied
+        );
+        let registry = state.subagents.as_ref().expect("registry view populated");
+        assert_eq!(registry.len(), 2, "each agent keeps its own entry");
+        assert_eq!(registry["sub-0"]["status"], "completed");
+        assert_eq!(
+            registry["sub-0"].get("type"),
+            None,
+            "the envelope tag is stripped from stored rows"
+        );
+
+        // A row without an agent id cannot be keyed and does not disturb
+        // the view.
         assert_eq!(
             apply(
                 &mut state,
-                &json!({"type": "x-manox-work/backgroundTasksChanged", "task": snapshot})
+                &json!({"type": "x-manox-work/subagentsChanged", "status": "running"})
             ),
-            Outcome::Applied
+            Outcome::NoOp
         );
-        assert_eq!(state.background_tasks, Some(snapshot));
+        assert_eq!(state.subagents.as_ref().expect("still populated").len(), 2);
+    }
+
+    /// The root-cause gate for the whole "hand-written key sets" class: for
+    /// every extension action the host emits from a journal row, every key
+    /// the reducer's arm reads must actually appear in what the real
+    /// translator produces. Three arms drifted exactly this way
+    /// (`backgroundTasksChanged`, `subagentsChanged`, `sessionInfoChanged`)
+    /// before this test existed. Actions without a journal producer are
+    /// excluded with their reason.
+    #[test]
+    fn every_key_the_reducer_reads_is_produced_by_the_translator() {
+        use manox_journal::{JournalWireEntry, JournalWireEvent};
+
+        // (action tag, keys the reducer arm reads, a journal row that
+        // produces it).
+        let cases: &[(&str, &[&str], JournalWireEvent)] = &[
+            (
+                super::super::actions::PLAN_MODE_CHANGED,
+                &["enabled"],
+                JournalWireEvent::PlanModeChange { enabled: true },
+            ),
+            (
+                super::super::actions::PLAN_CHANGED,
+                &["snapshot"],
+                JournalWireEvent::PlanUpdate {
+                    snapshot: json!({}),
+                },
+            ),
+            (
+                super::super::actions::PLAN_VERDICT_REQUESTED,
+                &[],
+                JournalWireEvent::PlanReview {
+                    state: "proposed".into(),
+                    plan_file: None,
+                    title: None,
+                    content: None,
+                },
+            ),
+            (
+                super::super::actions::WORK_GOAL_CHANGED,
+                &["goal"],
+                JournalWireEvent::Goal {
+                    goal: Some(json!({})),
+                },
+            ),
+            (
+                super::super::actions::WORK_BROWSER_SUITES,
+                &["suites"],
+                JournalWireEvent::BrowserSuites { suites: vec![] },
+            ),
+            (
+                super::super::actions::WORK_BACKGROUND_TASKS,
+                // The nested `task_id` is row shape, pinned by the host
+                // golden and the manox-ahp-runtime chain test; this gate
+                // checks the action's own keys.
+                &["snapshot"],
+                JournalWireEvent::BackgroundTask {
+                    snapshot: json!({}),
+                },
+            ),
+            (
+                super::super::actions::WORK_SUBAGENTS,
+                &["agentId"],
+                JournalWireEvent::SubagentProgress {
+                    agent_id: "sub-0".into(),
+                    agent_type: "explore".into(),
+                    tool_uses: 0,
+                    latest_activity: None,
+                    status: "running".into(),
+                },
+            ),
+            (
+                super::super::actions::WORK_ACTIVE_TOOLS,
+                &["tools"],
+                JournalWireEvent::ActiveToolsChange { tools: vec![] },
+            ),
+            (
+                super::super::actions::METRICS_CHANGED,
+                &[],
+                JournalWireEvent::Metrics {
+                    kind: "token_usage".into(),
+                    data: json!({}),
+                },
+            ),
+            (
+                super::super::actions::PINNED_CHANGED,
+                &["pinned"],
+                JournalWireEvent::PinnedArchived {
+                    pinned: true,
+                    archived: false,
+                },
+            ),
+            (
+                super::super::actions::LABEL_CHANGED,
+                &["label"],
+                JournalWireEvent::Label { label: "x".into() },
+            ),
+            (
+                super::super::actions::SESSION_INFO_CHANGED,
+                &["data"],
+                JournalWireEvent::SessionInfo {
+                    data: json!({"name": "agent"}),
+                },
+            ),
+            (
+                super::super::actions::LEAF_CHANGED,
+                &["targetId"],
+                JournalWireEvent::Leaf {
+                    target_id: "e-9".into(),
+                },
+            ),
+        ];
+        // Excluded from the gate, none of them foldable from a journal row:
+        // BASELINE (host envelope), WORK_BACKGROUND_TASK_STOPPED (declared,
+        // never produced), PLAN_VERDICT / ORDER_CHANGED (client-dispatchable;
+        // the runtime dispatch arms validate their payloads directly).
+        for (tag, read_keys, event) in cases {
+            assert!(
+                super::super::actions::ALL.contains(tag),
+                "{tag} must stay declared"
+            );
+            let entry = JournalWireEntry {
+                seq: 0,
+                id: "e-gate".into(),
+                parent_id: None,
+                timestamp: "2026-09-30T00:00:00.000Z".into(),
+                event: event.clone(),
+            };
+            let emitted = crate::translate::Translator::new().on_entry("c-1", "s-1", &entry);
+            let action = emitted
+                .iter()
+                .map(|e| serde_json::to_value(&e.action).expect("action serializes"))
+                .find(|a| a["type"] == *tag)
+                .unwrap_or_else(|| panic!("{tag} has no translator producer"));
+            for key in *read_keys {
+                assert!(
+                    action.get(*key).is_some(),
+                    "{tag}: the reducer reads `{key}` but the translator emits {action}"
+                );
+            }
+        }
     }
 }
