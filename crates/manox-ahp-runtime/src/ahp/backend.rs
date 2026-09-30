@@ -2101,6 +2101,15 @@ impl Backend for RuntimeBackend {
                     .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
             }
+            manox_ahp::ext::commands::OPEN_TURN => {
+                // A read-only journal fact, not a hosted-session operation:
+                // the owner stamp sits in the shared journal file, so the
+                // answer is available for any journaled session — including
+                // one another process (the cx CLI) owns and is running.
+                let session_id = extension_session(params)?;
+                let owner = block_on(super::open_turn_owner(&session_id));
+                Ok(serde_json::json!({ "owner": owner }))
+            }
             manox_ahp::ext::commands::GOAL => {
                 let session_id = extension_session(params)?;
                 // `action` is required: a goal command with no verb has no

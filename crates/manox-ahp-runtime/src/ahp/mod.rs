@@ -281,6 +281,39 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     })
 }
 
+/// The open turn's owning process for one chat journal: the last
+/// `turnStart` row's owner stamp, cleared by any later `turnFinish` — the
+/// same lifecycle the chat fold gives `active_turn`, read from the raw rows
+/// because the AHP fold drops the action meta (an attach-time reader could
+/// not reach it there). Answers `None` for an unknown/unreadable journal and
+/// for a journal whose last turn closed; callers treat both as "no owner"
+/// and never auto-cancel on that account.
+pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_journal::TurnOwner> {
+    let snapshot = match crate::journal_query::cold_read(chat_id).await {
+        crate::journal_query::ColdRead::Data(snapshot) => snapshot,
+        crate::journal_query::ColdRead::NotFound => return None,
+        crate::journal_query::ColdRead::Corrupt(error) => {
+            tracing::warn!(chat_id, %error, "open turn owner: journal unreadable");
+            return None;
+        }
+    };
+    let mut owner = None;
+    for record in &snapshot.records {
+        match &record.entry {
+            manox_harness::session::SessionTreeEntry::TurnStart { owner: stamped, .. } => {
+                // The single manual field mapping between the harness's local
+                // TurnOwner mirror and the journal's (the W4 conversion
+                // point) — guarded by `owner_survives_the_legacy_translation`
+                // in translate.rs tests.
+                owner = stamped.map(|o| manox_journal::TurnOwner { pid: o.pid });
+            }
+            manox_harness::session::SessionTreeEntry::TurnFinish { .. } => owner = None,
+            _ => {}
+        }
+    }
+    owner
+}
+
 /// The session ids belonging to one thread: journal-header thread stamps,
 /// the active pointer, and the legacy singleton's own id — sorted, so the
 /// fold order (and therefore the resulting state) is deterministic.
