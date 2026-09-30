@@ -96,11 +96,13 @@ pub(super) async fn persist_ui_note(
     if let Some(row) = record_journal_loss(&appender, "ui_note", &err).await {
         state.pending_journal.lock().unwrap().push(row);
     }
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-        anyhow::anyhow!(
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
             "journal append permanently failed for `ui_note`: {err:#}; the entry was dropped"
-        ),
-    ))));
+        )))),
+        "journal-loss ui-note drop",
+    );
     false
 }
 
@@ -556,9 +558,11 @@ pub(super) async fn rebuild_session(
             *state.current_resources.lock().unwrap() = Some(session.resources().clone());
         }
         Err(err) => {
-            let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                "pi session open failed: {err}"
-            )));
+            send_notice(
+                notice_tx,
+                BackendNotice::Fatal(anyhow::anyhow!("pi session open failed: {err}")),
+                "engine fatal",
+            );
         }
     }
 }

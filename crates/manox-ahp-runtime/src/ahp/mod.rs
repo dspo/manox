@@ -655,4 +655,137 @@ mod baseline_tests {
             let _ = std::fs::remove_file(&registry);
         })
     }
+
+    /// One label journal with a thread-stamped header, at a chosen time.
+    async fn write_label_journal(
+        sessions: &std::path::Path,
+        id: &str,
+        thread: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        label: &str,
+    ) {
+        let path = sessions.join(format!("{id}.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.into(),
+                cwd: "/".into(),
+                created_at: at,
+                parent_session_path: None,
+                metadata: Some(serde_json::json!({ "thread": thread })),
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                id: format!("e-{id}"),
+                parent_id: None,
+                timestamp: at,
+                target_id: format!("e-{id}"),
+                label: Some(label.into()),
+            })
+            .await
+            .unwrap();
+        drop(storage);
+    }
+
+    fn write_registry(thread: &str, active: &str) -> std::path::PathBuf {
+        let registry = manox_agent::thread_registry::registry_path();
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry,
+            serde_json::json!({ thread: { "active_session": active } }).to_string(),
+        )
+        .unwrap();
+        registry
+    }
+
+    /// The wrong-shelf half of the baseline fix: the ACTIVE session carries
+    /// the thread's current rows, so its journal must be folded (last) even
+    /// though the thread-URI baseline used to answer from the URI's own
+    /// journal alone.
+    #[test]
+    fn the_active_sessions_rows_reach_the_thread_baseline() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "o_shelf",
+                "T-shelf",
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                "shelfOld",
+            )
+            .await;
+            write_label_journal(&sessions, "act_s", "T-shelf", chrono::Utc::now(), "act").await;
+            let registry = write_registry("T-shelf", "act_s");
+
+            let baseline = extension_channel_baseline("x-manox-thread:/T-shelf", "act_s").await;
+            assert_eq!(
+                baseline["label"], "act",
+                "the active session's own row must be in — and win — the baseline: {baseline}"
+            );
+
+            let _ = std::fs::remove_file(sessions.join("o_shelf.jsonl"));
+            let _ = std::fs::remove_file(sessions.join("act_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// The freshness half: there is no seed cache to grow stale — a row that
+    /// lands after a baseline was served must show up in the next one.
+    #[test]
+    fn a_row_appended_after_a_baseline_shows_up_in_the_next_one() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "fresh_s",
+                "fresh_s",
+                chrono::Utc::now() - chrono::Duration::seconds(1),
+                "v1",
+            )
+            .await;
+            let registry = write_registry("fresh_s", "fresh_s");
+
+            let first = extension_channel_baseline("x-manox-thread:/fresh_s", "fresh_s").await;
+            assert_eq!(first["label"], "v1");
+
+            // Append after the first baseline was served.
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(
+                &sessions.join("fresh_s.jsonl"),
+            )
+            .await
+            .unwrap();
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                    id: "e-v2".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    target_id: "e-v2".into(),
+                    label: Some("v2".into()),
+                })
+                .await
+                .unwrap();
+            drop(storage);
+
+            let second = extension_channel_baseline("x-manox-thread:/fresh_s", "fresh_s").await;
+            assert_eq!(
+                second["label"], "v2",
+                "the next baseline must see rows written after the previous one: {second}"
+            );
+
+            let _ = std::fs::remove_file(sessions.join("fresh_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
 }

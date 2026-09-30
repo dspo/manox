@@ -187,12 +187,12 @@ where
                     if let Err(error) = persist_title(sessions_dir, &target, title.clone()).await {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
-                        let _ = notice_tx.send(BackendNotice::SessionListDirty);
+                        send_notice(notice_tx, BackendNotice::SessionListDirty, "session list dirty");
                         // The facade mirrors the persisted title so the
                         // title bar tracks the sidebar without a reload.
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
+                        send_notice(notice_tx, BackendNotice::Event(Box::new(
                             ThreadEvent::TitleChanged { title },
-                        )));
+                        )), "title changed notice");
                     }
                 }
                 Some(SessionCmd::AppendUiNote(record)) => {
@@ -297,9 +297,11 @@ pub(super) async fn settle_run(
     // message) must not leak the middleware skip into the next turn.
     session.journal_appender().clear_accepted_user_entry();
     if let Err(err) = result {
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-            anyhow::anyhow!("{err:#}"),
-        ))));
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!("{err:#}")))),
+            "error notice",
+        );
     }
     state.running.store(false, Ordering::Relaxed);
     // The sticky cwd may have moved during the run (a tool call with an
@@ -312,9 +314,13 @@ pub(super) async fn settle_run(
     let last = state.last_cwd_note.lock().unwrap().clone();
     if last.as_deref() != Some(projected_str.as_str()) {
         *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-            path: projected_str,
-        })));
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                path: projected_str,
+            })),
+            "cwd changed notice",
+        );
     }
     // Mid-run appends parked their persistence (the run owned the session);
     // persist before the authoritative sync so the rebuilt mirror keeps them.
@@ -338,11 +344,13 @@ pub(super) async fn settle_run(
                 }
                 if kind != "error" && !loss_notified {
                     loss_notified = true;
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!(
+                    send_notice(
+                        notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                             "journal append permanently failed for `{kind}` at settle: {err:#}; the entry was dropped"
-                        ),
-                    ))));
+                        )))),
+                        "error notice",
+                    );
                 }
             }
         }
@@ -391,18 +399,24 @@ pub(super) async fn settle_run(
         if let Some(row) = record_journal_loss(&appender, "turn_finish", &err).await {
             state.pending_journal.lock().unwrap().push(row);
         }
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-            anyhow::anyhow!(
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                 "journal append permanently failed for `turn_finish` at settle: {err:#}; the entry was dropped"
-            ),
-        ))));
+            )))),
+            "error notice",
+        );
     }
-    let _ = notice_tx.send(BackendNotice::Settled {
-        cancelled: abort_requested,
-        failed,
-        steered,
-        stranded,
-    });
+    send_notice(
+        notice_tx,
+        BackendNotice::Settled {
+            cancelled: abort_requested,
+            failed,
+            steered,
+            stranded,
+        },
+        "run settled",
+    );
     // Plugin lifecycle: `Stop` fires on every settled turn (fail-open,
     // detached) — after the `Settled` notice so observers see the turn's
     // final state first.
@@ -560,7 +574,11 @@ pub(super) async fn resume_steering_queue(
         // flag) so a switch-away parks the thread instead of dropping it
         // mid-run — identical to the wake branch this helper now subsumes.
         state.running.store(true, Ordering::Relaxed);
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)),
+            "turn started notice",
+        );
         let (result, abort_requested) = drive_run(
             session.continue_(),
             &handle,
@@ -664,21 +682,21 @@ pub(super) fn subscribe_session(
             if let AgentEvent::MessageEnd { message } = &event {
                 match &**message {
                     AgentMessage::User { .. } => {
-                        let _ = tx.send(BackendNotice::SessionListDirty);
+                        send_notice(&tx, BackendNotice::SessionListDirty, "session list dirty");
                     }
                     AgentMessage::Assistant { .. }
                         if !assistant_flag.swap(true, std::sync::atomic::Ordering::SeqCst) =>
                     {
                         // First assistant message: the deferred session file
                         // just materialized, so the sidebar can list it.
-                        let _ = tx.send(BackendNotice::SessionListDirty);
+                        send_notice(&tx, BackendNotice::SessionListDirty, "session list dirty");
                     }
                     _ => {}
                 }
             }
             title.observe(&event);
             for te in adapt::agent_event_to_thread_events(&event) {
-                let _ = tx.send(BackendNotice::Event(Box::new(te)));
+                send_notice(&tx, BackendNotice::Event(Box::new(te)), "engine notice");
             }
         })
     }))
@@ -796,9 +814,13 @@ pub(super) fn subscribe_harness_events(
             let _ = wake.send(());
         }
         manox_harness::harness::HarnessEvent::CompactionStart { .. } => {
-            let _ = tx.send(BackendNotice::Event(Box::new(
-                ThreadEvent::CompactionStarted { tokens_before: 0 },
-            )));
+            send_notice(
+                &tx,
+                BackendNotice::Event(Box::new(ThreadEvent::CompactionStarted {
+                    tokens_before: 0,
+                })),
+                "compaction started notice",
+            );
         }
         manox_harness::harness::HarnessEvent::CompactionEnd {
             result: Some(result),
@@ -812,12 +834,16 @@ pub(super) fn subscribe_harness_events(
             // same clear before mirroring.
             clear_user_chrome_spawn(sessions_dir.clone(), session_path.clone());
             let retained_tail = adapt::harness_messages_to_messages(&result.retained_tail);
-            let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::Compaction {
-                summary: result.summary,
-                messages_compacted: 0,
-                tokens_before: result.tokens_before,
-                retained_tail,
-            })));
+            send_notice(
+                &tx,
+                BackendNotice::Event(Box::new(ThreadEvent::Compaction {
+                    summary: result.summary,
+                    messages_compacted: 0,
+                    tokens_before: result.tokens_before,
+                    retained_tail,
+                })),
+                "compaction notice",
+            );
         }
         _ => {}
     }))
