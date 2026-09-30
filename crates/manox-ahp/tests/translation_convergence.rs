@@ -716,6 +716,7 @@ async fn a_plan_proposal_reaches_a_subscribed_client() {
             plan_file: Some("/plans/demo-plan.md".to_string()),
             title: Some("Demo plan".to_string()),
             content: Some("# Demo\n\n- step one".to_string()),
+            request_id: None,
         },
     ]
     .into_iter()

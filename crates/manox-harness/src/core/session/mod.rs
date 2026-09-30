@@ -198,6 +198,14 @@ pub enum SessionTreeEntry {
         title: Option<String>,
         #[serde(default)]
         content: Option<String>,
+        /// The settled edge's back-reference to its proposal — the request id
+        /// (`plan-review:<proposal entry id>`) the proposal edge minted. A
+        /// review outlives its turn and routinely spans a host restart, so
+        /// the resolution must be self-describing: a fold that never saw the
+        /// proposal (a bridge resuming above it) can still emit the verdict.
+        /// Absent on rows written before the field existed.
+        #[serde(default)]
+        request_id: Option<String>,
     },
     /// A persisted UI note card (was the fire-and-forget AppendUiNote).
     #[serde(rename = "ui_note", rename_all = "camelCase")]

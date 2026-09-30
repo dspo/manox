@@ -147,6 +147,7 @@ mod tests {
                     plan_file: Some("/p.md".into()),
                     title: Some("T".into()),
                     content: Some("# T".into()),
+                    request_id: None,
                 },
                 Target::Chat,
             ),

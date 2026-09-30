@@ -225,6 +225,10 @@ pub enum JournalWireEvent {
     /// `plan_file` names the reviewed plan (forensics; always serialized, null
     /// when unknown). `title`/`content` ride the proposed edge so the review
     /// card renders from the journal alone, without a file read at fold time.
+    /// `request_id` rides the resolved edge (the proposal's request id, the
+    /// id the client's card is keyed by): a review outlives its turn and
+    /// routinely spans a host restart, so the resolution is self-describing
+    /// and a fold that never saw the proposal can still emit the verdict.
     PlanReview {
         state: String,
         plan_file: Option<String>,
@@ -232,6 +236,8 @@ pub enum JournalWireEvent {
         title: Option<String>,
         #[serde(default)]
         content: Option<String>,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     /// Goal set / cleared (`None` = cleared).
     Goal { goal: Option<serde_json::Value> },

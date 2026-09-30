@@ -97,10 +97,10 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
         super::actions::PLAN_CHANGED => {
             state.plan = action.get("snapshot").cloned();
         }
-        super::actions::PLAN_VERDICT_REQUESTED | super::actions::PLAN_VERDICT => {
+        super::actions::PLAN_VERDICT_REQUESTED | super::actions::PLAN_REVIEW_SETTLED => {
             // Both edges land in the same field: the review's lifecycle is one
-            // fact (a proposal, then its verdict), and a client renders the
-            // difference from the payload.
+            // fact (a proposal, then its settlement), and a client renders the
+            // difference from the action type.
             state.plan_review = Some(action.clone());
         }
         super::actions::WORK_GOAL_CHANGED => {
