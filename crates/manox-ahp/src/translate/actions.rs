@@ -495,6 +495,7 @@ impl Translator {
         let at = crate::translate::target_of(&entry.event).uri(chat_id, session_id);
         let chat = Target::Chat.uri(chat_id, session_id);
         let session = Target::Session.uri(chat_id, session_id);
+        let thread = Target::Thread.uri(chat_id, session_id);
         let mut out = Vec::new();
         match &entry.event {
             // ── transcript ───────────────────────────────────────────────
@@ -768,26 +769,28 @@ impl Translator {
                         is_archived: *archived,
                     }),
                 ));
-                // AHP has no pin bit: the declared extension action rides the
-                // session channel, and a client that does not know it ignores it.
+                // AHP has no pin bit, so the pin half rides the thread
+                // extension channel — the session channel's reducer ignores
+                // extension actions by construction, so an envelope there is
+                // never folded and never baselined.
                 out.push(Emitted::new(
-                    &session,
+                    &thread,
                     extension_action(ext::actions::PINNED_CHANGED, json!({"pinned": pinned})),
                 ));
             }
             JournalWireEvent::Label { label } => out.push(Emitted::new(
-                &session,
+                &thread,
                 extension_action(ext::actions::LABEL_CHANGED, json!({"label": label})),
             )),
             JournalWireEvent::SessionInfo { data } => out.push(Emitted::new(
-                &session,
+                &thread,
                 // The row rides nested under `data`: the fold reads that key,
                 // and a bare flatten would scatter the row's fields across the
                 // action envelope where no arm looks for them.
                 extension_action(ext::actions::SESSION_INFO_CHANGED, json!({"data": data})),
             )),
             JournalWireEvent::Leaf { target_id } => out.push(Emitted::new(
-                &session,
+                &thread,
                 extension_action(ext::actions::LEAF_CHANGED, json!({"targetId": target_id})),
             )),
             // ── plan ─────────────────────────────────────────────────────
@@ -2467,13 +2470,14 @@ mod tests {
 
     #[test]
     fn a_background_task_row_rides_the_snapshot_key_into_the_registry_state() {
-        // Minimal payload on purpose: this test pins the wire KEY (the row
+        // One-field payload on purpose: this test pins the wire KEY (the row
         // rides nested under `snapshot`) and its route into the fold — not
-        // the row's shape. The shape's authority is the host golden
+        // the row's shape, which no literal here could faithfully claim. The
+        // shape's authority is the host golden
         // (`task_snapshot_serialization_is_wire_stable`), and the chain from
         // that real shape runs in manox-ahp-runtime's
         // `background_task_snapshot_flows_from_host_shape_to_extension_state`.
-        let snapshot = json!({"task_id": "mon_7", "status": "Completed"});
+        let snapshot = json!({"task_id": "mon_7"});
         let mut translator = Translator::new();
         let emitted = translator.on_entry(
             "c-1",

@@ -2,7 +2,7 @@
 //! state the protocol does not model.
 //!
 //! AHP deliberately stays agent-agnostic: plan mode and plan artefacts, goal,
-//! compaction, background work, browser suites, the sub-agent tree, thread
+//! background work, browser suites, the sub-agent tree, thread
 //! pinning/ordering/grouping, the workspace rows, the command catalogue, the
 //! aggregated conversation metrics and client-contributed tools have **no**
 //! protocol counterpart. They travel as:
@@ -32,7 +32,14 @@ pub const META_KEY: &str = "x-manox";
 /// `fetchEntries`/`modelChat`/`modelChatCancel`/`cancelDelivery`/`shutdown`
 /// commands off the surface. A client that caches version 1's declaration would
 /// otherwise keep offering names this build answers `unsupported` to.
-pub const VERSION: u32 = 3;
+///
+/// 4: the thread rows (`pinnedChanged` / `labelChanged` / `sessionInfoChanged`
+/// / `leafChanged`) moved from `ahp-session:/<id>` — where no fold ever ran
+/// and no baseline could carry them — to the dedicated [`channels::THREAD`]
+/// channel; the never-folded `compaction` bag field went with them. A client
+/// caching version 3 lost nothing it could read: those envelopes were
+/// unfollable there.
+pub const VERSION: u32 = 4;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
@@ -42,6 +49,8 @@ pub mod channels {
     pub const WORK: &str = "x-manox-work:/";
     /// Aggregated conversation metrics — the v2 Q face (per chat).
     pub const METRICS: &str = "x-manox-metrics:/";
+    /// Thread rows: pin, label, session info, leaf cursor (per session).
+    pub const THREAD: &str = "x-manox-thread:/";
     /// Durable workspace rows: directory identity plus ordered session account.
     pub const WORKSPACES: &str = "x-manox-workspaces://";
     /// Command / skill catalogue (stateless snapshot channel).
@@ -55,7 +64,7 @@ pub mod channels {
     /// it was deleted with the v2 gateway, so a subscriber would wait forever on
     /// a channel that can only ever answer `null`. Re-declaring it is the right
     /// move the moment a model-completion implementation exists to back it.
-    pub const ALL: &[&str] = &[PLAN, WORK, METRICS, WORKSPACES, COMMANDS];
+    pub const ALL: &[&str] = &[PLAN, WORK, METRICS, THREAD, WORKSPACES, COMMANDS];
 }
 
 /// Actions served by the extension channels.

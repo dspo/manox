@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 /// Everything manox carries that AHP has no native slot for, per session.
 ///
@@ -58,16 +59,16 @@ pub struct XManoxState {
     /// `agentId`; `None` means no row has been folded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<BTreeMap<String, Value>>,
-    /// Compaction state (started / finished with its summary facts).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<Value>,
     /// Thread pinned flag — AHP has no pin bit, only read/archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
     /// Label row attached to the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Session-info annotation row.
+    /// Session-info annotation row. The bag is per channel, so on
+    /// `x-manox-thread:/` this holds the session-info row while on
+    /// `x-manox-metrics:/` it holds the metrics aggregate (the metrics
+    /// read model has no field of its own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_info: Option<Value>,
     /// The journal's active-chain leaf (fork cursor).
@@ -97,7 +98,16 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     let Some(tag) = action.get("type").and_then(Value::as_str) else {
         return Outcome::Unrecognised;
     };
-    let before = state.clone();
+    // The generic NoOp detector clones the whole bag; the two keyed
+    // registries are exempt — their rows carry up-to-8KiB output tails, so a
+    // whole-bag clone per journal row is quadratic in session history — and
+    // report their own change instead.
+    let keyed = matches!(
+        tag,
+        super::actions::WORK_BACKGROUND_TASKS | super::actions::WORK_SUBAGENTS
+    );
+    let before = (!keyed).then(|| state.clone());
+    let mut registry_changed = false;
     match tag {
         super::actions::PLAN_MODE_CHANGED => {
             state.plan_mode = action.get("enabled").and_then(Value::as_bool);
@@ -135,10 +145,18 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
             if let Some(snapshot) = action.get("snapshot")
                 && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
             {
-                state
-                    .background_tasks
-                    .get_or_insert_with(BTreeMap::new)
-                    .insert(task_id.to_string(), snapshot.clone());
+                let registry = state.background_tasks.get_or_insert_with(BTreeMap::new);
+                match registry.entry(task_id.to_string()) {
+                    Entry::Occupied(slot) if slot.get() == snapshot => {}
+                    Entry::Occupied(mut slot) => {
+                        slot.insert(snapshot.clone());
+                        registry_changed = true;
+                    }
+                    Entry::Vacant(slot) => {
+                        slot.insert(snapshot.clone());
+                        registry_changed = true;
+                    }
+                }
             }
         }
         super::actions::WORK_SUBAGENTS => {
@@ -149,10 +167,18 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 let mut row = action.clone();
                 if let Some(fields) = row.as_object_mut() {
                     fields.remove("type");
-                    state
-                        .subagents
-                        .get_or_insert_with(BTreeMap::new)
-                        .insert(agent_id.to_string(), row);
+                    let registry = state.subagents.get_or_insert_with(BTreeMap::new);
+                    match registry.entry(agent_id.to_string()) {
+                        Entry::Occupied(slot) if slot.get() == &row => {}
+                        Entry::Occupied(mut slot) => {
+                            slot.insert(row);
+                            registry_changed = true;
+                        }
+                        Entry::Vacant(slot) => {
+                            slot.insert(row);
+                            registry_changed = true;
+                        }
+                    }
                 }
             }
         }
@@ -193,7 +219,14 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
         }
         _ => return Outcome::Unrecognised,
     }
-    if *state == before {
+    if keyed {
+        return if registry_changed {
+            Outcome::Applied
+        } else {
+            Outcome::NoOp
+        };
+    }
+    if before.as_ref() == Some(&*state) {
         Outcome::NoOp
     } else {
         Outcome::Applied
@@ -363,67 +396,66 @@ mod tests {
         assert_eq!(state.subagents.as_ref().expect("still populated").len(), 2);
     }
 
-    /// The root-cause gate for the whole "hand-written key sets" class: for
-    /// every extension action the host emits from a journal row, every key
-    /// the reducer's arm reads must actually appear in what the real
-    /// translator produces. Three arms drifted exactly this way
-    /// (`backgroundTasksChanged`, `subagentsChanged`, `sessionInfoChanged`)
-    /// before this test existed. Actions without a journal producer are
-    /// excluded with their reason.
+    /// The root-cause gate for the whole "hand-written key sets" class, in
+    /// its routing-aware form: every host-emitted extension action must (a)
+    /// be produced by the real translator, (b) ride an *extension* channel —
+    /// an action on a state-bearing channel is `StateAction::Unknown` to that
+    /// channel's reducer, so it is never folded and never baselined (the
+    /// session-channel thread rows drifted exactly this way) — and (c) leave
+    /// its state field populated. The final whole-struct comparison makes a
+    /// *new* `XManoxState` field a compile error here until a producer case
+    /// covers it, so "declared but always empty" cannot come back.
     #[test]
-    fn every_key_the_reducer_reads_is_produced_by_the_translator() {
+    fn every_extension_state_field_is_reachable_through_the_real_fold() {
         use manox_journal::{JournalWireEntry, JournalWireEvent};
 
-        // (action tag, keys the reducer arm reads, a journal row that
-        // produces it).
-        let cases: &[(&str, &[&str], JournalWireEvent)] = &[
+        let entry = |event: JournalWireEvent| JournalWireEntry {
+            seq: 0,
+            id: "e-gate".into(),
+            parent_id: None,
+            timestamp: "2026-09-30T00:00:00.000Z".into(),
+            event,
+        };
+        // Host-emitted: journal row → the tag it must produce.
+        let host_cases: Vec<(JournalWireEvent, &str)> = vec![
             (
-                super::super::actions::PLAN_MODE_CHANGED,
-                &["enabled"],
                 JournalWireEvent::PlanModeChange { enabled: true },
+                super::super::actions::PLAN_MODE_CHANGED,
             ),
             (
-                super::super::actions::PLAN_CHANGED,
-                &["snapshot"],
                 JournalWireEvent::PlanUpdate {
                     snapshot: json!({}),
                 },
+                super::super::actions::PLAN_CHANGED,
             ),
             (
-                super::super::actions::PLAN_VERDICT_REQUESTED,
-                &[],
                 JournalWireEvent::PlanReview {
                     state: "proposed".into(),
                     plan_file: None,
                     title: None,
                     content: None,
                 },
+                super::super::actions::PLAN_VERDICT_REQUESTED,
             ),
             (
-                super::super::actions::WORK_GOAL_CHANGED,
-                &["goal"],
                 JournalWireEvent::Goal {
-                    goal: Some(json!({})),
+                    goal: Some(json!({"text": "ship"})),
                 },
+                super::super::actions::WORK_GOAL_CHANGED,
             ),
             (
+                JournalWireEvent::BrowserSuites {
+                    suites: vec!["chrome".into()],
+                },
                 super::super::actions::WORK_BROWSER_SUITES,
-                &["suites"],
-                JournalWireEvent::BrowserSuites { suites: vec![] },
             ),
             (
-                super::super::actions::WORK_BACKGROUND_TASKS,
-                // The nested `task_id` is row shape, pinned by the host
-                // golden and the manox-ahp-runtime chain test; this gate
-                // checks the action's own keys.
-                &["snapshot"],
                 JournalWireEvent::BackgroundTask {
-                    snapshot: json!({}),
+                    snapshot: json!({"task_id": "mon_7"}),
                 },
+                super::super::actions::WORK_BACKGROUND_TASKS,
             ),
             (
-                super::super::actions::WORK_SUBAGENTS,
-                &["agentId"],
                 JournalWireEvent::SubagentProgress {
                     agent_id: "sub-0".into(),
                     agent_type: "explore".into(),
@@ -431,76 +463,127 @@ mod tests {
                     latest_activity: None,
                     status: "running".into(),
                 },
+                super::super::actions::WORK_SUBAGENTS,
             ),
             (
+                JournalWireEvent::ActiveToolsChange {
+                    tools: vec!["bash".into()],
+                },
                 super::super::actions::WORK_ACTIVE_TOOLS,
-                &["tools"],
-                JournalWireEvent::ActiveToolsChange { tools: vec![] },
             ),
             (
-                super::super::actions::METRICS_CHANGED,
-                &[],
                 JournalWireEvent::Metrics {
                     kind: "token_usage".into(),
                     data: json!({}),
                 },
+                super::super::actions::METRICS_CHANGED,
             ),
             (
-                super::super::actions::PINNED_CHANGED,
-                &["pinned"],
                 JournalWireEvent::PinnedArchived {
                     pinned: true,
                     archived: false,
                 },
+                super::super::actions::PINNED_CHANGED,
             ),
             (
-                super::super::actions::LABEL_CHANGED,
-                &["label"],
                 JournalWireEvent::Label { label: "x".into() },
+                super::super::actions::LABEL_CHANGED,
             ),
             (
-                super::super::actions::SESSION_INFO_CHANGED,
-                &["data"],
                 JournalWireEvent::SessionInfo {
                     data: json!({"name": "agent"}),
                 },
+                super::super::actions::SESSION_INFO_CHANGED,
             ),
             (
-                super::super::actions::LEAF_CHANGED,
-                &["targetId"],
                 JournalWireEvent::Leaf {
                     target_id: "e-9".into(),
                 },
+                super::super::actions::LEAF_CHANGED,
             ),
         ];
-        // Excluded from the gate, none of them foldable from a journal row:
-        // BASELINE (host envelope), WORK_BACKGROUND_TASK_STOPPED (declared,
-        // never produced), PLAN_VERDICT / ORDER_CHANGED (client-dispatchable;
-        // the runtime dispatch arms validate their payloads directly).
-        for (tag, read_keys, event) in cases {
+        // Client-dispatched: the action as the client sends it (no journal
+        // producer exists; the runtime dispatch arms accept these directly).
+        let client_cases: Vec<(serde_json::Value, &str)> = vec![(
+            json!({"type": super::super::actions::ORDER_CHANGED, "order": {"s-1": 1}}),
+            super::super::actions::ORDER_CHANGED,
+        )];
+        // Excluded, no fold arm to feed: BASELINE (host envelope),
+        // WORK_BACKGROUND_TASK_STOPPED (declared, never produced),
+        // PLAN_VERDICT (folds with the host-emitted verdict-requested edge),
+        // the workspaces rows (declared, fold lives outside this bag).
+
+        let mut state = XManoxState::default();
+        let mut plan_review_action = None;
+        for (event, tag) in &host_cases {
             assert!(
                 super::super::actions::ALL.contains(tag),
                 "{tag} must stay declared"
             );
-            let entry = JournalWireEntry {
-                seq: 0,
-                id: "e-gate".into(),
-                parent_id: None,
-                timestamp: "2026-09-30T00:00:00.000Z".into(),
-                event: event.clone(),
-            };
-            let emitted = crate::translate::Translator::new().on_entry("c-1", "s-1", &entry);
-            let action = emitted
+            let emitted =
+                crate::translate::Translator::new().on_entry("c-1", "s-1", &entry(event.clone()));
+            let hit = emitted
                 .iter()
-                .map(|e| serde_json::to_value(&e.action).expect("action serializes"))
-                .find(|a| a["type"] == *tag)
+                .find(|e| serde_json::to_value(&e.action).unwrap()["type"] == *tag)
                 .unwrap_or_else(|| panic!("{tag} has no translator producer"));
-            for key in *read_keys {
-                assert!(
-                    action.get(*key).is_some(),
-                    "{tag}: the reducer reads `{key}` but the translator emits {action}"
-                );
+            let action = serde_json::to_value(&hit.action).unwrap();
+            assert!(
+                crate::ext::is_extension_channel(&hit.channel),
+                "{tag} must ride an extension channel; it was emitted on {} where no fold runs",
+                hit.channel
+            );
+            assert_eq!(
+                apply(&mut state, &action),
+                Outcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+            if *tag == super::super::actions::PLAN_VERDICT_REQUESTED {
+                plan_review_action = Some(action.clone());
             }
         }
+        for (action, tag) in &client_cases {
+            assert_eq!(
+                apply(&mut state, action),
+                Outcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+        }
+
+        // Total coverage: every field of the bag, populated by the cases
+        // above. The struct literal has no `..Default` on purpose.
+        assert_eq!(
+            state,
+            XManoxState {
+                plan_mode: Some(true),
+                plan: Some(json!({})),
+                plan_review: plan_review_action,
+                goal: Some(json!({"text": "ship"})),
+                browser_suites: Some(vec!["chrome".to_string()]),
+                background_tasks: Some(
+                    [("mon_7".to_string(), json!({"task_id": "mon_7"}),)]
+                        .into_iter()
+                        .collect()
+                ),
+                subagents: Some(
+                    [(
+                        "sub-0".to_string(),
+                        json!({
+                            "agentId": "sub-0", "agentType": "explore",
+                            "toolUses": 0, "latestActivity": null,
+                            "status": "running"
+                        }),
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                pinned: Some(true),
+                label: Some("x".to_string()),
+                session_info: Some(json!({"name": "agent"})),
+                leaf: Some("e-9".to_string()),
+                active_tools: Some(vec!["bash".to_string()]),
+                order: Some(json!({"s-1": 1})),
+            },
+            "every extension-state field must be reachable from a live producer"
+        );
     }
 }

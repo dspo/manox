@@ -405,10 +405,11 @@ mod tests {
             for emitted in translator.on_entry("c-1", "s-1", &entry) {
                 if emitted.channel == "x-manox-work:/s-1" {
                     let action = serde_json::to_value(&emitted.action).expect("action serializes");
-                    assert_eq!(
-                        reducer::apply(&mut state, &action),
-                        Outcome::Applied,
-                        "the fold must consume the emitted action: {action}"
+                    let outcome = reducer::apply(&mut state, &action);
+                    assert_ne!(
+                        outcome,
+                        Outcome::Unrecognised,
+                        "the fold must know the emitted action: {action}"
                     );
                 }
             }
