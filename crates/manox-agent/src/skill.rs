@@ -9,7 +9,7 @@
 //!
 //! Discovery mirrors the marketplace layout: each installed plugin's
 //! `skills/<skill-name>/SKILL.md` is registered under `plugin:skill-name`, and
-//! user-authored `~/.manox/skills/<name>/SKILL.md` files use the bare
+//! user-authored `~/.claude/skills/<name>/SKILL.md` files use the bare
 //! name. A plugin may also carry a root-level `SKILL.md` (the plugin's own
 //! overview) — registered under the bare plugin name.
 
@@ -25,9 +25,19 @@ use crate::plugin::PluginManager;
 
 #[derive(Debug, Clone, Deserialize)]
 struct SkillMeta {
+    /// Optional: when frontmatter omits it, the skill's directory name names
+    /// the skill (the loaders' existing fallback).
+    #[serde(default)]
     name: String,
     #[serde(default)]
     description: String,
+    /// Claude Code's `disable-model-invocation`: the skill stays
+    /// user-invocable (slash) but is hidden from the model's summary list so
+    /// the model neither discovers nor auto-invokes it. `allowed-tools` is
+    /// accepted-and-ignored, matching commands' documented stance (the pi
+    /// harness runs its full toolset for a turn).
+    #[serde(default, rename = "disable-model-invocation")]
+    disable_model_invocation: bool,
 }
 
 /// A loaded skill: frontmatter identity + the body the `skill` tool returns.
@@ -36,6 +46,7 @@ pub struct SkillDefinition {
     pub name: String,
     pub description: String,
     pub body: String,
+    pub disable_model_invocation: bool,
     /// On-disk source, for diagnostics and re-reads.
     pub source: PathBuf,
 }
@@ -112,10 +123,13 @@ impl SkillRegistry {
 
     /// One-line `(name, description)` summaries for the system prompt, so the
     /// model knows which skills exist without their full bodies in context.
-    /// The `system/main` template iterates this list — no markdown is built here.
+    /// Skills marked `disable-model-invocation` are withheld — the model must
+    /// not discover them; users still invoke them via slash. The `system/main`
+    /// template iterates this list — no markdown is built here.
     pub fn summaries(&self) -> Vec<crate::prompt::SkillSummaryPromptData> {
         self.skills
             .iter()
+            .filter(|(_, s)| !s.disable_model_invocation)
             .map(|(key, s)| crate::prompt::SkillSummaryPromptData {
                 name: key.clone(),
                 description: s.description.clone(),
@@ -181,8 +195,68 @@ fn load_skill_file(path: &Path) -> Result<SkillDefinition> {
         name: parsed.front.name,
         description: parsed.front.description,
         body: parsed.body,
+        disable_model_invocation: parsed.front.disable_model_invocation,
         source: path.to_path_buf(),
     })
+}
+
+/// Resolve one project-level skill on demand:
+/// `<cwd>/.claude/skills/<name>/SKILL.md`. Project skills are cwd-scoped by
+/// nature, so they are read fresh at use instead of living in the
+/// process-global registry — a slash invocation from a thread whose cwd sits
+/// in a repo with its own `.claude` picks that repo's skill up with no
+/// restart. The *directory name is the identity*: it names the skill for
+/// lookup and advertisement alike, so a frontmatter `name` that differs from
+/// the directory can never advertise an unresolvable key (and the global
+/// loader's frontmatter-name keying stays contained to its own layer).
+pub fn resolve_project(cwd: &Path, name: &str) -> Option<SkillDefinition> {
+    if name.is_empty()
+        || name.contains(':')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
+        return None;
+    }
+    let skill_file = cwd
+        .join(".claude")
+        .join("skills")
+        .join(name)
+        .join("SKILL.md");
+    let mut skill = load_skill_file(&skill_file).ok()?;
+    skill.name = name.to_string();
+    Some(skill)
+}
+
+/// Global summaries plus the project layer: `<cwd>/.claude/skills/`
+/// entries shadow a global skill of the same bare name and honor
+/// `disable-model-invocation`. Advertised under the directory name — the same
+/// key `resolve_project` looks up — so advertise and resolve can never drift
+/// apart. Built per session (the build knows the cwd), unlike the
+/// process-global [`summaries`].
+pub fn summaries_for_cwd(cwd: &Path) -> Vec<crate::prompt::SkillSummaryPromptData> {
+    let mut out: Vec<crate::prompt::SkillSummaryPromptData> = summaries_or_empty();
+    let dir = cwd.join(".claude").join("skills");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut project: Vec<crate::prompt::SkillSummaryPromptData> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            let skill = resolve_project(cwd, &name)?;
+            (!skill.disable_model_invocation).then_some(crate::prompt::SkillSummaryPromptData {
+                name,
+                description: skill.description,
+            })
+        })
+        .collect();
+    project.sort_by(|a, b| a.name.cmp(&b.name));
+    for summary in project {
+        out.retain(|s| s.name != summary.name);
+        out.push(summary);
+    }
+    out
 }
 
 static REGISTRY: OnceLock<SkillRegistry> = OnceLock::new();
@@ -229,7 +303,7 @@ pub fn list_skill_records() -> Vec<SkillRecord> {
         .collect()
 }
 
-/// Write a user-authored skill to `~/.manox/skills/<name>/SKILL.md`.
+/// Write a user-authored skill to `~/.claude/skills/<name>/SKILL.md`.
 /// When `previous_name` differs from `draft.name`, the old directory is removed
 /// after the new one is written so renames do not leave stale copies behind.
 pub fn save_user_skill(draft: &UserSkillDraft, previous_name: Option<&str>) -> Result<()> {
@@ -352,6 +426,7 @@ mod tests {
                 name: "exam".to_string(),
                 description: "生成试卷".to_string(),
                 body: String::new(),
+                disable_model_invocation: false,
                 source: PathBuf::new(),
             }),
         );
@@ -362,6 +437,7 @@ mod tests {
                 name: "task".to_string(),
                 description: "delegate task".to_string(),
                 body: String::new(),
+                disable_model_invocation: false,
                 source: PathBuf::new(),
             }),
         );
@@ -385,6 +461,112 @@ mod tests {
         assert!(
             !sums.iter().any(|s| s.name == "task"),
             "bare plugin skill name must not be advertised — it is not a resolvable lookup key"
+        );
+    }
+
+    #[test]
+    fn resolve_project_keys_on_the_directory_name() {
+        let proj = tempfile::tempdir().unwrap();
+        let dir = proj.path().join(".claude").join("skills").join("tutor");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Frontmatter omits `name`; the directory names the skill.
+        std::fs::write(dir.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        let skill = resolve_project(proj.path(), "tutor").unwrap();
+        assert_eq!(skill.name, "tutor");
+
+        // Frontmatter `name` differing from the directory must not drift the
+        // advertise key away from the lookup key: the directory wins.
+        let dir2 = proj.path().join(".claude").join("skills").join("guide");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("SKILL.md"),
+            "---\nname: exam\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(resolve_project(proj.path(), "guide").unwrap().name, "guide");
+
+        // Path-y names never resolve: `Path::join` with an absolute segment
+        // would replace the base and escape `.claude/` entirely.
+        assert!(resolve_project(proj.path(), "absent").is_none());
+        assert!(resolve_project(proj.path(), "gitwork:review").is_none());
+        assert!(resolve_project(proj.path(), "/etc/foo").is_none());
+        assert!(resolve_project(proj.path(), "a/b").is_none());
+    }
+
+    #[test]
+    fn summaries_hide_model_disabled_skills() {
+        let mut skills = BTreeMap::new();
+        skills.insert(
+            "open".to_string(),
+            Arc::new(SkillDefinition {
+                name: "open".to_string(),
+                description: "visible".to_string(),
+                body: String::new(),
+                disable_model_invocation: false,
+                source: PathBuf::new(),
+            }),
+        );
+        skills.insert(
+            "secret".to_string(),
+            Arc::new(SkillDefinition {
+                name: "secret".to_string(),
+                description: "user-only".to_string(),
+                body: String::new(),
+                disable_model_invocation: true,
+                source: PathBuf::new(),
+            }),
+        );
+        let reg = SkillRegistry { skills };
+        let names: Vec<String> = reg.summaries().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["open"], "disable-model-invocation must be withheld");
+    }
+
+    #[test]
+    fn project_summaries_shadow_global_same_name_and_hide_disabled() {
+        let proj = tempfile::tempdir().unwrap();
+        let exam = proj.path().join(".claude").join("skills").join("exam");
+        std::fs::create_dir_all(&exam).unwrap();
+        std::fs::write(
+            exam.join("SKILL.md"),
+            "---\nname: exam\ndescription: project-local exam\n---\nbody",
+        )
+        .unwrap();
+        let secret = proj.path().join(".claude").join("skills").join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(
+            secret.join("SKILL.md"),
+            "---\nname: secret\ndescription: user-only\ndisable-model-invocation: true\n---\nbody",
+        )
+        .unwrap();
+
+        // A frontmatter name differing from the directory is advertised under
+        // the directory — the key lookups (and shadowing) actually use.
+        let aliased = proj.path().join(".claude").join("skills").join("tutor");
+        std::fs::create_dir_all(&aliased).unwrap();
+        std::fs::write(
+            aliased.join("SKILL.md"),
+            "---\nname: frontmatter-name\ndescription: aliased\n---\nbody",
+        )
+        .unwrap();
+
+        let merged = summaries_for_cwd(proj.path());
+        let exam = merged
+            .iter()
+            .find(|s| s.name == "exam")
+            .expect("exam present");
+        assert_eq!(exam.description, "project-local exam");
+        let tutor = merged
+            .iter()
+            .find(|s| s.name == "tutor")
+            .expect("tutor present");
+        assert_eq!(tutor.description, "aliased");
+        assert!(
+            !merged.iter().any(|s| s.name == "frontmatter-name"),
+            "advertising the frontmatter name would advertise an unresolvable key"
+        );
+        assert!(
+            !merged.iter().any(|s| s.name == "secret"),
+            "disable-model-invocation project skills must not be advertised"
         );
     }
 }

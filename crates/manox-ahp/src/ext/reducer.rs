@@ -135,10 +135,10 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
         super::actions::PLAN_CHANGED => {
             state.plan = action.get("snapshot").cloned();
         }
-        super::actions::PLAN_VERDICT_REQUESTED | super::actions::PLAN_VERDICT => {
+        super::actions::PLAN_VERDICT_REQUESTED | super::actions::PLAN_REVIEW_SETTLED => {
             // Both edges land in the same field: the review's lifecycle is one
-            // fact (a proposal, then its verdict), and a client renders the
-            // difference from the payload.
+            // fact (a proposal, then its settlement), and a client renders the
+            // difference from the action type.
             state.plan_review = Some(action.clone());
         }
         super::actions::WORK_GOAL_CHANGED => {
@@ -437,6 +437,7 @@ mod tests {
                     plan_file: None,
                     title: None,
                     content: None,
+                    request_id: Some("plan-review:e-gate".into()),
                 },
                 super::super::actions::PLAN_VERDICT_REQUESTED,
                 "x-manox-plan:/c-1",
@@ -524,7 +525,7 @@ mod tests {
         )];
         // Excluded, no fold arm to feed: BASELINE (host envelope),
         // WORK_BACKGROUND_TASK_STOPPED (declared, never produced),
-        // PLAN_VERDICT (folds with the host-emitted verdict-requested edge),
+        // PLAN_REVIEW_SETTLED (folds with the host-emitted verdict-requested edge),
         // the workspaces rows (declared, fold lives outside this bag).
 
         let mut state = XManoxState::default();

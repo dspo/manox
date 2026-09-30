@@ -358,7 +358,10 @@ pub(super) fn session_builder(
             manox_harness::prompt::CaptainConfig {
                 cwd: cwd.to_path_buf(),
                 today: chrono::Local::now().format("%Y-%m-%d").to_string(),
-                skills: crate::skill::summaries_or_empty()
+                // Global + project (`.claude/skills` under the session cwd)
+                // summaries; model-hidden (`disable-model-invocation`) and
+                // model-shadowed entries resolved inside.
+                skills: crate::skill::summaries_for_cwd(cwd)
                     .into_iter()
                     .map(|s| manox_harness::prompt::SkillSummary {
                         name: s.name,

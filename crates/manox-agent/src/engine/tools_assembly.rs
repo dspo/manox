@@ -572,7 +572,7 @@ pub(super) fn build_tools(
             ));
         }
     }
-    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    // MCP servers (mcp.json + project/plugin .mcp.json): each advertised tool rides
     // behind the same permission gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`manox_agent::init`
     // tests) contributes nothing.
@@ -629,10 +629,11 @@ pub(super) fn build_tools(
     let subagent_runtime = SubagentRuntime::new();
     let mut registry = AgentRegistry::new();
     register_defaults(&mut registry);
-    // User-authored (~/.manox/agents) + plugin-provided
-    // (`<plugin>/agents/`, namespaced) definitions layer over the
-    // built-ins; same-name user files override built-ins.
-    crate::agent_defs::register_user_and_plugin(&mut registry);
+    // User-authored (~/.claude/agents), project (`.claude/agents` under the
+    // session cwd, overriding user) + plugin-provided (`<plugin>/agents/`,
+    // namespaced) definition layers over the built-ins; later same-name
+    // registrations override earlier ones.
+    crate::agent_defs::register_user_and_plugin(&mut registry, Some(cwd));
     // Dedicated per-definition models from the cx providers config's
     // `subagents:` map; an unreadable config warns and leaves subagents
     // inheriting the thread model.

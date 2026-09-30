@@ -83,8 +83,10 @@ pub mod actions {
     pub const PLAN_CHANGED: &str = "x-manox-plan/planChanged";
     /// A plan review is due, carrying the verdict request (host-emitted).
     pub const PLAN_VERDICT_REQUESTED: &str = "x-manox-plan/verdictRequested";
-    /// A plan verdict settled (client-dispatchable).
-    pub const PLAN_VERDICT: &str = "x-manox-plan/verdict";
+    /// A plan review settled — approve, refine, or implicit dismissal (the
+    /// journal edge carries no outcome discriminant, so the action names the
+    /// lifecycle fact, not a verdict; host-emitted).
+    pub const PLAN_REVIEW_SETTLED: &str = "x-manox-plan/reviewSettled";
     /// Goal set/cleared (host-emitted; clients set it through `x-manox/goal`).
     pub const WORK_GOAL_CHANGED: &str = "x-manox-work/goalChanged";
     /// Background-task registry snapshot (host-emitted).
@@ -125,7 +127,7 @@ pub mod actions {
         PLAN_MODE_CHANGED,
         PLAN_CHANGED,
         PLAN_VERDICT_REQUESTED,
-        PLAN_VERDICT,
+        PLAN_REVIEW_SETTLED,
         WORK_GOAL_CHANGED,
         WORK_BACKGROUND_TASKS,
         WORK_BACKGROUND_TASK_STOPPED,

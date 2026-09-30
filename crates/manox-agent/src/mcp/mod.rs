@@ -1,8 +1,9 @@
 //! MCP (Model Context Protocol) client integration — shared core.
 //!
-//! Reads `~/.manox/mcp.toml` (layered with each installed plugin's
-//! `.mcp.json`), connects every configured server (stdio or streamable HTTP)
-//! via the `rmcp` SDK, and lists their tools. The harness bridges differ:
+//! Reads `~/.manox/mcp.json` (layered with the project `.mcp.json` and each
+//! installed plugin's `.mcp.json`), connects every configured server (stdio
+//! or streamable HTTP) via the `rmcp` SDK, and lists their tools. The
+//! harness bridges differ:
 //! the manox harness wraps each tool as a manox `AgentTool` ([`napi_tool::PiMcpTool`]);
 //! the retired manox harness wraps the same connected servers into its own
 //! tool type. Configuration is file-only (no UI writes) in both.
@@ -58,8 +59,9 @@ pub enum ServerState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotView {
     pub name: String,
-    /// `file://` URI of the file that declares this server (mcp.toml or a
-    /// plugin's `.mcp.json`) — the AHP customization's source URI.
+    /// `file://` URI of the file that declares this server (mcp.json, a
+    /// project `.mcp.json`, or a plugin's `.mcp.json`) — the AHP
+    /// customization's source URI.
     pub source_uri: String,
     pub state: ServerState,
 }
@@ -299,11 +301,11 @@ fn fire(name: &str, state: ServerState) {
     });
 }
 
-/// Read the config (mcp.toml + plugin `.mcp.json` layers), connect every
-/// server, list tools. Call at startup after `runtime::init`. Blocks until
-/// all connections settle (per-server timeout); failures become `Error`
-/// slots, keeping the server visible to the AHP face and restartable via
-/// [`start`].
+/// Read the config (mcp.json global + project `.mcp.json` + plugin
+/// `.mcp.json` layers), connect every server, list tools. Call at startup
+/// after `runtime::init`. Blocks until all connections settle (per-server
+/// timeout); failures become `Error` slots, keeping the server visible to
+/// the AHP face and restartable via [`start`].
 pub fn init() {
     let dir = crate::paths::manox_config_dir();
     let config = match &dir {
@@ -316,9 +318,11 @@ pub fn init() {
             McpConfig::default()
         }
     };
+    let project = config::McpConfig::load_project(&std::env::current_dir().unwrap_or_default());
     let registry = build_registry(resolved_config(
         config,
         dir.ok().as_deref(),
+        project,
         &crate::settings::mcp_disabled(),
     ));
     let count = registry.tool_count();
@@ -347,13 +351,20 @@ pub fn try_global() -> Option<&'static McpRegistry> {
     REGISTRY.get()
 }
 
-/// The merged MCP config (mcp.toml + plugin `.mcp.json` layers) without
-/// connecting — the settings panel lists configured servers from it.
+/// The merged MCP config (mcp.json global + project `.mcp.json` + plugin
+/// `.mcp.json` layers) without connecting — the settings panel lists
+/// configured servers from it.
 pub fn load_merged_config() -> McpConfig {
     let mut config = crate::paths::manox_config_dir()
         .ok()
         .and_then(|dir| McpConfig::load(&dir).ok())
         .unwrap_or_default();
+    // Project layer overrides the global layer on name clashes.
+    if let Some((_, project)) =
+        McpConfig::load_project(&std::env::current_dir().unwrap_or_default())
+    {
+        config.mcp_servers.extend(project.mcp_servers);
+    }
     merge_plugin_declarations(&mut config);
     config
 }
@@ -514,25 +525,34 @@ fn header_map(
 }
 
 /// Fold the config layers into one name → (config, source URI) map, dropping
-/// servers the user disabled in settings. User `mcp.toml` entries win on an
-/// exact key clash by being inserted first; each entry records the file that
-/// declares it, which is the source URI the AHP face publishes.
+/// servers the user disabled in settings. Layer precedence on an exact key
+/// clash, strongest last: plugin declarations (`<plugin>__<server>` keys,
+/// inserted with `or_insert`) < global `mcp.json` < project `.mcp.json`.
+/// Each entry records the file that declares it, which is the source URI the
+/// AHP face publishes.
 ///
 /// Layering parity with [`merge_plugin_declarations`] (same merge rules, plus
-/// the source-URI dimension). When `config_dir` is `None` the user layer has
+/// the source-URI dimension). When `config_dir` is `None` the global layer has
 /// nowhere to come from and contributes nothing — the AHP customization's
 /// `uri` is a required field, so an entry without a resolvable source is
 /// skipped rather than published with an empty URI.
 fn resolved_config(
     config: McpConfig,
     config_dir: Option<&std::path::Path>,
+    project: Option<(std::path::PathBuf, McpConfig)>,
     disabled: &[String],
 ) -> BTreeMap<String, (McpServerConfig, String)> {
     let mut resolved: BTreeMap<String, (McpServerConfig, String)> = BTreeMap::new();
     if let Some(dir) = config_dir {
-        let toml_uri = format!("file://{}", dir.join("mcp.toml").display());
+        let global_uri = format!("file://{}", dir.join("mcp.json").display());
         for (name, cfg) in &config.mcp_servers {
-            resolved.insert(name.clone(), (cfg.clone(), toml_uri.clone()));
+            resolved.insert(name.clone(), (cfg.clone(), global_uri.clone()));
+        }
+    }
+    if let Some((path, project_config)) = project {
+        let project_uri = format!("file://{}", path.display());
+        for (name, cfg) in &project_config.mcp_servers {
+            resolved.insert(name.clone(), (cfg.clone(), project_uri.clone()));
         }
     }
     for record in config::list_plugin_declared_servers() {
@@ -575,6 +595,7 @@ pub fn start(name: &str) -> Result<(), String> {
         let resolved = resolved_config(
             config::load_global(),
             crate::paths::manox_config_dir().ok().as_deref(),
+            McpConfig::load_project(&std::env::current_dir().unwrap_or_default()),
             &[],
         );
         let Some((config, source_uri)) = resolved.get(name) else {
@@ -750,7 +771,7 @@ mod tests {
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
         config.mcp_servers.insert("beta".into(), stdio_cfg());
         config.mcp_servers.insert("gamma".into(), stdio_cfg());
-        let resolved = resolved_config(config, config_dir(), &["beta".to_string()]);
+        let resolved = resolved_config(config, config_dir(), None, &["beta".to_string()]);
         let names: Vec<&String> = resolved.keys().collect();
         assert_eq!(names, ["alpha", "gamma"]);
     }
@@ -759,27 +780,55 @@ mod tests {
     fn resolved_config_noop_on_empty_disabled_list() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
-        assert_eq!(resolved_config(config, config_dir(), &[]).len(), 1);
+        assert_eq!(resolved_config(config, config_dir(), None, &[]).len(), 1);
     }
 
     #[test]
     fn resolved_config_user_entry_wins_over_plugin_and_keeps_its_source() {
         let mut config = McpConfig::default();
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
-        let mut resolved = resolved_config(config, config_dir(), &[]);
+        let mut resolved = resolved_config(config, config_dir(), None, &[]);
         // A plugin declaring the same key must not displace the user entry:
-        // the source stays the user's mcp.toml, never a plugin manifest.
+        // the source stays the user's mcp.json, never a plugin manifest.
         resolved
             .entry("alpha".to_string())
             .or_insert_with(|| (stdio_cfg(), "file:///plugin/.mcp.json".into()));
         let (config, source) = &resolved["alpha"];
         assert!(
-            source.ends_with("mcp.toml"),
-            "a user entry's source is mcp.toml: {source}"
+            source.ends_with("mcp.json"),
+            "a user entry's source is mcp.json: {source}"
         );
         assert!(matches!(
             &config.transport,
             McpServerTransportConfig::Stdio { command, .. } if command == "true"
+        ));
+    }
+
+    #[test]
+    fn project_layer_overrides_global_and_keeps_its_source() {
+        let mut global = McpConfig::default();
+        global.mcp_servers.insert("alpha".into(), stdio_cfg());
+        let mut project = McpConfig::default();
+        project.mcp_servers.insert(
+            "alpha".into(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::StreamableHttp {
+                    url: "http://127.0.0.1:7400/mcp".into(),
+                    headers: None,
+                },
+            },
+        );
+        let resolved = resolved_config(
+            global,
+            config_dir(),
+            Some((std::path::PathBuf::from("/proj/.mcp.json"), project)),
+            &[],
+        );
+        let (config, source) = &resolved["alpha"];
+        assert_eq!(source, "file:///proj/.mcp.json");
+        assert!(matches!(
+            &config.transport,
+            McpServerTransportConfig::StreamableHttp { .. }
         ));
     }
 
@@ -789,7 +838,7 @@ mod tests {
         config.mcp_servers.insert("alpha".into(), stdio_cfg());
         // The AHP customization's `uri` is required; an entry with no
         // resolvable source must not become an empty-URI customization.
-        assert!(resolved_config(config, None, &[]).is_empty());
+        assert!(resolved_config(config, None, None, &[]).is_empty());
     }
 
     #[test]
@@ -797,7 +846,7 @@ mod tests {
         let registry = McpRegistry {
             slots: RwLock::new(vec![ServerSlot {
                 name: "alpha".into(),
-                source_uri: "file:///mcp.toml".into(),
+                source_uri: "file:///mcp.json".into(),
                 config: stdio_cfg(),
                 state: ServerState::Error("boom".into()),
                 client: None,
@@ -821,7 +870,7 @@ mod tests {
         let registry = McpRegistry {
             slots: RwLock::new(vec![ServerSlot {
                 name: "alpha".into(),
-                source_uri: "file:///mcp.toml".into(),
+                source_uri: "file:///mcp.json".into(),
                 config: stdio_cfg(),
                 state: ServerState::Stopped,
                 client: None,
@@ -842,7 +891,7 @@ mod tests {
         let registry = McpRegistry {
             slots: RwLock::new(vec![ServerSlot {
                 name: "alpha".into(),
-                source_uri: "file:///mcp.toml".into(),
+                source_uri: "file:///mcp.json".into(),
                 config: stdio_cfg(),
                 state: ServerState::Stopped,
                 client: None,

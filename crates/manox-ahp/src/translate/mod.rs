@@ -17,7 +17,10 @@
 
 pub mod actions;
 
-pub use actions::{Emitted, Translator, config_keys, plan_review_request_id};
+pub use actions::{Emitted, Translator, config_keys};
+/// Re-exported from the journal vocabulary crate: the runtime resolves the
+/// same id the translator and the engine's restore replay mint.
+pub use manox_journal::plan_review_request_id;
 
 use manox_journal::JournalWireEvent;
 
@@ -157,6 +160,7 @@ mod tests {
                     plan_file: Some("/p.md".into()),
                     title: Some("T".into()),
                     content: Some("# T".into()),
+                    request_id: None,
                 },
                 Target::Chat,
             ),

@@ -1,9 +1,12 @@
-//! MCP server configuration types — parsed from `~/.manox/mcp.toml`.
+//! MCP server configuration types — parsed from `~/.manox/mcp.json`.
 //!
-//! The file is a `[mcp_servers.<name>]` map. Each entry is either a stdio
-//! command (`command` + `args`) or a streamable-HTTP endpoint (`url`). A
-//! missing file is benign (no servers); a malformed file is warn-logged and
-//! skipped so manox still starts.
+//! The file uses the Claude Code `mcpServers` shape:
+//! `{ "mcpServers": { <name>: <cfg> } }` — the same schema as a project
+//! `.mcp.json` and a plugin's `.mcp.json`, so one server entry reads
+//! identically in all three layers. Each entry is either a stdio command
+//! (`command` + `args`) or a streamable-HTTP endpoint (`url`). A missing
+//! file is benign (no servers); a malformed file is warn-logged and skipped
+//! so manox still starts.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -11,10 +14,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-/// Top-level config: a map of server name → server config.
+/// Top-level config: a map of server name → server config. Serialized under
+/// the Claude Code `mcpServers` key.
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct McpConfig {
-    #[serde(default)]
+    #[serde(default, rename = "mcpServers")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
@@ -102,24 +106,46 @@ pub struct PluginMcpServerRecord {
 }
 
 impl McpConfig {
-    /// Read and parse `mcp.toml` from the manox config dir. Returns an empty
+    /// Read and parse `mcp.json` from the manox config dir. Returns an empty
     /// config (no servers) when the file is absent. A parse failure is
     /// returned as an error so the caller can decide to warn-and-continue.
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join("mcp.toml");
+        let path = dir.join("mcp.json");
         let raw = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                tracing::debug!("no mcp.toml at {}, MCP disabled", path.display());
+                tracing::debug!("no mcp.json at {}, MCP disabled", path.display());
                 return Ok(Self::default());
             }
             Err(e) => {
                 return Err(e).with_context(|| format!("reading {}", path.display()));
             }
         };
-        let cfg =
-            toml::from_str::<Self>(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let cfg = serde_json::from_str::<Self>(&raw)
+            .with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
+    }
+
+    /// Read the project-level `.mcp.json` (Claude Code's public project-scope
+    /// MCP convention) from `cwd`. Returns `None` when the file is absent;
+    /// a malformed file is warn-logged and treated as absent.
+    pub fn load_project(cwd: &Path) -> Option<(PathBuf, Self)> {
+        let path = cwd.join(".mcp.json");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                tracing::warn!("reading {}: {e}", path.display());
+                return None;
+            }
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(cfg) => Some((path, cfg)),
+            Err(e) => {
+                tracing::warn!("parsing {}: {e}", path.display());
+                None
+            }
+        }
     }
 }
 
@@ -137,14 +163,15 @@ pub fn load_global() -> McpConfig {
     }
 }
 
-/// Persist the user's `mcp.toml` using the same schema that `load_global`
+/// Persist the user's `mcp.json` using the same schema that `load_global`
 /// reads. Plugin-declared servers are not written here; they continue to live
 /// inside each installed plugin's `.mcp.json`.
 pub fn save_global(config: &McpConfig) -> Result<()> {
     let dir = crate::paths::ensure_manox_config_dir()
-        .context("ensuring manox config dir exists before writing mcp.toml")?;
-    let path = dir.join("mcp.toml");
-    let body = toml::to_string_pretty(config).context("serializing mcp.toml")?;
+        .context("ensuring manox config dir exists before writing mcp.json")?;
+    let path = dir.join("mcp.json");
+    let mut body = serde_json::to_string_pretty(config).context("serializing mcp.json")?;
+    body.push('\n');
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -196,24 +223,26 @@ mod tests {
 
     #[test]
     fn empty_file_yields_no_servers() {
-        let cfg: McpConfig = toml::from_str("").unwrap();
+        let cfg: McpConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.mcp_servers.is_empty());
     }
 
     #[test]
-    fn parses_stdio_and_http() {
-        let toml = r#"
-[mcp_servers.fs]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-env = { FOO = "bar" }
-
-[mcp_servers.remote]
-url = "https://mcp.example.com/sse"
-[mcp_servers.remote.headers]
-Authorization = "Bearer xxx"
-"#;
-        let cfg: McpConfig = toml::from_str(toml).unwrap();
+    fn parses_claude_code_shape_stdio_and_http() {
+        let json = r#"{
+            "mcpServers": {
+                "fs": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                    "env": {"FOO": "bar"}
+                },
+                "remote": {
+                    "url": "https://mcp.example.com/sse",
+                    "headers": {"Authorization": "Bearer xxx"}
+                }
+            }
+        }"#;
+        let cfg: McpConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.mcp_servers.len(), 2);
         let fs = cfg.mcp_servers.get("fs").unwrap();
         match &fs.transport {
@@ -246,30 +275,38 @@ Authorization = "Bearer xxx"
         }
     }
 
+    /// The written form is the Claude Code wire shape: a top-level
+    /// `mcpServers` object, and it round-trips through a fresh parse.
+    #[test]
+    fn save_shape_round_trips_through_claude_code_key() {
+        let cfg: McpConfig =
+            serde_json::from_str(r#"{"mcpServers":{"fs":{"command":"npx"}}}"#).unwrap();
+        let body = serde_json::to_string(&cfg).unwrap();
+        assert!(body.contains(r#""mcpServers""#), "{body}");
+        assert!(!body.contains("mcp_servers"), "{body}");
+        let reparsed: McpConfig = serde_json::from_str(&body).unwrap();
+        assert_eq!(reparsed.mcp_servers.len(), 1);
+    }
+
     #[test]
     fn rejects_command_and_url_together() {
-        let toml = r#"
-[mcp_servers.bad]
-command = "npx"
-url = "https://mcp.example.com"
-"#;
-        let err = toml::from_str::<McpConfig>(toml).unwrap_err();
+        let err = serde_json::from_str::<McpConfig>(
+            r#"{"mcpServers":{"bad":{"command":"npx","url":"https://mcp.example.com"}}}"#,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("not both"), "{err:#}");
     }
 
     #[test]
     fn rejects_missing_transport() {
-        let toml = r#"
-[mcp_servers.bad]
-args = ["x"]
-"#;
-        let err = toml::from_str::<McpConfig>(toml).unwrap_err();
+        let err = serde_json::from_str::<McpConfig>(r#"{"mcpServers":{"bad":{"args":["x"]}}}"#)
+            .unwrap_err();
         assert!(err.to_string().contains("missing transport"), "{err:#}");
     }
 
     #[test]
     fn missing_file_is_empty() {
-        // A directory that exists but contains no mcp.toml → empty config.
+        // A directory that exists but contains no mcp.json → empty config.
         let dir = std::env::temp_dir();
         let sub = dir.join("manox-mcp-test-missing");
         let _ = std::fs::remove_dir_all(&sub);
@@ -277,5 +314,23 @@ args = ["x"]
         let cfg = McpConfig::load(&sub).unwrap();
         assert!(cfg.mcp_servers.is_empty());
         let _ = std::fs::remove_dir_all(&sub);
+    }
+
+    #[test]
+    fn project_layer_reads_mcp_json_and_tolerates_absence() {
+        let proj = tempfile::tempdir().unwrap();
+        assert!(McpConfig::load_project(proj.path()).is_none());
+
+        std::fs::write(
+            proj.path().join(".mcp.json"),
+            r#"{"mcpServers":{"proj-fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let (path, cfg) = McpConfig::load_project(proj.path()).unwrap();
+        assert_eq!(path, proj.path().join(".mcp.json"));
+        assert_eq!(cfg.mcp_servers.len(), 1);
+
+        std::fs::write(proj.path().join(".mcp.json"), "{not json").unwrap();
+        assert!(McpConfig::load_project(proj.path()).is_none());
     }
 }

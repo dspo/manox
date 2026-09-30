@@ -19,4 +19,5 @@ pub mod journal;
 
 pub use journal::{
     JournalWireEntry, JournalWireEvent, ModelRef, StreamId, ThreadHeader, UsagePayload,
+    plan_review_request_id,
 };

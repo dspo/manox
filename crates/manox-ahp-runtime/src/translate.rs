@@ -202,12 +202,14 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
             plan_file,
             title,
             content,
+            request_id,
             ..
         } => W::PlanReview {
             state: state.clone(),
             plan_file: plan_file.clone(),
             title: title.clone(),
             content: content.clone(),
+            request_id: request_id.clone(),
         },
         SessionTreeEntry::Goal { goal, .. } => W::Goal { goal: goal.clone() },
         SessionTreeEntry::Title { title, .. } => W::Title {
