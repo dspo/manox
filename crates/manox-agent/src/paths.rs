@@ -72,23 +72,32 @@ pub fn commands_dir() -> Result<PathBuf> {
     Ok(claude_home()?.join("commands"))
 }
 
-/// `$HOME/.claude/plugins` — installed plugin roots, one
-/// subdirectory per plugin (`plugins/<name>/`). Populated by the plugin
-/// manager on `install`; scanned by the skill/command/agent/hook loaders.
+/// `$HOME/.claude/plugins` — the Claude Code plugin store, shared in place:
+/// `installed_plugins.json` (the install registry),
+/// `known_marketplaces.json`, `marketplaces/<slug>/` clones, and
+/// `cache/<marketplace>/<plugin>/<version>/` installed trees. Written only
+/// by the plugin manager's explicit user operations; scanned by the
+/// skill/command/agent/hook/MCP loaders on every read.
 pub fn plugins_dir() -> Result<PathBuf> {
-    Ok(manox_config_dir()?.join("plugins"))
+    Ok(claude_home()?.join("plugins"))
 }
 
-/// Root directory of a single installed plugin.
-pub fn plugin_root(name: &str) -> Result<PathBuf> {
-    Ok(plugins_dir()?.join(name))
+/// `$HOME/.claude/plugins/installed_plugins.json` — the shared install
+/// registry (schema version 2).
+pub fn installed_plugins_file() -> Result<PathBuf> {
+    Ok(plugins_dir()?.join("installed_plugins.json"))
 }
 
-/// `$HOME/.manox/marketplaces` — cloned marketplace git repos,
-/// one per remote URL. Each clone contains a `.claude-plugin/marketplace.json`
-/// index plus the `plugins/<name>/` sources the index points at.
-pub fn marketplace_cache_dir() -> Result<PathBuf> {
-    Ok(manox_config_dir()?.join("marketplaces"))
+/// `$HOME/.claude/plugins/known_marketplaces.json` — the shared marketplace
+/// registration list.
+pub fn known_marketplaces_file() -> Result<PathBuf> {
+    Ok(plugins_dir()?.join("known_marketplaces.json"))
+}
+
+/// `$HOME/.claude/settings.json` — Claude Code's own settings file; manox
+/// touches only its `enabledPlugins` map and round-trips the rest.
+pub fn claude_settings_file() -> Result<PathBuf> {
+    Ok(claude_home()?.join("settings.json"))
 }
 
 /// Stable filesystem-safe slug for a marketplace git URL: the last non-empty
@@ -100,24 +109,6 @@ pub fn marketplace_slug(git_url: &str) -> String {
     let trimmed = git_url.trim_end_matches('/');
     let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
     tail.trim_end_matches(".git").to_string()
-}
-
-/// Directory holding the cloned marketplace repo for `git_url`.
-pub fn marketplace_dir(git_url: &str) -> Result<PathBuf> {
-    Ok(marketplace_cache_dir()?.join(marketplace_slug(git_url)))
-}
-
-/// File recording which plugins are currently enabled, one plugin name per line.
-/// The loaders consult this to decide which `plugins/<name>/` roots to scan.
-pub fn enabled_plugins_file() -> Result<PathBuf> {
-    Ok(manox_config_dir()?.join("enabled_plugins.txt"))
-}
-
-/// File recording installed plugins that are explicitly disabled, one plugin
-/// name per line. A disabled plugin stays on disk (so it survives as
-/// installed) but is excluded from the loader-scanned set until re-enabled.
-pub fn disabled_plugins_file() -> Result<PathBuf> {
-    Ok(manox_config_dir()?.join("disabled_plugins.txt"))
 }
 
 /// `$HOME/.manox/settings.toml` — plain-file user preferences (UI
