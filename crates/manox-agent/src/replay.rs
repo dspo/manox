@@ -54,6 +54,11 @@ pub struct ReplayedThreadState {
     /// any verdict clears). `None` = the chain never saw one — the sidecar
     /// hint stands (the pre-vocabulary hole-fill).
     pub plan_review_pending: Option<bool>,
+    /// The open review's request id, minted from the last `proposed` row's
+    /// own entry id (the request id IS `plan-review:<proposal entry id>`); a
+    /// resolved row clears it. The journal is the carrier, so the restore
+    /// survives a host restart without a sidecar.
+    pub plan_review_request_id: Option<String>,
     /// Goal value from the last `goal` entry; `Some(Null)` is an explicit
     /// clear.
     pub goal: Option<serde_json::Value>,
@@ -99,8 +104,23 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             SessionTreeEntry::PlanUpdate { snapshot, .. } => {
                 state.plan_snapshot = Some(snapshot.clone());
             }
-            SessionTreeEntry::PlanReview { state: review, .. } => {
-                state.plan_review_pending = Some(review == "proposed");
+            SessionTreeEntry::PlanReview {
+                state: review,
+                id,
+                request_id,
+                ..
+            } => {
+                let proposed = review == "proposed";
+                state.plan_review_pending = Some(proposed);
+                state.plan_review_request_id = if proposed {
+                    Some(
+                        request_id
+                            .clone()
+                            .unwrap_or_else(|| manox_journal::plan_review_request_id(id)),
+                    )
+                } else {
+                    None
+                };
             }
             SessionTreeEntry::Goal { goal, .. } => {
                 state.goal = Some(goal.clone().unwrap_or(serde_json::Value::Null));

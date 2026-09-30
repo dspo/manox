@@ -300,6 +300,14 @@ struct EngineState {
     /// Plan-mode state shared by the actor, the hooks, the gate, and the
     /// `ProposePlan` tool.
     plan: Arc<crate::plan_mode::PlanSessionState>,
+    /// The open plan review's request id (`plan-review:<proposal entry id>`),
+    /// set when the proposed edge journals and consumed by the resolved
+    /// edge's row so the resolution is self-describing: a review outlives
+    /// its turn and routinely spans a host restart, and a fold that never
+    /// saw the proposal (a bridge resuming above it) can only emit the
+    /// verdict from the row itself. `None` when no review is pending or the
+    /// row predates the field.
+    plan_review_request_id: Mutex<Option<String>>,
     /// The host permission gate wrapping every mutating tool (mode +
     /// pending interaction round trips).
     gate: Arc<ApprovalGate>,
@@ -464,6 +472,7 @@ pub fn spawn_engine(
         gate,
         question_gate,
         plan: crate::plan_mode::PlanSessionState::new(),
+        plan_review_request_id: Mutex::new(None),
         goal_bridge,
         goal_continuation_reserved: AtomicBool::new(false),
         goal_continuation_round: Mutex::new(None),
@@ -1116,6 +1125,7 @@ async fn run_actor(
             .set_active_instructions(render_plan_instructions());
     }
     let plan_review_pending = restored_state.plan_review_pending;
+    *state.plan_review_request_id.lock().unwrap() = restored_state.plan_review_request_id.clone();
     let plan_snapshot = restored_state.plan_snapshot.clone();
     let restored_title = restored_state.title.clone();
 
@@ -1497,19 +1507,30 @@ async fn run_actor(
                 // and the P face; the sidecar flag demotes to the
                 // pre-vocabulary hole-fill). "proposed"/"resolved" is the
                 // fold vocabulary; the verdict discriminant rides the
-                // notice plane.
+                // notice plane. The resolved edge carries the proposal's
+                // request id so the resolution is self-describing: a review
+                // outlives its turn and routinely spans a host restart, and
+                // a fold that never saw the proposal can only emit the
+                // verdict from the row itself.
                 let review_state = if pending { "proposed" } else { "resolved" };
-                if let Err(err) = session
-                    .append_typed(
-                        "plan_review",
-                        serde_json::json!({
-                            "state": review_state,
-                            "planFile": state.plan.plan_file(),
-                        }),
-                    )
-                    .await
-                {
-                    tracing::error!(%err, "failed to journal the plan review edge");
+                let request_id = (*state.plan_review_request_id.lock().unwrap()).clone();
+                let mut payload = serde_json::json!({
+                    "state": review_state,
+                    "planFile": state.plan.plan_file(),
+                });
+                if let Some(request_id) = request_id.filter(|_| !pending) {
+                    payload["requestId"] = serde_json::Value::String(request_id);
+                }
+                match session.append_typed("plan_review", payload).await {
+                    Ok(entry_id) => {
+                        let mut request_id = state.plan_review_request_id.lock().unwrap();
+                        if pending {
+                            *request_id = Some(manox_journal::plan_review_request_id(&entry_id));
+                        } else {
+                            *request_id = None;
+                        }
+                    }
+                    Err(err) => tracing::error!(%err, "failed to journal the plan review edge"),
                 }
             }
             SessionCmd::PersistPlanSnapshot(snapshot) => {
@@ -2400,6 +2421,10 @@ struct RestoredThreadState {
     /// review edge folds the pending flag; the sidecar hint is the
     /// pre-vocabulary hole-fill.
     plan_review_pending: bool,
+    /// The open review's request id, replayed from the journal (the
+    /// proposed row's own entry id mints it; a resolved row clears it).
+    /// `None` when no review is pending.
+    plan_review_request_id: Option<String>,
     plan_snapshot: Option<serde_json::Value>,
     title: Option<String>,
     /// Journal authority (goal stage ②): the replayed last `goal` snapshot
@@ -2451,6 +2476,7 @@ fn merge_restored_state(
         plan_mode: replayed.plan_mode.unwrap_or(false),
         plan_file: meta.plan_file.clone(),
         plan_review_pending: replayed.plan_review_pending.unwrap_or(false),
+        plan_review_request_id: replayed.plan_review_request_id.clone(),
         plan_snapshot: journal_plan_snapshot(replayed).or_else(|| meta.plan_snapshot.clone()),
         title: replayed
             .title

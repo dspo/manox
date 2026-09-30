@@ -115,7 +115,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 
 **`ServerCall`（6）**
 
-`Approve`→`chat/toolCallReady{pending-confirmation, options[], _meta:{x-manox:{authId,summary,deliveryId}}}` + `chat/toolCallConfirmed{approved,selectedOptionId?,reason?}`；`AskUserQuestion`→elicitation 三动作（多客户端草稿同步白拿）；`PlanVerdict`→`x-manox-plan/verdictRequested`+`/verdict`；`BrowserOp`/`ClipboardRead`/`OpenExternal`/`InvokeClientTool`→宿主→客户端 request `x-manox/browserOp|clipboardRead|openExternal|invokeTool`（按 `capabilities` 路由，fail-closed 不变）。
+`Approve`→`chat/toolCallReady{pending-confirmation, options[], _meta:{x-manox:{authId,summary,deliveryId}}}` + `chat/toolCallConfirmed{approved,selectedOptionId?,reason?}`；`AskUserQuestion`→elicitation 三动作（多客户端草稿同步白拿）；`PlanVerdict`→`x-manox-plan/verdictRequested`+`/reviewSettled`；`BrowserOp`/`ClipboardRead`/`OpenExternal`/`InvokeClientTool`→宿主→客户端 request `x-manox/browserOp|clipboardRead|openExternal|invokeTool`（按 `capabilities` 路由，fail-closed 不变）。
 
 **`HostEvent`（8 变体 + 死亡清单）**
 
@@ -169,7 +169,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 | 扩展通道 | 承载的领域状态 | AHP 缺口来源 |
 |---|---|---|
-| `x-manox-plan:/<chat-id>` | plan 模式开关、plan 文件/制品内容、评审请求与裁决（`verdictRequested`/`verdict`/`execute`/`planModeChanged`） | AHP 无 plan 模式与 plan 制品/评审 |
+| `x-manox-plan:/<chat-id>` | plan 模式开关、plan 文件/制品内容、评审请求与裁决（`verdictRequested`/`reviewSettled`/`execute`/`planModeChanged`） | AHP 无 plan 模式与 plan 制品/评审 |
 | `x-manox-work:/<session-id>` | goal、后台任务、browser suites 运行态、子代理树（depth/branch/agent_label） | AHP 是扁平 worker chat，无 depth/父子树；goal/后台任务/browser suites 无对应 |
 | `x-manox-metrics:/<chat-id>` | 原 Q 面聚合：turns/messages、per-model usage、成本、context%、git stats，按 cursor 变更推送 | AHP 无按需聚合（Q）面 |
 | `x-manox-workspaces://` | `manox-workspace` 域：目录行 + 有序会话账 + 全局 archive 集（原 `ClientCall::Workspace`） | AHP 无 workspace 行域 |
@@ -782,7 +782,7 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
 - `JsonRpcRequest.id` 在 `ahp-types` 里是 `u64`：使用字符串 id 的 JSON-RPC 客户端会在解析期被拒
   （整帧判为 `-32700`）。官方 Rust/TS 客户端均发数字 id，故暂不处理；容忍字符串 id 记入 W5 候选。
 - 规范 §B.4 提到的 `PlanVerdict` 在 `manox-protocol` 里**不存在**（实测 `ServerCall` 只有 6 个变体），
-  计划评审经 `Approve` 腿到达；`x-manox-plan/verdictRequested|verdict` 仍按 §D 声明保留。
+  计划评审经 `Approve` 腿到达；`x-manox-plan/verdictRequested|reviewSettled` 仍按 §D 声明保留（`verdict` 已改名 `reviewSettled`：resolved 边不载 approve/refine 判别式）。
 
 ### H.5 W4 已执行：v2 拆除完成（2026-09-24）
 
@@ -917,7 +917,7 @@ VS Code 拿到的是一个普通单选问题，不是它的原生 plan-review �
 `planReview`。这使问题从"用错了 API"升级为设计选择：
 
 - **(a)** 接受降级：用类型化 `ChatInputRequest` 发普通提问，放弃"原生卡片"这一说法，文档同步；
-- **(b)** 走已经为它准备好的通道：`x-manox-plan/verdictRequested` 与 `x-manox-plan/verdict`
+- **(b)** 走已经为它准备好的通道：`x-manox-plan/verdictRequested` 与 `x-manox-plan/verdict`（后者后改名 `x-manox-plan/reviewSettled`）
   在 `ext::actions::ALL` 里**已声明**、`ext/reducer.rs:100` **已折叠**，但**没有任何生产者**
   ——与本 PR 早先修掉的"声明了却没有实现"是同一类缺陷（§H.5⑥⑦）。plan review 正好落在这里。
 

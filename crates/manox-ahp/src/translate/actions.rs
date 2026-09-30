@@ -70,7 +70,7 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload};
+use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload, plan_review_request_id};
 use serde_json::{Value, json};
 
 use crate::ext;
@@ -495,6 +495,7 @@ impl Translator {
         let at = crate::translate::target_of(&entry.event).uri(chat_id, session_id);
         let chat = Target::Chat.uri(chat_id, session_id);
         let session = Target::Session.uri(chat_id, session_id);
+        let plan = Target::Plan.uri(chat_id, session_id);
         let mut out = Vec::new();
         match &entry.event {
             // ── transcript ───────────────────────────────────────────────
@@ -811,14 +812,47 @@ impl Translator {
                 plan_file,
                 title,
                 content,
+                request_id: row_request_id,
             } => {
                 // The review's two edges: a verdict is owed, or one landed.
                 // The proposal opens VS Code's native plan-review card (a
                 // `chat/inputRequested` whose request carries the `planReview`
                 // block); the resolution closes that same part by its request
-                // id, so no separate `x-manox-plan` verdict card is needed.
+                // id on the chat face, and the plan-channel settle below is
+                // the fold-visible half for clients whose turn lifecycle
+                // already archived the request.
                 if state == "resolved" {
-                    if let Some(request_id) = self.plan_review.take() {
+                    // The settled edge is self-describing on rows the engine
+                    // wrote after the field existed; translator memory covers
+                    // rows written before it (the proposal replayed in this
+                    // translator's own lifetime). A resolution neither names
+                    // nor is remembered for cannot name its request — skip
+                    // rather than emit a verdict no client can correlate.
+                    let request_id = row_request_id.clone().or_else(|| self.plan_review.take());
+                    // A resolution settles the remembered review too, named
+                    // or not — leaving the memory standing re-emits it on any
+                    // later id-less resolved row.
+                    self.plan_review = None;
+                    if let Some(request_id) = request_id {
+                        // The settlement rides the plan channel in its own
+                        // right: the chat-level `ChatInputCompleted` below only
+                        // folds when the request's turn is still ACTIVE, and a
+                        // plan review legitimately outlives its turn (the turn
+                        // finishes the moment the plan is proposed) — the
+                        // reducer then no-ops on both sides and the client's
+                        // card can never retire (#88's composer lock). The
+                        // plan-channel state is where the settlement is
+                        // fold-visible regardless of turn lifecycle. It names
+                        // no outcome — the journal edge does not carry one
+                        // (approve / refine / implicit dismissal all land
+                        // here) — hence "settled", not "verdict".
+                        out.push(Emitted::new(
+                            &plan,
+                            extension_action(
+                                ext::actions::PLAN_REVIEW_SETTLED,
+                                plan_review_settled_payload(&request_id, plan_file.as_deref()),
+                            ),
+                        ));
                         out.push(Emitted::new(
                             &chat,
                             StateAction::ChatInputCompleted(ChatInputCompletedAction {
@@ -827,6 +861,11 @@ impl Translator {
                                 answers: None,
                             }),
                         ));
+                    } else {
+                        tracing::debug!(
+                            seq = entry.seq,
+                            "plan review resolved with no correlatable request id; no settlement emitted"
+                        );
                     }
                 } else {
                     let request_id = plan_review_request_id(&entry.id);
@@ -840,7 +879,7 @@ impl Translator {
                     // own state (durable, and backfillable to a client that
                     // reconnects), which the one-shot broadcast was not.
                     out.push(Emitted::new(
-                        &crate::translate::Target::Plan.uri(chat_id, session_id),
+                        &plan,
                         extension_action(
                             ext::actions::PLAN_VERDICT_REQUESTED,
                             plan_review_payload(
@@ -2011,14 +2050,6 @@ fn confirmation_prompt(title: &str, tool_name: &str) -> String {
     format!("{subject} — awaiting confirmation")
 }
 
-/// The deterministic request id for a plan-review card: the proposal journal
-/// entry's id, namespaced so the runtime can tell a plan verdict apart from an
-/// `AskUserQuestion` answer on the `chat/inputCompleted` path. The translator
-/// (which mints it) and the runtime (which resolves it) share this shape.
-pub fn plan_review_request_id(entry_id: &str) -> String {
-    format!("plan-review:{entry_id}")
-}
-
 /// The plan-review block, for the `x-manox-plan` channel.
 ///
 /// This is where the plan's title, content and actions live. It cannot ride
@@ -2053,6 +2084,19 @@ fn plan_review_payload(
         ],
         "canProvideFeedback": true,
     });
+    if let Some(plan_file) = plan_file {
+        payload["planUri"] = json!(file_uri(plan_file));
+    }
+    payload
+}
+
+/// The settled edge's payload: the same `planUri` spelling and encoding the
+/// proposal edge used (the fold replaces `plan_review` wholesale, so the pair
+/// must speak one shape or a late subscriber sees the plan reference mutate).
+/// The key is omitted — not null — when the journal row carried no file, as
+/// `plan_review_payload` does.
+fn plan_review_settled_payload(request_id: &str, plan_file: Option<&str>) -> Value {
+    let mut payload = json!({ "requestId": request_id });
     if let Some(plan_file) = plan_file {
         payload["planUri"] = json!(file_uri(plan_file));
     }
@@ -2378,6 +2422,7 @@ mod tests {
                     plan_file: Some("/plans/demo-plan.md".into()),
                     title: Some("Demo plan".into()),
                     content: Some("# Demo\n\n- step one".into()),
+                    request_id: None,
                 },
             ),
         );
@@ -2440,6 +2485,7 @@ mod tests {
                     plan_file: Some("/p.md".into()),
                     title: Some("T".into()),
                     content: Some("# T".into()),
+                    request_id: None,
                 },
             ),
         );
@@ -2453,13 +2499,76 @@ mod tests {
                     plan_file: None,
                     title: None,
                     content: None,
+                    request_id: None,
                 },
             ),
         );
-        assert_eq!(emitted.len(), 1);
-        let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(emitted.len(), 2);
+        let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(settled["type"], ext::actions::PLAN_REVIEW_SETTLED);
+        assert_eq!(settled["requestId"], "plan-review:e-1");
+        // No file on the resolved edge: the key is OMITTED — the same
+        // `planUri` spelling and absence semantics the proposal edge uses
+        // (the fold replaces `plan_review` wholesale, so the pair must
+        // speak one shape).
+        assert!(emitted[0].channel.starts_with("x-manox-plan"));
+        assert!(settled.get("planUri").is_none());
+        let value = serde_json::to_value(&emitted[1].action).expect("action serializes");
         assert_eq!(value["type"], "chat/inputCompleted");
         assert_eq!(value["requestId"], "plan-review:e-1");
+    }
+
+    /// The resolution is self-describing: a resolved row carrying its
+    /// request id settles in a translator that never saw the proposal (a
+    /// bridge resuming above it, after a host restart). The payload names
+    /// the plan with the proposal edge's `planUri` encoding.
+    #[test]
+    fn plan_review_resolution_survives_a_translator_restart() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-9",
+                JournalWireEvent::PlanReview {
+                    state: "resolved".into(),
+                    plan_file: Some("/p.md".into()),
+                    title: None,
+                    content: None,
+                    request_id: Some("plan-review:e-1".into()),
+                },
+            ),
+        );
+        assert_eq!(emitted.len(), 2);
+        let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
+        assert_eq!(settled["type"], ext::actions::PLAN_REVIEW_SETTLED);
+        assert_eq!(settled["requestId"], "plan-review:e-1");
+        assert_eq!(settled["planUri"], "file:///p.md");
+        let value = serde_json::to_value(&emitted[1].action).expect("action serializes");
+        assert_eq!(value["requestId"], "plan-review:e-1");
+    }
+
+    /// A resolution that neither names its request nor is remembered for
+    /// one cannot be correlated — nothing is emitted rather than a verdict
+    /// no client can route.
+    #[test]
+    fn plan_review_resolution_without_a_correlatable_id_emits_nothing() {
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-9",
+                JournalWireEvent::PlanReview {
+                    state: "resolved".into(),
+                    plan_file: None,
+                    title: None,
+                    content: None,
+                    request_id: None,
+                },
+            ),
+        );
+        assert!(emitted.is_empty());
     }
 }
 
