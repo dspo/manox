@@ -62,6 +62,7 @@ tera.workspace = true
 tokio-tungstenite = { workspace = true }
 rustwright_core = { workspace = true, optional = true }
 html2text = "0.17.1"
+tempfile = "3"
 
 [dev-dependencies]
 # Self-reference with `test-support`: integration tests (`tests/`) compile the
@@ -69,7 +70,6 @@ html2text = "0.17.1"
 # `drop_for_test` / `drop_global_for_test`) must come from the feature.
 # `chrome-use` keeps the chrome_use module and its live tests in the suite.
 manox-agent = { path = ".", features = ["test-support", "chrome-use"] }
-tempfile = "3"
 
 [lints.clippy]
 dbg_macro = "deny"
