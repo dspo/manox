@@ -629,7 +629,7 @@ pub(super) fn build_tools(
     let subagent_runtime = SubagentRuntime::new();
     let mut registry = AgentRegistry::new();
     register_defaults(&mut registry);
-    // User-authored (~/.manox/agents) + plugin-provided
+    // User-authored (~/.claude/agents) + plugin-provided
     // (`<plugin>/agents/`, namespaced) definitions layer over the
     // built-ins; same-name user files override built-ins.
     crate::agent_defs::register_user_and_plugin(&mut registry);

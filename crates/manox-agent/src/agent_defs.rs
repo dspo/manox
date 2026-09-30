@@ -4,7 +4,7 @@
 //! The built-in `Explore` definition ships in `pi-extensions`; this loader
 //! adds two discovery layers on top at session-build time:
 //!
-//! - **User-authored** files under `~/.manox/agents/*.md`
+//! - **User-authored** files under `~/.claude/agents/*.md`
 //!   (Claude Code `.claude/agents/*.md` format: YAML frontmatter +
 //!   markdown system prompt). A user file with the same `name` overrides
 //!   the built-in (registry insert replaces), so users can customize the
@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 
 use manox_harness::ext_point_agent::{AgentDef, AgentRegistry};
 
-/// `~/.manox/agents` — user-authored subagent definitions.
+/// `~/.claude/agents` — user-authored subagent definitions.
 pub fn user_agents_dir() -> Result<PathBuf, anyhow::Error> {
-    Ok(crate::paths::manox_config_dir()?.join("agents"))
+    crate::paths::agents_dir()
 }
 
 /// Parse every `*.md` definition in `dir`; malformed files warn and skip.

@@ -72,11 +72,12 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 
 非必要不将提示词硬编码到 `.rs` 中，用 `.md` 文本文件维护：主 agent 提示词在 `crates/manox-agent/src/prompt/templates/system/*.tera.md`（Tera 渲染，`prompt/renderer.rs` 是唯一接触 `tera::` 的地方；模板只有英文单语一份，无 locale 子树）、子 agent 定义在 `crates/manox-harness/ext-agents/*.md`（`include_str!`，由 `ext/subagent/spawn.rs` 嵌入）、审批 reviewer 在 `crates/manox-agent/src/approval_agent_prompt.md`（`include_str!`，`approval_review.rs:16`）、标题生成在 `crates/manox-agent/src/title_agent_prompt.md`（`include_str!`，`title.rs:24`）；技能提示词 `skills/<name>/SKILL.md` 运行时从磁盘加载（`crates/manox-agent/src/skill.rs`）。短参数化模板（1-2 句）可留在 `.rs`，多段落散文一律用 `.md`。
 
-## 运行时配置（`~/.manox/`）
+## 运行时配置（`~/.manox/`）与生态根（`~/.claude/`）
 
-**所有持久化内容统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）。路径清单：
+持久化分两个根：**运行时状态统一位于 `~/.manox/`**（不再使用 `~/.config/cx/`）；**扩展生态资产位于 `~/.claude/`**（与 Claude Code CLI 物理共享，装一次两边可用；`MANOX_CLAUDE_HOME` 整体重定向，测试隔离用）。路径清单：
 
 - 单一状态根：`~/.manox/`（`manox_agent::paths::manox_config_dir()` 与 `manox_providers::cx_state_dir()` 均指向它）。**多进程共享**：runtime 允许多实例共用同一状态根，跨进程协调在资源粒度——per-session 写租约（`manox_agent::session_lease`，`sessions/<id>.jsonl.lock`，驱动即独占、进程死自动释放、冲突报 `session/already-owned`）、threads.db 走 SQLite WAL、共享状态文件（registry/sidebar/sidecar）走 per-file flock、网关单例走 `~/.manox/gateway.lock`。无全 store 级单实例锁。
+- 生态根：`~/.claude/`（`manox_agent::paths::claude_home()`）。用户技能 `~/.claude/skills/`、斜杠命令 `~/.claude/commands/`、子 agent 定义 `~/.claude/agents/`、规则 `~/.claude/rules/`（与 CLAUDE.md 层级一同由 `claude_md.rs` 装载）；插件与市场存储亦在此根下（见 `plugin.rs`）。
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（WAL 模式；`threads.db-shm` / `threads.db-wal` 随行）
 - 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
@@ -84,7 +85,7 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
-- 子 agent：`~/.manox/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具，架构与 `~/projects/github/deepseek-harness` 的 subagent 服务同构：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
+- 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具，架构与 `~/projects/github/deepseek-harness` 的 subagent 服务同构：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.toml`（stdio 或 HTTP）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
