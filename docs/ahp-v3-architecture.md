@@ -111,7 +111,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 
 **`ClientNote`（27 + 3 compat）**
 
-`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetApprovalMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox-plan/execute`；`Compact`→`x-manox/compact`；`Goal`→`x-manox-work/goalChanged`；`StopBackgroundTask`→`x-manox-work/backgroundTaskStopped`；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→`x-manox/modelChatCancel`；`Shutdown`→`x-manox/shutdown`（连接级）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
+`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetApprovalMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox-plan/execute`；`Compact`→`x-manox/compact`；`Goal`→`x-manox-work/goalChanged`；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→`x-manox/modelChatCancel`；`Shutdown`→`x-manox/shutdown`（连接级）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
 
 **`ServerCall`（6）**
 
@@ -589,16 +589,16 @@ reconnect 快照腿、dispatch 句柄。
   每一项要么落在 AHP action/state、要么落在 `x-manox` 扩展通道、要么是**有意的**结构性缺席
   （`-32601`）。此项在 W4 执行时**未完成**，是 W5 的第一件事。
 
-**W4 收尾审计发现的声明面残余（已定位，未修；不属 W4 的删除范围）**：W4 已把
-`commands::ALL` 从 8 条收到 3 条、`channels::ALL` 从 6 条收到 5 条（见 §H.5⑥⑦），但同一次审计
-发现 `actions::ALL` 仍有 **4 条只声明、无生产者**：
+**W4 收尾审计发现的声明面残余（一项已修，三项待 W5 裁决）**：W4 已把
+`commands::ALL` 从 8 条收到 3 条、`channels::ALL` 从 6 条收到 5 条（见 §H.5⑥⑦），同一次审计
+发现 `actions::ALL` 有 **4 条只声明、无生产者**，其后处置如下：
 
 | 声明 | 状态 |
 |---|---|
 | `x-manox-workspaces/baseline` | 无生产者；客户端只在 `extension_baseline` 拿一次快照 |
 | `x-manox-workspaces/changed` | 无生产者；workspace 增删改不推送给已订阅者 |
 | `x-manox-workspaces/removed` | 同上 |
-| `x-manox-work/backgroundTaskStopped` | 无生产者（客户端可派发，但宿主从不发） |
+| ~~`x-manox-work/backgroundTaskStopped`~~ | **已删除**（声明面 VERSION 5，#853）：无派发臂（每次客户端派发都被拒 "no runtime intent"）、无宿主生产者（停止信号已经由 `backgroundTasksChanged` 的 `status:"Stopped"` 送达），留在声明面只是过度承诺 |
 
 **为什么不顺手修**：workspace 三个动作的正确落点比"加一个 forwarder"深一层——`manox-workspace`
 的 feed（`Baseline`/`Upsert`/`Remove`/`Order`/`Archived`）是现成的，但 `XManoxState` **没有
@@ -609,8 +609,11 @@ reconnect 快照腿、dispatch 句柄。
 从声明面删掉）。**这个决定留到 W5**，与"多客户端并发与 owner 语义"一起做，因为两者都动
 扩展状态模型。
 
-`x-manox-work/backgroundTaskStopped` 相对独立：`manox_agent::background_task` 有 stop 路径，
-补一个 producer 即可，但仍需先确认 AHP 的 `Unknown` 动作能承载它（同上的 fold 归属问题）。
+`x-manox-work/backgroundTaskStopped` 的处置（#853，已完成）：两条诚实路径里取了删除而非补齐
+——把它做成客户端可派发的 stop 需要先裁决可停 id 的会话作用域、与 TaskStop 工具的审批对齐、
+payload/reducer 形态，在零消费者时属于投机实现；且宿主从不发它，停止信号已经由
+`backgroundTasksChanged` 的 `status:"Stopped"` 送达，补 producer 只是冗余信号。若未来要客户端
+派发 stop，按新声明（含 VERSION bump）重新引入。
 
 ### H.2i W4 准入账的第二轮补齐（2026-09-24）
 

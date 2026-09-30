@@ -51,6 +51,13 @@ turn id 方案。结论如下，三条证据相互印证：
 落点图例：**A** = AHP 原生（action / state 字段 / command），**X** = `x-manox` 扩展（计划
 「`x-manox` 扩展面」已定点的那七项之一，或本表新提出的扩展），**🔴** = 丢弃。
 
+> **权威口径**：`x-manox` 声明面的权威枚举是 `manox_ahp::ext::declaration()`
+> （`crates/manox-ahp/src/ext/mod.rs`：`actions::ALL` / `commands::ALL` /
+> `requests::ALL` / `channels::ALL`）。本表引用的 `x-manox*` 名称由守卫测试
+> `crates/manox-ahp/tests/doc_declaration_guard.rs` 对照该声明面校验：凡**不在**
+> wire 上的名称（v2 设计期提案、已删除行），所在行必须带 `not-on-wire` 标记。
+> 扩展 action 的实际通道以 `translate/actions.rs` 的发射臂为准。
+
 ### §2.1 `JournalWireEvent`（40）
 
 | v2 条目 | AHP 落点 | 类别 |
@@ -71,20 +78,20 @@ turn id 方案。结论如下，三条证据相互印证：
 | `CwdChange` | `session/workingDirectorySet` | A |
 | `ProjectChange` | `session/configChanged`（`project` 值）+ `SessionState.project` | A |
 | `Title` | `session/titleChanged` | A |
-| `PinnedArchived` | `session/isArchivedChanged`（原生位）+ `x-manox/pinnedChanged`（AHP 无 pin 位） | A + X |
-| `Leaf` | `createChat{source}` 的 fork 语义；游标本身 → `x-manox/leafChanged` | A + X |
+| `PinnedArchived` | `session/isArchivedChanged`（原生位）+ `x-manox/pinnedChanged`（AHP 无 pin 位；行落在 `x-manox-thread:/<session>`，#842） | A + X |
+| `Leaf` | `createChat{source}` 的 fork 语义；游标本身 → `x-manox/leafChanged`（`x-manox-thread:/<session>`，#842） | A + X |
 | `SubagentChild` | `chat/responsePart{toolCall}` 指向子 `ahp-chat:/`（`ToolResultSubagentContent`） | A |
-| `SubagentProgress` | `x-manox/subagentsChanged` | X |
-| `PlanModeChange` / `PlanModeRequest` / `PlanUpdate` / `PlanReview` | `x-manox/planModeChanged`·`x-manox/planUpdated`·`x-manox/planReviewChanged`（计划定点） | X |
-| `Goal` | `x-manox/goalChanged` | X |
-| `BrowserSuites` | `x-manox/browserSuitesChanged` | X |
-| `BackgroundTask` | `x-manox/backgroundTaskChanged` | X |
-| `ActiveToolsChange` | `x-manox/work activeToolsChanged`（内核诊断态，标准面无位） | X |
-| `Compaction` / `CompactionStarted` | `x-manox/compactionComplete`·`compactionStarted`（**不得**错用 `chat/truncated`：那是客户端请求截断） | X |
+| `SubagentProgress` | `x-manox-work/subagentsChanged` | X |
+| `PlanModeChange` / `PlanModeRequest` / `PlanUpdate` / `PlanReview` | `x-manox-plan/planModeChanged`·`x-manox-plan/planChanged`·`x-manox-plan/verdictRequested`·`x-manox-plan/reviewSettled`（实施落定：评审生命周期拆为 verdictRequested/reviewSettled 两动作，#846） | X |
+| `Goal` | `x-manox-work/goalChanged` | X |
+| `BrowserSuites` | `x-manox-work/browserSuitesChanged` | X |
+| `BackgroundTask` | `x-manox-work/backgroundTasksChanged`（行落在 `x-manox-work:/<thread-id>`） | X |
+| `ActiveToolsChange` | `x-manox-work/activeToolsChanged`（内核诊断态，标准面无位） | X |
+| `Compaction` / `CompactionStarted` | 扩展 action 从未上 wire（`x-manox/compactionComplete`·`compactionStarted` 是设计期提案，`not-on-wire`）：compaction 以 chat 原生面承载（activity 部件 + summary 行）；**不得**错用 `chat/truncated`——那是客户端请求截断 | X→A |
 | `BranchSummary` | `chat/responsePart{systemNotification}` | A |
-| `Label` | `x-manox/labelChanged` | X |
-| `SessionInfo` | `x-manox/sessionInfoChanged` | X |
-| `Metrics` | `x-manox-metrics` channel 的聚合值（`x-manox/metricsChanged`） | X |
+| `Label` | `x-manox/labelChanged`（行落在 `x-manox-thread:/<session>`，#842） | X |
+| `SessionInfo` | `x-manox/sessionInfoChanged`（行落在 `x-manox-thread:/<session>`，#842） | X |
+| `Metrics` | `x-manox-metrics` channel 的聚合值（`x-manox-metrics/changed`） | X |
 
 ### §2.2 `HostEvent`（11）
 
@@ -92,7 +99,7 @@ turn id 方案。结论如下，三条证据相互印证：
 |---|---|---|
 | `Ready{epoch}` | `initialize` 结果（`protocolVersion` + `serverSeq`） | A |
 | `Models(Vec<ModelInfo>)` | `root/agentsChanged`（`RootState.agents`） | A |
-| `Commands(Value)` | `x-manox-commands://` channel + `x-manox/commandsChanged` | X |
+| `Commands(Value)` | `x-manox-commands://` channel（订阅快照即目录；不存在 `x-manox/commandsChanged` action，`not-on-wire`） | X |
 | `ThreadsUpdated(Vec<ThreadListItem>)` | `listSessions` + `root/sessionSummaryChanged`（列表**不是** root state） | A |
 | `SessionStatus{session_id, running, …}` | `SessionState.status` 位集（由 session/chat action 派生，无独立事件） | A |
 | `SessionCreated` / `SessionDisposed` | `root/sessionAdded`·`root/sessionRemoved` + `session/chatAdded` / `disposeSession` | A |
@@ -118,7 +125,8 @@ turn id 方案。结论如下，三条证据相互印证：
 `subscribe ahp-terminal:/`；`RegisterSessionTools`→`SessionInputRequestKind::ToolClientExecution`（原生）；
 `CreateSession`→`createSession`；`Submit`→`dispatchAction{chat/turnStarted}`；`Steer`→
 `chat/pendingMessageSet{kind:"steering"}`；`PageHistory`→`fetchTurns`；`Workspace{call}`→`x-manox-workspaces://`；
-`GetConversationInfo`→`x-manox-metrics`；`CancelDelivery`→`x-manox/cancelDelivery`（server→client 请求的撤回）；
+`GetConversationInfo`→`x-manox-metrics`；`CancelDelivery`→无落点（`x-manox/cancelDelivery` 是设计期提案，`not-on-wire`；撤回经
+`session/inputNeededRemoved` 表达）；
 `ForkSession`→`createChat{source:{kind:"fork"|"sideChat"}}`。
 
 🔴 `ClientCall::ModelChat` + `ClientNote::CancelModelChat` + `ServerNote::{ModelText, ModelThinking, ModelToolCall, ModelChatDone}`：
@@ -127,13 +135,15 @@ turn id 方案。结论如下，三条证据相互印证：
 `ClientNote`(27)：`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeSession`；
 `DropQueued`→`chat/pendingMessageRemoved{kind:"queued"}`；`CancelTurn`→`chat/turnCancelled`；
 `SetModel`/`SetReasoningEffort`/`SetApprovalMode`→`session/configChanged`；`SetCwd`→`session/workingDirectory*`；
-`SetPlanMode`/`PlanSeedExecution`→`x-manox/planModeChanged`·`x-manox/planExecute`；`SetBrowserSuite`→
-`x-manox/browserSuitesChanged`；`Compact`→`x-manox/compactionStarted`；`Goal`→`x-manox/goalChanged`；
-`StopBackgroundTask`→`x-manox/backgroundTaskChanged`；`ArchiveThread`→`session/isArchivedChanged`；
+`SetPlanMode`→`x-manox-plan/planModeChanged`（客户端可派发的 action）；`PlanSeedExecution`→`x-manox/planExecute`（命令）；
+`SetBrowserSuite`→`session/configChanged`（状态行由 `x-manox-work/browserSuitesChanged` 承载）；
+`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；
+`StopBackgroundTask`→无落点（曾声明的 `x-manox-work/backgroundTaskStopped` 从未接派发臂、宿主从不发，已随声明面 v5 删除；`not-on-wire`）；
+`ArchiveThread`→`session/isArchivedChanged`；
 `PinThread`→`x-manox/pinnedChanged`；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；
 `TerminalInput`/`TerminalResize`→`terminal/input`·`terminal/resized`；`AppendUserMessage`→
 `chat/pendingMessageSet{kind:"queued"}`；`AppendUiNote`→`chat/responsePart{systemNotification}`；
-`Shutdown`→`x-manox/shutdown`（连接级）。
+`Shutdown`→无落点（`x-manox/shutdown` 是设计期提案，`not-on-wire`；连接关闭即断开）。
 
 🔴 compat 三件 `ClientNote::{CreateSession, Submit, Steer}`：v2 遗留双发腿，随 v2 一并消失。
 
@@ -143,8 +153,8 @@ turn id 方案。结论如下，三条证据相互印证：
 `SessionInputRequestKind::ToolClientExecution` + `x-manox/invokeTool` 兜底。
 
 `ServerNote`(12)：`Ready`→握手；`SessionCreated`/`SessionDisposed`/`Error`→ 见 §2.2；
-`ThreadsUpdated`/`Models`/`Commands`→ 见 §2.2；`DeliveryCancelled`→ 裁决撤回经 `x-manox/cancelDelivery`
-与 `session/inputNeededRemoved` 表达。
+`ThreadsUpdated`/`Models`/`Commands`→ 见 §2.2；`DeliveryCancelled`→ 裁决撤回经
+`session/inputNeededRemoved` 表达（`x-manox/cancelDelivery` 从未落地，`not-on-wire`）。
 
 ### §2.5 `ThreadEvent`（37，直播面）
 
