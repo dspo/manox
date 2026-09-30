@@ -82,11 +82,13 @@ where
             }
             if kind != "error" {
                 loss_signaled = true;
-                let _ = live_notice.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                    anyhow::anyhow!(
+                send_notice(
+                    &live_notice,
+                    BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                         "journal append permanently failed for `{kind}`: {err:#}; cancelling the turn"
-                    ),
-                ))));
+                    )))),
+                    "journal-loss turn cancellation",
+                );
                 live_abort_flag.store(true, Ordering::SeqCst);
                 live_handle.abort();
             }
@@ -113,7 +115,7 @@ where
         tokio::select! {
             _ = live_ticker.tick() => {
                 if sync_live_history(&live, state) {
-                    let _ = notice_tx.send(BackendNotice::LiveHistory);
+                    send_notice(notice_tx, BackendNotice::LiveHistory, "live history refresh");
                 }
                 let cursor = appender_for_watchdog.storage().journal_cursor().await;
                 if watchdog_cursor != Some(cursor) {

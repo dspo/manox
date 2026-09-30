@@ -316,6 +316,21 @@ pub struct ReadyInfo {
     pub project: Option<std::path::PathBuf>,
 }
 
+/// Send a backend notice, logging at debug when the receiver is already
+/// gone. Losing a notice at session teardown is normal timing, never an
+/// error — but it must stay diagnosable (the "why didn't the card update"
+/// class), so every notice send goes through here instead of a bare
+/// `let _ = tx.send(..)`.
+pub(crate) fn send_notice(
+    tx: &tokio::sync::mpsc::UnboundedSender<BackendNotice>,
+    notice: BackendNotice,
+    what: &str,
+) {
+    if tx.send(notice).is_err() {
+        tracing::debug!(what, "notice channel closed; notice dropped");
+    }
+}
+
 /// Notices the backend sends back to the facade's gpui drainer.
 pub enum BackendNotice {
     /// A run event already adapted into a `ThreadEvent`.

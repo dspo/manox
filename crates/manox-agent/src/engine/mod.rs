@@ -33,7 +33,7 @@ use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::questions::PiAskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
-use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
+use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine, send_notice};
 
 // The engine is split by concern: journal plumbing, tool assembly,
 // session lifecycle, and the run/settle loop. Each child starts from

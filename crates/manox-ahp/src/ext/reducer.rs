@@ -93,6 +93,26 @@ pub enum Outcome {
     Unrecognised,
 }
 
+/// Keyed-upsert one row into a registry view; reports whether the view
+/// changed. The shared body of the keyed arms — a new registry field reuses
+/// this rather than copying the three-branch match a third time.
+fn upsert_row(registry: &mut Option<BTreeMap<String, Value>>, key: &str, row: &Value) -> bool {
+    match registry
+        .get_or_insert_with(BTreeMap::new)
+        .entry(key.to_string())
+    {
+        Entry::Occupied(slot) if slot.get() == row => false,
+        Entry::Occupied(mut slot) => {
+            slot.insert(row.clone());
+            true
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(row.clone());
+            true
+        }
+    }
+}
+
 /// Fold one extension action into `state`.
 pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     let Some(tag) = action.get("type").and_then(Value::as_str) else {
@@ -145,18 +165,7 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
             if let Some(snapshot) = action.get("snapshot")
                 && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
             {
-                let registry = state.background_tasks.get_or_insert_with(BTreeMap::new);
-                match registry.entry(task_id.to_string()) {
-                    Entry::Occupied(slot) if slot.get() == snapshot => {}
-                    Entry::Occupied(mut slot) => {
-                        slot.insert(snapshot.clone());
-                        registry_changed = true;
-                    }
-                    Entry::Vacant(slot) => {
-                        slot.insert(snapshot.clone());
-                        registry_changed = true;
-                    }
-                }
+                registry_changed = upsert_row(&mut state.background_tasks, task_id, snapshot);
             }
         }
         super::actions::WORK_SUBAGENTS => {
@@ -167,18 +176,7 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 let mut row = action.clone();
                 if let Some(fields) = row.as_object_mut() {
                     fields.remove("type");
-                    let registry = state.subagents.get_or_insert_with(BTreeMap::new);
-                    match registry.entry(agent_id.to_string()) {
-                        Entry::Occupied(slot) if slot.get() == &row => {}
-                        Entry::Occupied(mut slot) => {
-                            slot.insert(row);
-                            registry_changed = true;
-                        }
-                        Entry::Vacant(slot) => {
-                            slot.insert(row);
-                            registry_changed = true;
-                        }
-                    }
+                    registry_changed = upsert_row(&mut state.subagents, agent_id, &row);
                 }
             }
         }
@@ -416,17 +414,22 @@ mod tests {
             timestamp: "2026-09-30T00:00:00.000Z".into(),
             event,
         };
-        // Host-emitted: journal row → the tag it must produce.
-        let host_cases: Vec<(JournalWireEvent, &str)> = vec![
+        // Host-emitted: journal row → the tag it must produce and the exact
+        // channel it must ride (an action on the WRONG extension channel
+        // still folds — into the wrong bag — so `is_extension_channel` alone
+        // cannot catch it).
+        let host_cases: Vec<(JournalWireEvent, &str, &str)> = vec![
             (
                 JournalWireEvent::PlanModeChange { enabled: true },
                 super::super::actions::PLAN_MODE_CHANGED,
+                "x-manox-plan:/c-1",
             ),
             (
                 JournalWireEvent::PlanUpdate {
                     snapshot: json!({}),
                 },
                 super::super::actions::PLAN_CHANGED,
+                "x-manox-plan:/c-1",
             ),
             (
                 JournalWireEvent::PlanReview {
@@ -436,24 +439,28 @@ mod tests {
                     content: None,
                 },
                 super::super::actions::PLAN_VERDICT_REQUESTED,
+                "x-manox-plan:/c-1",
             ),
             (
                 JournalWireEvent::Goal {
                     goal: Some(json!({"text": "ship"})),
                 },
                 super::super::actions::WORK_GOAL_CHANGED,
+                "x-manox-work:/s-1",
             ),
             (
                 JournalWireEvent::BrowserSuites {
                     suites: vec!["chrome".into()],
                 },
                 super::super::actions::WORK_BROWSER_SUITES,
+                "x-manox-work:/s-1",
             ),
             (
                 JournalWireEvent::BackgroundTask {
                     snapshot: json!({"task_id": "mon_7"}),
                 },
                 super::super::actions::WORK_BACKGROUND_TASKS,
+                "x-manox-work:/s-1",
             ),
             (
                 JournalWireEvent::SubagentProgress {
@@ -464,12 +471,14 @@ mod tests {
                     status: "running".into(),
                 },
                 super::super::actions::WORK_SUBAGENTS,
+                "x-manox-work:/s-1",
             ),
             (
                 JournalWireEvent::ActiveToolsChange {
                     tools: vec!["bash".into()],
                 },
                 super::super::actions::WORK_ACTIVE_TOOLS,
+                "x-manox-work:/s-1",
             ),
             (
                 JournalWireEvent::Metrics {
@@ -477,6 +486,7 @@ mod tests {
                     data: json!({}),
                 },
                 super::super::actions::METRICS_CHANGED,
+                "x-manox-metrics:/c-1",
             ),
             (
                 JournalWireEvent::PinnedArchived {
@@ -484,22 +494,26 @@ mod tests {
                     archived: false,
                 },
                 super::super::actions::PINNED_CHANGED,
+                "x-manox-thread:/s-1",
             ),
             (
                 JournalWireEvent::Label { label: "x".into() },
                 super::super::actions::LABEL_CHANGED,
+                "x-manox-thread:/s-1",
             ),
             (
                 JournalWireEvent::SessionInfo {
                     data: json!({"name": "agent"}),
                 },
                 super::super::actions::SESSION_INFO_CHANGED,
+                "x-manox-thread:/s-1",
             ),
             (
                 JournalWireEvent::Leaf {
                     target_id: "e-9".into(),
                 },
                 super::super::actions::LEAF_CHANGED,
+                "x-manox-thread:/s-1",
             ),
         ];
         // Client-dispatched: the action as the client sends it (no journal
@@ -515,7 +529,7 @@ mod tests {
 
         let mut state = XManoxState::default();
         let mut plan_review_action = None;
-        for (event, tag) in &host_cases {
+        for (event, tag, expected_channel) in &host_cases {
             assert!(
                 super::super::actions::ALL.contains(tag),
                 "{tag} must stay declared"
@@ -531,6 +545,11 @@ mod tests {
                 crate::ext::is_extension_channel(&hit.channel),
                 "{tag} must ride an extension channel; it was emitted on {} where no fold runs",
                 hit.channel
+            );
+            assert_eq!(
+                hit.channel, *expected_channel,
+                "{tag} was emitted on the wrong extension channel; its fold would land in \
+                 another channel's bag and the expected channel's baseline would stay empty"
             );
             assert_eq!(
                 apply(&mut state, &action),

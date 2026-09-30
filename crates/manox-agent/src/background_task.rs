@@ -403,10 +403,7 @@ impl BackgroundTask {
         let send_result = {
             let s = self.state.lock().expect("task state poisoned");
             // Building the snapshot walks the whole event ring; skip it when
-            // no notifier is registered to receive the result. The build and
-            // send still share one lock hold: a read-then-send window would
-            // let a sampled `Running` snapshot land after a terminal one and
-            // flip the card backwards.
+            // no notifier is registered to receive the result.
             let Some(tx) = s.notifier.as_ref() else {
                 return;
             };

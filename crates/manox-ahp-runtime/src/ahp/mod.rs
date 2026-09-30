@@ -62,6 +62,7 @@ use ahp_types::state::{
 use manox_ahp::channels::{chat, session};
 use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
+use serde_json::Value;
 
 pub(crate) mod changeset;
 #[cfg(feature = "mcp")]
@@ -301,6 +302,51 @@ fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
         }
     }
     members.into_iter().collect()
+}
+
+/// The fresh, thread-scoped fold of one session-scoped `x-manox*` extension
+/// channel: every member journal of the owning thread, replayed for exactly
+/// the requested channel.
+///
+/// Two properties the seed cache cannot give a reconnecting client: thread
+/// scoping — after a thread continues into a new session, the active
+/// session's journal carries rows the URI's own journal lacks — and
+/// freshness — the seed is built once per process, while the baseline
+/// envelope carries the current watermark, so a stale fold would be accepted
+/// as current truth. Live emissions key extension channels by thread id (the
+/// bridge and [`fold_journal`] both pass the thread id as the translator's
+/// session parameter), so rows are replayed only when their channel matches
+/// the request verbatim.
+pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) -> Value {
+    let thread_id = thread_of_session(session_id)
+        .await
+        .unwrap_or_else(|| session_id.to_string());
+    let registry = manox_agent::thread_registry::load().await;
+    let active = registry
+        .get(&thread_id)
+        .map(|entry| entry.active_session.clone())
+        .unwrap_or_else(|| session_id.to_string());
+    let mut members = thread_sessions(&thread_id, &active);
+    // The active session folds last: scalar rows are last-writer-wins, and
+    // the active session's journal is the thread's current truth.
+    members.retain(|id| id != &active);
+    members.push(active);
+    let mut state = manox_ahp::ext::XManoxState::default();
+    for id in members {
+        let Some(fold) = fold_journal(&id, &thread_id).await else {
+            continue;
+        };
+        for (row_channel, action) in &fold.extension_actions {
+            if row_channel != channel {
+                continue;
+            }
+            let Ok(value) = serde_json::to_value(action) else {
+                continue;
+            };
+            let _ = manox_ahp::ext::reducer::apply(&mut state, &value);
+        }
+    }
+    serde_json::to_value(&state).unwrap_or(Value::Null)
 }
 
 /// The `<id>.jsonl` stem of a sessions-dir entry (non-journals yield `None`).

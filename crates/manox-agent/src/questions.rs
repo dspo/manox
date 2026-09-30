@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::permission::{AskAnswer, PendingAuthMeta};
 use crate::thread::{ThreadEvent, ToolCallStatus};
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 /// How one parked question settled. The question seam's own vocabulary — the
 /// approval path's `ToolAuthorizationResponse` never carries an ask again.
@@ -141,7 +141,11 @@ impl UserQuestionGate {
     }
 
     fn emit(&self, event: ThreadEvent) {
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(event)));
+        send_notice(
+            &self.notice_tx,
+            BackendNotice::Event(Box::new(event)),
+            "question-flow notice",
+        );
     }
 
     /// Park one question: stores the responder, returns the receiver the tool
