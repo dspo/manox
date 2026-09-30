@@ -36,7 +36,8 @@ pub enum Command {
     Reconnect,
     /// Observe a channel.
     Subscribe,
-    /// Release a channel (a notification, not a request).
+    /// Release a channel (a client notification upstream; the request form is
+    /// served too, with the same semantics).
     Unsubscribe,
     /// Dispatch a state mutation (a notification, not a request).
     DispatchAction,
