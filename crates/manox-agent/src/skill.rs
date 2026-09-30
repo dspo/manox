@@ -205,9 +205,17 @@ fn load_skill_file(path: &Path) -> Result<SkillDefinition> {
 /// nature, so they are read fresh at use instead of living in the
 /// process-global registry — a slash invocation from a thread whose cwd sits
 /// in a repo with its own `.claude` picks that repo's skill up with no
-/// restart. The directory name wins when frontmatter omits `name`.
+/// restart. The *directory name is the identity*: it names the skill for
+/// lookup and advertisement alike, so a frontmatter `name` that differs from
+/// the directory can never advertise an unresolvable key (and the global
+/// loader's frontmatter-name keying stays contained to its own layer).
 pub fn resolve_project(cwd: &Path, name: &str) -> Option<SkillDefinition> {
-    if name.is_empty() || name.contains(':') || name.contains("..") {
+    if name.is_empty()
+        || name.contains(':')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
         return None;
     }
     let skill_file = cwd
@@ -216,16 +224,16 @@ pub fn resolve_project(cwd: &Path, name: &str) -> Option<SkillDefinition> {
         .join(name)
         .join("SKILL.md");
     let mut skill = load_skill_file(&skill_file).ok()?;
-    if skill.name.is_empty() {
-        skill.name = name.to_string();
-    }
+    skill.name = name.to_string();
     Some(skill)
 }
 
 /// Global summaries plus the project layer: `<cwd>/.claude/skills/`
 /// entries shadow a global skill of the same bare name and honor
-/// `disable-model-invocation`. Built per session (the build knows the cwd),
-/// unlike the process-global [`summaries`].
+/// `disable-model-invocation`. Advertised under the directory name — the same
+/// key `resolve_project` looks up — so advertise and resolve can never drift
+/// apart. Built per session (the build knows the cwd), unlike the
+/// process-global [`summaries`].
 pub fn summaries_for_cwd(cwd: &Path) -> Vec<crate::prompt::SkillSummaryPromptData> {
     let mut out: Vec<crate::prompt::SkillSummaryPromptData> = summaries_or_empty();
     let dir = cwd.join(".claude").join("skills");
@@ -238,7 +246,7 @@ pub fn summaries_for_cwd(cwd: &Path) -> Vec<crate::prompt::SkillSummaryPromptDat
             let name = entry.file_name().into_string().ok()?;
             let skill = resolve_project(cwd, &name)?;
             (!skill.disable_model_invocation).then_some(crate::prompt::SkillSummaryPromptData {
-                name: skill.name,
+                name,
                 description: skill.description,
             })
         })
@@ -457,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_project_reads_cwd_scoped_skill_with_dir_name_fallback() {
+    fn resolve_project_keys_on_the_directory_name() {
         let proj = tempfile::tempdir().unwrap();
         let dir = proj.path().join(".claude").join("skills").join("tutor");
         std::fs::create_dir_all(&dir).unwrap();
@@ -466,8 +474,23 @@ mod tests {
         let skill = resolve_project(proj.path(), "tutor").unwrap();
         assert_eq!(skill.name, "tutor");
 
+        // Frontmatter `name` differing from the directory must not drift the
+        // advertise key away from the lookup key: the directory wins.
+        let dir2 = proj.path().join(".claude").join("skills").join("guide");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(
+            dir2.join("SKILL.md"),
+            "---\nname: exam\ndescription: d\n---\nbody",
+        )
+        .unwrap();
+        assert_eq!(resolve_project(proj.path(), "guide").unwrap().name, "guide");
+
+        // Path-y names never resolve: `Path::join` with an absolute segment
+        // would replace the base and escape `.claude/` entirely.
         assert!(resolve_project(proj.path(), "absent").is_none());
         assert!(resolve_project(proj.path(), "gitwork:review").is_none());
+        assert!(resolve_project(proj.path(), "/etc/foo").is_none());
+        assert!(resolve_project(proj.path(), "a/b").is_none());
     }
 
     #[test]
@@ -516,12 +539,31 @@ mod tests {
         )
         .unwrap();
 
+        // A frontmatter name differing from the directory is advertised under
+        // the directory — the key lookups (and shadowing) actually use.
+        let aliased = proj.path().join(".claude").join("skills").join("tutor");
+        std::fs::create_dir_all(&aliased).unwrap();
+        std::fs::write(
+            aliased.join("SKILL.md"),
+            "---\nname: frontmatter-name\ndescription: aliased\n---\nbody",
+        )
+        .unwrap();
+
         let merged = summaries_for_cwd(proj.path());
         let exam = merged
             .iter()
             .find(|s| s.name == "exam")
             .expect("exam present");
         assert_eq!(exam.description, "project-local exam");
+        let tutor = merged
+            .iter()
+            .find(|s| s.name == "tutor")
+            .expect("tutor present");
+        assert_eq!(tutor.description, "aliased");
+        assert!(
+            !merged.iter().any(|s| s.name == "frontmatter-name"),
+            "advertising the frontmatter name would advertise an unresolvable key"
+        );
         assert!(
             !merged.iter().any(|s| s.name == "secret"),
             "disable-model-invocation project skills must not be advertised"

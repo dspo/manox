@@ -176,11 +176,19 @@ fn load_command_file(path: &Path, fallback_name: String) -> Result<CommandDefini
 /// `<cwd>/.claude/commands/<name>.md` — Claude Code's project-scope command
 /// convention. Project commands are cwd-scoped by nature, so they are read
 /// fresh at dispatch when the process-global registry misses, instead of
-/// being loaded at startup. `plugin:`-qualified and path-y names never
-/// resolve here; the global registry (builtin < user) keeps precedence for
+/// being loaded at startup. The name guard is the trust boundary between a
+/// user/model-supplied name and the filesystem: `Path::join` with an
+/// absolute component would *replace* the base entirely, so any name that is
+/// not a single bare path component (`/`, `\`, `..`, `plugin:`-qualified) is
+/// refused, and the global registry (builtin < user) keeps precedence for
 /// names it already knows.
 pub fn resolve_project(cwd: &Path, name: &str) -> Option<CommandDefinition> {
-    if name.is_empty() || name.contains(':') || name.contains("..") {
+    if name.is_empty()
+        || name.contains(':')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+    {
         return None;
     }
     let path = cwd
@@ -401,8 +409,11 @@ mod builtin_tests {
         assert_eq!(cmd.description, "Tutor");
         assert!(cmd.render("rust").contains("Tour rust"));
 
-        // Missing file and namespaced names never resolve project-side.
+        // Missing file and path-y names never resolve project-side — an
+        // absolute segment would make `Path::join` escape `.claude/`.
         assert!(resolve_project(proj.path(), "absent").is_none());
         assert!(resolve_project(proj.path(), "gitwork:deliver").is_none());
+        assert!(resolve_project(proj.path(), "/etc/foo").is_none());
+        assert!(resolve_project(proj.path(), "a/b").is_none());
     }
 }
