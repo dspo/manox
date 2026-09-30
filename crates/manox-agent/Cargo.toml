@@ -6,7 +6,7 @@ publish.workspace = true
 
 [features]
 default = ["mcp"]
-# MCP client (~/.manox/mcp.toml + plugin .mcp.json servers). The gpui app and
+# MCP client (~/.manox/mcp.json + project/plugin .mcp.json servers). The gpui app and
 # the cx CLI keep it; lean embedders may opt out — sessions then run without
 # MCP tools (the registry simply never initializes).
 mcp = ["dep:rmcp"]
