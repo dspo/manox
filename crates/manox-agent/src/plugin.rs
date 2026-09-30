@@ -84,45 +84,74 @@ impl MarketplacePluginSource {
                     None => format!("git-subdir:{url}"),
                 },
             },
+            MarketplacePluginSource::Unsupported { kind } => format!("unsupported:{kind}"),
         }
+    }
+
+    /// Whether `install` can act on this source at all — `Unsupported`
+    /// entries stay visible in marketplace listings but refuse to install.
+    pub fn installable(&self) -> bool {
+        !matches!(self, MarketplacePluginSource::Unsupported { .. })
     }
 }
 
-/// The `source` field of a marketplace entry. Claude Code accepts three
-/// shapes: an in-repo relative path string, a `{source: "github", repo}`
-/// pointer, and a `{source: "git-subdir", url, path, ref}` pointer. The
-/// official `claude-plugins-official` index is mostly object-shaped, so a
-/// string-only reading would reject it wholesale.
+/// The `source` field of a marketplace entry. The official
+/// `claude-plugins-official` index in the wild (2026-09) carries four object
+/// kinds — `github` (2/203), `git-subdir` (47), `url` (104), all of them
+/// usually sha-pinned — plus 50 plain in-repo relative-path strings. `url`
+/// is a whole-repo clone pinned by sha, i.e. a path-less `git-subdir`, and
+/// deserializes into the same variant.
+///
+/// An unknown kind must not fail the enclosing entry, let alone the whole
+/// index: one unrecognized source used to make the entire marketplace
+/// vanish from the UI. Unknown kinds parse into
+/// [`MarketplacePluginSource::Unsupported`] — listed, never installed.
 #[derive(Debug, Clone)]
 pub enum MarketplacePluginSource {
     /// Directory relative to the marketplace repo root (`./plugins/gitwork`).
     Relative(String),
     Remote(RemoteSource),
+    /// A source kind this build does not understand, kept visible instead of
+    /// poisoning the index parse.
+    Unsupported {
+        kind: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum RemoteSource {
-    /// `{source: "github", repo: "owner/repo", ref?}` — resolved as a shallow
-    /// clone of `https://github.com/<repo>.git`.
-    GitHub { repo: String, r#ref: Option<String> },
-    /// `{source: "git-subdir", url, path?, ref?}` — a subdirectory of an
-    /// arbitrary git repo.
+    /// `{source: "github", repo: "owner/repo", ref?, sha?}` — resolved as a
+    /// shallow clone of `https://github.com/<repo>.git`.
+    GitHub {
+        repo: String,
+        r#ref: Option<String>,
+        sha: Option<String>,
+    },
+    /// `{source: "git-subdir", url, path?, ref?, sha?}` — a subdirectory of
+    /// an arbitrary git repo. `{source: "url", url, sha?}` deserializes here
+    /// with `path: None`: a whole-repo clone pinned by sha.
     GitSubdir {
         url: String,
         path: Option<String>,
         r#ref: Option<String>,
+        sha: Option<String>,
     },
 }
 
 /// Hand-rolled (not `#[serde(untagged)]`) so a mis-shaped `source` reports
-/// which of the three shapes was expected instead of a generic untagged
-/// "data did not match any variant".
+/// which shape was expected; unknown kinds degrade to
+/// [`MarketplacePluginSource::Unsupported`] rather than erroring.
 impl<'de> Deserialize<'de> for MarketplacePluginSource {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
         let raw = Value::deserialize(deserializer)?;
+        let unsupported = |kind: &str| {
+            Ok(MarketplacePluginSource::Unsupported {
+                kind: kind.to_string(),
+            })
+        };
         match raw {
             Value::String(path) => Ok(MarketplacePluginSource::Relative(path)),
             Value::Object(map) => {
@@ -130,37 +159,41 @@ impl<'de> Deserialize<'de> for MarketplacePluginSource {
                 match kind {
                     Some("github") => {
                         let Some(repo) = map.get("repo").and_then(Value::as_str) else {
-                            return Err(serde::de::Error::custom(
-                                "github source requires a `repo` field",
-                            ));
+                            return unsupported("github-without-repo");
                         };
                         Ok(MarketplacePluginSource::Remote(RemoteSource::GitHub {
                             repo: repo.to_string(),
                             r#ref: map.get("ref").and_then(Value::as_str).map(str::to_string),
+                            sha: map.get("sha").and_then(Value::as_str).map(str::to_string),
                         }))
                     }
                     Some("git-subdir") => {
                         let Some(url) = map.get("url").and_then(Value::as_str) else {
-                            return Err(serde::de::Error::custom(
-                                "git-subdir source requires a `url` field",
-                            ));
+                            return unsupported("git-subdir-without-url");
                         };
                         Ok(MarketplacePluginSource::Remote(RemoteSource::GitSubdir {
                             url: url.to_string(),
                             path: map.get("path").and_then(Value::as_str).map(str::to_string),
                             r#ref: map.get("ref").and_then(Value::as_str).map(str::to_string),
+                            sha: map.get("sha").and_then(Value::as_str).map(str::to_string),
                         }))
                     }
-                    other => Err(serde::de::Error::custom(format!(
-                        "unsupported marketplace source kind {other:?} (expected a relative \
-                         path string, \"github\" or \"git-subdir\")"
-                    ))),
+                    Some("url") => {
+                        let Some(url) = map.get("url").and_then(Value::as_str) else {
+                            return unsupported("url-without-url");
+                        };
+                        Ok(MarketplacePluginSource::Remote(RemoteSource::GitSubdir {
+                            url: url.to_string(),
+                            path: None,
+                            r#ref: map.get("ref").and_then(Value::as_str).map(str::to_string),
+                            sha: map.get("sha").and_then(Value::as_str).map(str::to_string),
+                        }))
+                    }
+                    Some(kind) => unsupported(kind),
+                    None => unsupported("malformed"),
                 }
             }
-            Value::Null => Err(serde::de::Error::missing_field("source")),
-            _ => Err(serde::de::Error::custom(
-                "marketplace source must be a path string or an object",
-            )),
+            _ => unsupported("malformed"),
         }
     }
 }
@@ -448,15 +481,23 @@ impl PluginManager {
     /// entries. A disabled plugin is removed the same way as an enabled one.
     pub fn uninstall(plugin_name: &str) -> Result<()> {
         for key in Self::keys_for(plugin_name)? {
-            for entry in InstalledPlugins::load()?.entries(&key) {
+            let mut doc = InstalledPlugins::load()?;
+            // Only the user-scope trees are manox's to delete: sibling
+            // project/local entries are Claude Code's per-repo installs, and
+            // removing them would destroy exactly what `record_install`
+            // preserves on the write side.
+            for entry in doc.entries(&key).into_iter().filter(|e| e.scope == "user") {
                 if entry.root.exists() {
                     std::fs::remove_dir_all(&entry.root).with_context(|| {
                         format!("removing installed tree {}", entry.root.display())
                     })?;
                 }
             }
-            InstalledPlugins::remove(&key)?;
-            SettingsPatch::remove_enabled(&key)?;
+            // The toggle goes with the key: a surviving sibling scope still
+            // needs its `enabledPlugins` entry intact for Claude Code.
+            if doc.remove_user_scope(&key)? {
+                SettingsPatch::remove_enabled(&key)?;
+            }
         }
         Ok(())
     }
@@ -630,12 +671,17 @@ struct InstallEntry {
     scope: String,
     #[serde(rename = "installPath")]
     root: PathBuf,
+    #[serde(default)]
     version: String,
-    #[serde(rename = "installedAt")]
+    #[serde(default, rename = "installedAt")]
     installed_at: String,
-    #[serde(rename = "lastUpdated")]
+    #[serde(default, rename = "lastUpdated")]
     last_updated: String,
-    #[serde(rename = "gitCommitSha")]
+    /// Optional in the wild: current Claude Code omits it when the
+    /// marketplace entry carries no sha (observed on huggingface-skills).
+    /// Requiring it made the installed plugin silently invisible — the
+    /// entry failed to parse and was skipped as malformed.
+    #[serde(default, rename = "gitCommitSha")]
     commit_sha: String,
 }
 
@@ -784,17 +830,38 @@ impl InstalledPlugins {
         write_json_atomic(&paths::installed_plugins_file()?, &doc.doc)
     }
 
-    fn remove(key: &str) -> Result<()> {
+    /// Drop the user-scope entries under `key`, keeping sibling scopes
+    /// verbatim; returns true when the key is now entry-less and was removed
+    /// from the registry altogether. A key with surviving siblings stays
+    /// registered — it is still Claude Code's bookkeeping for those scopes.
+    fn remove_user_scope(&mut self, key: &str) -> Result<bool> {
         let mut doc = Self::load_for_write()?;
-        let removed = doc
+        let Some(list) = doc
             .doc
             .get_mut("plugins")
-            .and_then(Value::as_object_mut)
-            .is_some_and(|plugins| plugins.remove(key).is_some());
-        if removed {
-            write_json_atomic(&paths::installed_plugins_file()?, &doc.doc)?;
+            .and_then(|p| p.get_mut(key))
+            .and_then(Value::as_array_mut)
+            .map(|list| {
+                list.retain(|raw| raw.get("scope").and_then(Value::as_str) != Some("user"));
+                list.clone()
+            })
+        else {
+            return Ok(false);
+        };
+        if list.is_empty() {
+            let removed = doc
+                .doc
+                .get_mut("plugins")
+                .and_then(Value::as_object_mut)
+                .is_some_and(|plugins| plugins.remove(key).is_some());
+            if removed {
+                write_json_atomic(&paths::installed_plugins_file()?, &doc.doc)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
-        Ok(())
+        write_json_atomic(&paths::installed_plugins_file()?, &doc.doc)?;
+        Ok(false)
     }
 }
 
@@ -1154,32 +1221,41 @@ fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()
         bail!("git clone failed: {url} (exit {:?})", status.code());
     }
     if let Some(sha) = sha_ref {
-        let fetched = Command::new("git")
+        git_checkout_sha(dest, url, sha)?;
+    }
+    Ok(())
+}
+
+/// Check out one commit SHA in an existing clone: fetch it shallowly, then
+/// check out FETCH_HEAD. Servers that refuse shallow SHA fetches get a full
+/// fetch fallback. The marketplace pin is authoritative — after this, HEAD
+/// is the pinned commit, not the remote's current default branch.
+fn git_checkout_sha(dir: &Path, url: &str, sha: &str) -> Result<()> {
+    let fetched = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch", "--depth", "1", "origin", sha])
+        .status()
+        .with_context(|| format!("git fetch {sha} in {url}"))?;
+    if !fetched.success() {
+        let full = Command::new("git")
             .arg("-C")
-            .arg(dest)
-            .args(["fetch", "--depth", "1", "origin", sha])
+            .arg(dir)
+            .args(["fetch", "origin"])
             .status()
-            .with_context(|| format!("git fetch {sha} in {url}"))?;
-        if !fetched.success() {
-            let full = Command::new("git")
-                .arg("-C")
-                .arg(dest)
-                .args(["fetch", "origin"])
-                .status()
-                .with_context(|| format!("git fetch in {url}"))?;
-            if !full.success() {
-                bail!("git fetch failed for {url}");
-            }
+            .with_context(|| format!("git fetch in {url}"))?;
+        if !full.success() {
+            bail!("git fetch failed for {url}");
         }
-        let checkout = Command::new("git")
-            .arg("-C")
-            .arg(dest)
-            .args(["checkout", "--quiet", "FETCH_HEAD"])
-            .status()
-            .with_context(|| format!("git checkout {sha} in {url}"))?;
-        if !checkout.success() {
-            bail!("git checkout failed for {sha} in {url}");
-        }
+    }
+    let checkout = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["checkout", "--quiet", "FETCH_HEAD"])
+        .status()
+        .with_context(|| format!("git checkout {sha} in {url}"))?;
+    if !checkout.success() {
+        bail!("git checkout failed for {sha} in {url}");
     }
     Ok(())
 }
@@ -1196,9 +1272,9 @@ fn is_commit_sha(git_ref: &str) -> bool {
 /// sources are shallow-cloned into `scratch`, which the CALLER owns and must
 /// keep alive until the tree has been consumed — a clone dir dropped at
 /// function exit is exactly the bug that made every remote-source install
-/// copy from a deleted directory. A pinned `sha` in the entry is not
-/// verified against the checkout — the index is treated as authoritative,
-/// as Claude Code does.
+/// copy from a deleted directory. A pinned `sha` is checked out (fetch +
+/// checkout, with a full-fetch fallback); the pin is authoritative — the
+/// installed commit is the pinned one, not the remote's current HEAD.
 fn materialize_source(
     repo_root: &Path,
     source: &MarketplacePluginSource,
@@ -1206,25 +1282,51 @@ fn materialize_source(
 ) -> Result<(PathBuf, String)> {
     match source {
         MarketplacePluginSource::Relative(rel) => {
-            let tree = repo_root.join(rel.trim_start_matches("./"));
+            if !is_safe_subpath(rel) {
+                bail!("plugin source {rel:?} escapes the marketplace clone");
+            }
+            let tree = repo_root.join(strip_source_prefix(rel));
             if !tree.exists() {
                 bail!("plugin source {} missing", tree.display());
             }
             Ok((tree, git_rev_parse_head(repo_root)))
         }
+        MarketplacePluginSource::Unsupported { kind } => {
+            bail!(
+                "unsupported marketplace source kind {kind:?} — cannot install this plugin \
+                 (manox may be older than the marketplace)"
+            )
+        }
         MarketplacePluginSource::Remote(remote) => {
-            let (url, subpath, git_ref) = match remote {
-                RemoteSource::GitHub { repo, r#ref } => (
+            let (url, subpath, git_ref, pinned_sha) = match remote {
+                RemoteSource::GitHub { repo, r#ref, sha } => (
                     format!("https://github.com/{repo}.git"),
                     None,
                     r#ref.as_deref(),
+                    sha.as_deref(),
                 ),
-                RemoteSource::GitSubdir { url, path, r#ref } => {
-                    (url.clone(), path.as_deref(), r#ref.as_deref())
-                }
+                RemoteSource::GitSubdir {
+                    url,
+                    path,
+                    r#ref,
+                    sha,
+                } => (
+                    url.clone(),
+                    path.as_deref(),
+                    r#ref.as_deref(),
+                    sha.as_deref(),
+                ),
             };
+            if let Some(sub) = subpath
+                && !is_safe_subpath(sub)
+            {
+                bail!("plugin subpath {sub:?} escapes the cloned repository");
+            }
             let clone_dir = scratch.join("clone");
             git_clone_shallow(&url, git_ref, &clone_dir)?;
+            if let Some(sha) = pinned_sha {
+                git_checkout_sha(&clone_dir, &url, sha)?;
+            }
             let tree = match subpath {
                 Some(sub) => clone_dir.join(sub.trim_matches('/')),
                 None => clone_dir.clone(),
@@ -1232,9 +1334,38 @@ fn materialize_source(
             if !tree.exists() {
                 bail!("plugin source {} missing in {url}", tree.display());
             }
-            Ok((tree, git_rev_parse_head(&clone_dir)))
+            // Provenance is the pin when there is one — the tree IS that
+            // commit after the checkout above.
+            let commit = pinned_sha
+                .map(str::to_string)
+                .unwrap_or_else(|| git_rev_parse_head(&clone_dir));
+            Ok((tree, commit))
         }
     }
+}
+
+/// Reject marketplace-controlled path fragments that would escape the clone:
+/// absolute paths and `..` components. `Path::join` with an absolute segment
+/// replaces the base entirely, and `..` walks out of it — either turns a
+/// marketplace index entry into "copy any directory on disk into the install
+/// tree (and run its hooks)". A leading `.` is harmless (Rust keeps it as a
+/// `CurDir` component; joining is a no-op) and allowed.
+fn is_safe_subpath(path: &str) -> bool {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.starts_with('/') || trimmed.starts_with('~') {
+        return false;
+    }
+    std::path::Path::new(trimmed).components().all(|c| {
+        matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    })
+}
+
+/// The `./` prefix marketplace indexes put on relative sources.
+fn strip_source_prefix(path: &str) -> &str {
+    path.strip_prefix("./").unwrap_or(path)
 }
 
 /// Best-effort `.in_use/<pid>` marker so Claude Code's cache GC cannot delete
@@ -1314,7 +1445,9 @@ mod tests {
         "plugins": [
             {"name": "gitwork", "description": "g", "source": "./plugins/gitwork"},
             {"name": "remote-gh", "source": {"source": "github", "repo": "dspo/remote-gh"}},
-            {"name": "remote-sub", "source": {"source": "git-subdir", "url": "https://example.com/x.git", "path": "plugins/remote-sub", "ref": "v1.2.3", "sha": "abc123"}}
+            {"name": "remote-sub", "source": {"source": "git-subdir", "url": "https://example.com/x.git", "path": "plugins/remote-sub", "ref": "v1.2.3", "sha": "abc123"}},
+            {"name": "url-kind", "source": {"source": "url", "url": "https://example.com/repo.git", "sha": "d645d2c8ce0689a568224436061872ab9f0ab179"}},
+            {"name": "alien", "source": {"source": "svn", "url": "https://example.com/svn"}}
         ]
     }"#;
 
@@ -1358,7 +1491,7 @@ mod tests {
     fn parses_marketplace_index_with_all_source_shapes() {
         let idx: MarketplaceIndex = serde_json::from_str(INDEX_RAW).unwrap();
         assert_eq!(idx.name, "demo");
-        assert_eq!(idx.plugins.len(), 3);
+        assert_eq!(idx.plugins.len(), 5);
         assert!(
             matches!(&idx.plugins[0].source, MarketplacePluginSource::Relative(path) if path == "./plugins/gitwork")
         );
@@ -1366,23 +1499,49 @@ mod tests {
             matches!(&idx.plugins[1].source, MarketplacePluginSource::Remote(RemoteSource::GitHub { repo, .. }) if repo == "dspo/remote-gh")
         );
         assert!(
-            matches!(&idx.plugins[2].source, MarketplacePluginSource::Remote(RemoteSource::GitSubdir { url, path, r#ref }) if url == "https://example.com/x.git" && path.as_deref() == Some("plugins/remote-sub") && r#ref.as_deref() == Some("v1.2.3"))
+            matches!(&idx.plugins[2].source, MarketplacePluginSource::Remote(RemoteSource::GitSubdir { url, path, r#ref, sha }) if url == "https://example.com/x.git" && path.as_deref() == Some("plugins/remote-sub") && r#ref.as_deref() == Some("v1.2.3") && sha.as_deref() == Some("abc123"))
         );
         assert_eq!(
             idx.plugins[2].source.display(),
             "git-subdir:https://example.com/x.git@v1.2.3"
         );
+        // `url` kind (104/203 entries of the official index): a whole-repo
+        // clone pinned by sha — a path-less git-subdir.
+        assert!(
+            matches!(
+                &idx.plugins[3].source,
+                MarketplacePluginSource::Remote(RemoteSource::GitSubdir { url, path, sha: Some(sha), .. })
+                    if url == "https://example.com/repo.git" && path.is_none() && sha == "d645d2c8ce0689a568224436061872ab9f0ab179"
+            ),
+            "url kind must deserialize into a sha-pinned path-less clone, got {:?}",
+            idx.plugins[3].source
+        );
+        // An unknown kind must not poison the entry, let alone the index.
+        assert!(matches!(
+            &idx.plugins[4].source,
+            MarketplacePluginSource::Unsupported { kind } if kind == "svn"
+        ));
+        assert!(!idx.plugins[4].source.installable());
+        assert_eq!(idx.plugins[4].source.display(), "unsupported:svn");
     }
 
     #[test]
-    fn rejects_unknown_source_shape_with_actionable_error() {
-        let err =
-            serde_json::from_str::<MarketplacePluginSource>(r#"{"source": "svn", "url": "x"}"#)
-                .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unsupported marketplace source kind")
-        );
+    fn malformed_sources_degrade_to_unsupported_not_error() {
+        for raw in [
+            r#"{"source": "svn", "url": "x"}"#,
+            r#"{"source": "github"}"#,
+            r#"{"source": "git-subdir"}"#,
+            r#"{"source": "url"}"#,
+            r#"{}"#,
+            r#"7"#,
+        ] {
+            let parsed: MarketplacePluginSource = serde_json::from_str(raw).unwrap();
+            assert!(
+                matches!(parsed, MarketplacePluginSource::Unsupported { .. }),
+                "{raw} must degrade to Unsupported, got {parsed:?}"
+            );
+            assert!(!parsed.installable());
+        }
     }
 
     #[test]
@@ -1766,6 +1925,7 @@ mod tests {
             url: repo.path().to_str().unwrap().to_string(),
             path: Some("plugins/pinned".to_string()),
             r#ref: Some(sha.clone()),
+            sha: None,
         });
         let scratch = tempfile::tempdir().unwrap();
         let (tree, provenance) =
@@ -1819,6 +1979,191 @@ mod tests {
         assert!(foreign_root.join(".git").exists());
     }
 
+    /// Claude Code omits `gitCommitSha` (and can omit the timestamps) when
+    /// the marketplace entry carries no sha — observed on the real
+    /// huggingface-skills install. Requiring those fields made the installed
+    /// plugin silently invisible: the entry failed to parse and was skipped.
+    #[test]
+    fn install_entries_without_provenance_fields_stay_visible() {
+        let _home = ClaudeHome::new();
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join(".claude-plugin")).unwrap();
+        let registry_path = paths::installed_plugins_file().unwrap();
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry_path,
+            format!(
+                r#"{{"version":2,"plugins":{{"huggingface-skills@claude-plugins-official":[{{"scope":"user","installPath":{},"version":"1.0.2","installedAt":"2026-09-30T04:01:38.828Z","lastUpdated":"2026-09-30T04:01:38.828Z"}}]}}}}"#,
+                serde_json::to_string(tree.path().to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let installed = PluginManager::all_installed();
+        assert_eq!(installed.len(), 1, "a sha-less install must stay visible");
+        assert_eq!(
+            installed[0].name, "huggingface-skills",
+            "the real-world regression shape"
+        );
+        assert_eq!(PluginManager::installed().len(), 1);
+    }
+
+    /// Marketplace-controlled paths may not escape the clone: `Path::join`
+    /// with an absolute segment replaces the base, `..` walks out — either
+    /// would let an index entry copy any directory on disk into the install
+    /// tree, hooks included.
+    #[test]
+    fn source_paths_may_not_escape_the_clone() {
+        let market = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(market.path().join("plugins/ok/.claude-plugin")).unwrap();
+        std::fs::write(
+            market.path().join("plugins/ok/.claude-plugin/plugin.json"),
+            r#"{"name":"ok"}"#,
+        )
+        .unwrap();
+
+        for source in [
+            MarketplacePluginSource::Relative("../escape".to_string()),
+            MarketplacePluginSource::Relative("/etc".to_string()),
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let err = materialize_source(market.path(), &source, scratch.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("escapes"),
+                "{source:?} must be refused: {err:#}"
+            );
+        }
+
+        let remote = MarketplacePluginSource::Remote(RemoteSource::GitSubdir {
+            url: market.path().to_str().unwrap().to_string(),
+            path: Some("../../../etc".to_string()),
+            r#ref: None,
+            sha: None,
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let err = materialize_source(market.path(), &remote, scratch.path()).unwrap_err();
+        assert!(err.to_string().contains("escapes"), "{err:#}");
+    }
+
+    /// A sha-only entry (no `ref` — 107/203 of the official index) must
+    /// install the pinned commit, not the remote's current HEAD.
+    #[test]
+    fn materializes_a_sha_only_remote_source_at_the_pin() {
+        let repo = tempfile::tempdir().unwrap();
+        let plugins = repo.path().join("plugins/pinned");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(plugins.join("marker.txt"), "pinned-content").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["-c", "user.email=t@t", "-c", "user.name=t", "add", "."],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let pinned_sha = git_rev_parse_head(repo.path());
+        // A second commit moves HEAD away from the pin.
+        std::fs::write(plugins.join("marker.txt"), "head-content").unwrap();
+        for args in [
+            vec!["-c", "user.email=t@t", "-c", "user.name=t", "add", "."],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "second",
+            ],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        assert_ne!(git_rev_parse_head(repo.path()), pinned_sha);
+
+        let source = MarketplacePluginSource::Remote(RemoteSource::GitSubdir {
+            url: repo.path().to_str().unwrap().to_string(),
+            path: Some("plugins/pinned".to_string()),
+            r#ref: None,
+            sha: Some(pinned_sha.clone()),
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let (tree, provenance) =
+            materialize_source(Path::new("/nonexistent"), &source, scratch.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree.join("marker.txt")).unwrap(),
+            "pinned-content",
+            "the tree must be the pinned commit, not HEAD"
+        );
+        assert_eq!(provenance, pinned_sha);
+    }
+
+    /// Uninstall removes only the user-scope tree and entry: a project-scope
+    /// sibling Claude Code recorded under the same key — and its toggle —
+    /// survive, mirroring what `record_install` protects on the write side.
+    #[test]
+    fn uninstall_preserves_sibling_scopes() {
+        let _home = ClaudeHome::new();
+        let user_tree = tempfile::tempdir().unwrap();
+        let project_tree = tempfile::tempdir().unwrap();
+        for tree in [&user_tree, &project_tree] {
+            std::fs::create_dir_all(tree.path().join(".claude-plugin")).unwrap();
+        }
+        seed_registry(&[]);
+        let registry_path = paths::installed_plugins_file().unwrap();
+        std::fs::write(
+            &registry_path,
+            format!(
+                r#"{{"version":2,"plugins":{{"x@m":[{{"scope":"project","installPath":{},"version":"0.1.0","installedAt":"t0","lastUpdated":"t0","gitCommitSha":"s"}},{{"scope":"user","installPath":{},"version":"1.0.0","installedAt":"t1","lastUpdated":"t1","gitCommitSha":"t"}}]}}}}"#,
+                serde_json::to_string(project_tree.path().to_str().unwrap()).unwrap(),
+                serde_json::to_string(user_tree.path().to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        seed_toggles(&[("x@m", true)]);
+
+        PluginManager::uninstall("x").unwrap();
+
+        assert!(!user_tree.path().exists(), "the user tree goes");
+        assert!(project_tree.path().exists(), "the project tree stays");
+        let registry = read_json(&registry_path).unwrap().unwrap();
+        let entries = registry["plugins"]["x@m"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["scope"], json!("project"));
+        let settings = read_json(&paths::claude_settings_file().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            settings["enabledPlugins"]["x@m"],
+            json!(true),
+            "the toggle belongs to the surviving key"
+        );
+
+        // Uninstalling again with no user entry left is a no-op that keeps
+        // the sibling bookkeeping.
+        PluginManager::uninstall("x").unwrap();
+        let registry = read_json(&registry_path).unwrap().unwrap();
+        assert_eq!(registry["plugins"]["x@m"].as_array().unwrap().len(), 1);
+    }
+
     /// Read-only probe of a real Claude Code installation: registry files,
     /// marketplace indexes, and the enabled set must all parse. Gated behind
     /// `MANOX_RUN_LIVE=1` like the other live tests; skips silently when no
@@ -1849,5 +2194,44 @@ mod tests {
             !PluginManager::installed().is_empty(),
             "live ~/.claude has installs but none enabled"
         );
+        // Official-index drift probe: every entry of the largest marketplace
+        // must parse. One unparseable entry used to erase the whole
+        // marketplace from the UI (the url-kind mass, 104/203 at
+        // 2026-09); this fails loudly the day a new kind appears.
+        if let Some(record) = records.iter().max_by_key(|r| r.plugin_count) {
+            let index = PluginManager::load_marketplace_index(&record.root).unwrap_or_else(|e| {
+                panic!("largest marketplace {} unparseable: {e:#}", record.slug)
+            });
+            let raw_count = read_json(&record.root.join(".claude-plugin").join("marketplace.json"))
+                .ok()
+                .flatten()
+                .and_then(|doc| doc.get("plugins").and_then(Value::as_array).cloned())
+                .map(|a| a.len());
+            if let Some(raw_count) = raw_count {
+                assert_eq!(
+                    index.plugins.len(),
+                    raw_count,
+                    "marketplace {}: {raw_count} raw entries but only {} parse —                      entries are being dropped, treat as schema drift",
+                    record.slug,
+                    index.plugins.len()
+                );
+            }
+            let unsupported: Vec<_> = index
+                .plugins
+                .iter()
+                .filter(|p| !p.source.installable())
+                .collect();
+            assert!(
+                unsupported.is_empty(),
+                "marketplace {}: {} entries use source kinds manox does not install: {:?}",
+                record.slug,
+                unsupported.len(),
+                unsupported
+                    .iter()
+                    .map(|p| p.source.display())
+                    .take(5)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }
