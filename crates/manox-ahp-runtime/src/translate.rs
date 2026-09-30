@@ -381,3 +381,103 @@ fn message_value(message: &AgentMessage) -> Vec<serde_json::Value> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manox_agent::background_task::{TaskKind, TaskSnapshot, TaskStatus};
+    use manox_ahp::ext::XManoxState;
+    use manox_ahp::ext::reducer::{self, Outcome};
+    use manox_ahp::translate::Translator;
+
+    /// Fold journal rows through the live projection into extension state —
+    /// the exact path a reconnecting client's baseline takes: one translator
+    /// across the whole journal, the fold consuming each emitted action.
+    fn fold(events: Vec<JournalWireEvent>) -> XManoxState {
+        let mut state = XManoxState::default();
+        let mut translator = Translator::new();
+        for event in events {
+            let entry = JournalWireEntry {
+                seq: 0,
+                id: "e-1".into(),
+                parent_id: None,
+                timestamp: "2026-09-30T00:00:00.000Z".into(),
+                event,
+            };
+            for emitted in translator.on_entry("c-1", "s-1", &entry) {
+                if emitted.channel == "x-manox-work:/s-1" {
+                    let action = serde_json::to_value(&emitted.action).expect("action serializes");
+                    let outcome = reducer::apply(&mut state, &action);
+                    assert_ne!(
+                        outcome,
+                        Outcome::Unrecognised,
+                        "the fold must know the emitted action: {action}"
+                    );
+                }
+            }
+        }
+        state
+    }
+
+    /// The full background-task projection chain, anchored at the real
+    /// producer shape: host `TaskSnapshot` → journal row → wire action →
+    /// extension registry state. Lives here because this is the only crate
+    /// that may name both `manox_agent` (the shape's authority) and
+    /// `manox_ahp` (the fold) — the golden in `manox-agent` pins the
+    /// serialization, this test pins that everything downstream of it still
+    /// consumes that exact shape.
+    #[test]
+    fn background_task_snapshot_flows_from_host_shape_to_extension_state() {
+        let snapshot = TaskSnapshot {
+            task_id: "mon_7".into(),
+            kind: TaskKind::MonitorCommand,
+            owner_thread_id: "t-1".into(),
+            description: "watch the build".into(),
+            status: TaskStatus::Completed,
+            created_at_ms: 1_000,
+            ended_at_ms: Some(2_000),
+            event_count: 42,
+            total_bytes: 4_096,
+            exit_code: Some(0),
+            failure_summary: Some("nope".into()),
+            anchor_message_id: Some("m1".into()),
+            output_tail: "last line".into(),
+        };
+        let wire = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        let other = TaskSnapshot {
+            task_id: "bg_8".into(),
+            kind: TaskKind::BackgroundBash,
+            description: "run the suite".into(),
+            ..snapshot.clone()
+        };
+        let wire_other = serde_json::to_value(&other).expect("snapshot serializes");
+
+        let state = fold(vec![JournalWireEvent::BackgroundTask {
+            snapshot: wire.clone(),
+        }]);
+        assert_eq!(
+            state.background_tasks.as_ref().and_then(|m| m.get("mon_7")),
+            Some(&wire),
+            "the host shape reaches the registry view verbatim, keyed by task id"
+        );
+
+        // The registry property the whole-field fold used to break: a second
+        // task's row joins the view instead of replacing it, so a
+        // reconnecting client's baseline carries every task the journal has
+        // rows for.
+        let state = fold(vec![
+            JournalWireEvent::BackgroundTask { snapshot: wire },
+            JournalWireEvent::BackgroundTask {
+                snapshot: wire_other,
+            },
+        ]);
+        assert_eq!(
+            state
+                .background_tasks
+                .expect("registry view populated")
+                .len(),
+            2,
+            "each task keeps its own registry entry"
+        );
+    }
+}

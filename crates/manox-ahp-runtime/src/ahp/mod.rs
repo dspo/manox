@@ -62,6 +62,7 @@ use ahp_types::state::{
 use manox_ahp::channels::{chat, session};
 use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
+use serde_json::Value;
 
 pub(crate) mod changeset;
 #[cfg(feature = "mcp")]
@@ -207,6 +208,10 @@ pub(crate) struct JournalFold {
     /// built by replaying them through [`crate::ext::reducer`].
     pub(crate) extension_actions: Vec<(String, StateAction)>,
     pub(crate) model_ref: Option<String>,
+    /// The last consumed entry's RFC3339 (millis, UTC) stamp — the journal's
+    /// recency for baseline replay ordering, where string comparison is
+    /// chronological because every stamp shares one format.
+    pub(crate) last_timestamp: Option<String>,
     /// The journal's dense tail (`JournalSnapshotData::cursor`): the highest seq
     /// the fold consumed. A live bridge forwards feed events strictly above it,
     /// which is what keeps a seeded snapshot and the following actions disjoint.
@@ -263,7 +268,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     // A pure fold must not observe wall-clock time: `chat::initial` stamps
     // "now", the journal's own last entry replaces it. A never-written
     // journal keeps the initial stamp.
-    if let Some(stamp) = last_timestamp {
+    if let Some(stamp) = last_timestamp.clone() {
         state.modified_at = stamp;
     }
     Some(JournalFold {
@@ -271,6 +276,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
         session_actions,
         extension_actions,
         model_ref,
+        last_timestamp,
         tail: snapshot.cursor,
     })
 }
@@ -301,6 +307,77 @@ fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
         }
     }
     members.into_iter().collect()
+}
+
+/// The fresh, thread-scoped fold of one session-scoped `x-manox*` extension
+/// channel: every member journal of the owning thread, replayed for exactly
+/// the requested channel.
+///
+/// Two properties the seed cache cannot give a reconnecting client: thread
+/// scoping — after a thread continues into a new session, the active
+/// session's journal carries rows the URI's own journal lacks — and
+/// freshness — the seed is built once per process, while the baseline
+/// envelope carries the current watermark, so a stale fold would be accepted
+/// as current truth. Live emissions key extension channels by thread id (the
+/// bridge and [`fold_journal`] both pass the thread id as the translator's
+/// session parameter), so rows are replayed only when their channel matches
+/// the request verbatim.
+pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) -> Value {
+    let thread_id = thread_of_session(session_id)
+        .await
+        .unwrap_or_else(|| session_id.to_string());
+    let registry = manox_agent::thread_registry::load().await;
+    let active = registry
+        .get(&thread_id)
+        .map(|entry| entry.active_session.clone())
+        .unwrap_or_else(|| session_id.to_string());
+    // Non-active members fold in JOURNAL TIME order, not id order: session
+    // ids are uuids whose dictionary order is unrelated to time, and the
+    // scalar rows are last-writer-wins — id order let a time-older journal
+    // overwrite a newer value (probe-proven). Each journal is folded once and
+    // only the requested channel's rows are kept. `None` stamps (empty
+    // journals) sort first: nothing to win with. The active session folds
+    // last regardless — its journal is the thread's current truth.
+    let mut older: Vec<(Option<String>, Vec<StateAction>)> = Vec::new();
+    for id in thread_sessions(&thread_id, &active) {
+        if id == active {
+            continue;
+        }
+        let Some(fold) = fold_journal(&id, &thread_id).await else {
+            continue;
+        };
+        let rows = fold
+            .extension_actions
+            .into_iter()
+            .filter(|(row_channel, _)| row_channel == channel)
+            .map(|(_, action)| action)
+            .collect();
+        older.push((fold.last_timestamp, rows));
+    }
+    older.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut state = manox_ahp::ext::XManoxState::default();
+    let replay = |state: &mut manox_ahp::ext::XManoxState, rows: &[StateAction]| {
+        for action in rows {
+            let Ok(value) = serde_json::to_value(action) else {
+                continue;
+            };
+            let _ = manox_ahp::ext::reducer::apply(state, &value);
+        }
+    };
+    for (_, rows) in &older {
+        replay(&mut state, rows);
+    }
+    if let Some(fold) = fold_journal(&active, &thread_id).await {
+        let rows = fold
+            .extension_actions
+            .into_iter()
+            .filter(|(row_channel, _)| row_channel == channel)
+            .map(|(_, action)| action)
+            .collect::<Vec<_>>();
+        replay(&mut state, &rows);
+    }
+    serde_json::to_value(&state).unwrap_or(Value::Null)
 }
 
 /// The `<id>.jsonl` stem of a sessions-dir entry (non-journals yield `None`).
@@ -473,4 +550,242 @@ pub mod runtime;
 #[cfg(feature = "terminal")]
 pub fn session_uri_of_terminal(session_id: &str) -> String {
     manox_ahp::channels::session::uri(session_id)
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::*;
+    use manox_harness::session::SessionStorage;
+
+    /// Regression for the dictionary-order fold: member session ids are
+    /// uuids, so id order carries no time information, and the scalar rows
+    /// are last-writer-wins — folding members by id let a time-older journal
+    /// overwrite a newer value. Here the ids sort in the OPPOSITE order of
+    /// their journal times, and the newest label must win; the active
+    /// session (no label row) must not disturb it.
+    #[test]
+    fn the_newest_member_journal_wins_scalar_rows_regardless_of_id_order() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            // "a_mid" sorts before "z_old" but is written an hour later.
+            let members = [
+                ("z_old", chrono::Duration::hours(2), "olderTime"),
+                ("a_mid", chrono::Duration::hours(1), "newerTime"),
+            ];
+            for (id, ago, label) in members {
+                let path = sessions.join(format!("{id}.jsonl"));
+                let _ = std::fs::remove_file(&path);
+                let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                    &path,
+                    manox_harness::session::jsonl::JsonlSessionMetadata {
+                        id: id.into(),
+                        cwd: "/".into(),
+                        created_at: chrono::Utc::now() - ago,
+                        parent_session_path: None,
+                        metadata: Some(serde_json::json!({"thread": "T-ord"})),
+                    },
+                )
+                .await
+                .unwrap();
+                storage
+                    .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                        id: format!("e-{id}"),
+                        parent_id: None,
+                        timestamp: chrono::Utc::now() - ago,
+                        target_id: format!("e-{id}"),
+                        label: Some(label.into()),
+                    })
+                    .await
+                    .unwrap();
+                drop(storage);
+            }
+            // The active session: newest journal, no label row of its own.
+            let active_path = sessions.join("m_act.jsonl");
+            let _ = std::fs::remove_file(&active_path);
+            let active_storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &active_path,
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "m_act".into(),
+                    cwd: "/".into(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    metadata: Some(serde_json::json!({"thread": "T-ord"})),
+                },
+            )
+            .await
+            .unwrap();
+            active_storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::CustomMessage {
+                    id: "e-act".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    custom_type: "embedder_seed".into(),
+                    content: vec![manox_harness::types::ContentBlock::Text {
+                        text: "active".into(),
+                        signature: None,
+                    }],
+                    details: None,
+                    display: false,
+                })
+                .await
+                .unwrap();
+            drop(active_storage);
+            // The thread registry points T-ord at the active session.
+            let registry = manox_agent::thread_registry::registry_path();
+            std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+            std::fs::write(
+                &registry,
+                serde_json::json!({"T-ord": {"active_session": "m_act"}}).to_string(),
+            )
+            .unwrap();
+
+            let baseline = extension_channel_baseline("x-manox-thread:/T-ord", "m_act").await;
+            assert_eq!(
+                baseline["label"], "newerTime",
+                "the time-newer member journal must win, not the id-later one: {baseline}"
+            );
+
+            for id in ["z_old", "a_mid", "m_act"] {
+                let _ = std::fs::remove_file(sessions.join(format!("{id}.jsonl")));
+            }
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// One label journal with a thread-stamped header, at a chosen time.
+    async fn write_label_journal(
+        sessions: &std::path::Path,
+        id: &str,
+        thread: &str,
+        at: chrono::DateTime<chrono::Utc>,
+        label: &str,
+    ) {
+        let path = sessions.join(format!("{id}.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.into(),
+                cwd: "/".into(),
+                created_at: at,
+                parent_session_path: None,
+                metadata: Some(serde_json::json!({ "thread": thread })),
+            },
+        )
+        .await
+        .unwrap();
+        storage
+            .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                id: format!("e-{id}"),
+                parent_id: None,
+                timestamp: at,
+                target_id: format!("e-{id}"),
+                label: Some(label.into()),
+            })
+            .await
+            .unwrap();
+        drop(storage);
+    }
+
+    fn write_registry(thread: &str, active: &str) -> std::path::PathBuf {
+        let registry = manox_agent::thread_registry::registry_path();
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(
+            &registry,
+            serde_json::json!({ thread: { "active_session": active } }).to_string(),
+        )
+        .unwrap();
+        registry
+    }
+
+    /// The wrong-shelf half of the baseline fix: the ACTIVE session carries
+    /// the thread's current rows, so its journal must be folded (last) even
+    /// though the thread-URI baseline used to answer from the URI's own
+    /// journal alone.
+    #[test]
+    fn the_active_sessions_rows_reach_the_thread_baseline() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "o_shelf",
+                "T-shelf",
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                "shelfOld",
+            )
+            .await;
+            write_label_journal(&sessions, "act_s", "T-shelf", chrono::Utc::now(), "act").await;
+            let registry = write_registry("T-shelf", "act_s");
+
+            let baseline = extension_channel_baseline("x-manox-thread:/T-shelf", "act_s").await;
+            assert_eq!(
+                baseline["label"], "act",
+                "the active session's own row must be in — and win — the baseline: {baseline}"
+            );
+
+            let _ = std::fs::remove_file(sessions.join("o_shelf.jsonl"));
+            let _ = std::fs::remove_file(sessions.join("act_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// The freshness half: there is no seed cache to grow stale — a row that
+    /// lands after a baseline was served must show up in the next one.
+    #[test]
+    fn a_row_appended_after_a_baseline_shows_up_in_the_next_one() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "fresh_s",
+                "fresh_s",
+                chrono::Utc::now() - chrono::Duration::seconds(1),
+                "v1",
+            )
+            .await;
+            let registry = write_registry("fresh_s", "fresh_s");
+
+            let first = extension_channel_baseline("x-manox-thread:/fresh_s", "fresh_s").await;
+            assert_eq!(first["label"], "v1");
+
+            // Append after the first baseline was served.
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(
+                &sessions.join("fresh_s.jsonl"),
+            )
+            .await
+            .unwrap();
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                    id: "e-v2".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    target_id: "e-v2".into(),
+                    label: Some("v2".into()),
+                })
+                .await
+                .unwrap();
+            drop(storage);
+
+            let second = extension_channel_baseline("x-manox-thread:/fresh_s", "fresh_s").await;
+            assert_eq!(
+                second["label"], "v2",
+                "the next baseline must see rows written after the previous one: {second}"
+            );
+
+            let _ = std::fs::remove_file(sessions.join("fresh_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
 }

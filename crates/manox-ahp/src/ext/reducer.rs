@@ -20,6 +20,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 
 /// Everything manox carries that AHP has no native slot for, per session.
 ///
@@ -44,22 +46,29 @@ pub struct XManoxState {
     /// Active browser suites.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_suites: Option<Vec<String>>,
-    /// Background-task registry snapshot.
+    /// Background-task registry view: task id → the task's latest wire
+    /// snapshot. Journal rows carry one task's snapshot each, so the fold
+    /// upserts by `task_id` and has no clear edge — `None` means no task row
+    /// has been folded, and terminal tasks keep their row (bounded by the
+    /// session's distinct task count).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background_tasks: Option<Value>,
-    /// The sub-agent tree and its progress ticks.
+    pub background_tasks: Option<BTreeMap<String, Value>>,
+    /// Sub-agent registry view: agent id → the agent's latest progress row
+    /// (envelope tag stripped). Progress rows carry one agent's tick each
+    /// (nesting is structurally off this iteration), so the fold upserts by
+    /// `agentId`; `None` means no row has been folded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<Value>,
-    /// Compaction state (started / finished with its summary facts).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compaction: Option<Value>,
+    pub subagents: Option<BTreeMap<String, Value>>,
     /// Thread pinned flag — AHP has no pin bit, only read/archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
     /// Label row attached to the thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// Session-info annotation row.
+    /// Session-info annotation row. The bag is per channel, so on
+    /// `x-manox-thread:/` this holds the session-info row while on
+    /// `x-manox-metrics:/` it holds the metrics aggregate (the metrics
+    /// read model has no field of its own).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_info: Option<Value>,
     /// The journal's active-chain leaf (fork cursor).
@@ -84,12 +93,41 @@ pub enum Outcome {
     Unrecognised,
 }
 
+/// Keyed-upsert one row into a registry view; reports whether the view
+/// changed. The shared body of the keyed arms — a new registry field reuses
+/// this rather than copying the three-branch match a third time.
+fn upsert_row(registry: &mut Option<BTreeMap<String, Value>>, key: &str, row: &Value) -> bool {
+    match registry
+        .get_or_insert_with(BTreeMap::new)
+        .entry(key.to_string())
+    {
+        Entry::Occupied(slot) if slot.get() == row => false,
+        Entry::Occupied(mut slot) => {
+            slot.insert(row.clone());
+            true
+        }
+        Entry::Vacant(slot) => {
+            slot.insert(row.clone());
+            true
+        }
+    }
+}
+
 /// Fold one extension action into `state`.
 pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     let Some(tag) = action.get("type").and_then(Value::as_str) else {
         return Outcome::Unrecognised;
     };
-    let before = state.clone();
+    // The generic NoOp detector clones the whole bag; the two keyed
+    // registries are exempt — their rows carry up-to-8KiB output tails, so a
+    // whole-bag clone per journal row is quadratic in session history — and
+    // report their own change instead.
+    let keyed = matches!(
+        tag,
+        super::actions::WORK_BACKGROUND_TASKS | super::actions::WORK_SUBAGENTS
+    );
+    let before = (!keyed).then(|| state.clone());
+    let mut registry_changed = false;
     match tag {
         super::actions::PLAN_MODE_CHANGED => {
             state.plan_mode = action.get("enabled").and_then(Value::as_bool);
@@ -119,13 +157,28 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 });
         }
         super::actions::WORK_BACKGROUND_TASKS => {
-            state.background_tasks = action.get("snapshot").cloned();
+            // A whole-field replace would leave a late subscriber's registry
+            // view holding only the last-changed task, so rows upsert by
+            // `task_id`. A row without a string `task_id` cannot be keyed and
+            // is dropped; the producer shape is pinned by the host's
+            // `task_snapshot_serialization_is_wire_stable` golden test.
+            if let Some(snapshot) = action.get("snapshot")
+                && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
+            {
+                registry_changed = upsert_row(&mut state.background_tasks, task_id, snapshot);
+            }
         }
         super::actions::WORK_SUBAGENTS => {
-            state.subagents = action
-                .get("tree")
-                .cloned()
-                .or_else(|| action.get("snapshot").cloned());
+            // Same registry shape as background tasks: progress rows carry
+            // one agent's tick each, keyed upsert by `agentId`; a row
+            // without a string `agentId` cannot be keyed and is dropped.
+            if let Some(agent_id) = action.get("agentId").and_then(Value::as_str) {
+                let mut row = action.clone();
+                if let Some(fields) = row.as_object_mut() {
+                    fields.remove("type");
+                    registry_changed = upsert_row(&mut state.subagents, agent_id, &row);
+                }
+            }
         }
         super::actions::WORK_ACTIVE_TOOLS => {
             state.active_tools = action.get("tools").and_then(Value::as_array).map(|tools| {
@@ -164,7 +217,14 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
         }
         _ => return Outcome::Unrecognised,
     }
-    if *state == before {
+    if keyed {
+        return if registry_changed {
+            Outcome::Applied
+        } else {
+            Outcome::NoOp
+        };
+    }
+    if before.as_ref() == Some(&*state) {
         Outcome::NoOp
     } else {
         Outcome::Applied
@@ -234,5 +294,316 @@ mod tests {
             Outcome::Unrecognised
         );
         assert_eq!(state, XManoxState::default());
+    }
+
+    #[test]
+    fn background_task_rows_upsert_the_registry_view_by_task_id() {
+        let snapshot = json!({"task_id": "bg_3", "status": "Running"});
+        let action_for = |snapshot: Value| json!({"type": "x-manox-work/backgroundTasksChanged", "snapshot": snapshot});
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &action_for(snapshot.clone())),
+            Outcome::Applied
+        );
+        assert_eq!(
+            state.background_tasks,
+            Some(
+                [("bg_3".to_string(), snapshot.clone())]
+                    .into_iter()
+                    .collect()
+            )
+        );
+
+        // A second task joins; a later tick of the first task replaces only
+        // its own entry. The view is a registry, not last-writer-wins.
+        let other = json!({"task_id": "mon_4", "status": "Running"});
+        assert_eq!(apply(&mut state, &action_for(other)), Outcome::Applied);
+        let tick = json!({"task_id": "bg_3", "status": "Completed"});
+        assert_eq!(apply(&mut state, &action_for(tick)), Outcome::Applied);
+        let registry = state
+            .background_tasks
+            .as_ref()
+            .expect("registry view populated");
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry["bg_3"]["status"], "Completed");
+
+        // A row without a keyable `task_id` cannot enter the view and does
+        // not disturb it (there is no clear edge on this action).
+        assert_eq!(
+            apply(
+                &mut state,
+                &json!({"type": "x-manox-work/backgroundTasksChanged"})
+            ),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            apply(&mut state, &action_for(json!({"status": "Running"}))),
+            Outcome::NoOp
+        );
+        assert_eq!(
+            state
+                .background_tasks
+                .as_ref()
+                .expect("still populated")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn subagent_progress_rows_upsert_the_registry_view_by_agent_id() {
+        let row_for = |agent: &str, status: &str| {
+            json!({
+                "type": "x-manox-work/subagentsChanged",
+                "agentId": agent,
+                "agentType": "explore",
+                "status": status
+            })
+        };
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(&mut state, &row_for("sub-0", "running")),
+            Outcome::Applied
+        );
+        assert_eq!(
+            apply(&mut state, &row_for("sub-1", "running")),
+            Outcome::Applied
+        );
+        assert_eq!(
+            apply(&mut state, &row_for("sub-0", "completed")),
+            Outcome::Applied
+        );
+        let registry = state.subagents.as_ref().expect("registry view populated");
+        assert_eq!(registry.len(), 2, "each agent keeps its own entry");
+        assert_eq!(registry["sub-0"]["status"], "completed");
+        assert_eq!(
+            registry["sub-0"].get("type"),
+            None,
+            "the envelope tag is stripped from stored rows"
+        );
+
+        // A row without an agent id cannot be keyed and does not disturb
+        // the view.
+        assert_eq!(
+            apply(
+                &mut state,
+                &json!({"type": "x-manox-work/subagentsChanged", "status": "running"})
+            ),
+            Outcome::NoOp
+        );
+        assert_eq!(state.subagents.as_ref().expect("still populated").len(), 2);
+    }
+
+    /// The root-cause gate for the whole "hand-written key sets" class, in
+    /// its routing-aware form: every host-emitted extension action must (a)
+    /// be produced by the real translator, (b) ride an *extension* channel —
+    /// an action on a state-bearing channel is `StateAction::Unknown` to that
+    /// channel's reducer, so it is never folded and never baselined (the
+    /// session-channel thread rows drifted exactly this way) — and (c) leave
+    /// its state field populated. The final whole-struct comparison makes a
+    /// *new* `XManoxState` field a compile error here until a producer case
+    /// covers it, so "declared but always empty" cannot come back.
+    #[test]
+    fn every_extension_state_field_is_reachable_through_the_real_fold() {
+        use manox_journal::{JournalWireEntry, JournalWireEvent};
+
+        let entry = |event: JournalWireEvent| JournalWireEntry {
+            seq: 0,
+            id: "e-gate".into(),
+            parent_id: None,
+            timestamp: "2026-09-30T00:00:00.000Z".into(),
+            event,
+        };
+        // Host-emitted: journal row → the tag it must produce and the exact
+        // channel it must ride (an action on the WRONG extension channel
+        // still folds — into the wrong bag — so `is_extension_channel` alone
+        // cannot catch it).
+        let host_cases: Vec<(JournalWireEvent, &str, &str)> = vec![
+            (
+                JournalWireEvent::PlanModeChange { enabled: true },
+                super::super::actions::PLAN_MODE_CHANGED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                JournalWireEvent::PlanUpdate {
+                    snapshot: json!({}),
+                },
+                super::super::actions::PLAN_CHANGED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                JournalWireEvent::PlanReview {
+                    state: "proposed".into(),
+                    plan_file: None,
+                    title: None,
+                    content: None,
+                    request_id: Some("plan-review:e-gate".into()),
+                },
+                super::super::actions::PLAN_VERDICT_REQUESTED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                JournalWireEvent::Goal {
+                    goal: Some(json!({"text": "ship"})),
+                },
+                super::super::actions::WORK_GOAL_CHANGED,
+                "x-manox-work:/s-1",
+            ),
+            (
+                JournalWireEvent::BrowserSuites {
+                    suites: vec!["chrome".into()],
+                },
+                super::super::actions::WORK_BROWSER_SUITES,
+                "x-manox-work:/s-1",
+            ),
+            (
+                JournalWireEvent::BackgroundTask {
+                    snapshot: json!({"task_id": "mon_7"}),
+                },
+                super::super::actions::WORK_BACKGROUND_TASKS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                JournalWireEvent::SubagentProgress {
+                    agent_id: "sub-0".into(),
+                    agent_type: "explore".into(),
+                    tool_uses: 0,
+                    latest_activity: None,
+                    status: "running".into(),
+                },
+                super::super::actions::WORK_SUBAGENTS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                JournalWireEvent::ActiveToolsChange {
+                    tools: vec!["bash".into()],
+                },
+                super::super::actions::WORK_ACTIVE_TOOLS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                JournalWireEvent::Metrics {
+                    kind: "token_usage".into(),
+                    data: json!({}),
+                },
+                super::super::actions::METRICS_CHANGED,
+                "x-manox-metrics:/c-1",
+            ),
+            (
+                JournalWireEvent::PinnedArchived {
+                    pinned: true,
+                    archived: false,
+                },
+                super::super::actions::PINNED_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                JournalWireEvent::Label { label: "x".into() },
+                super::super::actions::LABEL_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                JournalWireEvent::SessionInfo {
+                    data: json!({"name": "agent"}),
+                },
+                super::super::actions::SESSION_INFO_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                JournalWireEvent::Leaf {
+                    target_id: "e-9".into(),
+                },
+                super::super::actions::LEAF_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+        ];
+        // Client-dispatched: the action as the client sends it (no journal
+        // producer exists; the runtime dispatch arms accept these directly).
+        let client_cases: Vec<(serde_json::Value, &str)> = vec![(
+            json!({"type": super::super::actions::ORDER_CHANGED, "order": {"s-1": 1}}),
+            super::super::actions::ORDER_CHANGED,
+        )];
+        // Excluded, no fold arm to feed: BASELINE (host envelope),
+        // WORK_BACKGROUND_TASK_STOPPED (declared, never produced),
+        // PLAN_REVIEW_SETTLED (folds with the host-emitted verdict-requested edge),
+        // the workspaces rows (declared, fold lives outside this bag).
+
+        let mut state = XManoxState::default();
+        let mut plan_review_action = None;
+        for (event, tag, expected_channel) in &host_cases {
+            assert!(
+                super::super::actions::ALL.contains(tag),
+                "{tag} must stay declared"
+            );
+            let emitted =
+                crate::translate::Translator::new().on_entry("c-1", "s-1", &entry(event.clone()));
+            let hit = emitted
+                .iter()
+                .find(|e| serde_json::to_value(&e.action).unwrap()["type"] == *tag)
+                .unwrap_or_else(|| panic!("{tag} has no translator producer"));
+            let action = serde_json::to_value(&hit.action).unwrap();
+            assert!(
+                crate::ext::is_extension_channel(&hit.channel),
+                "{tag} must ride an extension channel; it was emitted on {} where no fold runs",
+                hit.channel
+            );
+            assert_eq!(
+                hit.channel, *expected_channel,
+                "{tag} was emitted on the wrong extension channel; its fold would land in \
+                 another channel's bag and the expected channel's baseline would stay empty"
+            );
+            assert_eq!(
+                apply(&mut state, &action),
+                Outcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+            if *tag == super::super::actions::PLAN_VERDICT_REQUESTED {
+                plan_review_action = Some(action.clone());
+            }
+        }
+        for (action, tag) in &client_cases {
+            assert_eq!(
+                apply(&mut state, action),
+                Outcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+        }
+
+        // Total coverage: every field of the bag, populated by the cases
+        // above. The struct literal has no `..Default` on purpose.
+        assert_eq!(
+            state,
+            XManoxState {
+                plan_mode: Some(true),
+                plan: Some(json!({})),
+                plan_review: plan_review_action,
+                goal: Some(json!({"text": "ship"})),
+                browser_suites: Some(vec!["chrome".to_string()]),
+                background_tasks: Some(
+                    [("mon_7".to_string(), json!({"task_id": "mon_7"}),)]
+                        .into_iter()
+                        .collect()
+                ),
+                subagents: Some(
+                    [(
+                        "sub-0".to_string(),
+                        json!({
+                            "agentId": "sub-0", "agentType": "explore",
+                            "toolUses": 0, "latestActivity": null,
+                            "status": "running"
+                        }),
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                pinned: Some(true),
+                label: Some("x".to_string()),
+                session_info: Some(json!({"name": "agent"})),
+                leaf: Some("e-9".to_string()),
+                active_tools: Some(vec!["bash".to_string()]),
+                order: Some(json!({"s-1": 1})),
+            },
+            "every extension-state field must be reachable from a live producer"
+        );
     }
 }

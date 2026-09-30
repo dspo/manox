@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::permission::{PendingAuthMeta, PermissionDecision, ToolAuthorizationResponse};
 use crate::thread::{PermissionMode, ThreadEvent};
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Model-facing denial marker (always English, never localized): read-only mode
 /// refuses every fs mutation. Matches deepseek's `[sandbox: …]` vocabulary.
@@ -132,7 +132,11 @@ impl ApprovalGate {
     }
 
     pub(crate) fn emit(&self, event: ThreadEvent) {
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(event)));
+        send_notice(
+            &self.notice_tx,
+            BackendNotice::Event(Box::new(event)),
+            "approval-flow notice",
+        );
     }
 
     /// Park a new interaction: stores the responder, returns the receiver

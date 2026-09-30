@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 use crate::background_task;
 use crate::subagent_watchdog::SubagentWatchdog;
 use crate::thread::ThreadEvent;
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Prefix of the peer delivery a failed subagent run emits to the parent.
 /// Shared with `subagent_restore`, which keys the restored row's status off
@@ -420,11 +420,13 @@ impl AgentTool for DelegationTool {
         // watchdog activity line.
         let cancel = run.dispose_token().clone();
         let (task_id, task) = background_task::register(self.owner_thread_id(), card_title, cancel);
-        let _ = self.notice_tx().send(BackendNotice::Event(Box::new(
-            ThreadEvent::BackgroundTaskUpdated {
+        send_notice(
+            &self.notice_tx(),
+            BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
                 snapshot: task.snapshot(&task_id),
-            },
-        )));
+            })),
+            "subagent task card snapshot",
+        );
         let runtime = Arc::clone(&self.runtime);
         let observer = Arc::clone(&self.observer);
         let notice_tx = self.notice_tx();
@@ -459,17 +461,23 @@ impl AgentTool for DelegationTool {
                 )),
             };
             background_task::apply_settlement(&task, &task_id, &settlement);
-            let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                ThreadEvent::BackgroundTaskUpdated {
+            send_notice(
+                &notice_tx,
+                BackendNotice::Event(Box::new(ThreadEvent::BackgroundTaskUpdated {
                     snapshot: task.snapshot(&task_id),
-                },
-            )));
+                })),
+                "subagent task terminal snapshot",
+            );
             if let Some(text) = delivery {
-                let _ = notice_tx.send(BackendNotice::SteerDelivered {
-                    from: manox_harness::steer_bus::AgentId::Subagent(run_id_for_delivery),
-                    reason: manox_harness::steer_bus::SteerReason::Complete,
-                    payload: manox_harness::steer_bus::SteerPayload { text },
-                });
+                send_notice(
+                    &notice_tx,
+                    BackendNotice::SteerDelivered {
+                        from: manox_harness::steer_bus::AgentId::Subagent(run_id_for_delivery),
+                        reason: manox_harness::steer_bus::SteerReason::Complete,
+                        payload: manox_harness::steer_bus::SteerPayload { text },
+                    },
+                    "subagent report delivery",
+                );
             }
             let _ = observer; // rail settlement already happened via on_settled
         });
@@ -821,8 +829,9 @@ impl SubagentRunObserver {
         status: crate::thread::ToolCallStatus,
         health: Option<String>,
     ) {
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::SubagentProgress {
+        send_notice(
+            &self.notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::SubagentProgress {
                 id: run_id.to_string(),
                 subagent_type: subagent_type.to_string(),
                 tool_uses: 0,
@@ -830,8 +839,9 @@ impl SubagentRunObserver {
                 latest_activity: activity,
                 status,
                 health,
-            },
-        )));
+            })),
+            "subagent progress tick",
+        );
     }
 }
 
@@ -897,7 +907,11 @@ impl RunObserver for SubagentRunObserver {
             );
         }
         for ev in crate::engine::adapt::child_events_of(run_id, event) {
-            let _ = self.notice_tx.send(BackendNotice::Event(Box::new(ev)));
+            send_notice(
+                &self.notice_tx,
+                BackendNotice::Event(Box::new(ev)),
+                "subagent child event",
+            );
         }
     }
 

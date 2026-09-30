@@ -38,7 +38,7 @@ use manox_harness::core::provider::RequestObserver;
 use tokio::sync::mpsc;
 
 use crate::thread::ThreadEvent;
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Bytes per token in the re-processing estimate. The gate never sees the
 /// provider's tokenizer, so it prices a divergence with the conventional
@@ -440,19 +440,23 @@ impl PrefixStabilityGate {
             sample
         };
         let sample = sample?;
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::PrefixStability {
+        send_notice(
+            &self.notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::PrefixStability {
                 stability_pct: sample.stability_pct,
                 system_changed: sample.system_changed,
                 tools_changed: sample.tools_changed,
-            },
-        )));
+            })),
+            "prefix stability sample",
+        );
         if sample.diverged && sample.attributed.is_none() {
-            let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-                ThreadEvent::CacheInvalidation {
+            send_notice(
+                &self.notice_tx,
+                BackendNotice::Event(Box::new(ThreadEvent::CacheInvalidation {
                     reprocessed_tokens: sample.reprocessed_tokens,
-                },
-            )));
+                })),
+                "prefix cache invalidation",
+            );
         }
         Some(sample)
     }

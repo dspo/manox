@@ -33,7 +33,7 @@ use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::questions::PiAskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
-use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
+use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine, send_notice};
 
 // The engine is split by concern: journal plumbing, tool assembly,
 // session lifecycle, and the run/settle loop. Each child starts from
@@ -896,9 +896,13 @@ async fn run_actor(
                 cold_journal_append(initial_path.clone(), kind, payload).await;
             }
         }
-        let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-            "no model configured — add a provider in Settings"
-        )));
+        send_notice(
+            &notice_tx,
+            BackendNotice::Fatal(anyhow::anyhow!(
+                "no model configured — add a provider in Settings"
+            )),
+            "engine fatal",
+        );
         return;
     };
 
@@ -1029,9 +1033,13 @@ async fn run_actor(
                         registered = ?registered,
                         "pi session build failed"
                     );
-                    let _ = notice_tx.send(BackendNotice::Fatal(anyhow::anyhow!(
-                        "pi session build failed: {err} (registered providers: {registered:?})"
-                    )));
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Fatal(anyhow::anyhow!(
+                            "pi session build failed: {err} (registered providers: {registered:?})"
+                        )),
+                        "engine fatal",
+                    );
                     return;
                 }
             }
@@ -1156,22 +1164,26 @@ async fn run_actor(
             .active_tool_names()
             .unwrap_or_else(|| session.tools()),
     );
-    let _ = notice_tx.send(BackendNotice::Ready(Box::new(ReadyInfo {
-        restored,
-        model: Some(pi_model.clone()),
-        permission_mode,
-        reasoning_effort,
-        browser_suites,
-        plan_mode: restored_state.plan_mode,
-        plan_file: restored_state.plan_file.clone(),
-        plan_review_pending,
-        plan_snapshot,
-        title: restored_title,
-        goal: restored_state.goal.clone(),
-        pinned: restored_state.pinned,
-        archived: restored_state.archived,
-        project: restored_state.project.clone(),
-    })));
+    send_notice(
+        &notice_tx,
+        BackendNotice::Ready(Box::new(ReadyInfo {
+            restored,
+            model: Some(pi_model.clone()),
+            permission_mode,
+            reasoning_effort,
+            browser_suites,
+            plan_mode: restored_state.plan_mode,
+            plan_file: restored_state.plan_file.clone(),
+            plan_review_pending,
+            plan_snapshot,
+            title: restored_title,
+            goal: restored_state.goal.clone(),
+            pinned: restored_state.pinned,
+            archived: restored_state.archived,
+            project: restored_state.project.clone(),
+        })),
+        "engine ready",
+    );
     // A restored session already "started": arm the SessionStart hook latch
     // so the first prompt does not re-fire it.
     if restored {
@@ -1186,9 +1198,13 @@ async fn run_actor(
     let projected_str = projected.to_string_lossy().into_owned();
     if state.last_cwd_note.lock().unwrap().as_deref() != Some(projected_str.as_str()) {
         *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-            path: projected_str,
-        })));
+        send_notice(
+            &notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+                path: projected_str,
+            })),
+            "cwd changed notice",
+        );
     }
     let mut run_steers: Vec<String> = Vec::new();
     let mut shutdown_after_run = false;
@@ -1215,11 +1231,13 @@ async fn run_actor(
                     }
                     if kind != "error" && !loss_notified {
                         loss_notified = true;
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                            ThreadEvent::Error(anyhow::anyhow!(
+                        send_notice(
+                            &notice_tx,
+                            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                                 "journal append permanently failed for `{kind}`: {err:#}; the entry was dropped"
-                            )),
-                        )));
+                            )))),
+                            "error notice",
+                        );
                     }
                 }
             }
@@ -1300,17 +1318,23 @@ async fn run_actor(
                     // be persisted must not run — accepted-without-logged
                     // breaks the journal contract. The facade converges the
                     // turn it optimistically started.
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!(
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                             "submit persistence failed: {err:#}; the turn was not started"
-                        ),
-                    ))));
-                    let _ = notice_tx.send(BackendNotice::Settled {
-                        cancelled: false,
-                        failed: true,
-                        steered: Vec::new(),
-                        stranded: Vec::new(),
-                    });
+                        )))),
+                        "error notice",
+                    );
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Settled {
+                            cancelled: false,
+                            failed: true,
+                            steered: Vec::new(),
+                            stranded: Vec::new(),
+                        },
+                        "run settled",
+                    );
                     continue;
                 }
                 // Plugin lifecycle: `SessionStart` fires once per session,
@@ -1494,11 +1518,13 @@ async fn run_actor(
                     // request behind it. The user got the Error notice, so
                     // re-selecting the mode is the retry.
                     state.plan.set_requested(None);
-                    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-                        anyhow::anyhow!(
+                    send_notice(
+                        &notice_tx,
+                        BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                             "journal append permanently failed for `plan_mode_request`: {err:#}; the selection was dropped — switch the mode again to retry"
-                        ),
-                    ))));
+                        )))),
+                        "error notice",
+                    );
                     continue;
                 }
                 // Idle threads have no boundary to wait for, so the selection
@@ -1588,10 +1614,16 @@ async fn run_actor(
                     {
                         tracing::warn!(%error, "failed to persist Title agent result");
                     } else {
-                        let _ = notice_tx.send(BackendNotice::SessionListDirty);
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                            ThreadEvent::TitleChanged { title },
-                        )));
+                        send_notice(
+                            &notice_tx,
+                            BackendNotice::SessionListDirty,
+                            "session list dirty",
+                        );
+                        send_notice(
+                            &notice_tx,
+                            BackendNotice::Event(Box::new(ThreadEvent::TitleChanged { title })),
+                            "title changed notice",
+                        );
                     }
                 }
             }
@@ -1655,9 +1687,11 @@ async fn run_actor(
                 {
                     tracing::warn!(error = %err, "failed to persist plan-mode exit");
                 }
-                let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                    ThreadEvent::PlanModeChanged { enabled: false },
-                )));
+                send_notice(
+                    &notice_tx,
+                    BackendNotice::Event(Box::new(ThreadEvent::PlanModeChanged { enabled: false })),
+                    "plan mode changed notice",
+                );
                 if compact {
                     match session.compact(compact_instructions.as_deref()).await {
                         Ok(_) => {
@@ -1676,7 +1710,11 @@ async fn run_actor(
                     }
                 }
                 state.running.store(true, Ordering::Relaxed);
-                let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)));
+                send_notice(
+                    &notice_tx,
+                    BackendNotice::Event(Box::new(ThreadEvent::TurnStarted)),
+                    "turn started notice",
+                );
                 let handle = session.handle();
                 let active_session_path = session.path().clone();
                 let journal_appender = session.journal_appender();
@@ -1845,11 +1883,13 @@ async fn run_actor(
                         state.pending_journal.lock().unwrap().push(row);
                     }
                     if kind != "error" {
-                        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-                            ThreadEvent::Error(anyhow::anyhow!(
+                        send_notice(
+                            &notice_tx,
+                            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                                 "journal append permanently failed for `{kind}`: {err:#}; the entry was dropped"
-                            )),
-                        )));
+                            )))),
+                            "error notice",
+                        );
                     }
                 }
             }
@@ -2295,9 +2335,11 @@ async fn apply_plan_mode(
     if let Err(err) = write_plan_file_sidecar(sessions_dir, session_path, &state.plan).await {
         tracing::warn!(error = %err, "failed to persist plan mode");
     }
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PlanModeChanged { enabled },
-    )));
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::PlanModeChanged { enabled })),
+        "plan mode changed notice",
+    );
 }
 
 /// Persist the last plan file from the shared state into the session sidecar
@@ -2337,11 +2379,13 @@ fn resync_plan_state(
 ) {
     plan.set(restored.plan_mode, restored.plan_file.clone());
     plan.set_active_instructions(restored.plan_mode.then(render_plan_instructions).flatten());
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PlanModeChanged {
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::PlanModeChanged {
             enabled: restored.plan_mode,
-        },
-    )));
+        })),
+        "plan mode changed notice",
+    );
 }
 
 /// Persist the permission mode in the session sidecar (wire field
@@ -2450,11 +2494,13 @@ fn resync_approval_mode(
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
 ) {
     state.gate.set_mode(restored.permission_mode);
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PermissionModeChanged {
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::PermissionModeChanged {
             mode: restored.permission_mode,
-        },
-    )));
+        })),
+        "permission mode changed notice",
+    );
 }
 
 /// The observable state of a restored thread (K2), resolved journal-first:
@@ -2830,11 +2876,13 @@ async fn bind_project(
         if let Some(row) = record_journal_loss(&appender, "project_change", &err).await {
             state.pending_journal.lock().unwrap().push(row);
         }
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::Error(anyhow::anyhow!(
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                 "journal append permanently failed for `project_change`: {err:#}; the entry was dropped"
-            )),
-        )));
+            )))),
+            "error notice",
+        );
     }
 }
 
@@ -2860,16 +2908,22 @@ async fn announce_established_cwd(
         if let Some(row) = record_journal_loss(&appender, "cwd_change", &err).await {
             state.pending_journal.lock().unwrap().push(row);
         }
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-            anyhow::anyhow!(
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                 "journal append permanently failed for `cwd_change`: {err:#}; the entry was dropped"
-            ),
-        ))));
+            )))),
+            "error notice",
+        );
     }
     *state.last_cwd_note.lock().unwrap() = Some(projected_str.clone());
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-        path: projected_str,
-    })));
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
+            path: projected_str,
+        })),
+        "cwd changed notice",
+    );
 }
 
 /// The host-driven working-directory switch (`SetCwd`): a real move is
@@ -2883,33 +2937,43 @@ async fn handle_set_cwd(
     path: &Path,
 ) {
     if !path.is_dir() {
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-            anyhow::anyhow!(
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
                 "set_cwd: working directory does not exist: {}",
                 path.display()
-            ),
-        ))));
+            )))),
+            "error notice",
+        );
         return;
     }
     if session.projected_cwd().await == path {
         let path_str = path.to_string_lossy().into_owned();
         *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-            path: path_str,
-        })));
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::CwdChanged { path: path_str })),
+            "cwd changed notice",
+        );
         return;
     }
     if let Err(err) = session.set_session_cwd(path.to_path_buf()).await {
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::Error(
-            anyhow::anyhow!("set_cwd failed: {err:#}"),
-        ))));
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::Error(anyhow::anyhow!(
+                "set_cwd failed: {err:#}"
+            )))),
+            "error notice",
+        );
         return;
     }
     let path_str = path.to_string_lossy().into_owned();
     *state.last_cwd_note.lock().unwrap() = Some(path_str.clone());
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::CwdChanged {
-        path: path_str,
-    })));
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::CwdChanged { path: path_str })),
+        "cwd changed notice",
+    );
 }
 
 /// Apply the user's permission-mode decision (K3): gate + sidecar cache +
@@ -2928,9 +2992,11 @@ async fn apply_permission_mode(
     if let Err(err) = write_approval_mode_sidecar(sessions_dir, session_path, mode).await {
         tracing::warn!(error = %err, "failed to persist approval mode");
     }
-    let _ = notice_tx.send(BackendNotice::Event(Box::new(
-        ThreadEvent::PermissionModeChanged { mode },
-    )));
+    send_notice(
+        notice_tx,
+        BackendNotice::Event(Box::new(ThreadEvent::PermissionModeChanged { mode })),
+        "permission mode changed notice",
+    );
 }
 
 /// Persist the initial-title decision (K3): the sidecar cache write, the
@@ -2946,10 +3012,16 @@ async fn persist_initial_title(
     if let Err(error) = persist_title(sessions_dir, session_path, title.clone()).await {
         tracing::warn!(%error, "failed to persist initial title");
     } else {
-        let _ = notice_tx.send(BackendNotice::SessionListDirty);
-        let _ = notice_tx.send(BackendNotice::Event(Box::new(ThreadEvent::TitleChanged {
-            title,
-        })));
+        send_notice(
+            notice_tx,
+            BackendNotice::SessionListDirty,
+            "session list dirty",
+        );
+        send_notice(
+            notice_tx,
+            BackendNotice::Event(Box::new(ThreadEvent::TitleChanged { title })),
+            "title changed notice",
+        );
     }
 }
 

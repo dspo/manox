@@ -31,7 +31,7 @@ use crate::goal::{
 };
 use crate::goal_driver::{render_goal_blocked_wrapup, render_goal_complete_wrapup};
 use crate::thread::ThreadEvent;
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Incremental fold cache: `seq` is the highest thread-event seq folded.
 #[derive(Debug, Clone, Default)]
@@ -183,9 +183,11 @@ impl GoalBridge {
 
     fn emit(&self, goal: Option<ThreadGoal>) {
         if let Some(tx) = self.notice_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(BackendNotice::Event(Box::new(ThreadEvent::GoalChanged {
-                goal,
-            })));
+            send_notice(
+                tx,
+                BackendNotice::Event(Box::new(ThreadEvent::GoalChanged { goal })),
+                "session goal changed",
+            );
         }
     }
 

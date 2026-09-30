@@ -139,6 +139,11 @@ impl Cursor {
 /// lag-resync: asks, tool calls/results, plan reviews, lifecycle and config
 /// facts. Delta rows (streamed text/thinking/output chunks) are consciously
 /// dropped from a gap — replaying them at flood rate re-lags the bridge.
+/// `BackgroundTask` and `SubagentProgress` are NOT droppable: they are the
+/// sole state carriers of the work channel's registry views (upsert-by-key,
+/// no other repair path), and both are lifecycle/state-transition rows, not
+/// per-chunk floods — dropping one leaves the task or agent frozen at its
+/// previous status for every live subscriber.
 fn is_state_bearing(event: &JournalWireEvent) -> bool {
     !matches!(
         event,
@@ -147,8 +152,6 @@ fn is_state_bearing(event: &JournalWireEvent) -> bool {
             | JournalWireEvent::ToolOutputChunk { .. }
             | JournalWireEvent::Stop { .. }
             | JournalWireEvent::SubagentChild { .. }
-            | JournalWireEvent::SubagentProgress { .. }
-            | JournalWireEvent::BackgroundTask { .. }
     )
 }
 
@@ -158,11 +161,6 @@ struct Seeded {
     session: SessionState,
     chat: ChatState,
     tail: u64,
-    /// The `x-manox*` channel state this journal folds to, by channel URI.
-    /// The AHP reducers do not fold extension actions, so this is what a
-    /// subscriber to a declared extension channel is answered with instead of
-    /// silence.
-    extensions: HashMap<String, manox_ahp::ext::XManoxState>,
 }
 
 /// The notification carrying an extension channel's baseline state.
@@ -336,19 +334,9 @@ impl RuntimeBackend {
         // A session created moments ago has no journal line yet: it is an empty
         // chat, not an unknown one. Subscribing to a brand-new session must work,
         // and the bridge picks its entries up from seq 0 onward.
-        let (chat, tail, extensions) = match fold_journal(session_id, &thread_id).await {
-            Some(fold) => {
-                let mut extensions: HashMap<String, manox_ahp::ext::XManoxState> = HashMap::new();
-                for (channel, action) in &fold.extension_actions {
-                    let Ok(value) = serde_json::to_value(action) else {
-                        continue;
-                    };
-                    let state = extensions.entry(channel.clone()).or_default();
-                    let _ = manox_ahp::ext::reducer::apply(state, &value);
-                }
-                (fold.chat, fold.tail, extensions)
-            }
-            None => (chat::initial(session_id), 0, HashMap::new()),
+        let (chat, tail) = match fold_journal(session_id, &thread_id).await {
+            Some(fold) => (fold.chat, fold.tail),
+            None => (chat::initial(session_id), 0),
         };
         // The session half needs the same tolerance as the chat half, for the
         // same reason: a brand-new session has no store row until a list
@@ -366,7 +354,6 @@ impl RuntimeBackend {
             session: session_state,
             chat,
             tail,
-            extensions,
         });
         self.seeds
             .lock()
@@ -1828,7 +1815,12 @@ impl Backend for RuntimeBackend {
                 if tag.get("type").and_then(Value::as_str)
                     == Some(manox_ahp::ext::actions::PINNED_CHANGED) =>
             {
-                let Some(session_id) = session::id(channel) else {
+                // A client answers where it observes: the host emits the pin
+                // row on the thread channel, and its native archived sibling
+                // rides the session channel — both are legal dispatch homes.
+                let session_id = session::id(channel)
+                    .or_else(|| channel.strip_prefix(manox_ahp::ext::channels::THREAD));
+                let Some(session_id) = session_id else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
                 let Some(pinned) = tag.get("pinned").and_then(Value::as_bool) else {
@@ -1846,7 +1838,9 @@ impl Backend for RuntimeBackend {
                 if tag.get("type").and_then(Value::as_str)
                     == Some(manox_ahp::ext::actions::ORDER_CHANGED) =>
             {
-                let Some(session_id) = session::id(channel) else {
+                let session_id = session::id(channel)
+                    .or_else(|| channel.strip_prefix(manox_ahp::ext::channels::THREAD));
+                let Some(session_id) = session_id else {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
                 // `before: null` means "to the head of its partition", which is
@@ -2057,19 +2051,15 @@ impl Backend for RuntimeBackend {
                     .split('/')
                     .next()
                     .filter(|id| !id.is_empty())?;
-                match block_on(self.seeded(session_id)) {
-                    Some(seeded) => seeded
-                        .extensions
-                        .get(channel)
-                        .map(|state| serde_json::to_value(state).unwrap_or_else(|_| Value::Null))
-                        // A declared channel with no rows yet answers its (empty)
-                        // state, not `null`: the client replaces what it holds,
-                        // and `null` would claim the channel says nothing at all.
-                        .unwrap_or_else(|| serde_json::json!({})),
-                    // An unknown session is not a served channel: answering an
-                    // empty baseline would claim state for a session that has none.
-                    None => return None,
-                }
+                // Folded fresh and thread-scoped, never from the seed cache:
+                // the cache is built once per process and per single journal,
+                // while a reconnecting client must see every member
+                // session's rows and the ones that landed after its last
+                // connect (the envelope's current watermark would bless a
+                // stale fold as truth). A thread with no rows yet answers its
+                // (empty) state, not `null`: the client replaces what it
+                // holds, and `null` would claim the channel says nothing.
+                block_on(super::extension_channel_baseline(channel, session_id))
             } else {
                 self.catalogue_baseline(channel)
             };

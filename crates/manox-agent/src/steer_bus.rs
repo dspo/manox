@@ -15,7 +15,7 @@ use manox_harness::tool::{AgentTool, AgentToolResult, ToolError};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::thread_engine::BackendNotice;
+use crate::thread_engine::{BackendNotice, send_notice};
 
 // ── AgentBus ─────────────────────────────────────────────────────────────
 
@@ -145,10 +145,14 @@ impl AgentBus {
     pub fn abort_all_members(&self) {
         let members: Vec<String> = locked(&self.spawned_members).iter().cloned().collect();
         for thread_id in members {
-            let _ = self.notice_tx.send(BackendNotice::BusRequest {
-                op: BusOp::AbortMember { thread_id },
-                responder: None,
-            });
+            send_notice(
+                &self.notice_tx,
+                BackendNotice::BusRequest {
+                    op: BusOp::AbortMember { thread_id },
+                    responder: None,
+                },
+                "steer bus request",
+            );
         }
     }
 

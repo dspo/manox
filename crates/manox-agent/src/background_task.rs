@@ -400,12 +400,28 @@ impl BackgroundTask {
     /// window would let a sampled `Running` snapshot land after a terminal
     /// one and flip the card backwards.
     fn emit_snapshot(&self, task_id: &TaskId) {
-        let s = self.state.lock().expect("task state poisoned");
-        let snapshot = build_snapshot(&s, task_id);
-        if let Some(tx) = s.notifier.as_ref() {
-            let _ = tx.send(BackendNotice::Event(Box::new(
+        let send_result = {
+            let s = self.state.lock().expect("task state poisoned");
+            // Building the snapshot walks the whole event ring; skip it when
+            // no notifier is registered to receive the result.
+            let Some(tx) = s.notifier.as_ref() else {
+                return;
+            };
+            let snapshot = build_snapshot(&s, task_id);
+            tx.send(BackendNotice::Event(Box::new(
                 ThreadEvent::BackgroundTaskUpdated { snapshot },
-            )));
+            )))
+        };
+        if send_result.is_err() {
+            // A closed channel means the session is tearing down; losing the
+            // update is correct there, and debug keeps it diagnosable. Logged
+            // outside the state lock: the drain/observer path must not hold
+            // the task while writing to a tracing subscriber.
+            tracing::debug!(
+                target: "tasks",
+                task_id = %task_id,
+                "notice channel closed; card snapshot dropped"
+            );
         }
     }
 

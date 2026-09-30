@@ -37,6 +37,13 @@ pub enum Target {
     Work,
     /// `x-manox-metrics:/<chat-id>` — aggregated conversation metrics.
     Metrics,
+    /// `x-manox-thread:/<session-id>` — pin, label, session info, leaf cursor.
+    ///
+    /// These rows have no AHP-native slot and only fold on an extension
+    /// channel: emitted on `ahp-session:/<id>` they are `StateAction::Unknown`
+    /// to the session reducer, land in the fold's session bucket, and are
+    /// unreachable from the extension state and its baselines.
+    Thread,
 }
 
 impl Target {
@@ -48,6 +55,7 @@ impl Target {
             Self::Plan => format!("{}{chat_id}", crate::ext::channels::PLAN),
             Self::Work => format!("{}{session_id}", crate::ext::channels::WORK),
             Self::Metrics => format!("{}{chat_id}", crate::ext::channels::METRICS),
+            Self::Thread => format!("{}{session_id}", crate::ext::channels::THREAD),
         }
     }
 }
@@ -81,10 +89,12 @@ pub fn target_of(event: &JournalWireEvent) -> Target {
         | E::PermissionModeChange { .. }
         | E::ReasoningEffortChange { .. }
         | E::Title { .. }
-        | E::PinnedArchived { .. }
-        | E::Label { .. }
-        | E::SessionInfo { .. }
-        | E::Leaf { .. } => Target::Session,
+        // `PinnedArchived` lands here for its native archived half; the
+        // extension pin half re-targets the thread channel at its emit site.
+        | E::PinnedArchived { .. } => Target::Session,
+        // Thread rows: the extension face is their only face — on the session
+        // channel no fold ever consumed them (see [`Target::Thread`]).
+        E::Label { .. } | E::SessionInfo { .. } | E::Leaf { .. } => Target::Thread,
         // ── plan ─────────────────────────────────────────────────────
         E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
         // ── extension work surface ───────────────────────────────────
@@ -166,6 +176,24 @@ mod tests {
                 },
                 Target::Metrics,
             ),
+            // Thread rows fold only on an extension channel; this pins them
+            // off the session channel for good.
+            (
+                JournalWireEvent::Label { label: "x".into() },
+                Target::Thread,
+            ),
+            (
+                JournalWireEvent::SessionInfo {
+                    data: serde_json::json!({}),
+                },
+                Target::Thread,
+            ),
+            (
+                JournalWireEvent::Leaf {
+                    target_id: "e-9".into(),
+                },
+                Target::Thread,
+            ),
         ];
         for (event, expected) in samples {
             assert_eq!(target_of(&event), expected, "for {event:?}");
@@ -179,5 +207,6 @@ mod tests {
         assert_eq!(Target::Plan.uri("c-1", "s-1"), "x-manox-plan:/c-1");
         assert_eq!(Target::Work.uri("c-1", "s-1"), "x-manox-work:/s-1");
         assert_eq!(Target::Metrics.uri("c-1", "s-1"), "x-manox-metrics:/c-1");
+        assert_eq!(Target::Thread.uri("c-1", "s-1"), "x-manox-thread:/s-1");
     }
 }
