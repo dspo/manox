@@ -303,7 +303,8 @@ pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_journal::Turn
             manox_harness::session::SessionTreeEntry::TurnStart { owner: stamped, .. } => {
                 // The single manual field mapping between the harness's local
                 // TurnOwner mirror and the journal's (the W4 conversion
-                // point) — guarded by `owner_survives_the_legacy_translation`
+                // point) — guarded by
+                // `the_legacy_turn_start_translation_carries_the_owner_pid`
                 // in translate.rs tests.
                 owner = stamped.map(|o| manox_journal::TurnOwner { pid: o.pid });
             }
@@ -819,6 +820,82 @@ mod baseline_tests {
 
             let _ = std::fs::remove_file(sessions.join("fresh_s.jsonl"));
             let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// The `x-manox/openTurn` query face: the last stamped `turnStart`
+    /// answers, any later `turnFinish` clears it, and a session with no
+    /// journal at all answers none — the conservative side a reader never
+    /// auto-cancels on.
+    #[test]
+    fn the_open_turn_owner_reads_the_last_stamp_and_clears_on_finish() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            let path = sessions.join("open_turn_s.jsonl");
+            let _ = std::fs::remove_file(&path);
+            let at = chrono::Utc::now();
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &path,
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "open_turn_s".into(),
+                    cwd: "/".into(),
+                    created_at: at,
+                    parent_session_path: None,
+                    metadata: Some(serde_json::json!({ "thread": "T-open" })),
+                },
+            )
+            .await
+            .unwrap();
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::TurnStart {
+                    id: "e-ts".into(),
+                    parent_id: None,
+                    timestamp: at,
+                    owner: Some(manox_harness::session::TurnOwner { pid: 4242 }),
+                })
+                .await
+                .unwrap();
+            drop(storage);
+
+            let owner = open_turn_owner("open_turn_s").await;
+            assert_eq!(
+                owner.map(|owner| owner.pid),
+                Some(4242),
+                "the last turnStart's stamp answers the query"
+            );
+
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(&path)
+                .await
+                .unwrap();
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::TurnFinish {
+                    id: "e-tf".into(),
+                    parent_id: Some("e-ts".into()),
+                    timestamp: chrono::Utc::now(),
+                    cancelled: false,
+                    failed: false,
+                    stranded_steer_ids: Vec::new(),
+                })
+                .await
+                .unwrap();
+            drop(storage);
+
+            assert_eq!(
+                open_turn_owner("open_turn_s").await,
+                None,
+                "a later turnFinish clears the owner"
+            );
+            assert_eq!(
+                open_turn_owner("no_such_session").await,
+                None,
+                "a session with no journal answers no owner"
+            );
+
+            let _ = std::fs::remove_file(&path);
         })
     }
 }

@@ -107,7 +107,11 @@ impl TurnOwner {
 
     /// Whether the owning process is still alive. A reused pid reads as
     /// alive — the conservative side: the turn is treated as live and left
-    /// for a deliberate manual settle, never auto-cancelled.
+    /// for a deliberate manual settle, never auto-cancelled. An
+    /// out-of-range pid (`> i32::MAX`, only possible from a corrupt or
+    /// forged row) casts to a negative pid_t, where `kill` reads as a
+    /// process-group query; signal 0 is harmless there and the answer again
+    /// reads alive — the same conservative side.
     pub fn is_alive(&self) -> bool {
         let result = unsafe { libc::kill(self.pid as libc::pid_t, 0) };
         if result == 0 {
