@@ -86,6 +86,44 @@ pub struct ThreadHeader {
     pub created_at: String,
 }
 
+/// The process that started a turn, stamped on the `turnStart` row (§C.2
+/// lifecycle group). The journal is shared across processes (desktop host, cx
+/// CLI), so a reader of an open turn needs this to tell a dead turn — owning
+/// process gone, safe to settle on its behalf — from one another process is
+/// executing right now (never auto-cancelled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnOwner {
+    pub pid: u32,
+}
+
+impl TurnOwner {
+    /// The stamp for a turn this process is starting.
+    pub fn for_current_process() -> Self {
+        Self {
+            pid: std::process::id(),
+        }
+    }
+
+    /// Whether the owning process is still alive. A reused pid reads as
+    /// alive — the conservative side: the turn is treated as live and left
+    /// for a deliberate manual settle, never auto-cancelled. An
+    /// out-of-range pid (`> i32::MAX`, only possible from a corrupt or
+    /// forged row) casts to a negative pid_t, where `kill` reads as a
+    /// process-group query; signal 0 is harmless there and the answer again
+    /// reads alive — the same conservative side.
+    pub fn is_alive(&self) -> bool {
+        let result = unsafe { libc::kill(self.pid as libc::pid_t, 0) };
+        if result == 0 {
+            true
+        } else {
+            // EPERM means the process exists but is owned by someone else —
+            // alive. Only ESRCH (no such process) reads as dead.
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+}
+
 /// One journal wire event: the §C.2 entry vocabulary, verbatim. Variant
 /// payload fields match the §C.2 table; the row group is in each variant's
 /// doc comment.
@@ -142,7 +180,15 @@ pub enum JournalWireEvent {
     },
     // ── lifecycle ───────────────────────────────────────────────────
     /// A model turn started (drives the `running` projection's true edge).
-    TurnStart,
+    /// `owner` stamps the process that started the turn, so a reader of the
+    /// shared journal can tell a dead turn (owning process gone — safe to
+    /// settle on its behalf) from one another process is executing right now
+    /// (never auto-cancelled). Rows from before the stamp, and rows whose pid
+    /// was reused since, read `None`/alive — the conservative side.
+    TurnStart {
+        #[serde(default)]
+        owner: Option<TurnOwner>,
+    },
     /// A model turn finished. `cancelled` / `failed` classify the exit;
     /// `strandedSteerIds` lists steer messages that never injected.
     TurnFinish {
@@ -400,5 +446,46 @@ mod tests {
         assert_eq!(json["to"], "DeepSeek-anthropic/deepseek-chat");
         let back: JournalWireEvent = serde_json::from_value(json).unwrap();
         assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn turn_start_round_trips_the_owner_and_reads_old_rows_as_none() {
+        let stamped = JournalWireEvent::TurnStart {
+            owner: Some(TurnOwner { pid: 4242 }),
+        };
+        let json = serde_json::to_value(&stamped).unwrap();
+        assert_eq!(json["owner"]["pid"], serde_json::json!(4242));
+        let back: JournalWireEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(stamped, back);
+
+        // Rows written before the stamp carry no owner: they parse with
+        // `None`, and a reader treats such a turn conservatively (never
+        // auto-cancelled).
+        let unstamped: JournalWireEvent =
+            serde_json::from_value(serde_json::json!({ "type": "turnStart" }))
+                .expect("a pre-stamp row parses");
+        assert_eq!(
+            unstamped,
+            JournalWireEvent::TurnStart { owner: None },
+            "an old row reads as unstamped"
+        );
+    }
+
+    #[test]
+    fn the_current_process_reads_alive_and_a_reaped_one_dead() {
+        assert!(TurnOwner::for_current_process().is_alive());
+
+        // A child that has been waited on is reaped: its pid is genuinely
+        // gone (ESRCH), deterministically — no live-process race. A reused
+        // pid instead reads alive, the conservative side: the turn is left
+        // for a deliberate manual settle, never auto-cancelled.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("a trivial child spawns");
+        child.wait().expect("the child is reaped");
+        assert!(
+            !TurnOwner { pid: child.id() }.is_alive(),
+            "a reaped process reads as dead"
+        );
     }
 }

@@ -36,7 +36,7 @@ fn scripted_journal() -> Vec<JournalWireEntry> {
             origin_rpc: Some("rpc-1".to_string()),
             display: None,
         },
-        TurnStart,
+        TurnStart { owner: None },
         AgentTextDelta {
             s: "Running ".to_string(),
         },
@@ -324,7 +324,7 @@ fn mid_run_steer_journal() -> Vec<JournalWireEntry> {
             origin_rpc: Some("rpc-submit".to_string()),
             display: None,
         },
-        TurnStart,
+        TurnStart { owner: None },
         AgentTextDelta {
             s: "Starting.".to_string(),
         },
@@ -473,7 +473,7 @@ fn a_steer_is_not_replayed_by_a_later_turn() {
         id: "sentry-99".to_string(),
         parent_id: Some("sentry-5".to_string()),
         timestamp: "2026-09-23T01:01:00.000Z".to_string(),
-        event: TurnStart,
+        event: TurnStart { owner: None },
     };
     for emitted in translator.on_entry("c-1", "s-1", &next) {
         ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
@@ -710,7 +710,7 @@ async fn a_plan_proposal_reaches_a_subscribed_client() {
     let mut translator = Translator::new();
     let mut published = 0usize;
     for (seq, event) in [
-        TurnStart,
+        TurnStart { owner: None },
         PlanReview {
             state: "proposed".to_string(),
             plan_file: Some("/plans/demo-plan.md".to_string()),

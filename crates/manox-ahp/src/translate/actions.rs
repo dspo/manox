@@ -559,7 +559,7 @@ impl Translator {
                 );
             }
             // ── turn lifecycle ───────────────────────────────────────────
-            JournalWireEvent::TurnStart => self.on_turn_start(&chat, entry, &mut out),
+            JournalWireEvent::TurnStart { .. } => self.on_turn_start(&chat, entry, &mut out),
             JournalWireEvent::TurnFinish {
                 cancelled,
                 failed,
@@ -2654,7 +2654,7 @@ mod turn_message_tests {
         };
         let mut out = Vec::new();
         for entry in [
-            row(1, JournalWireEvent::TurnStart),
+            row(1, JournalWireEvent::TurnStart { owner: None }),
             row(
                 2,
                 JournalWireEvent::Message {
@@ -2680,6 +2680,45 @@ mod turn_message_tests {
                     if p.kind == PendingMessageKind::Steering
             )),
             "the initiating row is not a steer: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_turn_started_meta_stays_owner_free() {
+        // The open-turn owner is delivered on the `x-manox/openTurn` query
+        // face (the fold and the live bridge never replay turnStarted meta —
+        // an attach-time reader could not reach it there), so the meta stays
+        // the plain entry id regardless of the row's owner stamp.
+        let mut t = Translator::new();
+        let row = |seq: u64, event: JournalWireEvent| JournalWireEntry {
+            seq,
+            id: format!("e-{seq}"),
+            parent_id: None,
+            timestamp: "2026-09-29T00:00:00.000Z".into(),
+            event,
+        };
+        let mut out = Vec::new();
+        out.extend(t.on_entry(
+            "c-1",
+            "s-1",
+            &row(
+                1,
+                JournalWireEvent::TurnStart {
+                    owner: Some(manox_journal::TurnOwner { pid: 4242 }),
+                },
+            ),
+        ));
+        let meta = out
+            .iter()
+            .find_map(|e| match &e.action {
+                StateAction::ChatTurnStarted(a) => a.meta.as_ref(),
+                _ => None,
+            })
+            .expect("turnStarted carries meta");
+        assert_eq!(meta["x-manox"]["entryId"], serde_json::json!("e-1"));
+        assert!(
+            meta["x-manox"].get("turnOwner").is_none(),
+            "the meta must not carry the owner: {meta:?}"
         );
     }
 }

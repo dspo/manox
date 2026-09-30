@@ -155,6 +155,11 @@ pub mod commands {
     pub const PLAN_EXECUTE: &str = "x-manox/planExecute";
     /// Set or clear the session goal.
     pub const GOAL: &str = "x-manox/goal";
+    /// Ask for the open turn's owning process (pid), or none: a client that
+    /// reopens a shared-journal thread uses the owner's liveness to settle a
+    /// dead turn on its behalf without ever touching one another process is
+    /// running. The pid source is the `turnStart` row's `owner` stamp.
+    pub const OPEN_TURN: &str = "x-manox/openTurn";
 
     /// Every command this build **serves**, which is what [`declaration`]
     /// advertises.
@@ -178,7 +183,7 @@ pub mod commands {
     /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
     ///   v2 waterfall's concept; AHP settles through channel actions;
     /// - process shutdown — a host-lifecycle concern, not a session one.
-    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL];
+    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL, OPEN_TURN];
 }
 
 /// Client-contributed session tools: an AHP-native action, not an extension

@@ -84,7 +84,11 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
             data: note.clone(),
         },
         // ── lifecycle ───────────────────────────────────────────────────
-        SessionTreeEntry::TurnStart { .. } => W::TurnStart,
+        // The owner stamp survives the legacy replay path too: a turn
+        // replayed from an old jsonl carries its owner (or none) unchanged.
+        SessionTreeEntry::TurnStart { owner, .. } => W::TurnStart {
+            owner: owner.map(|o| manox_journal::TurnOwner { pid: o.pid }),
+        },
         SessionTreeEntry::TurnFinish {
             cancelled,
             failed,
@@ -385,6 +389,34 @@ fn message_value(message: &AgentMessage) -> Vec<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_legacy_turn_start_translation_carries_the_owner_pid() {
+        // W4 guard: the harness's local TurnOwner mirror and the journal's
+        // TurnOwner are two definitions — this conversion is their single
+        // manual field mapping, so a field added to one side without the
+        // other fails right here.
+        let entry: SessionTreeEntry = serde_json::from_value(serde_json::json!({
+            "type": "turn_start",
+            "id": "e-1",
+            "parentId": null,
+            "timestamp": "2026-01-01T00:00:00Z",
+            "owner": { "pid": 4242 },
+        }))
+        .expect("a stamped turn start parses");
+        let wire = wire_entry(1, &entry).expect("turn start translates");
+        match &wire.event {
+            JournalWireEvent::TurnStart { owner } => {
+                assert_eq!(
+                    owner.as_ref().expect("the owner survives").pid,
+                    4242,
+                    "the owner pid must survive the legacy translation"
+                );
+            }
+            other => panic!("unexpected wire event: {other:?}"),
+        }
+    }
+
     use manox_agent::background_task::{TaskKind, TaskSnapshot, TaskStatus};
     use manox_ahp::ext::XManoxState;
     use manox_ahp::ext::reducer::{self, Outcome};

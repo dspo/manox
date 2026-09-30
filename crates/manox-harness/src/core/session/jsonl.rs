@@ -3281,6 +3281,7 @@ mod tests {
                 id: id.into(),
                 parent_id: Some(parent.into()),
                 timestamp: chrono::Utc::now(),
+                owner: None,
             }
         }
 
