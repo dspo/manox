@@ -2224,7 +2224,14 @@ impl Thread {
         args: &str,
         ui: Option<MessageUiMetadata>,
     ) -> bool {
-        let Some(cmd) = crate::command::global().get(name).cloned() else {
+        // Global registry first (builtin < user < plugin-namespaced); a miss
+        // falls through to the project layer under the thread's cwd, read
+        // fresh per dispatch.
+        let cmd = crate::command::global()
+            .get(name)
+            .cloned()
+            .or_else(|| crate::command::resolve_project(&self.cwd, name).map(Arc::new));
+        let Some(cmd) = cmd else {
             return false;
         };
         self.insert_slash_turn(cmd.render(args), ui);
@@ -2233,9 +2240,17 @@ impl Thread {
 
     /// Run a skill turn: inject the named skill's body (description + body,
     /// the user's args appended) as the user message, mirroring the retired
-    /// manox harness's `submit_skill`.
+    /// manox harness's `submit_skill`. The project layer under the thread's
+    /// cwd resolves on a registry miss; `disable-model-invocation` skills
+    /// stay reachable here — the flag hides them from the model, not from
+    /// the user's slash.
     pub fn submit_skill(&mut self, key: &str, args: &str, ui: Option<MessageUiMetadata>) -> bool {
-        let Some(skill) = crate::skill::global().get(key).cloned() else {
+        let skill = crate::skill::global()
+            .get(key)
+            .cloned()
+            .map(|arc| (*arc).clone())
+            .or_else(|| crate::skill::resolve_project(&self.cwd, key));
+        let Some(skill) = skill else {
             return false;
         };
         let rendered = crate::prompt::render(

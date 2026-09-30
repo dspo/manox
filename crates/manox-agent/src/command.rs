@@ -172,6 +172,24 @@ fn load_command_file(path: &Path, fallback_name: String) -> Result<CommandDefini
     Ok(build_command(parsed, fallback_name, path.to_path_buf()))
 }
 
+/// Resolve one project-level slash command on demand:
+/// `<cwd>/.claude/commands/<name>.md` — Claude Code's project-scope command
+/// convention. Project commands are cwd-scoped by nature, so they are read
+/// fresh at dispatch when the process-global registry misses, instead of
+/// being loaded at startup. `plugin:`-qualified and path-y names never
+/// resolve here; the global registry (builtin < user) keeps precedence for
+/// names it already knows.
+pub fn resolve_project(cwd: &Path, name: &str) -> Option<CommandDefinition> {
+    if name.is_empty() || name.contains(':') || name.contains("..") {
+        return None;
+    }
+    let path = cwd
+        .join(".claude")
+        .join("commands")
+        .join(format!("{name}.md"));
+    load_command_file(&path, name.to_string()).ok()
+}
+
 /// Assemble a [`CommandDefinition`] from a parsed frontmatter file, an explicit
 /// name, and a source path. Shared by [`load_command_file`] (disk-sourced) and
 /// [`parse_builtin_command`] (embedded). The `name` is the filename stem for
@@ -366,5 +384,25 @@ mod builtin_tests {
             registry.get("healthz").is_some(),
             "CommandRegistry::load must include the builtin healthz command"
         );
+    }
+
+    #[test]
+    fn resolve_project_reads_cwd_scoped_command() {
+        let proj = tempfile::tempdir().unwrap();
+        let dir = proj.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("tutor.md"),
+            "---\ndescription: Tutor\nargument-hint: <topic>\n---\nTour $ARGUMENTS",
+        )
+        .unwrap();
+        let cmd = resolve_project(proj.path(), "tutor").unwrap();
+        assert_eq!(cmd.name, "tutor");
+        assert_eq!(cmd.description, "Tutor");
+        assert!(cmd.render("rust").contains("Tour rust"));
+
+        // Missing file and namespaced names never resolve project-side.
+        assert!(resolve_project(proj.path(), "absent").is_none());
+        assert!(resolve_project(proj.path(), "gitwork:deliver").is_none());
     }
 }
