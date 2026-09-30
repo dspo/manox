@@ -5,12 +5,13 @@
 //!
 //! This is the host's single source of truth for task cards: the session
 //! producers report their lifecycle straight into it through `attach`
-//! (the host `TaskObserver`), Sailors register directly, and the
-//! observer-driven paths re-emit each change as a
-//! `ThreadEvent::BackgroundTaskUpdated` snapshot. The stop path's own
-//! synchronous terminal push is the one exception — it settles the
-//! registry without a snapshot; the producers' settlements carry the
-//! notices.
+//! (the host `TaskObserver`), Sailors register directly, and every state
+//! change a path can observe is re-emitted as a
+//! `ThreadEvent::BackgroundTaskUpdated` snapshot — producer emissions via
+//! the observer, and the stop path's own synchronous terminal push via the
+//! per-task notifier the observer registers. Output snapshots are
+//! throttled (every fifth line), so "each change" means each lifecycle
+//! change plus sampled output.
 //!
 //! Settlement is first-wins: `push_terminal` transitions a Running/Stopping
 //! task, so duplicate terminal reports from a
@@ -164,6 +165,11 @@ struct TaskState {
     /// The hook that actually stops the underlying pi-side work. Registered
     /// by whoever proxies the task (monitor manager / background manager).
     on_stop: Option<OnStopHook>,
+    /// Notice sink for snapshots this registry pushes itself (the stop
+    /// path's synchronous terminal status). Producer-driven changes emit
+    /// through the observer instead; tasks registered without an observer
+    /// (Sailors) deliver their own notices.
+    notifier: Option<mpsc::UnboundedSender<BackendNotice>>,
     exit_code: Option<i32>,
     /// Truncated failure/stderr summary.
     failure_summary: Option<String>,
@@ -191,6 +197,7 @@ impl TaskState {
             exited_at: None,
             exited_at_ms: None,
             on_stop: None,
+            notifier: None,
             exit_code: None,
             failure_summary: None,
         }
@@ -374,6 +381,29 @@ impl BackgroundTask {
     /// proxy.
     pub fn set_on_stop(&self, on_stop: OnStopHook) {
         self.state.lock().expect("task state poisoned").on_stop = Some(on_stop);
+    }
+
+    /// Register the notice sink for snapshots this registry pushes itself
+    /// (the stop path's synchronous terminal status). Called by the host
+    /// observer at proxy registration.
+    pub fn set_notifier(&self, notifier: mpsc::UnboundedSender<BackendNotice>) {
+        self.state.lock().expect("task state poisoned").notifier = Some(notifier);
+    }
+
+    /// Emit a snapshot through the registered notifier, if any.
+    fn emit_snapshot(&self, task_id: &TaskId) {
+        let snapshot = self.snapshot(task_id);
+        if let Some(tx) = self
+            .state
+            .lock()
+            .expect("task state poisoned")
+            .notifier
+            .as_ref()
+        {
+            let _ = tx.send(BackendNotice::Event(Box::new(
+                ThreadEvent::BackgroundTaskUpdated { snapshot },
+            )));
+        }
     }
 
     pub fn owner_thread_id(&self) -> String {
@@ -633,6 +663,7 @@ impl manox_harness::tasks::TaskObserver for HostTaskObserver {
             CancellationToken::new(),
         );
         proxy.set_on_stop(Arc::new(move |_, cause| stop(cause)));
+        proxy.set_notifier(self.notice_tx.clone());
         self.emit_snapshot(&proxy, id);
     }
 
@@ -747,7 +778,11 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
 
     // The pi-side producers normally settle the task themselves through their
     // own settlement path; this fallback covers hooks that cannot report.
+    // Either way the terminal status must reach the cards: the notifier (a
+    // host-side copy of the observer's notice channel) emits the snapshot
+    // even when the producer side is gone.
     task.push_terminal(&TaskId(id.to_string()), terminal);
+    task.emit_snapshot(&TaskId(id.to_string()));
 
     Ok(())
 }
@@ -1039,6 +1074,49 @@ mod tests {
         stop(&tid).await.ok();
         assert_eq!(proxy.status(), TaskStatus::Stopped);
         remove(&TaskId(tid.clone()));
+    }
+
+    /// The stop path's own terminal push must reach the cards: stopping a
+    /// proxy emits a terminal snapshot through the notifier even if the
+    /// producer side (whose observer owns the other notice path) is gone.
+    /// This is the host half of the "card stuck on Running" guard.
+    #[tokio::test]
+    async fn host_stop_emits_terminal_snapshot() {
+        let id = TaskId("notified_stop".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-notify".into(),
+            "watch".into(),
+            CancellationToken::new(),
+        );
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        proxy.set_notifier(notice_tx);
+
+        stop(&id.0).await.expect("stop succeeds");
+        assert_eq!(proxy.status(), TaskStatus::Stopped);
+
+        let mut saw_terminal = false;
+        for _ in 0..50 {
+            match notice_rx.try_recv() {
+                Ok(BackendNotice::Event(ev)) => {
+                    if let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev
+                        && snapshot.task_id == id.0
+                        && snapshot.status == TaskStatus::Stopped
+                    {
+                        saw_terminal = true;
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            saw_terminal,
+            "the host stop path must emit a terminal snapshot"
+        );
+        remove(&id);
     }
 
     #[test]
