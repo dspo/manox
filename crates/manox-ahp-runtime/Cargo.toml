@@ -44,4 +44,5 @@ ws-gateway = ["dep:axum", "manox-ahp/axum-ws"]
 
 [dev-dependencies]
 manox-terminal.workspace = true
+manox-agent = { workspace = true, features = ["test-support"] }
 tempfile = "3"
