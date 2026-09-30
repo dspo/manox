@@ -181,15 +181,27 @@ impl SubagentRuntime {
                 started_at: Instant::now(),
             },
         );
-        let _ = self.events_tx.send(Event::Start(RunInfo {
-            run_id: run_id.clone(),
-            provider: provider.to_string(),
-            label: label.clone(),
-            kind: request_kind,
-            model: request_model,
-            local: true,
-            budgets: resolved_budgets,
-        }));
+        if self
+            .events_tx
+            .send(Event::Start(RunInfo {
+                run_id: run_id.clone(),
+                provider: provider.to_string(),
+                label: label.clone(),
+                kind: request_kind,
+                model: request_model,
+                local: true,
+                budgets: resolved_budgets,
+            }))
+            .is_err()
+        {
+            // An unsubscribed observation channel is normal, not an error —
+            // debug keeps a dropped lifecycle event diagnosable.
+            tracing::debug!(
+                target: "tasks",
+                id = %run_id,
+                "no start observers subscribed; event dropped"
+            );
+        }
         // Settle watcher: close the run table entry and publish the paired
         // end event. The run's own consumers await `run.result` separately.
         let watcher_runtime = Arc::downgrade(self);
@@ -201,14 +213,24 @@ impl SubagentRuntime {
             let result = watcher_result.await;
             if let Some(runtime) = watcher_runtime.upgrade() {
                 mutex(&runtime.runs).remove(&watcher_id);
-                let _ = runtime.events_tx.send(Event::End(RunEndInfo {
-                    run_id: watcher_id,
-                    provider: watcher_provider,
-                    label: watcher_label,
-                    local: true,
-                    stop_reason: result.stop_reason.clone(),
-                    output: result.output.clone(),
-                }));
+                if runtime
+                    .events_tx
+                    .send(Event::End(RunEndInfo {
+                        run_id: watcher_id.clone(),
+                        provider: watcher_provider,
+                        label: watcher_label,
+                        local: true,
+                        stop_reason: result.stop_reason.clone(),
+                        output: result.output.clone(),
+                    }))
+                    .is_err()
+                {
+                    tracing::debug!(
+                        target: "tasks",
+                        id = %watcher_id,
+                        "no end observers subscribed; event dropped"
+                    );
+                }
             }
         });
         Ok(run)

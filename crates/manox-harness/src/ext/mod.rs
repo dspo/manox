@@ -36,3 +36,93 @@ pub(crate) fn next_task_ordinal() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::ext::bash::background::BackgroundRegistry;
+    use crate::ext::monitor::WsMonitorRegistry;
+    use std::path::Path;
+    use tokio_util::sync::CancellationToken;
+
+    /// Two ids sharing an ordinal suffix would alias one entry in the host's
+    /// process-global task registry. This pins the #829 fix: the ordinal is
+    /// one process-wide counter, not a per-registry one — two live
+    /// `BackgroundRegistry` instances (one per session) must never mint the
+    /// same id, and the `mon_`/`bg_`/`ws_` spaces must not overlap.
+    #[tokio::test]
+    async fn ordinals_stay_unique_across_registries_and_prefixes() {
+        let spawn_ids = |registry: &BackgroundRegistry| {
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                ids.push(
+                    registry
+                        .spawn_with_line_events(
+                            "true",
+                            Path::new("/tmp"),
+                            Box::new(|_, _| {}),
+                            Box::new(|_, _| {}),
+                        )
+                        .expect("mon_ spawn")
+                        .0,
+                );
+                ids.push(
+                    registry
+                        .spawn_escalated_with_line_events(
+                            "true",
+                            Path::new("/tmp"),
+                            Box::new(|_, _| {}),
+                            Box::new(|_, _| {}),
+                        )
+                        .expect("bg_ spawn")
+                        .0,
+                );
+            }
+            ids
+        };
+        let first = spawn_ids(&BackgroundRegistry::new());
+        let second = spawn_ids(&BackgroundRegistry::new());
+        let ws = WsMonitorRegistry::new();
+        let monitors: Vec<String> = (0..2)
+            .map(|_| {
+                ws.register("ws://127.0.0.1:9/unused".into(), CancellationToken::new())
+                    .0
+            })
+            .collect();
+
+        let all: Vec<&String> = first.iter().chain(&second).chain(&monitors).collect();
+        let ordinals: Vec<u64> = all
+            .iter()
+            .map(|id| {
+                id.split_once('_')
+                    .expect("id carries its prefix")
+                    .1
+                    .parse()
+                    .expect("ordinal suffix")
+            })
+            .collect();
+        let mut unique = ordinals.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            ordinals.len(),
+            "two registries minted the same ordinal: {all:?}"
+        );
+
+        let in_prefix = |prefix: &str| {
+            let ids: Vec<&String> = all
+                .iter()
+                .filter(|id| id.starts_with(prefix))
+                .copied()
+                .collect();
+            assert!(!ids.is_empty(), "no {prefix} ids were minted: {all:?}");
+            let mut sorted: Vec<&String> = ids.clone();
+            sorted.sort();
+            sorted.dedup();
+            assert_eq!(sorted.len(), ids.len(), "duplicate {prefix} ids: {ids:?}");
+        };
+        for prefix in ["mon_", "bg_", "ws_"] {
+            in_prefix(prefix);
+        }
+    }
+}

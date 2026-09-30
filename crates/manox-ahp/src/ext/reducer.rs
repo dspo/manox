@@ -119,7 +119,10 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 });
         }
         super::actions::WORK_BACKGROUND_TASKS => {
-            state.background_tasks = action.get("snapshot").cloned();
+            state.background_tasks = action
+                .get("snapshot")
+                .or_else(|| action.get("task"))
+                .cloned();
         }
         super::actions::WORK_SUBAGENTS => {
             state.subagents = action
@@ -234,5 +237,30 @@ mod tests {
             Outcome::Unrecognised
         );
         assert_eq!(state, XManoxState::default());
+    }
+
+    #[test]
+    fn background_task_snapshots_fold_under_both_payload_keys() {
+        let snapshot = json!({"task_id": "bg_3", "status": "running"});
+        // The canonical key this host emits.
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(
+                &mut state,
+                &json!({"type": "x-manox-work/backgroundTasksChanged", "snapshot": snapshot})
+            ),
+            Outcome::Applied
+        );
+        assert_eq!(state.background_tasks, Some(snapshot.clone()));
+        // The pre-fix key an older translation layer may still carry.
+        let mut state = XManoxState::default();
+        assert_eq!(
+            apply(
+                &mut state,
+                &json!({"type": "x-manox-work/backgroundTasksChanged", "task": snapshot})
+            ),
+            Outcome::Applied
+        );
+        assert_eq!(state.background_tasks, Some(snapshot));
     }
 }

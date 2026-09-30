@@ -873,7 +873,7 @@ impl Translator {
                 &at,
                 extension_action(
                     ext::actions::WORK_BACKGROUND_TASKS,
-                    json!({"task": snapshot}),
+                    json!({"snapshot": snapshot}),
                 ),
             )),
             // ── metrics ──────────────────────────────────────────────────
@@ -2460,6 +2460,61 @@ mod tests {
         let value = serde_json::to_value(&emitted[0].action).expect("action serializes");
         assert_eq!(value["type"], "chat/inputCompleted");
         assert_eq!(value["requestId"], "plan-review:e-1");
+    }
+
+    #[test]
+    fn a_background_task_snapshot_reaches_the_reducer_state_intact() {
+        let snapshot = json!({
+            "task_id": "mon_7",
+            "kind": "MonitorCommand",
+            "owner_thread_id": "t-1",
+            "description": "watch build",
+            "status": "running",
+            "created_at_ms": 1_000,
+            "event_count": 0,
+            "total_bytes": 0
+        });
+        let mut translator = Translator::new();
+        let emitted = translator.on_entry(
+            "c-1",
+            "s-1",
+            &entry(
+                "e-1",
+                JournalWireEvent::BackgroundTask {
+                    snapshot: snapshot.clone(),
+                },
+            ),
+        );
+        let work: Vec<_> = emitted
+            .iter()
+            .filter(|e| e.channel == "x-manox-work:/s-1")
+            .collect();
+        assert_eq!(
+            work.len(),
+            1,
+            "one journal row, one work-channel action: {emitted:?}"
+        );
+        let action = serde_json::to_value(&work[0].action).expect("action serializes");
+        assert_eq!(action["type"], "x-manox-work/backgroundTasksChanged");
+        assert_eq!(
+            action["snapshot"], snapshot,
+            "the canonical payload key is `snapshot`"
+        );
+
+        // The reference client fold: the declared `backgroundTasks` state must
+        // actually receive the snapshot this action carried.
+        let mut state = crate::ext::XManoxState::default();
+        assert_eq!(
+            crate::ext::reducer::apply(&mut state, &action),
+            crate::ext::ExtOutcome::Applied
+        );
+        assert_eq!(state.background_tasks, Some(snapshot.clone()));
+        // …and the field survives a state round-trip for reconnecting clients.
+        let encoded = serde_json::to_value(&state).expect("state serializes");
+        assert_eq!(encoded["backgroundTasks"], snapshot);
+        let decoded: crate::ext::XManoxState =
+            serde_json::from_value(encoded).expect("state round-trips");
+        assert_eq!(decoded.background_tasks, Some(snapshot));
     }
 }
 

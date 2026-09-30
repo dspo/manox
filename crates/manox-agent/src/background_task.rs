@@ -402,10 +402,20 @@ impl BackgroundTask {
     fn emit_snapshot(&self, task_id: &TaskId) {
         let s = self.state.lock().expect("task state poisoned");
         let snapshot = build_snapshot(&s, task_id);
-        if let Some(tx) = s.notifier.as_ref() {
-            let _ = tx.send(BackendNotice::Event(Box::new(
-                ThreadEvent::BackgroundTaskUpdated { snapshot },
-            )));
+        if let Some(tx) = s.notifier.as_ref()
+            && tx
+                .send(BackendNotice::Event(Box::new(
+                    ThreadEvent::BackgroundTaskUpdated { snapshot },
+                )))
+                .is_err()
+        {
+            // A closed channel means the session is tearing down; losing
+            // the update is correct there, and debug keeps it diagnosable.
+            tracing::debug!(
+                target: "tasks",
+                task_id = %task_id,
+                "notice channel closed; card snapshot dropped"
+            );
         }
     }
 
