@@ -4103,7 +4103,11 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     // mints a fresh UUID on every rebuild (it is not journal-derived),
     // so like message-payload timestamps (the K5 as-built note) it is
     // not a byte-for-byte assertion face. Everything else — roles,
-    // content, note cards, ordering — must round-trip exactly.
+    // content, note cards, ordering — must round-trip exactly. `timestamp`
+    // is stripped for the same reason: the projection stamps wall-clock
+    // time at rebuild, so the live and reloaded faces differ by whatever
+    // seconds elapsed between them (the second-boundary flake this once
+    // shipped as a CI-red).
     let display_shape = |display: &[HistoryEntry]| -> Vec<serde_json::Value> {
         display
             .iter()
@@ -4111,6 +4115,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
                 let mut value = serde_json::to_value(entry).unwrap();
                 if let Some(message) = value.get_mut("Message").and_then(|m| m.as_object_mut()) {
                     message.remove("id");
+                    message.remove("timestamp");
                 }
                 value
             })
