@@ -224,6 +224,7 @@ fn turn_start() -> E {
         id: String::new(),
         parent_id: None,
         timestamp: stamp(),
+        owner: None,
     }
 }
 

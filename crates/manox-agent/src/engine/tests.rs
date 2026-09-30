@@ -1127,6 +1127,19 @@ fn durable_journal_mapping_round_trips_every_journaled_event() {
     }
 }
 
+#[test]
+fn the_turn_start_payload_stamps_the_owning_process() {
+    let (kind, payload) =
+        durable_journal_payload(&ThreadEvent::TurnStarted).expect("turn start journals");
+    assert_eq!(kind, "turn_start");
+    assert_eq!(
+        payload["owner"]["pid"],
+        serde_json::json!(std::process::id()),
+        "the row stamps this process as the turn owner: readers of the shared
+         journal settle a dead owner's turn and never touch a live one's"
+    );
+}
+
 /// The journal relay maps storage appends (and Lagged) into the thread
 /// feed in order — the §C.3 host read face T4's follow streams ride.
 #[tokio::test]
@@ -1162,6 +1175,7 @@ async fn journal_relay_feeds_storage_appends_in_seq_order() {
                 id: format!("e{i}"),
                 parent_id: parent.map(str::to_string),
                 timestamp: chrono::Utc::now(),
+                owner: None,
             })
             .await
             .unwrap();

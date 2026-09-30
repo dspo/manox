@@ -84,7 +84,11 @@ pub fn wire_event(entry: &SessionTreeEntry) -> Option<JournalWireEvent> {
             data: note.clone(),
         },
         // ── lifecycle ───────────────────────────────────────────────────
-        SessionTreeEntry::TurnStart { .. } => W::TurnStart,
+        // The owner stamp survives the legacy replay path too: a turn
+        // replayed from an old jsonl carries its owner (or none) unchanged.
+        SessionTreeEntry::TurnStart { owner, .. } => W::TurnStart {
+            owner: owner.map(|o| manox_journal::TurnOwner { pid: o.pid }),
+        },
         SessionTreeEntry::TurnFinish {
             cancelled,
             failed,

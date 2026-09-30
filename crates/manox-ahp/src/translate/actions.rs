@@ -70,7 +70,9 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload, plan_review_request_id};
+use manox_journal::{
+    JournalWireEntry, JournalWireEvent, TurnOwner, UsagePayload, plan_review_request_id,
+};
 use serde_json::{Value, json};
 
 use crate::ext;
@@ -559,7 +561,9 @@ impl Translator {
                 );
             }
             // ── turn lifecycle ───────────────────────────────────────────
-            JournalWireEvent::TurnStart => self.on_turn_start(&chat, entry, &mut out),
+            JournalWireEvent::TurnStart { owner } => {
+                self.on_turn_start(&chat, entry, owner.as_ref(), &mut out)
+            }
             JournalWireEvent::TurnFinish {
                 cancelled,
                 failed,
@@ -1176,7 +1180,13 @@ impl Translator {
     }
 
     /// `turnStart`: open the AHP turn, carrying the queued user row if one waits.
-    fn on_turn_start(&mut self, chat: &str, entry: &JournalWireEntry, out: &mut Vec<Emitted>) {
+    fn on_turn_start(
+        &mut self,
+        chat: &str,
+        entry: &JournalWireEntry,
+        owner: Option<&TurnOwner>,
+        out: &mut Vec<Emitted>,
+    ) {
         if let Some(open) = self.open.take() {
             // A `turnStart` with a turn still open means the previous turn never
             // closed (a crash between rows). Close it first: AHP's reducer replaces
@@ -1196,7 +1206,13 @@ impl Translator {
                 started_at: entry.timestamp.clone(),
                 message,
                 queued_message_id,
-                meta: Some(manox_meta(json!({"entryId": entry.id}))),
+                meta: Some(manox_meta(match owner {
+                    // The owning process stamps the turn for liveness: a
+                    // reader of the shared journal settles a dead owner's
+                    // turn on its behalf and never touches a live one's.
+                    Some(owner) => json!({ "entryId": entry.id, "turnOwner": owner }),
+                    None => json!({ "entryId": entry.id }),
+                })),
             }),
         ));
         self.open = Some(OpenTurn::new(id, entry.timestamp.clone(), false));
@@ -2654,7 +2670,7 @@ mod turn_message_tests {
         };
         let mut out = Vec::new();
         for entry in [
-            row(1, JournalWireEvent::TurnStart),
+            row(1, JournalWireEvent::TurnStart { owner: None }),
             row(
                 2,
                 JournalWireEvent::Message {
@@ -2680,6 +2696,61 @@ mod turn_message_tests {
                     if p.kind == PendingMessageKind::Steering
             )),
             "the initiating row is not a steer: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_turn_owner_rides_the_turn_started_meta_when_stamped() {
+        let mut t = Translator::new();
+        let row = |seq: u64, event: JournalWireEvent| JournalWireEntry {
+            seq,
+            id: format!("e-{seq}"),
+            parent_id: None,
+            timestamp: "2026-09-29T00:00:00.000Z".into(),
+            event,
+        };
+        let mut out = Vec::new();
+        out.extend(t.on_entry(
+            "c-1",
+            "s-1",
+            &row(
+                1,
+                JournalWireEvent::TurnStart {
+                    owner: Some(TurnOwner { pid: 4242 }),
+                },
+            ),
+        ));
+        let started = out
+            .iter()
+            .find_map(|e| match &e.action {
+                StateAction::ChatTurnStarted(a) => a.meta.as_ref(),
+                _ => None,
+            })
+            .expect("turnStarted carries meta");
+        assert_eq!(
+            started["x-manox"]["turnOwner"]["pid"],
+            serde_json::json!(4242),
+            "the owner pid rides the meta for liveness checks: {started:?}"
+        );
+
+        // A row from before the stamp: the meta carries no owner, and a
+        // reader treats the turn conservatively (never auto-cancelled).
+        let mut out = Vec::new();
+        out.extend(t.on_entry(
+            "c-1",
+            "s-1",
+            &row(2, JournalWireEvent::TurnStart { owner: None }),
+        ));
+        let meta = out
+            .iter()
+            .find_map(|e| match &e.action {
+                StateAction::ChatTurnStarted(a) => a.meta.as_ref(),
+                _ => None,
+            })
+            .expect("turnStarted carries meta");
+        assert!(
+            meta["x-manox"].get("turnOwner").is_none(),
+            "an unstamped row must not fabricate an owner: {meta:?}"
         );
     }
 }

@@ -647,7 +647,7 @@ impl RuntimeBackend {
         // parts. Skip both; the parts that follow address the client's turn
         // id.
         if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
-            || matches!(&entry.event, JournalWireEvent::TurnStart)
+            || matches!(&entry.event, JournalWireEvent::TurnStart { .. })
         {
             return;
         }
