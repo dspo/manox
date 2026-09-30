@@ -70,7 +70,7 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload};
+use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload, plan_review_request_id};
 use serde_json::{Value, json};
 
 use crate::ext;
@@ -818,7 +818,9 @@ impl Translator {
                 // The proposal opens VS Code's native plan-review card (a
                 // `chat/inputRequested` whose request carries the `planReview`
                 // block); the resolution closes that same part by its request
-                // id, so no separate `x-manox-plan` verdict card is needed.
+                // id on the chat face, and the plan-channel settle below is
+                // the fold-visible half for clients whose turn lifecycle
+                // already archived the request.
                 if state == "resolved" {
                     // The settled edge is self-describing on rows the engine
                     // wrote after the field existed; translator memory covers
@@ -827,6 +829,10 @@ impl Translator {
                     // nor is remembered for cannot name its request — skip
                     // rather than emit a verdict no client can correlate.
                     let request_id = row_request_id.clone().or_else(|| self.plan_review.take());
+                    // A resolution settles the remembered review too, named
+                    // or not — leaving the memory standing re-emits it on any
+                    // later id-less resolved row.
+                    self.plan_review = None;
                     if let Some(request_id) = request_id {
                         // The settlement rides the plan channel in its own
                         // right: the chat-level `ChatInputCompleted` below only
@@ -2042,14 +2048,6 @@ fn confirmation_prompt(title: &str, tool_name: &str) -> String {
         title
     };
     format!("{subject} — awaiting confirmation")
-}
-
-/// The deterministic request id for a plan-review card: the proposal journal
-/// entry's id, namespaced so the runtime can tell a plan verdict apart from an
-/// `AskUserQuestion` answer on the `chat/inputCompleted` path. The translator
-/// (which mints it) and the runtime (which resolves it) share this shape.
-pub fn plan_review_request_id(entry_id: &str) -> String {
-    format!("plan-review:{entry_id}")
 }
 
 /// The plan-review block, for the `x-manox-plan` channel.

@@ -2415,6 +2415,7 @@ dependencies = [
  "libc",
  "manox-agent",
  "manox-harness",
+ "manox-journal",
  "manox-providers",
  "parking_lot",
  "reqwest 0.12.28",

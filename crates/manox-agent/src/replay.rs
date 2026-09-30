@@ -54,10 +54,10 @@ pub struct ReplayedThreadState {
     /// any verdict clears). `None` = the chain never saw one — the sidecar
     /// hint stands (the pre-vocabulary hole-fill).
     pub plan_review_pending: Option<bool>,
-    /// The open review's request id, derived from the last `proposed` row's
-    /// own entry id (the request id IS `plan-review:<proposal entry id>`) or
-    /// read off a resolved row's self-description. The journal is the
-    /// carrier, so the restore survives a host restart without a sidecar.
+    /// The open review's request id, minted from the last `proposed` row's
+    /// own entry id (the request id IS `plan-review:<proposal entry id>`); a
+    /// resolved row clears it. The journal is the carrier, so the restore
+    /// survives a host restart without a sidecar.
     pub plan_review_request_id: Option<String>,
     /// Goal value from the last `goal` entry; `Some(Null)` is an explicit
     /// clear.
@@ -116,7 +116,7 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
                     Some(
                         request_id
                             .clone()
-                            .unwrap_or_else(|| format!("plan-review:{id}")),
+                            .unwrap_or_else(|| manox_journal::plan_review_request_id(id)),
                     )
                 } else {
                     None

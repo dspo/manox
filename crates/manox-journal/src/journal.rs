@@ -326,6 +326,15 @@ pub struct JournalWireEntry {
     pub event: JournalWireEvent,
 }
 
+/// The request id a plan-review proposal mints from its own entry id — the
+/// single key the client's card, the resolved row's `requestId`
+/// back-reference, and the settle action all correlate by. Every mint site
+/// (engine journal write, restore replay, AHP translation) goes through this
+/// one definition; a drifting copy strands the card with no error anywhere.
+pub fn plan_review_request_id(entry_id: &str) -> String {
+    format!("plan-review:{entry_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
