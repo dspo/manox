@@ -64,6 +64,7 @@ use manox_ahp::translate::Translator;
 use manox_journal::JournalWireEvent;
 use serde_json::Value;
 
+pub(crate) mod baseline_cache;
 pub(crate) mod changeset;
 #[cfg(feature = "mcp")]
 pub(crate) mod mcp;
@@ -316,12 +317,18 @@ fn thread_sessions(thread_id: &str, active: &str) -> Vec<String> {
 /// Two properties the seed cache cannot give a reconnecting client: thread
 /// scoping — after a thread continues into a new session, the active
 /// session's journal carries rows the URI's own journal lacks — and
-/// freshness — the seed is built once per process, while the baseline
-/// envelope carries the current watermark, so a stale fold would be accepted
-/// as current truth. Live emissions key extension channels by thread id (the
-/// bridge and [`fold_journal`] both pass the thread id as the translator's
-/// session parameter), so rows are replayed only when their channel matches
-/// the request verbatim.
+/// freshness — the baseline envelope carries the current watermark, so a
+/// stale fold would be accepted as current truth. Live emissions key
+/// extension channels by thread id (the bridge and [`fold_journal`] both
+/// pass the thread id as the translator's session parameter), so rows are
+/// replayed only when their channel matches the request verbatim.
+///
+/// The fold is pure over the member journals' bytes, so it is cached behind
+/// a fingerprint of those bytes ([`baseline_cache`]): an unchanged member
+/// set with unchanged stamps answers from cache, and any append, rewrite,
+/// deletion, or active-session flip misses and refolds. The cache never
+/// weakens the freshness property — it only skips a fold whose result is
+/// provably identical.
 pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) -> Value {
     let thread_id = thread_of_session(session_id)
         .await
@@ -331,19 +338,50 @@ pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) 
         .get(&thread_id)
         .map(|entry| entry.active_session.clone())
         .unwrap_or_else(|| session_id.to_string());
-    // Non-active members fold in JOURNAL TIME order, not id order: session
-    // ids are uuids whose dictionary order is unrelated to time, and the
-    // scalar rows are last-writer-wins — id order let a time-older journal
-    // overwrite a newer value (probe-proven). Each journal is folded once and
-    // only the requested channel's rows are kept. `None` stamps (empty
-    // journals) sort first: nothing to win with. The active session folds
-    // last regardless — its journal is the thread's current truth.
+    let members = thread_sessions(&thread_id, &active);
+    // `sessions_dir()` resolves through the global thread store before
+    // falling back to the home — the same resolution the fold reads with, so
+    // two state roots never share a cache key.
+    let root = sessions_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stamp = baseline_cache::fingerprint(&active, &members);
+    if let Some(hit) = baseline_cache::hit(&root, &thread_id, channel, &stamp) {
+        baseline_cache::note(true);
+        return hit;
+    }
+    baseline_cache::note(false);
+    let value =
+        serde_json::to_value(&fold_extension_state(channel, &thread_id, &active, &members).await)
+            .unwrap_or(Value::Null);
+    baseline_cache::store(&root, &thread_id, channel, stamp, value.clone());
+    value
+}
+
+/// The fold proper, over an already-enumerated member list: non-active
+/// members replay in journal-time order, then the active session's journal.
+///
+/// Non-active members fold in JOURNAL TIME order, not id order: session ids
+/// are uuids whose dictionary order is unrelated to time, and the scalar
+/// rows are last-writer-wins — id order let a time-older journal overwrite a
+/// newer value (probe-proven). Each journal is folded once and only the
+/// requested channel's rows are kept. `None` stamps (empty journals) sort
+/// first: nothing to win with. The active session folds last regardless —
+/// its journal is the thread's current truth. `thread_id` is the enumeration's
+/// thread: the translator keys live emissions by it, so member rows replay
+/// only when their channel matches the request verbatim.
+async fn fold_extension_state(
+    channel: &str,
+    thread_id: &str,
+    active: &str,
+    members: &[String],
+) -> manox_ahp::ext::XManoxState {
     let mut older: Vec<(Option<String>, Vec<StateAction>)> = Vec::new();
-    for id in thread_sessions(&thread_id, &active) {
+    for id in members {
         if id == active {
             continue;
         }
-        let Some(fold) = fold_journal(&id, &thread_id).await else {
+        let Some(fold) = fold_journal(id, thread_id).await else {
             continue;
         };
         let rows = fold
@@ -368,7 +406,7 @@ pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) 
     for (_, rows) in &older {
         replay(&mut state, rows);
     }
-    if let Some(fold) = fold_journal(&active, &thread_id).await {
+    if let Some(fold) = fold_journal(active, thread_id).await {
         let rows = fold
             .extension_actions
             .into_iter()
@@ -377,7 +415,7 @@ pub(crate) async fn extension_channel_baseline(channel: &str, session_id: &str) 
             .collect::<Vec<_>>();
         replay(&mut state, &rows);
     }
-    serde_json::to_value(&state).unwrap_or(Value::Null)
+    state
 }
 
 /// The `<id>.jsonl` stem of a sessions-dir entry (non-journals yield `None`).
@@ -785,6 +823,108 @@ mod baseline_tests {
             );
 
             let _ = std::fs::remove_file(sessions.join("fresh_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// The cache actually answers: an unchanged journal set serves the second
+    /// request from the cache (a hit, no fold), and any journal move — an
+    /// append here — forces the next request to fold again and see the new
+    /// row. Without the hit/fold probe this would also pass with the cache
+    /// deleted; with it, the freshness test above and this one pin both
+    /// halves: the cache must answer AND it must never answer stale.
+    #[test]
+    fn the_baseline_cache_answers_until_a_journal_moves() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "cache_s",
+                "cache_s",
+                chrono::Utc::now() - chrono::Duration::seconds(1),
+                "v1",
+            )
+            .await;
+            let registry = write_registry("cache_s", "cache_s");
+
+            let (hits_before, folds_before) = baseline_cache::probe();
+            let first = extension_channel_baseline("x-manox-thread:/cache_s", "cache_s").await;
+            let second = extension_channel_baseline("x-manox-thread:/cache_s", "cache_s").await;
+            assert_eq!(first, second, "unchanged journals fold to the same state");
+            let (hits, folds) = baseline_cache::probe();
+            assert_eq!(folds, folds_before + 1, "the fold ran exactly once");
+            assert_eq!(hits, hits_before + 1, "the second request hit the cache");
+
+            // An append moves the stamp: the cache must miss and refold.
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::open(
+                &sessions.join("cache_s.jsonl"),
+            )
+            .await
+            .unwrap();
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::Label {
+                    id: "e-v2".into(),
+                    parent_id: None,
+                    timestamp: chrono::Utc::now(),
+                    target_id: "e-v2".into(),
+                    label: Some("v2".into()),
+                })
+                .await
+                .unwrap();
+            drop(storage);
+
+            let third = extension_channel_baseline("x-manox-thread:/cache_s", "cache_s").await;
+            assert_eq!(
+                third["label"], "v2",
+                "the moved journal must refold: {third}"
+            );
+            let (_, folds_after) = baseline_cache::probe();
+            assert_eq!(folds_after, folds + 1, "the append forced a refold");
+
+            let _ = std::fs::remove_file(sessions.join("cache_s.jsonl"));
+            let _ = std::fs::remove_file(&registry);
+        })
+    }
+
+    /// Which member folds last is part of the fold's input, not just the
+    /// journals' bytes: flipping the active pointer must move the answer even
+    /// when no journal changed — here the newly-active journal carries the
+    /// winning row only after the flip.
+    #[test]
+    fn an_active_flip_moves_the_baseline_even_without_journal_changes() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+            write_label_journal(
+                &sessions,
+                "flip_a",
+                "T-flip",
+                chrono::Utc::now() - chrono::Duration::seconds(2),
+                "fromA",
+            )
+            .await;
+            write_label_journal(&sessions, "flip_b", "T-flip", chrono::Utc::now(), "fromB").await;
+            let registry = write_registry("T-flip", "flip_a");
+
+            let before = extension_channel_baseline("x-manox-thread:/T-flip", "flip_a").await;
+            assert_eq!(before["label"], "fromA", "the active journal folds last: {before}");
+
+            write_registry("T-flip", "flip_b");
+            let after = extension_channel_baseline("x-manox-thread:/T-flip", "flip_b").await;
+            assert_eq!(
+                after["label"], "fromB",
+                "the active flip must invalidate the cached fold even with unchanged journals: {after}"
+            );
+
+            let _ = std::fs::remove_file(sessions.join("flip_a.jsonl"));
+            let _ = std::fs::remove_file(sessions.join("flip_b.jsonl"));
             let _ = std::fs::remove_file(&registry);
         })
     }
