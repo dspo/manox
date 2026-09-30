@@ -1577,14 +1577,27 @@ impl Backend for RuntimeBackend {
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
-            StateAction::ChatToolCallConfirmed(confirmed) => self.confirm_tool_call(
-                channel,
-                &confirmed.tool_call_id,
-                confirmed.meta.as_ref(),
-                confirmed.approved,
-            ),
+            StateAction::ChatToolCallConfirmed(confirmed) => {
+                let outcome = self.confirm_tool_call(
+                    channel,
+                    &confirmed.tool_call_id,
+                    confirmed.meta.as_ref(),
+                    confirmed.approved,
+                );
+                // A settle may have cold-opened the session (a verdict for a
+                // subscribed-but-never-submitted thread): the bridge the seed
+                // skipped now has an engine to bridge, and the verdict's
+                // journal row above the seed's watermark is how every client
+                // fold learns the card retired.
+                if matches!(outcome, DispatchOutcome::Accepted)
+                    && let Some(session_id) = chat::id(channel)
+                {
+                    self.ensure_bridge(session_id);
+                }
+                outcome
+            }
             StateAction::ChatInputCompleted(completed) => {
-                if completed.request_id.starts_with("plan-review:") {
+                let outcome = if completed.request_id.starts_with("plan-review:") {
                     self.resolve_plan_review(channel, completed)
                 } else {
                     self.answer_question(
@@ -1592,7 +1605,13 @@ impl Backend for RuntimeBackend {
                         &completed.request_id,
                         map_answers(&completed.answers),
                     )
+                };
+                if matches!(outcome, DispatchOutcome::Accepted)
+                    && let Some(session_id) = chat::id(channel)
+                {
+                    self.ensure_bridge(session_id);
                 }
+                outcome
             }
             // ── session actions ────────────────────────────────────────────
             StateAction::SessionConfigChanged(changed) => {

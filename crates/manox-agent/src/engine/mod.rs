@@ -495,6 +495,8 @@ pub fn spawn_engine(
     let actor_notice_tx = notice_tx.clone();
     let actor_state = Arc::clone(&state);
     let actor_bus = Arc::clone(&bus);
+    let (restore_ready_tx, restore_ready_rx) = tokio::sync::watch::channel(false);
+    let actor_restore_tx = restore_ready_tx;
     let actor_initial_path = initial_path.clone();
     crate::runtime::handle().spawn(async move {
         // Held for the whole actor lifetime — through run_actor's settle —
@@ -515,6 +517,7 @@ pub fn spawn_engine(
             thread_id,
             parent_session,
             actor_bus,
+            actor_restore_tx,
         )
         .await;
         unregister_engine_route(&registry_thread_id, &actor_cmd_tx);
@@ -529,6 +532,7 @@ pub fn spawn_engine(
     SpawnedEngine {
         engine: Arc::new(PiEngine { cmd_tx, state, bus }),
         events: notice_rx,
+        restore_ready: restore_ready_rx,
     }
 }
 
@@ -857,6 +861,7 @@ async fn run_actor(
     thread_id: String,
     parent_session: Option<String>,
     bus: Arc<crate::steer_bus::AgentBus>,
+    restore_ready: tokio::sync::watch::Sender<bool>,
 ) {
     // Session assembly preflights the model against the registry, so resolve
     // only after the one-shot background registration (parallelized per
@@ -1110,6 +1115,11 @@ async fn run_actor(
     // legacy gap): restore it so a reopened session keeps its mode.
     let permission_mode = restored_state.permission_mode;
     state.gate.set_mode(permission_mode);
+    repark_unsettled(&state, &restored_state);
+    // The restore has landed — replayed parks are back on the gates. The
+    // settle path awaits this watch, so a verdict issued during the
+    // restore window waits here instead of hitting an empty gate.
+    let _ = restore_ready.send(true);
     // The reasoning effort rebuilds the same way: a reopened Max session
     // keeps its effort. The engine clamps against the current model and
     // persists the change in the transcript (TS `setThinkingLevel`).
@@ -1781,6 +1791,10 @@ async fn run_actor(
                 }
             }
             SessionCmd::Open { path } => {
+                // A re-open is a SECOND restore: drop the watch to false so
+                // the settle path's await waits through this window too (a
+                // `true` from the previous restore is a no-op on send).
+                let _ = restore_ready.send(false);
                 rebuild_session(
                     &mut session,
                     &path,
@@ -1835,6 +1849,8 @@ async fn run_actor(
                 crate::thread_registry::set_active(&thread_id, opened_id).await;
                 *state.active_path.lock().unwrap() = Some(path);
                 resync_approval_mode(&restored_state, &state, &notice_tx);
+                repark_unsettled(&state, &restored_state);
+                let _ = restore_ready.send(true);
                 // Opened sessions are resumed conversations: SessionStart
                 // already happened in a prior lifetime.
                 state.session_start_fired.store(true, Ordering::SeqCst);
@@ -2430,6 +2446,45 @@ pub(crate) fn parse_reasoning_effort(raw: &str) -> Option<ReasoningEffort> {
     }
 }
 
+/// §D.6 restore: parks the restored chain still carries re-arm the gates,
+/// so a verdict that outlived its process can still settle — and journal
+/// through the gate's sink. The AHP face serves the same rows as the wire
+/// card (`inputNeeded`), so without this the card is armed in every client
+/// while the gate has nothing to settle: the verdict would silently
+/// no-op and the card could never leave. A park already live under the
+/// same id (a re-open racing a live card) keeps its responder; there is
+/// no awaiting tool future behind a replayed park, so a settled replay
+/// parks nothing further — the verdict journals, the card retires, and a
+/// fresh turn (the user's next message) drives whatever comes next.
+fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
+    for park in &restored.unsettled_approvals {
+        if state.gate.register_if_absent(
+            &park.auth_id,
+            PendingAuthMeta {
+                tool_name: park.tool_name.clone(),
+                summary: park.summary.clone(),
+                input: park.input.clone(),
+            },
+        ) {
+            tracing::info!(auth_id = %park.auth_id, tool = %park.tool_name,
+                "restore re-parked an unsettled approval");
+        }
+    }
+    for park in &restored.unsettled_questions {
+        if state.question_gate.register_if_absent(
+            &park.auth_id,
+            PendingAuthMeta {
+                tool_name: park.tool_name.clone(),
+                summary: park.summary.clone(),
+                input: park.input.clone(),
+            },
+        ) {
+            tracing::info!(auth_id = %park.auth_id, tool = %park.tool_name,
+                "restore re-parked an unsettled question");
+        }
+    }
+}
+
 /// Re-apply the persisted permission mode after a session switch (K2): the
 /// mode comes from the journal-first restore rebuild; align the gate and
 /// the facade's chip with it.
@@ -2460,6 +2515,12 @@ struct RestoredThreadState {
     permission_mode: PermissionMode,
     reasoning_effort: ReasoningEffort,
     plan_mode: bool,
+    /// Unsettled parks the restored chain still carries (a `request` with
+    /// no `decision`): restore re-parks them so the verdict a park
+    /// outlived its process can still settle and journal.
+    unsettled_approvals: Vec<crate::replay::UnsettledInteraction>,
+    /// Same registry for the question seam's gate.
+    unsettled_questions: Vec<crate::replay::UnsettledInteraction>,
     /// Sidecar-only: the plan file has no journal vocabulary (the plan's
     /// content rides its own file; the entries carry mode + snapshot).
     plan_file: Option<String>,
@@ -2536,6 +2597,10 @@ fn merge_restored_state(
             Some(None) => None,
             None => meta.project.clone().map(PathBuf::from),
         },
+        // Filled by [`rebuild_restored_state`], the only caller holding the
+        // records the unsettled-park fold needs.
+        unsettled_approvals: Vec::new(),
+        unsettled_questions: Vec::new(),
     }
 }
 
@@ -2548,10 +2613,14 @@ async fn rebuild_restored_state(
 ) -> RestoredThreadState {
     let records = session.journal_range(0, u64::MAX).await.unwrap_or_default();
     let replayed = crate::replay::replay_thread_state(&records);
+    let (unsettled_approvals, unsettled_questions) =
+        crate::replay::unsettled_interactions(&records);
     let meta = manox_harness::session_meta::load(sessions_dir, session.path())
         .await
         .unwrap_or_default();
-    let merged = merge_restored_state(&replayed, &meta);
+    let mut merged = merge_restored_state(&replayed, &meta);
+    merged.unsettled_approvals = unsettled_approvals;
+    merged.unsettled_questions = unsettled_questions;
 
     // Cache repair: re-stamp every journal-backed field whose sidecar copy
     // diverges from the authority, in one write. Fields the journal has

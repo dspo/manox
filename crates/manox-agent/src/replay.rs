@@ -66,6 +66,87 @@ pub struct ReplayedThreadState {
     pub cwd: Option<String>,
 }
 
+/// An approval or question request the chain never answered.
+///
+/// Restore re-parks these on the engine's gates so a verdict that outlives
+/// the process can still settle and journal — the durable-park contract:
+/// every joining owner can answer a card the journal still carries, not
+/// only the process that was alive when the park was opened.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsettledInteraction {
+    /// The auth id a verdict must name (the gate's pending key, and the
+    /// `authId` the AHP face seeds the wire card under).
+    pub auth_id: String,
+    /// The parked tool's name (`AskUserQuestion` for an ask).
+    pub tool_name: String,
+    /// The park's summary line, verbatim.
+    pub summary: String,
+    /// The parked input, verbatim.
+    pub input: serde_json::Value,
+}
+
+/// Fold the `Approval`/`Question` request/decision pairing: a `request`
+/// arms (a later request for the same id replaces the earlier one), a
+/// `decision` discharges, and a decision for an id the chain never
+/// requested is a foreign row that changes nothing. The survivors are the
+/// unsettled parks, in chain order. Approvals and questions come back
+/// separately — the two gates keep distinct registries.
+pub fn unsettled_interactions(
+    records: &[JournalRecord],
+) -> (Vec<UnsettledInteraction>, Vec<UnsettledInteraction>) {
+    fn track(
+        parks: &mut Vec<UnsettledInteraction>,
+        kind: &str,
+        auth_id: &str,
+        payload: &serde_json::Value,
+    ) {
+        match kind {
+            "request" => {
+                parks.retain(|park| park.auth_id != auth_id);
+                parks.push(UnsettledInteraction {
+                    auth_id: auth_id.to_string(),
+                    tool_name: payload
+                        .get("toolName")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    summary: payload
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    input: payload
+                        .get("input")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                });
+            }
+            "decision" => parks.retain(|park| park.auth_id != auth_id),
+            _ => {}
+        }
+    }
+    let mut approvals = Vec::new();
+    let mut questions = Vec::new();
+    for record in records {
+        match &record.entry {
+            SessionTreeEntry::Approval {
+                kind,
+                auth_id,
+                payload,
+                ..
+            } => track(&mut approvals, kind, auth_id, payload),
+            SessionTreeEntry::Question {
+                kind,
+                auth_id,
+                payload,
+                ..
+            } => track(&mut questions, kind, auth_id, payload),
+            _ => {}
+        }
+    }
+    (approvals, questions)
+}
+
 /// Fold one active chain into the journal-backed state. Records must be in
 /// chain order (the storage's `journal_range` order); the fold itself is a
 /// pure last-wins scan.
@@ -188,6 +269,66 @@ mod tests {
 
     fn envelope() -> (String, Option<String>, chrono::DateTime<Utc>) {
         (uuid::Uuid::new_v4().to_string(), None, Utc::now())
+    }
+
+    fn park_entry(kind: &str, is_approval: bool, auth: &str) -> SessionTreeEntry {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (_, parent, ts) = envelope();
+        let payload = serde_json::json!({
+            "toolName": "TaskStop",
+            "summary": "escalate",
+            "input": {"task_id": "bg_0"},
+        });
+        if is_approval {
+            E::Approval {
+                id,
+                parent_id: parent,
+                timestamp: ts,
+                kind: kind.into(),
+                auth_id: auth.into(),
+                payload,
+            }
+        } else {
+            E::Question {
+                id,
+                parent_id: parent,
+                timestamp: ts,
+                kind: kind.into(),
+                auth_id: auth.into(),
+                payload,
+            }
+        }
+    }
+
+    #[test]
+    fn unsettled_parks_pair_requests_with_decisions() {
+        let records = vec![
+            record(park_entry("request", true, "a1")),
+            record(park_entry("decision", true, "a1")),
+            record(park_entry("request", false, "q1")),
+        ];
+        let (approvals, questions) = unsettled_interactions(&records);
+        assert!(approvals.is_empty(), "a decided approval is settled");
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].auth_id, "q1");
+        assert_eq!(questions[0].tool_name, "TaskStop");
+        assert_eq!(questions[0].summary, "escalate");
+        assert_eq!(questions[0].input, serde_json::json!({"task_id": "bg_0"}));
+    }
+
+    #[test]
+    fn a_repeated_request_replaces_and_a_foreign_decision_is_ignored() {
+        let records = vec![
+            record(park_entry("request", true, "a1")),
+            record(park_entry("decision", true, "ghost")),
+            record(park_entry("request", true, "a1")),
+            record(park_entry("decision", true, "a1")),
+            record(park_entry("request", true, "a2")),
+        ];
+        let (approvals, questions) = unsettled_interactions(&records);
+        assert!(questions.is_empty());
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0].auth_id, "a2");
     }
 
     #[test]

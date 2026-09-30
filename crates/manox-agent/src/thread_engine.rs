@@ -468,4 +468,8 @@ pub enum BrowserReply {
 pub struct SpawnedEngine {
     pub engine: Arc<dyn ThreadEngine>,
     pub events: tokio::sync::mpsc::UnboundedReceiver<BackendNotice>,
+    /// Fires `true` when the actor's journal-first restore — and the
+    /// re-park riding its tail — has landed. The settle path awaits this
+    /// so a verdict can never hit an empty gate during the restore window.
+    pub restore_ready: tokio::sync::watch::Receiver<bool>,
 }
