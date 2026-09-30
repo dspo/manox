@@ -301,11 +301,10 @@ pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_journal::Turn
     for record in &snapshot.records {
         match &record.entry {
             manox_harness::session::SessionTreeEntry::TurnStart { owner: stamped, .. } => {
-                // The single manual field mapping between the harness's local
-                // TurnOwner mirror and the journal's (the W4 conversion
-                // point) — guarded by
-                // `the_legacy_turn_start_translation_carries_the_owner_pid`
-                // in translate.rs tests.
+                // The single manual field mapping between the harness's
+                // local TurnOwner mirror and the journal's (the W4
+                // conversion point) — guarded in translate.rs tests by
+                // `the_legacy_turn_start_translation_carries_the_owner_pid`.
                 owner = stamped.map(|o| manox_journal::TurnOwner { pid: o.pid });
             }
             manox_harness::session::SessionTreeEntry::TurnFinish { .. } => owner = None,
@@ -725,6 +724,58 @@ mod baseline_tests {
         drop(storage);
     }
 
+    /// A journal whose lifecycle tail is under test: `entries` are appended
+    /// onto a fresh session file with the given turn owner on every start.
+    async fn write_turn_journal(
+        sessions: &std::path::Path,
+        id: &str,
+        owner: Option<u32>,
+        finish: bool,
+    ) {
+        let path = sessions.join(format!("{id}.jsonl"));
+        let _ = std::fs::remove_file(&path);
+        let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+            &path,
+            manox_harness::session::jsonl::JsonlSessionMetadata {
+                id: id.into(),
+                cwd: "/".into(),
+                created_at: chrono::Utc::now(),
+                parent_session_path: None,
+                metadata: Some(serde_json::json!({ "thread": id })),
+            },
+        )
+        .await
+        .unwrap();
+        let owner_json = owner.map(|pid| serde_json::json!({ "pid": pid }));
+        storage
+            .append_entry(
+                &serde_json::from_value(serde_json::json!({
+                    "type": "turn_start",
+                    "id": format!("e-{id}"),
+                    "parentId": null,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "owner": owner_json,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        if finish {
+            storage
+                .append_entry(&manox_harness::session::SessionTreeEntry::TurnFinish {
+                    id: format!("f-{id}"),
+                    parent_id: Some(format!("e-{id}")),
+                    timestamp: chrono::Utc::now(),
+                    cancelled: false,
+                    failed: false,
+                    stranded_steer_ids: vec![],
+                })
+                .await
+                .unwrap();
+        }
+        drop(storage);
+    }
+
     fn write_registry(thread: &str, active: &str) -> std::path::PathBuf {
         let registry = manox_agent::thread_registry::registry_path();
         std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
@@ -734,6 +785,32 @@ mod baseline_tests {
         )
         .unwrap();
         registry
+    }
+
+    #[test]
+    fn the_open_turn_owner_reads_the_journal_tail() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            let sessions = sessions_dir().expect("sessions dir under the hermetic home");
+            std::fs::create_dir_all(&sessions).unwrap();
+
+            // A stamped turn start at the tail: the owner answers.
+            write_turn_journal(&sessions, "open_s", Some(4242), false).await;
+            let owner = open_turn_owner("open_s").await.expect("an open turn");
+            assert_eq!(owner.pid, 4242);
+
+            // A turn finish after the start closes it: no owner.
+            write_turn_journal(&sessions, "closed_s", Some(4242), true).await;
+            assert!(
+                open_turn_owner("closed_s").await.is_none(),
+                "a finished turn has no owner"
+            );
+
+            // No journal file at all: no owner (the conservative answer).
+            assert!(open_turn_owner("absent_s").await.is_none());
+        })
     }
 
     /// The wrong-shelf half of the baseline fix: the ACTIVE session carries
