@@ -1265,6 +1265,7 @@ fn test_engine_state() -> Arc<EngineState> {
         gate,
         question_gate,
         plan: crate::plan_mode::PlanSessionState::new(),
+        plan_review_request_id: Mutex::new(None),
         goal_bridge: None,
         goal_continuation_reserved: AtomicBool::new(false),
         goal_continuation_round: Mutex::new(None),
