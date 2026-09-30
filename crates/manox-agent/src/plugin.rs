@@ -1248,10 +1248,15 @@ fn git_checkout_sha(dir: &Path, url: &str, sha: &str) -> Result<()> {
             bail!("git fetch failed for {url}");
         }
     }
+    // Check out the SHA itself, never FETCH_HEAD: on the fallback path the
+    // full fetch repoints FETCH_HEAD at the remote's default-branch tip, and
+    // checking that out would install the wrong commit (observed: master tip
+    // where the pin was an older commit). The SHA's object exists after
+    // either fetch, so checking it out directly is correct on both paths.
     let checkout = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["checkout", "--quiet", "FETCH_HEAD"])
+        .args(["checkout", "--quiet", sha])
         .status()
         .with_context(|| format!("git checkout {sha} in {url}"))?;
     if !checkout.success() {
