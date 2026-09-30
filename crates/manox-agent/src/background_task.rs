@@ -282,11 +282,15 @@ impl BackgroundTask {
         }
     }
 
-    /// Push a terminal event. First-wins: only Running/Stopping can transition.
-    pub fn push_terminal(&self, task_id: &TaskId, status: TaskStatus) {
+    /// Push a terminal event. First-wins: only Running/Stopping can
+    /// transition. Returns whether THIS call performed the transition —
+    /// callers that emit notices use it to skip duplicates (a kill-site
+    /// settlement and the stop path's fallback share one channel, so the
+    /// loser emitting again would double every journal line).
+    pub fn push_terminal(&self, task_id: &TaskId, status: TaskStatus) -> bool {
         let mut s = self.state.lock().expect("task state poisoned");
         if s.status.is_terminal() {
-            return;
+            return false;
         }
         s.status = status;
         s.exited_at = Some(Instant::now());
@@ -307,6 +311,7 @@ impl BackgroundTask {
         s.events.push_back(event);
         drop(s);
         self.completion.notify_waiters();
+        true
     }
 
     /// Set the exit code (for command/Bash tasks).
@@ -390,16 +395,14 @@ impl BackgroundTask {
         self.state.lock().expect("task state poisoned").notifier = Some(notifier);
     }
 
-    /// Emit a snapshot through the registered notifier, if any.
+    /// Emit a snapshot through the registered notifier, if any. The
+    /// snapshot is built and sent under the state lock: a read-then-send
+    /// window would let a sampled `Running` snapshot land after a terminal
+    /// one and flip the card backwards.
     fn emit_snapshot(&self, task_id: &TaskId) {
-        let snapshot = self.snapshot(task_id);
-        if let Some(tx) = self
-            .state
-            .lock()
-            .expect("task state poisoned")
-            .notifier
-            .as_ref()
-        {
+        let s = self.state.lock().expect("task state poisoned");
+        let snapshot = build_snapshot(&s, task_id);
+        if let Some(tx) = s.notifier.as_ref() {
             let _ = tx.send(BackendNotice::Event(Box::new(
                 ThreadEvent::BackgroundTaskUpdated { snapshot },
             )));
@@ -417,21 +420,28 @@ impl BackgroundTask {
     /// Build a serializable snapshot for UI cards.
     pub fn snapshot(&self, task_id: &TaskId) -> TaskSnapshot {
         let s = self.state.lock().expect("task state poisoned");
-        TaskSnapshot {
-            task_id: task_id.0.clone(),
-            kind: s.kind,
-            owner_thread_id: s.owner_thread_id.clone(),
-            description: s.description.clone(),
-            status: s.status,
-            created_at_ms: s.created_at_ms,
-            ended_at_ms: s.exited_at_ms,
-            event_count: s.event_count,
-            total_bytes: s.total_bytes,
-            exit_code: s.exit_code,
-            failure_summary: s.failure_summary.clone(),
-            anchor_message_id: None,
-            output_tail: output_tail_from_ring(&s),
-        }
+        build_snapshot(&s, task_id)
+    }
+}
+
+/// Build a snapshot from an already-locked state (shared by the UI
+/// projection and the notifier emission, which must read and send under
+/// one lock hold).
+fn build_snapshot(s: &TaskState, task_id: &TaskId) -> TaskSnapshot {
+    TaskSnapshot {
+        task_id: task_id.0.clone(),
+        kind: s.kind,
+        owner_thread_id: s.owner_thread_id.clone(),
+        description: s.description.clone(),
+        status: s.status,
+        created_at_ms: s.created_at_ms,
+        ended_at_ms: s.exited_at_ms,
+        event_count: s.event_count,
+        total_bytes: s.total_bytes,
+        exit_code: s.exit_code,
+        failure_summary: s.failure_summary.clone(),
+        anchor_message_id: None,
+        output_tail: output_tail_from_ring(s),
     }
 }
 
@@ -669,6 +679,7 @@ impl manox_harness::tasks::TaskObserver for HostTaskObserver {
 
     fn on_output(&self, id: &str, line: String) {
         let Some(proxy) = get_by_str(id) else {
+            tracing::warn!(target: "tasks", id, "output for unregistered task; dropping line");
             return;
         };
         proxy.push_event(&TaskId(id.to_string()), line);
@@ -693,6 +704,7 @@ impl manox_harness::tasks::TaskObserver for HostTaskObserver {
 
     fn on_settled(&self, id: &str, settlement: &manox_harness::tasks::Settlement) {
         let Some(proxy) = get_by_str(id) else {
+            tracing::warn!(target: "tasks", id, "settled task has no host proxy; dropping settlement");
             return;
         };
         apply_settlement(&proxy, &TaskId(id.to_string()), settlement);
@@ -701,12 +713,12 @@ impl manox_harness::tasks::TaskObserver for HostTaskObserver {
 }
 
 impl HostTaskObserver {
-    /// Emit a `BackgroundTaskUpdated` notice for a task.
+    /// Emit a `BackgroundTaskUpdated` notice for a task. Built and sent
+    /// under the task's state lock (see `BackgroundTask::emit_snapshot`):
+    /// the notifier registered here is the same channel, so both paths
+    /// share one stale-window-free primitive.
     fn emit_snapshot(&self, task: &BackgroundTask, id: &str) {
-        let snapshot = task.snapshot(&TaskId(id.to_string()));
-        let _ = self.notice_tx.send(BackendNotice::Event(Box::new(
-            ThreadEvent::BackgroundTaskUpdated { snapshot },
-        )));
+        task.emit_snapshot(&TaskId(id.to_string()));
     }
 }
 
@@ -780,9 +792,12 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
     // own settlement path; this fallback covers hooks that cannot report.
     // Either way the terminal status must reach the cards: the notifier (a
     // host-side copy of the observer's notice channel) emits the snapshot
-    // even when the producer side is gone.
-    task.push_terminal(&TaskId(id.to_string()), terminal);
-    task.emit_snapshot(&TaskId(id.to_string()));
+    // when this push is the one that transitioned the task — a producer
+    // settlement has already emitted through the same channel, and the
+    // fallback would only duplicate it (one journal line per copy).
+    if task.push_terminal(&TaskId(id.to_string()), terminal) {
+        task.emit_snapshot(&TaskId(id.to_string()));
+    }
 
     Ok(())
 }
@@ -1115,6 +1130,60 @@ mod tests {
         assert!(
             saw_terminal,
             "the host stop path must emit a terminal snapshot"
+        );
+        remove(&id);
+    }
+
+    /// The stop path must not duplicate a producer's terminal snapshot:
+    /// kill-point settlements emit through the same channel the notifier
+    /// writes to, so a stop arriving after such a settlement pushes no
+    /// second terminal snapshot (one journal line per stop, not two).
+    #[tokio::test]
+    async fn host_stop_after_producer_settlement_emits_no_duplicate() {
+        let id = TaskId("dup_stop".into());
+        let proxy = register_with_id(
+            id.clone(),
+            TaskKind::MonitorCommand,
+            "t-dup".into(),
+            "watch".into(),
+            CancellationToken::new(),
+        );
+        let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
+        proxy.set_notifier(notice_tx);
+
+        // Producer-side settlement, exactly as the observer's kill-point
+        // path does it: apply the settlement, then emit through the locked
+        // primitive on the shared channel.
+        apply_settlement(
+            &proxy,
+            &id,
+            &manox_harness::tasks::Settlement::new(
+                manox_harness::tasks::SettlementKind::Stopped,
+                manox_harness::tasks::SettlementCause::UserStop,
+            ),
+        );
+        proxy.emit_snapshot(&id);
+        let terminal_notices = |rx: &mut mpsc::UnboundedReceiver<BackendNotice>| {
+            let mut n = 0;
+            while let Ok(BackendNotice::Event(ev)) = rx.try_recv() {
+                if let ThreadEvent::BackgroundTaskUpdated { snapshot } = *ev
+                    && snapshot.task_id == id.0
+                    && snapshot.status == TaskStatus::Stopped
+                {
+                    n += 1;
+                }
+            }
+            n
+        };
+        assert_eq!(terminal_notices(&mut notice_rx), 1, "producer emitted once");
+
+        // The late host stop finds the task already terminal: no second
+        // terminal snapshot may be emitted.
+        stop(&id.0).await.expect("stop succeeds");
+        assert_eq!(
+            terminal_notices(&mut notice_rx),
+            0,
+            "the stop fallback must not duplicate the producer's snapshot"
         );
         remove(&id);
     }
