@@ -380,14 +380,18 @@ impl SessionRuntime for GatewayRuntime {
                 manox_agent::permission::PermissionDecision::Deny,
             )
         };
-        match self.server.ahp_inner().session_thread(session_id) {
-            Some(thread) => {
-                thread.with_mut(|t| t.respond_authorization(auth_id, response));
-                Ok(())
-            }
-            None => Err(RuntimeError::new(format!("unknown session {session_id}"))
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
-        }
+        // §D.6 settle path: a subscribed-but-never-submitted session has
+        // served state without a live engine in the sessions table, so the
+        // bare lookup would refuse a verdict as `unknown session` — the
+        // replayed park the restore re-parks would stay unanswerable
+        // forever. Cold-open the thread first; its restore re-arms the
+        // gates the chain still carries.
+        let inner = Arc::clone(self.server.ahp_inner());
+        let thread = block_on(crate::agent_server::ensure_opened_for_settle(
+            &inner, session_id,
+        ))?;
+        thread.with_mut(|t| t.respond_authorization(auth_id, response));
+        Ok(())
     }
 
     fn answer_question(
@@ -402,19 +406,19 @@ impl SessionRuntime for GatewayRuntime {
             answers = answers.len(),
             "gateway: answering question"
         );
-        match self.server.ahp_inner().session_thread(session_id) {
-            Some(thread) => {
-                thread.with_mut(|t| {
-                    t.respond_question(
-                        request_id,
-                        manox_agent::questions::AskOutcome::Answered(answers),
-                    )
-                });
-                Ok(())
-            }
-            None => Err(RuntimeError::new(format!("unknown session {session_id}"))
-                .with_code(manox_ahp_runtime::error::codes::SESSION_NOT_FOUND)),
-        }
+        // Same settle path as `confirm_tool_call`: cold-open before the
+        // bare lookup can refuse the verdict.
+        let inner = Arc::clone(self.server.ahp_inner());
+        let thread = block_on(crate::agent_server::ensure_opened_for_settle(
+            &inner, session_id,
+        ))?;
+        thread.with_mut(|t| {
+            t.respond_question(
+                request_id,
+                manox_agent::questions::AskOutcome::Answered(answers),
+            )
+        });
+        Ok(())
     }
 
     // MCP servers are process-global; the session id rides the trait for

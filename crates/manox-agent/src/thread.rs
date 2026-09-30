@@ -482,6 +482,12 @@ pub struct ThreadCore {
     /// `ThreadId`, `SubagentStarted.child`) are not `Clone`; once those land
     /// the event can derive `Clone` and this `Arc` comes off.
     subscribers: parking_lot::Mutex<Vec<async_channel::Sender<Arc<ThreadEvent>>>>,
+    /// Fires once the engine actor's journal-first restore has LANDED — the
+    /// point the replayed parks are back on the gates. Default: already
+    /// ready (a facade with no engine has no restore to await). The settle
+    /// path awaits this so a verdict issued during the restore window can
+    /// never hit an empty gate.
+    restore_ready: std::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl ThreadHandle {
@@ -490,7 +496,24 @@ impl ThreadHandle {
         Self(Arc::new(ThreadCore {
             state: parking_lot::RwLock::new(thread),
             subscribers: parking_lot::Mutex::new(Vec::new()),
+            // A facade built directly carries no engine restore to await;
+            // the engine-backed constructor swaps this via
+            // [`ThreadHandle::set_restore_ready`].
+            restore_ready: std::sync::Mutex::new(tokio::sync::watch::channel(true).1),
         }))
+    }
+
+    /// Swap in the engine actor's restore-completion watch. Engine-backed
+    /// facades only: the watch fires when the journal-first restore (and
+    /// its re-park) has landed.
+    pub(crate) fn set_restore_ready(&self, rx: tokio::sync::watch::Receiver<bool>) {
+        *self.0.restore_ready.lock().unwrap() = rx;
+    }
+
+    /// A cloneable watch handle for awaiters: `true` once the actor's
+    /// restore — and the re-park riding its tail — has landed.
+    pub fn restore_ready(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.0.restore_ready.lock().unwrap().clone()
     }
 
     /// Downgrade to a weak reference for the live-thread registry index. The
@@ -866,7 +889,11 @@ impl Thread {
         // journal is the goal authority; stage ③ retired the db leg and
         // with it the "goal features disabled" degrade).
         let goal_bridge = Some(GoalBridge::for_thread(&id.0));
-        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
+        let SpawnedEngine {
+            engine,
+            events,
+            restore_ready,
+        } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
             sessions_dir,
@@ -922,6 +949,7 @@ impl Thread {
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         });
+        handle.set_restore_ready(restore_ready);
         drain_engine_notices(handle.clone(), events);
         handle
     }
@@ -945,7 +973,13 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
+        // A fresh spawn has nothing to restore: the default (already
+        // ready) watch is the honest value, so the receiver is dropped.
+        let SpawnedEngine {
+            engine,
+            events,
+            restore_ready: _,
+        } = crate::engine::spawn_engine(
             cwd.clone(),
             model,
             sessions_dir,
@@ -1803,7 +1837,11 @@ impl Thread {
         let sessions_dir = crate::paths::manox_config_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("sessions");
-        let SpawnedEngine { engine, events } = crate::engine::spawn_engine(
+        let SpawnedEngine {
+            engine,
+            events,
+            restore_ready,
+        } = crate::engine::spawn_engine(
             cwd.clone(),
             model.clone(),
             sessions_dir,
@@ -1862,6 +1900,7 @@ impl Thread {
             pending_engine_events: None,
             extra_working_dirs: Vec::new(),
         });
+        handle.set_restore_ready(restore_ready);
         drain_engine_notices(handle.clone(), events);
         handle
     }
