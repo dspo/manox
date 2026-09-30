@@ -524,7 +524,6 @@ mod tests {
             super::super::actions::ORDER_CHANGED,
         )];
         // Excluded, no fold arm to feed: BASELINE (host envelope),
-        // WORK_BACKGROUND_TASK_STOPPED (declared, never produced),
         // PLAN_REVIEW_SETTLED (folds with the host-emitted verdict-requested edge),
         // the workspaces rows (declared, fold lives outside this bag).
 
