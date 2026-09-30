@@ -246,6 +246,111 @@ async fn unsubscribe_stops_delivery() {
     }
 }
 
+/// The reference client tears a channel down with a *request*-shaped
+/// `unsubscribe` too (the Rust SDK sends the notification form), so the
+/// request form must answer — `null`, since upstream defines no
+/// `UnsubscribeResult` — and stop delivery, exactly what the notification
+/// leg does. Before the router served the request form this answered
+/// `-32083` ("declared but not matched"), an internal-bug-shaped refusal of
+/// a teardown the client was entitled to.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_form_unsubscribe_answers_and_stops_delivery() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+    let (result, mut sub) = client
+        .subscribe(TestBackend::session_uri())
+        .await
+        .expect("subscribes");
+    assert!(result.snapshot.is_some(), "sessions carry state");
+
+    // Delivery is live before the teardown, so the quiet window after it is
+    // the unsubscribe's doing and not an absent subscription.
+    host.publish(
+        &TestBackend::session_uri(),
+        action(serde_json::json!({"type": "session/titleChanged", "title": "before"})),
+        None,
+    );
+    let event = tokio::time::timeout(Duration::from_secs(2), sub.recv())
+        .await
+        .expect("action arrives")
+        .expect("subscription open");
+    assert!(
+        matches!(event, ahp::SubscriptionEvent::Action(_)),
+        "expected an action envelope, got {event:?}"
+    );
+
+    let answer: serde_json::Value = client
+        .request(
+            "unsubscribe",
+            serde_json::json!({"channel": TestBackend::session_uri()}),
+        )
+        .await
+        .expect("the request form of unsubscribe answers");
+    assert!(
+        answer.is_null(),
+        "upstream defines no UnsubscribeResult: the result is null, got {answer}"
+    );
+
+    host.publish(
+        &TestBackend::session_uri(),
+        action(serde_json::json!({"type": "session/titleChanged", "title": "after"})),
+        None,
+    );
+    let event = tokio::time::timeout(Duration::from_secs(1), sub.recv()).await;
+    match event {
+        // Timed out waiting: nothing was delivered. (The SDK only closes the
+        // local fan-out on its own `unsubscribe`, which the raw request
+        // bypasses, so a quiet handle is the success shape here.)
+        Err(_) | Ok(None) => {}
+        Ok(Some(other)) => {
+            panic!("delivery continued after the request-form unsubscribe: {other:?}")
+        }
+    }
+}
+
+/// Unsubscribing a channel this connection never held is a no-op, in the
+/// request form exactly as in the notification form: the release is
+/// `subscriptions.remove(uri)`. A declared command name must not turn an
+/// unsolicited or repeated teardown into `-32083`.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_form_unsubscribe_is_idempotent_for_channels_never_subscribed() {
+    let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
+    let client = connect(&host).await;
+    client
+        .initialize(
+            "desktop".to_string(),
+            vec![PROTOCOL_VERSION.to_string()],
+            vec![],
+        )
+        .await
+        .expect("initializes");
+
+    let first: serde_json::Value = client
+        .request(
+            "unsubscribe",
+            serde_json::json!({"channel": TestBackend::chat_uri()}),
+        )
+        .await
+        .expect("unsubscribing a never-held channel answers, not -32083");
+    assert!(first.is_null());
+    let second: serde_json::Value = client
+        .request(
+            "unsubscribe",
+            serde_json::json!({"channel": TestBackend::chat_uri()}),
+        )
+        .await
+        .expect("repeating the teardown stays a no-op");
+    assert!(second.is_null());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn reconnect_answers_with_fresh_snapshots() {
     let host = Host::new(TestBackend::new() as Arc<dyn Backend>);
