@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use manox_harness::agent_loop::{StreamFn, StreamResolver};
-use manox_harness::coding_agent::{ModelRuntime, create_agent_session};
-use manox_harness::tasks::{Settlement, SettlementKind, TaskLifecycle, TaskObserver};
-use manox_harness::tool::AgentTool;
-use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model, StopReason};
 use manox_harness::bash::BashTool;
 use manox_harness::bash::orchestration::{BackgroundManager, OutputShape};
+use manox_harness::coding_agent::{ModelRuntime, create_agent_session};
+use manox_harness::tasks::{Settlement, TaskObserver};
+use manox_harness::tool::AgentTool;
+use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model, StopReason};
 use manox_harness::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 
 /// A stream returning a scripted sequence of assistant messages, one per call.
@@ -58,7 +58,8 @@ impl TaskObserver for PrintObserver {
         label: &str,
         _stop: manox_harness::tasks::StopHandle,
     ) {
-        self.spawned.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.spawned
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         println!("spawned {id} ({family:?}): {label}");
     }
 
@@ -67,7 +68,10 @@ impl TaskObserver for PrintObserver {
     }
 
     fn on_settled(&self, id: &str, settlement: &Settlement) {
-        println!("[{id}] settled: {} ({:?})", settlement.kind, settlement.cause);
+        println!(
+            "[{id}] settled: {:?} (cause: {:?})",
+            settlement.kind, settlement.cause
+        );
     }
 }
 

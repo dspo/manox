@@ -81,15 +81,11 @@ pub struct BackgroundManager {
     /// cleanup from the listener (which may run on any thread).
     runtime: Option<tokio::runtime::Handle>,
     /// Tasks owned by this manager awaiting settlement, with their
-    /// output-shaping preference. Removed at settlement time: by the
-    /// watcher on a natural completion, by the kill pass (`kill_all`) on
-    /// an abort/teardown, and by the watcher's killed branch after a
-    /// single-task kill. A task absent here is settled or dead.
+    /// output-shaping preference. The entry is the settlement token: the
+    /// watcher claims it for a natural completion, the kill sites claim it
+    /// for a stop/abort/teardown, and whichever claims it settles the task.
+    /// A task absent here is settled or dead.
     tasks: Arc<Mutex<HashMap<crate::core::TaskId, OutputShape>>>,
-    /// Cause recorded by kill sites (user stop / run abort / teardown)
-    /// before killing; the watcher settles killed tasks with it instead of
-    /// a natural completion.
-    killed: Arc<Mutex<HashMap<crate::core::TaskId, SettlementCause>>>,
     observer: Mutex<Option<Arc<dyn TaskObserver>>>,
     self_weak: Weak<BackgroundManager>,
     /// Lifecycle subscription; dropped with the manager. Guarded so the
@@ -105,7 +101,6 @@ impl BackgroundManager {
             steerer: Arc::new(Mutex::new(None)),
             runtime: tokio::runtime::Handle::try_current().ok(),
             tasks: Arc::new(Mutex::new(HashMap::new())),
-            killed: Arc::new(Mutex::new(HashMap::new())),
             observer: Mutex::new(None),
             self_weak: weak.clone(),
             _lifecycle: Arc::new(Mutex::new(None)),
@@ -128,9 +123,7 @@ impl BackgroundManager {
         *self.steerer.lock().expect("steerer lock poisoned") = Some(Arc::new(move |message| {
             handle.steer(message);
         }));
-        let registry = Arc::clone(&self.registry);
-        let tasks = Arc::clone(&self.tasks);
-        let killed = Arc::clone(&self.killed);
+        let manager_weak = self.self_weak.clone();
         // Refresh the handle in case construction happened outside a runtime;
         // the listener itself may run on any thread.
         let runtime = self
@@ -139,14 +132,13 @@ impl BackgroundManager {
             .or_else(|| tokio::runtime::Handle::try_current().ok());
         let listener: HarnessListener = Arc::new(move |event| {
             if matches!(event, crate::core::harness::HarnessEvent::Abort { .. }) {
-                let registry = Arc::clone(&registry);
-                let tasks = Arc::clone(&tasks);
-                let killed = Arc::clone(&killed);
+                let manager_weak = manager_weak.clone();
                 match &runtime {
                     Some(runtime) => {
                         runtime.spawn(async move {
-                            kill_all_tasks(&registry, &tasks, &killed, SettlementCause::RunAbort)
-                                .await;
+                            if let Some(manager) = manager_weak.upgrade() {
+                                kill_all_tasks(&manager, SettlementCause::RunAbort).await;
+                            }
                         });
                     }
                     None => tracing::warn!(
@@ -241,7 +233,6 @@ impl BackgroundManager {
         let registry = Arc::clone(&self.registry);
         let steerer = Arc::clone(&self.steerer);
         let tasks = Arc::clone(&self.tasks);
-        let killed = Arc::clone(&self.killed);
         let tid = id.clone();
         tokio::spawn(async move {
             // Event-driven: the drain task notifies the moment the exit is
@@ -256,17 +247,13 @@ impl BackgroundManager {
                 }
                 return;
             }
-            // First-wins witness: a kill site (user stop / run abort /
-            // teardown) drained the task's entry and recorded the cause, so
-            // the watcher settles with that cause and must not steer a
-            // completion summary into the session.
-            if let Some(cause) = killed.lock().expect("killed lock poisoned").remove(&tid) {
-                tasks.lock().expect("tasks lock poisoned").remove(&tid);
-                if let Some(obs) = &observer {
-                    obs.on_settled(&tid.0, &Settlement::new(SettlementKind::Stopped, cause));
-                }
+            // The task-table entry is the settlement token: kill sites claim
+            // it (and settle `Stopped` themselves) before killing, so an
+            // entry that is already gone here means the kill site settled
+            // the task and this watcher must not double-report.
+            let Some(shape) = tasks.lock().expect("tasks lock poisoned").remove(&tid) else {
                 return;
-            }
+            };
             let status = match registry.status(&tid, status_tail_bytes(&shape)) {
                 Ok(status) => status,
                 Err(e) => {
@@ -280,44 +267,53 @@ impl BackgroundManager {
                     return;
                 }
             };
-            if let Some(shape) = tasks.lock().expect("tasks lock poisoned").remove(&tid) {
-                let steerer = steerer.lock().expect("steerer lock poisoned").clone();
-                let settlement =
-                    Settlement::new(SettlementKind::Completed, SettlementCause::Natural)
-                        .with_exit_code(status.exit_code.flatten());
-                if let Some(steer) = steerer {
-                    steer(AgentMessage::user(format_summary(&tid, &status, shape)));
-                }
-                if let Some(obs) = &observer {
-                    obs.on_settled(&tid.0, &settlement);
-                }
+            let steerer = steerer.lock().expect("steerer lock poisoned").clone();
+            let settlement = Settlement::new(SettlementKind::Completed, SettlementCause::Natural)
+                .with_exit_code(status.exit_code.flatten());
+            if let Some(steer) = steerer {
+                steer(AgentMessage::user(format_summary(&tid, &status, shape)));
+            }
+            if let Some(obs) = &observer {
+                obs.on_settled(&tid.0, &settlement);
             }
         });
         Ok(id)
     }
 
-    /// Cancel every task this manager owns with an explicit cause.
+    /// Cancel every task this manager owns with an explicit cause. Each
+    /// claimed entry settles `Stopped` at the kill site; entries already
+    /// claimed by a natural completion stand down (their watcher settled
+    /// `Completed`).
     pub async fn kill_all(&self, cause: SettlementCause) {
-        kill_all_tasks(&self.registry, &self.tasks, &self.killed, cause).await;
+        kill_all_tasks(self, cause).await;
     }
 
-    /// Kill one task synchronously (user-facing stop). The completion watcher
-    /// settles the task with the recorded cause; first-wins keeps any
-    /// terminal status the host task center already pushed.
+    /// Kill one task synchronously (user-facing stop). The kill site itself
+    /// settles the task `Stopped` — the task-table entry is the exactly-once
+    /// token, so a watcher that already settled naturally wins and this
+    /// side stands down.
     pub fn kill(&self, id: &crate::core::TaskId) {
         self.kill_with_cause(id, SettlementCause::UserStop);
     }
 
-    /// Kill one task with the stopping side's explicit cause. The cause map
-    /// is first-wins, matching `MonitorManager`: a stop racing a run abort
-    /// keeps the first label.
+    /// Kill one task with the stopping side's explicit cause. The entry is
+    /// claimed before the kill: whichever side (this kill site or the
+    /// completion watcher) claims it settles the task, and the other stands
+    /// down — no settlement is lost and no bookkeeping survives to leak.
     pub fn kill_with_cause(&self, id: &crate::core::TaskId, cause: SettlementCause) {
-        self.killed
-            .lock()
-            .expect("killed lock poisoned")
-            .entry(id.clone())
-            .or_insert(cause);
+        let claimed = self.tasks.lock().expect("tasks lock poisoned").remove(id);
+        if let (true, Some(obs)) = (claimed.is_some(), self.observer()) {
+            obs.on_settled(&id.0, &Settlement::new(SettlementKind::Stopped, cause));
+        }
         let _ = self.registry.kill_sync(id);
+    }
+
+    /// The bound observer, if any.
+    fn observer(&self) -> Option<Arc<dyn TaskObserver>> {
+        self.observer
+            .lock()
+            .expect("observer lock poisoned")
+            .clone()
     }
 
     /// Poll one task's status, with a bounded tail of its output.
@@ -373,27 +369,25 @@ fn format_summary(id: &crate::core::TaskId, status: &TaskStatusInfo, shape: Outp
     )
 }
 
-async fn kill_all_tasks(
-    registry: &BackgroundRegistry,
-    tasks: &Mutex<HashMap<crate::core::TaskId, OutputShape>>,
-    killed: &Mutex<HashMap<crate::core::TaskId, SettlementCause>>,
-    cause: SettlementCause,
-) {
+async fn kill_all_tasks(manager: &BackgroundManager, cause: SettlementCause) {
     // Drain: a killed task's bookkeeping leaves the map here, so a later
     // kill pass never re-touches (and re-GC-refreshes) historical ids.
-    let drained: Vec<crate::core::TaskId> = tasks
+    let drained: Vec<crate::core::TaskId> = manager
+        .tasks
         .lock()
         .expect("tasks lock poisoned")
         .drain()
         .map(|(id, _)| id)
         .collect();
+    let observer = manager.observer();
     for id in drained {
-        killed
-            .lock()
-            .expect("killed lock poisoned")
-            .entry(id.clone())
-            .or_insert(cause);
-        let _ = registry.kill(&id).await;
+        // Claim -> settle -> kill, in that order: claiming the entry makes
+        // this kill site the settler (a watcher that already claimed it
+        // settled naturally and drained the entry first).
+        if let Some(obs) = &observer {
+            obs.on_settled(&id.0, &Settlement::new(SettlementKind::Stopped, cause));
+        }
+        let _ = manager.registry.kill(&id).await;
     }
 }
 
@@ -551,11 +545,11 @@ mod tests {
         assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
         assert_eq!(settled[0].cause, SettlementCause::Teardown);
         assert!(matches!(settled[0].kind, SettlementKind::Stopped));
-        // The kill path releases its bookkeeping: neither the task table
-        // nor the cause map may retain the killed id (a later kill pass
-        // would otherwise re-touch — and re-GC-refresh — historical ids).
+        // The kill path releases its bookkeeping: the task table may not
+        // retain the killed id (a later kill pass would otherwise re-touch
+        // — and re-GC-refresh — historical ids), and the settlement was
+        // emitted synchronously at the kill site.
         assert!(manager.tasks.lock().unwrap().is_empty());
-        assert!(manager.killed.lock().unwrap().is_empty());
     }
 
     /// Regression: a task killed via `kill_all` must neither steer a

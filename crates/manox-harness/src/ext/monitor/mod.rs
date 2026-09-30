@@ -204,17 +204,6 @@ impl MonitorManager {
         }
     }
 
-    fn emit_output(&self, id: &str, line: String) {
-        if let Some(obs) = self
-            .observer
-            .lock()
-            .expect("observer lock poisoned")
-            .as_ref()
-        {
-            obs.on_output(id, line);
-        }
-    }
-
     fn emit_settled(&self, id: &str, settlement: &Settlement) {
         if let Some(obs) = self
             .observer
@@ -292,9 +281,9 @@ impl MonitorManager {
     /// Emit a killed WS monitor's settlement from the kill site and release
     /// its task-table entry. The `abort()` drops the driver future in
     /// place, so nothing after its `run_ws_monitor(...).await` would run —
-    /// base behavior emitted the terminal event synchronously here, and the
-    /// observer contract requires exactly one `Settled`. Kill sites never
-    /// record `TimedOut`, so the terminal text carries no timeout figure.
+    /// the observer contract requires exactly one `Settled` per monitor.
+    /// Kill sites never record `TimedOut`, so the terminal text carries no
+    /// timeout figure.
     fn settle_killed_ws(&self, id: &str) {
         let entry = self.tasks.lock().expect("tasks lock poisoned").remove(id);
         let Some(task) = entry else {
@@ -332,14 +321,22 @@ impl MonitorManager {
         ));
         let timeout_secs = timeout.as_secs();
 
+        // The closures capture the observer clone from spawn time, never the
+        // manager: during `Drop` (session teardown) the manager is gone but
+        // the exit path must still settle the monitors it kills.
+        let observer = self
+            .observer
+            .lock()
+            .expect("observer lock poisoned")
+            .clone();
         let on_output = Box::new({
             let steerer = Arc::clone(&steerer);
             let batcher = Arc::clone(&batcher);
             let desc = desc.clone();
-            let weak = self.self_weak.clone();
+            let observer = observer.clone();
             move |task_id: &crate::core::TaskId, line: String| {
-                if let Some(manager) = weak.upgrade() {
-                    manager.emit_output(&task_id.0, line.clone());
+                if let Some(obs) = &observer {
+                    obs.on_output(&task_id.0, line.clone());
                 }
                 let batch = batcher.lock().expect("batcher lock poisoned").push(line);
                 if let Some(batch) = batch {
@@ -353,7 +350,7 @@ impl MonitorManager {
             let tasks = Arc::clone(&self.tasks);
             let batcher = Arc::clone(&batcher);
             let desc = desc.clone();
-            let weak = self.self_weak.clone();
+            let observer = observer.clone();
             move |task_id: &crate::core::TaskId, exit_code: Option<Option<i32>>| {
                 let tid = task_id.0.clone();
                 let kill_outcome = tasks
@@ -382,8 +379,10 @@ impl MonitorManager {
                     },
                 };
                 steer_terminal_text(&steerer, &tid, &desc, &settlement, timeout_secs);
-                if let Some(manager) = weak.upgrade() {
-                    manager.emit_settled(&tid, &settlement);
+                if let Some(obs) = &observer {
+                    obs.on_settled(&tid, &settlement);
+                } else {
+                    tracing::warn!(target: "tasks", id = %tid, "monitor exited with no observer bound; settlement not emitted");
                 }
             }
         });
@@ -438,6 +437,27 @@ impl MonitorManager {
             .port_u16()
             .unwrap_or(if url.starts_with("wss://") { 443 } else { 80 });
         let addrs = websocket::resolve_and_validate_addrs(host, port).await?;
+        self.spawn_websocket_pinned(description, url, protocols, timeout, persistent, &addrs)
+            .await
+    }
+
+    /// Spawn against caller-provided addresses, skipping URL validation and
+    /// DNS resolution. Internal seam (test-only consumer today): loopback
+    /// listeners keep the driver pinned at its connect phase everywhere, so
+    /// the regression tests run their assertions on every machine instead
+    /// of silently no-oping where an address range is unroutable.
+    #[doc(hidden)]
+    pub(crate) async fn spawn_websocket_pinned(
+        &self,
+        description: String,
+        url: String,
+        protocols: Vec<String>,
+        timeout: Duration,
+        persistent: bool,
+        addrs: &[std::net::SocketAddr],
+    ) -> Result<String, String> {
+        websocket::validate_protocols(&protocols)?;
+        let addrs = addrs.to_vec();
 
         let cancel = CancellationToken::new();
         let task_id = self.ws_registry.register(url.clone(), cancel.clone());
@@ -1250,26 +1270,27 @@ mod tests {
         );
     }
 
-    /// A locally-bound address in the benchmarking range (198.18.0.0/15):
-    /// it passes URL validation (loopback/private/link-local are rejected)
-    /// yet stays local, so an accepted socket that never answers the
-    /// handshake pins a WS driver at its connect phase. Returns `None`
-    /// where the range is unroutable (sandboxed environments).
-    async fn bind_ws_probe_listener() -> Option<(tokio::net::TcpListener, std::net::SocketAddr)> {
-        let listener = tokio::net::TcpListener::bind("198.18.0.1:0").await.ok()?;
-        let addr = listener.local_addr().ok()?;
-        Some((listener, addr))
+    /// A loopback listener that accepts connections but never answers the
+    /// WebSocket handshake, pinning a driver at its connect phase. Paired
+    /// with `spawn_websocket_pinned`, which skips URL validation (loopback
+    /// is otherwise rejected) — the tests below must run their assertions
+    /// on every machine, not silently no-op where an address range is
+    /// unroutable.
+    async fn bind_hanging_ws_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
     }
 
-    /// C1 regression probe: a live WS driver must not hold the manager —
-    /// otherwise `Drop` (and with it `kill_all_sync`, the documented
-    /// teardown backstop) is unreachable for the monitor's lifetime and a
-    /// persistent monitor pins its session forever.
+    /// A live WS driver must not hold the manager: otherwise `Drop` (and
+    /// with it `kill_all_sync`, the documented teardown backstop) is
+    /// unreachable for the monitor's lifetime and a persistent monitor
+    /// pins its session forever.
     #[tokio::test]
     async fn manager_droppable_with_live_ws_driver() {
-        let Some((listener, addr)) = bind_ws_probe_listener().await else {
-            return;
-        };
+        let (listener, addr) = bind_hanging_ws_listener().await;
         let accepts = std::sync::atomic::AtomicUsize::new(0);
         let accepts = std::sync::Arc::new(accepts);
         let accepts_srv = std::sync::Arc::clone(&accepts);
@@ -1284,18 +1305,19 @@ mod tests {
         let manager = MonitorManager::new(Arc::new(BackgroundRegistry::new()));
         let weak = Arc::downgrade(&manager);
         manager
-            .spawn_websocket(
+            .spawn_websocket_pinned(
                 "probe".into(),
                 format!("ws://{addr}"),
                 Vec::new(),
                 Duration::from_secs(3600),
                 true,
+                &[addr],
             )
             .await
-            .expect("spawn_websocket accepts the probe address");
+            .expect("pinned spawn accepts the loopback address");
 
         // Wait until the driver is inside `run_ws_monitor` (it dialled the
-        // probe listener).
+        // listener).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while accepts.load(std::sync::atomic::Ordering::SeqCst) == 0
             && tokio::time::Instant::now() < deadline
@@ -1319,14 +1341,12 @@ mod tests {
         );
     }
 
-    /// C1b regression probe: `stop()` on a WS monitor hard-aborts the driver
-    /// future, so the settlement must be emitted at the kill site — exactly
-    /// once, with the recorded cause — and the task-table entry released.
+    /// `stop()` on a WS monitor hard-aborts the driver future, so the
+    /// settlement must be emitted at the kill site — exactly once, with the
+    /// recorded cause — and the task-table entry released.
     #[tokio::test]
     async fn stopped_ws_monitor_settles_at_kill_site_and_releases_entry() {
-        let Some((listener, addr)) = bind_ws_probe_listener().await else {
-            return;
-        };
+        let (listener, addr) = bind_hanging_ws_listener().await;
         let accepts = std::sync::atomic::AtomicUsize::new(0);
         let accepts = std::sync::Arc::new(accepts);
         let accepts_srv = std::sync::Arc::clone(&accepts);
@@ -1342,15 +1362,16 @@ mod tests {
         let observer = RecordingObserver::new();
         manager.set_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
         let tid = manager
-            .spawn_websocket(
+            .spawn_websocket_pinned(
                 "probe".into(),
                 format!("ws://{addr}"),
                 Vec::new(),
                 Duration::from_secs(3600),
                 true,
+                &[addr],
             )
             .await
-            .expect("spawn_websocket accepts the probe address");
+            .expect("pinned spawn accepts the loopback address");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while accepts.load(std::sync::atomic::Ordering::SeqCst) == 0
@@ -1371,9 +1392,61 @@ mod tests {
         );
     }
 
+    /// Dropping the manager (session teardown) must not swallow the
+    /// settlement of the command monitors it kills: the exit path settles
+    /// through the spawn-time observer clone, so the observer sees exactly
+    /// one `Settled` even though the manager is already gone. Without this,
+    /// a host proxy could stay Running forever (no terminal push, no GC).
+    #[tokio::test]
+    async fn command_monitor_settles_after_manager_drop() {
+        let manager = MonitorManager::new(Arc::new(BackgroundRegistry::new()));
+        let observer = RecordingObserver::new();
+        manager.set_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
+        *manager.steerer.lock().unwrap() = Some(Arc::new(|_| {}));
+
+        let tid = manager
+            .spawn_command(
+                "outliving watcher".into(),
+                "sleep 30".into(),
+                &PathBuf::from("/tmp"),
+                Duration::from_secs(60),
+                false,
+            )
+            .unwrap();
+
+        // Session teardown: the last manager handle goes away while the
+        // monitor runs; `Drop` SIGKILLs it and the exit path — holding only
+        // spawn-time clones — must still settle it.
+        drop(manager);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let settlements: Vec<Settlement> = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|ev| match ev {
+                    TaskLifecycle::Settled { id, settlement } if id == &tid => {
+                        Some(settlement.clone())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !settlements.is_empty() || tokio::time::Instant::now() >= deadline {
+                assert_eq!(settlements.len(), 1, "exactly one settlement after Drop");
+                assert_eq!(settlements[0].kind, SettlementKind::Stopped);
+                assert_eq!(settlements[0].cause, SettlementCause::Teardown);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// A 500-line flood must not lose the settlement or the output: the
     /// observer sits on the drain hot path (push-only), so this pins the
-    /// end-to-end property the old broadcast-Lagged test covered.
+    /// end-to-end property under backpressure-shaped load.
+    /// observer sits on the drain hot path (push-only), so this pins the
+    /// end-to-end property under backpressure-shaped load.
     #[tokio::test]
     async fn command_monitor_output_flood_still_settles() {
         let manager = MonitorManager::new(Arc::new(BackgroundRegistry::new()));
