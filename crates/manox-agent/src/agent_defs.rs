@@ -58,25 +58,36 @@ fn load_dir(dir: &Path) -> Vec<(String, AgentDef)> {
 }
 
 /// Register user-authored definitions (same-name overrides built-ins), then
-/// plugin definitions namespaced `<plugin>:<name>`.
-pub fn register_user_and_plugin(registry: &mut AgentRegistry) {
+/// the project layer (`<project_cwd>/.claude/agents/`, overriding user on
+/// name clashes — Claude Code's project-over-user precedence), then plugin
+/// definitions namespaced `<plugin>:<name>`.
+pub fn register_user_and_plugin(registry: &mut AgentRegistry, project_cwd: Option<&Path>) {
     register_from_dirs(
         registry,
         user_agents_dir().ok().as_deref(),
+        project_cwd,
         &crate::plugin::PluginManager::installed(),
     );
 }
 
-/// Testable core: `user_dir` for user-authored definitions, `plugins`
-/// whose `agents/` subdirectories are namespaced.
+/// Testable core: `user_dir` for user-authored definitions, `project_cwd`
+/// whose `.claude/agents/` forms the project layer, and `plugins` whose
+/// `agents/` subdirectories are namespaced.
 fn register_from_dirs(
     registry: &mut AgentRegistry,
     user_dir: Option<&Path>,
+    project_cwd: Option<&Path>,
     plugins: &[crate::plugin::InstalledPlugin],
 ) {
     if let Some(dir) = user_dir {
         for (label, def) in load_dir(dir) {
             tracing::debug!(agent = %def.name, source = %label, "registered user agent definition");
+            registry.register(def);
+        }
+    }
+    if let Some(cwd) = project_cwd {
+        for (label, def) in load_dir(&cwd.join(".claude").join("agents")) {
+            tracing::debug!(agent = %def.name, source = %label, "registered project agent definition");
             registry.register(def);
         }
     }
@@ -104,7 +115,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "reviewer.md", VALID_DEF);
         let mut registry = AgentRegistry::new();
-        register_from_dirs(&mut registry, Some(dir.path()), &[]);
+        register_from_dirs(&mut registry, Some(dir.path()), None, &[]);
         assert_eq!(registry.names(), vec!["Reviewer"]);
         assert_eq!(
             registry.get("Reviewer").unwrap().description,
@@ -119,7 +130,7 @@ mod tests {
         write(dir.path(), "broken.md", "no frontmatter here");
         write(dir.path(), "notes.txt", VALID_DEF);
         let mut registry = AgentRegistry::new();
-        register_from_dirs(&mut registry, Some(dir.path()), &[]);
+        register_from_dirs(&mut registry, Some(dir.path()), None, &[]);
         assert_eq!(registry.names(), vec!["Reviewer"]);
     }
 
@@ -137,7 +148,7 @@ mod tests {
             AgentDef::parse_md("---\nname: Explore\ndescription: Built-in.\ntools:\n  - Read\n---\nBuilt-in body.\n")
                 .unwrap(),
         );
-        register_from_dirs(&mut registry, Some(dir.path()), &[]);
+        register_from_dirs(&mut registry, Some(dir.path()), None, &[]);
         assert_eq!(registry.names(), vec!["Explore"]);
         assert_eq!(
             registry.get("Explore").unwrap().description,
@@ -155,6 +166,7 @@ mod tests {
         register_from_dirs(
             &mut registry,
             None,
+            None,
             &[crate::plugin::InstalledPlugin {
                 name: "gitwork".to_string(),
                 root: plugin_root.path().to_path_buf(),
@@ -165,11 +177,46 @@ mod tests {
     }
 
     #[test]
+    fn project_layer_overrides_user_same_name() {
+        let user = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let agents = project.path().join(".claude").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let user_agents = user.path().join("agents");
+        std::fs::create_dir_all(&user_agents).unwrap();
+        write(&user_agents, "reviewer.md", VALID_DEF);
+        std::fs::write(
+            user.path().join("agents/reviewer.md"),
+            "---\nname: Reviewer\ndescription: User reviewer.\ntools:\n  - Read\n---\nUser body.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("reviewer.md"),
+            "---\nname: Reviewer\ndescription: Project reviewer.\ntools:\n  - Read\n---\nProject body.\n",
+        )
+        .unwrap();
+        let mut registry = AgentRegistry::new();
+        register_from_dirs(
+            &mut registry,
+            Some(user.path().join("agents").as_path()),
+            Some(project.path()),
+            &[],
+        );
+        assert_eq!(registry.names(), vec!["Reviewer"]);
+        assert_eq!(
+            registry.get("Reviewer").unwrap().description,
+            "Project reviewer.",
+            "project registration must override the user layer"
+        );
+    }
+
+    #[test]
     fn missing_dirs_register_nothing() {
         let mut registry = AgentRegistry::new();
         register_from_dirs(
             &mut registry,
             Some(Path::new("/nonexistent/agents-dir")),
+            None,
             &[],
         );
         assert!(registry.names().is_empty());
