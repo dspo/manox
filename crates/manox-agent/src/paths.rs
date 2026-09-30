@@ -199,9 +199,13 @@ pub(crate) mod tests {
 
     /// The ecosystem dirs hang off `claude_home`, not `manox_home`: flipping
     /// them back under `~/.manox` would silently fork the shared Claude Code
-    /// ecosystem again.
+    /// ecosystem again. Reads take the same lock as the mutating sibling —
+    /// otherwise test A could read `claude_home()` before, and `skills_dir()`
+    /// after, a concurrent setter flips the var, and the two halves of the
+    /// assertion disagree.
     #[test]
     fn ecosystem_dirs_live_under_claude_home() {
+        let _guard = claude_home_lock();
         let claude = claude_home().unwrap();
         assert_eq!(skills_dir().unwrap(), claude.join("skills"));
         assert_eq!(commands_dir().unwrap(), claude.join("commands"));
