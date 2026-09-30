@@ -95,7 +95,7 @@ pub fn init() {
     runtime::init();
     settings::init_optimization();
     provider_glue::init();
-    // MCP servers (mcp.toml + plugin .mcp.json layers) — blocks until the
+    // MCP servers (mcp.json + project/plugin .mcp.json layers) — blocks until the
     // connections settle (per-server timeout); failures are isolated.
     #[cfg(feature = "mcp")]
     mcp::init();

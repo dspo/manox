@@ -1746,7 +1746,7 @@ impl Backend for RuntimeBackend {
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
-            // The config is file-owned (mcp.toml / plugin manifests); a
+            // The config is file-owned (mcp.json / project/plugin manifests); a
             // client-side mutation of anything beyond enablement would fold a
             // customization the next launch would not reproduce.
             StateAction::SessionCustomizationUpdated(_)
@@ -2777,7 +2777,7 @@ mod mcp_dispatch_tests {
         let backend = backend(McpOnlyRuntime::serving());
         let customization = Customization::McpServer(Box::new(McpServerCustomization {
             id: "fs".to_string(),
-            uri: "file:///mcp.toml".to_string(),
+            uri: "file:///mcp.json".to_string(),
             name: "fs".to_string(),
             icons: None,
             range: None,

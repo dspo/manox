@@ -572,7 +572,7 @@ pub(super) fn build_tools(
             ));
         }
     }
-    // MCP servers (mcp.toml + plugin .mcp.json): each advertised tool rides
+    // MCP servers (mcp.json + project/plugin .mcp.json): each advertised tool rides
     // behind the same permission gate as built-ins (remote calls are mutating
     // by default). A registry that never initialized (pre-`manox_agent::init`
     // tests) contributes nothing.
