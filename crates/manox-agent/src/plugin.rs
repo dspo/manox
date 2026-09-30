@@ -177,6 +177,9 @@ pub struct InstalledPlugin {
     pub name: String,
     pub root: PathBuf,
     pub marketplace: String,
+    /// The full registry key (`name@marketplace`) this install was read
+    /// from — the identity `enabledPlugins` toggles are keyed by.
+    pub key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -229,7 +232,6 @@ impl PluginManager {
     /// `github:`-sourced marketplaces), that slug and clone are reused so
     /// the two tools never fork one marketplace into two registrations.
     pub fn add_marketplace(git_url: &str) -> Result<MarketplaceIndex> {
-        paths::ensure_manox_config_dir()?;
         let known = KnownMarketplaces::load()?;
         let (slug, root) = match known.by_url(git_url) {
             Some(record) => (record.slug.clone(), record.install_location.clone()),
@@ -347,7 +349,9 @@ impl PluginManager {
     }
 
     /// List the plugins declared by one cached marketplace plus their current
-    /// installed/enabled status in the shared store.
+    /// installed/enabled status in the shared store. Enabled-ness is keyed
+    /// `name@<this marketplace>` — the same name installed from another
+    /// marketplace has its own toggle and does not leak here.
     pub fn list_marketplace_plugins(slug: &str) -> Result<Vec<MarketplacePluginRecord>> {
         let known = KnownMarketplaces::load()?;
         let repo_root = known
@@ -356,19 +360,22 @@ impl PluginManager {
         let index = Self::load_marketplace_index(&repo_root)?;
         let installed_names: std::collections::HashSet<String> =
             Self::all_installed().into_iter().map(|p| p.name).collect();
-        let enabled_names: std::collections::HashSet<String> =
-            Self::enabled_names().into_iter().collect();
+        let toggles = enabled_toggles();
         let mut out: Vec<MarketplacePluginRecord> = index
             .plugins
             .into_iter()
-            .map(|plugin| MarketplacePluginRecord {
-                marketplace_slug: slug.to_string(),
-                installed: installed_names.contains(&plugin.name),
-                enabled: installed_names.contains(&plugin.name)
-                    && enabled_names.contains(&plugin.name),
-                name: plugin.name,
-                description: plugin.description,
-                source: plugin.source.display(),
+            .map(|plugin| {
+                let installed = installed_names.contains(&plugin.name);
+                let key = format!("{}@{}", plugin.name, slug);
+                let enabled = installed && toggles.get(&key).copied() != Some(false);
+                MarketplacePluginRecord {
+                    marketplace_slug: slug.to_string(),
+                    installed,
+                    enabled,
+                    name: plugin.name,
+                    description: plugin.description,
+                    source: plugin.source.display(),
+                }
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -399,7 +406,11 @@ impl PluginManager {
                 )
             })?;
 
-        let (source_tree, commit_sha) = materialize_source(&repo_root, &entry.source)?;
+        // The caller owns the scratch dir: a remote-source clone must outlive
+        // materialize_source or the copy below would read a deleted directory.
+        let scratch = tempfile::tempdir().context("creating install scratch dir")?;
+        let (source_tree, commit_sha) =
+            materialize_source(&repo_root, &entry.source, scratch.path())?;
         let version = load_plugin_manifest(&source_tree)
             .ok()
             .and_then(|m| m.version)
@@ -473,59 +484,75 @@ impl PluginManager {
     /// plugins, in stable (alphabetical) order. Re-read from disk on every
     /// call: Claude Code may rewrite the registry at any time.
     pub fn installed() -> Vec<InstalledPlugin> {
-        let enabled_names: std::collections::HashSet<String> =
-            Self::enabled_names().into_iter().collect();
-        Self::all_installed()
+        Self::scan()
             .into_iter()
-            .filter(|plugin| enabled_names.contains(&plugin.name))
+            .filter(|(_, enabled)| *enabled)
+            .map(|(plugin, _)| plugin)
             .collect()
     }
 
     /// Installed plugins regardless of enabled state, in stable (alphabetical)
     /// order. Entries whose install tree vanished (Claude Code cache GC, a
     /// failed update) are skipped silently — the next read reflects whatever
-    /// Claude Code settled on.
+    /// Claude Code settled on. Keys with no user-scope entry (project/local
+    /// scope installs Claude Code records per-repo) are *not* scanned: the
+    /// user-level loaders would otherwise promote a repo-scoped install into
+    /// every session.
     pub fn all_installed() -> Vec<InstalledPlugin> {
-        let mut out = Vec::new();
+        Self::scan().into_iter().map(|(plugin, _)| plugin).collect()
+    }
+
+    /// The single read pass behind [`Self::installed`], [`Self::all_installed`]
+    /// and [`Self::installed_details`]: one read each of
+    /// `installed_plugins.json` and `settings.json`, yielding every
+    /// user-scope install together with its key-level toggle. Toggles are
+    /// keyed `name@marketplace` — a name present under two marketplaces is
+    /// two independent toggles, and filtering by bare name would let an
+    /// explicit `foo@m1: false` keep scanning because `foo@m2` is enabled.
+    /// A missing key counts as enabled: the install registry is the fact,
+    /// the map is a UI toggle.
+    fn scan() -> Vec<(InstalledPlugin, bool)> {
         let Ok(plugins) = InstalledPlugins::load() else {
-            return out;
+            return Vec::new();
         };
+        let toggles = enabled_toggles();
+        let mut out = Vec::new();
         for key in plugins.keys() {
             let Some((name, marketplace)) = key.rsplit_once('@') else {
                 tracing::warn!("skipping malformed installed-plugins key {key:?}");
                 continue;
             };
-            // One key may carry several entries (scopes/versions); the
-            // user-scope entry is the one the user-level loaders scan.
-            let entries = plugins.entries(key);
-            let Some(entry) = entries
-                .iter()
-                .find(|e| e.scope == "user")
-                .or_else(|| entries.first())
-            else {
+            // Only the user-scope entry is the one the user-level loaders
+            // scan; a key without one belongs to other scopes' bookkeeping.
+            let Some(entry) = plugins.entries(key).into_iter().find(|e| e.scope == "user") else {
                 continue;
             };
             if !entry.root.exists() {
                 continue;
             }
             mark_in_use(&entry.root);
-            out.push(InstalledPlugin {
-                name: name.to_string(),
-                root: entry.root.clone(),
-                marketplace: marketplace.to_string(),
-            });
+            let enabled = toggles.get(key).copied() != Some(false);
+            out.push((
+                InstalledPlugin {
+                    name: name.to_string(),
+                    root: entry.root,
+                    marketplace: marketplace.to_string(),
+                    key: key.to_string(),
+                },
+                enabled,
+            ));
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out.sort_by(|a, b| {
+            (a.0.name.clone(), a.0.key.clone()).cmp(&(b.0.name.clone(), b.0.key.clone()))
+        });
         out
     }
 
     /// Installed plugins plus the parsed manifest fields used by the plugin
     /// management UI.
     pub fn installed_details() -> Vec<InstalledPluginRecord> {
-        let enabled_names: std::collections::HashSet<String> =
-            Self::enabled_names().into_iter().collect();
         let mut out = Vec::new();
-        for plugin in Self::all_installed() {
+        for (plugin, enabled) in Self::scan() {
             let manifest = load_plugin_manifest(&plugin.root);
             out.push(InstalledPluginRecord {
                 name: plugin.name.clone(),
@@ -539,7 +566,7 @@ impl PluginManager {
                     .as_ref()
                     .ok()
                     .and_then(|manifest| manifest.version.clone()),
-                enabled: enabled_names.contains(&plugin.name),
+                enabled,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -562,33 +589,21 @@ impl PluginManager {
         }
         Ok(keys)
     }
+}
 
-    /// Names currently enabled — installed names without an explicit `false`
-    /// in `settings.json`. A missing key counts as enabled: the install
-    /// registry is the fact, the map is a UI toggle.
-    fn enabled_names() -> Vec<String> {
-        let Ok(plugins) = InstalledPlugins::load() else {
-            return Vec::new();
-        };
-        let toggles = paths::claude_settings_file()
-            .ok()
-            .and_then(|path| read_json(&path).ok())
-            .flatten()
-            .and_then(|doc| doc.get("enabledPlugins").cloned())
-            .and_then(|t| t.as_object().cloned())
-            .unwrap_or_default();
-        let mut names = Vec::new();
-        for key in plugins.keys() {
-            let Some(name) = key.rsplit_once('@').map(|(n, _)| n.to_string()) else {
-                continue;
-            };
-            let enabled = toggles.get(key).and_then(Value::as_bool) != Some(false);
-            if enabled && !names.contains(&name) {
-                names.push(name);
-            }
-        }
-        names
-    }
+/// The `enabledPlugins` map of `settings.json`, read leniently (a missing or
+/// malformed file yields no toggles — every install then reads as enabled).
+fn enabled_toggles() -> BTreeMap<String, bool> {
+    paths::claude_settings_file()
+        .ok()
+        .and_then(|path| read_json(&path).ok())
+        .flatten()
+        .and_then(|doc| doc.get("enabledPlugins").cloned())
+        .and_then(|t| t.as_object().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| v.as_bool().map(|b| (k, b)))
+        .collect()
 }
 
 /// Default clone location for a slug when no explicit `installLocation` is
@@ -694,18 +709,22 @@ impl InstalledPlugins {
         &self.keys
     }
 
-    /// Typed view of one key's install entries; malformed entries are
-    /// dropped with a warning rather than failing the whole registry.
-    fn entries(&self, key: &str) -> Vec<InstallEntry> {
-        let Some(list) = self
-            .doc
+    /// Raw view of one key's install entries, unknown fields included — the
+    /// write path needs these to round-trip entries manox does not model.
+    fn raw_entries(&self, key: &str) -> Vec<Value> {
+        self.doc
             .get("plugins")
             .and_then(|p| p.get(key))
             .and_then(Value::as_array)
-        else {
-            return Vec::new();
-        };
-        list.iter()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Typed view of one key's install entries; malformed entries are
+    /// dropped with a warning rather than failing the whole registry.
+    fn entries(&self, key: &str) -> Vec<InstallEntry> {
+        self.raw_entries(key)
+            .iter()
             .filter_map(
                 |raw| match serde_json::from_value::<InstallEntry>(raw.clone()) {
                     Ok(entry) => Some(entry),
@@ -728,10 +747,21 @@ impl InstalledPlugins {
         let mut doc = Self::load_for_write()?;
         let key = format!("{name}@{marketplace}");
         let now = now_rfc3339();
-        let previous_installed_at = doc
-            .entries(&key)
-            .first()
-            .map(|entry| entry.installed_at.clone())
+        // A key may carry sibling entries Claude Code wrote for other scopes
+        // (project/local installs of the same plugin); replacing the array
+        // wholesale would silently delete those registrations. Drop only the
+        // user-scope entries being superseded and keep the rest verbatim.
+        let raws = doc.raw_entries(&key);
+        let siblings: Vec<Value> = raws
+            .iter()
+            .filter(|raw| raw.get("scope").and_then(Value::as_str) != Some("user"))
+            .cloned()
+            .collect();
+        let previous_installed_at = raws
+            .iter()
+            .filter_map(|raw| serde_json::from_value::<InstallEntry>(raw.clone()).ok())
+            .find(|entry| entry.scope == "user")
+            .map(|entry| entry.installed_at)
             .unwrap_or_else(|| now.clone());
         let entry = json!({
             "scope": "user",
@@ -748,7 +778,9 @@ impl InstalledPlugins {
             .or_insert_with(|| json!({}))
             .as_object_mut()
             .context("installed_plugins.plugins")?;
-        plugins.insert(key, json!([entry]));
+        let mut list = siblings;
+        list.push(entry);
+        plugins.insert(key, Value::Array(list));
         write_json_atomic(&paths::installed_plugins_file()?, &doc.doc)
     }
 
@@ -842,20 +874,43 @@ impl KnownMarketplaces {
         })
     }
 
-    /// Insert or update one registration, round-tripping the rest of the
-    /// document. An unparseable file aborts the write.
+    /// Insert or update one registration, merging into any existing record
+    /// instead of replacing it: only `installLocation`/`lastUpdated` are
+    /// manox's to maintain, and `source` is written only when the slug has
+    /// no source yet — rewriting a Claude Code-authored registration (say a
+    /// `{"source": "github", "repo": ...}` shape, or records carrying extra
+    /// metadata fields) would fork exactly the shared registry this module
+    /// exists to share. An unparseable file aborts the write.
     fn register(slug: &str, git_url: &str, root: &Path) -> Result<()> {
         let path = paths::known_marketplaces_file()?;
         let mut doc = read_json_for_write(&path)?.unwrap_or_else(|| json!({}));
         let obj = doc.as_object_mut().context("known_marketplaces doc")?;
-        obj.insert(
-            slug.to_string(),
-            json!({
-                "source": {"source": "git", "url": git_url},
-                "installLocation": root,
-                "lastUpdated": now_rfc3339(),
-            }),
-        );
+        let entry = obj
+            .entry(slug.to_string())
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("known_marketplaces entry")?;
+        if !entry.contains_key("source") {
+            entry.insert(
+                "source".to_string(),
+                json!({"source": "git", "url": git_url}),
+            );
+        } else if let Some(existing_url) = entry
+            .get("source")
+            .and_then(|s| s.get("url"))
+            .and_then(Value::as_str)
+            .filter(|existing| normalize_git_url(existing) != normalize_git_url(git_url))
+        {
+            // A source naming a *different* URL under the slug manox just
+            // cloned is a stale or colliding registration — surfacing it
+            // beats silently trusting either side.
+            tracing::warn!(
+                "marketplace {slug} was registered for {existing_url} but {} was cloned into it",
+                git_url
+            );
+        }
+        entry.insert("installLocation".to_string(), json!(root));
+        entry.insert("lastUpdated".to_string(), json!(now_rfc3339()));
         write_json_atomic(&path, &doc)
     }
 
@@ -1078,11 +1133,16 @@ fn git_rev_parse_head(dir: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Shallow-clone `url` (optionally at `git_ref`) into `dest`.
+/// Shallow-clone `url` (optionally at `git_ref`) into `dest`. A `git_ref`
+/// that is a commit SHA cannot go through `clone --branch` (git only accepts
+/// branch/tag names there): clone the default branch shallow, then fetch and
+/// check out the SHA — falling back to a full fetch when the server refuses
+/// shallow SHA fetches.
 fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()> {
+    let sha_ref = git_ref.filter(|git_ref| is_commit_sha(git_ref));
     let mut cmd = Command::new("git");
     cmd.args(["clone", "--depth", "1", "--quiet"]);
-    if let Some(git_ref) = git_ref {
+    if let Some(git_ref) = git_ref.filter(|_| sha_ref.is_none()) {
         cmd.arg("--branch").arg(git_ref);
     }
     let status = cmd
@@ -1093,18 +1153,56 @@ fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()
     if !status.success() {
         bail!("git clone failed: {url} (exit {:?})", status.code());
     }
+    if let Some(sha) = sha_ref {
+        let fetched = Command::new("git")
+            .arg("-C")
+            .arg(dest)
+            .args(["fetch", "--depth", "1", "origin", sha])
+            .status()
+            .with_context(|| format!("git fetch {sha} in {url}"))?;
+        if !fetched.success() {
+            let full = Command::new("git")
+                .arg("-C")
+                .arg(dest)
+                .args(["fetch", "origin"])
+                .status()
+                .with_context(|| format!("git fetch in {url}"))?;
+            if !full.success() {
+                bail!("git fetch failed for {url}");
+            }
+        }
+        let checkout = Command::new("git")
+            .arg("-C")
+            .arg(dest)
+            .args(["checkout", "--quiet", "FETCH_HEAD"])
+            .status()
+            .with_context(|| format!("git checkout {sha} in {url}"))?;
+        if !checkout.success() {
+            bail!("git checkout failed for {sha} in {url}");
+        }
+    }
     Ok(())
+}
+
+/// A 40-hex-digit ref is a commit SHA, not a branch or tag name — the shape
+/// marketplace indexes pin provenance with.
+fn is_commit_sha(git_ref: &str) -> bool {
+    git_ref.len() == 40 && git_ref.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Materialize a marketplace entry's source into a local directory and
 /// return the tree plus the git commit it came from. In-repo relative paths
 /// are used directly (the marketplace clone is already a checkout); remote
-/// sources are shallow-cloned into a temp dir. A pinned `sha` in the entry
-/// is not verified against the checkout — the index is treated as
-/// authoritative, as Claude Code does.
+/// sources are shallow-cloned into `scratch`, which the CALLER owns and must
+/// keep alive until the tree has been consumed — a clone dir dropped at
+/// function exit is exactly the bug that made every remote-source install
+/// copy from a deleted directory. A pinned `sha` in the entry is not
+/// verified against the checkout — the index is treated as authoritative,
+/// as Claude Code does.
 fn materialize_source(
     repo_root: &Path,
     source: &MarketplacePluginSource,
+    scratch: &Path,
 ) -> Result<(PathBuf, String)> {
     match source {
         MarketplacePluginSource::Relative(rel) => {
@@ -1125,16 +1223,16 @@ fn materialize_source(
                     (url.clone(), path.as_deref(), r#ref.as_deref())
                 }
             };
-            let tmp = tempfile::tempdir().context("creating clone temp dir")?;
-            git_clone_shallow(&url, git_ref, tmp.path())?;
+            let clone_dir = scratch.join("clone");
+            git_clone_shallow(&url, git_ref, &clone_dir)?;
             let tree = match subpath {
-                Some(sub) => tmp.path().join(sub.trim_matches('/')),
-                None => tmp.path().to_path_buf(),
+                Some(sub) => clone_dir.join(sub.trim_matches('/')),
+                None => clone_dir.clone(),
             };
             if !tree.exists() {
                 bail!("plugin source {} missing in {url}", tree.display());
             }
-            Ok((tree, git_rev_parse_head(tmp.path())))
+            Ok((tree, git_rev_parse_head(&clone_dir)))
         }
     }
 }
@@ -1368,6 +1466,51 @@ mod tests {
         (market, url, slug)
     }
 
+    /// Seed `installed_plugins.json` with (key, existing tree, scope)
+    /// entries and `settings.json` with `enabledPlugins: {}`.
+    fn seed_registry(entries: &[(&str, &Path, &str)]) {
+        let registry_path = paths::installed_plugins_file().unwrap();
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        let mut plugins = serde_json::Map::new();
+        for (key, tree, scope) in entries {
+            plugins.insert(
+                (*key).to_string(),
+                json!([{
+                    "scope": scope,
+                    "installPath": tree,
+                    "version": "1.0.0",
+                    "installedAt": "t0",
+                    "lastUpdated": "t0",
+                    "gitCommitSha": "s",
+                }]),
+            );
+        }
+        std::fs::write(
+            &registry_path,
+            serde_json::to_string(&json!({"version": 2, "plugins": plugins})).unwrap(),
+        )
+        .unwrap();
+        let settings = paths::claude_settings_file().unwrap();
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, r#"{"enabledPlugins":{}}"#).unwrap();
+    }
+
+    /// Add explicit enabledPlugins toggles on top of [`seed_registry`].
+    fn seed_toggles(toggles: &[(&str, bool)]) {
+        let path = paths::claude_settings_file().unwrap();
+        let mut doc = read_json(&path).unwrap().unwrap();
+        let obj = doc.as_object_mut().unwrap();
+        let map = obj
+            .get_mut("enabledPlugins")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        for (key, enabled) in toggles {
+            map.insert((*key).to_string(), json!(enabled));
+        }
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+    }
+
     /// Full lifecycle against a real local git marketplace, redirected into a
     /// temp Claude home: install writes the cache tree + both registries;
     /// disable/enable flip the settings toggle; uninstall removes everything;
@@ -1507,6 +1650,172 @@ mod tests {
             !keys.contains_key(slug.as_str()),
             "same URL must not gain a second registration"
         );
+        assert!(foreign_root.join(".git").exists());
+    }
+
+    /// Toggles are keyed `name@marketplace`: disabling `foo@m1` must not
+    /// keep `foo@m1` scanned merely because `foo@m2` exists (the bare-name
+    /// filter leaked key-level state across marketplaces).
+    #[test]
+    fn toggles_are_key_scoped() {
+        let _home = ClaudeHome::new();
+        let tree1 = tempfile::tempdir().unwrap();
+        let tree2 = tempfile::tempdir().unwrap();
+        for tree in [&tree1, &tree2] {
+            std::fs::create_dir_all(tree.path().join(".claude-plugin")).unwrap();
+        }
+        seed_registry(&[
+            ("foo@m1", tree1.path(), "user"),
+            ("foo@m2", tree2.path(), "user"),
+        ]);
+        seed_toggles(&[("foo@m1", false)]);
+
+        let installed = PluginManager::installed();
+        assert_eq!(
+            installed.iter().map(|p| p.key.as_str()).collect::<Vec<_>>(),
+            ["foo@m2"],
+            "the explicitly disabled foo@m1 must not be scanned"
+        );
+        let details = PluginManager::installed_details();
+        assert_eq!(details.len(), 2);
+        let m1 = details.iter().find(|d| d.marketplace == "m1").unwrap();
+        let m2 = details.iter().find(|d| d.marketplace == "m2").unwrap();
+        assert!(!m1.enabled);
+        assert!(m2.enabled);
+        assert_eq!(PluginManager::all_installed().len(), 2);
+    }
+
+    /// A project/local-scope entry recorded by Claude Code under the same
+    /// key survives a manox (re)install — only the user-scope entry is
+    /// superseded.
+    #[test]
+    fn record_install_preserves_sibling_scopes() {
+        let _home = ClaudeHome::new();
+        let project_tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project_tree.path().join(".claude-plugin")).unwrap();
+        seed_registry(&[]);
+        let registry_path = paths::installed_plugins_file().unwrap();
+        std::fs::write(
+            &registry_path,
+            format!(
+                r#"{{"version":2,"plugins":{{"x@m":[{{"scope":"project","installPath":{},"version":"0.1.0","installedAt":"t0","lastUpdated":"t0","gitCommitSha":"s"}}]}}}}"#,
+                serde_json::to_string(project_tree.path().to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let user_tree = tempfile::tempdir().unwrap();
+        InstalledPlugins::record_install("x", "m", user_tree.path(), "1.0.0", "abc").unwrap();
+
+        let registry = read_json(&registry_path).unwrap().unwrap();
+        let entries = registry["plugins"]["x@m"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["scope"], json!("project"));
+        assert_eq!(entries[0]["version"], json!("0.1.0"));
+        assert_eq!(entries[1]["scope"], json!("user"));
+        assert_eq!(entries[1]["version"], json!("1.0.0"));
+    }
+
+    /// A key whose entries are all project-scope is Claude Code's per-repo
+    /// bookkeeping — the user-level loaders must not promote it into every
+    /// session.
+    #[test]
+    fn project_only_keys_are_not_scanned() {
+        let _home = ClaudeHome::new();
+        let tree = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tree.path().join(".claude-plugin")).unwrap();
+        seed_registry(&[("repo@m", tree.path(), "project")]);
+
+        assert!(PluginManager::all_installed().is_empty());
+        assert!(PluginManager::installed().is_empty());
+    }
+
+    /// A `git-subdir` entry whose `ref` pins a commit SHA materializes via
+    /// fetch + checkout (clone --branch only accepts branch/tag names).
+    #[test]
+    fn materializes_a_sha_pinned_remote_source() {
+        let repo = tempfile::tempdir().unwrap();
+        let plugins = repo.path().join("plugins/pinned");
+        std::fs::create_dir_all(&plugins).unwrap();
+        std::fs::write(plugins.join("marker.txt"), "pinned-content").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["-c", "user.email=t@t", "-c", "user.name=t", "add", "."],
+            vec![
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        let sha = git_rev_parse_head(repo.path());
+        assert!(is_commit_sha(&sha));
+
+        let source = MarketplacePluginSource::Remote(RemoteSource::GitSubdir {
+            url: repo.path().to_str().unwrap().to_string(),
+            path: Some("plugins/pinned".to_string()),
+            r#ref: Some(sha.clone()),
+        });
+        let scratch = tempfile::tempdir().unwrap();
+        let (tree, provenance) =
+            materialize_source(Path::new("/nonexistent"), &source, scratch.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tree.join("marker.txt")).unwrap(),
+            "pinned-content"
+        );
+        assert_eq!(provenance, sha);
+    }
+
+    /// Registering a URL Claude Code already recorded merges into the
+    /// record: the CC-authored source shape and any extra fields survive;
+    /// only installLocation/lastUpdated refresh.
+    #[test]
+    fn register_merges_into_an_existing_claude_code_record() {
+        let _home = ClaudeHome::new();
+        let (_market, url, _slug) = seed_marketplace();
+        let foreign_root = paths::plugins_dir().unwrap().join("marketplaces/remora");
+        // Claude Code's registration for this URL: a `name` field manox
+        // never models, ahead of the manox merge.
+        let path = paths::known_marketplaces_file().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"remora":{{"extraField":true,"name":"remora-plugins","source":{{"source":"git","url":{}}},"installLocation":{},"lastUpdated":"t0"}}}}"#,
+                serde_json::to_string(url.as_str()).unwrap(),
+                serde_json::to_string(foreign_root.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+
+        PluginManager::add_marketplace(&url).unwrap();
+
+        let known = read_json(&path).unwrap().unwrap();
+        let record = &known["remora"];
+        assert_eq!(record["extraField"], json!(true), "unknown fields survive");
+        assert_eq!(
+            record["name"],
+            json!("remora-plugins"),
+            "unknown fields survive"
+        );
+        assert_eq!(
+            record["source"]["source"],
+            json!("git"),
+            "a CC-authored source shape must not be rewritten"
+        );
+        assert_ne!(record["lastUpdated"], json!("t0"));
+        // The clone landed in the recorded location, not a slug-derived one.
         assert!(foreign_root.join(".git").exists());
     }
 

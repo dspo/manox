@@ -171,6 +171,7 @@ mod tests {
                 name: "gitwork".to_string(),
                 root: plugin_root.path().to_path_buf(),
                 marketplace: "test".to_string(),
+                key: "gitwork@test".to_string(),
             }],
         );
         assert_eq!(registry.names(), vec!["gitwork:Reviewer"]);

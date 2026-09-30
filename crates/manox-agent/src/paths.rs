@@ -156,9 +156,10 @@ pub fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-/// Ensure the manox config root exists. Called by writers (plugin manager,
-/// settings, MCP config) before they lay down files; readers tolerate
-/// absence so a fresh machine with no config still boots.
+/// Ensure the manox config root exists. Called by writers (settings, MCP
+/// config) before they lay down files; readers tolerate absence so a fresh
+/// machine with no config still boots. The plugin store no longer lives
+/// here — it moved to the shared Claude home.
 pub fn ensure_manox_config_dir() -> Result<PathBuf> {
     let dir = manox_config_dir()?;
     if dir.exists() {
