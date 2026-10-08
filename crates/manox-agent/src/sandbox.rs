@@ -1,11 +1,10 @@
-//! OS-level sandbox for the pi-path `bash` tool: macOS seatbelt
+//! OS-level sandbox for the kernel-path `bash` tool: macOS seatbelt
 //! (`sandbox-exec`) wrapping one-shot commands.
 //!
 //! The seatbelt renders a per-call file-effect profile from the effective
 //! `PermissionMode`: `read-only` denies all file writes (only required sinks
 //! like `/dev/null`); `workspace-write` allows the shared `writable_roots`;
 //! `danger-full-access` skips the seatbelt entirely (the unsandboxed backend).
-//! Mirrors `~/projects/github/deepseek-harness` `dsh-sandbox-local`.
 //!
 //! Network and `.git` protection are outside the mode vocabulary: the
 //! `(allow default)` base admits all network, and `workspace-write` allows any
@@ -228,7 +227,7 @@ fn login_shell_path() -> String {
     .clone()
 }
 
-/// One-shot seatbelt-wrapped bash backend for the pi bash tool. The effective
+/// One-shot seatbelt-wrapped bash backend for the bash tool. The effective
 /// mode is resolved per call by the host-injected `mode_resolver` (the
 /// session mode, or an approved `sandbox_permissions` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels

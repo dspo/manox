@@ -1,6 +1,6 @@
 //! Host-private Title agent and its evidence shaping.
 //!
-//! Title generation is a manox capability, not a Pi parity surface. Each run
+//! Title generation is a manox capability, not a parity surface. Each run
 //! creates an ephemeral `manox_harness::Agent` with exactly one terminating `Title` tool.
 
 use std::path::Path;

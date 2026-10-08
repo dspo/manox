@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 pub const MAX_OBJECTIVE_CHARS: usize = 4_000;
 
 /// Minimum number of admitted goal rounds before the model may report a
-/// blocker through `UpdateGoal` — the anti-bail gate, matching the DSH
-/// tool-goal `blockedAfterConsecutiveRounds` default of 3.
+/// blocker through `UpdateGoal` — the anti-bail gate default of 3.
 pub const BLOCKED_MIN_GOAL_ROUNDS: u64 = 3;
 
 /// The single supported goal event version; the fold rejects anything else.
@@ -426,7 +425,7 @@ pub fn apply_goal_event(state: &GoalFoldState, event: &GoalEvent) -> Result<Goal
 }
 
 /// Pause/resume/complete/block must preserve the goal definition (objective,
-/// budget, round cap) — the DSH `requireSameDefinition` rule.
+/// budget, round cap) — the require-same-definition rule.
 fn require_same_definition(current: &ThreadGoal, next: &ThreadGoal) -> Result<()> {
     if current.objective != next.objective
         || current.token_budget != next.token_budget

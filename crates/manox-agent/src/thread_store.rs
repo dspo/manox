@@ -1,8 +1,8 @@
 //! The `ThreadStore` facade — the session-list state the sidebar renders.
 //!
-//! The sidebar's session list comes from the pi session repository (jsonl)
+//! The sidebar's session list comes from the session repository (jsonl)
 //! plus a per-session UI-metadata sidecar (`manox_harness::session_meta`).
-//! The pi transcript persists itself, so `refresh_thread_list` only refreshes
+//! The transcript persists itself, so `refresh_thread_list` only refreshes
 //! the sidebar list; manox SQLite timeline/note records are not produced.
 //! Archived sessions are excluded from the sidebar list but stay in
 //! `session_paths` so their sidecar remains addressable. The retired manox
@@ -353,7 +353,7 @@ static GLOBAL: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(Non
 #[cfg(any(test, feature = "test-support"))]
 static TEST_OVERRIDE: std::sync::Mutex<Option<StoreHandle>> = std::sync::Mutex::new(None);
 
-/// Resolve the pi session directory under the manox config dir.
+/// Resolve the session directory under the manox config dir.
 pub(crate) fn sessions_dir() -> PathBuf {
     crate::paths::manox_config_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
@@ -1281,12 +1281,12 @@ impl ThreadStore {
         self.write_meta(id, move |meta| meta.tag = tag);
     }
 
-    /// Append a `model_change` event. The pi transcript records model changes
+    /// Append a `model_change` event. The transcript records model changes
     /// itself; nothing to do here.
     pub fn record_model_change(&self, _thread_id: &str, _from: Option<&str>, _to: &str) {}
 
     /// Append a typed event to the thread's timeline. The manox SQLite
-    /// timeline is not produced by the pi backend.
+    /// timeline is not produced by the harness backend.
     pub fn record_event(
         &self,
         _thread_id: &str,
@@ -2064,7 +2064,7 @@ mod tests {
         std::sync::Arc<crate::db::ThreadsDatabase>,
         std::path::PathBuf,
     ) {
-        let path = std::env::temp_dir().join(format!("pi-store-test-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("store-test-{}.db", uuid::Uuid::new_v4()));
         let db = std::sync::Arc::new(
             crate::db::ThreadsDatabase::open(&path).expect("open temp threads db"),
         );
@@ -2250,7 +2250,7 @@ mod tests {
     #[test]
     fn purge_superseded_predecessors_removes_only_unmaterialized_sidecars() {
         let (db, db_path) = temp_db();
-        let dir = std::env::temp_dir().join(format!("pi-store-purge-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("store-purge-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let handle = store_handle(db);
         handle.with_mut(|s| s.sessions_dir = dir.clone());
@@ -3346,7 +3346,7 @@ mod tests {
         // A pin journals its decision and persists the account, both of which
         // need the runtime — so the account file goes to a scratch path.
         crate::runtime::init_hermetic_for_test();
-        let scratch = std::env::temp_dir().join(format!("pi-order-{}.json", uuid::Uuid::new_v4()));
+        let scratch = std::env::temp_dir().join(format!("order-{}.json", uuid::Uuid::new_v4()));
         crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
         let (store, path) = ordered_store(&[
             ("t1", "/p/a", 300, false),
@@ -3415,7 +3415,7 @@ mod tests {
         // Archiving journals its decision and persists the account, both of
         // which need the runtime — so the account file goes to a scratch path.
         crate::runtime::init_hermetic_for_test();
-        let scratch = std::env::temp_dir().join(format!("pi-order-{}.json", uuid::Uuid::new_v4()));
+        let scratch = std::env::temp_dir().join(format!("order-{}.json", uuid::Uuid::new_v4()));
         crate::sidebar_order::set_order_path_for_test(Some(scratch.clone()));
         let (store, path) =
             ordered_store(&[("t1", "/p/a", 100, false), ("t2", "/p/a", 200, false)]);

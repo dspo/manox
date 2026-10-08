@@ -1,5 +1,5 @@
 //! Process-global registry of background tasks — command Monitor, WebSocket
-//! Monitor, background Bash (proxied from the pi-side registries), and
+//! Monitor, background Bash (proxied from the kernel-side registries), and
 //! asynchronously-dispatched subagents — each with an owner thread, status,
 //! stop routing, and a bounded output ring.
 //!
@@ -22,7 +22,7 @@
 //!
 //! Tasks persist after exit so a final poll or status card can observe the
 //! terminal state; a periodic GC sweep removes long-dead entries. Task ids
-//! issued by the pi-side registries are process-unique (one shared ordinal);
+//! issued by the kernel-side registries are process-unique (one shared ordinal);
 //! directly-registered tasks (subagents) draw from the registry counter.
 
 use std::collections::{HashMap, VecDeque};
@@ -67,7 +67,7 @@ pub enum TaskKind {
     MonitorWebSocket,
     BackgroundBash,
     /// An asynchronously-dispatched subagent coroutine running in a background
-    /// pi session. Completion is delivered to the Captain as a
+    /// session. Completion is delivered to the Captain as a
     /// `BackendNotice::SteerDelivered{reason: Complete}` peer message; a
     /// Running snapshot is emitted at dispatch + at settlement so the UI card
     /// surfaces during the run and its Stop button (`background_task::stop`)
@@ -162,7 +162,7 @@ struct TaskState {
     created_at_ms: u64,
     exited_at: Option<Instant>,
     exited_at_ms: Option<u64>,
-    /// The hook that actually stops the underlying pi-side work. Registered
+    /// The hook that actually stops the underlying kernel-side work. Registered
     /// by whoever proxies the task (monitor manager / background manager).
     on_stop: Option<OnStopHook>,
     /// Notice sink for snapshots this registry pushes itself (the stop
@@ -204,7 +204,7 @@ impl TaskState {
     }
 }
 
-/// The hook that actually stops a proxy's underlying work (the pi-side
+/// The hook that actually stops a proxy's underlying work (the kernel-side
 /// kill). The second argument carries the stopping side's intent so the
 /// producer's kill site records the right [`SettlementCause`] — a host
 /// teardown (`SessionEnded`) forwards `Teardown`, a user-facing stop
@@ -381,7 +381,7 @@ impl BackgroundTask {
             .clone()
     }
 
-    /// Register the hook that actually stops the underlying pi-side work when
+    /// Register the hook that actually stops the underlying kernel-side work when
     /// this task's stop path runs. Called once by the owner that created the
     /// proxy.
     pub fn set_on_stop(&self, on_stop: OnStopHook) {
@@ -549,7 +549,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 }
 
 /// Allocate a unique id for a directly-registered task. Direct registration
-/// is subagent-only (pi-path tasks enter through `register_with_id` under
+/// is subagent-only (kernel-path tasks enter through `register_with_id` under
 /// their harness-issued ids), so the prefix namespace never overlaps the
 /// harness registries' `mon_`/`bg_`/`ws_`.
 fn next_id() -> TaskId {
@@ -560,7 +560,7 @@ fn next_id() -> TaskId {
 }
 
 /// Register an asynchronously-dispatched subagent and return its id and
-/// handle. Subagents are the only directly-registered tasks; every pi-path
+/// handle. Subagents are the only directly-registered tasks; every kernel-path
 /// producer enters through `register_with_id` instead.
 pub fn register(
     owner_thread_id: String,
@@ -581,9 +581,9 @@ pub fn register(
     (id, task)
 }
 
-/// Register a proxy task under a caller-chosen id (the pi-side task id the
-/// bridge mirrors). Used so `stop` sees the same id as the underlying pi task.
-/// Idempotent: an existing entry with the id is returned untouched. Pi-side
+/// Register a proxy task under a caller-chosen id (the kernel-side task id the
+/// bridge mirrors). Used so `stop` sees the same id as the underlying kernel task.
+/// Idempotent: an existing entry with the id is returned untouched. Kernel-side
 /// ids are process-unique (one shared ordinal), so no cross-task collision
 /// can reach this call.
 pub fn register_with_id(
@@ -663,7 +663,7 @@ const OUTPUT_EMIT_THRESHOLD: u32 = 5;
 
 /// The host's [`TaskObserver`]: binds the session producers (monitors,
 /// background bash) to this registry. Each `Spawned` registers a proxy task
-/// under the pi task id (one id space for `stop` and the UI cards, with an
+/// under the kernel task id (one id space for `stop` and the UI cards, with an
 /// on_stop hook back into the producer), each `Output` lands in the proxy's
 /// bounded ring (snapshots throttled), and each `Settled` records the
 /// wire-stable terminal status through `apply_settlement`.
@@ -793,7 +793,7 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
     task.cancel();
 
     // Proxy tasks own no process here; the registered hook is the actual
-    // pi-side kill, forwarded with the stop's intent. It runs before the
+    // kernel-side kill, forwarded with the stop's intent. It runs before the
     // fallback terminal push below.
     if let Some(on_stop) = task.on_stop() {
         let cause = if terminal == TaskStatus::SessionEnded {
@@ -804,7 +804,7 @@ async fn stop_with_status(id: &str, terminal: TaskStatus) -> Result<(), String> 
         on_stop(id, cause);
     }
 
-    // The pi-side producers normally settle the task themselves through their
+    // The kernel-side producers normally settle the task themselves through their
     // own settlement path; this fallback covers hooks that cannot report.
     // Either way the terminal status must reach the cards: the notifier (a
     // host-side copy of the observer's notice channel) emits the snapshot
@@ -1025,7 +1025,7 @@ mod tests {
     }
 
     /// The host observer bridges a real command monitor end-to-end: the
-    /// proxy registers under the pi task id, snapshots flow as
+    /// proxy registers under the kernel task id, snapshots flow as
     /// `BackgroundTaskUpdated` notices (running → completed with output),
     /// and a user stop routes through the on_stop hook into the monitor
     /// manager.

@@ -1,14 +1,13 @@
 //! Native provider registration: reads the cx-style provider config
 //! (`~/.manox/cx.providers.config.yaml` — this project's native
 //! provider format) and registers every provider × wire_api endpoint into
-//! the pi kernel's [`crate::core::ProviderRegistry`].
+//! the kernel's [`crate::core::ProviderRegistry`].
 //!
-//! Extension autonomy (the TS `cx-bridge.ts` pattern): this module owns
+//! Extension autonomy: this module owns
 //! its own config schema and credential resolution and hands the kernel
 //! only declarative `ProviderConfig`s — it never depends on the host's
-//! provider stack. One deliberate deviation from the TS extension: the
-//! yaml's per-model `context`/`max_tokens` fields are honored (TS ignores
-//! them), with precedence yaml > `[Nm]` suffix > KNOWN_MODELS > defaults.
+//! provider stack. The yaml's per-model `context`/`max_tokens` fields are
+//! honored, with precedence yaml > `[Nm]` suffix > KNOWN_MODELS > defaults.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -61,7 +60,7 @@ struct CxProvider {
     #[serde(default)]
     models: BTreeMap<String, Option<CxModel>>,
     /// Process env for cx agents — parsed but intentionally not applied to
-    /// pi registrations (parity with the TS extension).
+    /// provider registrations (parity with the TS extension).
     #[serde(default)]
     #[allow(dead_code)]
     env: BTreeMap<String, String>,
@@ -278,8 +277,7 @@ fn model_supports_wire_api(wire_apis: Option<&[String]>, endpoint_wire_api: &str
 /// Resolve an `apikey_source` the way manox-providers does, with one
 /// deliberate difference: `env:VAR` is **not** read eagerly — it is passed
 /// through as the kernel's `$VAR` interpolation syntax so the value is
-/// re-read on every request (TS pi resolves api keys uncached for the same
-/// reason).
+/// re-read on every request.
 ///
 /// `Ok(None)` never happens for a present source; a missing source is a
 /// hard error (parity with manox-providers, which refuses to build a model

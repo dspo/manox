@@ -3,7 +3,7 @@
 //! The user-questions seam: the host's `AskUserQuestion` interactive round
 //! trip and the pending registry it parks on.
 //!
-//! The pi kernel exposes the `requires_approval` seam on `AgentTool` but
+//! The kernel exposes the `requires_approval` seam on `AgentTool` but
 //! ships no interactive ask surface — that is a host concern. This module owns
 //! it end to end: the tool parses and validates the model's questions, parks
 //! one card per call on [`UserQuestionGate`], and folds the id-routed answers
@@ -29,9 +29,9 @@ pub enum AskOutcome {
     /// The canonical id-routed tri-state answers, one per answered or
     /// explicitly skipped question.
     Answered(Vec<AskAnswer>),
-    /// The user CLOSED the card to speak instead (dsh `ASK_CANCELLED`): an
-    /// explicit "not now, let me talk" that is neither an answer nor a
-    /// rejection nor a turn interrupt.
+    /// The user CLOSED the card to speak instead: an explicit "not now, let
+    /// me talk" that is neither an answer nor a rejection nor a turn
+    /// interrupt.
     Dismissed,
     /// The question settled without any user input (no capable answerer, a
     /// withdrawn delivery, or an abandoned replay waiter) — an explicit
@@ -248,7 +248,7 @@ impl UserQuestionGate {
     }
 }
 
-/// The pi harness `AskUserQuestion` tool. Schema and semantics ported from
+/// The harness `AskUserQuestion` tool. Schema and semantics ported from
 /// the retired manox tool: the run IS the round trip — the question card
 /// renders from the `ToolCallAuthorization` event and the user's answers come
 /// back through [`UserQuestionGate`], short-circuited into a `ToolResult`
@@ -257,8 +257,8 @@ impl UserQuestionGate {
 pub struct PiAskUserQuestionTool {
     gate: Arc<UserQuestionGate>,
     /// Live plan-mode flag, so a dismissed question card can tell the model
-    /// to *stay in plan mode* when the user closes it mid-planning (dsh
-    /// `ASK_CANCELLED` under `intent:plan-review`) versus the plain stop-and-
+    /// to *stay in plan mode* when the user closes it mid-planning (the
+    /// plan-review dismissal wording) versus the plain stop-and-
     /// wait line outside plan mode. `None` in bare test constructions → the
     /// general wording.
     plan: Option<Arc<crate::plan_mode::PlanSessionState>>,
@@ -315,7 +315,7 @@ impl PiAgentTool for PiAskUserQuestionTool {
         signal: CancellationToken,
         _ctx: &dyn ToolContext,
     ) -> Result<AgentToolResult, ToolError> {
-        // D5 `DELEGATED_CALLER` (dsh L4: only the runtime root may ask a human).
+        // D5 `DELEGATED_CALLER` (only the runtime root may ask a human).
         // The approval gate is the host's human-facing service; a subagent runs
         // with a synthetic fail-closed gate (see `engine`'s subagent build), so
         // a bare `ApprovalGate` on the *main* line is the marker of the runtime
@@ -420,10 +420,10 @@ impl PiAgentTool for PiAskUserQuestionTool {
                  treat this as input or consent. Re-ask with fewer, simpler questions \
                  or continue under explicitly stated assumptions.",
             )),
-            // The user closed the card to speak instead (dsh `ASK_CANCELLED`):
+            // The user closed the card to speak instead:
             // NOT an answer, NOT a rejection, NOT a turn interrupt. The model
             // stops and waits for the forthcoming message. In plan mode the
-            // dsh line keeps the "stay in plan mode" clause; elsewhere the
+            // guidance keeps the "stay in plan mode" clause; elsewhere the
             // same guidance drops it. Never re-asked as a denial.
             AskOutcome::Dismissed => {
                 let text = if self.plan_mode_active() {
@@ -472,7 +472,7 @@ fn ensure_ask_ids(input: &mut serde_json::Value) {
 }
 
 /// Validate one question's optional L1 vocabulary (`id` / `detail` /
-/// `intent`) plus its options. `BAD_INTENT` is the dsh report's code for an
+/// `intent`) plus its options. `BAD_INTENT` is the code for an
 /// intent that cannot mean what it says: an `approve` label that is not one
 /// of this question's own options, or a declared `kind` with no `detail`
 /// support text for the specialised surface to render.
@@ -672,8 +672,8 @@ fn fold_ask_answers(
             "selected": answer.selected,
         });
         if let Some(custom) = answer.custom {
-            // Single-select custom replaces the selection outright
-            // (dsh L6.3); multi-select custom supplements it.
+            // Single-select custom replaces the selection outright;
+            // multi-select custom supplements it.
             if !multi {
                 row["selected"] = serde_json::Value::Array(Vec::new());
             }
@@ -909,7 +909,7 @@ mod tests {
             "the unknown-id answer is dropped and the tri-state speaks the canonical shape"
         );
 
-        // Single-select custom REPLACES the selection (dsh L6.3).
+        // Single-select custom REPLACES the selection.
         let rows = fold_ask_answers(
             &parked,
             vec![AskAnswer::new(
@@ -1103,7 +1103,7 @@ mod tests {
         );
     }
 
-    /// PR-0b: inside plan mode the dsh "stay in plan mode" clause is present,
+    /// PR-0b: inside plan mode the "stay in plan mode" clause is present,
     /// so the model keeps drafting rather than exiting or re-asking.
     #[tokio::test]
     async fn ask_dismissed_in_plan_mode_keeps_plan_clause() {
@@ -1209,7 +1209,7 @@ mod tests {
         let text = result_text(&result);
         assert!(
             text.contains("[DELEGATED_CALLER]"),
-            "names the dsh taxonomy code: {text}"
+            "names the taxonomy code: {text}"
         );
         assert!(
             gate.pending_entries().is_empty(),

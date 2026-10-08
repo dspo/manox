@@ -3,7 +3,7 @@
 // A session is a tree of entries persisted as JSONL. Each entry has an id and
 // parentId, forming a DAG walked leafward to reconstruct the conversation
 // context. Variant `type` tags are snake_case and field names are camelCase,
-// matching the TS Pi v3 on-disk schema exactly so real session files load.
+// matching the on-disk schema exactly so real session files load.
 
 pub mod jsonl;
 pub mod repository;
@@ -15,7 +15,7 @@ use serde_json::Value as JsonValue;
 
 /// A single entry in the session tree.
 ///
-/// Field names serialize as camelCase to match the TS Pi v3 schema. A `leaf`
+/// Field names serialize as camelCase. A `leaf`
 /// entry records a cursor move to an older branch point: its `targetId` is the
 /// entry the cursor now points at, and the leaf entry itself is never walked
 /// The process that started a turn — the local wire mirror of the journal's
@@ -38,7 +38,7 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         message: AgentMessage,
         /// The RPC id this message was submitted under (§C.2 `originRpc`,
-        /// dsh `source.rpcId`). The server pins the client's Submit
+        /// source RPC id). The server pins the client's Submit
         /// `origin_rpc` on the user message's journal entry so the client can
         /// retire its optimistic echo (echo/retire protocol, §F.2). Absent on
         /// every other entry and on older session files.
@@ -276,7 +276,7 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         message: String,
     },
-    /// An assistant text delta (durable streaming chunk, dsh parity).
+    /// An assistant text delta (durable streaming chunk).
     #[serde(rename = "agent_text_delta", rename_all = "camelCase")]
     AgentTextDelta {
         id: String,
@@ -1057,7 +1057,7 @@ impl<S: SessionStorage> Session<S> {
     }
 
     /// Move the session cursor to an earlier entry, appending a `leaf` entry
-    /// that records the branch point — the TS `moveTo`. `None` resets the
+    /// that records the branch point. `None` resets the
     /// cursor to the root.
     pub async fn move_to(&self, target_id: Option<&str>) -> Result<(), anyhow::Error> {
         self.storage.set_leaf_id(target_id).await
@@ -1627,7 +1627,7 @@ mod tests {
             cwd: "/private/tmp/manox--wt".into(),
         };
         let wire = serde_json::to_string(&entry).unwrap();
-        // The wire tag and camelCase fields must match the TS Pi v3 shape.
+        // The wire tag and camelCase fields must match the on-disk shape.
         assert!(wire.contains(r#""type":"cwd_change""#), "{wire}");
         assert!(wire.contains(r#""parentId":"m1""#), "{wire}");
         let back: SessionTreeEntry = serde_json::from_str(&wire).unwrap();
@@ -1882,7 +1882,7 @@ mod tests {
     }
 }
 
-/// The TS `SessionTreeEntry["type"]` discriminator used by branch queries.
+/// The `SessionTreeEntry` type discriminator used by branch queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
     Message,
@@ -1979,7 +1979,7 @@ impl EntryType {
 /// Where a branch query starts traversing.
 #[derive(Debug, Clone, Default)]
 pub enum BranchStart {
-    /// The active leaf (TS `start` unset).
+    /// The active leaf.
     #[default]
     Leaf,
     /// Explicit `null`: no traversal, empty result.
@@ -1988,11 +1988,11 @@ pub enum BranchStart {
     At(String),
 }
 
-/// The TS `SessionBranchQuery`: a bounded traversal of the active branch.
+/// A bounded traversal query over the active branch.
 #[derive(Debug, Clone, Default)]
 pub struct SessionBranchQuery {
     /// Entry where traversal starts; defaults to the active leaf. `None`
-    /// (TS `null`) yields an empty result.
+    /// yields an empty result.
     pub start: BranchStart,
     /// Stop after the first entry of this type (inclusive).
     pub stop_at_type: Option<EntryType>,

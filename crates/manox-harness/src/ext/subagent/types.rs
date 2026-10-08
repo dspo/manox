@@ -1,5 +1,4 @@
-//! The subagent seam's consumer-facing contracts, mirrored from the dsh
-//! (`deepseek-harness`) `SubagentProvider` surface: request, capability, and
+//! The subagent seam's consumer-facing contracts: request, capability, and
 //! result types plus the `start`/`end` observation payloads. A request that
 //! needs a capability the chosen provider lacks is rejected with a typed
 //! error rather than accepted-then-ignored (fail loud, no silent
@@ -147,7 +146,7 @@ pub struct StartRequest {
     pub parent_depth: u32,
     /// Lineage: the parent's session id, written into the child header.
     pub parent_session: Option<String>,
-    /// Arming wall-clock/idle budgets (manox original; dsh has no analog).
+    /// Arming wall-clock/idle budgets.
     pub budgets: Budgets,
     /// `Some("worktree")` isolates the child in a throwaway git worktree
     /// (manox original).
@@ -156,8 +155,7 @@ pub struct StartRequest {
     /// session's default env comes from the provider assembly).
     pub env: Arc<dyn ExecutionEnv>,
     /// The parent's working directory — the child's cwd, and the repo a
-    /// `worktree` isolation forks from (the dsh "providers derive workspace
-    /// from the parent" clause).
+    /// `worktree` isolation forks from.
     pub cwd: PathBuf,
     /// Cancellation from the spawning context — the canonical cancel channel
     /// both before and after startup.
@@ -174,9 +172,9 @@ pub struct ResolvedStartRequest {
     pub descriptor: crate::ext::subagent::descriptor::Descriptor,
 }
 
-/// Why a subagent run ended. Mirrors the dsh merge-extensible vocabulary:
-/// backends may add variants; consumers branch on the known cases and treat
-/// unknown as an error-class reason.
+/// Why a subagent run ended. The vocabulary is merge-extensible: backends
+/// may add variants; consumers branch on the known cases and treat unknown
+/// as an error-class reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopReason {
     /// The child finished its turn normally.
@@ -194,7 +192,7 @@ pub enum StopReason {
 }
 
 /// Symmetric with the merge-extensible deserialization: known variants
-/// serialize to their dsh kebab wire forms; an unknown round-trips as its
+/// serialize to their kebab-case wire forms; an unknown round-trips as its
 /// raw string.
 impl Serialize for StopReason {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -275,13 +273,13 @@ pub struct RunInfo {
     /// Whether the child is an in-process session (always true today).
     pub local: bool,
     /// The dispatch's armed budgets — the host watchdog reads the idle
-    /// budget from here (manox original; dsh carries no budgets).
+    /// budget from here.
     pub budgets: Budgets,
 }
 
 /// The static per-definition configuration one model-facing delegation tool
-/// is built from (the dsh preset's per-instance `tool-subagent` config,
-/// sourced from manox agent manifests + the providers config).
+/// is built from (sourced from manox agent manifests + the providers
+/// config).
 #[derive(Debug, Clone)]
 pub struct DelegationToolConfig {
     /// The provider registry name the tool dispatches on (e.g. `spawn`).
@@ -321,8 +319,7 @@ pub struct RunEndInfo {
     pub output: String,
 }
 
-/// The runtime's observation event pair (`start`/`end`), the dsh
-/// `subagent/start|end` equivalent.
+/// The runtime's observation event pair (`start`/`end`).
 #[derive(Debug, Clone)]
 pub enum Event {
     Start(RunInfo),
@@ -406,7 +403,7 @@ pub struct RunSnapshot {
     pub kind: String,
     pub label: String,
     pub provider: String,
-    /// dsh status vocabulary; one-shot runs are `running` until they settle.
+    /// Status vocabulary; one-shot runs are `running` until they settle.
     pub status: &'static str,
     pub running_for_ms: u64,
     pub local: bool,
@@ -434,10 +431,10 @@ mod tests {
     use super::*;
 
     /// The stop-reason vocabulary is merge-extensible: known variants
-    /// serialize to their dsh kebab wire forms, and a backend-added variant
+    /// serialize to their kebab-case wire forms, and a backend-added variant
     /// deserializes as `Unknown` (never a deserialize error).
     #[test]
-    fn stop_reason_serializes_to_dsh_wire_forms() {
+    fn stop_reason_serializes_to_kebab_wire_forms() {
         assert_eq!(
             serde_json::to_value(StopReason::Completed).unwrap(),
             serde_json::json!("completed")

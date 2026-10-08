@@ -24,8 +24,7 @@ use crate::types::{
     AgentContext, AgentEvent, AgentMessage, ContentBlock, Model, StopReason, Usage,
 };
 
-/// Tokens reserved for the summarization prompt and the model's response —
-/// the TS `GenerateBranchSummaryOptions.reserveTokens` default.
+/// Tokens reserved for the summarization prompt and the model's response.
 pub const RESERVE_TOKENS: usize = 16_384;
 
 /// Result of a branch summarization run, mirroring the TS
@@ -55,7 +54,7 @@ pub struct BranchPreparation {
     pub total_tokens: u64,
 }
 
-/// Extract a message from a session entry — the TS `getMessageFromEntry`:
+/// Extract a message from a session entry:
 /// tool results are skipped (the assistant tool call carries their context),
 /// custom messages fold to their custom form, and branch/compaction summaries
 /// become their tagged user carriers.
@@ -155,8 +154,7 @@ pub fn prepare_branch_entries(
     }
 }
 
-/// The instruction block asking the model for a structured branch summary —
-/// the TS `BRANCH_SUMMARY_PROMPT`.
+/// The instruction block asking the model for a structured branch summary.
 pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// The preamble prepended to every model-produced branch summary.
@@ -179,8 +177,8 @@ pub fn build_branch_summary_prompt(
     format!("<conversation>\n{conversation}\n</conversation>\n\n{instructions}")
 }
 
-/// Summarize an abandoned branch — the TS `generateBranchSummary`. An empty
-/// preparation yields the TS "No content to summarize" marker without a model
+/// Summarize an abandoned branch. An empty
+/// preparation yields the "No content to summarize" marker without a model
 /// call; a cancelled run reports `aborted`; a failed run propagates the
 /// provider error.
 // All inputs are distinct semantic surfaces (entries, model, runtime,

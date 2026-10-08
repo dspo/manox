@@ -56,8 +56,8 @@ pub fn model_cost_rates(model: &Model) -> Option<Cost> {
         .then_some(rates)
 }
 
-/// Price a wire usage against a rate card (USD per 1M tokens per class) —
-/// the TS pi-ai per-message pricing step. `Cost.total` sums all classes.
+/// Price a wire usage against a rate card (USD per 1M tokens per class).
+/// `Cost.total` sums all classes.
 pub fn price_usage(rates: &Cost, usage: &Usage) -> Cost {
     let per_million = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
     let input = per_million(usage.input_tokens, rates.input);

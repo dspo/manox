@@ -22,8 +22,7 @@ use crate::tools::edit_diff;
 #[derive(Default)]
 pub struct EditTool {
     /// Reject no-drift edits whose anchor lines a prior `read`/`grep` never
-    /// displayed. Off by default, matching upstream oh-my-pi's shipped
-    /// `edit.enforceSeenLines: false`: the guard historically caused frequent
+    /// displayed. Off by default: the guard historically caused frequent
     /// edit rejections once truncation or summaries hid part of a file the
     /// model believed it had fully read. Hosts that want the anti-blind-edit
     /// discipline opt in explicitly.
@@ -132,7 +131,7 @@ impl AgentTool for EditTool {
             hashline::parse_patch(patch).map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
         // Clear the clipboard at the start of each edit call — the anonymous
-        // register is batch-local, matching oh-my-pi's startClipboardBatch.
+        // register is batch-local to one edit.
         ctx.tool_state()
             .clipboard
             .lock()

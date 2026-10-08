@@ -2,7 +2,7 @@
 //! round, and the settle logic that admits it (round accounting + token
 //! accounting) when the run actually consumed it.
 //!
-//! Delivery uses the pi harness's `follow_up` queue: the round message is an
+//! Delivery uses the harness's `follow_up` queue: the round message is an
 //! `AgentMessage::Custom` with `display: false`, so the model sees it as a
 //! user-role message on the wire (`convert_to_llm` projects Custom onto
 //! User), while the UI mirror drops it (`harness_messages_to_messages`
@@ -29,7 +29,7 @@ pub struct GoalRoundIdentity {
     pub round: u64,
 }
 
-/// Goal-budget tokens of one pi usage report — excludes provider cache reads
+/// Goal-budget tokens of one usage report — excludes provider cache reads
 /// by definition (`budget_tokens` parity).
 fn budget_from_pi_usage(usage: &manox_harness::types::Usage) -> u64 {
     usage.input_tokens + usage.cache_creation_input_tokens + usage.output_tokens
@@ -96,7 +96,7 @@ pub fn render_goal_blocked_wrapup(objective: &str, reason: &str) -> String {
 ///
 /// Short-circuits (in order): a round already reserved, no active armed goal,
 /// round cap exhausted (auto-block with `round-limit`), or competing input
-/// queued (yield, DSH parity).
+/// queued (yield).
 pub async fn maybe_queue_goal_round(
     session: &AgentSession,
     bridge: &Arc<GoalBridge>,

@@ -412,7 +412,7 @@ impl Accumulator {
                     }
                     WireDelta::Signature { signature } => {
                         // Signatures accumulate silently: no incremental event
-                        // exists for them, matching the TS Pi event surface.
+                        // exists for them.
                         // The start block may already carry a signature the
                         // delta appends onto.
                         if let ContentBlock::Thinking { signature: s, .. } = &mut self.blocks[index]
@@ -960,7 +960,7 @@ mod tests {
         assert_eq!(raw_stop_reason.as_deref(), Some("end_turn"));
     }
 
-    /// Redacted thinking carries the TS `[Reasoning redacted]` placeholder
+    /// Redacted thinking carries the `[Reasoning redacted]` placeholder
     /// text instead of an empty string.
     #[tokio::test]
     async fn redacted_thinking_uses_placeholder_text() {

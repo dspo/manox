@@ -2,7 +2,7 @@
 // endpoint.
 //
 // Usage:
-//   cargo run -p pi --example responses_chat -- \
+//   cargo run -p manox-harness --example responses_chat -- \
 //     --base-url https://api.openai.com/v1 \
 //     --api-key sk-... \
 //     --model gpt-5-mini \

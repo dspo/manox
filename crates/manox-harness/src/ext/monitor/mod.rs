@@ -4,7 +4,7 @@
 //!
 //! ## Extension point usage
 //!
-//! This module uses only existing `crates/pi` extension points:
+//! This module uses only existing kernel extension points:
 //!
 //! - `AgentTool` trait — registered via `ToolRegistry::register()`
 //! - `AgentSession::steer()` — inject events into the agent (steer-only:

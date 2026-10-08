@@ -16,7 +16,7 @@ pub(super) fn steer_message(id: String, text: String, images: Vec<ContentBlock>)
         text,
         signature: None,
     }];
-    // TS `createUserMessage(text, images)` parity: image blocks ride the
+    // Image blocks ride the
     // steered user message behind the text.
     content.extend(images);
     // S3 stable-id: carry the client `Steer` message id as the durable row
@@ -435,7 +435,7 @@ pub(super) fn attach_plan_hooks(
 /// memory hierarchy (managed policy, `~/.claude/CLAUDE.md` + rules, the
 /// per-directory chain down to the session cwd) loaded through
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
-/// every turn (TS project-instruction semantics). Skills/templates stay
+/// every turn. Skills/templates stay
 /// empty here — manox skills ride the `manox_agent::skill` registry instead.
 pub(super) fn instruction_resources(cwd: &Path) -> manox_harness::harness::HarnessResources {
     let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
@@ -525,8 +525,8 @@ pub(super) async fn rebuild_session(
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
     // Like the startup restore, a session swap passes no model override so
-    // the opened session's own persisted model wins (TS `options.model >
-    // restored model`); the actor adopts it right after the open.
+    // the opened session's own persisted model wins; the actor adopts it
+    // right after the open.
     let (builder, orchestrators, read_only_subagent) = session_builder(
         &cwd,
         sessions_dir,
@@ -563,7 +563,7 @@ pub(super) async fn rebuild_session(
         Err(err) => {
             send_notice(
                 notice_tx,
-                BackendNotice::Fatal(anyhow::anyhow!("pi session open failed: {err}")),
+                BackendNotice::Fatal(anyhow::anyhow!("session open failed: {err}")),
                 "engine fatal",
             );
         }

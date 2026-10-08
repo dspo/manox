@@ -1,5 +1,5 @@
-//! The in-process `spawn` backend — the dsh `subagent-spawn-in-process`
-//! equivalent. A child is a fresh [`AgentSession`] composed from the parent's
+//! The in-process `spawn` backend. A child is a fresh [`AgentSession`]
+//! composed from the parent's
 //! tool snapshot (stripped, filtered, and auto-deny-gated), the definition's
 //! persona as system prompt, and the inherited live model. The provider owns
 //! the whole one-shot run: prompt, event pump, budgets, cancellation, and
@@ -43,7 +43,7 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(90);
 const FINAL_MAX_BYTES: usize = 128 * 1024;
 const FINAL_MAX_LINES: usize = 2000;
 
-/// Provider-authored diagnostic cap (dsh contract: 4096 UTF-8 bytes, free of
+/// Provider-authored diagnostic cap (4096 UTF-8 bytes, free of
 /// tool inputs and credentials).
 const DIAGNOSTIC_MAX_BYTES: usize = 4096;
 
@@ -566,8 +566,7 @@ async fn drive_run(run: DrivenRun) -> RunResult {
 }
 
 /// Extract the final assistant text: the text blocks of the last assistant
-/// message that carried content, skipping empty/usage-only messages — the
-/// dsh `finalAssistantOutput` canonical rule.
+/// message that carried content, skipping empty/usage-only messages.
 pub fn extract_final_text(messages: &[AgentMessage]) -> String {
     for msg in messages.iter().rev() {
         if let AgentMessage::Assistant { content, .. } = msg {
@@ -1005,7 +1004,7 @@ mod tests {
     }
 
     /// D6 invariant: the subagent `never` gate rejects an approval-bearing
-    /// call with the dsh reason and passes an approval-free call through.
+    /// call and passes an approval-free call through.
     #[tokio::test]
     async fn auto_deny_gate_rejects_gated_and_runs_free() {
         let dir = tempfile::tempdir().unwrap();
@@ -1038,7 +1037,7 @@ mod tests {
             .expect_err("a gated call must not run in a subagent");
         assert!(
             gated.to_string().contains("rejected automatically"),
-            "the denial names the dsh boundary: {gated}"
+            "the denial names the subagent boundary: {gated}"
         );
 
         let free = wrapped[0]
@@ -1197,7 +1196,7 @@ mod tests {
     }
 
     /// Output extraction: the last non-empty assistant message wins; an
-    /// empty transcript yields nothing (the dsh canonical rule).
+    /// empty transcript yields nothing.
     #[test]
     fn extract_final_text_prefers_last_non_empty_assistant() {
         use crate::core::types::{AgentMessage, ContentBlock};

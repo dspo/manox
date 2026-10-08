@@ -118,8 +118,8 @@ pub fn mid_stream(message: String) -> ProviderError {
     }
 }
 
-/// Whether an assistant message signals a context-window overflow, mirroring
-/// the TS `isContextOverflow` three-case check:
+/// Whether an assistant message signals a context-window overflow. Three
+/// cases:
 ///
 /// 1. Error-based: `Error` stop reason whose message classifies as overflow.
 /// 2. Silent: a completed response whose reported input (plus cache reads)

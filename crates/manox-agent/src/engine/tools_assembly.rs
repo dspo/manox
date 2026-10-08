@@ -271,8 +271,8 @@ impl BrowserSuite {
         }
     }
 }
-/// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
-/// orchestration (assembly mirrors the `pi-extensions` orchestration example).
+/// The full toolset: the kernel's file tools plus the the extension layer bash/sub-agent
+/// orchestration (assembly mirrors the `the extension layer` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
 /// no gate — permission policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
@@ -377,7 +377,7 @@ pub(super) fn build_tools(
         bash = bash.with_unsandboxed_operations(ops);
     }
     let tools: Vec<Arc<dyn PiAgentTool>> = vec![
-        // Read with oh-my-pi path selectors (`path:N-M` / `:raw` / multi-range);
+        // Read with path selectors (`path:N-M` / `:raw` / multi-range);
         // selector-less reads delegate to the kernel ReadTool unchanged.
         Arc::new(manox_harness::read::SelectorReadTool::new()),
         // Write/Edit carry the process write lock for their execution window:
@@ -621,7 +621,7 @@ pub(super) fn build_tools(
         Arc::clone(bus),
         manox_harness::steer_bus::AgentId::Captain,
     )));
-    // The dsh-isomorphic delegation surface: one runtime + spawn provider
+    // The delegation surface: one runtime + spawn provider
     // per session assembly; one delegation tool per registered definition
     // (Explore, Sailor, user/plugin manifests); the control pair. Child
     // snapshots strip every registered delegation-surface name (nesting is

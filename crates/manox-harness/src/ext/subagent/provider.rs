@@ -1,12 +1,12 @@
 //! The [`SubagentProvider`] seam — one registered transport for running
-//! child agents (the dsh interface of the same name). Providers are trusted
+//! child agents. Providers are trusted
 //! same-process implementations; the runtime treats descriptors and
 //! returned values as borrowed immutable data. The runtime may call one
 //! provider concurrently for distinct children; providers isolate
 //! operation-local mutable state.
 //!
 //! [`RunObserver`] is the host bridge: the run loop lives with the provider
-//! (dsh parity — a provider owns its children's turns), while everything
+//! (a provider owns its children's turns), while everything
 //! that touches host-owned surfaces (transcript events, health surfaces,
 //! background cards) flows through the observer the host injected at
 //! assembly.
@@ -144,8 +144,8 @@ pub trait SubagentProvider: Send + Sync {
     /// partial resources; ownership transfers on fulfillment.
     async fn start(&self, request: ResolvedStartRequest) -> Result<SubagentRun, SubagentError>;
 
-    /// Whether this provider can create continuable children (dsh: method
-    /// presence IS the capability; in Rust the predicate stands in for it).
+    /// Whether this provider can create continuable children (the predicate
+    /// stands in for a method-presence capability check).
     fn supports_continuable(&self) -> bool {
         false
     }

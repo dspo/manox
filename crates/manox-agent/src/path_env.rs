@@ -9,9 +9,9 @@
 //! failure that motivated the retired manox harness's `path_env` module.
 //!
 //! The manox harness has a single injection point: the process environment itself.
-//! Every spawn site inherits it — the pi kernel's bash tool
+//! Every spawn site inherits it — the kernel's bash tool
 //! (`TokioExecutionEnv`), MCP stdio servers
-//! (supervisor bus), and monitor/background commands (pi-extensions).
+//! (supervisor bus), and monitor/background commands.
 //! [`install`] resolves the login shell's PATH once on a background thread
 //! and applies it process-wide, so no kernel or extension changes are
 //! needed.

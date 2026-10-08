@@ -28,7 +28,7 @@ use crate::core::provider::openai::completions::CompletionsStreamFn;
 use crate::core::provider::openai::responses::ResponsesStreamFn;
 use crate::types::{Model, StreamOptions, ThinkingKind};
 
-/// The wire protocol a provider or model speaks — the TS `Api` union.
+/// The wire protocol a provider or model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
     /// Anthropic Messages (`/v1/messages`).
@@ -70,7 +70,7 @@ impl Api {
     }
 }
 
-/// Per-million-token cost rates — the TS `Model.cost` shape.
+/// Per-million-token cost rates.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Cost {
     pub input: f64,
@@ -79,14 +79,14 @@ pub struct Cost {
     pub cache_write: f64,
 }
 
-/// An input modality a model accepts — the TS `("text" | "image")[]`.
+/// An input modality a model accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputModality {
     Text,
     Image,
 }
 
-/// One model in a provider registration — the TS `ProviderModelConfig`
+/// One model in a provider registration.
 /// (minus `thinkingLevelMap`/`headers`/`compat`, which the Rust providers
 /// do not consume yet).
 #[derive(Debug, Clone)]
@@ -116,7 +116,7 @@ pub struct ProviderModelConfig {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
-/// A declarative provider registration — the TS `ProviderConfig` (subset:
+/// A declarative provider registration (subset:
 /// no `streamSimple`/`refreshModels`/`oauth` yet).
 #[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
@@ -132,7 +132,7 @@ pub struct ProviderConfig {
     /// Extra headers merged into every request.
     pub headers: Option<HashMap<String, String>>,
     /// When true, `Authorization: Bearer <resolved key>` is added on top
-    /// of the protocol's native key header (TS `authHeader`).
+    /// of the protocol's native key header.
     pub auth_header: bool,
     /// The models to register; replaces any previous models of this
     /// provider on re-registration.
@@ -248,7 +248,7 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Remove a provider and its models (TS `unregisterProvider`).
+    /// Remove a provider and its models.
     pub fn unregister_provider(&self, name: &str) {
         self.providers.lock().unwrap().remove(name);
         self.models.lock().unwrap().remove(name);
@@ -415,9 +415,8 @@ impl ModelCatalog for RegistryCatalog {
     }
 }
 
-/// Interpolate `$VAR` / `${VAR}` env references in a configured value —
-/// the TS `resolveTemplate`. Called per request so environment changes
-/// are tracked (TS resolves the api key uncached for the same reason).
+/// Interpolate `$VAR` / `${VAR}` env references in a configured value.
+/// Called per request so environment changes are tracked.
 pub fn interpolate_env(value: &str) -> Result<String, String> {
     interpolate_env_with(value, &|name| std::env::var(name).ok())
 }

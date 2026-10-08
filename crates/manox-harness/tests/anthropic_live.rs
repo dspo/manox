@@ -2,7 +2,7 @@
 //
 // Gated on ANTHROPIC_API_KEY; skipped (not failed) when the key is absent so
 // CI without credentials stays green. Run explicitly with:
-//   cargo test -p pi --test anthropic_live -- --ignored --nocapture
+//   cargo test -p manox-harness --test anthropic_live -- --ignored --nocapture
 
 use manox_harness::core::provider::ProviderError;
 use manox_harness::core::provider::anthropic::AnthropicStreamFn;

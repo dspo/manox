@@ -7,7 +7,7 @@
 // and reach the filesystem (#364).
 //
 // Usage:
-//   cargo run -p pi --example agent_loop_tool
+//   cargo run -p manox-harness --example agent_loop_tool
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

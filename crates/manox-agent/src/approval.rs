@@ -1,6 +1,6 @@
 //! Permission gating for the manox harness (host-layer policy).
 //!
-//! The pi kernel exposes the `requires_approval` seam on `AgentTool` but
+//! The kernel exposes the `requires_approval` seam on `AgentTool` but
 //! deliberately ships no gate — permission policy is a harness concern. This
 //! module is the manox harness's gate: pure mode-based allow/deny, fully
 //! synchronous, no reviewer and no interactive approval round trip.
@@ -55,7 +55,7 @@ struct PendingAuth {
     meta: PendingAuthMeta,
 }
 
-/// Shared permission state for one pi thread: the mode, the pending
+/// Shared permission state for one thread: the mode, the pending
 /// interaction round trips, and the event channel back to the UI. Lives in
 /// the engine state so the tool wrappers (tokio side) and the facade's
 /// respond path (gpui side) see one source of truth.
@@ -294,7 +294,7 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
 
 // ── The gating wrapper ──────────────────────────────────────────────────────
 
-/// Wraps a pi tool with the host's permission policy. Tools that neither
+/// Wraps a kernel tool with the host's permission policy. Tools that neither
 /// declare `requires_approval` nor mutate anything pass straight through.
 pub struct ApprovalGatedTool {
     inner: Arc<dyn PiAgentTool>,

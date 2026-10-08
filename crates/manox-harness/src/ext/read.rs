@@ -1,12 +1,11 @@
-//! Read tool with oh-my-pi style `path:selector` syntax.
+//! Read tool with `path:selector` syntax.
 //!
 //! Wraps the kernel [`crate::core::tools::read::ReadTool`]: a `path` without a
 //! selector delegates unchanged (offset/limit paging preserved); a
 //! `path:selector` suffix routes through the selector grammar
 //! ([`crate::path_selector`]) — numbered ranges, `:raw` verbatim, or a
-//! compound of both. TS Pi's Read has no selector syntax; this is the
-//! product-level extension riding the `AgentTool` seam, so the kernel tool
-//! stays TS-aligned.
+//! compound of both. The kernel Read stays selector-free; this is the
+//! product-level extension riding the `AgentTool` seam.
 //!
 //! Selector reads keep the kernel's invariants: the hashline snapshot
 //! fingerprints the FULL file (only display is sliced), and the same byte /

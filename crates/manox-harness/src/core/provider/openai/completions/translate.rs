@@ -1,4 +1,4 @@
-// Translation between pi's domain types and the Chat Completions wire types.
+// Translation between the domain types and the Chat Completions wire types.
 //
 // The protocol keeps tool calls inside the assistant message (`tool_calls`)
 // and gives every tool result its own `role: "tool"` message, so conversion
@@ -283,8 +283,8 @@ fn image_part(data: &str, mime_type: &str) -> UserPart {
     }
 }
 
-/// Map a protocol finish_reason into the domain enum, faithful to the TS Pi
-/// map. content_filter/network_error collapse to `Error` (the detail surfaces
+/// Map a protocol finish_reason into the domain enum.
+/// content_filter/network_error collapse to `Error` (the detail surfaces
 /// as `error_message`); unknown reasons also read as `Error` rather than a
 /// silent natural stop, so a vendor failure never looks like completion.
 pub fn parse_finish_reason(s: &str) -> crate::types::StopReason {

@@ -1,10 +1,9 @@
 //! The sandbox POLICY vocabulary: the per-call file-effect mode, the
 //! writable-root derivation shared by the bash seatbelt and the fs write
-//! fence, and the `sandbox_permissions` escalation contract. Mirrors
-//! `~/projects/github/deepseek-harness` `dsh-sandbox` + `escalation.ts`.
+//! fence, and the `sandbox_permissions` escalation contract.
 //!
-//! This is the extension-layer home so the bash tool (`pi_extensions::bash`)
-//! and the host fs-fence wrapper consume one vocabulary without a host
+//! This is the extension-layer home so the bash tool and the host fs-fence
+//! wrapper consume one vocabulary without a host
 //! import — the extension layer must not depend back on the host. The host
 //! re-exports `PermissionMode` from `crate::thread` for session/persistence.
 //!
@@ -379,13 +378,13 @@ mod tests {
 
     #[test]
     fn writable_roots_canonical_dedup() {
-        let root = Path::new("/tmp/pi-ext-sandbox-roots-test");
+        let root = Path::new("/tmp/ext-sandbox-roots-test");
         let roots = writable_roots(PermissionMode::WorkspaceWrite, root);
         // The workspace root is always present (canonicalized).
         assert!(
             roots
                 .iter()
-                .any(|r| r.ends_with("pi-ext-sandbox-roots-test"))
+                .any(|r| r.ends_with("ext-sandbox-roots-test"))
         );
         // Canonical + deduplicated: a second resolution adds no new entries.
         let before = roots.len();

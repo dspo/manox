@@ -1,11 +1,11 @@
 //! Host-side `AgentBus` + `Steer` tool — the TeamMember messaging channel.
 //! Routes `Steer` messages between the facade, the singleton `Captain`, and
 //! spawned member threads (real manox Threads). In-thread subagent
-//! delegation moved to the dsh-isomorphic `subagent` module (delegation
+//! delegation moved to the `subagent` module (delegation
 //! tools + runtime + provider); the bus retains only the member operations,
 //! which are pure gpui facade round trips (`BusOp`). Sits on the kernel's
-//! intra-session `steer` (`HarnessHandle::steer`). TS Pi has no cross-session
-//! agent bus — this is a manox host extension.
+//! intra-session `steer` (`HarnessHandle::steer`). The cross-session
+//! agent bus is a manox host extension.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, Weak};

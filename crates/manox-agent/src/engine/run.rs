@@ -364,7 +364,7 @@ pub(super) async fn settle_run(
     // each queued steer by its command id; a steer whose cancel fails was
     // already drained by THIS run, so it is genuinely steered (its row is
     // on disk), not stranded. `abort_requested || failed` only retracts the
-    // still-queued tail — DSH parity (a pending steer is discarded/failed,
+    // still-queued tail (a pending steer is discarded/failed,
     // never poured into a dying or later run).
     let (steered, stranded) = if abort_requested || failed {
         let mut steered = Vec::new();
@@ -431,7 +431,7 @@ pub(super) async fn settle_run(
 }
 
 /// Post-settle goal housekeeping shared by every run: disarm automatic
-/// continuation on any cancellation or run error (DSH parity — the goal keeps
+/// continuation on any cancellation or run error (the goal keeps
 /// its durable phase until a human resume re-arms it), and admit the goal
 /// round that just ran when one was in flight.
 pub(super) async fn goal_housekeeping(
@@ -542,14 +542,14 @@ pub(super) async fn chain_goal_rounds(
 /// message per `OneAtATime` round exits after that round's run.
 ///
 /// This is the single entry point the actor uses for BOTH the wake-driven
-/// resume (a monitor steered events while idle — old DSH parity) and the
+/// resume (a monitor steered events while idle) and the
 /// between-runs facade `Steer` (S1: an idle steer now starts its own run
 /// instead of waiting for the next turn), and it is called after every
 /// normal settle to drain a steer that landed in the run's final moments
 /// (S2).
 ///
-/// Abort/failed discipline (S2 guard, omp `#drainStrandedQueuedMessages` /
-/// dsh `agent.ts` "never pour a steer into a dying or later run"): a round
+/// Abort/failed discipline (S2 settle-drain guard — never pour a steer into
+/// a dying or later run): a round
 /// that aborted or errored stops the chain immediately — `settle_run` already
 /// retracted the not-yet-drained steers from the queue (S4), so a stranded
 /// steer is never silently injected by a later run.
@@ -639,7 +639,7 @@ pub(super) async fn resume_steering_queue(
     }
 }
 
-/// Forward every pi run event through the adapt mapping onto the notice
+/// Forward every run event through the adapt mapping onto the notice
 /// channel as UI events.
 pub(super) fn subscribe_session(
     session: &AgentSession,
@@ -792,7 +792,7 @@ pub(super) fn merge_positioned_notes(display: &mut Vec<HistoryEntry>, notes: &[P
 }
 
 /// Adapt harness lifecycle events onto the notice channel. Carries the
-/// compaction visibility pair (TS `compaction_start` / `compaction_end`):
+/// compaction visibility pair:
 /// start flips the UI into its summarizing state, a successful end lands the
 /// Recap card. The end event's token counts ride the result; the UI chrome
 /// consumes only the summary.

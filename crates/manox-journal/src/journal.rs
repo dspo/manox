@@ -208,7 +208,7 @@ pub enum JournalWireEvent {
     /// A terminal error (`anyhow::Error` flattened to `{ message }`, §C.2).
     Error { message: String },
     // ── streaming delta ─────────────────────────────────────────────
-    /// An assistant text delta (chunked, durable — dsh parity).
+    /// An assistant text delta (chunked, durable).
     AgentTextDelta { s: String },
     /// An assistant thinking delta.
     AgentThinkingDelta { s: String },

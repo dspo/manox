@@ -421,7 +421,7 @@ async fn user_row_ids(session: &AgentSession) -> Vec<String> {
         .collect()
 }
 
-/// S1 (dsh `wakeDriver` idle-steer) + S3 (stable row id): a `Steer`
+/// S1 (idle-steer) + S3 (stable row id): a `Steer`
 /// arriving while the actor is idle starts its OWN run immediately, and
 /// the injected `user` journal row is keyed by the client message id.
 #[tokio::test]
@@ -528,7 +528,7 @@ async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
     let _ = cmd_tx; // keep the sender alive for the run
 }
 
-/// S2 (pi `agent-loop` / omp settle-drain): a steer still queued when a
+/// S2 (settle-drain guard): a steer still queued when a
 /// run settles is drained by the same continuation helper, so it is never
 /// silently deferred to an unrelated later turn.
 #[tokio::test]
@@ -603,7 +603,7 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
     let _ = cmd_tx;
 }
 
-/// S4 (omp `#drainStrandedQueuedMessages` `#abortInProgress` guard): an
+/// S4 (abort-retraction guard): an
 /// aborted run must RETRACT its not-yet-drained steer from the surviving
 /// kernel queue and report it as stranded (not injected), so it is never
 /// silently re-injected into the next run and a client retry does not
@@ -4020,10 +4020,10 @@ async fn journal_replay_is_consistent_across_disk_reload() {
 
     // K2 cache repair: the diverging (here: empty) sidecar converges
     // toward the journal authority — INCLUDING the title (the repair
-    // is enabled by the rename-route decision: a pi thread's sidecar
+    // is enabled by the rename-route decision: a thread's sidecar
     // title is written only by the journaled auto-title scheduler; the
     // direct writer `set_external_title` serves external TUI sessions,
-    // which carry no pi chain and never reach this rebuild).
+    // which carry no journal chain and never reach this rebuild).
     let repaired = manox_harness::session_meta::load(&sessions, &live_path)
         .await
         .unwrap();
@@ -4261,7 +4261,7 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
     );
 
     // The cache converged toward the authority in the same pass —
-    // the title INCLUDED (the rename-route decision: the pi-thread
+    // the title INCLUDED (the rename-route decision: the thread
     // sidecar title's only writer is the journaled auto-title
     // scheduler, so a divergence is a stale cache, not a newer user
     // decision; external-session titles never reach this rebuild).

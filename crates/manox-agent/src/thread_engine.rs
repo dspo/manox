@@ -1,10 +1,9 @@
 //! The harness-engine contract the `Thread` facade delegates to.
 //!
-//! The interface shape follows the pi `AgentSession` capabilities — run,
-//! steer, abort, model/thinking switching, session switching — because pi is
-//! the first-class harness; the manox implementation adapts to that shape
-//! where the two disagree (manox yields). The trait is deliberately free of
-//! gpui: a backend either owns its own async runtime (pi actor) or drives the
+//! The interface shape follows the `AgentSession` capabilities — run,
+//! steer, abort, model/thinking switching, session switching. The trait is
+//! deliberately free of gpui: a backend either owns its own async runtime
+//! (the session actor) or drives the
 //! facade through injected callbacks, so the facade's `Context` never leaks
 //! into the contract.
 

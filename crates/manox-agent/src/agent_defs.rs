@@ -1,7 +1,7 @@
 //! User-authored and plugin-provided subagent definitions (ported from the
 //! retired manox harness's `agent_def` loader).
 //!
-//! The built-in `Explore` definition ships in `pi-extensions`; this loader
+//! The built-in `Explore` definition ships in `the extension layer`; this loader
 //! adds two discovery layers on top at session-build time:
 //!
 //! - **User-authored** files under `~/.claude/agents/*.md`

@@ -280,7 +280,7 @@ where
 
 /// Error substrings that never classify as retryable — subscription/account
 /// limits and quota/billing exhaustion are deterministic and would burn the
-/// retry budget. Mirrors the TS `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN`.
+/// retry budget.
 const NON_RETRYABLE_PATTERNS: &[&str] = &[
     "GoUsageLimitError",
     "FreeUsageLimitError",
@@ -355,8 +355,8 @@ fn combined_regex(patterns: &[&str]) -> regex::Regex {
 }
 
 /// Classify whether a failed assistant message looks like a transient
-/// provider or transport error, mirroring the TS `isRetryableAssistantError`
-/// (a case-insensitive regex over the raw provider text). Callers handle
+/// provider or transport error (a case-insensitive regex over the raw
+/// provider text). Callers handle
 /// context overflow separately (compaction, not retry); this classifier
 /// itself does not know the context window. A non-retryable limit pattern
 /// wins over a retryable one, so deterministic errors fail fast.
@@ -719,8 +719,8 @@ mod tests {
     }
 
     #[test]
-    fn retryable_assistant_error_matches_ts_regex_separators() {
-        // The TS `.?` separator matches one optional character: a space, a
+    fn retryable_assistant_error_matches_regex_separators() {
+        // The `.?` separator matches one optional character: a space, a
         // dash, an underscore, or nothing at all.
         for message in [
             "Rate Limit exceeded",

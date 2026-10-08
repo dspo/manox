@@ -7,7 +7,7 @@
 // transcript matches the persisted prefix exactly.
 //
 // Usage:
-//   cargo run -p pi --example session_resume
+//   cargo run -p manox-harness --example session_resume
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};

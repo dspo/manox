@@ -51,9 +51,9 @@ pub struct AgentSession {
     session_dir: PathBuf,
     cwd: PathBuf,
     runtime: ModelRuntime,
-    /// The facade's pending next-turn messages (TS coding-agent
-    /// `_pendingNextTurnMessages`): delivered AFTER the prompt's own user
-    /// message as asides, distinct from the harness's queued-first queue.
+    /// The facade's pending next-turn messages: delivered AFTER the prompt's
+    /// own user message as asides, distinct from the harness's queued-first
+    /// queue.
     pending_next_turn: Arc<std::sync::Mutex<Vec<AgentMessage>>>,
     /// Set when a reopened session's model could not be resolved exactly and
     /// the initial model was used instead.
@@ -81,15 +81,15 @@ impl AgentSession {
         self.prompt_with_images(text, Vec::new()).await
     }
 
-    /// Register a hook handler (TS extension `on(event, handler)` parity).
-    /// Handlers fire at their [`crate::harness::HookPoint`] for every prompt
+    /// Register a hook handler. Handlers fire at their
+    /// [`crate::harness::HookPoint`] for every prompt
     /// this session runs.
     pub fn on(&mut self, hook: crate::harness::HookPoint, handler: crate::harness::HookHandler) {
         self.harness.on(hook, handler);
     }
 
-    /// Prompt with attached images (TS `prompt(text, { images })` parity).
-    /// Image blocks ride the prompt's own user message; providers translate
+    /// Prompt with attached images. Image blocks ride the prompt's own user
+    /// message; providers translate
     /// them per wire API.
     pub async fn prompt_with_images(
         &mut self,
@@ -110,7 +110,7 @@ impl AgentSession {
         let expanded = self.expand_prompt(&text);
         // The facade delivers its pending next-turn messages as asides AFTER
         // the prompt's own user message (user-first); the harness's own
-        // queue keeps pi-agent-core queued-first semantics.
+        // queue keeps queued-first semantics.
         let asides = std::mem::take(&mut *self.pending_next_turn.lock().unwrap());
         self.harness
             .prompt_input(crate::harness::PromptInput {
@@ -121,8 +121,8 @@ impl AgentSession {
             .await
     }
 
-    /// The TS `_expandSkillCommand` + `expandPromptTemplate` expansion.
-    /// Delegates to the free `expand_prompt_with` so the engine's
+    /// The skill/prompt-template expansion. Delegates to the free
+    /// `expand_prompt_with` so the engine's
     /// acceptance-side persistence (the K5 edge) expands identically.
     fn expand_prompt(&self, text: &str) -> String {
         crate::harness::expand_prompt_with(self.resources(), text)
@@ -185,7 +185,7 @@ impl AgentSession {
     }
 
     /// Queue a next-turn message delivered after the next prompt's own
-    /// message (TS coding-agent `nextTurn` asides).
+    /// message.
     pub fn next_turn(&self, text: &str) {
         // Refuse after shutdown: the facade's queue contract matches the
         // harness's (no further operations once shut down).
@@ -199,7 +199,7 @@ impl AgentSession {
     }
 
     /// The model-fallback notice when a reopened session's model could not
-    /// be restored exactly (TS `modelFallbackMessage`), if any.
+    /// be restored exactly, if any.
     pub fn model_fallback_notice(&self) -> Option<&str> {
         self.model_fallback_notice.as_deref()
     }
@@ -530,8 +530,8 @@ impl AgentSession {
         self.harness.agent().clear_queues()
     }
 
-    /// Session statistics aggregated over the full active-branch entries —
-    /// the TS `getSessionStats`. Assistant and tool-result usage plus
+    /// Session statistics aggregated over the full active-branch entries.
+    /// Assistant and tool-result usage plus
     /// compaction/branch-summary usage all count, so totals reflect what was
     /// actually billed across the session, not just the live context.
     pub async fn session_stats(
@@ -632,7 +632,7 @@ impl AgentSession {
     }
 
     /// Move the session cursor to an earlier entry, optionally summarizing
-    /// the abandoned branch (TS `navigateTree`).
+    /// the abandoned branch.
     pub async fn navigate(
         &mut self,
         target_id: &str,
@@ -1131,7 +1131,7 @@ impl AgentSessionBuilder {
         if self.model.is_none() {
             // Only install the model resolver when the caller did NOT
             // explicitly set a model: `builder.with_model(B).open()` must
-            // keep B (TS `options.model > restored model`), and restore
+            // keep B, and restore
             // would otherwise overwrite it with the session's model.
             harness = harness.with_model_resolver(model_resolver(&runtime));
         }
@@ -2242,7 +2242,7 @@ mod tests {
     }
 
     /// `builder.with_model(B).open(path)` keeps B even when the session
-    /// recorded model A (TS `options.model > restored model`); the first
+    /// recorded model A; the first
     /// provider request is actually served by B.
     #[tokio::test]
     async fn open_keeps_an_explicit_model_override() {
@@ -2446,7 +2446,7 @@ mod tests {
     }
 
     /// A custom catalog can restrict a model's supported thinking levels
-    /// (TS `thinkingLevelMap`), and xhigh clamps to the supported max.
+    ///, and xhigh clamps to the supported max.
     /// `set_thinking_level(None)` reads as `"off"` (facade contract): on a
     /// thinking model it disables thinking, stays off across a prompt, and a
     /// reopen projects the same off.
@@ -2777,7 +2777,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        // Desired xhigh: not supported -> clamps to max (TS up-search).
+        // Desired xhigh: not supported -> clamps to max.
         session
             .set_thinking_level(Some("xhigh".into()))
             .await
@@ -2984,8 +2984,7 @@ mod tests {
             Some(crate::types::ContentBlock::Image { data, .. }) if data == "bmV3"
         ));
 
-        // A transform without `images` keeps the original attachments (TS
-        // `images ?? currentImages`).
+        // A transform without `images` keeps the original attachments.
         let dir2 = tempfile::tempdir().unwrap();
         let mut session = input_hook_session(&dir2).await;
         session.on(

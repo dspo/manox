@@ -37,7 +37,7 @@ struct SkillMeta {
     /// Claude Code's `disable-model-invocation`: the skill stays
     /// user-invocable (slash) but is hidden from the model's summary list so
     /// the model neither discovers nor auto-invokes it. `allowed-tools` is
-    /// accepted-and-ignored, matching commands' documented stance (the pi
+    /// accepted-and-ignored (the
     /// harness runs its full toolset for a turn).
     #[serde(default, rename = "disable-model-invocation")]
     disable_model_invocation: bool,

@@ -1,7 +1,7 @@
 // Session repository: directory-scoped create / open / list / delete / fork /
-// branch over JSONL session files — the TS `SessionRepository` surface for a
+// branch over JSONL session files — a typed repository surface for a
 // per-cwd session folder. New and branched sessions defer their file to the
-// first assistant message (TS `_persist`), so an empty session never appears
+// first assistant message, so an empty session never appears
 // in `list`.
 //
 // `list`/`info` are BOUNDED reads: the header line plus the first user
@@ -73,7 +73,7 @@ impl SessionRepository {
 
     /// Create a new session in the repository directory. The file is deferred
     /// until the first assistant message, so an empty session is invisible to
-    /// [`Self::list`] and never touches disk — TS `newSession` + `_persist`.
+    /// [`Self::list`] and never touches disk.
     pub async fn create(
         &self,
         metadata: JsonlSessionMetadata,
@@ -272,7 +272,7 @@ const VALUE_USER: &[u8] = br#""user""#;
 /// A JSON member test on the raw line: `<key pattern>`, optional
 /// whitespace, `:`, optional whitespace, `<value pattern>` — anywhere in
 /// the line. Key ORDER does not matter (serde's tagged enums put `type`
-/// first, but TS Pi's serializer or a hand-edited file may not); a single
+/// first, but a hand-edited file may not); a single
 /// space around the colon is tolerated (compact writers emit none).
 fn json_member_is(line: &[u8], key: &[u8], value: &[u8]) -> bool {
     let mut from = 0usize;
@@ -496,7 +496,7 @@ mod tests {
             .append_message(AgentMessage::user("buried prompt"))
             .await
             .unwrap();
-        // The file materializes on the first ASSISTANT message (TS
+        // The file materializes on the first ASSISTANT message (deferred
         // `_persist`) — the user prompt alone stays deferred.
         buried.append_message(assistant("reply")).await.unwrap();
 
@@ -576,7 +576,8 @@ mod tests {
     }
 
     /// The member matcher is key-order-insensitive and tolerates a space
-    /// around the colon: a message line written by TS Pi (or a hand edit)
+    /// around the colon: a message line written by an older writer (or a
+    /// hand edit)
     /// with `type` NOT first, and with spaced members, still surfaces.
     #[tokio::test]
     async fn scan_finds_messages_regardless_of_key_order_and_spacing() {

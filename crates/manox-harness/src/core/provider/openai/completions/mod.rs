@@ -33,8 +33,8 @@ pub struct CompletionsStreamFn {
     api_key: String,
     base_url: String,
     options: StreamOptions,
-    /// Whether the endpoint reports `finish_reason` (TS
-    /// `supportsFinishReason`, default true). A stream that ends without one
+    /// Whether the endpoint reports `finish_reason` (default true). A stream
+    /// that ends without one
     /// is truncated and surfaces an error; only endpoints that explicitly
     /// opt out accept a missing `finish_reason` and infer `stop`/`toolUse`.
     supports_finish_reason: bool,
@@ -84,7 +84,7 @@ impl CompletionsStreamFn {
 
     /// Declare that the endpoint never reports `finish_reason`; a stream
     /// without one then infers `stop`/`toolUse` instead of being treated as
-    /// truncated (TS `model.compat.supportsFinishReason: false`).
+    /// truncated.
     pub fn with_supports_finish_reason(mut self, supports: bool) -> Self {
         self.supports_finish_reason = supports;
         self
@@ -381,7 +381,7 @@ impl Accumulator {
     }
 
     fn push_text(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
-        // One text block per stream, mirroring TS: interleaved reasoning does
+        // One text block per stream: interleaved reasoning does
         // not close the open text block — deltas keep appending to it.
         let index = match self.open_text {
             Some(i) => i,
@@ -410,7 +410,7 @@ impl Accumulator {
     }
 
     fn push_thinking(&mut self, thinking: &str, events: &mut Vec<AssistantMessageEvent>) {
-        // One thinking block per stream, mirroring TS: interleaved text does
+        // One thinking block per stream: interleaved text does
         // not close the open thinking block.
         let index = match self.open_thinking {
             Some(i) => i,
@@ -750,7 +750,7 @@ mod tests {
     }
 
     /// Interleaved text and reasoning keep exactly two blocks for the whole
-    /// stream — each kind merges into its single block, mirroring TS.
+    /// stream — each kind merges into its single block.
     #[tokio::test]
     async fn interleaved_text_and_thinking_merge_into_two_blocks() {
         let (tx, _rx) = chan();
@@ -1103,8 +1103,7 @@ data: [DONE]\n\n";
     }
 
     /// An endpoint declared without `finish_reason` support completes a
-    /// `[DONE]`-closed stream with the inferred stop reason (TS
-    /// `supportsFinishReason: false`).
+    /// `[DONE]`-closed stream with the inferred stop reason.
     #[tokio::test]
     async fn compat_endpoint_without_finish_reason_infers_stop() {
         let body = "data: {\"id\":\"r1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\

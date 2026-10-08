@@ -7,7 +7,7 @@
 // reopen restores exactly the compacted transcript.
 //
 // Usage:
-//   cargo run -p pi --example split_turn_compact
+//   cargo run -p manox-harness --example split_turn_compact
 
 use std::sync::Arc;
 

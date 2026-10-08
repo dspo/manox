@@ -8,19 +8,19 @@
 /// Build the harness system prompt from a base prompt, the project
 /// instruction context files (AGENTS.md / CLAUDE.md), and the mounted skills.
 /// This is the facade's single prompt builder — skills appear as an index so
-/// the model knows what is invocable (TS `buildSystemPrompt`).
+/// the model knows what is invocable.
 /// The default coding-agent base prompt, ported from the TS
 /// `buildSystemPrompt` non-UI core: the identity line and the always-present
 /// guidelines. The UI documentation section and per-tool snippets are
 /// dynamic (added by [`build_harness_prompt`]).
-pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operating inside pi, a coding agent harness. \
+pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operating inside manox, a coding agent harness. \
     You help users by reading files, executing commands, editing code, and writing new files.\n\n\
     In addition to the tools below, you may have access to other custom tools depending on the project.\n\n\
     Guidelines:\n\
     - Be concise in your responses\n\
     - Show file paths clearly when working with files";
 
-/// One-line tool snippets for the Available tools list (TS `toolSnippets`).
+/// One-line tool snippets for the Available tools list.
 const TOOL_SNIPPETS: &[(&str, &str)] = &[
     ("Read", "Read a file from the filesystem"),
     ("Bash", "Run a shell command"),
@@ -40,7 +40,7 @@ pub fn build_harness_prompt(
     custom: bool,
 ) -> String {
     let mut prompt = base.to_string();
-    // TS `customPrompt` replaces the default prompt: no tools list or
+    // A custom prompt replaces the default prompt: no tools list or
     // guidelines are appended, only context files, skills, and the cwd.
     if !custom {
         prompt.push_str("\n\nAvailable tools:\n");

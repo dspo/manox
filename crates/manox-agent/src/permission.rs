@@ -1,7 +1,7 @@
 //! Tool-call permissions.
 //!
 //! These types are the shared currency between the harness backends and the
-//! UI: the pi harness gates tools through them (see `pi_approval`), and the
+//! UI: the harness gates tools through them (see `pi_approval`), and the
 //! workspace sends its `AskUserQuestion` answers back as
 //! [`ToolAuthorizationResponse`].
 
@@ -15,7 +15,7 @@ pub enum PermissionDecision {
 }
 
 /// One canonical answer to one `AskUserQuestion` question, routed by the
-/// question's stable `id` (never its text — the dsh L1 vocabulary).
+/// question's stable `id` (never its text).
 ///
 /// Tri-state, encoded entirely in the `(selected, custom)` pair:
 /// - **option selection**: `selected` non-empty, `custom: None` — the chosen
@@ -84,7 +84,7 @@ pub enum ToolAuthorizationResponse {
     /// The user CLOSED the question card to speak instead — an explicit
     /// "not now, let me talk" that is neither an answer, a rejection, nor a
     /// turn interrupt. The tool result tells the model to stop and wait for
-    /// the forthcoming message (dsh `ASK_CANCELLED`), so the model neither
+    /// the forthcoming message, so the model neither
     /// treats silence as consent nor reads the close as a denial. Distinct
     /// from `AskUserQuestionExpired` (a delivery that lapsed with no human
     /// action) so the two causes surface different model guidance.

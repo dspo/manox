@@ -1,7 +1,7 @@
-//! [`SubagentRuntime`] — the provider registry and one-shot start seam (the
-//! dsh `ctx.subagents` service, in-process scope). Providers register with a
-//! guard handle whose drop removes them (effect-scoped, HMR-safe in dsh
-//! terms); `start` validates capabilities fail-loud, resolves the durable
+//! [`SubagentRuntime`] — the provider registry and one-shot start seam,
+//! in-process scope. Providers register with a
+//! guard handle whose drop removes them (effect-scoped);
+//! `start` validates capabilities fail-loud, resolves the durable
 //! child descriptor, and dispatches to the chosen provider. The runtime also
 //! tracks live runs for the `list_agents`/`interrupt_agent` control surface.
 

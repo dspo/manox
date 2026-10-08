@@ -2,8 +2,7 @@
 // and lazily migrates on its next append).
 //
 // Layout of a session file (the caller picks the path — typically a
-// `timestamp_sessionId.jsonl` under a per-cwd directory, matching the TS Pi
-// repo naming):
+// `timestamp_sessionId.jsonl` under a per-cwd directory):
 //   line 0 — a session header: `{"type":"session","version":4,"id":..,"timestamp":..,"cwd":..,"parentSession"?:..,"metadata"?:..}`
 //              (a v3 header, `"version":3`, loads and migrates).
 //   line 1.. — session-tree entries, appended in occurrence order. A `leaf`
@@ -91,7 +90,7 @@ pub struct JsonlSessionMetadata {
 }
 
 /// The first line of a v3 session file. Field names are camelCase to match the
-/// TS Pi header schema (multi-word fields like `parentSession` would otherwise
+/// Header schema (multi-word fields like `parentSession` would otherwise
 /// leak snake_case onto disk).
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,7 +161,7 @@ impl JsonlSessionStorage {
     /// Create a new session file at `path`, writing `metadata` as the header.
     ///
     /// The path is the exact file location — the caller owns the naming scheme
-    /// (the TS Pi repo writes `timestamp_sessionId.jsonl` under a per-cwd
+    /// (typically `timestamp_sessionId.jsonl` under a per-cwd
     /// directory). A missing parent directory is created. This errors if the
     /// file already exists; reopen an existing file with [`Self::open`].
     pub async fn create(
@@ -534,7 +533,7 @@ impl JsonlSessionStorage {
         let line = v4_line(&entry, seq)?;
         // A deferred session materializes on the first assistant message: the
         // header plus every buffered entry are written in one shot, so the
-        // on-disk order matches the in-memory index (TS `_persist`). Before
+        // on-disk order matches the in-memory index. Before
         // that boundary the row lives ONLY in memory — writing it straight to
         // disk (the pre-fix bug) produced headerless zombie files on every
         // boot / new-session click (two default rows, no `session` header),
@@ -548,7 +547,7 @@ impl JsonlSessionStorage {
         );
         if *self.deferred.lock().await {
             // A deferred session materializes on the first assistant message
-            // (TS `_persist`) — or on ANY entry the caller marks durable (K5:
+            // — or on ANY entry the caller marks durable (K5:
             // a session carrying an accepted Submit has interacted, so it is
             // no zombie; the accepted text must be on disk before the
             // receipt's crash window opens).
@@ -577,7 +576,7 @@ impl JsonlSessionStorage {
         }
         // A buffered (pre-materialization) row needs no disk write: the index
         // below carries it until the flush rewrites the file wholesale.
-        // Index the entry before moving the cursor, mirroring TS Pi's order:
+        // Index the entry before moving the cursor:
         // a concurrent `get_leaf_id` must never see a cursor whose target is
         // absent from the index, which would read as session corruption.
         self.entries.lock().await.push(entry.clone());
@@ -850,9 +849,8 @@ fn parse_file(path: &Path, bytes: &[u8]) -> Result<ParsedFile, anyhow::Error> {
             }
         };
         // Wire-level structural checks before deserializing: a missing
-        // required field must not be silently read as `null` (TS
-        // `parseEntryLine` treats a missing `parentId`/`targetId` as an
-        // invalid entry).
+        // required field must not be silently read as `null` (a missing
+        // `parentId`/`targetId` is an invalid entry).
         validate_entry_wire(&value)?;
         let seq = value.get("seq").and_then(JsonValue::as_u64);
         let entry: SessionTreeEntry = serde_json::from_value(value)?;
@@ -1121,8 +1119,8 @@ fn validate_header_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Wire-level structural checks on a raw entry object before deserializing,
-/// mirroring the TS `parseEntryLine`: `parentId` (and `targetId` on `leaf`
+/// Wire-level structural checks on a raw entry object before deserializing:
+/// `parentId` (and `targetId` on `leaf`
 /// entries) must be present as `null|string` — a missing field is corruption,
 /// not a silent root or empty cursor.
 fn validate_entry_wire(value: &JsonValue) -> Result<(), anyhow::Error> {
@@ -1765,7 +1763,7 @@ mod tests {
                     exit_code: Some(101),
                     cancelled: false,
                     truncated: true,
-                    full_output_path: Some("/tmp/pi-bash-1.log".into()),
+                    full_output_path: Some("/tmp/bash-1.log".into()),
                     exclude_from_context: Some(true),
                     timestamp: chrono::Utc::now(),
                 },
@@ -1794,7 +1792,7 @@ mod tests {
                 assert_eq!(output, "tail");
                 assert_eq!(exit_code, Some(101));
                 assert!(truncated);
-                assert_eq!(full_output_path.as_deref(), Some("/tmp/pi-bash-1.log"));
+                assert_eq!(full_output_path.as_deref(), Some("/tmp/bash-1.log"));
                 // The withholding must survive the round trip, or a reopened
                 // session would start feeding the model what the user hid.
                 assert_eq!(exclude_from_context, Some(true));
@@ -1824,7 +1822,7 @@ mod tests {
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
 
         // set_leaf_id persists a `leaf` entry that redirects the cursor to the
-        // target, matching the TS Pi v3 schema (not an in-memory override).
+        // target, matching the on-disk schema (not an in-memory override).
         storage.set_leaf_id(Some("m1")).await.unwrap();
         assert_eq!(storage.get_leaf_id().await.unwrap(), Some("m1".into()));
 
@@ -2188,7 +2186,7 @@ mod tests {
     }
 
     /// A Message entry persisted by manox must write camelCase `parentId` so
-    /// the file is a valid TS Pi v3 session (and other tools reading it do not
+    /// the file is a valid session file (and other tools reading it do not
     /// silently lose ancestry). Guards against dropping `rename_all` on the
     /// variant.
     #[tokio::test]
@@ -2239,14 +2237,14 @@ mod tests {
         assert_eq!(path[1].parent_id(), Some("root"));
     }
 
-    /// A real TS Pi v3 session file uses camelCase entry fields, stores a
+    /// A real session file uses camelCase entry fields, stores a
     /// message's own timestamp as epoch milliseconds, and writes no `leaf`
     /// entries. Such a file must load with the leaf cursor at the last entry.
     #[tokio::test]
     async fn test_loads_real_ts_pi_v3_layout() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        // Mirrors the on-disk shape captured from a real TS Pi session: header,
+        // Mirrors the on-disk shape of a real session file: header,
         // a model_change (camelCase modelId), a thinking_level_change
         // (camelCase thinkingLevel), and a message whose inner timestamp is
         // integer millis. No `leaf` entry.
@@ -2324,7 +2322,7 @@ mod tests {
     async fn test_loads_custom_entry_with_string_and_object_data() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        // Real TS Pi sessions carry `custom` entries whose `data` is either a
+        // Real sessions carry `custom` entries whose `data` is either a
         // plain string or a JSON object. Both must load and expose id/parentId.
         let contents = concat!(
             r#"{"type":"session","version":3,"id":"s1","timestamp":"2026-05-28T07:13:46.608Z","cwd":"/proj"}"#,
@@ -2380,7 +2378,7 @@ mod tests {
         assert_eq!(path[0].id(), "x1");
     }
 
-    /// A real TS Pi v3 session file may carry every entry kind in the flat
+    /// A real session file may carry every entry kind in the flat
     /// wire shape, including a trailing `leaf` entry that redirects the
     /// cursor. Each must load into the matching variant with camelCase fields
     /// mapped, and a trailing leaf must land the cursor on its `targetId`.
@@ -2493,8 +2491,8 @@ mod tests {
         }
     }
 
-    /// A `Label` entry with no label text must omit the field on disk (TS
-    /// types it `string | undefined`), not serialize it as `null`.
+    /// A `Label` entry with no label text must omit the field on disk,
+    /// not serialize it as `null`.
     #[tokio::test]
     async fn test_label_entry_omits_unset_label_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -2632,7 +2630,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session.jsonl");
-        // Mirrors a real TS Pi session after one compaction: messages m1..m3,
+        // Mirrors a real session after one compaction: messages m1..m3,
         // a compaction keeping from m2 onward (firstKeptEntryId, no tail
         // payload), then a post-compaction message. No `leaf` entry.
         let contents = concat!(

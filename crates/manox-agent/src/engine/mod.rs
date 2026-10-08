@@ -1,10 +1,10 @@
-//! The pi harness engine: drives a `manox_harness::coding_agent::AgentSession` from a
+//! The harness engine: drives a `manox_harness::coding_agent::AgentSession` from a
 //! tokio actor and adapts its events onto the UI's `ThreadEvent` language.
 //!
 //! This is the first-class harness backend behind the `Thread` facade: the
 //! facade holds an `Arc<dyn ThreadEngine>` (this `PiEngine`), spawns the
 //! actor, and drains `BackendNotice`s on the gpui thread. Pure mappings
-//! between pi wire types and the UI language live here (adapt), so the
+//! between kernel wire types and the UI language live here (adapt), so the
 //! facade only ever sees `Message` / `ThreadEvent`.
 
 use std::collections::{HashMap, HashSet};
@@ -60,14 +60,14 @@ pub use tools_assembly::BrowserSuite;
 /// against churn on large sessions.
 const LIVE_HISTORY_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Commands the gpui side sends to the pi actor.
+/// Commands the gpui side sends to the harness actor.
 pub(crate) enum SessionCmd {
     /// Start a turn with the given user text and attached images.
     Prompt {
         text: String,
         images: Vec<manox_harness::types::ContentBlock>,
-        /// The RPC id the client submitted this turn under (dsh `source.rpcId`,
-        /// §C.2 `originRpc`). The server pins it on the prompt's user-message
+        /// The RPC id the client submitted this turn under (§C.2 `originRpc`).
+        /// The server pins it on the prompt's user-message
         /// journal entry so the client can retire its optimistic echo (§F.2).
         /// `None` for internally-driven turns (goal rounds, plan seeds).
         origin_rpc: Option<String>,
@@ -89,7 +89,7 @@ pub(crate) enum SessionCmd {
     Abort,
     /// Hot-swap the model for the next provider request.
     SetModel(PiModel),
-    /// Map the reasoning effort onto pi's thinking level.
+    /// Map the reasoning effort onto the harness's thinking level.
     SetThinkingLevel(Option<String>),
     /// Switch the permission mode and persist it in the session sidecar.
     SetPermissionMode(PermissionMode),
@@ -355,7 +355,7 @@ struct LiveTranscript {
     streaming: Option<AgentMessage>,
 }
 
-/// The pi harness backend behind the `Thread` facade.
+/// The harness backend behind the `Thread` facade.
 pub struct PiEngine {
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     state: Arc<EngineState>,
@@ -376,7 +376,7 @@ impl PiEngine {
     }
 }
 
-/// Spawn the pi actor and return the engine handle plus its notice receiver.
+/// Spawn the harness actor and return the engine handle plus its notice receiver.
 /// The facade drains the receiver on the gpui thread. `initial_path`, when
 /// given, opens that session file instead of restoring the newest one.
 /// `lease` is the driven session's write lease (None for fresh sessions —
@@ -844,7 +844,7 @@ impl ThreadEngine for PiEngine {
     }
 }
 
-// ── The pi actor ───────────────────────────────────────────────────────────
+// ── The harness actor ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
@@ -958,7 +958,7 @@ async fn run_actor(
         }
         // The restore path passes no model override: `builder.open()`
         // projects the session's own model only when the builder carries
-        // none (TS `options.model > restored model`), and the actor adopts
+        // none, and the actor adopts
         // it right after the open below.
         let (builder, orchestrators, read_only_subagent) = session_builder(
             &tool_cwd,
@@ -988,7 +988,7 @@ async fn run_actor(
                 session = Some(s);
             }
             Err(err) => {
-                tracing::warn!("pi session restore failed ({err}); starting fresh");
+                tracing::warn!("session restore failed ({err}); starting fresh");
             }
         }
     }
@@ -1031,12 +1031,12 @@ async fn run_actor(
                         error = %err,
                         model_provider = %pi_model.provider,
                         registered = ?registered,
-                        "pi session build failed"
+                        "session build failed"
                     );
                     send_notice(
                         &notice_tx,
                         BackendNotice::Fatal(anyhow::anyhow!(
-                            "pi session build failed: {err} (registered providers: {registered:?})"
+                            "session build failed: {err} (registered providers: {registered:?})"
                         )),
                         "engine fatal",
                     );
@@ -1122,7 +1122,7 @@ async fn run_actor(
     let _ = restore_ready.send(true);
     // The reasoning effort rebuilds the same way: a reopened Max session
     // keeps its effort. The engine clamps against the current model and
-    // persists the change in the transcript (TS `setThinkingLevel`).
+    // persists the change in the transcript.
     let reasoning_effort = restored_state.reasoning_effort;
     if reasoning_effort != ReasoningEffort::default()
         && let Err(err) = session
@@ -1267,7 +1267,7 @@ async fn run_actor(
                 // Collapse wakeups queued while the actor was busy; the
                 // steering-queue check inside the helper decides whether a
                 // run is owed. A monitor steered events while the session was
-                // idle — resume now (S1/DSH parity via the shared helper).
+                // idle — resume now (S1 via the shared helper).
                 while wakeup_rx.try_recv().is_ok() {}
                 resume_steering_queue(
                     &mut session,
@@ -1405,7 +1405,7 @@ async fn run_actor(
                 if shutdown_after_run {
                     break;
                 }
-                // S2 (pi `agent-loop` / omp settle-drain): a steer enqueued in
+                // S2 (settle-drain guard): a steer enqueued in
                 // this run's final moments — after the loop's last turn-boundary
                 // drain but before `Settled` — is still sitting in the surviving
                 // kernel queue. Drain it here (the helper no-ops when the queue
@@ -1429,7 +1429,7 @@ async fn run_actor(
                 }
             }
             SessionCmd::Steer { id, text, images } => {
-                // S1 (dsh `wakeDriver` idle-steer): a steer that arrives while
+                // S1 (idle-steer): a steer that arrives while
                 // the actor is idle no longer waits for an unrelated next turn.
                 // Enqueue it under its command id (S4 retractable; S3 the same
                 // id is the injected `user` row's durable identity), then
@@ -1475,7 +1475,7 @@ async fn run_actor(
                 // `model_change` entry.
                 if pi_model != new_model {
                     if let Err(err) = session.set_model(new_model.clone()).await {
-                        tracing::warn!("pi set_model failed: {err}");
+                        tracing::warn!("set_model failed: {err}");
                     } else {
                         // Keep the actor's working model in sync: Open/NewSession
                         // below build sessions with it.
@@ -1528,8 +1528,8 @@ async fn run_actor(
                     continue;
                 }
                 // Idle threads have no boundary to wait for, so the selection
-                // commits immediately (dsh parity — its `set()` appends
-                // between turns). Mid-run selections never reach this arm:
+                // commits immediately (between turns). Mid-run selections
+                // never reach this arm:
                 // `drive_run` records them and leaves the commit to the
                 // Prompt boundary.
                 if !state.running.load(Ordering::Relaxed) {
@@ -1769,7 +1769,7 @@ async fn run_actor(
                             .downcast_ref::<manox_harness::compaction::NothingToCompact>()
                             .is_some() =>
                     {
-                        tracing::debug!("pi compact: nothing to compact");
+                        tracing::debug!("compact: nothing to compact");
                     }
                     Err(err) => {
                         let _ =
@@ -1779,7 +1779,7 @@ async fn run_actor(
             }
             SessionCmd::SetThinkingLevel(level) => {
                 if let Err(err) = session.set_thinking_level(level.clone()).await {
-                    tracing::warn!("pi set_thinking_level failed: {err}");
+                    tracing::warn!("set_thinking_level failed: {err}");
                 }
                 // The facade's knob only sends "high"/"max"; persist the
                 // choice so a reopened session restores the same effort.
@@ -2638,15 +2638,15 @@ async fn rebuild_restored_state(
         .filter(|title| meta.title.as_deref() != Some(title.as_str()));
     // K2 title repair, ENABLED (the rename-route decision): the only
     // direct-sidecar title writer is `set_external_title`, which serves
-    // EXTERNAL TUI sessions — they carry no pi journal chain, never reach
+    // EXTERNAL TUI sessions — they carry no journal chain, never reach
     // this rebuild, and their sidecar is desktop-authoritative by design
     // (the external process owns the session file, so a journaled rename
-    // face does not apply and a cold journal append would race it). A pi
+    // face does not apply and a cold journal append would race it). A
     // thread's sidecar title is written only by the auto-title scheduler,
     // whose decision journals the `title` entry first — so a divergence
     // here is a stale cache and the chain re-stamps it. A chain that never
     // saw a title keeps the sidecar value (hole-fill; the scheduler seeds
-    // through `journal_title.or(sidecar)`). A future pi rename UI must
+    // through `journal_title.or(sidecar)`). A future rename UI must
     // route a journaled face (`thread_store::rename_thread`,
     // pin_thread-isomorphic).
     let repair_flags = replayed
@@ -3027,8 +3027,8 @@ async fn persist_initial_title(
 
 /// Mirror session usage into the engine state. Cumulative and per-model
 /// totals come from the kernel's stats over the full active branch —
-/// compacted history, tool results, and summarization usage included (TS
-/// `getSessionStats` semantics: totals reflect what was actually billed).
+/// compacted history, tool results, and summarization usage included
+/// (totals reflect what was actually billed).
 /// Only the per-request attribution for the env card stays a thin
 /// presentation walk here.
 async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
@@ -3038,7 +3038,7 @@ async fn sync_usage(session: &AgentSession, state: &Arc<EngineState>) {
             // Degrade to the assistant-only walk (the pre-stats mechanism)
             // so a failing stats read never freezes UI usage at stale
             // values. Loses tool-result/summary usage for this sync only.
-            tracing::warn!("pi session stats failed; falling back to message walk: {err:#}");
+            tracing::warn!("session stats failed; falling back to message walk: {err:#}");
             sync_usage_from_messages(session, state);
             return;
         }
@@ -3189,7 +3189,7 @@ fn token_usage_from_totals(t: &manox_harness::coding_agent::usage::UsageTotals) 
     }
 }
 
-/// Map a pi usage report onto the manox token shape.
+/// Map a usage report onto the manox token shape.
 fn to_token_usage(u: &manox_harness::types::Usage) -> TokenUsage {
     TokenUsage {
         input_tokens: u.input_tokens,
@@ -3242,7 +3242,7 @@ async fn refresh_session_list(sessions_dir: &Path, state: &Arc<EngineState>) {
     *state.sessions.lock().unwrap() = out;
 }
 
-/// Map a pi session info onto the actor's mirrored session list.
+/// Map a session info onto the actor's mirrored session list.
 ///
 /// A flat mirror of the sidebar store (the sidebar itself renders
 /// `ThreadStore::summaries()` with team depth resolution); rows here stay
@@ -3285,16 +3285,16 @@ fn session_info_to_summary(
     }
 }
 
-// ── Pure mappings between pi wire types and the UI language ────────────────
+// ── Pure mappings between kernel wire types and the UI language ────────────────
 
-/// Pure mappings between pi harness wire types and the UI's language.
+/// Pure mappings between harness wire types and the UI's language.
 ///
 /// The facade renders two data shapes: the `ThreadEvent` stream (live deltas)
-/// and `manox_agent::Message` history (rebuild). A pi `AgentSession` produces
+/// and `manox_agent::Message` history (rebuild). A harness `AgentSession` produces
 /// `AgentEvent`s and `AgentMessage`s; the functions here translate them into
 /// those two shapes so the polished manox render pipeline is reused.
 ///
-/// The harness<->pi translation is internal to the crate in production builds;
+/// The harness translation is internal to the crate in production builds;
 /// it is exposed as `pub` only under `test-support` so integration tests (e.g.
 /// the agent-ui overlap walk) can rebuild a conversation from a captured
 /// session without widening the production API surface.

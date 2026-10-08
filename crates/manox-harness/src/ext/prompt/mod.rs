@@ -1,4 +1,4 @@
-//! Prompt assembly for pi harness sessions — the extension-layer renderer
+//! Prompt assembly for harness sessions — the extension-layer renderer
 //! that owns the system prompt.
 //!
 //! Templates live under `templates/<preset>/`; this module registers the
