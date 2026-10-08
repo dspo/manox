@@ -2062,14 +2062,16 @@ impl Backend for RuntimeBackend {
                     .split('/')
                     .next()
                     .filter(|id| !id.is_empty())?;
-                // Folded fresh and thread-scoped, never from the seed cache:
-                // the cache is built once per process and per single journal,
-                // while a reconnecting client must see every member
-                // session's rows and the ones that landed after its last
-                // connect (the envelope's current watermark would bless a
-                // stale fold as truth). A thread with no rows yet answers its
-                // (empty) state, not `null`: the client replaces what it
-                // holds, and `null` would claim the channel says nothing.
+                // Folded thread-scoped — fresh, or served by the
+                // journal-stamp baseline cache when no member journal moved —
+                // and never from the seed cache: the seed is built once per
+                // process and per single journal, while a reconnecting client
+                // must see every member session's rows and the ones that
+                // landed after its last connect (the envelope's current
+                // watermark would bless a stale fold as truth). A thread with
+                // no rows yet answers its (empty) state, not `null`: the
+                // client replaces what it holds, and `null` would claim the
+                // channel says nothing.
                 block_on(super::extension_channel_baseline(channel, session_id))
             } else {
                 self.catalogue_baseline(channel)
