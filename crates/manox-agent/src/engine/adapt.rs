@@ -3,7 +3,7 @@ use crate::language_model::{
     LanguageModelToolResult, LanguageModelToolUse, StopReason as ManoxStopReason,
 };
 use crate::thread::ToolCallStatus;
-use manox_harness::types::StopReason as StopReason;
+use manox_harness::types::StopReason;
 
 /// Map one kernel `AgentEvent` onto the `ThreadEvent`s the workspace renders.
 ///

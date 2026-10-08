@@ -273,7 +273,10 @@ impl SubagentProvider for SpawnProvider {
                 .as_ref()
                 .and_then(|o| o.reasoning_effort.clone())
             {
-                session.set_thinking_level(Some(effort)).await.map_err(|e| {
+                session
+                    .set_thinking_level(Some(effort))
+                    .await
+                    .map_err(|e| {
                         SubagentError::Provider(
                             self.name().to_string(),
                             format!("failed to apply reasoning effort: {e}"),

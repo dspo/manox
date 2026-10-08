@@ -3908,9 +3908,10 @@ async fn journal_replay_is_consistent_across_disk_reload() {
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let resolver_for = |stream: Arc<ToolRoundsStream>| {
-        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
-            Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
-        });
+        let resolver: manox_harness::agent_loop::StreamResolver =
+            Arc::new(move |_m: &HarnessModel| {
+                Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
+            });
         resolver
     };
     let mut session = create_agent_session()

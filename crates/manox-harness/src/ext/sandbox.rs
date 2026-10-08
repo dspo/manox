@@ -381,11 +381,7 @@ mod tests {
         let root = Path::new("/tmp/ext-sandbox-roots-test");
         let roots = writable_roots(PermissionMode::WorkspaceWrite, root);
         // The workspace root is always present (canonicalized).
-        assert!(
-            roots
-                .iter()
-                .any(|r| r.ends_with("ext-sandbox-roots-test"))
-        );
+        assert!(roots.iter().any(|r| r.ends_with("ext-sandbox-roots-test")));
         // Canonical + deduplicated: a second resolution adds no new entries.
         let before = roots.len();
         let mut seen: Vec<PathBuf> = Vec::new();

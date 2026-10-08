@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use manox_harness::tool::{
-    AgentTool as HarnessAgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError, ToolProgress,
+    AgentTool as HarnessAgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError,
+    ToolProgress,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;

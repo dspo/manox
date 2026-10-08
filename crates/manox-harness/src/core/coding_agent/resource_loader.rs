@@ -389,7 +389,9 @@ mod tests {
         let dir = tmp();
         let cwd = dir.path().join("proj");
         let skills = cwd.join("skills");
-        tokio::fs::create_dir_all(skills.join("deep")).await.unwrap();
+        tokio::fs::create_dir_all(skills.join("deep"))
+            .await
+            .unwrap();
         tokio::fs::write(
             skills.join("review.md"),
             "---\nname: review\ndescription: review the diff\n---\nCheck the diff.",

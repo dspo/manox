@@ -412,8 +412,9 @@ impl AgentSession {
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
-        let effective = clamp_thinking(&model, &levels, Some(level.unwrap_or_else(|| "off".into())))
-            .filter(|l| l != "off");
+        let effective =
+            clamp_thinking(&model, &levels, Some(level.unwrap_or_else(|| "off".into())))
+                .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
         let previous = self.harness.agent().state().thinking_level.clone();
         if effective != previous {
@@ -3102,5 +3103,4 @@ mod tests {
         assert!(messages.is_empty(), "handled input runs no turn");
         assert!(!*later_ran.lock().unwrap(), "handled stops the chain");
     }
-
 }
