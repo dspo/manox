@@ -241,6 +241,10 @@ pub struct MarketplacePluginRecord {
 pub struct InstalledPluginRecord {
     pub name: String,
     pub marketplace: String,
+    /// The full registry key (`name@marketplace`) — the identity the
+    /// enable/disable/uninstall APIs address, and the same-name installs
+    /// from two marketplaces what keeps them apart.
+    pub key: String,
     pub root: PathBuf,
     pub description: Option<String>,
     pub version: Option<String>,
@@ -479,44 +483,61 @@ impl PluginManager {
 
     /// Remove an installed plugin: drop its cache tree and both registry
     /// entries. A disabled plugin is removed the same way as an enabled one.
-    pub fn uninstall(plugin_name: &str) -> Result<()> {
-        for key in Self::keys_for(plugin_name)? {
-            let mut doc = InstalledPlugins::load()?;
-            // Only the user-scope trees are manox's to delete: sibling
-            // project/local entries are Claude Code's per-repo installs, and
-            // removing them would destroy exactly what `record_install`
-            // preserves on the write side.
-            for entry in doc.entries(&key).into_iter().filter(|e| e.scope == "user") {
-                if entry.root.exists() {
-                    std::fs::remove_dir_all(&entry.root).with_context(|| {
-                        format!("removing installed tree {}", entry.root.display())
-                    })?;
-                }
+    ///
+    /// The argument is the full registry key (`name@marketplace`): the same
+    /// plugin name installed from two marketplaces is two independent
+    /// installs, and only the addressed one is removed.
+    pub fn uninstall(plugin_key: &str) -> Result<()> {
+        let mut doc = InstalledPlugins::load()?;
+        Self::require_installed(&doc, plugin_key)?;
+        // Only the user-scope trees are manox's to delete: sibling
+        // project/local entries are Claude Code's per-repo installs, and
+        // removing them would destroy exactly what `record_install`
+        // preserves on the write side.
+        for entry in doc
+            .entries(plugin_key)
+            .into_iter()
+            .filter(|e| e.scope == "user")
+        {
+            if entry.root.exists() {
+                std::fs::remove_dir_all(&entry.root)
+                    .with_context(|| format!("removing installed tree {}", entry.root.display()))?;
             }
-            // The toggle goes with the key: a surviving sibling scope still
-            // needs its `enabledPlugins` entry intact for Claude Code.
-            if doc.remove_user_scope(&key)? {
-                SettingsPatch::remove_enabled(&key)?;
-            }
+        }
+        // The toggle goes with the key: a surviving sibling scope still
+        // needs its `enabledPlugins` entry intact for Claude Code.
+        if doc.remove_user_scope(plugin_key)? {
+            SettingsPatch::remove_enabled(plugin_key)?;
         }
         Ok(())
     }
 
     /// Re-enable an installed plugin: set `enabledPlugins[key] = true` so
-    /// loaders scan it again on the next start.
-    pub fn enable(plugin_name: &str) -> Result<()> {
-        for key in Self::keys_for(plugin_name)? {
-            SettingsPatch::set_enabled(&key, true)?;
-        }
-        Ok(())
+    /// loaders scan it again on the next start. The argument is the full
+    /// registry key (`name@marketplace`) — a same-name install from another
+    /// marketplace keeps its own toggle.
+    pub fn enable(plugin_key: &str) -> Result<()> {
+        Self::require_installed(&InstalledPlugins::load()?, plugin_key)?;
+        SettingsPatch::set_enabled(plugin_key, true)
     }
 
     /// Disable an installed plugin: set `enabledPlugins[key] = false` so
     /// loaders stop scanning it on the next start. Files stay on disk — only
-    /// `uninstall` removes them.
-    pub fn disable(plugin_name: &str) -> Result<()> {
-        for key in Self::keys_for(plugin_name)? {
-            SettingsPatch::set_enabled(&key, false)?;
+    /// `uninstall` removes them. The argument is the full registry key
+    /// (`name@marketplace`); a same-name install from another marketplace
+    /// keeps its own toggle.
+    pub fn disable(plugin_key: &str) -> Result<()> {
+        Self::require_installed(&InstalledPlugins::load()?, plugin_key)?;
+        SettingsPatch::set_enabled(plugin_key, false)
+    }
+
+    /// The write-side identity gate: only a key the install registry
+    /// actually records may be toggled or removed. A typo'd or stale key
+    /// must fail loud — a silent no-op would leave the caller's UI showing
+    /// a state the disk never took.
+    fn require_installed(plugins: &InstalledPlugins, plugin_key: &str) -> Result<()> {
+        if !plugins.keys().iter().any(|key| key == plugin_key) {
+            bail!("plugin {plugin_key} is not installed");
         }
         Ok(())
     }
@@ -598,6 +619,7 @@ impl PluginManager {
             out.push(InstalledPluginRecord {
                 name: plugin.name.clone(),
                 marketplace: plugin.marketplace.clone(),
+                key: plugin.key.clone(),
                 root: plugin.root.clone(),
                 description: manifest
                     .as_ref()
@@ -612,23 +634,6 @@ impl PluginManager {
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
-    }
-
-    /// The registry keys whose name part is `plugin_name`; empty when the
-    /// plugin has no install registered, keeping the toggles free of names
-    /// with nothing behind them.
-    fn keys_for(plugin_name: &str) -> Result<Vec<String>> {
-        let plugins = InstalledPlugins::load()?;
-        let keys: Vec<String> = plugins
-            .keys()
-            .iter()
-            .filter(|key| key.rsplit_once('@').is_some_and(|(n, _)| n == plugin_name))
-            .cloned()
-            .collect();
-        if keys.is_empty() {
-            bail!("plugin {plugin_name} is not installed");
-        }
-        Ok(keys)
     }
 }
 
@@ -1724,17 +1729,18 @@ mod tests {
         assert_eq!(installed[0].marketplace, slug);
         assert_eq!(installed[0].root, root);
 
-        PluginManager::disable("gitwork").unwrap();
+        PluginManager::disable(&key).unwrap();
         assert!(PluginManager::installed().is_empty());
         let details = PluginManager::installed_details();
         assert_eq!(details.len(), 1);
         assert!(!details[0].enabled);
         assert_eq!(details[0].version.as_deref(), Some("3.0.0"));
+        assert_eq!(details[0].key, key);
 
-        PluginManager::enable("gitwork").unwrap();
+        PluginManager::enable(&key).unwrap();
         assert_eq!(PluginManager::installed().len(), 1);
 
-        PluginManager::uninstall("gitwork").unwrap();
+        PluginManager::uninstall(&key).unwrap();
         assert!(PluginManager::all_installed().is_empty());
         let registry = read_json(&paths::installed_plugins_file().unwrap())
             .unwrap()
@@ -2145,7 +2151,7 @@ mod tests {
         .unwrap();
         seed_toggles(&[("x@m", true)]);
 
-        PluginManager::uninstall("x").unwrap();
+        PluginManager::uninstall("x@m").unwrap();
 
         assert!(!user_tree.path().exists(), "the user tree goes");
         assert!(project_tree.path().exists(), "the project tree stays");
@@ -2164,9 +2170,81 @@ mod tests {
 
         // Uninstalling again with no user entry left is a no-op that keeps
         // the sibling bookkeeping.
-        PluginManager::uninstall("x").unwrap();
+        PluginManager::uninstall("x@m").unwrap();
         let registry = read_json(&registry_path).unwrap().unwrap();
         assert_eq!(registry["plugins"]["x@m"].as_array().unwrap().len(), 1);
+    }
+
+    /// The write side is key-scoped like the read side (#850): the same
+    /// plugin name installed from two marketplaces is two independent
+    /// installs, and toggling or removing one key must leave the sibling
+    /// key — its tree and its toggle — exactly where it was.
+    #[test]
+    fn writes_are_scoped_to_the_addressed_key() {
+        let _home = ClaudeHome::new();
+        let (_m1, url1, slug1) = seed_marketplace();
+        let (_m2, url2, slug2) = seed_marketplace();
+        PluginManager::add_marketplace(&url1).unwrap();
+        PluginManager::add_marketplace(&url2).unwrap();
+        let key1 = format!("gitwork@{slug1}");
+        let key2 = format!("gitwork@{slug2}");
+        PluginManager::install(&slug1, "gitwork").unwrap();
+        PluginManager::install(&slug2, "gitwork").unwrap();
+
+        PluginManager::disable(&key1).unwrap();
+        let installed: Vec<_> = PluginManager::installed()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
+        assert_eq!(
+            installed,
+            vec![key2.clone()],
+            "only the disabled key leaves the scan"
+        );
+        assert_eq!(enabled_toggles().get(&key1), Some(&false));
+        assert_eq!(
+            enabled_toggles().get(&key2),
+            Some(&true),
+            "the sibling keeps the enabled state install gave it"
+        );
+
+        PluginManager::enable(&key1).unwrap();
+        assert_eq!(enabled_toggles().get(&key1), Some(&true));
+
+        PluginManager::uninstall(&key1).unwrap();
+        let remaining: Vec<_> = PluginManager::all_installed()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![key2.clone()],
+            "only the addressed key is removed"
+        );
+        assert!(
+            !enabled_toggles().contains_key(&key1),
+            "the removed key's toggle goes with it"
+        );
+        assert_eq!(enabled_toggles().get(&key2), Some(&true));
+    }
+
+    /// A key the registry does not record must fail loud on every write —
+    /// a silent no-op would leave a UI showing a state the disk never took.
+    #[test]
+    fn writes_to_an_unknown_key_fail_loud() {
+        let _home = ClaudeHome::new();
+        seed_registry(&[]);
+        for write in [
+            (|k: &str| PluginManager::enable(k)) as fn(&str) -> Result<()>,
+            (|k: &str| PluginManager::disable(k)) as fn(&str) -> Result<()>,
+            (|k: &str| PluginManager::uninstall(k)) as fn(&str) -> Result<()>,
+        ] {
+            let err = write("ghost@nowhere").unwrap_err();
+            assert!(
+                err.to_string().contains("not installed"),
+                "the error names the miss: {err}"
+            );
+        }
     }
 
     /// Read-only probe of a real Claude Code installation: registry files,
