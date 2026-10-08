@@ -15,7 +15,7 @@ use crate::db::ThreadSummary;
 use crate::language_model::TokenUsage;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
 use crate::thread::PermissionMode;
-use manox_harness::types::Model as PiModel;
+use manox_harness::types::Model as HarnessModel;
 
 /// Commands a facade can issue to its harness backend, plus the backend's
 /// authoritative state the facade mirrors after a settled run.
@@ -93,7 +93,7 @@ pub trait ThreadEngine: Send + Sync {
     }
 
     /// The model the backend currently runs, if any.
-    fn model(&self) -> Option<PiModel>;
+    fn model(&self) -> Option<HarnessModel>;
 
     /// Start a turn with the given user text and attached images (base64
     /// blocks per the kernel's `ContentBlock::Image`). Events flow back
@@ -131,7 +131,7 @@ pub trait ThreadEngine: Send + Sync {
     fn abort_spawned_members(&self) {}
 
     /// Hot-swap the model for the next provider request.
-    fn set_model(&self, model: PiModel);
+    fn set_model(&self, model: HarnessModel);
 
     /// Map the reasoning effort onto the backend's thinking level.
     fn set_thinking_level(&self, level: Option<String>);

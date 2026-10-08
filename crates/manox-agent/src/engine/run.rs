@@ -21,7 +21,7 @@ pub(super) async fn drive_run<F>(
     live: Arc<Mutex<LiveTranscript>>,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     sessions_dir: &Path,
     session_path: &Path,
     appender: &Arc<JournalAppender>,
@@ -159,9 +159,9 @@ where
                     // model the fixed stream refuses leaves every mirror on
                     // the model the run still serves, and the model already in
                     // play is never re-queued.
-                    if *pi_model != new_model && handle.set_model(new_model.clone()) {
+                    if *harness_model != new_model && handle.set_model(new_model.clone()) {
                         *state.model.lock().unwrap() = Some(new_model.clone());
-                        *pi_model = new_model;
+                        *harness_model = new_model;
                     }
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {
@@ -474,7 +474,7 @@ pub(super) async fn chain_goal_rounds(
     live: Arc<Mutex<LiveTranscript>>,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     sessions_dir: &Path,
     cwd: &Path,
     session_path: &Path,
@@ -506,7 +506,7 @@ pub(super) async fn chain_goal_rounds(
             Arc::clone(&live),
             state,
             notice_tx,
-            pi_model,
+            harness_model,
             sessions_dir,
             session_path,
             &journal_appender,
@@ -562,7 +562,7 @@ pub(super) async fn resume_steering_queue(
     live: Arc<Mutex<LiveTranscript>>,
     state: &Arc<EngineState>,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     sessions_dir: &Path,
     cwd: &Path,
 ) {
@@ -588,7 +588,7 @@ pub(super) async fn resume_steering_queue(
             Arc::clone(&live),
             state,
             notice_tx,
-            pi_model,
+            harness_model,
             sessions_dir,
             &active_session_path,
             &journal_appender,
@@ -627,7 +627,7 @@ pub(super) async fn resume_steering_queue(
             Arc::clone(&live),
             state,
             notice_tx,
-            pi_model,
+            harness_model,
             sessions_dir,
             cwd,
             &active_session_path,

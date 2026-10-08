@@ -312,7 +312,7 @@ pub(super) fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: Option<&PiModel>,
+    model: Option<&HarnessModel>,
     gate: &Arc<ApprovalGate>,
     question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
@@ -397,11 +397,11 @@ pub(super) fn session_builder(
 /// scheduler all see the restored choice.
 pub(super) fn adopt_session_model(
     session: &AgentSession,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     state: &EngineState,
 ) {
     let restored = session.model().clone();
-    *pi_model = restored.clone();
+    *harness_model = restored.clone();
     *state.model.lock().unwrap() = Some(restored);
 }
 
@@ -495,7 +495,7 @@ pub(super) async fn rebuild_session(
     path: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     state: &EngineState,
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -552,7 +552,7 @@ pub(super) async fn rebuild_session(
             // never attach (write confinement is now in ApprovalGatedTool).
             attach_plugin_hooks(&mut s, &cwd);
             attach_prefix_gate(&mut s, notice_tx, thread_id);
-            adopt_session_model(&s, pi_model, state);
+            adopt_session_model(&s, harness_model, state);
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.
             spawn_journal_relay(session, &state.journal_tx);

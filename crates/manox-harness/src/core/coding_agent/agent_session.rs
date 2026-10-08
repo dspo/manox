@@ -3103,11 +3103,4 @@ mod tests {
         assert!(!*later_ran.lock().unwrap(), "handled stops the chain");
     }
 
-    fn test_thinking_model() -> Model {
-        Model {
-            thinking: crate::types::ThinkingKind::Enabled,
-            ..test_model()
-        }
-    }
-
 }

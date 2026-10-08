@@ -1,6 +1,6 @@
 //! Pi `AgentTool` adapter wrapping a remote MCP tool.
 //!
-//! Each `PiMcpTool` holds the server name, the rmcp `Tool` definition, and a
+//! Each `McpTool` holds the server name, the rmcp `Tool` definition, and a
 //! clonable handle to the running rmcp client service. `execute` calls
 //! `tools/call` natively on the tokio runtime (harness tools already run there —
 //! no executor bridge needed, unlike the retired manox adapter).
@@ -40,7 +40,7 @@ pub fn bridged_tool_name(server: &str, tool: &str) -> String {
     )
 }
 
-pub struct PiMcpTool {
+pub struct McpTool {
     /// Cached `mcp__<server>__<tool>` id; returned by `name()` without leaking.
     name: String,
     /// Cached description (empty string when the server gave none).
@@ -49,7 +49,7 @@ pub struct PiMcpTool {
     client: McpClientHandle,
 }
 
-impl PiMcpTool {
+impl McpTool {
     pub fn new(server_name: String, tool: rmcp::model::Tool, client: McpClientHandle) -> Self {
         let name = bridged_tool_name(&server_name, &tool.name);
         let description = tool
@@ -67,7 +67,7 @@ impl PiMcpTool {
 }
 
 #[async_trait::async_trait]
-impl AgentTool for PiMcpTool {
+impl AgentTool for McpTool {
     fn name(&self) -> &str {
         &self.name
     }

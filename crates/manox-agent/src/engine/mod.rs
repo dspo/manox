@@ -2,7 +2,7 @@
 //! tokio actor and adapts its events onto the UI's `ThreadEvent` language.
 //!
 //! This is the first-class harness backend behind the `Thread` facade: the
-//! facade holds an `Arc<dyn ThreadEngine>` (this `PiEngine`), spawns the
+//! facade holds an `Arc<dyn ThreadEngine>` (this `Engine`), spawns the
 //! actor, and drains `BackendNotice`s on the gpui thread. Pure mappings
 //! between kernel wire types and the UI language live here (adapt), so the
 //! facade only ever sees `Message` / `ThreadEvent`.
@@ -21,8 +21,8 @@ use manox_harness::ext_point_agent::AgentRegistry;
 use manox_harness::monitor::{MonitorManager, MonitorTool};
 use manox_harness::subagent::spawn::register_defaults;
 use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
-use manox_harness::tool::AgentTool as PiAgentTool;
-use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as PiModel};
+use manox_harness::tool::AgentTool as HarnessAgentTool;
+use manox_harness::types::{AgentEvent, AgentMessage, ContentBlock, Model as HarnessModel};
 use manox_harness::{BackgroundRegistry, BashOutputTool};
 use tokio::sync::mpsc;
 
@@ -31,7 +31,7 @@ use crate::db::{HistoryEntry, PositionedNote, ThreadSummary, UI_NOTE_CUSTOM_TYPE
 use crate::language_model::{MessageContent, ReasoningEffort, TokenUsage};
 use crate::message::Message;
 use crate::permission::{PendingAuthMeta, ToolAuthorizationResponse};
-use crate::questions::PiAskUserQuestionTool;
+use crate::questions::AskUserQuestionTool;
 use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine, send_notice};
 
@@ -88,7 +88,7 @@ pub(crate) enum SessionCmd {
     /// Abort the running turn.
     Abort,
     /// Hot-swap the model for the next provider request.
-    SetModel(PiModel),
+    SetModel(HarnessModel),
     /// Map the reasoning effort onto the harness's thinking level.
     SetThinkingLevel(Option<String>),
     /// Switch the permission mode and persist it in the session sidecar.
@@ -272,7 +272,7 @@ struct EngineState {
     per_model_cost: Mutex<HashMap<String, f64>>,
     /// The actor's working model; `SetModel` mirrors here so session
     /// builds always read the latest choice.
-    model: Arc<Mutex<Option<PiModel>>>,
+    model: Arc<Mutex<Option<HarnessModel>>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
@@ -356,13 +356,13 @@ struct LiveTranscript {
 }
 
 /// The harness backend behind the `Thread` facade.
-pub struct PiEngine {
+pub struct Engine {
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     state: Arc<EngineState>,
     bus: Arc<crate::steer_bus::AgentBus>,
 }
 
-impl PiEngine {
+impl Engine {
     /// Multi-root grant: approve an extra working directory into the
     /// session's shared granted-root set (the fs fence + seatbelt widen
     /// through the shared Arc, pre- or post-materialize).
@@ -386,7 +386,7 @@ impl PiEngine {
 #[allow(clippy::too_many_arguments)] // engine spawn: startup options stay explicit
 pub fn spawn_engine(
     cwd: PathBuf,
-    model: Option<PiModel>,
+    model: Option<HarnessModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
     fresh: bool,
@@ -530,7 +530,7 @@ pub fn spawn_engine(
         spawn_history_preview(path, Arc::clone(&state), notice_tx);
     }
     SpawnedEngine {
-        engine: Arc::new(PiEngine { cmd_tx, state, bus }),
+        engine: Arc::new(Engine { cmd_tx, state, bus }),
         events: notice_rx,
         restore_ready: restore_ready_rx,
     }
@@ -593,12 +593,12 @@ fn spawn_history_preview(
     });
 }
 
-impl ThreadEngine for PiEngine {
+impl ThreadEngine for Engine {
     fn grant_working_directory(&self, dir: PathBuf) {
-        PiEngine::grant_working_directory(self, dir);
+        Engine::grant_working_directory(self, dir);
     }
     fn granted_working_directories(&self) -> Vec<PathBuf> {
-        PiEngine::granted_working_directories(self)
+        Engine::granted_working_directories(self)
     }
     fn run_with_origin(
         &self,
@@ -696,7 +696,7 @@ impl ThreadEngine for PiEngine {
         rx
     }
 
-    fn model(&self) -> Option<PiModel> {
+    fn model(&self) -> Option<HarnessModel> {
         self.state.model.lock().unwrap().clone()
     }
 
@@ -743,7 +743,7 @@ impl ThreadEngine for PiEngine {
         self.bus.abort_all_members();
     }
 
-    fn set_model(&self, model: PiModel) {
+    fn set_model(&self, model: HarnessModel) {
         let _ = self.cmd_tx.send(SessionCmd::SetModel(model));
     }
 
@@ -849,7 +849,7 @@ impl ThreadEngine for PiEngine {
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
-    model: Option<PiModel>,
+    model: Option<HarnessModel>,
     sessions_dir: PathBuf,
     initial_path: Option<PathBuf>,
     fresh: bool,
@@ -878,7 +878,7 @@ async fn run_actor(
     if let Some(bridge) = &state.goal_bridge {
         bridge.set_sender(notice_tx.clone());
     }
-    let Some(mut pi_model) = model.or_else(crate::provider_glue::default_model) else {
+    let Some(mut harness_model) = model.or_else(crate::provider_glue::default_model) else {
         // Retire and land whatever was queued before the exit, exactly as the
         // command loop's own shutdown does. An early return that skipped this
         // left the route registered with a live sender, so a store dispatch
@@ -981,7 +981,7 @@ async fn run_actor(
                 attach_plan_hooks(&mut s, &state.plan, &tool_cwd, read_only_subagent);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
-                adopt_session_model(&s, &mut pi_model, &state);
+                adopt_session_model(&s, &mut harness_model, &state);
                 restored = true;
                 // The restored file is the thread's active session.
                 crate::thread_registry::set_active(&thread_id, &header.id).await;
@@ -999,7 +999,7 @@ async fn run_actor(
                 &cwd,
                 &sessions_dir,
                 &runtime,
-                Some(&pi_model),
+                Some(&harness_model),
                 &state.gate,
                 &state.question_gate,
                 &state.plan,
@@ -1029,7 +1029,7 @@ async fn run_actor(
                     let registered = registry.provider_names();
                     tracing::error!(
                         error = %err,
-                        model_provider = %pi_model.provider,
+                        model_provider = %harness_model.provider,
                         registered = ?registered,
                         "session build failed"
                     );
@@ -1168,7 +1168,7 @@ async fn run_actor(
         &notice_tx,
         BackendNotice::Ready(Box::new(ReadyInfo {
             restored,
-            model: Some(pi_model.clone()),
+            model: Some(harness_model.clone()),
             permission_mode,
             reasoning_effort,
             browser_suites,
@@ -1277,7 +1277,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &cwd,
                 )
@@ -1363,7 +1363,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &active_session_path,
                     &journal_appender,
@@ -1396,7 +1396,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &cwd,
                     &active_session_path,
@@ -1419,7 +1419,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &cwd,
                 )
@@ -1447,7 +1447,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &cwd,
                 )
@@ -1473,13 +1473,13 @@ async fn run_actor(
                 // leaves the actor on the model the session still runs, and
                 // the model already in play never appends a second
                 // `model_change` entry.
-                if pi_model != new_model {
+                if harness_model != new_model {
                     if let Err(err) = session.set_model(new_model.clone()).await {
                         tracing::warn!("set_model failed: {err}");
                     } else {
                         // Keep the actor's working model in sync: Open/NewSession
                         // below build sessions with it.
-                        pi_model = new_model.clone();
+                        harness_model = new_model.clone();
                         *state.model.lock().unwrap() = Some(new_model);
                     }
                 }
@@ -1658,7 +1658,7 @@ async fn run_actor(
                         Arc::clone(&live_mirror),
                         &state,
                         &notice_tx,
-                        &mut pi_model,
+                        &mut harness_model,
                         &sessions_dir,
                         &cwd,
                         &active_session_path,
@@ -1727,7 +1727,7 @@ async fn run_actor(
                     Arc::clone(&live_mirror),
                     &state,
                     &notice_tx,
-                    &mut pi_model,
+                    &mut harness_model,
                     &sessions_dir,
                     &active_session_path,
                     &journal_appender,
@@ -1800,7 +1800,7 @@ async fn run_actor(
                     &path,
                     &sessions_dir,
                     &runtime,
-                    &mut pi_model,
+                    &mut harness_model,
                     &state,
                     &cwd,
                     &notice_tx,
@@ -1961,7 +1961,7 @@ struct PersistedTitleScheduler {
 struct TitleScheduler {
     state: Arc<Mutex<TitleSchedulerState>>,
     runtime: ModelRuntime,
-    model: Arc<Mutex<Option<PiModel>>>,
+    model: Arc<Mutex<Option<HarnessModel>>>,
     live: Arc<Mutex<LiveTranscript>>,
     goal: Option<Arc<crate::goal_tools::GoalBridge>>,
     plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -1974,7 +1974,7 @@ impl TitleScheduler {
     #[allow(clippy::too_many_arguments)]
     fn new(
         runtime: ModelRuntime,
-        model: Arc<Mutex<Option<PiModel>>>,
+        model: Arc<Mutex<Option<HarnessModel>>>,
         live: Arc<Mutex<LiveTranscript>>,
         goal: Option<Arc<crate::goal_tools::GoalBridge>>,
         plan: Arc<crate::plan_mode::PlanSessionState>,
@@ -2162,7 +2162,7 @@ mod title_scheduler_tests {
         // the non-reentrant std mutex when a terminate tool ended the turn.
         let (tx, _rx) = mpsc::unbounded_channel::<SessionCmd>();
         let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(
-            |_model: &PiModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
+            |_model: &HarnessModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
                 Err(anyhow::anyhow!("unused in this test"))
             },
         );

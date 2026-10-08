@@ -3,14 +3,14 @@ use crate::language_model::{
     LanguageModelToolResult, LanguageModelToolUse, StopReason as ManoxStopReason,
 };
 use crate::thread::ToolCallStatus;
-use manox_harness::types::StopReason as PiStopReason;
+use manox_harness::types::StopReason as StopReason;
 
 /// Map one kernel `AgentEvent` onto the `ThreadEvent`s the workspace renders.
 ///
 /// Events with no UI counterpart (run/turn lifecycle handled by the facade,
 /// message boundaries, block start/end markers) map to nothing.
 /// `ToolCallAuthorization` never comes from this mapping — the permission
-/// gate (`pi_approval`) emits it directly while parked on a user answer.
+/// gate (`approval`) emits it directly while parked on a user answer.
 /// `Plan*` and sub-agent events remain manox-only and are never produced.
 pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     match event {
@@ -32,7 +32,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             _ => Vec::new(),
         },
         AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
-            Some(PiStopReason::Error) => {
+            Some(StopReason::Error) => {
                 vec![ThreadEvent::Error(anyhow::anyhow!(
                     "{}",
                     message_error_text(message)
@@ -149,13 +149,13 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
                         *text = crate::proposed_plan::strip_proposed_plan_blocks(text);
                     }
                 }
-                if matches!(stop_reason, Some(PiStopReason::Error)) {
+                if matches!(stop_reason, Some(StopReason::Error)) {
                     blocks.push(MessageContent::Text(format!(
                         "[turn failed: {}]",
                         error_message.as_deref().unwrap_or("unknown error")
                     )));
                 }
-                if matches!(stop_reason, Some(PiStopReason::Aborted)) {
+                if matches!(stop_reason, Some(StopReason::Aborted)) {
                     blocks.push(MessageContent::Text("[turn aborted]".to_string()));
                 }
                 out.push(Message::assistant(blocks));
@@ -303,7 +303,7 @@ fn text_of_blocks(blocks: &[ContentBlock]) -> String {
     out
 }
 
-fn message_stop_reason(message: &AgentMessage) -> Option<PiStopReason> {
+fn message_stop_reason(message: &AgentMessage) -> Option<StopReason> {
     match message {
         AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
         _ => None,
@@ -321,13 +321,13 @@ fn message_error_text(message: &AgentMessage) -> String {
 
 /// Map a stop reason onto the manox shape. `Error` never routes through
 /// this helper: callers surface it as an `Error` event instead of a stop.
-fn manox_stop_reason_of(reason: &PiStopReason) -> ManoxStopReason {
+fn manox_stop_reason_of(reason: &StopReason) -> ManoxStopReason {
     match reason {
-        PiStopReason::Stop => ManoxStopReason::EndTurn,
-        PiStopReason::Length => ManoxStopReason::MaxTokens,
-        PiStopReason::ToolUse => ManoxStopReason::ToolUse,
-        PiStopReason::Aborted => ManoxStopReason::Cancelled,
-        PiStopReason::Error => ManoxStopReason::EndTurn,
+        StopReason::Stop => ManoxStopReason::EndTurn,
+        StopReason::Length => ManoxStopReason::MaxTokens,
+        StopReason::ToolUse => ManoxStopReason::ToolUse,
+        StopReason::Aborted => ManoxStopReason::Cancelled,
+        StopReason::Error => ManoxStopReason::EndTurn,
     }
 }
 
@@ -594,7 +594,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
         // mirrors the main thread's `MessageEnd` mapping; the message usage
         // rides along so the panel can stamp the just-finished reply.
         AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
-            Some(PiStopReason::Error) => vec![ThreadEvent::SubagentChild {
+            Some(StopReason::Error) => vec![ThreadEvent::SubagentChild {
                 id: id.to_string(),
                 child: crate::thread::SubagentChildEvent::Error(message_error_text(message)),
             }],

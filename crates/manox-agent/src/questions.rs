@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use manox_harness::tool::{AgentTool as PiAgentTool, AgentToolResult, ToolContext, ToolError};
+use manox_harness::tool::{AgentTool as HarnessAgentTool, AgentToolResult, ToolContext, ToolError};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -254,7 +254,7 @@ impl UserQuestionGate {
 /// back through [`UserQuestionGate`], short-circuited into a `ToolResult`
 /// without any execution. Read-only by contract: permission modes never touch
 /// it.
-pub struct PiAskUserQuestionTool {
+pub struct AskUserQuestionTool {
     gate: Arc<UserQuestionGate>,
     /// Live plan-mode flag, so a dismissed question card can tell the model
     /// to *stay in plan mode* when the user closes it mid-planning (the
@@ -264,7 +264,7 @@ pub struct PiAskUserQuestionTool {
     plan: Option<Arc<crate::plan_mode::PlanSessionState>>,
 }
 
-impl PiAskUserQuestionTool {
+impl AskUserQuestionTool {
     pub fn new(gate: Arc<UserQuestionGate>) -> Self {
         Self { gate, plan: None }
     }
@@ -281,7 +281,7 @@ impl PiAskUserQuestionTool {
 }
 
 #[async_trait::async_trait]
-impl PiAgentTool for PiAskUserQuestionTool {
+impl HarnessAgentTool for AskUserQuestionTool {
     fn name(&self) -> &str {
         crate::tools::ASK_USER_QUESTION
     }
@@ -952,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn ask_success_result_is_the_canonical_json_line() {
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({
             "questions": [{
@@ -1000,7 +1000,7 @@ mod tests {
     #[tokio::test]
     async fn ask_expired_adjudication_answers_no_answer() {
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({
             "questions": [{
@@ -1055,7 +1055,7 @@ mod tests {
 
     /// Drive the ask tool and settle its parked card with `response`.
     async fn run_ask_settled(
-        tool: &PiAskUserQuestionTool,
+        tool: &AskUserQuestionTool,
         gate: &Arc<UserQuestionGate>,
         ctx: &LocalToolContext,
         outcome: AskOutcome,
@@ -1084,7 +1084,7 @@ mod tests {
     #[tokio::test]
     async fn ask_dismissed_outside_plan_mode_waits_for_message() {
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!result.is_error, "a dismissal is guidance, not an error");
@@ -1110,7 +1110,7 @@ mod tests {
         let (gate, _rx) = gate_with_events();
         let plan = crate::plan_mode::PlanSessionState::new();
         plan.set(true, None);
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
         let ctx = tool_ctx();
         let result = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!result.is_error);
@@ -1127,7 +1127,7 @@ mod tests {
     #[tokio::test]
     async fn ask_mints_id_on_the_card_and_routes_the_answer_by_id() {
         let (gate, mut notices) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let settle = {
             let gate = Arc::clone(&gate);
@@ -1199,7 +1199,7 @@ mod tests {
     async fn ask_from_delegated_gate_is_rejected_as_delegated_caller() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let gate = Arc::new(UserQuestionGate::new(tx).with_delegated(true));
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = tool
             .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
@@ -1229,7 +1229,7 @@ mod tests {
     #[test]
     fn ask_surface_bytes_are_frozen() {
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(gate);
+        let tool = AskUserQuestionTool::new(gate);
         assert_eq!(
             tool.description(),
             "Ask the user clarifying questions when multiple valid approaches exist \
@@ -1256,7 +1256,7 @@ mod tests {
     #[tokio::test]
     async fn ask_result_bytes_are_frozen() {
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let params = serde_json::json!({
             "questions": [{
@@ -1296,7 +1296,7 @@ mod tests {
         );
 
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let expired = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Expired).await;
         assert!(expired.is_error);
         assert_eq!(
@@ -1308,7 +1308,7 @@ mod tests {
         );
 
         let (gate, _rx) = gate_with_events();
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let dismissed = run_ask_settled(&tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert!(!dismissed.is_error);
         assert_eq!(
@@ -1320,7 +1320,7 @@ mod tests {
         let (gate, _rx) = gate_with_events();
         let plan = crate::plan_mode::PlanSessionState::new();
         plan.set(true, None);
-        let plan_tool = PiAskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
+        let plan_tool = AskUserQuestionTool::new(Arc::clone(&gate)).with_plan_state(plan);
         let dismissed_in_plan =
             run_ask_settled(&plan_tool, &gate, &ctx, AskOutcome::Dismissed).await;
         assert_eq!(
@@ -1331,7 +1331,7 @@ mod tests {
 
         let (tx, _rx) = mpsc::unbounded_channel();
         let delegated_gate = Arc::new(UserQuestionGate::new(tx).with_delegated(true));
-        let delegated = PiAskUserQuestionTool::new(delegated_gate);
+        let delegated = AskUserQuestionTool::new(delegated_gate);
         let refused = delegated
             .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
             .await
@@ -1403,7 +1403,7 @@ mod tests {
             seen_question: std::sync::Mutex::new(None),
         });
         gate.register_answerer(Arc::clone(&claimer) as Arc<dyn UserQuestionAnswerer>);
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let result = tool
             .execute("ask-1", ask_params(), CancellationToken::new(), &ctx)
@@ -1436,7 +1436,7 @@ mod tests {
     async fn composed_answerer_delegation_falls_through_to_the_wire() {
         let (gate, _rx) = gate_with_events();
         gate.register_answerer(Arc::new(DelegatingAnswerer) as Arc<dyn UserQuestionAnswerer>);
-        let tool = PiAskUserQuestionTool::new(Arc::clone(&gate));
+        let tool = AskUserQuestionTool::new(Arc::clone(&gate));
         let ctx = tool_ctx();
         let settle = {
             let gate = Arc::clone(&gate);

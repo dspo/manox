@@ -7,8 +7,8 @@ use super::*;
 fn default_active_tool_names_excludes_browser_suites() {
     // The default active set keeps every non-browser tool and drops both
     // opt-in suites, so browser tools never ride the default system prompt.
-    let tools: Vec<Arc<dyn PiAgentTool>> = vec![
-        Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn PiAgentTool>,
+    let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
+        Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn HarnessAgentTool>,
         Arc::new(crate::web_tools::WebExploreOpenTool::new(
             tokio::sync::mpsc::unbounded_channel().0,
         )),
@@ -386,7 +386,7 @@ async fn permission_mode_write_preserves_other_sidecar_fields() {
 async fn steer_test_session(dir: &tempfile::TempDir) -> AgentSession {
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
         Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     create_agent_session()
@@ -453,7 +453,7 @@ async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     // The between-runs `Steer` arm: enqueue under the client id (S3/S4) and
     // remember the id for the settle confirmation.
@@ -473,7 +473,7 @@ async fn idle_steer_starts_its_own_run_and_lands_the_client_row_id() {
         Arc::clone(&live),
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_dir,
         &cwd,
     )
@@ -555,7 +555,7 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     // A steer lands in the run's final moments: still in the queue after
     // the settle point.
@@ -577,7 +577,7 @@ async fn settle_drains_a_steer_left_queued_at_run_end() {
         Arc::clone(&live),
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_dir,
         &cwd,
     )
@@ -853,7 +853,7 @@ async fn retried_steer_injects_once_after_abort() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     // Run 1 queues a steer, then aborts before draining it.
     let aborted_id = "aborted-then-retracted".to_string();
@@ -889,7 +889,7 @@ async fn retried_steer_injects_once_after_abort() {
         Arc::clone(&live),
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_dir,
         &cwd,
     )
@@ -1453,8 +1453,8 @@ impl manox_harness::tool::AgentTool for EchoTool {
     }
 }
 
-fn test_model_switched() -> PiModel {
-    PiModel {
+fn test_model_switched() -> HarnessModel {
+    HarnessModel {
         provider: "test".into(),
         api: "test".into(),
         id: "new".into(),
@@ -1477,7 +1477,7 @@ async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     std::fs::create_dir_all(&cwd).unwrap();
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
         Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -1496,7 +1496,7 @@ async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
@@ -1515,7 +1515,7 @@ async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
         live,
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -1537,8 +1537,8 @@ async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
     assert!(announced, "the commit announces the switch");
 }
 
-fn test_model() -> PiModel {
-    PiModel {
+fn test_model() -> HarnessModel {
+    HarnessModel {
         provider: "test".into(),
         api: "test".into(),
         id: "test".into(),
@@ -1570,7 +1570,7 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         release2: Arc::new(tokio::sync::Notify::new()),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let runtime = ModelRuntime::new(resolver);
@@ -1594,7 +1594,7 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
@@ -1609,7 +1609,7 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         live,
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -1653,7 +1653,7 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
         "the turn after the mid-run switch must stream under the new model"
     );
     assert_eq!(
-        pi_model.id, "new",
+        harness_model.id, "new",
         "the actor's working model follows the switch"
     );
     // The session attributes the switched turn's usage to the new model:
@@ -1818,7 +1818,7 @@ async fn parallel_tool_rounds_land_every_result() {
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
 
@@ -1862,7 +1862,7 @@ async fn parallel_tool_rounds_land_every_result() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
@@ -1877,7 +1877,7 @@ async fn parallel_tool_rounds_land_every_result() {
         live,
         &state,
         &facade_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -2008,7 +2008,7 @@ async fn mid_run_journal_append_lands_immediately() {
         release: Arc::new(tokio::sync::Notify::new()),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
 
@@ -2028,7 +2028,7 @@ async fn mid_run_journal_append_lands_immediately() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
@@ -2043,7 +2043,7 @@ async fn mid_run_journal_append_lands_immediately() {
         live,
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -2197,7 +2197,7 @@ async fn ui_note_permanent_append_failure_fails_loud() {
             Err(anyhow::anyhow!("the k9 probe never streams"))
         }
     }
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
         Ok(Arc::new(K9IdleStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let session = create_agent_session()
@@ -2313,7 +2313,7 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
         release: Arc::new(tokio::sync::Notify::new()),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
 
@@ -2360,7 +2360,7 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
     let active_session_path = session.path().clone();
@@ -2376,7 +2376,7 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
         live,
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -2596,7 +2596,7 @@ struct K5Rig {
     live: Arc<Mutex<LiveTranscript>>,
     run_steers: Vec<String>,
     shutdown_after_run: bool,
-    pi_model: PiModel,
+    harness_model: HarnessModel,
     handle: manox_harness::harness::HarnessHandle,
     sessions_path: PathBuf,
     active_session_path: PathBuf,
@@ -2615,7 +2615,7 @@ impl K5Rig {
             live: Arc::new(Mutex::new(LiveTranscript::default())),
             run_steers: Vec::new(),
             shutdown_after_run: false,
-            pi_model: test_model(),
+            harness_model: test_model(),
             handle: session.handle(),
             sessions_path: dir.path().join("sessions"),
             active_session_path: session.path().clone(),
@@ -2640,7 +2640,7 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -2692,7 +2692,7 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
         Arc::clone(&rig.live),
         &rig.state,
         &rig.notice_tx,
-        &mut rig.pi_model,
+        &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
         &rig.journal_appender,
@@ -2744,7 +2744,7 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
         release: Arc::new(tokio::sync::Notify::new()),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -2789,7 +2789,7 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
             Arc::clone(&rig.live),
             &rig.state,
             &rig.notice_tx,
-            &mut rig.pi_model,
+            &mut rig.harness_model,
             &rig.sessions_path,
             &rig.active_session_path,
             &rig.journal_appender,
@@ -2843,7 +2843,7 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -2883,7 +2883,7 @@ async fn queued_submit_persists_at_drain_before_the_run() {
         Arc::clone(&rig.live),
         &rig.state,
         &rig.notice_tx,
-        &mut rig.pi_model,
+        &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
         &rig.journal_appender,
@@ -2931,7 +2931,7 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -2973,7 +2973,7 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
         Arc::clone(&rig.live),
         &rig.state,
         &rig.notice_tx,
-        &mut rig.pi_model,
+        &mut rig.harness_model,
         &rig.sessions_path,
         &rig.active_session_path,
         &rig.journal_appender,
@@ -3031,7 +3031,7 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
         release2: Arc::new(tokio::sync::Notify::new()),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let runtime = ModelRuntime::new(resolver);
@@ -3055,7 +3055,7 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     let live = Arc::new(Mutex::new(LiveTranscript::default()));
     let mut run_steers = Vec::new();
     let mut shutdown_after_run = false;
-    let mut pi_model = test_model();
+    let mut harness_model = test_model();
 
     let handle = session.handle();
     let sessions_path = dir.path().join("sessions");
@@ -3070,7 +3070,7 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
         live,
         &state,
         &notice_tx,
-        &mut pi_model,
+        &mut harness_model,
         &sessions_path,
         &active_session_path,
         &journal_appender,
@@ -3181,7 +3181,7 @@ impl manox_harness::agent_loop::StreamFn for StaticStream {
 struct TestModelCatalog;
 
 impl manox_harness::coding_agent::model_runtime::ModelCatalog for TestModelCatalog {
-    fn resolve(&self, provider: &str, model_id: &str) -> Option<PiModel> {
+    fn resolve(&self, provider: &str, model_id: &str) -> Option<HarnessModel> {
         match (provider, model_id) {
             ("test", "test") => Some(test_model()),
             ("test", "new") => Some(test_model_switched()),
@@ -3204,7 +3204,7 @@ async fn reopened_session_restores_its_own_model() {
     let sessions = dir.path().join("sessions");
     tokio::fs::create_dir_all(&sessions).await.unwrap();
 
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
         Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let runtime = ModelRuntime::new(resolver).with_catalog(Arc::new(TestModelCatalog));
@@ -3252,10 +3252,10 @@ async fn reopened_session_restores_its_own_model() {
     );
 
     let state = test_engine_state();
-    let mut pi_model = test_model();
-    adopt_session_model(&reopened, &mut pi_model, &state);
+    let mut harness_model = test_model();
+    adopt_session_model(&reopened, &mut harness_model, &state);
     assert_eq!(
-        pi_model.id, "new",
+        harness_model.id, "new",
         "the actor's working model follows the restored session"
     );
     assert_eq!(
@@ -3621,7 +3621,7 @@ async fn subagent_session_persists_under_host_dir_with_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &HarnessModel| {
         Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let runtime = ModelRuntime::new(resolver);
@@ -3780,7 +3780,7 @@ async fn prompt_pin_carries_the_expanded_text() {
         rounds: 0,
         call: std::sync::atomic::AtomicUsize::new(0),
     });
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let resources = manox_harness::harness::HarnessResources {
@@ -3908,7 +3908,7 @@ async fn journal_replay_is_consistent_across_disk_reload() {
         call: std::sync::atomic::AtomicUsize::new(0),
     });
     let resolver_for = |stream: Arc<ToolRoundsStream>| {
-        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+        let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
             Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
         });
         resolver
@@ -4171,7 +4171,7 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
         rounds: 0,
         call: std::sync::atomic::AtomicUsize::new(0),
     });
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let session = create_agent_session()
@@ -4339,7 +4339,7 @@ async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them
         rounds: 0,
         call: std::sync::atomic::AtomicUsize::new(0),
     });
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let session = create_agent_session()
@@ -4430,7 +4430,7 @@ async fn decision_rig_session(dir: &tempfile::TempDir) -> AgentSession {
         rounds: 0,
         call: std::sync::atomic::AtomicUsize::new(0),
     });
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     create_agent_session()
@@ -4650,7 +4650,7 @@ async fn set_permission_mode_writes_the_gate_before_the_actor_drains() {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
     let (notice_tx, _notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
     let bus = crate::steer_bus::AgentBus::new("test-thread".into(), notice_tx);
-    let engine = PiEngine {
+    let engine = Engine {
         cmd_tx,
         state: Arc::clone(&state),
         bus,
@@ -4904,7 +4904,7 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
         advertised: Arc::clone(&advertised),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()
@@ -4996,7 +4996,7 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
         advertised: Arc::clone(&advertised),
     });
     let stream_for_resolver = Arc::clone(&stream);
-    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &PiModel| {
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(move |_m: &HarnessModel| {
         Ok(Arc::clone(&stream_for_resolver) as Arc<dyn manox_harness::agent_loop::StreamFn>)
     });
     let mut session = create_agent_session()

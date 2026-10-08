@@ -23,7 +23,7 @@ use crate::goal_tools::GoalBridge;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
-use manox_harness::types::Model as PiModel;
+use manox_harness::types::Model as HarnessModel;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone, Default)]
@@ -329,7 +329,7 @@ pub struct Thread {
     /// engine's granted-root set at spawn (multi-working-dirs).
     extra_working_dirs: Vec<PathBuf>,
     project: Option<PathBuf>,
-    model: Option<PiModel>,
+    model: Option<HarnessModel>,
     permission_mode: PermissionMode,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
@@ -1502,7 +1502,7 @@ impl Thread {
         self.project.as_ref()
     }
 
-    pub fn model(&self) -> Option<&PiModel> {
+    pub fn model(&self) -> Option<&HarnessModel> {
         self.model.as_ref()
     }
 
@@ -2169,7 +2169,7 @@ impl Thread {
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.
-    pub fn set_model(&mut self, model: PiModel) {
+    pub fn set_model(&mut self, model: HarnessModel) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
@@ -2762,7 +2762,7 @@ pub(crate) mod tests {
             HashMap::new()
         }
 
-        fn model(&self) -> Option<PiModel> {
+        fn model(&self) -> Option<HarnessModel> {
             None
         }
 
@@ -2788,7 +2788,7 @@ pub(crate) mod tests {
             self.abort_calls.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn set_model(&self, _model: PiModel) {}
+        fn set_model(&self, _model: HarnessModel) {}
 
         fn set_thinking_level(&self, level: Option<String>) {
             *self.thinking_level.lock().unwrap() = level;
@@ -3754,8 +3754,8 @@ pub(crate) mod tests {
     }
 
     /// A model identity for facade tests.
-    fn facade_model(id: &str) -> PiModel {
-        PiModel {
+    fn facade_model(id: &str) -> HarnessModel {
+        HarnessModel {
             provider: "test".into(),
             api: "anthropic".into(),
             id: id.into(),
@@ -3766,7 +3766,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn ready_with_model(model: Option<PiModel>) -> BackendNotice {
+    fn ready_with_model(model: Option<HarnessModel>) -> BackendNotice {
         BackendNotice::Ready(Box::new(ReadyInfo {
             goal: None,
             restored: false,
