@@ -125,7 +125,7 @@ mod tests {
         let skills = vec![Skill {
             name: "review".into(),
             description: "review the diff".into(),
-            location: "/proj/.pi/skills/review.md".into(),
+            location: "/proj/skills/review.md".into(),
             content: "Check the diff.".into(),
         }];
         let tools = vec!["Read".to_string(), "Bash".to_string()];
@@ -144,7 +144,7 @@ mod tests {
             "<project_instructions path=\"/proj/CLAUDE.md\">\nKeep changes minimal.\n</project_instructions>"
         ));
         assert!(prompt.contains(
-            "<skill name=\"review\">\n<description>review the diff</description>\n<path>/proj/.pi/skills/review.md</path>\n</skill>"
+            "<skill name=\"review\">\n<description>review the diff</description>\n<path>/proj/skills/review.md</path>\n</skill>"
         ));
         assert!(prompt.contains("Be concise in your responses"));
     }
@@ -154,7 +154,7 @@ mod tests {
         let skills = vec![Skill {
             name: "review".into(),
             description: String::new(),
-            location: "/proj/.pi/skills/review.md".into(),
+            location: "/proj/skills/review.md".into(),
             content: "x".into(),
         }];
         // No read tool: skills are hidden — they cannot be referenced.

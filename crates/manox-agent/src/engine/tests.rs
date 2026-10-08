@@ -392,7 +392,6 @@ async fn steer_test_session(dir: &tempfile::TempDir) -> AgentSession {
     create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -1484,7 +1483,6 @@ async fn drive_run_commits_a_pending_plan_mode_selection_before_the_run() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -1580,7 +1578,6 @@ async fn mid_run_model_switch_applies_to_next_turn_and_stats() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(runtime)
         .with_model(test_model())
         .with_tools(vec![
@@ -1828,7 +1825,6 @@ async fn parallel_tool_rounds_land_every_result() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2019,7 +2015,6 @@ async fn mid_run_journal_append_lands_immediately() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2208,7 +2203,6 @@ async fn ui_note_permanent_append_failure_fails_loud() {
     let session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2326,7 +2320,6 @@ async fn mid_run_typed_append_permanent_failure_fails_loud_and_cancels() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2653,7 +2646,6 @@ async fn accepted_user_entry_persists_before_the_run_and_the_middleware_skips_th
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2758,7 +2750,6 @@ async fn kill_after_receipt_keeps_the_accepted_entry_and_origin() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2858,7 +2849,6 @@ async fn queued_submit_persists_at_drain_before_the_run() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -2947,7 +2937,6 @@ async fn stale_accepted_pin_never_leaks_into_the_next_turn() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -3050,7 +3039,6 @@ async fn mid_run_append_ui_note_mirrors_now_and_parks_persist() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(runtime)
         .with_model(test_model())
         .with_tools(vec![
@@ -3214,9 +3202,7 @@ async fn reopened_session_restores_its_own_model() {
     let cwd = dir.path().join("proj");
     tokio::fs::create_dir_all(&cwd).await.unwrap();
     let sessions = dir.path().join("sessions");
-    let agent = dir.path().join("agent");
     tokio::fs::create_dir_all(&sessions).await.unwrap();
-    tokio::fs::create_dir_all(&agent).await.unwrap();
 
     let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(|_m: &PiModel| {
         Ok(Arc::new(StaticStream) as Arc<dyn manox_harness::agent_loop::StreamFn>)
@@ -3227,7 +3213,6 @@ async fn reopened_session_restores_its_own_model() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(&sessions)
-        .with_agent_dir(&agent)
         .with_model_runtime(runtime.clone())
         .with_model(test_model())
         .with_tools(vec![
@@ -3252,7 +3237,6 @@ async fn reopened_session_restores_its_own_model() {
     // Phase 2: the fixed restore path — no model override on the
     // builder, so `open()` restores the session's own model.
     let reopened = create_agent_session()
-        .with_agent_dir(&agent)
         .with_model_runtime(runtime)
         .with_tools(vec![
             Arc::new(EchoTool) as Arc<dyn manox_harness::tool::AgentTool>
@@ -3809,7 +3793,6 @@ async fn prompt_pin_carries_the_expanded_text() {
     let session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -3933,7 +3916,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(sessions.clone())
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver_for(Arc::clone(&stream))))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -4075,7 +4057,6 @@ async fn journal_replay_is_consistent_across_disk_reload() {
     let reloaded = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(sessions.clone())
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver_for(Arc::clone(&stream))))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -4196,7 +4177,6 @@ async fn restored_state_prefers_journal_over_sidecar_and_repairs_cache() {
     let session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(sessions.clone())
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -4365,7 +4345,6 @@ async fn store_journal_rows_route_to_the_actor_and_the_shutdown_claim_lands_them
     let session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -4457,7 +4436,6 @@ async fn decision_rig_session(dir: &tempfile::TempDir) -> AgentSession {
     create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -4932,7 +4910,6 @@ async fn embedder_tool_registered_after_assembly_reaches_schema_and_dispatch() {
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")
@@ -5025,7 +5002,6 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     let mut session = create_agent_session()
         .with_cwd(&cwd)
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(dir.path().join("agent"))
         .with_model_runtime(ModelRuntime::new(resolver))
         .with_model(test_model())
         .with_system_prompt("You are a test assistant.")

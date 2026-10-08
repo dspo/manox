@@ -1,5 +1,5 @@
-// Pi agent harness — Rust port of the Pi coding agent's core loop, compaction,
-// session management, and built-in tools.
+// Manox agent kernel — the core loop, compaction, session management, and
+// built-in tools.
 //
 // Layers (bottom-up):
 //   agent_loop.rs  — run_loop: the pure dual-loop state machine
@@ -23,11 +23,9 @@ pub mod output_guard;
 pub mod provider;
 pub mod provider_registry;
 pub mod session;
-pub mod settings;
 pub mod system_prompt;
 pub mod tool;
 pub mod tools;
-pub mod trust;
 pub mod types;
 
 pub mod agent;

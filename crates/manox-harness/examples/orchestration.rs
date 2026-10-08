@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session = create_agent_session()
         .with_cwd(dir.path())
-        .with_session_dir(dir.path().join(".pi-session"))
+        .with_session_dir(dir.path().join("sessions"))
         .with_model_runtime(ModelRuntime::new(main_resolver))
         .with_tools(tools)
         .build()

@@ -1,9 +1,10 @@
-// Manox harness — merged from pi (core) + pi-extensions (ext).
+// Manox harness — the agent kernel and its extension layer.
 //
 // `core`  contains the agent loop, LLM providers, session management, and
-//         built-in tools (the original `pi` crate).
-// `ext`   contains in-process extensions — bash tool, subagent dispatch,
-//         sandbox, prompt templates, etc. (the original `pi-extensions` crate).
+//         built-in tools: the kernel proper, free of host business logic.
+// `ext`   contains in-process extensions built on the kernel's extension
+//         points — bash orchestration, subagent dispatch, sandbox, prompt
+//         templates, etc.
 //
 // Re-exports are chosen so that downstream crates can use `manox_harness::X`
 // instead of `manox_harness::core::X` for the most common public types.
@@ -27,11 +28,9 @@ pub use core::hashline;
 pub use core::output_guard;
 pub use core::provider_registry;
 pub use core::session;
-pub use core::settings;
 pub use core::system_prompt;
 pub use core::tool;
 pub use core::tools;
-pub use core::trust;
 pub use core::types;
 
 // Re-export ext modules (except `provider` which conflicts with core::provider).

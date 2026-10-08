@@ -1,16 +1,15 @@
 // AgentSession: the coding-agent facade over an AgentHarness — a session in
 // a per-cwd folder, a model runtime, loaded resources, and the mounted tools.
 // It composes the harness rather than reimplementing loop/compaction/session:
-// `build()` assembles settings / trust / resources / system prompt / tools /
-// model runtime (builder overrides win), `open()` restores the session's own
-// model / thinking / active tools before returning, and the S4 control surface
-// is forwarded straight through. `fork` replaces the session with a
-// root→leaf path fork; `close` settles the harness before returning the path.
+// `build()` assembles resources / system prompt / tools / model runtime from
+// builder overrides (the facade reads no configuration from disk), `open()`
+// restores the session's own model / thinking / active tools before
+// returning, and the S4 control surface is forwarded straight through.
+// `fork` replaces the session with a root→leaf path fork; `close` settles the
+// harness before returning the path.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use anyhow::Context;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +26,6 @@ use crate::tools::grep::GrepTool;
 use crate::tools::ls::LsTool;
 use crate::tools::read::ReadTool;
 use crate::tools::write::WriteTool;
-use crate::trust::{TrustManager, TrustStatus};
 use crate::types::{AgentMessage, Model, StopReason};
 
 use super::model_runtime::{ModelCatalog, ModelRuntime};
@@ -35,29 +33,6 @@ use super::model_runtime::{ModelCatalog, ModelRuntime};
 /// Ceiling for a user-run shell command, matching the bash tool's default.
 const BASH_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 use super::resource_loader::ResourceLoader;
-
-/// Per-agent-dir mutex registry so concurrent `patch_global_settings` calls
-/// on the same agent dir serialize their read-modify-write. The registry
-/// itself is a brief `std::sync::Mutex` over a path map; the per-path lock
-/// is a `tokio::sync::Mutex` held across the await points of the patch.
-static SETTINGS_LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
-
-/// Per-process counter for unique temp-file names (paired with the pid).
-static SETTINGS_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Acquire (get-or-create) the per-path settings mutex. Returns the
-/// `Arc`; the caller awaits `arc.lock()`.
-fn settings_lock(path: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
-    let registry = SETTINGS_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = registry.lock().expect("settings lock registry poisoned");
-    if let Some(m) = guard.get(path).cloned() {
-        return m;
-    }
-    let m = Arc::new(tokio::sync::Mutex::new(()));
-    guard.insert(path.to_path_buf(), Arc::clone(&m));
-    m
-}
 
 /// How much of the context window a conversation occupies. `tokens` and
 /// `percent` are `None` when the figure is unknowable — see
@@ -81,16 +56,13 @@ pub struct AgentSession {
     /// message as asides, distinct from the harness's queued-first queue.
     pending_next_turn: Arc<std::sync::Mutex<Vec<AgentMessage>>>,
     /// Set when a reopened session's model could not be resolved exactly and
-    /// the initial model was used instead (TS `modelFallbackMessage`).
+    /// the initial model was used instead.
     model_fallback_notice: Option<String>,
-    /// The settings default thinking level applied at assembly; used when a
-    /// model switch moves from a non-thinking model to a thinking one (TS
-    /// restores the settings default).
-    settings_thinking_default: Option<String>,
-    /// The agent config dir; `set_model`/`set_thinking_level` persist the
-    /// default model / thinking level to its global settings file (TS
-    /// `setDefaultModelAndProvider`/`setDefaultThinkingLevel`).
-    agent_dir: PathBuf,
+    /// The session's most recent thinking preference in wire form (including
+    /// an explicit `"off"`); a model switch that re-enables thinking restores
+    /// it instead of falling back to `medium`. In-memory only — the session
+    /// JSONL entries are the durable record.
+    thinking_preference: Option<String>,
     /// Prepended to every `execute_bash` command, so a user-run command sees
     /// the same shell setup as the bash tool's.
     shell_command_prefix: Option<String>,
@@ -374,30 +346,29 @@ impl AgentSession {
         self.harness.model()
     }
 
-    /// Switch the model (persisted; the resolver serves the new api).
-    /// Re-clamps the thinking level against the new model's capability and
-    /// persists the actual level (TS `setModel` → `_getThinkingLevelForModelSwitch`
-    /// → `setThinkingLevel`): a switch from a non-thinking model restores the
-    /// settings default (else `medium`), otherwise the user preference is kept
-    /// and clamped.
+    /// Switch the model (persisted via the session's model-change entry; the
+    /// resolver serves the new api). Re-clamps the thinking level against the
+    /// new model's capability and persists the actual level: a switch from a
+    /// non-thinking model restores the session's last thinking preference
+    /// (else `medium`), otherwise the user preference is kept and clamped.
     pub async fn set_model(&mut self, model: Model) -> Result<(), anyhow::Error> {
-        // TS checkAuth: preflight the target model's credentials before any
-        // mutation. The harness resolves streams through the same resolver at
-        // prompt time, so a `MissingCredential` surfaced here is exactly the
-        // error the next prompt would hit; failing now leaves the model, the
-        // session JSONL, and settings all unchanged.
+        // Preflight the target model's credentials before any mutation. The
+        // harness resolves streams through the same resolver at prompt time,
+        // so a `MissingCredential` surfaced here is exactly the error the
+        // next prompt would hit; failing now leaves the model, the session
+        // JSONL, and the thinking preference unchanged.
         (self.runtime.resolver())(&model).context("preflight model credentials")?;
 
-        // Compute the effective thinking level up front: TS
-        // `_getThinkingLevelForModelSwitch` keeps the user preference when
-        // the current model supports thinking, else restores the settings
-        // default; `setThinkingLevel` clamps against the NEW model.
+        // Compute the effective thinking level up front: keep the user
+        // preference when the current model supports thinking, else restore
+        // the session's last preference; either way the level is clamped
+        // against the NEW model.
         let current_level = self.harness.agent().state().thinking_level.clone();
         let current_supports = self.harness.model().thinking != crate::types::ThinkingKind::None;
         let desired = if current_supports {
             Some(current_level.clone().unwrap_or_else(|| "off".into()))
         } else {
-            self.settings_thinking_default
+            self.thinking_preference
                 .clone()
                 .or_else(|| Some("medium".into()))
         };
@@ -408,50 +379,22 @@ impl AgentSession {
             .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
 
-        // TS order: update agent (append model_change + in-memory), then
-        // append the thinking entry, THEN persist settings LAST. A switch or
-        // entry failure cannot leave settings ahead of the session JSONL,
-        // which is authoritative on reopen.
+        // Order: update agent (append model_change + in-memory), then append
+        // the thinking entry. The session JSONL is authoritative on reopen.
         self.harness.set_model(model.clone()).await?;
-        // TS `setThinkingLevel`: persist only when the effective level
-        // actually changes; the entry write is synchronous and throws on
-        // failure — propagate it so the caller knows the state did not land.
+        // Persist only when the effective level actually changes; the entry
+        // write is synchronous and throws on failure — propagate it so the
+        // caller knows the state did not land.
         if effective != current_level {
             self.harness
                 .session()
                 .append_thinking_level_change(&wire)
                 .await?;
             if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                self.settings_thinking_default = Some(wire.clone());
+                self.thinking_preference = Some(wire.clone());
             }
         }
         self.harness.set_initial_thinking_level(effective);
-
-        // Settings last: the declared default (provider/model, and the
-        // thinking level when the new model supports it or the level is not
-        // off) for future sessions. The switch and thinking entry have
-        // already landed, so a write failure is logged rather than failing an
-        // otherwise-successful switch.
-        let provider = model.provider.clone();
-        let model_id = model.id.clone();
-        let thinking_default =
-            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
-                Some(wire.clone())
-            } else {
-                None
-            };
-        if let Err(e) = self
-            .patch_global_settings(|obj| {
-                obj.insert("defaultProvider".into(), provider.into());
-                obj.insert("defaultModel".into(), model_id.into());
-                if let Some(d) = thinking_default {
-                    obj.insert("defaultThinkingLevel".into(), d.into());
-                }
-            })
-            .await
-        {
-            tracing::warn!("failed to persist model switch default: {e:#}");
-        }
         Ok(())
     }
 
@@ -460,41 +403,17 @@ impl AgentSession {
         self.harness.agent().state().thinking_level.clone()
     }
 
-    /// Set the reasoning tier (persisted). `None` reads as `"off"` (the
-    /// facade's contract, mirrored by the harness); the effective level is
-    /// clamped against the current model and persisted only when it changes
-    /// (TS `setThinkingLevel`).
+    /// Set the reasoning tier (persisted via the session's thinking entry).
+    /// `None` reads as `"off"` (the facade's contract, mirrored by the
+    /// harness); the effective level is clamped against the current model and
+    /// persisted only when it changes. Subagent sessions apply their pinned
+    /// effort through the same path — the facade touches nothing outside the
+    /// session's own JSONL.
     pub async fn set_thinking_level(&mut self, level: Option<String>) -> Result<(), anyhow::Error> {
-        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), true)
-            .await
-    }
-
-    /// Apply a reasoning tier to this session only — the same clamp and
-    /// `thinking_level_change` entry as [`Self::set_thinking_level`], minus
-    /// the write to the agent's global settings default. A subagent session
-    /// applying its pinned effort must not touch the shared
-    /// `~/.pi/agent/settings.json`.
-    pub async fn set_thinking_level_local(
-        &mut self,
-        level: Option<String>,
-    ) -> Result<(), anyhow::Error> {
-        self.apply_thinking(Some(level.unwrap_or_else(|| "off".into())), false)
-            .await
-    }
-
-    /// Shared reasoning-tier application: clamp the desired level against
-    /// the model's capability, append a `thinking_level_change` entry when
-    /// it changes, and apply it in memory. `persist` additionally writes the
-    /// effective level to the agent's global settings default (the
-    /// persisting setter's contract); the session-local path skips that.
-    async fn apply_thinking(
-        &mut self,
-        desired: Option<String>,
-        persist: bool,
-    ) -> Result<(), anyhow::Error> {
         let model = self.harness.model().clone();
         let levels = self.runtime.thinking_levels(&model);
-        let effective = clamp_thinking(&model, &levels, desired).filter(|l| l != "off");
+        let effective = clamp_thinking(&model, &levels, Some(level.unwrap_or_else(|| "off".into())))
+            .filter(|l| l != "off");
         let wire = effective.clone().unwrap_or_else(|| "off".into());
         let previous = self.harness.agent().state().thinking_level.clone();
         if effective != previous {
@@ -502,78 +421,11 @@ impl AgentSession {
                 .session()
                 .append_thinking_level_change(&wire)
                 .await?;
-            if persist && (model.thinking != crate::types::ThinkingKind::None || wire != "off") {
-                self.settings_thinking_default = Some(wire.clone());
-                let default = wire.clone();
-                // Best-effort preference for future sessions; the entry has
-                // already landed, so a write failure is logged, not fatal.
-                if let Err(e) = self
-                    .patch_global_settings(|obj| {
-                        obj.insert("defaultThinkingLevel".into(), default.into());
-                    })
-                    .await
-                {
-                    tracing::warn!("failed to persist default thinking level: {e:#}");
-                }
+            if model.thinking != crate::types::ThinkingKind::None || wire != "off" {
+                self.thinking_preference = Some(wire.clone());
             }
         }
         self.harness.set_initial_thinking_level(effective);
-        Ok(())
-    }
-
-    /// Patch the global settings file at the field level: the raw JSON is
-    /// read, the closure mutates specific top-level keys, and the whole
-    /// object is written back atomically (temp file + rename). Fields the
-    /// typed `Settings` does not model (theme, packages, extensions,
-    /// transport, images, enabledModels, future keys) survive untouched, as
-    /// TS merges only the modified fields.
-    ///
-    /// The whole read-modify-write is serialized per agent dir by a
-    /// process-local mutex so two `AgentSession` instances sharing one agent
-    /// dir (e.g. two windows) cannot lose updates or race on the temp file.
-    /// manox ships single-process, so no cross-process file lock is taken;
-    /// concurrent writes from OTHER processes are not guarded.
-    async fn patch_global_settings(
-        &self,
-        patch: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
-    ) -> Result<(), anyhow::Error> {
-        let path = crate::settings::Settings::global_path(&self.agent_dir);
-        // Serialize per-path: hold the lock across read, patch, write, rename
-        // so a concurrent patch on the same agent dir sees this write's
-        // result, not a stale snapshot.
-        let lock = settings_lock(&path);
-        let _guard = lock.lock().await;
-        let root = match tokio::fs::read_to_string(&path).await {
-            // A missing file is a fresh start: patch runs against `{}`.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-            Err(e) => return Err(e.into()),
-            Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-                .context("parse global settings.json")?,
-        };
-        let mut root = match root {
-            serde_json::Value::Object(map) => map,
-            // A non-object root is corrupt; do not silently rewrite it under
-            // a synthetic key (that key would itself become an unmodeled
-            // field polluting the file).
-            other => anyhow::bail!("global settings.json root is not an object: {other}"),
-        };
-        patch(&mut root);
-        let serialized = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
-        // The agent dir may not yet exist for a first-time user; create it so
-        // the temp file write does not fail on a missing parent.
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        // Unique temp name per call: concurrent patches (even within this
-        // process) cannot clobber each other's temp file before the rename.
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "settings.json".into());
-        let n = SETTINGS_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = path.with_file_name(format!("{file_name}.tmp.{}.{}", std::process::id(), n));
-        tokio::fs::write(&tmp, serialized).await?;
-        tokio::fs::rename(&tmp, &path).await?;
         Ok(())
     }
 
@@ -925,36 +777,9 @@ impl AgentSession {
     }
 }
 
-/// Resolve a settings path against the project cwd (TS `resolvePath`).
-fn resolve_path(cwd: &std::path::Path, path: &str) -> PathBuf {
-    let expanded = expand_tilde(path);
-    if expanded.is_absolute() {
-        expanded
-    } else {
-        cwd.join(expanded)
-    }
-}
-
-/// Expand a leading `~` to the home directory, the TS `expandTildePath`.
-fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    PathBuf::from(path)
-}
-
-/// The default agent config directory: `~/.pi/agent` (TS `getAgentDir`).
-fn default_agent_dir() -> PathBuf {
-    std::env::var("PI_AGENT_DIR")
-        .map(|v| expand_tilde(&v))
-        .unwrap_or_else(|_| expand_tilde("~/.pi/agent"))
-}
-
-/// Clamp a desired thinking level against a model's capability (TS
-/// `clampThinkingLevel`): a non-thinking model forces `off`; with no desire,
-/// a thinking-capable model defaults to `medium`.
+/// Clamp a desired thinking level against a model's capability: a
+/// non-thinking model forces `off`; with no desire, a thinking-capable model
+/// defaults to `medium`.
 fn clamp_thinking(model: &Model, levels: &[String], desired: Option<String>) -> Option<String> {
     let levels: Vec<&str> = if model.thinking == crate::types::ThinkingKind::None {
         vec!["off"]
@@ -1023,25 +848,27 @@ fn model_resolver(
 
 /// Builds an [`AgentSession`]: cwd, session folder, model runtime, resources,
 /// and the tool allow list. Explicit builder overrides win over the assembled
-/// defaults.
+/// defaults; the facade reads no configuration from disk.
 #[derive(Default)]
 pub struct AgentSessionBuilder {
     cwd: Option<PathBuf>,
     session_dir: Option<PathBuf>,
-    agent_dir: Option<PathBuf>,
     model_runtime: Option<ModelRuntime>,
     resources: Option<HarnessResources>,
     tools: Vec<Arc<dyn AgentTool>>,
     /// Initial active tool subset; `None` when the full mounted set is in
-    /// play or the TS default four applies.
+    /// play or the built-in default four apply.
     initial_active_tools: Option<Vec<String>>,
     model: Option<Model>,
     system_prompt: Option<String>,
     /// Consumer system-prompt builder; when set, it renders the initial
     /// system prompt and every rebuild, replacing the default fold.
     system_prompt_builder: Option<crate::harness::SystemPromptBuilder>,
-    settings: Option<crate::settings::Settings>,
-    trust: Option<TrustManager>,
+    /// Default thinking tier for a NEW session (clamped against the model);
+    /// a reopened session's persisted entry wins over it.
+    default_thinking_level: Option<String>,
+    /// Prepended to every user-run `execute_bash` command.
+    shell_command_prefix: Option<String>,
     /// Session id pinned by the caller for a fresh `build()`; `None` draws a
     /// fresh uuid. `open()` ignores it — the file's own id wins.
     session_id: Option<String>,
@@ -1060,12 +887,6 @@ impl AgentSessionBuilder {
 
     pub fn with_session_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.session_dir = Some(dir.into());
-        self
-    }
-
-    /// The global config directory (instructions / skills / templates).
-    pub fn with_agent_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.agent_dir = Some(dir.into());
         self
     }
 
@@ -1109,15 +930,17 @@ impl AgentSessionBuilder {
         self
     }
 
-    /// Override the loaded settings.
-    pub fn with_settings(mut self, settings: crate::settings::Settings) -> Self {
-        self.settings = Some(settings);
+    /// Default thinking tier for a NEW session; clamped against the model
+    /// at assembly, and a reopened session's persisted entry wins over it.
+    pub fn with_default_thinking_level(mut self, level: Option<String>) -> Self {
+        self.default_thinking_level = level;
         self
     }
 
-    /// Override the trust manager.
-    pub fn with_trust(mut self, trust: TrustManager) -> Self {
-        self.trust = Some(trust);
+    /// Prepended to every user-run `execute_bash` command (e.g. a shell
+    /// setup snippet), matching the prefix the mounted bash tool runs with.
+    pub fn with_shell_command_prefix(mut self, prefix: Option<String>) -> Self {
+        self.shell_command_prefix = prefix;
         self
     }
 
@@ -1152,10 +975,10 @@ impl AgentSessionBuilder {
         self
     }
 
-    /// The shared build/open assembly: settings, trust, resources, system
-    /// prompt, model, tools, and runtime are resolved identically for a new
-    /// session and a reopened one, so a reopen does not drift. `restore`
-    /// rebuilds the transcript and runtime configuration for open.
+    /// The shared build/open assembly: resources, system prompt, model,
+    /// tools, and runtime are resolved identically for a new session and a
+    /// reopened one, so a reopen does not drift. `restore` rebuilds the
+    /// transcript and runtime configuration for open.
     async fn assemble_common(
         &self,
         session: crate::session::Session<crate::session::jsonl::JsonlSessionStorage>,
@@ -1163,72 +986,21 @@ impl AgentSessionBuilder {
         session_dir: PathBuf,
         restore: bool,
     ) -> Result<AgentSession, anyhow::Error> {
-        // Agent config dir: explicit override, `PI_AGENT_DIR`, or `~/.pi/agent`
-        // (with `~` expanded).
-        let agent_dir = self.agent_dir.clone().unwrap_or_else(default_agent_dir);
-
-        // Trust first: the global `agentDir/trust.json`, nearest-ancestor
-        // match. Undecided projects are treated as untrusted (no UI to ask).
-        let trust = match &self.trust {
-            Some(trust) => trust.clone(),
-            None => TrustManager::load(&agent_dir.join("trust.json")).unwrap_or_default(),
-        };
-        let trusted = matches!(trust.check(&cwd), TrustStatus::Trusted);
-
-        // Settings: loaded and merged unless the caller supplied an override.
-        // An untrusted project's settings are treated as an empty config —
-        // `.pi/settings.json` cannot steer shell prefix, model, retry, or
-        // resource paths until the project is trusted (TS).
-        let settings = match &self.settings {
-            Some(settings) => settings.clone(),
-            None => {
-                let mut global = crate::settings::Settings::load_global_at(&agent_dir).await?;
-                if trusted {
-                    let project = crate::settings::Settings::load_project_at(&cwd).await?;
-                    global.merge(&project);
-                }
-                global
-            }
-        };
-
-        // Resources: discovered unless the caller supplied them. Trust gates
-        // project-scoped resources; the user/agentDir ones always load.
+        // Resources: the caller's injection wins; otherwise the default
+        // discovery loads the project instruction chain for the cwd.
         let resources = match &self.resources {
             Some(resources) => resources.clone(),
-            None => {
-                let extra_skills = settings
-                    .skills
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| resolve_path(&cwd, &p))
-                    .collect();
-                let extra_prompts = settings
-                    .prompts
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|p| resolve_path(&cwd, &p))
-                    .collect();
-                let loader = ResourceLoader::new(&cwd)
-                    .with_agent_dir(&agent_dir)
-                    .with_trust(trusted)
-                    .with_extra_skill_paths(extra_skills)
-                    .with_extra_prompt_paths(extra_prompts);
-                loader.snapshot().await?
-            }
+            None => ResourceLoader::new(&cwd).snapshot().await?,
         };
 
         let session_path = session.storage().path().to_path_buf();
-        // TS default tool set: read/bash/edit/write only.
-        // The registry mounts ALL seven built-in tools (TS); the initial
-        // ACTIVE subset is the TS default four, so grep/glob/ls remain
+        // Built-in tool set: read/bash/edit/write/grep/glob/ls. The initial
+        // ACTIVE subset is the default four, so grep/glob/ls remain
         // enableable later via set_active_tools.
         let tools: Vec<Arc<dyn AgentTool>> = if self.tools.is_empty() {
             vec![
                 Arc::new(ReadTool) as Arc<dyn AgentTool>,
-                Arc::new(BashTool::new(settings.shell_command_prefix.clone()))
-                    as Arc<dyn AgentTool>,
+                Arc::new(BashTool::new(self.shell_command_prefix.clone())) as Arc<dyn AgentTool>,
                 Arc::new(EditTool::default()) as Arc<dyn AgentTool>,
                 Arc::new(WriteTool) as Arc<dyn AgentTool>,
                 Arc::new(GrepTool) as Arc<dyn AgentTool>,
@@ -1275,8 +1047,8 @@ impl AgentSessionBuilder {
             ),
         };
 
-        // The session's own model when reopening (restore), the builder
-        // override or settings default otherwise.
+        // The session's own model when reopening (restore); otherwise the
+        // builder override or the default model.
         let session_model = if restore {
             session
                 .build_session_context()
@@ -1290,24 +1062,12 @@ impl AgentSessionBuilder {
             Some(runtime) => runtime.clone(),
             None => ModelRuntime::from_env(),
         };
-        let settings_thinking_default = settings.default_thinking_level.clone();
-
-        // The settings/catalog initial model — resolved through the runtime
-        // catalog (never a hand-built guess of protocol or parameters).
-        let settings_initial_model = settings.default_model.as_ref().and_then(|id| {
-            let provider = settings
-                .default_provider
-                .clone()
-                .unwrap_or_else(|| "anthropic".into());
-            runtime.resolve_model(&provider, id)
-        });
         let mut fallback_notice = None;
         let model = match &self.model {
             Some(model) => model.clone(),
             None => match &session_model {
                 // Exact restored model first; a miss falls back to the
-                // settings/catalog initial model, else the default, with an
-                // observable notice (TS `modelFallbackMessage`).
+                // default model with an observable notice.
                 Some(mref) => match runtime.resolve_model(&mref.provider, &mref.model_id) {
                     Some(model) => model,
                     None => {
@@ -1316,10 +1076,10 @@ impl AgentSessionBuilder {
                              using the initial model instead",
                             mref.provider, mref.model_id
                         ));
-                        settings_initial_model.clone().unwrap_or_else(default_model)
+                        default_model()
                     }
                 },
-                None => settings_initial_model.unwrap_or_else(default_model),
+                None => default_model(),
             },
         };
 
@@ -1327,11 +1087,10 @@ impl AgentSessionBuilder {
         // thinking clamp needs it after restore.
         let model_key = (model.provider.clone(), model.id.clone(), model.thinking);
 
-        // A new session persists its initial model and thinking entries (TS
-        // writes them on session creation); they buffer in the deferred
-        // storage until the first assistant message materializes the file,
-        // so a close/reopen or a pre-first-message fork projects the same
-        // configuration.
+        // A new session persists its initial model and thinking entries; they
+        // buffer in the deferred storage until the first assistant message
+        // materializes the file, so a close/reopen or a pre-first-message
+        // fork projects the same configuration.
         let has_thinking_entry = if restore {
             session.build_session_context().await?.has_thinking_entry
         } else {
@@ -1343,7 +1102,7 @@ impl AgentSessionBuilder {
                     clamp_thinking(
                         &model,
                         &runtime.thinking_levels(&model),
-                        settings.default_thinking_level.clone(),
+                        self.default_thinking_level.clone(),
                     )
                     .unwrap_or_else(|| "off".into())
                     .as_str(),
@@ -1410,26 +1169,8 @@ impl AgentSessionBuilder {
         // after-response hooks fire on the real provider requests.
         let observer = harness.request_observer();
         harness.rebind_stream_resolver(runtime.resolver_with_observer(observer));
-        // Apply the loaded non-UI settings: compaction, retry, and queue
-        // modes are in-memory-only setters, safe for a reopen. The default
-        // thinking tier applies only to a NEW session and only as initial
-        // in-memory state — never through the persisting setter, which would
-        // append a `thinking_level_change` entry and overwrite the session's
-        // persisted tier on every reopen.
-        harness.set_compaction_settings(settings.resolved_compaction());
-        harness.set_retry_settings(settings.resolved_retry());
-        if let Some(mode) = settings.resolved_steering_mode() {
-            harness.set_steering_mode(mode);
-        }
-        if let Some(mode) = settings.resolved_follow_up_mode() {
-            harness.set_follow_up_mode(mode);
-        }
-        if let Some(enabled) = settings.show_cache_miss_notices {
-            harness.set_show_cache_miss_notices(enabled);
-        }
-        if let Some(reserve) = settings.resolved_branch_summary_reserve() {
-            harness.set_branch_summary_reserve(reserve);
-        }
+        // Compaction, retry, and queue knobs keep their harness defaults at
+        // assembly; consumers tune them post-build via the in-memory setters.
         if restore {
             harness.restore().await?;
         }
@@ -1439,10 +1180,10 @@ impl AgentSessionBuilder {
         // session with no persisted entry. An explicit persisted `"off"` is
         // a real decision and is never overridden.
         // The final thinking level: the session's persisted level (a reopen
-        // with an entry), else the settings default, else the TS default
+        // with an entry), else the builder default, else the built-in
         // `medium` — clamped against the FINAL model's capability in every
-        // case (TS clamps again after a model fallback). One value lands in
-        // memory, so the first turn equals a reopen.
+        // case. One value lands in memory, so the first turn equals a
+        // reopen.
         let desired = if restore && has_thinking_entry {
             // A persisted entry is a real preference — an explicit `"off"`
             // must survive the reopen (the projection folds it to `None`).
@@ -1455,7 +1196,7 @@ impl AgentSessionBuilder {
                     .unwrap_or_else(|| "off".into()),
             )
         } else {
-            settings.default_thinking_level.clone()
+            self.default_thinking_level.clone()
         };
         let clamp_model = Model {
             provider: model_key.0.clone(),
@@ -1477,23 +1218,22 @@ impl AgentSessionBuilder {
             runtime,
             pending_next_turn: Arc::new(std::sync::Mutex::new(Vec::new())),
             model_fallback_notice: fallback_notice,
-            settings_thinking_default,
-            agent_dir,
-            shell_command_prefix: settings.shell_command_prefix.clone(),
+            thinking_preference: self.default_thinking_level.clone(),
+            shell_command_prefix: self.shell_command_prefix.clone(),
             bash_signals: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
-    /// Open (or create) the session and assemble the harness.
+    /// Open (or create) the session and assemble the harness. The session
+    /// directory is required: the caller owns where sessions live.
     pub async fn build(self) -> Result<AgentSession, anyhow::Error> {
         let cwd = self
             .cwd
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let session_dir = self
-            .session_dir
-            .clone()
-            .unwrap_or_else(|| cwd.join(".pi-sessions"));
+        let session_dir = self.session_dir.clone().ok_or_else(|| {
+            anyhow::anyhow!("session_dir is required: call with_session_dir before build")
+        })?;
         tokio::fs::create_dir_all(&session_dir).await?;
         let repo = SessionRepository::new(&session_dir);
         let session = repo
@@ -1512,10 +1252,10 @@ impl AgentSessionBuilder {
     }
 
     /// Open an existing session file, restoring its model / thinking /
-    /// active tools / effective cwd and its full assembly (settings, trust,
-    /// resources, system prompt, tools, runtime) before returning — callers
-    /// must not restore manually. Tools and the returned session cwd follow
-    /// the session's own project directory.
+    /// active tools / effective cwd and its full assembly (resources, system
+    /// prompt, tools, runtime) before returning — callers must not restore
+    /// manually. Tools and the returned session cwd follow the session's own
+    /// project directory.
     pub async fn open(self, path: PathBuf) -> Result<AgentSession, anyhow::Error> {
         let session_dir = path
             .parent()
@@ -2217,12 +1957,9 @@ mod tests {
                 thinking: crate::types::ThinkingKind::None,
                 metadata: Default::default(),
             };
-            let agent_dir = dir.path().join("agent");
-            tokio::fs::create_dir_all(&agent_dir).await.unwrap();
             let mut session = create_agent_session()
                 .with_cwd(&cwd)
                 .with_session_dir(dir.path().join("sessions"))
-                .with_agent_dir(&agent_dir)
                 .with_model_runtime(runtime(api))
                 .with_model(model.clone())
                 .build()
@@ -2246,86 +1983,28 @@ mod tests {
         }
     }
 
-    /// An untrusted project's settings are treated as an empty config:
-    /// `.pi/settings.json` cannot steer the shell prefix or resource paths.
-    #[tokio::test]
-    async fn untrusted_project_settings_are_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
-            .await
-            .unwrap();
-        // Project settings attempt to set a shell prefix and an external
-        // skill path — untrusted, so neither applies.
-        tokio::fs::create_dir_all(cwd.join(".pi")).await.unwrap();
-        tokio::fs::write(
-            cwd.join(".pi/settings.json"),
-            r#"{"shellCommandPrefix": "sudo", "skills": ["/ext/skills"]}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::create_dir_all(dir.path().join("ext/skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(dir.path().join("ext/skills/ext.md"), "external skill")
-            .await
-            .unwrap();
-        // No trust decision: project treated as untrusted.
-        let session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        let skill_names: Vec<&str> = session
-            .resources()
-            .skills
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        assert!(
-            !skill_names.contains(&"ext"),
-            "external skill path must not load from untrusted project settings: {skill_names:?}"
-        );
-        assert!(
-            !skill_names.contains(&"proj"),
-            "project skills skipped when untrusted: {skill_names:?}"
-        );
-    }
-
     /// The system prompt is rebuilt when the active tools change, so skills
     /// disappear once the read tool is disabled.
     #[tokio::test]
     async fn prompt_rebuilds_after_active_tool_changes() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            cwd.join(".pi/skills/review.md"),
-            "---\nname: review\n---\nCheck the diff.",
-        )
-        .await
-        .unwrap();
-        let mut trust = crate::trust::TrustManager::new();
-        trust.trust(&cwd);
-        trust.save(&agent_dir.join("trust.json")).unwrap();
+        let resources = HarnessResources {
+            skills: vec![crate::harness::Skill {
+                name: "review".into(),
+                description: String::new(),
+                location: "/proj/skills/review.md".into(),
+                content: "Check the diff.".into(),
+            }],
+            ..Default::default()
+        };
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .with_model(test_model())
+            .with_resources(resources)
             .build()
             .await
             .unwrap();
@@ -2425,23 +2104,13 @@ mod tests {
     }
 
     /// The first turn's thinking level equals a reopen's (both clamped and
-    /// persisted); an explicit persisted "off" beats a settings default.
+    /// persisted); an explicit persisted "off" beats the configured default.
     #[tokio::test]
     async fn thinking_first_turn_matches_reopen_and_off_wins_over_settings() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        // Settings default: high.
-        tokio::fs::create_dir_all(agent_dir.join("settings.json").parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(
-            agent_dir.join("settings.json"),
-            r#"{"defaultThinkingLevel": "high"}"#,
-        )
-        .await
-        .unwrap();
+        // Configured default: high.
 
         // Non-thinking model: the default clamps to off, and the first turn
         // matches a reopen.
@@ -2452,7 +2121,7 @@ mod tests {
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
+            .with_default_thinking_level(Some("high".into()))
             .with_model_runtime(fake_runtime())
             .with_model(non_thinking)
             .build()
@@ -2463,7 +2132,6 @@ mod tests {
         session.prompt("hi").await.unwrap();
         let path = session.close().await.unwrap();
         let resumed = create_agent_session()
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .open(path)
             .await
@@ -2481,11 +2149,8 @@ mod tests {
     async fn catalog_miss_falls_back_with_notice() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
-            .with_agent_dir(&agent_dir)
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
             .with_model_runtime(fake_runtime())
@@ -2689,7 +2354,6 @@ mod tests {
         let session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(dir.path().join("agent"))
             .with_model_runtime(fake_runtime().with_catalog(Arc::new(SonnetCatalog)))
             .with_model(sonnet)
             .build()
@@ -2705,20 +2369,12 @@ mod tests {
 
     /// set_model re-clamps thinking: thinking high -> non-thinking becomes
     /// off (in-memory AND persisted); non-thinking -> thinking restores the
-    /// settings default.
+    /// configured default.
     #[tokio::test]
     async fn set_model_reclamps_thinking_and_persists() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
-        tokio::fs::write(
-            agent_dir.join("settings.json"),
-            r#"{"defaultThinkingLevel": "high"}"#,
-        )
-        .await
-        .unwrap();
         // A thinking model.
         let thinking = Model {
             thinking: crate::types::ThinkingKind::Enabled,
@@ -2727,13 +2383,13 @@ mod tests {
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
+            .with_default_thinking_level(Some("high".into()))
             .with_model_runtime(fake_runtime())
             .with_model(thinking)
             .build()
             .await
             .unwrap();
-        // high (settings default, thinking-capable).
+        // high (configured default, thinking-capable).
         assert_eq!(
             session.harness.agent().state().thinking_level.as_deref(),
             Some("high")
@@ -2752,7 +2408,7 @@ mod tests {
             "high clamps to off for a non-thinking model"
         );
 
-        // Switch back to a thinking model: restores the settings default.
+        // Switch back to a thinking model: restores the configured default.
         let thinking2 = Model {
             thinking: crate::types::ThinkingKind::Enabled,
             id: "thinking-2".into(),
@@ -2762,7 +2418,7 @@ mod tests {
         assert_eq!(
             session.harness.agent().state().thinking_level.as_deref(),
             Some("high"),
-            "non-thinking -> thinking restores the settings default"
+            "non-thinking -> thinking restores the configured default"
         );
         // The persisted entries reflect the clamps.
         let entries = session
@@ -2798,14 +2454,11 @@ mod tests {
     async fn set_thinking_level_none_disables_and_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         let session_dir = dir.path().join("sessions");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(&session_dir)
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
@@ -2827,7 +2480,6 @@ mod tests {
         let reopened = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(&session_dir)
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .open(session.harness.session().storage().path().to_path_buf())
             .await
@@ -2846,14 +2498,11 @@ mod tests {
     async fn thinking_entries_are_deduplicated_and_preference_survives() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         let session_dir = dir.path().join("sessions");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(&session_dir)
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
@@ -2923,166 +2572,14 @@ mod tests {
         );
     }
 
-    /// `patch_global_settings` preserves fields the typed `Settings` does not
-    /// model (theme, packages, nested objects): only the patched keys change.
-    #[tokio::test]
-    async fn settings_patch_preserves_unknown_and_nested_fields() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
-        // A settings file with known + unknown + nested fields.
-        tokio::fs::write(
-            agent_dir.join("settings.json"),
-            r##"{
-                "defaultModel": "claude-sonnet-4-6",
-                "defaultProvider": "anthropic",
-                "theme": {"base": "dark", "accent": "#f0a"},
-                "packages": ["rust", "python"],
-                "extensions": {"foo": {"enabled": true}},
-                "enabledModels": ["sonnet", "opus"]
-            }"##,
-        )
-        .await
-        .unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(Model {
-                thinking: crate::types::ThinkingKind::Enabled,
-                ..test_model()
-            })
-            .build()
-            .await
-            .unwrap();
-        // A model switch patches defaultModel/defaultProvider only.
-        session
-            .set_model(Model {
-                provider: "openai".into(),
-                api: "openai".into(),
-                id: "gpt-5".into(),
-                thinking: crate::types::ThinkingKind::Enabled,
-                context_window: 200_000,
-                max_tokens: 16_384,
-                metadata: Default::default(),
-            })
-            .await
-            .unwrap();
-        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
-            .await
-            .unwrap();
-        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        let obj = root.as_object().unwrap();
-        // Patched keys updated.
-        assert_eq!(obj["defaultModel"], "gpt-5");
-        assert_eq!(obj["defaultProvider"], "openai");
-        // Unknown scalar, nested object, array, and nested-boolean fields
-        // all survive the patch.
-        assert_eq!(obj["theme"]["base"], "dark");
-        assert_eq!(obj["theme"]["accent"], "#f0a");
-        assert_eq!(obj["packages"][0], "rust");
-        assert_eq!(obj["packages"][1], "python");
-        assert_eq!(obj["extensions"]["foo"]["enabled"], true);
-        assert_eq!(obj["enabledModels"][0], "sonnet");
-    }
-
-    /// A corrupt global settings file neither blocks a model switch nor gets
-    /// silently wiped: `patch_global_settings` reads it, the parse error
-    /// aborts the patch before any write, and the switch (which writes the
-    /// session JSONL, not settings) proceeds. The on-disk content is left
-    /// intact for the user to repair.
-    #[tokio::test]
-    async fn corrupt_settings_survive_a_model_switch() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
-        // Build with no settings file so construction succeeds, then corrupt
-        // the file mid-session (the realistic path to a bad file at patch
-        // time).
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(Model {
-                thinking: crate::types::ThinkingKind::Enabled,
-                ..test_model()
-            })
-            .build()
-            .await
-            .unwrap();
-        let corrupt = "{ not valid json";
-        tokio::fs::write(agent_dir.join("settings.json"), corrupt)
-            .await
-            .unwrap();
-        let result = session
-            .set_model(Model {
-                id: "x".into(),
-                ..test_model()
-            })
-            .await;
-        assert!(
-            result.is_ok(),
-            "switch proceeds despite corrupt settings: {result:?}"
-        );
-        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
-            .await
-            .unwrap();
-        assert_eq!(raw, corrupt, "corrupt settings must not be wiped");
-    }
-
-    /// A first-time user whose agent dir does not yet exist can still switch
-    /// models: `patch_global_settings` creates the parent dir before the
-    /// temp-file write.
-    #[tokio::test]
-    async fn patch_global_settings_creates_missing_agent_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        // Deliberately do NOT create the agent dir; settings has no file.
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(Model {
-                thinking: crate::types::ThinkingKind::Enabled,
-                ..test_model()
-            })
-            .build()
-            .await
-            .unwrap();
-        session
-            .set_model(Model {
-                provider: "openai".into(),
-                api: "openai".into(),
-                id: "gpt-5".into(),
-                thinking: crate::types::ThinkingKind::Enabled,
-                context_window: 200_000,
-                max_tokens: 16_384,
-                metadata: Default::default(),
-            })
-            .await
-            .unwrap();
-        assert!(agent_dir.join("settings.json").exists());
-    }
-
     /// A model whose credentials cannot be resolved is rejected by the
-    /// preflight BEFORE any mutation: the harness model, the session JSONL,
-    /// and settings.json are all left unchanged.
+    /// preflight BEFORE any mutation: the harness model and the session
+    /// JSONL are left unchanged.
     #[tokio::test]
     async fn set_model_rejected_by_credential_preflight_leaves_state_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         // A runtime whose resolver errors for the "unauthed" model and serves
         // the rest with the scripted stream.
         use crate::agent_loop::StreamFn;
@@ -3105,16 +2602,9 @@ mod tests {
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(runtime)
             .with_model(test_model())
             .build()
-            .await
-            .unwrap();
-        // Seed a settings file with a sentinel unknown field; it must survive
-        // a rejected switch untouched.
-        let sentinel = r#"{"defaultModel":"test-1","theme":"dark"}"#;
-        tokio::fs::write(agent_dir.join("settings.json"), sentinel)
             .await
             .unwrap();
         let model_before = session.harness.model().id.clone();
@@ -3150,80 +2640,6 @@ mod tests {
             entries_before, entries_after,
             "session JSONL unchanged on rejected switch"
         );
-        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
-            .await
-            .unwrap();
-        assert_eq!(raw, sentinel, "settings unchanged on rejected switch");
-    }
-
-    /// Two `AgentSession` instances sharing one agent dir can patch different
-    /// settings fields concurrently without losing updates: the per-path
-    /// mutex serializes the read-modify-write, so both keys land.
-    #[tokio::test]
-    async fn concurrent_settings_patches_on_shared_agent_dir_do_not_lose_updates() {
-        // Run several rounds; the race window is real I/O, so a missing
-        // lock would flakily drop a key on at least one round.
-        for round in 0..20usize {
-            let dir = tempfile::tempdir().unwrap();
-            let cwd = dir.path().join("proj");
-            let agent_dir = dir.path().join("agent");
-            tokio::fs::create_dir_all(&cwd).await.unwrap();
-            tokio::fs::create_dir_all(&agent_dir).await.unwrap();
-            let mut a = create_agent_session()
-                .with_cwd(&cwd)
-                .with_session_dir(dir.path().join("sessions-a"))
-                .with_agent_dir(&agent_dir)
-                .with_model_runtime(fake_runtime())
-                .with_model(Model {
-                    thinking: crate::types::ThinkingKind::Enabled,
-                    ..test_model()
-                })
-                .build()
-                .await
-                .unwrap();
-            let mut b = create_agent_session()
-                .with_cwd(&cwd)
-                .with_session_dir(dir.path().join("sessions-b"))
-                .with_agent_dir(&agent_dir)
-                .with_model_runtime(fake_runtime())
-                .with_model(Model {
-                    thinking: crate::types::ThinkingKind::Enabled,
-                    ..test_model()
-                })
-                .build()
-                .await
-                .unwrap();
-            // A switches the model; B changes the thinking level. Both patch
-            // the shared settings file on different keys. A's target model is
-            // non-thinking, so its patch writes ONLY defaultProvider/
-            // defaultModel — set_model conditionally declares a thinking
-            // default too, and with it the final defaultThinkingLevel would
-            // depend on patch ORDER (last writer wins), making the assertions
-            // below flaky by construction.
-            let (ra, rb) = tokio::join!(
-                a.set_model(Model {
-                    id: format!("beta-{round}"),
-                    thinking: crate::types::ThinkingKind::None,
-                    ..test_model()
-                }),
-                b.set_thinking_level(Some("high".into()))
-            );
-            ra.unwrap();
-            rb.unwrap();
-            let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
-                .await
-                .unwrap();
-            let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-            assert_eq!(
-                root["defaultModel"],
-                format!("beta-{round}"),
-                "round {round}: model patch lost"
-            );
-            assert_eq!(
-                root["defaultThinkingLevel"], "high",
-                "round {round}: thinking patch lost"
-            );
-        }
     }
 
     /// An explicit `off` preference on a thinking model survives a round
@@ -3234,14 +2650,11 @@ mod tests {
     async fn explicit_off_preference_survives_non_thinking_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         let session_dir = dir.path().join("sessions");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(&session_dir)
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
@@ -3279,12 +2692,6 @@ mod tests {
             None,
             "explicit off survives the round trip"
         );
-        // The persisted settings preference keeps the wire off.
-        let raw = tokio::fs::read_to_string(agent_dir.join("settings.json"))
-            .await
-            .unwrap();
-        let root: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(root["defaultThinkingLevel"], "off");
     }
 
     /// A session-append failure propagates: the caller sees an error and the
@@ -3295,14 +2702,11 @@ mod tests {
     async fn thinking_append_failure_propagates_and_leaves_state_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
         let session_dir = dir.path().join("sessions");
         tokio::fs::create_dir_all(&cwd).await.unwrap();
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(&session_dir)
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(fake_runtime())
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
@@ -3362,12 +2766,9 @@ mod tests {
             }
         }
         let runtime = fake_runtime().with_catalog(Arc::new(CappedCatalog));
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(&agent_dir).await.unwrap();
         let mut session = create_agent_session()
             .with_cwd(&cwd)
             .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
             .with_model_runtime(runtime)
             .with_model(Model {
                 thinking: crate::types::ThinkingKind::Enabled,
@@ -3394,44 +2795,6 @@ mod tests {
             session.harness.agent().state().thinking_level.as_deref(),
             Some("medium")
         );
-    }
-
-    #[tokio::test]
-    async fn undecided_trust_skips_project_scoped_resources() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(agent_dir.join("skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
-            .await
-            .unwrap();
-        tokio::fs::write(agent_dir.join("skills/user.md"), "user skill")
-            .await
-            .unwrap();
-        // No trust decision: the project is treated as untrusted.
-        let session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(&agent_dir)
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        let names = session.tools();
-        assert!(names.iter().any(|n| n == "Bash"), "{names:?}");
-        let skill_names: Vec<&str> = session
-            .resources()
-            .skills
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        assert_eq!(skill_names, vec!["user"], "{skill_names:?}");
     }
 
     /// A build without any model runtime fails with the typed
@@ -3748,53 +3111,4 @@ mod tests {
         }
     }
 
-    /// The local setter clamps like the persisting one but never writes the
-    /// agent's global settings: a pinned subagent effort must not leak into
-    /// `~/.pi/agent/settings.json`.
-    #[tokio::test]
-    async fn set_thinking_level_local_applies_without_global_write() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_agent_dir(dir.path().join("agent"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_thinking_model())
-            .build()
-            .await
-            .unwrap();
-        session
-            .set_thinking_level_local(Some("max".into()))
-            .await
-            .unwrap();
-        assert_eq!(session.thinking_level().as_deref(), Some("max"));
-        assert!(
-            !dir.path().join("agent/settings.json").exists(),
-            "the local setter must not write the agent's global settings"
-        );
-    }
-
-    /// A non-thinking model clamps any pinned effort to off, so the session
-    /// level stays unset.
-    #[tokio::test]
-    async fn set_thinking_level_local_clamps_non_thinking_models() {
-        let dir = tempfile::tempdir().unwrap();
-        let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(&cwd).await.unwrap();
-        let mut session = create_agent_session()
-            .with_cwd(&cwd)
-            .with_session_dir(dir.path().join("sessions"))
-            .with_model_runtime(fake_runtime())
-            .with_model(test_model())
-            .build()
-            .await
-            .unwrap();
-        session
-            .set_thinking_level_local(Some("high".into()))
-            .await
-            .unwrap();
-        assert_eq!(session.thinking_level(), None);
-    }
 }

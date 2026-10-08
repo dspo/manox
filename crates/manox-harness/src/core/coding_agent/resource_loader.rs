@@ -1,12 +1,12 @@
-// Resource loading for the coding-agent facade: global (agentDir) and
-// project instructions from the AGENTS/CLAUDE ancestor chain, skills, and
-// prompt templates. Mirrors the TS discovery: per directory the candidates
-// are checked in order `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`
-// (closest directory wins); the same file reached through different paths
-// (symlinks, worktrees) is loaded once; skills are found recursively by
-// `SKILL.md` plus direct root `.md` files and carry frontmatter name /
-// description; name conflicts surface as diagnostics instead of silent
-// overwrites.
+// Resource loading for the coding-agent facade: project instructions from
+// the AGENTS/CLAUDE ancestor chain, plus skills and prompt templates from
+// explicitly configured directories. Per directory the instruction
+// candidates are checked in order `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`,
+// `CLAUDE.MD` (closest directory wins); the same file reached through
+// different paths (symlinks, worktrees) is loaded once; skills are found
+// recursively by `SKILL.md` plus direct root `.md` files and carry
+// frontmatter name / description; name conflicts surface as diagnostics
+// instead of silent overwrites.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -16,18 +16,10 @@ use crate::harness::{ContextFile, HarnessResources, PromptTemplate, Skill};
 /// Loads resources for a working directory.
 pub struct ResourceLoader {
     cwd: PathBuf,
-    /// Global config directory whose instructions / skills / templates apply
-    /// to every project.
-    agent_dir: Option<PathBuf>,
-    /// Whether the project is trusted. Untrusted (or undecided) projects
-    /// lose their project-scoped resources (`.pi/skills`, `.pi/prompts`) —
-    /// the TS trust gate on project config resources. User (agentDir)
-    /// resources and the instruction ancestor chain always load.
-    trusted: bool,
-    /// Extra skill directories from settings (`settings.skills`).
-    extra_skill_paths: Vec<PathBuf>,
-    /// Extra prompt template directories from settings (`settings.prompts`).
-    extra_prompt_paths: Vec<PathBuf>,
+    /// Directories scanned recursively for skills.
+    skill_dirs: Vec<PathBuf>,
+    /// Directories whose direct `.md` files load as prompt templates.
+    prompt_dirs: Vec<PathBuf>,
 }
 
 /// A non-fatal discovery problem: name conflicts, unreadable files, or
@@ -46,42 +38,28 @@ pub struct ResourceSnapshot {
     pub diagnostics: Vec<ResourceDiagnostic>,
 }
 
-/// Candidate instruction file names per directory, in TS preference order.
+/// Candidate instruction file names per directory, in preference order.
 const INSTRUCTION_CANDIDATES: &[&str] = &["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
 impl ResourceLoader {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         ResourceLoader {
             cwd: cwd.into(),
-            agent_dir: None,
-            trusted: true,
-            extra_skill_paths: Vec::new(),
-            extra_prompt_paths: Vec::new(),
+            skill_dirs: Vec::new(),
+            prompt_dirs: Vec::new(),
         }
     }
 
-    /// Mark the project trusted or not; untrusted projects skip
-    /// project-scoped resources.
-    pub fn with_trust(mut self, trusted: bool) -> Self {
-        self.trusted = trusted;
+    /// Directories scanned recursively for skills (`SKILL.md` anywhere plus
+    /// direct root `.md` files).
+    pub fn with_skill_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.skill_dirs = dirs;
         self
     }
 
-    /// Additional skill directories (TS `settings.skills`).
-    pub fn with_extra_skill_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.extra_skill_paths = paths;
-        self
-    }
-
-    /// Additional prompt template directories (TS `settings.prompts`).
-    pub fn with_extra_prompt_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.extra_prompt_paths = paths;
-        self
-    }
-
-    /// Load the global (agentDir) instructions / skills / templates too.
-    pub fn with_agent_dir(mut self, agent_dir: impl Into<PathBuf>) -> Self {
-        self.agent_dir = Some(agent_dir.into());
+    /// Directories whose direct `.md` files load as prompt templates.
+    pub fn with_prompt_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.prompt_dirs = dirs;
         self
     }
 
@@ -96,14 +74,9 @@ impl ResourceLoader {
         let mut diagnostics = Vec::new();
         let mut seen_files: HashSet<PathBuf> = HashSet::new();
 
-        // Instructions: agentDir first, then the ancestor chain from cwd to
-        // the filesystem root, closest directory first.
-        if let Some(agent_dir) = &self.agent_dir {
-            load_instruction_file(agent_dir, &mut resources, &mut diagnostics, &mut seen_files)
-                .await;
-        }
-        // The ancestor chain loads root -> cwd (TS order), so the nearest
-        // directory's instructions come last in the prompt.
+        // Instructions: the ancestor chain from cwd to the filesystem root,
+        // loaded root -> cwd so the nearest directory's instructions come
+        // last in the prompt.
         let mut ancestors = Vec::new();
         let mut dir = Some(self.cwd.as_path());
         while let Some(current) = dir {
@@ -115,22 +88,11 @@ impl ResourceLoader {
                 .await;
         }
 
-        // Skills and prompts: user (agentDir) resources always load;
-        // project-scoped `.pi/skills` / `.pi/prompts` load only for trusted
-        // projects (TS gates project config resources on trust).
-        if let Some(agent_dir) = &self.agent_dir {
-            load_skills(agent_dir, &mut resources, &mut diagnostics).await;
-            load_templates(agent_dir, &mut resources, &mut diagnostics).await;
+        for dir in &self.skill_dirs {
+            load_skills_from_dir(dir, &mut resources, &mut diagnostics).await;
         }
-        if self.trusted {
-            load_skills(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
-            load_templates(&self.cwd.join(".pi"), &mut resources, &mut diagnostics).await;
-        }
-        for path in &self.extra_skill_paths {
-            load_explicit_path(path, false, &mut resources, &mut diagnostics).await;
-        }
-        for path in &self.extra_prompt_paths {
-            load_explicit_path(path, true, &mut resources, &mut diagnostics).await;
+        for dir in &self.prompt_dirs {
+            load_templates_from_dir(dir, &mut resources, &mut diagnostics).await;
         }
 
         Ok(ResourceSnapshot {
@@ -140,8 +102,8 @@ impl ResourceLoader {
     }
 }
 
-/// Load the first instruction candidate of a directory as a skill, unless the
-/// same file was already loaded through another path.
+/// Load the first instruction candidate of a directory as a context file,
+/// unless the same file was already loaded through another path.
 async fn load_instruction_file(
     dir: &Path,
     resources: &mut HarnessResources,
@@ -181,8 +143,6 @@ async fn load_instruction_file(
     }
 }
 
-/// Discover skills under `root`: `SKILL.md` files anywhere (recursively,
-/// named after their parent directory) plus direct root `.md` files.
 /// Discover skills in a skills directory: `SKILL.md` files anywhere
 /// (recursively, named after their parent directory) plus direct root
 /// `.md` files.
@@ -232,62 +192,6 @@ async fn load_skills_from_dir(
     }
 }
 
-/// The default skill dirs (`<root>/skills`) — TS agentDir/skills and
-/// `.pi/skills`.
-async fn load_skills(
-    root: &Path,
-    resources: &mut HarnessResources,
-    diagnostics: &mut Vec<ResourceDiagnostic>,
-) {
-    load_skills_from_dir(&root.join("skills"), resources, diagnostics).await;
-}
-
-/// Load an explicit settings path (`settings.skills` / `settings.prompts`):
-/// a directory is scanned directly, a single Markdown file loads as one
-/// skill/template — never re-joined under a `skills`/`prompts` subdir.
-async fn load_explicit_path(
-    path: &Path,
-    is_prompt: bool,
-    resources: &mut HarnessResources,
-    diagnostics: &mut Vec<ResourceDiagnostic>,
-) {
-    if path.is_dir() {
-        if is_prompt {
-            load_templates_from_dir(path, resources, diagnostics).await;
-        } else {
-            load_skills_from_dir(path, resources, diagnostics).await;
-        }
-    } else if path.is_file() && path.extension().is_some_and(|e| e == "md") {
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("resource")
-            .to_string();
-        if is_prompt {
-            let Ok(content) = tokio::fs::read_to_string(path).await else {
-                return;
-            };
-            if resources.prompt_templates.iter().any(|t| t.name == name) {
-                diagnostics.push(ResourceDiagnostic {
-                    message: format!("prompt template name conflict: {name:?}"),
-                    path: path.to_string_lossy().into_owned(),
-                });
-                return;
-            }
-            resources
-                .prompt_templates
-                .push(PromptTemplate { name, content });
-        } else {
-            load_skill_file(path, name, resources, diagnostics).await;
-        }
-    } else {
-        diagnostics.push(ResourceDiagnostic {
-            message: "skill/prompt path is not a directory or markdown file".into(),
-            path: path.to_string_lossy().into_owned(),
-        });
-    }
-}
-
 /// Read a skill file, parse its frontmatter (`name` / `description`), and
 /// merge it into the resources with a conflict diagnostic on name clash.
 async fn load_skill_file(
@@ -327,15 +231,14 @@ async fn load_skill_file(
 }
 
 /// Merge a skill, recording a diagnostic when a same-named skill already
-/// exists — the later (project) load wins the slot.
+/// exists — the first load wins the slot.
 fn push_skill(
     resources: &mut HarnessResources,
     diagnostics: &mut Vec<ResourceDiagnostic>,
     skill: Skill,
 ) {
     if let Some(winner) = resources.skills.iter().find(|s| s.name == skill.name) {
-        // The first loaded skill wins (TS keeps the first; later resources
-        // are losers). User/global skills therefore take precedence.
+        // The first loaded skill wins; later same-named resources are losers.
         diagnostics.push(ResourceDiagnostic {
             message: format!(
                 "skill name conflict: {:?} (kept {} as winner, dropped {})",
@@ -346,16 +249,6 @@ fn push_skill(
         return;
     }
     resources.skills.push(skill);
-}
-
-/// Load direct `templates/*.md` as prompt templates, project winning name
-/// conflicts over global.
-async fn load_templates(
-    root: &Path,
-    resources: &mut HarnessResources,
-    diagnostics: &mut Vec<ResourceDiagnostic>,
-) {
-    load_templates_from_dir(&root.join("prompts"), resources, diagnostics).await;
 }
 
 /// Load direct `*.md` files of a prompts directory as prompt templates.
@@ -495,26 +388,25 @@ mod tests {
     async fn recursive_skill_discovery_with_frontmatter_and_conflicts() {
         let dir = tmp();
         let cwd = dir.path().join("proj");
-        tokio::fs::create_dir_all(cwd.join(".pi/skills/deep"))
-            .await
-            .unwrap();
+        let skills = cwd.join("skills");
+        tokio::fs::create_dir_all(skills.join("deep")).await.unwrap();
         tokio::fs::write(
-            cwd.join(".pi/skills/review.md"),
+            skills.join("review.md"),
             "---\nname: review\ndescription: review the diff\n---\nCheck the diff.",
         )
         .await
         .unwrap();
         tokio::fs::write(
-            cwd.join(".pi/skills/deep/SKILL.md"),
+            skills.join("deep/SKILL.md"),
             "---\nname: deep-skill\n---\nDeep skill body.",
         )
         .await
         .unwrap();
-        tokio::fs::write(cwd.join(".pi/skills/deep/notes.md"), "ignored")
+        tokio::fs::write(skills.join("deep/notes.md"), "ignored")
             .await
             .unwrap();
 
-        let loader = ResourceLoader::new(&cwd);
+        let loader = ResourceLoader::new(&cwd).with_skill_dirs(vec![skills.clone()]);
         let snapshot = loader.snapshot_with_diagnostics().await.unwrap();
         let names: Vec<&str> = snapshot
             .resources
@@ -541,17 +433,15 @@ mod tests {
             "nested non-SKILL md ignored"
         );
 
-        // A user (agentDir) skill with the same name -> conflict diagnostic,
-        // the later (project) load wins the slot.
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(agent_dir.join("skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(agent_dir.join("skills/review.md"), "user review")
+        // A same-named skill in a second dir -> conflict diagnostic, the
+        // first load wins the slot.
+        let other = dir.path().join("other-skills");
+        tokio::fs::create_dir_all(&other).await.unwrap();
+        tokio::fs::write(other.join("review.md"), "other review")
             .await
             .unwrap();
         let snapshot = ResourceLoader::new(&cwd)
-            .with_agent_dir(&agent_dir)
+            .with_skill_dirs(vec![skills, other])
             .snapshot_with_diagnostics()
             .await
             .unwrap();
@@ -575,66 +465,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untrusted_projects_lose_project_scoped_resources() {
-        let dir = tmp();
-        let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(cwd.join(".pi/skills"))
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(agent_dir.join("skills"))
-            .await
-            .unwrap();
-        tokio::fs::write(cwd.join(".pi/skills/proj.md"), "project skill")
-            .await
-            .unwrap();
-        tokio::fs::write(agent_dir.join("skills/user.md"), "user skill")
-            .await
-            .unwrap();
-
-        // Trusted: both load.
-        let snapshot = ResourceLoader::new(&cwd)
-            .with_agent_dir(&agent_dir)
-            .snapshot_with_diagnostics()
-            .await
-            .unwrap();
-        assert_eq!(snapshot.resources.skills.len(), 2);
-
-        // Untrusted: project-scoped resources are dropped, user ones remain.
-        let snapshot = ResourceLoader::new(&cwd)
-            .with_agent_dir(&agent_dir)
-            .with_trust(false)
-            .snapshot_with_diagnostics()
-            .await
-            .unwrap();
-        let names: Vec<&str> = snapshot
-            .resources
-            .skills
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["user"], "{names:?}");
-    }
-
-    #[tokio::test]
     async fn templates_collision_keeps_the_first_winner() {
         let dir = tmp();
         let cwd = dir.path().join("proj");
-        let agent_dir = dir.path().join("agent");
-        tokio::fs::create_dir_all(cwd.join(".pi/prompts"))
+        let prompts_a = dir.path().join("prompts-a");
+        let prompts_b = dir.path().join("prompts-b");
+        tokio::fs::create_dir_all(&prompts_a).await.unwrap();
+        tokio::fs::create_dir_all(&prompts_b).await.unwrap();
+        tokio::fs::write(prompts_a.join("fix.md"), "first fix")
             .await
             .unwrap();
-        tokio::fs::create_dir_all(agent_dir.join("prompts"))
-            .await
-            .unwrap();
-        tokio::fs::write(agent_dir.join("prompts/fix.md"), "global fix")
-            .await
-            .unwrap();
-        tokio::fs::write(cwd.join(".pi/prompts/fix.md"), "project fix")
+        tokio::fs::write(prompts_b.join("fix.md"), "second fix")
             .await
             .unwrap();
 
-        let loader = ResourceLoader::new(&cwd).with_agent_dir(&agent_dir);
+        let loader = ResourceLoader::new(&cwd).with_prompt_dirs(vec![prompts_a, prompts_b]);
         let snapshot = loader.snapshot_with_diagnostics().await.unwrap();
         let fix = snapshot
             .resources
@@ -642,9 +487,8 @@ mod tests {
             .iter()
             .find(|t| t.name == "fix")
             .unwrap();
-        // The first loaded (global) template wins; the project one is the
-        // loser (TS collision semantics).
-        assert_eq!(fix.content, "global fix");
+        // The first loaded template wins; the later one is the loser.
+        assert_eq!(fix.content, "first fix");
         assert!(
             snapshot
                 .diagnostics
