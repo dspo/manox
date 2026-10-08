@@ -90,6 +90,20 @@ async fn dispatch_request(
         "initialize" => initialize(inner, conn, params).await,
         "ping" => Ok(Value::Null),
         "subscribe" => subscribe(inner, conn, params).await,
+        // Upstream types `unsubscribe` as a client notification, and the
+        // notification leg in `dispatch_notification` stays the canonical
+        // path — but this host's command table declares the name, and the
+        // reference client also tears a channel down with a request-shaped
+        // `unsubscribe`. The request form therefore gets exactly the
+        // notification leg's semantics (release the channel; releasing one
+        // this connection does not hold is a no-op) and answers `null`,
+        // since upstream defines no `UnsubscribeResult` and the client reads
+        // no result.
+        "unsubscribe" => {
+            let params: UnsubscribeParams = parse_params(params)?;
+            conn.unsubscribe(&params.channel);
+            Ok(Value::Null)
+        }
         "reconnect" => reconnect(inner, conn, params).await,
         "listSessions" => list_sessions(inner, params),
         // The reference client resolves the session configuration *before* it

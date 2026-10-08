@@ -69,7 +69,7 @@ pub fn target_of(event: &JournalWireEvent) -> Target {
             Target::Chat
         }
         // ── lifecycle ────────────────────────────────────────────────
-        E::TurnStart
+        E::TurnStart { .. }
         | E::TurnFinish { .. }
         | E::Stop { .. }
         | E::Retry { .. }
@@ -128,7 +128,7 @@ mod tests {
                 JournalWireEvent::AgentTextDelta { s: "x".into() },
                 Target::Chat,
             ),
-            (JournalWireEvent::TurnStart, Target::Chat),
+            (JournalWireEvent::TurnStart { owner: None }, Target::Chat),
             (
                 JournalWireEvent::ToolCall {
                     call_id: "t".into(),

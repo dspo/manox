@@ -39,7 +39,13 @@ pub const META_KEY: &str = "x-manox";
 /// channel; the never-folded `compaction` bag field went with them. A client
 /// caching version 3 lost nothing it could read: those envelopes were
 /// unfollable there.
-pub const VERSION: u32 = 4;
+///
+/// 5: `backgroundTaskStopped` left the declaration. It never had a dispatch
+/// arm (every client dispatch was rejected with "no runtime intent") and never
+/// had a host producer (the stop signal already reaches clients through
+/// `backgroundTasksChanged`'s `status: "Stopped"`), so a client caching
+/// version 4 kept only a name that was rejected either way.
+pub const VERSION: u32 = 5;
 
 /// State-bearing extension channel prefixes, in declaration order.
 pub mod channels {
@@ -91,8 +97,6 @@ pub mod actions {
     pub const WORK_GOAL_CHANGED: &str = "x-manox-work/goalChanged";
     /// Background-task registry snapshot (host-emitted).
     pub const WORK_BACKGROUND_TASKS: &str = "x-manox-work/backgroundTasksChanged";
-    /// Background task stopped (client-dispatchable).
-    pub const WORK_BACKGROUND_TASK_STOPPED: &str = "x-manox-work/backgroundTaskStopped";
     /// Active browser suites (host-emitted; clients set through `session/configChanged`).
     pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
     /// Sub-agent tree / progress (host-emitted).
@@ -130,7 +134,6 @@ pub mod actions {
         PLAN_REVIEW_SETTLED,
         WORK_GOAL_CHANGED,
         WORK_BACKGROUND_TASKS,
-        WORK_BACKGROUND_TASK_STOPPED,
         WORK_BROWSER_SUITES,
         WORK_SUBAGENTS,
         WORK_ACTIVE_TOOLS,
@@ -155,6 +158,11 @@ pub mod commands {
     pub const PLAN_EXECUTE: &str = "x-manox/planExecute";
     /// Set or clear the session goal.
     pub const GOAL: &str = "x-manox/goal";
+    /// Ask for the open turn's owning process (pid), or none: a client that
+    /// reopens a shared-journal thread uses the owner's liveness to settle a
+    /// dead turn on its behalf without ever touching one another process is
+    /// running. The pid source is the `turnStart` row's `owner` stamp.
+    pub const OPEN_TURN: &str = "x-manox/openTurn";
 
     /// Every command this build **serves**, which is what [`declaration`]
     /// advertises.
@@ -178,7 +186,7 @@ pub mod commands {
     /// - adjudication retraction (`cancelDelivery`) — deliveries are the deleted
     ///   v2 waterfall's concept; AHP settles through channel actions;
     /// - process shutdown — a host-lifecycle concern, not a session one.
-    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL];
+    pub const ALL: &[&str] = &[COMPACT, PLAN_EXECUTE, GOAL, OPEN_TURN];
 }
 
 /// Client-contributed session tools: an AHP-native action, not an extension

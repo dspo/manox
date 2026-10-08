@@ -18,6 +18,6 @@ pub mod base64_bytes;
 pub mod journal;
 
 pub use journal::{
-    JournalWireEntry, JournalWireEvent, ModelRef, StreamId, ThreadHeader, UsagePayload,
+    JournalWireEntry, JournalWireEvent, ModelRef, StreamId, ThreadHeader, TurnOwner, UsagePayload,
     plan_review_request_id,
 };

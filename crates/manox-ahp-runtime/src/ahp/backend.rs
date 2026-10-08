@@ -647,7 +647,7 @@ impl RuntimeBackend {
         // parts. Skip both; the parts that follow address the client's turn
         // id.
         if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
-            || matches!(&entry.event, JournalWireEvent::TurnStart)
+            || matches!(&entry.event, JournalWireEvent::TurnStart { .. })
         {
             return;
         }
@@ -1214,7 +1214,18 @@ fn summary_from_row(
         created_at: unix_to_rfc3339(row.created_at),
         modified_at: unix_to_rfc3339(row.updated_at),
         changes: None,
-        meta: None,
+        // The store row is the pin authority (pin_session journals through
+        // it): ride the summary's `_meta` extension slot so a client's list
+        // render sees the pin without subscribing the thread channel. Always
+        // present — clients read the field uniformly, and a pinned=false is
+        // as much a fact as a pinned=true.
+        meta: Some({
+            let mut xmanox = serde_json::Map::new();
+            xmanox.insert("pinned".to_string(), serde_json::json!(row.pinned));
+            let mut meta = ahp_types::common::JsonObject::new();
+            meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
+            meta
+        }),
     }
 }
 
@@ -2051,14 +2062,16 @@ impl Backend for RuntimeBackend {
                     .split('/')
                     .next()
                     .filter(|id| !id.is_empty())?;
-                // Folded fresh and thread-scoped, never from the seed cache:
-                // the cache is built once per process and per single journal,
-                // while a reconnecting client must see every member
-                // session's rows and the ones that landed after its last
-                // connect (the envelope's current watermark would bless a
-                // stale fold as truth). A thread with no rows yet answers its
-                // (empty) state, not `null`: the client replaces what it
-                // holds, and `null` would claim the channel says nothing.
+                // Folded thread-scoped — fresh, or served by the
+                // journal-stamp baseline cache when no member journal moved —
+                // and never from the seed cache: the seed is built once per
+                // process and per single journal, while a reconnecting client
+                // must see every member session's rows and the ones that
+                // landed after its last connect (the envelope's current
+                // watermark would bless a stale fold as truth). A thread with
+                // no rows yet answers its (empty) state, not `null`: the
+                // client replaces what it holds, and `null` would claim the
+                // channel says nothing.
                 block_on(super::extension_channel_baseline(channel, session_id))
             } else {
                 self.catalogue_baseline(channel)
@@ -2100,6 +2113,15 @@ impl Backend for RuntimeBackend {
                     .plan_seed(&session_id, plan_file)
                     .map_err(|error| HostError::Backend(error.message))?;
                 Ok(Value::Null)
+            }
+            manox_ahp::ext::commands::OPEN_TURN => {
+                // A read-only journal fact, not a hosted-session operation:
+                // the owner stamp sits in the shared journal file, so the
+                // answer is available for any journaled session — including
+                // one another process (the cx CLI) owns and is running.
+                let session_id = extension_session(params)?;
+                let owner = block_on(super::open_turn_owner(&session_id));
+                Ok(serde_json::json!({ "owner": owner }))
             }
             manox_ahp::ext::commands::GOAL => {
                 let session_id = extension_session(params)?;
@@ -2810,5 +2832,42 @@ mod mcp_dispatch_tests {
             matches!(&outcome, DispatchOutcome::Rejected(reason) if reason.contains("file-owned")),
             "the refusal must name the ownership rule: {outcome:?}"
         );
+    }
+
+    /// The list rides the store rows, and the store row is the pin
+    /// authority (pin_session journals through it) — so every summary must
+    /// carry the pin in its `_meta` extension slot: a client's sidebar then
+    /// renders the pin for rows whose thread channel it never subscribed.
+    #[test]
+    fn summaries_carry_the_pin_in_the_meta_slot() {
+        // pin_thread's drained sidecar writes spawn on the process runtime.
+        crate::test_support::init_globals();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
+                .expect("open temp threads db"),
+        );
+        let store = manox_agent::thread_store::standalone_for_test(db);
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-pinned", None);
+            st.insert_summary_for_test("s-plain", None);
+            st.pin_thread("s-pinned", true);
+        });
+
+        let read_pin = |id: &str| {
+            store.read(|state| {
+                let row = state.summary_by_id(id).expect("the seeded row exists");
+                let summary = summary_from_row(row, state, None);
+                summary
+                    .meta
+                    .expect("the meta slot is always populated")
+                    .get("x-manox")
+                    .and_then(|x| x.get("pinned"))
+                    .and_then(serde_json::Value::as_bool)
+                    .expect("the meta carries x-manox.pinned as a bool")
+            })
+        };
+        assert!(read_pin("s-pinned"), "the pinned row reads pinned");
+        assert!(!read_pin("s-plain"), "the unpinned row reads unpinned");
     }
 }

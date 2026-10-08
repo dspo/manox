@@ -18,6 +18,15 @@ use serde_json::Value as JsonValue;
 /// Field names serialize as camelCase to match the TS Pi v3 schema. A `leaf`
 /// entry records a cursor move to an older branch point: its `targetId` is the
 /// entry the cursor now points at, and the leaf entry itself is never walked
+/// The process that started a turn — the local wire mirror of the journal's
+/// `TurnOwner`. Readers of the shared journal use its liveness to settle a
+/// dead owner's turn without touching one another process is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnOwner {
+    pub pid: u32,
+}
+
 /// (the cursor is `targetId`, not the leaf entry's own id).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -221,6 +230,12 @@ pub enum SessionTreeEntry {
         id: String,
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
+        /// The process that started the turn (wire mirror of the journal's
+        /// `TurnOwner`): readers of the shared journal use its liveness to
+        /// settle a dead owner's turn without touching a live one. Absent on
+        /// rows written before the stamp.
+        #[serde(default)]
+        owner: Option<TurnOwner>,
     },
     /// A model turn finished.
     #[serde(rename = "turn_finish", rename_all = "camelCase")]

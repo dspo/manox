@@ -83,8 +83,9 @@ impl CommandDefinition {
     }
 }
 
-/// Process-wide registry of slash commands, keyed by `plugin:name` or bare
-/// `name`. Loaded once at startup; malformed files are skipped.
+/// Process-wide registry of slash commands, keyed by the plugin's full
+/// registry key (`name@marketplace:command`) or bare `name`. Loaded once at
+/// startup; malformed files are skipped.
 #[derive(Debug, Default)]
 pub struct CommandRegistry {
     commands: BTreeMap<String, Arc<CommandDefinition>>,
@@ -107,7 +108,7 @@ impl CommandRegistry {
             if !dir.exists() {
                 continue;
             }
-            scan_commands_dir(&dir, Some(&plugin.name), &mut commands);
+            scan_commands_dir(&dir, Some(&plugin.key), &mut commands);
         }
         Self { commands }
     }
@@ -121,7 +122,8 @@ impl CommandRegistry {
     }
 
     /// `(registry_key, definition)` pairs, for populating a UI command popover
-    /// where the surfaced name must be the full key (e.g. `gitwork:deliver`),
+    /// where the surfaced name must be the full key (e.g.
+    /// `gitwork@test:deliver`),
     /// not the bare filename stem stored in `CommandDefinition.name`.
     pub fn entries(&self) -> Vec<(&String, &Arc<CommandDefinition>)> {
         self.commands.iter().collect()
