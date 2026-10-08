@@ -424,8 +424,10 @@ impl PluginManager {
     /// Install a plugin from a marketplace: materialize its source tree (an
     /// in-repo path, a subdirectory of a remote repo, or a GitHub repo), copy
     /// it into the versioned cache location, and record the install in
-    /// `installed_plugins.json` + `enabledPlugins`. Reinstalling preserves
-    /// the original `installedAt` stamp and replaces the tree.
+    /// `installed_plugins.json`. The `enabledPlugins` toggle is written as
+    /// enabled only when the key is absent (first install) — a reinstall must
+    /// not resurrect a toggle the user explicitly disabled. Reinstalling
+    /// preserves the original `installedAt` stamp and replaces the tree.
     pub fn install(marketplace_slug: &str, plugin_name: &str) -> Result<()> {
         let known = KnownMarketplaces::load()?;
         let repo_root = known
@@ -471,8 +473,15 @@ impl PluginManager {
             &version,
             &commit_sha,
         )?;
-        if let Err(err) =
-            SettingsPatch::set_enabled(&format!("{plugin_name}@{marketplace_slug}"), true)
+        // Install refreshes files but must not flip a toggle the user
+        // explicitly turned off: an existing key records the user's decision
+        // and is left untouched (an explicit `true` is not rewritten either —
+        // rewriting it would only churn settings.json), while an absent key is
+        // the "never installed / never decided" state that reads as enabled —
+        // only that absence gets the toggle written.
+        let key = format!("{plugin_name}@{marketplace_slug}");
+        if !enabled_toggles().contains_key(&key)
+            && let Err(err) = SettingsPatch::set_enabled(&key, true)
         {
             // Non-fatal: a missing `enabledPlugins` key already reads as
             // enabled, so the install is usable even if the toggle write lost.
@@ -1751,6 +1760,62 @@ mod tests {
             .unwrap();
         assert!(settings["enabledPlugins"].as_object().unwrap().is_empty());
         assert!(!root.exists());
+    }
+
+    /// Reinstalling a plugin the user explicitly disabled must not resurrect
+    /// it: the preset `false` survives the install and the plugin stays out
+    /// of the enabled scan (the marketplace-view update path runs through
+    /// the same `install`).
+    #[test]
+    fn install_preserves_an_explicitly_disabled_toggle() {
+        let _home = ClaudeHome::new();
+        let (_market, url, slug) = seed_marketplace();
+        PluginManager::add_marketplace(&url).unwrap();
+        let key = format!("gitwork@{slug}");
+        SettingsPatch::set_enabled(&key, false).unwrap();
+
+        PluginManager::install(&slug, "gitwork").unwrap();
+
+        assert_eq!(enabled_toggles().get(&key), Some(&false));
+        assert!(
+            PluginManager::installed().iter().all(|p| p.key != key),
+            "a disabled install must stay out of the enabled scan"
+        );
+        assert!(
+            PluginManager::all_installed().iter().any(|p| p.key == key),
+            "the install itself still happened"
+        );
+    }
+
+    /// A first install (no `enabledPlugins` decision yet — no settings file
+    /// at all here) writes the toggle as enabled.
+    #[test]
+    fn install_enables_a_plugin_on_first_install() {
+        let _home = ClaudeHome::new();
+        let (_market, url, slug) = seed_marketplace();
+        PluginManager::add_marketplace(&url).unwrap();
+        let key = format!("gitwork@{slug}");
+
+        PluginManager::install(&slug, "gitwork").unwrap();
+
+        assert_eq!(enabled_toggles().get(&key), Some(&true));
+        assert!(PluginManager::installed().iter().any(|p| p.key == key));
+    }
+
+    /// Reinstalling an explicitly enabled plugin keeps it enabled; the
+    /// existing `true` is deliberately not rewritten.
+    #[test]
+    fn install_preserves_an_explicitly_enabled_toggle() {
+        let _home = ClaudeHome::new();
+        let (_market, url, slug) = seed_marketplace();
+        PluginManager::add_marketplace(&url).unwrap();
+        let key = format!("gitwork@{slug}");
+        SettingsPatch::set_enabled(&key, true).unwrap();
+
+        PluginManager::install(&slug, "gitwork").unwrap();
+
+        assert_eq!(enabled_toggles().get(&key), Some(&true));
+        assert!(PluginManager::installed().iter().any(|p| p.key == key));
     }
 
     /// A registry stamped with a newer schema version is still readable but
