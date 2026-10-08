@@ -488,8 +488,8 @@ impl PluginManager {
     /// plugin name installed from two marketplaces is two independent
     /// installs, and only the addressed one is removed.
     pub fn uninstall(plugin_key: &str) -> Result<()> {
-        Self::require_installed(plugin_key)?;
         let mut doc = InstalledPlugins::load()?;
+        Self::require_installed(&doc, plugin_key)?;
         // Only the user-scope trees are manox's to delete: sibling
         // project/local entries are Claude Code's per-repo installs, and
         // removing them would destroy exactly what `record_install`
@@ -517,7 +517,7 @@ impl PluginManager {
     /// registry key (`name@marketplace`) — a same-name install from another
     /// marketplace keeps its own toggle.
     pub fn enable(plugin_key: &str) -> Result<()> {
-        Self::require_installed(plugin_key)?;
+        Self::require_installed(&InstalledPlugins::load()?, plugin_key)?;
         SettingsPatch::set_enabled(plugin_key, true)
     }
 
@@ -527,7 +527,7 @@ impl PluginManager {
     /// (`name@marketplace`); a same-name install from another marketplace
     /// keeps its own toggle.
     pub fn disable(plugin_key: &str) -> Result<()> {
-        Self::require_installed(plugin_key)?;
+        Self::require_installed(&InstalledPlugins::load()?, plugin_key)?;
         SettingsPatch::set_enabled(plugin_key, false)
     }
 
@@ -535,8 +535,7 @@ impl PluginManager {
     /// actually records may be toggled or removed. A typo'd or stale key
     /// must fail loud — a silent no-op would leave the caller's UI showing
     /// a state the disk never took.
-    fn require_installed(plugin_key: &str) -> Result<()> {
-        let plugins = InstalledPlugins::load()?;
+    fn require_installed(plugins: &InstalledPlugins, plugin_key: &str) -> Result<()> {
         if !plugins.keys().iter().any(|key| key == plugin_key) {
             bail!("plugin {plugin_key} is not installed");
         }

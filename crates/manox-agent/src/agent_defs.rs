@@ -10,9 +10,10 @@
 //!   the built-in (registry insert replaces), so users can customize the
 //!   bundled agents.
 //! - **Plugin-provided** files under each installed plugin's `agents/`
-//!   directory, registered as `<plugin>:<name>` so they never collide with
+//!   directory, registered under the plugin's full registry key,
+//!   `<name>@<marketplace>:<name>`, so they never collide with
 //!   built-in or user agents — the parent model passes
-//!   `subagent_type: "gitwork:reviewer"` to delegate to a plugin agent,
+//!   `subagent_type: "gitwork@test:Reviewer"` to delegate to a plugin agent,
 //!   matching Claude Code's plugin-scoped lookup.
 //!
 //! A missing directory is normal (no definitions); a malformed file logs a
