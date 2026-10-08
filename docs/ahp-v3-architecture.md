@@ -106,12 +106,12 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 | `PageHistory` | `fetchTurns{cursor}`（翻页语义）；journal 条目级翻页由 `x-manox/fetchEntries` 兜底 |
 | `Workspace{call}` | `x-manox-workspaces://` 上的命令/动作 |
 | `GetConversationInfo` | `x-manox-metrics:/<chat-id>` 快照 |
-| `CancelDelivery` | `x-manox/cancelDelivery`（撤回未决宿主→客户端请求；状态化后该面收窄） |
+| `CancelDelivery` | 无落点（`x-manox/cancelDelivery` 是设计期提案，`not-on-wire`；撤回经 `session/inputNeededRemoved` 表达） |
 | `ForkSession` | `createChat{source:{kind:'fork'|'sideChat',turnId,selection?}}` + `x-manox/branchFork`（leaf 重定向/`BranchSummary` 语义） |
 
 **`ClientNote`（27 + 3 compat）**
 
-`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetApprovalMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox-plan/execute`；`Compact`→`x-manox/compact`；`Goal`→`x-manox-work/goalChanged`；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→`x-manox/modelChatCancel`；`Shutdown`→`x-manox/shutdown`（连接级）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
+`DetachSession`→`unsubscribe`；`DisposeSession`→`disposeChat`/`disposeSession`；`DropQueued`→`chat/pendingMessageRemoved{kind:'queued'}`；`CancelTurn`→`chat/turnCancelled`；`SetModel`→`session/configChanged`（canonical 串）；`SetReasoningEffort`/`SetApprovalMode`/`SetBrowserSuite`→`session/configChanged`（ConfigSchema 枚举；browser suite 仍由 `x-manox-work` 记状态）；`SetCwd`→`session/workingDirectorySet|Removed|Replaced`；`SetPlanMode`→`x-manox-plan/planModeChanged`；`PlanSeedExecution`→`x-manox/planExecute`（命令）；`Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；`StopBackgroundTask`→无落点（`backgroundTaskStopped` 声明随声明面 v5 删除——它从未接派发臂，宿主也从不发）；`ArchiveThread`→`session/isArchivedChanged`；`PinThread`→`x-manox/pinnedChanged`（AHP 无 pin 位）；`InsertThreadBefore`/`InsertGroupBefore`→`x-manox/orderChanged`；`TerminalInput`/`TerminalResize`→`terminal/input`/`terminal/resized`；`CancelModelChat`→无落点（`x-manox/modelChatCancel` 随 v2 网关删除，`not-on-wire`）；`Shutdown`→无落点（连接关闭即断开，`not-on-wire`）；`AppendUserMessage`→`chat/pendingMessageSet{kind:'queued'}`；`AppendUiNote`→`chat/responsePart{kind:'systemNotification'}`；compat `CreateSession`/`Submit`/`Steer` 随 v2 一并删除（无兼容期）。
 
 **`ServerCall`（6）**
 
