@@ -3,7 +3,7 @@ name = "manox-workspace"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-description = "Durable Workspace domain: directory identity rows with an ordered, header-validated session account (dsh workspace parity)."
+description = "Durable Workspace domain: directory identity rows with an ordered, header-validated session account."
 
 [dependencies]
 anyhow.workspace = true
