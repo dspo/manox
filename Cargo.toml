@@ -76,11 +76,12 @@ async-channel = "2"
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 # ahp / ahp-types —— Agent Host Protocol 官方 Rust crate（wire 类型 + 客户端
-# + 纯 reducer）。精确 pin：规范处于 pre-1.0、每个 minor 可能破坏；升级是显式
-# 任务而非顺手之举。宿主侧只用 ahp-types（类型）与 ahp::reducers（双端同码 fold）。
-ahp-types = "=0.9.0"
-ahp = "=0.9.0"
-ahp-ws = "=0.9.0"
+# + 纯 reducer）。精确 pin：minor 间仍可能破坏（官方仅承诺 1.0.0/0.9.0 两条
+# 协商基线）；升级是显式任务而非顺手之举。宿主侧只用 ahp-types（类型）与
+# ahp::reducers（双端同码 fold）。
+ahp-types = "=1.0.0"
+ahp = "=1.0.0"
+ahp-ws = "=1.0.0"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 libc = "0.2"

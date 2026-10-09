@@ -28,7 +28,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
 
 ### 协议（AHP）
 
-对外协议是 **AHP**（`ahp` / `ahp-types`，pin `=0.9.0`）：宿主层在 `manox-ahp`，
+对外协议是 **AHP**（`ahp` / `ahp-types`，pin `=1.0.0`）：宿主层在 `manox-ahp`，
 运行时半边在 `manox-ahp-runtime`，会话存储在 `manox-session-core`。
 **自研的 "protocol v2" 已整体删除**（含 `crates/manox-protocol`）——v2 能做的
 能力必须全部落在 AHP 面上（AHP 没有的那部分由 `x-manox/*` 扩展面承载），

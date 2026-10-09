@@ -383,7 +383,9 @@ mod tests {
             status: 1,
             activity: None,
             modified_at: now_iso8601(),
+            changes: None,
             origin: None,
+            movable: None,
             interactivity: None,
             working_directories: None,
         });
