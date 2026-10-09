@@ -5,7 +5,7 @@
 //!
 //! The registry is deliberately config-shape agnostic: parsing a concrete
 //! config format (e.g. the native cx providers yaml) is the extension's
-//! job (see `crate::ext::provider`), mirroring how extensions own
+//! job (see the `ext` layer's provider extension), mirroring how extensions own
 //! their own config schemas and only hand the kernel a `ProviderConfig`.
 //!
 //! Live consumption (usage telemetry, budgets, etc.) builds on the event
