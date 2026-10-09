@@ -88,6 +88,8 @@ pub fn summary(
         modified_at: modified_at.to_string(),
         changes: None,
         meta: None,
+        chats: None,
+        default_chat: None,
     }
 }
 

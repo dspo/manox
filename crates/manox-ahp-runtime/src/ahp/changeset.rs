@@ -27,10 +27,11 @@ use ahp_types::actions::{
 use ahp_types::common::JsonObject;
 use ahp_types::state::{
     Changeset, ChangesetCapabilities, ChangesetFile, ChangesetOperation, ChangesetOperationScope,
-    ChangesetOperationStatus, ChangesetState, ChangesetStatus, ErrorInfo, FileEdit,
+    ChangesetOperationStatus, ChangesetState, ChangesetStatus, ContentRef, ErrorInfo, FileEdit,
+    FileEditDiffStats, FileEditSide,
 };
 use parking_lot::Mutex;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The changeset key this engine serves. One kind, deliberately: turn and
 /// branch slices need per-turn file instrumentation the journal does not
@@ -319,24 +320,27 @@ fn truncate_patch(patch: String) -> String {
 /// The wire `ChangesetFile` for one scanned file. `after` points at the live
 /// worktree file — a client fetches its content through the existing
 /// `resourceRead` plane (the path sits inside the session's granted roots).
-/// Deletions carry only `before`'s URI: HEAD blobs have no content-serving
-/// face, and the (absent) patch tells the deletion story through counts.
+/// Deletions carry only `before`: HEAD blobs have no content-serving face, so
+/// that side's `ContentRef` is formal — it names a path nothing serves, and
+/// the counts tell the deletion story. The patch text rides `_meta`: AHP
+/// 1.0.0 typed `FileEdit.diff` down to the two counts, and `_meta` is the
+/// protocol's server-defined slot for exactly this kind of payload.
 fn wire_file(raw: &RawFile, reviewed: Option<bool>) -> ChangesetFile {
-    let after = (!raw.deleted).then(|| {
-        json!({
-            "uri": raw.id,
-            "content": {"uri": raw.id},
-        })
-    });
-    let before = raw.deleted.then(|| json!({"uri": raw.id}));
-    let mut diff = json!({
-        "added": raw.added,
-        "removed": raw.removed,
-    });
-    if !raw.patch.is_empty() {
-        diff["patch"] = Value::String(raw.patch.clone());
-    }
+    let side = || FileEditSide {
+        uri: raw.id.clone(),
+        content: ContentRef {
+            uri: raw.id.clone(),
+            size_hint: None,
+            content_type: None,
+            nonce: None,
+        },
+    };
+    let after = (!raw.deleted).then(side);
+    let before = raw.deleted.then(side);
     let mut meta = JsonObject::new();
+    if !raw.patch.is_empty() {
+        meta.insert("patch".to_string(), Value::String(raw.patch.clone()));
+    }
     if raw.patch.len() > PATCH_CAP {
         meta.insert("patchTruncated".to_string(), Value::Bool(true));
     }
@@ -345,7 +349,10 @@ fn wire_file(raw: &RawFile, reviewed: Option<bool>) -> ChangesetFile {
         edit: FileEdit {
             before,
             after,
-            diff: Some(diff),
+            diff: Some(FileEditDiffStats {
+                added: Some(raw.added as i64),
+                removed: Some(raw.removed as i64),
+            }),
         },
         reviewed,
         meta: (!meta.is_empty()).then_some(meta),
@@ -445,11 +452,17 @@ impl Engine {
                     if next != stored {
                         // The session's directory set moved (a cwd change, a
                         // new grant, or a repository appearing where none
-                        // was): rescan against the new set.
+                        // was): rescan against the new set. The entry keeps
+                        // its previous completed result while the rescan
+                        // runs — that is `Recomputing`, not a first
+                        // `Computing`.
                         entry.dirs = next;
-                        entry.status = ChangesetStatus::Computing;
+                        entry.status = ChangesetStatus::Recomputing;
                     }
-                    entry.status == ChangesetStatus::Computing
+                    matches!(
+                        entry.status,
+                        ChangesetStatus::Computing | ChangesetStatus::Recomputing
+                    )
                 }
                 None => {
                     sessions.insert(session_id.to_string(), SessionChangeset::new(dirs.clone()));
@@ -558,8 +571,10 @@ impl Engine {
     /// Re-scan and emit the replacement actions: `contentChanged` (files with
     /// the operation list; review flags carried over and cleared where the
     /// patch changed, per the spec's reset rule) then the settled
-    /// `statusChanged`. The transient `recomputing` edge is a post-0.9.0
-    /// addition and is not emitted. Empty when the session has no changeset.
+    /// `statusChanged`. No transient `recomputing` edge is emitted here — the
+    /// scan is synchronous, so subscribers only ever see the settled edges;
+    /// the `catalogue()` re-seed is where a dirs change marks an existing
+    /// entry `Recomputing`. Empty when the session has no changeset.
     pub fn recompute(&self, session_id: &str) -> Vec<(String, StateAction)> {
         let scan = {
             let sessions = self.sessions.lock();
@@ -587,10 +602,10 @@ impl Engine {
                     .map(|file| {
                         (
                             file.id.as_str(),
-                            file.edit
-                                .diff
+                            file.meta
                                 .as_ref()
-                                .and_then(|diff| diff.get("patch").and_then(Value::as_str)),
+                                .and_then(|meta| meta.get("patch"))
+                                .and_then(Value::as_str),
                         )
                     })
                     .collect();
@@ -842,11 +857,14 @@ mod tests {
             .after
             .as_ref()
             .expect("live file has an after side");
-        assert_eq!(after["uri"], "file:///repo/f.rs");
+        assert_eq!(after.uri, "file:///repo/f.rs");
         let diff = file.edit.diff.as_ref().expect("diff carries the stats");
-        assert_eq!(diff["added"], 3);
-        assert_eq!(diff["removed"], 1);
-        assert_eq!(diff["patch"], A_PATCH);
+        assert_eq!(diff.added, Some(3));
+        assert_eq!(diff.removed, Some(1));
+        assert_eq!(
+            file.meta.as_ref().and_then(|meta| meta.get("patch")),
+            Some(&Value::String(A_PATCH.to_string()))
+        );
         assert_eq!(file.reviewed, None);
     }
 
@@ -1233,6 +1251,75 @@ mod tests {
             .expect("the repo appears on the moved directory set");
         assert_eq!(entry.uri_template, uri("s-1"));
         assert_eq!(engine.state("s-1", KEY).unwrap().files.len(), 1);
+    }
+
+    #[test]
+    fn a_dirs_move_rescans_under_recomputing_with_the_previous_files_intact() {
+        // A moved directory set on an existing entry is `Recomputing`, not a
+        // first `Computing`: while the moved-set scan runs, a state read
+        // reports the transient status and still serves the previous
+        // completed result, then settles `Ready` on the new set.
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scans_clone = Arc::clone(&scans);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_clone = Arc::clone(&started);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_clone = Arc::clone(&release);
+        let engine = Arc::new(script(move |args| {
+            match args.first().copied().unwrap_or("") {
+                "rev-parse" => {
+                    if scans_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        ok("/repo\n")
+                    } else {
+                        started_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        while !release_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        ok("/repo2\n")
+                    }
+                }
+                "status" => ok(" M f.rs\0"),
+                "diff" if args.contains(&"--numstat") => ok("1\t1\tf.rs\n"),
+                "diff" => ok("+x\n"),
+                _ => ok(""),
+            }
+        }));
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
+        assert_eq!(
+            engine.state("s-1", KEY).unwrap().status,
+            ChangesetStatus::Ready
+        );
+
+        let mover = Arc::clone(&engine);
+        let handle =
+            std::thread::spawn(move || mover.catalogue("s-1", vec![PathBuf::from("/repo2")]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the moved-set scan never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mid = engine
+            .state("s-1", KEY)
+            .expect("the previous completed result still serves");
+        assert_eq!(mid.status, ChangesetStatus::Recomputing);
+        assert_eq!(
+            mid.files.len(),
+            1,
+            "the previous completed file list stays in place mid-rescan"
+        );
+        assert_eq!(mid.files[0].id, "file:///repo/f.rs");
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .join()
+            .unwrap()
+            .expect("the moved set holds a repository");
+        let settled = engine.state("s-1", KEY).unwrap();
+        assert_eq!(settled.status, ChangesetStatus::Ready);
+        assert_eq!(settled.files[0].id, "file:///repo2/f.rs");
     }
 
     #[test]

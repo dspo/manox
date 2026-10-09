@@ -9,7 +9,7 @@
 - 两仓**已经是**「一进程内、typed 的状态同步协议」：`dspo/manox` 的 `manox-protocol` v2（`crates/manox-protocol`，约 4.4k LOC）+ `manox-session-core` 的 `AgentServer` 单例（`agent_server.rs` 5588 行）经 `transport::RpcConnection` 的 `in_process_pair`（async_channel，进程内对象）与 GPUI 前端通信；`cx web` 另起 loopback WS（`ws/{mod,listener,connection}.rs`，`/ws` 单路由、`?token=`、`~/.manox/gateway-ws.json`、`~/.manox/gateway.lock` 单例），**同一套帧直挂 socket 上**，无翻译层。
 - 协议 v2 已自带的协议级机制（与 AHP 高度重叠）：`Initialize{protocol_epoch}` 握手、`FollowSession` 流（`Snapshot`→`Entry`→`Projections`）、seq 单点盖章（L4）、投影 `key→{value,asOfSeq}` higher-seq-wins（L6）、溢出即 `StreamEnd{Resync}` 的重同步（L5）、客户端缺口修复引擎 `journal_stream.rs`（497 行）、六车道信封（`FromClient`/`FromServer`）、31 个 `ClientNote` + 18 个 `ClientCall` + 6 个 `ServerCall`（waterfall 审批/询问/计划评审）+ `HostEvent` 总线 + `wire_surface!` 声明面（`surface.rs` 1032 行）。
 - 客户端侧（`dspo/manox-app`）已自行实现 AHP 意义上的 state store：`client_store.rs`+`client_store_handle.rs`（1153+2143 行）持 journal 窗口 + 投影面 + echo 表 + 传输状态，`journal_fold.rs`/`journal_translate.rs`（437+888）折叠与翻译，`multiplexer.rs`（1970）做 MsgId/StreamId 路由；`source_gates.rs`（432）用 grep 计数冻结「绕过网关的直读」，`views/*` 仍 import runtime Rust 类型（`ThreadEvent`/`Message`/`HistoryEntry`/`PermissionMode`…）并持 `ThreadHandle`「渲染镜像」。
-- AHP 侧（`~/projects/github/agent-host-protocol` @ `ce728562`，spec **0.9.0**）：JSON-RPC 2.0 + URI channel（`ahp-root://`、`ahp-session:/<uuid>`、`ahp-chat:/<cid>`、`ahp-terminal:/<id>`、`ahp-changeset:/<id>`、`ahp-automations://`、`ahp-session:/<uuid>/annotations`、`ahp-resource-watch:/<id>`、`ahp-otlp:`、`mcp://`）；"每帧 params 顶层带 `channel`" 使 `(method, params.channel)` 即可路由；宿主权威状态 + 客户端乐观写前（`dispatchAction{clientSeq}` → 宿主回 `action` 信封带 `origin{clientId,clientSeq}`/`rejectionReason`）；全局单调 `serverSeq` 与 `reconnect{lastSeenServerSeq}` 的「重放或快照」二选一；能力协商；`_meta` 与 **`x-` 前缀**为合法私有扩展位。
+- AHP 侧（`~/projects/github/agent-host-protocol`，spec **1.0.0**）：JSON-RPC 2.0 + URI channel（`ahp-root://`、`ahp-session:/<uuid>`、`ahp-chat:/<cid>`、`ahp-terminal:/<id>`、`ahp-changeset:/<id>`、`ahp-automations://`、`ahp-session:/<uuid>/annotations`、`ahp-resource-watch:/<id>`、`ahp-otlp:`、`mcp://`）；"每帧 params 顶层带 `channel`" 使 `(method, params.channel)` 即可路由；宿主权威状态 + 客户端乐观写前（`dispatchAction{clientSeq}` → 宿主回 `action` 信封带 `origin{clientId,clientSeq}`/`rejectionReason`）；全局单调 `serverSeq` 与 `reconnect{lastSeenServerSeq}` 的「重放或快照」二选一；能力协商；`_meta` 与 **`x-` 前缀**为合法私有扩展位。
 - **必须自建（AHP 无宿主 SDK）**：`ahp`/`ahp-types`/`ahp-ws` 三个 crate 全是客户端（`ahp-ws` 只会 dial），没有任何 server/listener/session-manager/dispatcher/replay 设施。宿主半边——JSON-RPC 路由、全局 `serverSeq` 序号、快照与重连、动作校验/接受表、副作用派发（动作 → 真正跑 agent）、`resource*` 文件面——**是我们的新增维护面**。参考实现只有 VS Code（TS，`src/vs/platform/agentHost/node/`）与一个 157 行的 dotnet 一致性 fixture。
 
 ### 用户裁决（2026-09-23）
@@ -25,7 +25,7 @@
 
 1. AHP 明示传输由双方带外选定，**in-process message channel 合法**（`transport.md`）。
 2. 9 个纯 reducer 已随 `ahp` crate 发布（`apply_action_to_{root,session,chat,terminal,changeset,annotations,resource_watch,automation,automation_run}` + `ReduceOutcome`，`ahp/src/reducers.rs`），规范的意图就是**宿主与客户端跑同一份 reducer 代码** ⇒ 收敛性由构造保证。
-3. `ahp-types` 0.9.0 已含全部 state/action/command/notification 类型，**唯一前端叙事（TypeScript `types/` 为源、六语言生成）**。
+3. `ahp-types` 1.0.0 已含全部 state/action/command/notification 类型，**唯一前端叙事（TypeScript `types/` 为源、六语言生成）**。
 4. 重连允许以**快照代替重放** ⇒ 首版不必自建重放缓冲。
 
 ---
@@ -81,7 +81,7 @@ manox 内核 ThreadCore + Journal v4（磁盘 .jsonl，生态工具仍可直读�
 | `MsgId` 关联 | JSON-RPC `id`；写路径改为 `clientSeq` 乐观对账 |
 | `StreamOpen/StreamItem(Entry/Projections)/StreamEnd{Resync}` | `subscribe`/`unsubscribe` + `action` 信封（`serverSeq`）；溢出 = 断连 → `reconnect`（快照腿） |
 | `Snapshot{records,has_more,projections}` | `subscribe` 结果 `{resource,state,fromSeq}` + `view.turns` + `fetchTurns{cursor}` 分页 |
-| `Initialize{protocol_epoch = 7}` | `initialize{protocolVersions:["0.9.0"],clientId,clientInfo,initialSubscriptions,locale}` → `{protocolVersion,serverSeq,snapshots,_meta:{"x-manox":{…}}}` |
+| `Initialize{protocol_epoch = 7}` | `initialize{protocolVersions:["1.0.0","0.9.0"],clientId,clientInfo,initialSubscriptions,locale}` → `{protocolVersion,serverSeq,snapshots,_meta:{"x-manox":{…}}}` |
 | `RpcError{code,message,data.code}`（稳定串码） | AHP 标准码（`-32001…-32011`）+ x-manox 码区间，声明表单一事实源（C2 纪律保留：生产零无码） |
 | `ServerCall` waterfall（Approve/AskUserQuestion/PlanVerdict） | **状态化**：`chat/toolCallReady`(+`options[]`)/`chat/toolCallConfirmed`；elicitation `chat/inputRequested`/`inputAnswerChanged`/`inputCompleted`；plan 走 `x-manox-plan/*`。多 owner 汇聚策略留在宿主侧，线下只暴露单一裁决结果与 `_meta.x-manox.deliveryId` 对账面 |
 | 进程内 `in_process_pair` | `ahp::Transport` 的进程内 impl（typed 帧，不序列化）；WS 由宿主侧 `WebSocketUpgrade` 提供 |
@@ -181,16 +181,16 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 - **单一事实源**：一切 `x-manox` 命名（通道、动作、命令、serverRequest、`_meta` 键、错误码区间）必须声明在本文这一张表（及其 D.1 声明块）里；代码中不得出现未声明的 `x-manox` 名。新增 = 先改本文，再改代码。
 - **未知容忍**：对端收到未知扩展通道/动作/`_meta` 键时忽略不断连、不报错（与 §附.3 Assumption 4 一致）。
 - **第三方 host 优雅降级**：manox-app 连非 manox host 时，`_meta["x-manox"]` 缺失即隐藏对应 UI 能力面，绝不因扩展缺失而报错或降格核心流程。
-- `x-` 前缀与 `_meta` 是 AHP 0.9.0 明示的合法私有扩展位；`x-manox` 不承诺第三方 host 支持。
+- `x-` 前缀与 `_meta` 是 AHP 1.0.0 明示的合法私有扩展位；`x-manox` 不承诺第三方 host 支持。
 
 ---
 
 ## §E 依赖与选型决策（不再留待实施者决定）
 
-1. **依赖**：`ahp-types`（wire 类型）+ `ahp`（client + **reducers**）**精确 pin `=0.9.x`**；`ahp-ws` 进 manox-app 侧测试与外部客户端 e2e（宿主侧 WS **不用** `ahp-ws`，它只能 dial；宿主用 axum `WebSocketUpgrade` + 自写 `ahp::Transport` impl——架构参考，禁止复制其代码，遵项目「禁抄袭第三方 crate」纪律）。
+1. **依赖**：`ahp-types`（wire 类型）+ `ahp`（client + **reducers**）**精确 pin（现 `=1.0.0`）**；`ahp-ws` 进 manox-app 侧测试与外部客户端 e2e（宿主侧 WS **不用** `ahp-ws`，它只能 dial；宿主用 axum `WebSocketUpgrade` + 自写 `ahp::Transport` impl——架构参考，禁止复制其代码，遵项目「禁抄袭第三方 crate」纪律）。
 2. **crate 布局**：新增 `crates/manox-ahp/`，承载 **AHP 协议的宿主半边 + journal→AHP 翻译 + x-manox 扩展声明面**，初始模块面为 `wire.rs`/`router.rs`/`sequencer.rs`/`channels/{root,session,chat,terminal}.rs`/`translate/`/`ext/`/`resource.rs`/`transport/{inproc,ws}.rs`/`error.rs` + `tests/`；**其 `Backend` trait 缝由 `manox-session-core` 实现**（宿主语义动作最终落到 session-core 的网关与内核调用）。`manox-protocol` 删除（见 §F），不保留 `manox-protocol` 空壳。
 3. **单网关单端口**：同一 axum listener 只留 `/ahp`（v2 的 `/ws` 直接删除，激进纪律）；token 与 `gateway.lock` 单例纪律不变，端点文件更名 `~/.manox/ahp-ws.json`。
-4. **协商与版本**：`protocolVersions:["0.9.0"]`；扩展经 `_meta["x-manox"]`（未知键方忽略不断连）；我们**只 advertise 并实现真正用到的动作子集**（约 35 个宿主发射动作 + 必须接受的 client-dispatchable 子集），未实现的动作一律拒（`rejectionReason` 或 x-manox 稳定码）。
+4. **协商与版本**：`protocolVersions:["1.0.0","0.9.0"]`（caret 语义，选择逻辑委托 `ahp_types::version::negotiate_protocol_version`）；扩展经 `_meta["x-manox"]`（未知键方忽略不断连）；我们**只 advertise 并实现真正用到的动作子集**（约 35 个宿主发射动作 + 必须接受的 client-dispatchable 子集），未实现的动作一律拒（`rejectionReason` 或 x-manox 稳定码）。
 5. **错误码**：AHP 标准码 + `x-manox/*` 码表（单一声明表；C2「生产零无码」结构门禁保留）。
 6. **能力**：advertise `multipleChats{fork,sideChat}`（= 已有分支/fork）；`multipleWorkingDirectories`（= 已有 `workingDirectories` 围栏，先不开 `immutablePrimary`）。
 7. **durability**：AHP 无持久化要求，**journal 仍是唯一 durable**；宿主启动时由 journal fold 得到通道状态，AHP 快照 = 该 fold 的输出。
@@ -307,7 +307,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 | 风险 | 影响 | 对策 |
 |---|---|---|
-| AHP 0.9.0 pre-1.0，每个 minor 已历史性引入破坏 | 适配面反复返工 | 精确 pin `=0.9.x` + 升级任务化 + 收敛性门禁当护栏 + 扩展面自有声明表隔离；把「升级」写成独立清单 |
+| AHP minor 间仍可能破坏（1.0.0 起官方仅承诺 1.0.0/0.9.0 两条协商基线） | 适配面反复返工 | 精确 pin + 升级任务化 + 收敛性门禁当护栏 + 扩展面自有声明表隔离；把「升级」写成独立清单 |
 | 无宿主 SDK，自建面大 | 工期与维护面上升（短期） | W1/W2 即交付主体；只实现用到的动作子集；重放腿延后到 W5（spec 允许快照代替）；长期净删 v2 全家 |
 | AHP 文档漂移（示例仍写 0.3.0、`annotations` 行缺失、`disposeChat` 矛盾） | 实现依据错位 | **以 `types/` 与 `ahp`/`ahp-types` crate 为准**，文档仅作语义参考；差异记 as-built |
 | 特性缺口（plan/compaction/子代理层级/pin+排序/workspace/命令目录/Q 面） | UI 功能退化 | 全部落 x-manox 扩展并在 W0 定稿；第三方 host 下优雅降级（`_meta` 缺失即隐藏） |
@@ -320,7 +320,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### 附.3 Assumptions
 
-1. `ahp`/`ahp-types` 0.9.x 的 reducers 可作宿主侧权威 fold（规范明示双端同码），我们**只依赖不复制**。
+1. `ahp`/`ahp-types` 的 reducers 可作宿主侧权威 fold（规范明示双端同码），我们**只依赖不复制**。
 2. 进程内 channel 作为 AHP 传输合法（`transport.md` 明示 in-process message channel 之一），且 typed 帧（不序列化）满足一致性要求（双路径一致性测试守护）。
 3. 我们只 advertise 并实现自己真正用到的动作子集；未实现动作拒绝（不是静默 no-op）。
 4. AHP 客户端对未知 `_meta` 键与未知 `x-` 方法必须忽略而不致断（VS Code 客户端实测确认）。
@@ -500,7 +500,7 @@ tap 写 journal → `tap_tx` → `notice_rx` → facade）**之后**，所以注
 计划把「真客户端 smoke」当一条门禁。它应当拆成两条——④a 现在就能做，④b 需要单独立项：
 
 - **④a（已执行）**：用上游**官方 TypeScript client**（`@microsoft/agent-host-protocol@0.9.0`，
-  与本仓 pin 的 `ahp-types = "=0.9.0"` 同版本）经 WS 打真实网关。
+  执行时与本仓当时的 pin `ahp-types = "=0.9.0"` 同版本；pin 现为 `=1.0.0`）经 WS 打真实网关。
   工具：`script/ahp-client-smoke/smoke.mjs`（13 项断言全 PASS）。
 - **④b（未做，独立立项）**：真 VS Code Agents window 的方言税（R5 那五处）。hcode 的连接来源
   只有 ambient/ssh/wsl 三条，全是起 VS Code 自己的 agent host，端点不可插拔；指向 manox 的 `/ahp`
@@ -769,7 +769,7 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
    实测帧：`{"channel":"ahp-root://","session":"…","activeClient":{"clientId":"capture"},
    "workingDirectories":["file:///tmp"]}` → 宿主回 `-32602 invalid params: missing field
    \`tools\``。核查：`SessionActiveClient.tools: Vec<ToolDefinition>` 在 pin 的
-   `ahp-types 0.9.0` 里**没有 `#[serde(default)]`**（必填），TS 类型 `state.d.ts:241` 同样是必填
+   `ahp-types 1.0.0` 里**没有 `#[serde(default)]`**（必填），TS 类型 `state.d.ts:241` 同样是必填
    `tools: ToolDefinition[]`；但**规范自己的 TS client** 在 `createSession` 里不发这个字段
    （`createSession` 走 `CommandMap` 泛型通道，TS 的 `activeClient` 拼装不填 `tools`）。
    即：**类型要求它、官方客户端不填它**。宿主拒绝是「按 pin 的类型」正确，但会让标准客户端的
@@ -780,7 +780,7 @@ W4 开工前逐文件核实，发现**计划 §一「`manox-session-core` 整体
 
 ### H.4 AHP 上游文档漂移（实施期实测）
 
-- `docs/specification/*.md` 的示例仍写 `"0.3.0"`，而 `ahp-types::version::PROTOCOL_VERSION` 为 `0.9.0`
+- `docs/specification/*.md` 的示例仍写 `"0.3.0"`，而 `ahp-types::version::PROTOCOL_VERSION` 为 `1.0.0`
   ——实现以 `types/` 与 crate 为准。
 - `JsonRpcRequest.id` 在 `ahp-types` 里是 `u64`：使用字符串 id 的 JSON-RPC 客户端会在解析期被拒
   （整帧判为 `-32700`）。官方 Rust/TS 客户端均发数字 id，故暂不处理；容忍字符串 id 记入 W5 候选。
@@ -899,7 +899,7 @@ claim 已入队的行，落到 `initial_path`。（该路径在 hermetic 测试 
 反序列化: {"request":{"id":"pr-1"}}   ← planReview 消失
 ```
 
-丢失点在**客户端 SDK 自己**：`ahp-0.9.0/src/client.rs:965` 对每条入站 action 都做
+丢失点在**客户端 SDK 自己**：`ahp-1.0.0/src/client.rs:965` 对每条入站 action 都做
 `serde_json::from_value::<ActionNotificationParams>`。所以 in-proc 与 WS **两条腿都丢**——
 不是传输问题，是类型系统问题，宿主侧无法绕过。
 

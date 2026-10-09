@@ -120,7 +120,7 @@ pub struct ChannelStore {
     /// reducer and seeded from the runtime's changeset engine.
     changesets: HashMap<String, ahp_types::state::ChangesetState>,
     /// `x-manox-*` channels: their state has no slot in AHP's `SnapshotState`
-    /// (nine arms, no generic one), so it is folded here and delivered to
+    /// (ten arms, no generic one), so it is folded here and delivered to
     /// subscribers as extension action envelopes.
     extensions: HashMap<String, crate::ext::XManoxState>,
 }
@@ -383,7 +383,9 @@ mod tests {
             status: 1,
             activity: None,
             modified_at: now_iso8601(),
+            changes: None,
             origin: None,
+            movable: None,
             interactivity: None,
             working_directories: None,
         });

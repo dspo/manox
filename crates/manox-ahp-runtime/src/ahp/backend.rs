@@ -1226,6 +1226,8 @@ fn summary_from_row(
             meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
             meta
         }),
+        chats: None,
+        default_chat: None,
     }
 }
 

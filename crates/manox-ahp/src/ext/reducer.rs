@@ -5,10 +5,11 @@
 //! manox-only state needs its own reducer, and this is it.
 //!
 //! Where it lives matters and is worth stating with the evidence: the Rust
-//! `ahp_types::state::SnapshotState` enum has exactly nine arms
-//! (`Session`/`Chat`/`Terminal`/`Changeset`/`ResourceWatch`/`Annotations`/
-//! `Automations`/`AutomationRun`/`Root`) and **no generic arm**, so a private
-//! channel cannot answer `subscribe` with a typed snapshot carrying its state.
+//! `ahp_types::state::SnapshotState` enum has exactly ten arms
+//! (`Session`/`Chat`/`Canvas`/`Terminal`/`Changeset`/`ResourceWatch`/
+//! `Annotations`/`Automations`/`AutomationRun`/`Root`) and **no generic arm**,
+//! so a private channel cannot answer `subscribe` with a typed snapshot
+//! carrying its state.
 //! The host therefore folds extension state here for its own bookkeeping and
 //! delivers it to subscribers as **extension action envelopes** (a baseline
 //! pushed right after `subscribe`, then deltas) — which is exactly what the

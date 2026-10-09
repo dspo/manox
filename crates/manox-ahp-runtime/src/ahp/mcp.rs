@@ -32,7 +32,7 @@ pub fn channel_uri(server: &str) -> String {
 
 /// The side-channel advertisement for a ready server: `tools/*` and
 /// `resources/*` are proxied (the flags are presence markers — the empty
-/// object means "served"). In 0.9.0 this Apps capability set is the only
+/// object means "served"). Through 1.0.0 this Apps capability set is the only
 /// defined carrier for a side-channel advertisement — manox borrows its
 /// `serverTools`/`serverResources` flags (and only those; it is not an Apps
 /// host and never serves `ui/*`), a point recorded in the PR's Assumptions.

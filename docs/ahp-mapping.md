@@ -168,9 +168,9 @@ turn id 方案。结论如下，三条证据相互印证：
 
 计划要求「`x-manox` 状态挂在自有 channel 上」。类型核对后必须补一条约束：
 
-**`ahp_types::state::SnapshotState` 只有九个臂**（`Session`/`Chat`/`Terminal`/`Changeset`/
+**`ahp_types::state::SnapshotState` 只有十个臂**（`Session`/`Chat`/`Canvas`/`Terminal`/`Changeset`/
 `ResourceWatch`/`Annotations`/`Automations`/`AutomationRun`/`Root`），**没有 `Unknown`/泛型臂**
-（`ahp-types-0.9.0/src/state.rs`）。而 `subscribe` 的 `SubscribeResult.snapshot.state` 就是它。
+（`ahp-types-1.0.0/src/state.rs`）。而 `subscribe` 的 `SubscribeResult.snapshot.state` 就是它。
 所以私有 channel **无法**用快照携带自己的 state。
 
 落地形态：`x-manox-*` channel 保持**stateless topic**（`subscribe` 回 `{}`），state 由宿主在
