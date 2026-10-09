@@ -2374,10 +2374,10 @@ impl Translator {
 /// the sides name the file (a client fetches content through the
 /// `resourceRead` plane), and the counts come from the patch's own
 /// statically-known spans: `SWAP`/`DEL`/`INS`/`CUT` count exactly, the
-/// block-replace/insert ops count their inline bodies, and only the block
-/// deletions and clipboard pastes — whose resolution needs file content or
-/// engine clipboard state the projection never sees — contribute 0, so the
-/// stats read as a lower bound. Any other tool, a missing parameter, or an
+/// block ops count their inline bodies, and the directions whose resolution
+/// needs file content or engine clipboard state the projection never sees
+/// (block-deleted spans, pasted bodies) carry `None` — an unknown count, not
+/// a zero — so a client renders `+?`/`-?` instead of reading "no changes". Any other tool, a missing parameter, or an
 /// unparseable patch answers `None` — no preview is better than a wrong one.
 fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection> {
     use manox_harness::core::hashline::{FileOp, Op};
@@ -2418,26 +2418,44 @@ fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection
                 .iter()
                 .map(|file| {
                     let path = file.path.display().to_string();
-                    let mut added = 0i64;
-                    let mut removed = 0i64;
+                    // Counts are Option from the ground up: a direction that
+                    // saw only statically-known ops stays a number, and any
+                    // block-deletion or paste — whose resolution needs file
+                    // content or clipboard state the projection never sees —
+                    // marks that DIRECTION unknown (`None`), never `0`. A `0`
+                    // would read as "no changes" on a card whose patch does
+                    // change lines the fold cannot count.
+                    let mut added: Option<i64> = Some(0);
+                    let mut removed: Option<i64> = Some(0);
                     for op in &file.ops {
                         match op {
                             Op::Swap { start, end, body } => {
-                                removed += (*end - *start + 1) as i64;
-                                added += body.len() as i64;
+                                removed = removed.map(|n| n + (*end - *start + 1) as i64);
+                                added = added.map(|n| n + body.len() as i64);
                             }
                             Op::Del { start, end } | Op::Cut { start, end } => {
-                                removed += (*end - *start + 1) as i64;
+                                removed = removed.map(|n| n + (*end - *start + 1) as i64);
                             }
-                            Op::Ins { body, .. }
-                            | Op::SwapBlk { body, .. }
-                            | Op::InsBlkPost { body, .. } => {
-                                added += body.len() as i64;
+                            // The block ops' inline bodies are known, so the
+                            // insertion side still counts; the content-resolved
+                            // span they replace or follow is not, so a
+                            // `SwapBlk` marks the REMOVED direction unknown.
+                            Op::Ins { body, .. } | Op::InsBlkPost { body, .. } => {
+                                added = added.map(|n| n + body.len() as i64);
                             }
-                            // Block deletions and pastes resolve against file
-                            // content or clipboard state the fold never sees:
-                            // they contribute 0 to the preview's lower bound.
-                            Op::DelBlk { .. } | Op::CutBlk { .. } | Op::Paste { .. } => {}
+                            Op::SwapBlk { body, .. } => {
+                                added = added.map(|n| n + body.len() as i64);
+                                removed = None;
+                            }
+                            // The deleted span of a block deletion and the
+                            // pasted body of a clipboard paste are the fully
+                            // unknowable directions.
+                            Op::DelBlk { .. } | Op::CutBlk { .. } => {
+                                removed = None;
+                            }
+                            Op::Paste { .. } => {
+                                added = None;
+                            }
                         }
                     }
                     // `REM` is a deletion (before only); a `MV` keeps both
@@ -2450,10 +2468,7 @@ fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection
                     FileEdit {
                         before,
                         after,
-                        diff: Some(FileEditDiffStats {
-                            added: Some(added),
-                            removed: Some(removed),
-                        }),
+                        diff: Some(FileEditDiffStats { added, removed }),
                     }
                 })
                 .collect();
@@ -3592,6 +3607,40 @@ mod preview_edits_tests {
     /// own journaled parameters: an `Edit` patch becomes per-file edits with
     /// statically-counted spans, a `Write` becomes a creation (after side
     /// only), and the counts ride the diff stats.
+    /// Unknowable directions carry None, not zero: a patch whose only edit
+    /// is a clipboard paste adds an unknown number of lines — `Some(0)` would
+    /// render as "+0" (reads "no changes") on a card that does change lines
+    /// the fold cannot count. The app's ±? face keys off exactly this.
+    #[test]
+    fn unknowable_directions_carry_none_not_zero() {
+        // A swap (both directions known) plus a paste (insertion unknown).
+        let preview = preview_edits(
+            "Edit",
+            Some(&json!({
+                "path": "/src/p.rs",
+                "patch": "[src/p.rs#1A2B3C]\nSWAP 1.=1:\nfixed\nPASTE.POST 3:",
+            })),
+        )
+        .expect("the preview parses");
+        let diff = preview.items[0].diff.as_ref().expect("stats present");
+        assert_eq!(diff.added, None, "the paste's insertion is unknown");
+        assert_eq!(diff.removed, Some(1), "the swap's span counts exactly");
+
+        // A pure block deletion: the removed direction is unknown, the added
+        // direction stays a known zero (the patch adds nothing).
+        let preview = preview_edits(
+            "Edit",
+            Some(&json!({
+                "path": "/src/q.rs",
+                "patch": "[src/q.rs#1A2B3C]\nDEL.BLK 2",
+            })),
+        )
+        .expect("the preview parses");
+        let diff = preview.items[0].diff.as_ref().expect("stats present");
+        assert_eq!(diff.removed, None, "the block span is unknown");
+        assert_eq!(diff.added, Some(0), "nothing is inserted");
+    }
+
     #[test]
     fn the_approval_gate_carries_the_edit_preview_face() {
         let mut t = Translator::new();
