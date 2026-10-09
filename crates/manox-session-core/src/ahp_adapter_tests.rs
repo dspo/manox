@@ -1356,8 +1356,8 @@ mod dispatch {
         std::fs::write(
             &session_file,
             "{\"type\":\"session\",\"version\":3,\"id\":\"s-dispatch\",\
-             \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
-             \"metadata\":{\"host\":\"manox\"}}\n",
+         \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
+         \"metadata\":{\"host\":\"manox\"}}\n",
         )
         .unwrap();
         manox_agent::thread_store::global().with_mut(|s| {
@@ -1799,8 +1799,8 @@ mod dispatch {
             &session_file,
             format!(
                 "{{\"type\":\"session\",\"version\":3,\"id\":\"{session_id}\",\
-                 \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
-                 \"metadata\":{{\"host\":\"manox\"}}}}\n"
+             \"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/p\",\
+             \"metadata\":{{\"host\":\"manox\"}}}}\n"
             ),
         )
         .unwrap();
@@ -2091,7 +2091,7 @@ mod dispatch {
         assert!(
             !commands.is_empty(),
             "the built-in slash commands must appear; an empty palette is what \
-             the v2 ListCommands call never returned"
+         the v2 ListCommands call never returned"
         );
         let names: Vec<&str> = commands.iter().filter_map(|c| c["name"].as_str()).collect();
         assert!(
@@ -2201,7 +2201,7 @@ mod dispatch {
         assert!(
             !matches!(state.claim, ahp_types::state::TerminalClaim::Client(_)),
             "the runtime does not arbitrate client input ownership, so it must not \
-             announce a client claim it would not enforce"
+         announce a client claim it would not enforce"
         );
 
         // The write path: keystrokes and resizes reach the PTY. Without these
@@ -2268,6 +2268,133 @@ mod dispatch {
 
         // An unknown terminal is absent, never fabricated.
         assert!(backend.terminal_state("no-such-terminal").is_none());
+    }
+
+    /// AHP 1.0's reconstruction contract (#875): subscribing to an EXITED
+    /// terminal returns its retained output — the same URI stays answerable
+    /// after the process is gone, lazily rebuilt from the registry's frozen
+    /// grid, no live PTY needed. This is what makes historical tool-result
+    /// terminals (and, in the app, external sessions' terminals) viewable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exited_terminal_serves_its_retained_output() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+
+        // Create through the backend face so the output pump is ensured —
+        // the contract under test is the channel's, and the pump is part of
+        // serving it.
+        backend
+            .create_terminal("s-exit", "t-exit", 80, 24)
+            .expect("the terminal spawns");
+        let terminal_id = "t-exit".to_string();
+        let uri = manox_ahp::channels::terminal::uri(&terminal_id);
+        assert_eq!(
+            backend.dispatch(
+                &uri,
+                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                    data: "echo reconstruction-marker && exit\n".to_string(),
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Accepted
+        );
+
+        // Bounded wait for the exit to land in the registry (the PTY watcher
+        // folds it asynchronously).
+        let state = {
+            let mut settled = None;
+            for _ in 0..100 {
+                if let Some(state) = backend.terminal_state(&terminal_id)
+                    && matches!(
+                        state.lifecycle,
+                        ahp_types::state::TerminalLifecycleState::Exited(_)
+                    )
+                {
+                    settled = Some(state);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            settled.expect("the terminal exits within the bounded wait")
+        };
+        let content = state
+            .content
+            .iter()
+            .map(|part| match part {
+                ahp_types::state::TerminalContentPart::Unclassified(u) => u.value.clone(),
+                _ => String::new(),
+            })
+            .collect::<String>();
+        assert!(
+            content.contains("reconstruction-marker"),
+            "the retained grid carries the output written before the exit: {content:?}"
+        );
+
+        // The write face is closed to the dead PTY: input is refused, never
+        // silently dropped into a process that no longer exists.
+        assert!(matches!(
+            backend.dispatch(
+                &uri,
+                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                    data: "x".to_string(),
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Rejected(_)
+        ));
+    }
+
+    /// The latency gate (#875's acceptance budget): the in-proc
+    /// keystroke→echo round trip through the AHP write face, the PTY, and
+    /// the folded state. The assertion is a pathological-regression bound
+    /// (two seconds), not a performance claim — the measured number is
+    /// printed for the delivery record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_inproc_echo_round_trip_stays_under_the_regression_bound() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+
+        backend
+            .create_terminal("s-latency", "t-latency", 80, 24)
+            .expect("the terminal spawns");
+        let terminal_id = "t-latency".to_string();
+        let uri = manox_ahp::channels::terminal::uri(&terminal_id);
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            backend.dispatch(
+                &uri,
+                &StateAction::TerminalInput(ahp_types::actions::TerminalInputAction {
+                    data: "echo latency-probe\n".to_string(),
+                }),
+                &origin(),
+            ),
+            DispatchOutcome::Accepted
+        );
+        let mut echoed = None;
+        for _ in 0..200 {
+            if let Some(state) = backend.terminal_state(&terminal_id) {
+                let content = state
+                    .content
+                    .iter()
+                    .map(|part| match part {
+                        ahp_types::state::TerminalContentPart::Unclassified(u) => u.value.clone(),
+                        _ => String::new(),
+                    })
+                    .collect::<String>();
+                if content.contains("latency-probe") {
+                    echoed = Some(started.elapsed());
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let elapsed = echoed.expect("the echo lands within the bounded wait");
+        println!("in-proc keystroke→folded-echo latency: {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the in-proc round trip regressed past the 2s pathological bound: {elapsed:?}"
+        );
         uninstall();
     }
 

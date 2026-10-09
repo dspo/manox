@@ -306,6 +306,11 @@ impl AgentServerInner {
         let Some(entry) = self.terminals.lock().get(terminal_id).cloned() else {
             return Err(format!("unknown terminal {terminal_id}"));
         };
+        // A dead child takes no input: refusing here is the honest answer a
+        // client needs (its PTY is gone), rather than bytes into the void.
+        if entry.handle.read(|t| t.child_exited).is_some() {
+            return Err(format!("terminal {terminal_id} has exited"));
+        }
         entry
             .handle
             .read(|t| t.input(data.as_bytes()))
@@ -387,7 +392,10 @@ impl AgentServerInner {
             .iter()
             .map(|(id, entry)| {
                 let title = entry.handle.read(|t| t.title.clone());
-                let exited = *entry.exited.lock().unwrap();
+                let exited = entry
+                    .handle
+                    .read(|t| t.child_exited)
+                    .or(*entry.exited.lock().unwrap());
                 (id.clone(), entry.session_id.clone(), title, exited)
             })
             .collect();
@@ -428,11 +436,22 @@ impl AgentServerInner {
     ) -> Option<ahp_types::state::TerminalState> {
         use ahp_types::state as ahp;
         let entry = self.terminals.lock().get(terminal_id).cloned()?;
-        let (lines, cols, rows, title, cwd) = entry.handle.read(|t| {
+        let (lines, cols, rows, title, cwd, child_exited) = entry.handle.read(|t| {
             let (lines, _, _) = t.text_snapshot();
-            (lines, t.cols, t.rows, t.title.clone(), t.cwd.clone())
+            (
+                lines,
+                t.cols,
+                t.rows,
+                t.title.clone(),
+                t.cwd.clone(),
+                t.child_exited,
+            )
         });
-        let exited = *entry.exited.lock().unwrap();
+        // The core's own reaper folds the child's exit; the entry mirror is
+        // the fallback. This is AHP 1.0's reconstruction contract: the exited
+        // state carries the retained grid, answered long after the process
+        // died, with no live PTY behind it.
+        let exited = child_exited.or(*entry.exited.lock().unwrap());
         Some(ahp::TerminalState {
             title: title.unwrap_or_default(),
             cwd: cwd.to_str().map(str::to_string),
