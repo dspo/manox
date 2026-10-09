@@ -1,4 +1,4 @@
-//! The process-wide pi provider registry.
+//! The process-wide provider registry.
 //!
 //! Registration is owned by the `manox_harness::provider` extension, which
 //! reads the native cx providers config and registers every provider
@@ -29,9 +29,9 @@ fn build() -> Arc<ProviderRegistry> {
         &registry,
         manox_harness::provider::default_config_path(),
     ) {
-        Ok(0) => tracing::info!("pi providers: no provider endpoints registered"),
-        Ok(count) => tracing::info!("pi providers: registered {count} provider endpoints"),
-        Err(err) => tracing::warn!("pi providers: registration failed: {err:#}"),
+        Ok(0) => tracing::info!("providers: no provider endpoints registered"),
+        Ok(count) => tracing::info!("providers: registered {count} provider endpoints"),
+        Err(err) => tracing::warn!("providers: registration failed: {err:#}"),
     }
     registry
 }
@@ -124,7 +124,7 @@ pub fn install_for_test(registry: Arc<ProviderRegistry>) {
 
 /// Wait for the one-shot initial registration to finish. Returns at once
 /// when it already completed, or when [`init`] was never called (nothing
-/// to wait for). Pi actors await this once at startup instead of
+/// to wait for). Harness actors await this once at startup instead of
 /// triggering per-thread provider reloads — registration (and its
 /// keychain/shell cost) happens exactly once per process.
 pub async fn wait_ready() {
@@ -148,7 +148,7 @@ pub fn global() -> Arc<ProviderRegistry> {
     // snapshot, not cascade into every model-listing view.
     REGISTRY
         .get()
-        .expect("pi_providers not initialized; call manox_agent::init first")
+        .expect("provider registry not initialized; call manox_agent::init first")
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -176,10 +176,10 @@ pub fn reload() -> anyhow::Result<()> {
         &fresh,
         manox_harness::provider::default_config_path(),
     )?;
-    tracing::info!("pi providers: reloaded {count} provider endpoints");
+    tracing::info!("providers: reloaded {count} provider endpoints");
     let lock = REGISTRY
         .get()
-        .expect("pi_providers not initialized; call manox_agent::init first");
+        .expect("provider registry not initialized; call manox_agent::init first");
     *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     // Fire the listener OUTSIDE the registry write lock: the broadcast
     // re-reads the fresh snapshot through global().
@@ -193,9 +193,9 @@ pub fn reload() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The default model for new pi threads: the settings `default_model`
+/// The default model for new threads: the settings `default_model`
 /// reference (id or alias) resolved against the registry, else the first
-/// registered model (sorted) that is visible to claude-class agents (pi is
+/// registered model (sorted) that is visible to claude-class agents (the harness is
 /// claude-class), else the first registered model outright, else `None`.
 pub fn default_model() -> Option<manox_harness::types::Model> {
     let reference = crate::settings::load().default_model;

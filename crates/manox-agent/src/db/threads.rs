@@ -361,7 +361,7 @@ impl ThreadsDatabase {
                     parent_id: row.get(11)?,
                     archived: row.get::<_, i64>(12)? != 0,
                     pinned: row.get::<_, i64>(13)? != 0,
-                    // The sidebar's tag source of truth is the pi session
+                    // The sidebar's tag source of truth is the session
                     // sidecar; the dead SQL path carries no tag column.
                     tag: None,
                     created_at: row.get(14)?,
@@ -450,7 +450,7 @@ impl ThreadsDatabase {
                 parent_id: row.get(9)?,
                 archived: row.get::<_, i64>(10)? != 0,
                 pinned: row.get::<_, i64>(11)? != 0,
-                // Tag lives in the pi session sidecar; the dead SQL path has none.
+                // Tag lives in the session sidecar; the dead SQL path has none.
                 tag: None,
                 created_at: row.get(12)?,
                 interacted_at: row.get(13)?,

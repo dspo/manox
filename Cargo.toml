@@ -1,7 +1,7 @@
 # manox —— 自研 agent runtime 库仓（gpui-free）。
 #
 # workspace 根。核心 crate（对外以 git 依赖形式提供给 host，如 dspo/manox-app）：
-#   - manox-harness:      agent 内核（pi 核心的 Rust 移植：agent loop、providers、
+#   - manox-harness:      agent 内核（agent loop、providers、
 #                         sessions、tools + ext 扩展）
 #   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
 #                         + MCP 接线）

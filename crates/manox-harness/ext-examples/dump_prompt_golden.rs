@@ -2,8 +2,8 @@
 //! template + prose:
 //!
 //! ```sh
-//! cargo run -p pi-extensions --example dump_prompt_golden \
-//!   > crates/pi-extensions/testdata/captain_prompt.golden.txt
+//! cargo run -p manox-harness --example dump_prompt_golden \
+//!   > crates/manox-harness/testdata/captain_prompt.golden.txt
 //! ```
 //!
 //! The dump renders [`manox_harness::prompt::render_golden_fixture`] — the

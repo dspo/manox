@@ -1,7 +1,7 @@
 # manox ↔ manox-app 交互协议 v3 —— AHP（Agent Host Protocol, channel 化）
 
 > **W0 规格冻结文档，normative**。本文冻结 v3 的目标终态、身份映射、不变式处置、x-manox 扩展声明面、依赖选型、删除清单与分期门禁；实施偏离一律记入 §H as-built，不回改上文冻结文本。
-> 取代关系：`docs/dsh-v2-architecture.md`（协议 v2，`manox-protocol`）自此进入冻结（只收 blocker 修复），其全部协议面到 v3 的映射以本文为唯一事实源。
+> 取代关系：协议 v2（`manox-protocol`）已被本文取代，其规格文档已删除；全部协议面到 v3 的映射以本文为唯一事实源。
 > 权威优先级（对 AHP 侧）：**`types/` 与 `ahp`/`ahp-types` crate 为准**，AHP 文档仅作语义参考（其示例仍写 0.3.0、`annotations` 行缺失、`disposeChat` 矛盾，差异记 as-built）。
 
 ## Context：现状事实（已核实，两仓当时 main）
@@ -10,7 +10,7 @@
 - 协议 v2 已自带的协议级机制（与 AHP 高度重叠）：`Initialize{protocol_epoch}` 握手、`FollowSession` 流（`Snapshot`→`Entry`→`Projections`）、seq 单点盖章（L4）、投影 `key→{value,asOfSeq}` higher-seq-wins（L6）、溢出即 `StreamEnd{Resync}` 的重同步（L5）、客户端缺口修复引擎 `journal_stream.rs`（497 行）、六车道信封（`FromClient`/`FromServer`）、31 个 `ClientNote` + 18 个 `ClientCall` + 6 个 `ServerCall`（waterfall 审批/询问/计划评审）+ `HostEvent` 总线 + `wire_surface!` 声明面（`surface.rs` 1032 行）。
 - 客户端侧（`dspo/manox-app`）已自行实现 AHP 意义上的 state store：`client_store.rs`+`client_store_handle.rs`（1153+2143 行）持 journal 窗口 + 投影面 + echo 表 + 传输状态，`journal_fold.rs`/`journal_translate.rs`（437+888）折叠与翻译，`multiplexer.rs`（1970）做 MsgId/StreamId 路由；`source_gates.rs`（432）用 grep 计数冻结「绕过网关的直读」，`views/*` 仍 import runtime Rust 类型（`ThreadEvent`/`Message`/`HistoryEntry`/`PermissionMode`…）并持 `ThreadHandle`「渲染镜像」。
 - AHP 侧（`~/projects/github/agent-host-protocol` @ `ce728562`，spec **0.9.0**）：JSON-RPC 2.0 + URI channel（`ahp-root://`、`ahp-session:/<uuid>`、`ahp-chat:/<cid>`、`ahp-terminal:/<id>`、`ahp-changeset:/<id>`、`ahp-automations://`、`ahp-session:/<uuid>/annotations`、`ahp-resource-watch:/<id>`、`ahp-otlp:`、`mcp://`）；"每帧 params 顶层带 `channel`" 使 `(method, params.channel)` 即可路由；宿主权威状态 + 客户端乐观写前（`dispatchAction{clientSeq}` → 宿主回 `action` 信封带 `origin{clientId,clientSeq}`/`rejectionReason`）；全局单调 `serverSeq` 与 `reconnect{lastSeenServerSeq}` 的「重放或快照」二选一；能力协商；`_meta` 与 **`x-` 前缀**为合法私有扩展位。
-- **必须自建（AHP 无宿主 SDK）**：`ahp`/`ahp-types`/`ahp-ws` 三个 crate 全是客户端（`ahp-ws` 只会 dial），没有任何 server/listener/session-manager/dispatcher/replay 设施。宿主半边——JSON-RPC 路由、全局 `serverSeq` 序号、快照与重连、动作校验/接受表、副作用派发（动作 → 真正跑 agent）、`resource*` 文件面——**是我们的新增维护面**。参考实现只有 VS Code（TS，`src/vs/platform/agentHost/node/`）、`pi-ahp`（TS，把 pi 暴露成 AHP host；pi 正是 manox 内核的上游）与一个 157 行的 dotnet 一致性 fixture。
+- **必须自建（AHP 无宿主 SDK）**：`ahp`/`ahp-types`/`ahp-ws` 三个 crate 全是客户端（`ahp-ws` 只会 dial），没有任何 server/listener/session-manager/dispatcher/replay 设施。宿主半边——JSON-RPC 路由、全局 `serverSeq` 序号、快照与重连、动作校验/接受表、副作用派发（动作 → 真正跑 agent）、`resource*` 文件面——**是我们的新增维护面**。参考实现只有 VS Code（TS，`src/vs/platform/agentHost/node/`）与一个 157 行的 dotnet 一致性 fixture。
 
 ### 用户裁决（2026-09-23）
 
@@ -221,7 +221,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W0 规格冻结（manox）
 
-- 交付：`docs/ahp-v3-architecture.md`（本文：映射表终稿 + x-manox 声明面 + 删除清单 + as-built 位）；`docs/dsh-v2-architecture.md` 顶部加「v2 已由 v3 取代，映射见 ahp-v3-architecture.md」指针（不改写历史章节）；本地拉起 VS Code Agents window 与 AHPX 作为外部验收客户端（记录 `settings.json` 与连接方式）。
+- 交付：`docs/ahp-v3-architecture.md`（本文：映射表终稿 + x-manox 声明面 + 删除清单 + as-built 位）；v2 规格文档加「v2 已由 v3 取代」指针（该文档现已删除）；本地拉起 VS Code Agents window 与 AHPX 作为外部验收客户端（记录 `settings.json` 与连接方式）。
 - 门禁：映射表与扩展面经用户确认；v2 进入冻结（只收 blocker 修复）。
 
 ### W1 宿主骨架（manox，纯新增）
@@ -349,7 +349,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 分支 `codex/ahp-host`（5 个提交，未 push、未开 PR）。已落地面与门禁：
 
-- **W0 规格冻结**：本文档 + `docs/dsh-v2-architecture.md` 顶部取代指针。
+- **W0 规格冻结**：本文档（v2 规格文档已由本文取代并删除）。
 - **journal 词汇叶子化**：新增 `crates/manox-journal/`（`journal.rs` 377 + `base64_bytes.rs` 53），
   偏离 §F/§E 的「迁入 manox-session-core」——叶子 crate 才不打断依赖拓扑
   （`manox-ahp` 需要词汇做翻译，`manox-session-core` 需要 `manox-ahp` 做宿主）。

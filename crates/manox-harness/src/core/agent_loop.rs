@@ -61,7 +61,7 @@ pub trait StreamFn: Send + Sync {
 
 /// Resolves the provider runtime for a model — the consumer-pluggable seam
 /// that switches protocol, endpoint, and credentials when the session model
-/// changes (the TS `Model.api` discriminator picking a stream function).
+/// changes (picking a stream function per protocol).
 /// `None` on the config keeps the run's fixed stream fn.
 pub type StreamResolver =
     Arc<dyn Fn(&Model) -> Result<Arc<dyn StreamFn>, anyhow::Error> + Send + Sync>;
@@ -83,8 +83,8 @@ pub async fn run_loop(
     let mut new_messages: Vec<AgentMessage> = prompts.to_vec();
 
     // Prepend prompts to the context. Their MessageStart/MessageEnd lifecycle
-    // is emitted inside the first turn (after AgentStart/TurnStart), matching
-    // TS Pi's event order — a consumer never sees a prompt outside its run.
+    // is emitted inside the first turn (after AgentStart/TurnStart) — a
+    // consumer never sees a prompt outside its run.
     let mut current_messages: Vec<AgentMessage> = context.messages.clone();
     current_messages.extend_from_slice(prompts);
     context.messages = current_messages;
@@ -177,7 +177,7 @@ async fn run_loop_inner(
 
             // On the first turn, announce the initial prompt messages after
             // AgentStart/TurnStart so they belong to the run and turn that
-            // consume them, mirroring TS Pi's event order.
+            // consume them.
             if turn_count == 1 {
                 for msg in new_messages.iter() {
                     sink.emit(AgentEvent::MessageStart {
@@ -322,7 +322,7 @@ async fn run_loop_inner(
 
                 for result in &tool_results {
                     // A tool result is a settled message in its own turn; give
-                    // it a matched MessageStart/MessageEnd pair like TS Pi.
+                    // it a matched MessageStart/MessageEnd pair.
                     sink.emit(AgentEvent::MessageStart {
                         message: Box::new(result.clone()),
                     })
@@ -362,7 +362,7 @@ async fn run_loop_inner(
                 context.messages.extend(update.appended_messages);
             }
 
-            // Check early stop (TS `shouldStopAfterTurn`, after `turn_end` and
+            // Check early stop (after `turn_end` and
             // `prepareNextTurn`). The turn's assistant `message` is passed, not
             // the last appended tool result.
             if let Some(ref should_stop) = config.should_stop_after_turn
@@ -477,7 +477,7 @@ async fn stream_assistant_response(
     // events the stream never sent, so exactly one of each reaches the sink
     // per assistant message. The latest partial assistant snapshot is kept so
     // a provider failure is materialized from the text that already streamed
-    // rather than an empty shell — TS marks the same partial message as an
+    // rather than an empty shell — the partial message surfaces as an
     // error, preserving content and usage.
     let mut first = true;
     let mut saw_end = false;
@@ -542,8 +542,8 @@ async fn stream_assistant_response(
 
 /// Build a terminal assistant message for a provider error or abort.
 ///
-/// `Aborted` when the run was cancelled, `Error` otherwise — matching the TS
-/// Pi terminal stop reasons. The message carries no content and an
+/// `Aborted` when the run was cancelled, `Error` otherwise — the terminal
+/// stop reasons. The message carries no content and an
 /// `error_message`, but keeps the model identity (`model`/`provider`/`api`)
 /// of the turn that was attempted, so a failed turn is still attributable to
 /// the model that was running it.
@@ -577,8 +577,8 @@ fn terminal_message(
 /// Terminal error for a provider failure that struck mid-stream: when a
 /// partial assistant already streamed, the failure is materialized from that
 /// snapshot — same content, usage, response identity, api, and timestamp —
-/// with only the stop reason and error message overwritten, mirroring TS's
-/// catch which marks the in-flight `output` in place as `stopReason: error`.
+/// with only the stop reason and error message overwritten — the in-flight
+/// output is marked in place as `stopReason: error`.
 /// Falls back to an empty terminal message when the stream failed before
 /// emitting anything.
 fn terminal_message_from_partial(
@@ -1217,7 +1217,7 @@ mod tests {
         );
     }
 
-    // ── should_stop_after_turn: TS `shouldStopAfterTurn` graceful stop ────────
+    // ── should_stop_after_turn: graceful stop ────────────────────────────────
 
     // The hook fires after `turn_end` + `prepareNextTurn`, receives the turn's
     // assistant `message` (not the last appended tool result), and — on true —
@@ -1766,7 +1766,7 @@ mod tests {
         assert!(has_user_start, "initial prompt must emit MessageStart");
         assert!(has_user_end, "initial prompt must emit MessageEnd");
 
-        // TS Pi orders the run/turn lifecycle before the user message: the
+        // The run/turn lifecycle is ordered before the user message: the
         // first MessageStart for a user prompt must follow AgentStart and the
         // first TurnStart.
         let user_start_idx = events
@@ -2303,7 +2303,7 @@ mod tests {
     /// provider does when the connection drops after streaming some text.
     struct PartialThenFailStreamFn {
         /// The timestamp stamped on the partial; the terminal error must keep
-        /// it, like TS mutating the in-flight output in place.
+        /// it — the in-flight output is mutated in place.
         partial_timestamp: chrono::DateTime<chrono::Utc>,
     }
 
@@ -2563,7 +2563,7 @@ mod tests {
     /// A mid-stream provider failure is materialized from the partial
     /// assistant that already streamed — content, usage, response id, and
     /// timestamp survive the error, so the text the user saw does not vanish
-    /// from the persisted turn (TS marks the same in-flight output as an
+    /// from the persisted turn (the same in-flight output is marked as an
     /// error).
     #[tokio::test]
     async fn provider_error_keeps_streamed_partial_content() {

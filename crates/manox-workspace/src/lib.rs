@@ -1,4 +1,4 @@
-//! Durable Workspace domain (deepseek-harness workspace parity): directory
+//! Durable Workspace domain: directory
 //! identity rows with an ordered, header-validated session account.
 //!
 //! A workspace is a stable uuid over an existing directory (`path` is the

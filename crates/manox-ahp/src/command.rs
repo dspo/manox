@@ -12,8 +12,6 @@
 //! else. Covering upstream's *whole* map is what makes the match a real gate —
 //! when a protocol release adds a command, [`Command::intent`] has no arm for it
 //! and the build fails, which is the only moment the drift is cheap to fix.
-//! (`pi-ahp` gets the same property from `satisfies Record<keyof CommandMap,
-//! CommandPolicy>` in TypeScript; this is its Rust equivalent.)
 //!
 //! Two consequences worth stating plainly:
 //!

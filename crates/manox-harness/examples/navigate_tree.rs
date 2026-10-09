@@ -6,7 +6,7 @@
 // branch and the summary survive.
 //
 // Usage:
-//   cargo run -p pi --example navigate_tree
+//   cargo run -p manox-harness --example navigate_tree
 
 use std::sync::Arc;
 

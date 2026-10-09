@@ -172,8 +172,8 @@ impl Drop for Subscription {
 /// [`Agent::run_with_lifecycle`]. Capacity one lets the loop run a single
 /// event ahead of the reducer; each emission awaits an acknowledgement fired
 /// only after the event has been reduced and its listeners awaited, so the
-/// loop's next step observes listener side effects — the same ordering TS
-/// Pi's awaited `emit` provides.
+/// loop's next step observes listener side effects: each emission is
+/// awaited before the loop proceeds.
 struct ChannelSink {
     tx: mpsc::Sender<(AgentEvent, tokio::sync::oneshot::Sender<()>)>,
 }
@@ -215,7 +215,7 @@ pub type PrepareTurnHook = Arc<
         > + Send
         + Sync,
 >;
-/// Decides whether the run should stop after a turn (TS `shouldStopAfterTurn`).
+/// Decides whether the run should stop after a turn.
 /// The `Arc<dyn Fn>` twin of [`crate::types::StopAfterTurnFn`] so
 /// `create_loop_config` can clone it into a per-run `Box` closure, mirroring
 /// the other observation hooks.
@@ -235,12 +235,12 @@ pub struct LoopHooks {
     pub before_provider_request: Option<BeforeProviderRequestHook>,
     pub before_tool_call: Option<BeforeToolCallHook>,
     pub after_tool_call: Option<AfterToolCallHook>,
-    /// Refreshes the loop context before the next turn of the same run — the
-    /// TS `prepareNextTurn` seam for applying runtime mutations (model,
+    /// Refreshes the loop context before the next turn of the same run —
+    /// the seam for applying runtime mutations (model,
     /// thinking level) queued mid-run.
     pub prepare_next_turn: Option<PrepareTurnHook>,
-    /// Stops the run after a turn settles — the TS `shouldStopAfterTurn`
-    /// seam for a graceful stop before the next LLM call.
+    /// Stops the run after a turn settles — a graceful stop before the next
+    /// LLM call.
     pub should_stop_after_turn: Option<StopAfterTurnHook>,
 }
 

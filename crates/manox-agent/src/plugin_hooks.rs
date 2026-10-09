@@ -8,8 +8,8 @@
 //! under manox.
 //!
 //! `SessionStart` fires before a session's first user turn (restored
-//! sessions skip it); `SessionEnd` fires when a thread is archived (the pi
-//! path's "session is over" analogue — the retired harness fired on thread
+//! sessions skip it); `SessionEnd` fires when a thread is archived (the
+//! "session is over" analogue — the retired harness fired on thread
 //! deletion). `Stop` fires on each turn's settlement. Hooks are
 //! fire-and-forget and fail-open: a handler error or timeout is logged and
 //! never blocks the turn. `PreToolUse` / `PostToolUse` therefore cannot

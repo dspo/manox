@@ -8,7 +8,7 @@
 // provider B.
 //
 // Usage:
-//   cargo run -p pi --example runtime_switch
+//   cargo run -p manox-harness --example runtime_switch
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};

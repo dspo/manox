@@ -1,6 +1,6 @@
 //! Host-private Title agent and its evidence shaping.
 //!
-//! Title generation is a manox capability, not a Pi parity surface. Each run
+//! Title generation is a manox capability, not a parity surface. Each run
 //! creates an ephemeral `manox_harness::Agent` with exactly one terminating `Title` tool.
 
 use std::path::Path;
@@ -13,7 +13,7 @@ use manox_harness::tool::{
     AgentTool, AgentToolResult, LocalToolContext, ToolContext, ToolError, ToolState,
 };
 use manox_harness::types::{
-    AgentMessage, ContentBlock, Model as PiModel, StopReason, StreamOptions,
+    AgentMessage, ContentBlock, Model as HarnessModel, StopReason, StreamOptions,
 };
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
@@ -216,7 +216,7 @@ pub fn request_prompt(request: &TitleRequest) -> String {
 
 pub async fn run_title_agent(
     runtime: &ModelRuntime,
-    session_model: &PiModel,
+    session_model: &HarnessModel,
     cwd: &Path,
     request: &TitleRequest,
 ) -> anyhow::Result<Option<String>> {
@@ -677,7 +677,7 @@ mod tests {
             "/tmp".into(),
             Arc::new(ToolState::new()),
         ));
-        let model = PiModel {
+        let model = HarnessModel {
             provider: "test".into(),
             api: "test".into(),
             id: "test".into(),

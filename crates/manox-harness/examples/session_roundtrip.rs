@@ -3,7 +3,7 @@
 // #373 (entry types / leaf-as-entry).
 //
 // Usage:
-//   cargo run -p pi --example session_roundtrip
+//   cargo run -p manox-harness --example session_roundtrip
 
 use manox_harness::AgentMessage;
 use manox_harness::session::jsonl::{JsonlSessionMetadata, JsonlSessionStorage};

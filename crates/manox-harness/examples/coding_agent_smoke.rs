@@ -6,7 +6,7 @@
 // resources, and compaction all run for real.
 //
 // Usage:
-//   cargo run -p pi --example coding_agent_smoke
+//   cargo run -p manox-harness --example coding_agent_smoke
 
 use std::sync::Arc;
 
@@ -107,12 +107,8 @@ fn fake_runtime() -> ModelRuntime {
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    // An isolated agent dir keeps set_model from writing the real
-    // ~/.pi/agent/settings.json; the smoke run must not touch the host.
-    let agent_dir = dir.path().join("agent");
-    tokio::fs::create_dir_all(&agent_dir).await.unwrap();
     // A CLAUDE.md (automatic context), a project skill, and a prompt
-    // template in the TS `.pi` layout.
+    // template under explicit resource directories.
     tokio::fs::write(cwd.join("CLAUDE.md"), "Keep changes minimal.")
         .await
         .unwrap();
@@ -120,26 +116,30 @@ async fn main() {
     tokio::fs::write(cwd.join("README.md"), "# smoke fixture\n")
         .await
         .unwrap();
-    tokio::fs::create_dir_all(cwd.join(".pi/skills"))
-        .await
-        .unwrap();
+    let skills_dir = cwd.join("skills");
+    let prompts_dir = cwd.join("prompts");
+    tokio::fs::create_dir_all(&skills_dir).await.unwrap();
     tokio::fs::write(
-        cwd.join(".pi/skills/review.md"),
+        skills_dir.join("review.md"),
         "---\nname: review\ndescription: review the work\n---\nCheck the diff.",
     )
     .await
     .unwrap();
-    tokio::fs::create_dir_all(cwd.join(".pi/prompts"))
+    tokio::fs::create_dir_all(&prompts_dir).await.unwrap();
+    tokio::fs::write(prompts_dir.join("review.md"), "Review {target}.")
         .await
         .unwrap();
-    tokio::fs::write(cwd.join(".pi/prompts/review.md"), "Review {target}.")
+    let resources = ResourceLoader::new(&cwd)
+        .with_skill_dirs(vec![skills_dir])
+        .with_prompt_dirs(vec![prompts_dir])
+        .snapshot()
         .await
         .unwrap();
 
     let mut session = create_agent_session()
         .with_cwd(cwd.clone())
         .with_session_dir(dir.path().join("sessions"))
-        .with_agent_dir(agent_dir.clone())
+        .with_resources(resources)
         .with_model_runtime(fake_runtime())
         .with_model(Model {
             provider: "mock".into(),
@@ -154,12 +154,16 @@ async fn main() {
         .await
         .expect("build");
 
-    // Loaded resources: project instructions became a skill, the template is
-    // available.
-    let resources = ResourceLoader::new(&cwd).snapshot().await.unwrap();
+    // Mounted resources: project instructions became context, the skill and
+    // the template are available.
+    let resources = session.resources().clone();
     assert_eq!(resources.context_files.len(), 1, "CLAUDE.md is context");
-    assert_eq!(resources.skills.len(), 1, ".pi/skills loads");
-    assert_eq!(resources.prompt_templates.len(), 1, ".pi/prompts loads");
+    assert_eq!(resources.skills.len(), 1, "explicit skill dir loads");
+    assert_eq!(
+        resources.prompt_templates.len(),
+        1,
+        "explicit prompt dir loads"
+    );
     println!(
         "resources: {} context files, {} skills, {} templates",
         resources.context_files.len(),
@@ -218,7 +222,6 @@ async fn main() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     let mut resumed = create_agent_session()
         .with_cwd(cwd)
-        .with_agent_dir(agent_dir)
         .with_model_runtime(fake_runtime())
         .open(listed[0].path.clone())
         .await

@@ -1,5 +1,5 @@
 //! Type definitions for the Steer agent bus — the unified inter-agent
-//! messaging primitive. These types live in pi-extensions (the extension
+//! messaging primitive. These types live in the extension layer (the
 //! layer) so both manox hosts share them without duplicating. The
 //! `AgentBus` implementation (routing, spawn, completion) lives in the
 //! host (`agent` crate) because it touches host-owned primitives.

@@ -2,7 +2,7 @@
 //!
 //! The engine core owns its own tokio runtime and exposes blocking calls, so
 //! every engine operation moves onto a blocking thread; tools never call the
-//! facade from an async context. The pi cancellation token is mirrored onto
+//! facade from an async context. The kernel cancellation token is mirrored onto
 //! the engine's `CancelToken`, so a cancelled turn interrupts the in-flight
 //! CDP wait instead of letting it run to the operation timeout.
 

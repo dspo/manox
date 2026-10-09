@@ -1,6 +1,6 @@
 //! Permission gating for the manox harness (host-layer policy).
 //!
-//! The pi kernel exposes the `requires_approval` seam on `AgentTool` but
+//! The kernel exposes the `requires_approval` seam on `AgentTool` but
 //! deliberately ships no gate — permission policy is a harness concern. This
 //! module is the manox harness's gate: pure mode-based allow/deny, fully
 //! synchronous, no reviewer and no interactive approval round trip.
@@ -17,13 +17,14 @@
 //! `AskUserQuestion`, which is an interaction by design, not a permission
 //! prompt.
 
-use manox_harness::types::Model as PiModel;
+use manox_harness::types::Model as HarnessModel;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use manox_harness::tool::{
-    AgentTool as PiAgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError, ToolProgress,
+    AgentTool as HarnessAgentTool, AgentToolResult, ExecutionMode, ToolContext, ToolError,
+    ToolProgress,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -33,7 +34,7 @@ use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Model-facing denial marker (always English, never localized): read-only mode
-/// refuses every fs mutation. Matches deepseek's `[sandbox: …]` vocabulary.
+/// refuses every fs mutation.
 const DENY_READ_ONLY: &str = "[sandbox: file access denied under read-only mode]";
 /// Model-facing denial marker: workspace-write refuses a mutation whose
 /// target the policy cannot prove inside the writable roots.
@@ -55,7 +56,7 @@ struct PendingAuth {
     meta: PendingAuthMeta,
 }
 
-/// Shared permission state for one pi thread: the mode, the pending
+/// Shared permission state for one thread: the mode, the pending
 /// interaction round trips, and the event channel back to the UI. Lives in
 /// the engine state so the tool wrappers (tokio side) and the facade's
 /// respond path (gpui side) see one source of truth.
@@ -63,7 +64,7 @@ pub struct ApprovalGate {
     mode: Mutex<PermissionMode>,
     pending: Mutex<HashMap<String, PendingAuth>>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
-    model: Arc<Mutex<Option<PiModel>>>,
+    model: Arc<Mutex<Option<HarnessModel>>>,
     /// K3 (L3): the engine actor's command sender, wired at spawn. The
     /// user's verdict on a parked card is an observable state change — it
     /// journals as an `approval` decision entry through the actor's
@@ -72,7 +73,7 @@ pub struct ApprovalGate {
     /// standalone gate (tests): verdicts simply do not journal.
     journal_sink: Mutex<Option<mpsc::UnboundedSender<crate::engine::SessionCmd>>>,
     /// D5 marker: `true` on a gate handed to a *delegated* (subagent) tool.
-    /// The runtime root's gate is `false`. `PiAskUserQuestionTool` refuses a
+    /// The runtime root's gate is `false`. `AskUserQuestionTool` refuses a
     /// call on a delegated gate (`DELEGATED_CALLER`) so only the root can ask
     /// a human. Default `false` (main-line gate).
     delegated: bool,
@@ -81,7 +82,7 @@ pub struct ApprovalGate {
 impl ApprovalGate {
     pub fn new(
         notice_tx: mpsc::UnboundedSender<BackendNotice>,
-        model_slot: Arc<Mutex<Option<PiModel>>>,
+        model_slot: Arc<Mutex<Option<HarnessModel>>>,
     ) -> Self {
         Self {
             mode: Mutex::new(PermissionMode::default()),
@@ -94,7 +95,7 @@ impl ApprovalGate {
     }
 
     /// Mark this gate as belonging to a delegated (subagent) tool — the
-    /// `DELEGATED_CALLER` signal `PiAskUserQuestionTool` refuses on.
+    /// `DELEGATED_CALLER` signal `AskUserQuestionTool` refuses on.
     pub fn with_delegated(mut self, delegated: bool) -> Self {
         self.delegated = delegated;
         self
@@ -121,13 +122,13 @@ impl ApprovalGate {
         *self.mode.lock().unwrap() = mode;
     }
 
-    pub fn model(&self) -> Option<PiModel> {
+    pub fn model(&self) -> Option<HarnessModel> {
         self.model.lock().unwrap().clone()
     }
 
     /// Live handle to the owner's model slot so dispatch-time readers (e.g.
     /// subagent spawn) inherit the current model, not an assembly snapshot.
-    pub fn model_slot(&self) -> Arc<Mutex<Option<PiModel>>> {
+    pub fn model_slot(&self) -> Arc<Mutex<Option<HarnessModel>>> {
         Arc::clone(&self.model)
     }
 
@@ -294,10 +295,10 @@ impl manox_harness::sandbox::EscalationApprover for GateEscalationApprover {
 
 // ── The gating wrapper ──────────────────────────────────────────────────────
 
-/// Wraps a pi tool with the host's permission policy. Tools that neither
+/// Wraps a kernel tool with the host's permission policy. Tools that neither
 /// declare `requires_approval` nor mutate anything pass straight through.
 pub struct ApprovalGatedTool {
-    inner: Arc<dyn PiAgentTool>,
+    inner: Arc<dyn HarnessAgentTool>,
     gate: Arc<ApprovalGate>,
     /// Plan-mode exemption: plan-file writes bypass the gate while plan
     /// mode is active (the model drafts the plan incrementally).
@@ -323,7 +324,7 @@ pub struct ApprovalGatedTool {
 pub type AutoAllowResolver = Arc<dyn Fn(&str, &serde_json::Value) -> bool + Send + Sync>;
 
 impl ApprovalGatedTool {
-    pub fn new(inner: Arc<dyn PiAgentTool>, gate: Arc<ApprovalGate>) -> Self {
+    pub fn new(inner: Arc<dyn HarnessAgentTool>, gate: Arc<ApprovalGate>) -> Self {
         Self {
             inner,
             gate,
@@ -458,7 +459,7 @@ impl ApprovalGatedTool {
 
     /// Validate the `sandbox_permissions`+`justification` pairing and, when
     /// present, resolve the wider mode through the host approver, returning
-    /// it as a per-call grant (no shared state — deepseek parity). `None`
+    /// it as a per-call grant (no shared state). `None`
     /// means no escalation was requested. A non-widening or unapproved
     /// request returns the verbatim error (fail-closed).
     async fn resolve_escalation(
@@ -657,7 +658,7 @@ fn nearest_existing_ancestor(target: &Path) -> PathBuf {
 }
 
 #[async_trait::async_trait]
-impl PiAgentTool for ApprovalGatedTool {
+impl HarnessAgentTool for ApprovalGatedTool {
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -769,7 +770,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl PiAgentTool for MockTool {
+    impl HarnessAgentTool for MockTool {
         fn name(&self) -> &str {
             self.name
         }
@@ -1377,7 +1378,7 @@ mod tests {
     /// escalation-field merge has somewhere to land).
     struct PropMock;
     #[async_trait::async_trait]
-    impl PiAgentTool for PropMock {
+    impl HarnessAgentTool for PropMock {
         fn name(&self) -> &str {
             "Write"
         }

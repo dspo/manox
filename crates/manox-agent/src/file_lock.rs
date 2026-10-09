@@ -1,5 +1,5 @@
 //! Process-global file write lock registry (ported from the retired manox
-//! harness) + the pi-path enforcement wrapper.
+//! harness) + the kernel-path enforcement wrapper.
 //!
 //! NOWAIT try-lock: concurrent writes to the same path are rejected with an
 //! error so agents coordinate disjoint write ranges instead of silently
@@ -14,7 +14,7 @@
 //! scope: a shell command's touched paths are not statically knowable, so
 //! bash-heavy work is coordinated by assigning it to disjoint directories.
 //!
-//! Pi wiring: the kernel's Write/Edit tools are wrapped in
+//! Wiring: the kernel's Write/Edit tools are wrapped in
 //! [`FileLockedTool`], which acquires the path's lock for the duration of
 //! the actual execution window (approval round trips happen outside the
 //! lock) and rejects with the holder's name on conflict. The retired manox

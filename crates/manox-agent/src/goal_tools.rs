@@ -1,10 +1,10 @@
-//! Goal service bridge and `AgentTool` adapters for the pi harness.
+//! Goal service bridge and `AgentTool` adapters for the harness.
 //!
 //! [`GoalBridge`] is the single writer of one thread's goal event stream: it
 //! folds the durable events (`crate::goal::fold_goal_events`) into the current
 //! [`ThreadGoal`], validates every mutation against the fold before appending
 //! (fail-loud, never a silent fallback), and holds the process-local
-//! continuation authority (`armed`) that the round driver gates on — the DSH
+//! continuation authority (`armed`) that the round driver gates on — the
 //! phase/activation split. The engine actor owns no gpui entities, so the
 //! facade and the tools share one bridge per thread.
 //!
@@ -49,7 +49,7 @@ pub struct GoalBridge {
     thread_id: String,
     notice_tx: Mutex<Option<mpsc::UnboundedSender<BackendNotice>>>,
     fold: Mutex<GoalFoldCache>,
-    /// Process-local continuation authority (DSH activation): whether the
+    /// Process-local continuation authority (activation): whether the
     /// round driver may queue another round. Never inherited on restore.
     ///
     /// Relaxed ordering is sufficient because every reader and writer runs
@@ -170,7 +170,7 @@ impl GoalBridge {
     }
 
     /// Remove process-local continuation authority without a durable change
-    /// (DSH `disarm`). The goal keeps its durable phase.
+    /// (disarm). The goal keeps its durable phase.
     pub fn disarm(&self) {
         self.armed.store(false, Ordering::Relaxed);
     }
@@ -282,7 +282,7 @@ impl GoalBridge {
     }
 
     /// Edit objective/budget/rounds in place (keeps goal id, status, and
-    /// revision continuity). Continuation authority is preserved (DSH: edit
+    /// revision continuity). Continuation authority is preserved (edit
     /// does not re-arm or disarm).
     fn edit(
         &self,

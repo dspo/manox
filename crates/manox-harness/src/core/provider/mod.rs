@@ -15,15 +15,15 @@ pub mod retry;
 pub mod sse;
 pub mod transform;
 
-/// Observes each HTTP request attempt of a provider stream — the TS
-/// before-payload / after-response hooks. A consumer attaches one via the
+/// Observes each HTTP request attempt of a provider stream. A consumer
+/// attaches one via the
 /// provider builder (`with_request_observer`) to surface payload and status
 /// outside the provider; the harness maps it onto its
 /// `BeforeProviderPayload` / `AfterProviderResponse` hook points.
 pub trait RequestObserver: Send + Sync {
     /// The payload about to be sent for `model`, `attempt` 1-indexed.
     /// Returning `Some(replacement)` substitutes the payload for this
-    /// attempt (the TS before-payload mutation); `None` sends the original.
+    /// attempt; `None` sends the original.
     fn before_payload(
         &self,
         attempt: u32,
@@ -56,8 +56,8 @@ pub fn model_cost_rates(model: &Model) -> Option<Cost> {
         .then_some(rates)
 }
 
-/// Price a wire usage against a rate card (USD per 1M tokens per class) —
-/// the TS pi-ai per-message pricing step. `Cost.total` sums all classes.
+/// Price a wire usage against a rate card (USD per 1M tokens per class).
+/// `Cost.total` sums all classes.
 pub fn price_usage(rates: &Cost, usage: &Usage) -> Cost {
     let per_million = |tokens: u64, rate: f64| tokens as f64 * rate / 1_000_000.0;
     let input = per_million(usage.input_tokens, rates.input);

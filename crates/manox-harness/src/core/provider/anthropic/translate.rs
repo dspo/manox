@@ -1,4 +1,4 @@
-// Translation between pi's domain types and the Anthropic wire types.
+// Translation between the domain types and the Anthropic wire types.
 //
 // The domain types in `crate::types` already mirror the protocol's block
 // shapes, so this layer is thin. The two non-trivial jobs are:
@@ -14,7 +14,7 @@ use crate::types::{
 
 /// Map a thinking level to an adaptive-thinking effort.
 ///
-/// pi reasons in named levels; adaptive models take an effort tier instead of
+/// named levels; adaptive models take an effort tier instead of
 /// a token budget. Unknown levels fall back to `high`, matching the reference
 /// mapping. "xhigh"/"max" pass through for the models that support them.
 fn map_effort(level: &str) -> Effort {
@@ -302,7 +302,7 @@ fn assistant_block_to_param(block: &ContentBlock) -> Option<ContentBlockParam> {
     }
 }
 
-/// Map a stored image block to the Anthropic wire source. TS Pi stores images
+/// Map a stored image block to the Anthropic wire source. Stored images are
 /// flat (`data` + `mimeType`); the Anthropic API nests them under `source`.
 fn image_source(data: &str, mime_type: &str) -> ImageSourceParam {
     ImageSourceParam::Base64 {
@@ -313,7 +313,7 @@ fn image_source(data: &str, mime_type: &str) -> ImageSourceParam {
 
 /// Parse a protocol stop_reason string into the domain enum.
 ///
-/// Faithful to the TS Pi map: refusal/sensitive/overflow collapse to `Error`
+/// refusal/sensitive/overflow collapse to `Error`
 /// (the refusal explanation surfaces as `error_message` on the message, set by
 /// the accumulator); pause_turn/stop_sequence read as a natural `Stop`.
 pub fn parse_stop_reason(s: &str) -> crate::types::StopReason {

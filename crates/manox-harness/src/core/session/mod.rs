@@ -3,7 +3,7 @@
 // A session is a tree of entries persisted as JSONL. Each entry has an id and
 // parentId, forming a DAG walked leafward to reconstruct the conversation
 // context. Variant `type` tags are snake_case and field names are camelCase,
-// matching the TS Pi v3 on-disk schema exactly so real session files load.
+// matching the on-disk schema exactly so real session files load.
 
 pub mod jsonl;
 pub mod repository;
@@ -15,7 +15,7 @@ use serde_json::Value as JsonValue;
 
 /// A single entry in the session tree.
 ///
-/// Field names serialize as camelCase to match the TS Pi v3 schema. A `leaf`
+/// Field names serialize as camelCase. A `leaf`
 /// entry records a cursor move to an older branch point: its `targetId` is the
 /// entry the cursor now points at, and the leaf entry itself is never walked
 /// The process that started a turn — the local wire mirror of the journal's
@@ -38,7 +38,7 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         message: AgentMessage,
         /// The RPC id this message was submitted under (§C.2 `originRpc`,
-        /// dsh `source.rpcId`). The server pins the client's Submit
+        /// source RPC id). The server pins the client's Submit
         /// `origin_rpc` on the user message's journal entry so the client can
         /// retire its optimistic echo (echo/retire protocol, §F.2). Absent on
         /// every other entry and on older session files.
@@ -160,8 +160,8 @@ pub enum SessionTreeEntry {
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         target_id: String,
-        // TS types `label` as `string | undefined` and omits it when unset;
-        // skip-on-None keeps Rust output byte-identical to a TS-written entry.
+        // `label` is optional on the wire and omitted when unset;
+        // skip-on-None keeps Rust output byte-identical to external writers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
@@ -276,7 +276,7 @@ pub enum SessionTreeEntry {
         timestamp: DateTime<Utc>,
         message: String,
     },
-    /// An assistant text delta (durable streaming chunk, dsh parity).
+    /// An assistant text delta (durable streaming chunk).
     #[serde(rename = "agent_text_delta", rename_all = "camelCase")]
     AgentTextDelta {
         id: String,
@@ -685,7 +685,7 @@ pub struct Session<S: SessionStorage> {
     storage: S,
     /// Serializes parent-selection + append so concurrent appends never read
     /// the same leaf and fork sibling branches — the linearized per-session
-    /// append queue of the TS storage (upstream 4488ad55c).
+    /// append queue.
     append_lock: tokio::sync::Mutex<()>,
     /// The RPC id a client pinned to THIS turn's first user message (the
     /// echo-retirement contract, §F.2): the host sets it when Submit carries
@@ -1057,7 +1057,7 @@ impl<S: SessionStorage> Session<S> {
     }
 
     /// Move the session cursor to an earlier entry, appending a `leaf` entry
-    /// that records the branch point — the TS `moveTo`. `None` resets the
+    /// that records the branch point. `None` resets the
     /// cursor to the root.
     pub async fn move_to(&self, target_id: Option<&str>) -> Result<(), anyhow::Error> {
         self.storage.set_leaf_id(target_id).await
@@ -1283,7 +1283,7 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 
     let mut context_entries = vec![path[compaction_idx].clone()];
     // A `first_kept_entry_id` absent from the path keeps nothing — the same
-    // outcome an undefined id produces in a hand-edited TS session file.
+    // outcome an undefined id produces in a hand-edited session file.
     if retained_tail.is_none() {
         let mut found_first_kept = false;
         for entry in &path[..compaction_idx] {
@@ -1302,7 +1302,7 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 /// The settings the active path carries: the reasoning tier from the latest
 /// `thinking_level_change`, the model from the latest `model_change` (an
 /// assistant message's own identity is a fresher witness than an older
-/// `model_change`, matching the TS projection), the active tool subset from
+/// `model_change`), the active tool subset from
 /// the latest `active_tools_change`, and the effective working directory from
 /// the latest `cwd_change`.
 #[allow(clippy::type_complexity)]
@@ -1627,7 +1627,7 @@ mod tests {
             cwd: "/private/tmp/manox--wt".into(),
         };
         let wire = serde_json::to_string(&entry).unwrap();
-        // The wire tag and camelCase fields must match the TS Pi v3 shape.
+        // The wire tag and camelCase fields must match the on-disk shape.
         assert!(wire.contains(r#""type":"cwd_change""#), "{wire}");
         assert!(wire.contains(r#""parentId":"m1""#), "{wire}");
         let back: SessionTreeEntry = serde_json::from_str(&wire).unwrap();
@@ -1882,7 +1882,7 @@ mod tests {
     }
 }
 
-/// The TS `SessionTreeEntry["type"]` discriminator used by branch queries.
+/// The `SessionTreeEntry` type discriminator used by branch queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryType {
     Message,
@@ -1979,7 +1979,7 @@ impl EntryType {
 /// Where a branch query starts traversing.
 #[derive(Debug, Clone, Default)]
 pub enum BranchStart {
-    /// The active leaf (TS `start` unset).
+    /// The active leaf.
     #[default]
     Leaf,
     /// Explicit `null`: no traversal, empty result.
@@ -1988,11 +1988,11 @@ pub enum BranchStart {
     At(String),
 }
 
-/// The TS `SessionBranchQuery`: a bounded traversal of the active branch.
+/// A bounded traversal query over the active branch.
 #[derive(Debug, Clone, Default)]
 pub struct SessionBranchQuery {
     /// Entry where traversal starts; defaults to the active leaf. `None`
-    /// (TS `null`) yields an empty result.
+    /// yields an empty result.
     pub start: BranchStart,
     /// Stop after the first entry of this type (inclusive).
     pub stop_at_type: Option<EntryType>,
@@ -2008,7 +2008,7 @@ pub struct SessionBranchQuery {
     pub limit: Option<usize>,
 }
 
-/// A branch-query failure carrying the TS error code.
+/// A branch-query failure carrying the stable error code.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BranchQueryError {
     /// The traversal start entry does not exist.
@@ -2020,8 +2020,8 @@ pub enum BranchQueryError {
 }
 
 impl<S: SessionStorage> Session<S> {
-    /// Find entries on the active branch under the given bounds — the
-    /// upstream `findEntriesOnBranch`. Mirrors the TS semantics exactly:
+    /// Find entries on the active branch under the given bounds. The walk
+    /// semantics exactly:
     /// walk from `start` toward the root (newest first) or from the root
     /// toward `start` (oldest first), stop after `stopAtType` / `stopAtId`
     /// (inclusive, computed after the traversal), filter by type / custom

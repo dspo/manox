@@ -1,8 +1,8 @@
 //! The `Thread` facade — the UI-facing conversation type.
 //!
 //! A gpui-free thread owned behind a `ThreadHandle` (`Arc<ThreadCore>`): the
-//! state lives in a lock, and run events from the tokio actor around a pi
-//! `AgentSession` (via the `ThreadEngine` contract) flow back through a
+//! state lives in a lock, and run events from the tokio actor around a
+//! harness `AgentSession` (via the `ThreadEngine` contract) flow back through a
 //! channel, are adapted into `ThreadEvent`s (see `engine::adapt`), and
 //! broadcast to the handle's subscribers. History is exposed as a display
 //! sequence (messages interleaved with persisted UI annotation cards) so the
@@ -23,7 +23,7 @@ use crate::goal_tools::GoalBridge;
 use crate::language_model::{MessageContent, ReasoningEffort, Role, StopReason, TokenUsage};
 use crate::message::{Message, MessageUiMetadata};
 use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine};
-use manox_harness::types::Model as PiModel;
+use manox_harness::types::Model as HarnessModel;
 
 /// Stable `Thread` id used for persistence.
 #[derive(Debug, Clone, Default)]
@@ -77,7 +77,7 @@ impl HistoryPhase {
     }
 }
 
-/// Events emitted by `Thread` to the UI. The pi backend produces the run
+/// Events emitted by `Thread` to the UI. The harness backend produces the run
 /// lifecycle subset; the remaining variants exist so the workspace and
 /// conversation list compile against the shared contract and simply never
 /// fire.
@@ -148,7 +148,7 @@ pub enum ThreadEvent {
         id: String,
         chunk: String,
     },
-    /// A sub-agent's child thread was constructed. Not produced by the pi
+    /// A sub-agent's child thread was constructed. Not produced by the
     /// backend in this stage (sub-agent observation panels are not wired).
     /// Carries the child's [`ThreadId`] (value type) — the event crosses the
     /// kernel boundary, so no handle/entity rides it.
@@ -171,7 +171,7 @@ pub enum ThreadEvent {
         /// carries one; `None` for lifecycle-only progress events.
         health: Option<String>,
     },
-    /// A streamed child-session event from a running sub-agent (the pi
+    /// A streamed child-session event from a running sub-agent (the
     /// bridge of the child's text/thinking deltas and tool lifecycle). The
     /// conversation attaches these to the Agent tool call's drill-down
     /// output; the rail uses them for live activity.
@@ -311,7 +311,7 @@ pub enum ThreadEvent {
     /// parity: the backend emits this from `BackendNotice::HistoryProgress` —
     /// keep the two variants in sync when either side changes.
     HistoryProgress,
-    /// The pi backend restored an existing session and the authoritative
+    /// The harness backend restored an existing session and the authoritative
     /// history is ready. The workspace rebuilds the conversation view.
     HistoryRestored,
     /// The persisted display title changed (Title agent result); the facade
@@ -321,7 +321,7 @@ pub enum ThreadEvent {
     },
 }
 
-/// The pi-backed thread facade.
+/// The harness-backed thread facade.
 pub struct Thread {
     pub id: ThreadId,
     cwd: PathBuf,
@@ -329,7 +329,7 @@ pub struct Thread {
     /// engine's granted-root set at spawn (multi-working-dirs).
     extra_working_dirs: Vec<PathBuf>,
     project: Option<PathBuf>,
-    model: Option<PiModel>,
+    model: Option<HarnessModel>,
     permission_mode: PermissionMode,
     messages: Vec<Message>,
     reasoning_effort: ReasoningEffort,
@@ -1317,8 +1317,7 @@ impl Thread {
         ui: Option<MessageUiMetadata>,
     ) {
         // Text blocks join the prompt text; image blocks ride the next
-        // prompt as kernel `ContentBlock::Image` (TS `prompt(text, { images })`
-        // parity).
+        // prompt as kernel `ContentBlock::Image`.
         let ordinal = self.user_prompt_ordinal();
         let human = ui.as_ref().and_then(|u| u.author.as_ref()).is_none();
         let mut images = Vec::new();
@@ -1390,7 +1389,7 @@ impl Thread {
         if let Some(engine) = &self.engine {
             engine.steer(text, images, Some(id.clone()));
         }
-        // The canonical message joins history at the next refresh (pi owns the
+        // The canonical message joins history at the next refresh (the harness owns the
         // transcript); the workspace renders the optimistic bubble until
         // `SteerInjected` confirms.
         id
@@ -1503,7 +1502,7 @@ impl Thread {
         self.project.as_ref()
     }
 
-    pub fn model(&self) -> Option<&PiModel> {
+    pub fn model(&self) -> Option<&HarnessModel> {
         self.model.as_ref()
     }
 
@@ -1526,7 +1525,7 @@ impl Thread {
                 let flat: String = t.split_whitespace().collect::<Vec<_>>().join(" ");
                 crate::title::initial_title(&flat).unwrap_or_default()
             })
-            .unwrap_or_else(|| "Manox Pi".to_string())
+            .unwrap_or_else(|| "manox".to_string())
     }
 
     pub fn permission_mode(&self) -> PermissionMode {
@@ -1821,7 +1820,7 @@ impl Thread {
         self.run_turn();
     }
 
-    /// Construct a team worker thread: a fresh pi session inheriting this
+    /// Construct a team worker thread: a fresh session inheriting this
     /// (leader) thread's cwd / model / permission mode / reasoning effort,
     /// labeled with the member name. Engine spawned eagerly (members always
     /// run). Members carry no goal bridge: the goal contract belongs to the
@@ -2170,7 +2169,7 @@ impl Thread {
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.
-    pub fn set_model(&mut self, model: PiModel) {
+    pub fn set_model(&mut self, model: HarnessModel) {
         let from = self.model.as_ref().map(|m| m.id.clone());
         let to = model.id.clone();
         self.model = Some(model.clone());
@@ -2217,19 +2216,19 @@ fn drain_engine_notices(
     });
 }
 
-/// Human-readable tool card title from the pi tool name + arguments. The
+/// Human-readable tool card title from the tool name + arguments. The
 /// third parameter (manox's sub-agent description override) is unused by the
-/// pi backend, which never spawns manox sub-agents.
+/// harness backend, which never spawns manox sub-agents.
 pub fn tool_title(name: &str, args: &serde_json::Value, _desc: Option<&str>) -> String {
     crate::engine::adapt::tool_title(name, args)
 }
 
 // Shared helpers the compact/estimation path calls with the same signature as
-// the manox build. The pi backend owns its own context management, so the
+// the manox build. The harness backend owns its own context management, so the
 // model-facing mapping is identity here and the pure helpers mirror the
 // manox semantics.
 
-/// The model-facing form of one content block. Pi keeps blocks verbatim —
+/// The model-facing form of one content block. The kernel keeps blocks verbatim —
 /// there is no manox envelope/compaction rewriting to undo.
 pub fn model_facing_content(c: &MessageContent) -> MessageContent {
     c.clone()
@@ -2255,7 +2254,7 @@ impl Thread {
     /// Run a markdown prompt-macro turn (`/plugin:command args`): render the
     /// command body with `$ARGUMENTS` substituted and send it as a user turn.
     /// The retired manox harness additionally applies the macro's
-    /// `allowed-tools` filter for the turn; the pi harness runs its full
+    /// `allowed-tools` filter for the turn; the harness runs its full
     /// toolset.
     pub fn submit_command(
         &mut self,
@@ -2510,7 +2509,7 @@ impl Thread {
     /// The ordinal the next inserted user prompt will occupy among user-role
     /// prompt messages — the sidecar key for its compact display form. The
     /// count runs over the mirrored transcript (`self.messages`), which
-    /// matches the pi session's `AgentMessage::User` entries: tool results
+    /// matches the session's `AgentMessage::User` entries: tool results
     /// and bash records are separate variants and never consume an ordinal.
     fn user_prompt_ordinal(&self) -> usize {
         self.messages
@@ -2522,7 +2521,7 @@ impl Thread {
     }
 
     /// Persist a registry turn's compact display form (`/key args`) in the
-    /// session sidecar. The pi transcript stores only the expanded
+    /// session sidecar. The transcript stores only the expanded
     /// macro/skill body, so the sidecar is what lets `engine::sync_history`
     /// restore the send-time bubble after a reload. Fire-and-forget: a lost
     /// write only narrows the reload window, the live bubble is unaffected.
@@ -2592,7 +2591,7 @@ impl Thread {
         persist_interaction_spawn(sessions_dir, session_path, chrono::Utc::now().timestamp());
     }
 
-    /// Whether the pi backend restored an existing session at startup.
+    /// Whether the harness backend restored an existing session at startup.
     pub fn restored(&self) -> bool {
         self.restored
     }
@@ -2763,7 +2762,7 @@ pub(crate) mod tests {
             HashMap::new()
         }
 
-        fn model(&self) -> Option<PiModel> {
+        fn model(&self) -> Option<HarnessModel> {
             None
         }
 
@@ -2789,7 +2788,7 @@ pub(crate) mod tests {
             self.abort_calls.fetch_add(1, Ordering::Relaxed);
         }
 
-        fn set_model(&self, _model: PiModel) {}
+        fn set_model(&self, _model: HarnessModel) {}
 
         fn set_thinking_level(&self, level: Option<String>) {
             *self.thinking_level.lock().unwrap() = level;
@@ -3163,7 +3162,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// TS parity: images ride the prompt's own user message. `run_turn` must
+    /// Images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
     #[tokio::test]
@@ -3275,7 +3274,7 @@ pub(crate) mod tests {
 
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
-    /// the image (kernel pushes the empty text block, TS parity).
+    /// the image (the kernel pushes the empty text block).
     #[tokio::test]
     async fn run_turn_image_only_insert_still_starts_turn() {
         let engine = Arc::new(FakeEngine {
@@ -3755,8 +3754,8 @@ pub(crate) mod tests {
     }
 
     /// A model identity for facade tests.
-    fn facade_model(id: &str) -> PiModel {
-        PiModel {
+    fn facade_model(id: &str) -> HarnessModel {
+        HarnessModel {
             provider: "test".into(),
             api: "anthropic".into(),
             id: id.into(),
@@ -3767,7 +3766,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn ready_with_model(model: Option<PiModel>) -> BackendNotice {
+    fn ready_with_model(model: Option<HarnessModel>) -> BackendNotice {
         BackendNotice::Ready(Box::new(ReadyInfo {
             goal: None,
             restored: false,

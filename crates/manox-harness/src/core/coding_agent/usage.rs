@@ -1,4 +1,4 @@
-//! Session usage aggregation — the port of TS `usage-totals.ts`,
+//! Session usage aggregation.
 //! `getSessionStats()`, and `getUsageCostBreakdown()`.
 //!
 //! Totals are derived from the authoritative transcript, never from an
@@ -9,7 +9,7 @@ use crate::session::SessionTreeEntry;
 use crate::types::{AgentMessage, ContentBlock, Usage};
 use serde::{Deserialize, Serialize};
 
-/// Token + cost totals — the TS `UsageTotals`.
+/// Token + cost totals.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub input: u64,
@@ -39,15 +39,15 @@ pub fn add_usage_to_totals(totals: &mut UsageTotals, usage: &Usage) {
     totals.cost += usage.cost.as_ref().map(|c| c.total).unwrap_or(0.0);
 }
 
-/// Per-model attributable usage — the TS `UsageCostBreakdownEntry`,
+/// Per-model attributable usage — the cost breakdown entry,
 /// carrying the full token-class totals so hosts can render per-model
-/// input/cache/output breakdowns (the TS shape exposes only the summed
-/// `tokens` + `cost`).
+/// input/cache/output breakdowns (the minimal wire shape exposes only the
+/// summed `tokens` + `cost`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsageBreakdown {
     /// `{provider}/{response_model or model}` for assistant usage; other
     /// usage (tool results, compaction, branch summaries) buckets into
-    /// `Tools/summaries` (TS parity).
+    /// `Tools/summaries`.
     pub key: String,
     pub totals: UsageTotals,
 }
@@ -58,7 +58,7 @@ impl ModelUsageBreakdown {
     }
 }
 
-/// Session statistics — the TS `SessionStats` minus `contextUsage` (hosts
+/// Session statistics (hosts
 /// derive the context budget separately).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionStats {
@@ -87,7 +87,7 @@ fn add_to_breakdown(
 /// Aggregate [`SessionStats`] over session entries. Counts every message
 /// entry and folds in the usage of assistant turns, tool results, and
 /// compaction/branch-summary calls alike — totals reflect what was
-/// actually billed across the session (TS `getSessionStats` semantics).
+/// actually billed across the session.
 pub fn session_stats_from_entries(entries: &[SessionTreeEntry]) -> SessionStats {
     let mut stats = SessionStats::default();
     let mut per_model: std::collections::HashMap<String, UsageTotals> =

@@ -1,10 +1,10 @@
-//! End-to-end wiring smoke test: the pi stack — agent loop + background
+//! End-to-end wiring smoke test: the harness stack — agent loop + background
 //! orchestration — running as a self-contained agent, no network.
 //!
 //! A background task is spawned through the `BackgroundManager` bound to
 //! the session, and the completion event + steered summary are observed.
 //!
-//! Run: `cargo run -p pi-extensions --example orchestration`
+//! Run: `cargo run -p manox-harness --example orchestration`
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -125,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut session = create_agent_session()
         .with_cwd(dir.path())
-        .with_session_dir(dir.path().join(".pi-session"))
+        .with_session_dir(dir.path().join("sessions"))
         .with_model_runtime(ModelRuntime::new(main_resolver))
         .with_tools(tools)
         .build()

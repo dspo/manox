@@ -1,6 +1,6 @@
 //! The durable child descriptor — the versioned, model-invisible identity
-//! record a subagent run is resumed/audited from (the dsh
-//! `subagent/descriptor` vocabulary, one-shot form). Persisted inside the
+//! record a subagent run is resumed/audited from (one-shot form). Persisted
+//! inside the
 //! child session header's `metadata.subagent` object; keys are
 //! whitelisted so an unknown field is a construction error, not silent
 //! data loss.

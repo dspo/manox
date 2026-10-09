@@ -1,5 +1,4 @@
-//! Host-side subagent delegation surface — the dsh `tool-subagent` +
-//! `tool-subagent-control` equivalent:
+//! Host-side subagent delegation surface:
 //!
 //! - [`DelegationTool`]: one model-facing tool per agent definition (name =
 //!   definition name), bound to the `spawn` provider. Foreground by default
@@ -580,7 +579,7 @@ fn background_delivery(result: &RunResult, stats: Option<(u64, u64)>) -> Option<
 // ── Control tools ────────────────────────────────────────────────────────
 
 /// The `ListAgents` control tool: the live-run table snapshot with the
-/// watchdog's health verdict per row (the dsh `list_agents`, children
+/// watchdog's health verdict per row (children
 /// scope; one-shot runs are always direct children).
 pub struct ListAgentsTool {
     runtime: Arc<SubagentRuntime>,
@@ -664,8 +663,8 @@ impl AgentTool for ListAgentsTool {
     }
 }
 
-/// The `InterruptAgent` control tool: cancel one live run (the dsh
-/// `interrupt_agent`, parent-adjacency enforced structurally — this runtime
+/// The `InterruptAgent` control tool: cancel one live run
+/// (`interrupt_agent`, parent-adjacency enforced structurally — this runtime
 /// only tracks this thread's children).
 pub struct InterruptAgentTool {
     runtime: Arc<SubagentRuntime>,

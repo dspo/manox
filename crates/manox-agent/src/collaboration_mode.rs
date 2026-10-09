@@ -6,7 +6,7 @@
 //! on the review card. The plan-mode instructions are English-only prose,
 //! injected every turn while plan mode is active.
 
-/// The user's verdict on a proposed plan (oh-my-pi's four execution options).
+/// The user's verdict on a proposed plan (four execution options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanReviewChoice {
     /// Execute the approved plan in fresh context: the workspace archives the

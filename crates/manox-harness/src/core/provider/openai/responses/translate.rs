@@ -1,4 +1,4 @@
-// Translation between pi's domain types and the Responses wire types.
+// Translation between the domain types and the Responses wire types.
 //
 // The protocol is item-oriented: a request replays the full conversation as
 // a flat `input` array, and continuity is client-side (`store: false`).

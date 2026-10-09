@@ -1,10 +1,9 @@
 //! The sandbox POLICY vocabulary: the per-call file-effect mode, the
 //! writable-root derivation shared by the bash seatbelt and the fs write
-//! fence, and the `sandbox_permissions` escalation contract. Mirrors
-//! `~/projects/github/deepseek-harness` `dsh-sandbox` + `escalation.ts`.
+//! fence, and the `sandbox_permissions` escalation contract.
 //!
-//! This is the extension-layer home so the bash tool (`pi_extensions::bash`)
-//! and the host fs-fence wrapper consume one vocabulary without a host
+//! This is the extension-layer home so the bash tool and the host fs-fence
+//! wrapper consume one vocabulary without a host
 //! import — the extension layer must not depend back on the host. The host
 //! re-exports `PermissionMode` from `crate::thread` for session/persistence.
 //!
@@ -218,8 +217,8 @@ pub fn manox_home() -> Option<PathBuf> {
 
 /// The roots one confined execution may WRITE under — the mode's meaning as a
 /// canonical, deduplicated allow-list. `read-only` returns an empty list
-/// (no caller guard needed — mirrors deepseek's `writableRoots(policy)` which
-/// checks the mode itself); `workspace-write` allows the policy's workspace
+/// (no caller guard needed — the mode itself is checked); `workspace-write`
+/// allows the policy's workspace
 /// root, the manox state home ([`manox_home`] — plan files and other session
 /// state write without escalation), the host `/tmp`, and the per-user
 /// platform temp dir (`std::env::temp_dir()` — the real temp area; omitting
@@ -278,9 +277,9 @@ pub enum EscalationOutcome {
     /// No approval channel is available (the approver exists but its channel
     /// is down — a rare composition/runtime failure). The host
     /// `GateEscalationApprover` always has a channel, so this is not produced
-    /// in manox today; it maps to the deepseek `unavailable` outcome (which,
-    /// like here, is only returned when an existing approver reports its
-    /// channel unavailable — a missing approver is a fatal `Err` in both).
+    /// in manox today; the `unavailable` outcome is only returned when an
+    /// existing approver reports its channel unavailable — a missing approver
+    /// is a fatal `Err`.
     Unavailable,
 }
 
@@ -379,14 +378,10 @@ mod tests {
 
     #[test]
     fn writable_roots_canonical_dedup() {
-        let root = Path::new("/tmp/pi-ext-sandbox-roots-test");
+        let root = Path::new("/tmp/ext-sandbox-roots-test");
         let roots = writable_roots(PermissionMode::WorkspaceWrite, root);
         // The workspace root is always present (canonicalized).
-        assert!(
-            roots
-                .iter()
-                .any(|r| r.ends_with("pi-ext-sandbox-roots-test"))
-        );
+        assert!(roots.iter().any(|r| r.ends_with("ext-sandbox-roots-test")));
         // Canonical + deduplicated: a second resolution adds no new entries.
         let before = roots.len();
         let mut seen: Vec<PathBuf> = Vec::new();

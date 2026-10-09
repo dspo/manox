@@ -219,7 +219,7 @@ pub const WEBEXPLORE_TOOL_NAMES: &[&str] = &[
 /// The default active tool subset: every mounted tool except the browser
 /// tool suites (ChromeUse + WebExplore), which stay dormant until the user
 /// opts in via the composer `+` menu.
-pub(super) fn default_active_tool_names(tools: &[Arc<dyn PiAgentTool>]) -> Vec<String> {
+pub(super) fn default_active_tool_names(tools: &[Arc<dyn HarnessAgentTool>]) -> Vec<String> {
     let browser: std::collections::HashSet<&str> = CHROMEUSE_TOOL_NAMES
         .iter()
         .chain(WEBEXPLORE_TOOL_NAMES)
@@ -271,8 +271,8 @@ impl BrowserSuite {
         }
     }
 }
-/// The full pi toolset: pi's file tools plus the pi-extensions bash/sub-agent
-/// orchestration (assembly mirrors the `pi-extensions` orchestration example).
+/// The full toolset: the kernel's file tools plus the the extension layer bash/sub-agent
+/// orchestration (assembly mirrors the `the extension layer` orchestration example).
 /// Every tool rides behind the host's [`ApprovalGatedTool`] (the kernel ships
 /// no gate — permission policy is a harness concern); `AskUserQuestion` joins
 /// ungated because asking the user is itself the interaction.
@@ -284,7 +284,7 @@ impl BrowserSuite {
 pub(super) fn build_tools(
     cwd: &Path,
     runtime: &ModelRuntime,
-    model: Option<&PiModel>,
+    model: Option<&HarnessModel>,
     session_id: &str,
     gate: &Arc<ApprovalGate>,
     question_gate: &Arc<crate::questions::UserQuestionGate>,
@@ -294,7 +294,7 @@ pub(super) fn build_tools(
     granted_roots: &crate::granted_roots::GrantedRoots,
     bus: &Arc<crate::steer_bus::AgentBus>,
 ) -> (
-    Vec<Arc<dyn PiAgentTool>>,
+    Vec<Arc<dyn HarnessAgentTool>>,
     SessionOrchestrators,
     crate::plan_mode::ReadOnlySubagentResolver,
 ) {
@@ -376,8 +376,8 @@ pub(super) fn build_tools(
     if let Some(ops) = unsandboxed_ops {
         bash = bash.with_unsandboxed_operations(ops);
     }
-    let tools: Vec<Arc<dyn PiAgentTool>> = vec![
-        // Read with oh-my-pi path selectors (`path:N-M` / `:raw` / multi-range);
+    let tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
+        // Read with path selectors (`path:N-M` / `:raw` / multi-range);
         // selector-less reads delegate to the kernel ReadTool unchanged.
         Arc::new(manox_harness::read::SelectorReadTool::new()),
         // Write/Edit carry the process write lock for their execution window:
@@ -436,7 +436,7 @@ pub(super) fn build_tools(
     // sees the shared granted roots so the fs fence widens exactly like the
     // seatbelt: same-repo worktree auto-admission plus escalation
     // accumulation, both derived from the call's effective cwd.
-    let mut tools: Vec<Arc<dyn PiAgentTool>> = tools
+    let mut tools: Vec<Arc<dyn HarnessAgentTool>> = tools
         .into_iter()
         .map(|tool| {
             let name = tool.name().to_string();
@@ -454,11 +454,11 @@ pub(super) fn build_tools(
                     Arc::clone(&standing_resolver),
                 );
             }
-            Arc::new(wrapper) as Arc<dyn PiAgentTool>
+            Arc::new(wrapper) as Arc<dyn HarnessAgentTool>
         })
         .collect();
     tools.push(Arc::new(
-        PiAskUserQuestionTool::new(Arc::clone(question_gate)).with_plan_state(Arc::clone(plan)),
+        AskUserQuestionTool::new(Arc::clone(question_gate)).with_plan_state(Arc::clone(plan)),
     ));
     // Plan proposal rides ungated like AskUserQuestion: submitting a plan is
     // the verdict request itself, not a side effect.
@@ -513,7 +513,7 @@ pub(super) fn build_tools(
     }
     for tool in [
         Arc::new(crate::web_tools::WebExploreOpenTool::new(notice_tx.clone()))
-            as Arc<dyn PiAgentTool>,
+            as Arc<dyn HarnessAgentTool>,
         Arc::new(crate::web_tools::WebExploreNavigateTool::new(
             notice_tx.clone(),
         )),
@@ -554,7 +554,7 @@ pub(super) fn build_tools(
             crate::chrome_use::ChromeUseFindChromiumExecutableTool,
         ));
         for tool in [
-            Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn PiAgentTool>,
+            Arc::new(crate::chrome_use::ChromeUseOpenTool) as Arc<dyn HarnessAgentTool>,
             Arc::new(crate::chrome_use::ChromeUseNavigateTool),
             Arc::new(crate::chrome_use::ChromeUseHoverTool),
             Arc::new(crate::chrome_use::ChromeUseClickTool),
@@ -580,7 +580,7 @@ pub(super) fn build_tools(
     if let Some(registry) = crate::mcp::try_global() {
         for server in registry.servers() {
             for tool in &server.tools {
-                let mcp_tool = Arc::new(crate::mcp::napi_tool::PiMcpTool::new(
+                let mcp_tool = Arc::new(crate::mcp::napi_tool::McpTool::new(
                     server.name.clone(),
                     tool.clone(),
                     Arc::clone(&server.client),
@@ -621,7 +621,7 @@ pub(super) fn build_tools(
         Arc::clone(bus),
         manox_harness::steer_bus::AgentId::Captain,
     )));
-    // The dsh-isomorphic delegation surface: one runtime + spawn provider
+    // The delegation surface: one runtime + spawn provider
     // per session assembly; one delegation tool per registered definition
     // (Explore, Sailor, user/plugin manifests); the control pair. Child
     // snapshots strip every registered delegation-surface name (nesting is
@@ -663,7 +663,7 @@ pub(super) fn build_tools(
     // ungated bypass); Write/Edit carry the process write lock so parallel
     // workers clobbering the same path surface a named-holder conflict
     // instead of silently racing.
-    let child_tools: Vec<Arc<dyn PiAgentTool>> = vec![
+    let child_tools: Vec<Arc<dyn HarnessAgentTool>> = vec![
         Arc::new(manox_harness::read::SelectorReadTool::new()),
         Arc::new(manox_harness::tools::grep::GrepTool),
         Arc::new(manox_harness::tools::glob::GlobTool),
@@ -840,11 +840,11 @@ pub(super) async fn refresh_embedder_tools(
     // same name contract `build_tools` mounted them under and the model
     // dispatches against, so stripping the previous embedder set by
     // prefix cannot disturb a built-in.
-    let fresh: Vec<Arc<dyn PiAgentTool>> = provider
+    let fresh: Vec<Arc<dyn HarnessAgentTool>> = provider
         .tools_for(session_id)
         .into_iter()
         .map(|tool| {
-            Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn PiAgentTool>
+            Arc::new(ApprovalGatedTool::new(tool, Arc::clone(gate))) as Arc<dyn HarnessAgentTool>
         })
         .collect();
     let old_client: Vec<String> = mounted
@@ -1001,16 +1001,16 @@ pub(super) async fn refresh_mcp_tools(
         // would pay).
         return;
     }
-    let mut fresh: Vec<Arc<dyn PiAgentTool>> = Vec::new();
+    let mut fresh: Vec<Arc<dyn HarnessAgentTool>> = Vec::new();
     for server in registry.servers() {
         for tool in server.tools {
-            let mcp_tool = Arc::new(crate::mcp::napi_tool::PiMcpTool::new(
+            let mcp_tool = Arc::new(crate::mcp::napi_tool::McpTool::new(
                 server.name.clone(),
                 tool,
                 Arc::clone(&server.client),
             ));
             fresh.push(Arc::new(ApprovalGatedTool::new(mcp_tool, Arc::clone(gate)))
-                as Arc<dyn PiAgentTool>);
+                as Arc<dyn HarnessAgentTool>);
         }
     }
     let mut tools = Vec::with_capacity(mounted.len() + fresh.len());

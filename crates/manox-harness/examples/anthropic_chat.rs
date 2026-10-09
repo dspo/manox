@@ -1,7 +1,7 @@
 // End-to-end smoke check for AnthropicStreamFn against a live endpoint.
 //
 // Usage:
-//   cargo run -p pi --example anthropic_chat -- \
+//   cargo run -p manox-harness --example anthropic_chat -- \
 //     --base-url https://api.anthropic.com \
 //     --api-key sk-ant-... \
 //     --model claude-haiku-4-5-20251001 \

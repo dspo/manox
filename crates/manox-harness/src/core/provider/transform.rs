@@ -130,8 +130,8 @@ pub fn repair_tool_flow(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                 // Close out the previous turn's tool calls first — a terminal
                 // assistant still marks the end of the prior turn.
                 insert_synthetic_results(&mut result, &mut pending, &mut resolved);
-                // TS Pi's transformMessages drops assistants that ended in
-                // `Error`/`Aborted`: their reasoning and tool calls may be
+                // Assistants that ended in
+                // `Error`/`Aborted` are dropped: their reasoning and tool calls may be
                 // incomplete and must not be replayed, so neither the message
                 // nor its calls enter the wire transcript.
                 if matches!(
@@ -518,13 +518,13 @@ mod tests {
             exit_code: Some(0),
             cancelled: false,
             truncated: true,
-            full_output_path: Some("/tmp/pi-bash-1.log".into()),
+            full_output_path: Some("/tmp/bash-1.log".into()),
             exclude_from_context: None,
             timestamp: chrono::Utc::now(),
         };
         assert_eq!(
             bash_execution_to_text(&msg),
-            "Ran `cargo test`\n```\ntail\n```\n\n[Output truncated. Full output: /tmp/pi-bash-1.log]"
+            "Ran `cargo test`\n```\ntail\n```\n\n[Output truncated. Full output: /tmp/bash-1.log]"
         );
     }
 

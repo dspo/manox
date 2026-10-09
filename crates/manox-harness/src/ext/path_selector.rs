@@ -1,4 +1,4 @@
-//! Path selector parsing — oh-my-pi style `path:selector` syntax.
+//! Path selector parsing — `path:selector` syntax.
 //!
 //! Selectors are appended to a file path after the last colon:
 //!
@@ -144,7 +144,7 @@ fn try_parse_ranges(sel: &str) -> Option<Vec<LineRange>> {
 /// Parse a single range chunk: `N`, `N-M`, `N-`, `N+K`, `N..M`, `N..`.
 /// Returns `None` on invalid syntax.
 fn parse_line_range_chunk(chunk: &str) -> Option<LineRange> {
-    // Strip optional `L` prefix (oh-my-pi allows `L50-L100`).
+    // Strip optional `L` prefix (`L50-L100`).
     let chunk = chunk.strip_prefix(['L', 'l']).unwrap_or(chunk);
     if chunk.is_empty() {
         return None;

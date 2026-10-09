@@ -14,8 +14,8 @@ use serde_json::Value as JsonValue;
 use crate::session::SessionTreeEntry;
 use crate::types::{AgentMessage, ContentBlock, StopReason, Usage};
 
-/// Compaction settings. Serializes as camelCase to match the TS Pi
-/// `settings.json` on-disk shape (`reserveTokens`, `keepRecentTokens`).
+/// Compaction settings. Serializes as camelCase (`reserveTokens`,
+/// `keepRecentTokens`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
@@ -62,7 +62,7 @@ pub struct CompactionResult {
 }
 
 /// File paths touched by the compacted region, grouped by operation kind.
-/// Mirrors the TS `FileOperations`; the sets serialize as JSON arrays.
+/// The sets serialize as JSON arrays.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FileOperations {
     /// Files inspected by `read` tool calls.
@@ -80,7 +80,7 @@ pub struct FileOperations {
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPreparation {
     /// The first entry kept intact; `None` when the whole transcript is
-    /// summarized (the wire field is then omitted, matching TS optionality).
+    /// summarized (the wire field is then omitted).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_kept_entry_id: Option<String>,
     /// The messages replaced by the summary.
@@ -278,8 +278,7 @@ pub struct CutPoint {
 /// Find the cut point and detect split-turn: when the cut lands inside a
 /// turn (the first kept message is not a user message and a user message
 /// precedes it), the turn's prefix — from its user message up to the cut — is
-/// summarized separately while the suffix stays retained, mirroring TS
-/// `findCutPoint`'s `turnStartIndex` / `isSplitTurn`.
+/// summarized separately while the suffix stays retained.
 pub fn find_cut_point_split(messages: &[AgentMessage], keep_recent_tokens: usize) -> CutPoint {
     let cut = find_cut_point(messages, keep_recent_tokens);
     if cut >= messages.len() || matches!(&messages[cut], AgentMessage::User { .. }) {
@@ -360,10 +359,9 @@ pub fn find_cut_point(messages: &[AgentMessage], keep_recent_tokens: usize) -> u
 /// orphans the trailing result and is advanced past, taking the result and
 /// its call together into the prefix.
 ///
-/// TS `findValidCutPoints` lists `custom` as a valid cut and relies on
-/// split-turn dual-summarization (`isSplitTurn`) to rescue a mid-turn cut;
-/// this Rust compaction does not implement split-turn (see
-/// `CompactionPreparation`), so orphaning is prevented at the cut itself.
+/// A `custom` entry is deliberately NOT treated as a valid cut here: this
+/// compaction does not implement split-turn (see `CompactionPreparation`),
+/// so orphaning is prevented at the cut itself.
 fn find_safe_cut(messages: &[AgentMessage], candidate: usize) -> usize {
     let tooluse_pos = tooluse_positions(messages);
 
@@ -418,9 +416,8 @@ fn first_orphaned_result(
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
 /// Truncate for summarization: keep the head and append a marker counting the
-/// dropped characters. The limit counts chars (Unicode scalar values — the
-/// Rust analogue of the TS string length, which counts UTF-16 code units),
-/// never bytes, so a multi-byte char is never split.
+/// dropped characters. The limit counts chars (Unicode scalar values, not
+/// UTF-16 code units), never bytes, so a multi-byte char is never split.
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let Some((end, _)) = text.char_indices().nth(max_chars) else {
         return text.to_string();
@@ -433,7 +430,7 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     )
 }
 
-/// Text blocks of a message, joined by newlines — the TS `contentText`.
+/// Text blocks of a message, joined by newlines.
 fn content_text(content: &[ContentBlock]) -> String {
     content
         .iter()
@@ -447,7 +444,7 @@ fn content_text(content: &[ContentBlock]) -> String {
 
 /// Serialize messages to text for summarization so the model reads them as
 /// material rather than a conversation to continue. Custom messages fold to
-/// their content as user lines — the TS `convertToLlm` mapping — and tool
+/// their content as user lines, and tool
 /// results are truncated to keep the request within budget.
 pub fn serialize_conversation(messages: &[AgentMessage]) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -635,8 +632,7 @@ pub fn build_compaction_prompt(
 }
 
 /// The instruction block for summarizing a split turn's prefix — the part of
-/// a turn the cut discarded while its suffix stays retained. Mirrors the TS
-/// `TURN_PREFIX_SUMMARIZATION_PROMPT`.
+/// a turn the cut discarded while its suffix stays retained.
 pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
 /// Build the summarization prompt for a split turn's prefix.
@@ -647,18 +643,17 @@ pub fn build_turn_prefix_prompt(prefix_messages: &[AgentMessage]) -> String {
     )
 }
 
-/// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
+/// Build the [`CompactionPreparation`] for the before-compact hook.
 ///
-/// `branch` is the full session path to the root — the same entries TS
-/// exposes as `branchEntries`. `messages` is the flat transcript the harness
+/// `branch` is the full session path to the root — the same entries
+/// exposed as `branchEntries`. `messages` is the flat transcript the harness
 /// compacts; `cut_point` splits it into `messages_to_summarize` /
 /// `retained_tail`. The latest compaction on the path contributes
 /// `previous_summary`, and file operations are extracted from the summarized
 /// region plus that boundary's recorded file lists.
 ///
-/// Returns `None` when nothing would be summarized — mirroring TS
-/// `prepareCompaction` returning `undefined`, which the session layer answers
-/// with "Nothing to compact".
+/// Returns `None` when nothing would be summarized — the session layer
+/// answers with "Nothing to compact".
 pub fn build_preparation(
     branch: &[SessionTreeEntry],
     messages: &[AgentMessage],
@@ -670,8 +665,8 @@ pub fn build_preparation(
     // The latest compaction on the path bounds the active context; its
     // summary is the `previousSummary` the summarization folds in. That
     // summary also lives in the transcript as the leading synthetic carrier
-    // message, so it is excluded from `messages_to_summarize` — mirroring TS,
-    // where `messagesToSummarize` starts at the boundary's first kept entry,
+    // message, so it is excluded from `messages_to_summarize`:
+    // the summarization range starts at the boundary's first kept entry,
     // not the compaction entry itself. Folding it twice would duplicate the
     // prior summary in the prompt.
     let previous_summary = branch.iter().rev().find_map(|e| match e {
@@ -738,8 +733,8 @@ impl std::fmt::Display for NothingToCompact {
 
 impl std::error::Error for NothingToCompact {}
 
-/// File paths touched by the compacted region, mirroring the TS
-/// `extractFileOperations`: assistant tool calls with a `path` argument are
+/// File paths touched by the compacted region: assistant tool calls with
+/// a `path` argument are
 /// classified as read / written / edited, and a previous (non-hook) compaction
 /// carrying `{readFiles, modifiedFiles}` details seeds the accumulator so file
 /// operations survive across repeated compactions.
@@ -806,7 +801,7 @@ pub(crate) fn extract_file_ops_from_message(message: &AgentMessage, ops: &mut Fi
 }
 
 /// Compute the sorted read-only and modified file lists from accumulated
-/// operations, mirroring the TS `computeFileLists`: modified = edited ∪
+/// operations: modified = edited ∪
 /// written; readFiles = read minus modified.
 pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
     let modified: BTreeSet<String> = file_ops.edited.union(&file_ops.written).cloned().collect();
@@ -820,8 +815,8 @@ pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String
     (read_files, modified_files)
 }
 
-/// Format the file lists as summary metadata tags, mirroring the TS
-/// `formatFileOperations`. Returns the empty string when there are no files,
+/// Format the file lists as summary metadata tags. Returns the empty string
+/// when there are no files,
 /// so the summary text is unchanged when no tool touched a file.
 pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = Vec::new();
@@ -1260,7 +1255,7 @@ mod tests {
     /// A multi-turn tool-call chain must never be split: the retained tail
     /// never starts on a `ToolResult` (its `ToolUse` would be summarized into
     /// the prefix, orphaning the result and producing an invalid provider
-    /// request). Mirrors TS `findValidCutPoints`, which excludes tool results
+    /// request). Tool results are excluded
     /// as cut indices. Covers `user → assistant(tool1) → result1 →
     /// assistant(tool2) → result2 → assistant(final)` across budgets that land
     /// the cut inside the tool-call region.
@@ -1427,7 +1422,7 @@ mod tests {
         assert!(text.contains("[User]: custom payload"));
         assert!(text.contains("[Assistant thinking]: weighing options"));
         assert!(text.contains("[Assistant]: answer"));
-        // json! literal order (TS Object.entries insertion order):
+        // json! literal order:
         assert!(text.contains("[Assistant tool calls]: Read(path=\"a.rs\", offset=3)"));
         // Tool results survive, truncated to the budget with a drop marker.
         assert!(text.contains(&format!("[Tool result]: {}", "r".repeat(2000))));

@@ -1,13 +1,11 @@
-//! Provider registration — the Rust counterpart of the TS
-//! `ExtensionAPI.registerProvider` seam (`packages/coding-agent`
-//! `provider-composer`). Extensions describe a provider declaratively
+//! Provider registration. Extensions describe a provider declaratively
 //! (endpoint, credential, wire protocol, model catalog) and the registry
 //! turns that description into `StreamFn` runtimes plus a global model
 //! index the host can list and resolve.
 //!
 //! The registry is deliberately config-shape agnostic: parsing a concrete
 //! config format (e.g. the native cx providers yaml) is the extension's
-//! job (see `pi_extensions::provider`), mirroring how TS extensions own
+//! job (see the `ext` layer's provider extension), mirroring how extensions own
 //! their own config schemas and only hand the kernel a `ProviderConfig`.
 //!
 //! Live consumption (usage telemetry, budgets, etc.) builds on the event
@@ -28,7 +26,7 @@ use crate::core::provider::openai::completions::CompletionsStreamFn;
 use crate::core::provider::openai::responses::ResponsesStreamFn;
 use crate::types::{Model, StreamOptions, ThinkingKind};
 
-/// The wire protocol a provider or model speaks — the TS `Api` union.
+/// The wire protocol a provider or model speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Api {
     /// Anthropic Messages (`/v1/messages`).
@@ -40,8 +38,8 @@ pub enum Api {
 }
 
 impl Api {
-    /// The TS wire name used by `registerProvider` configs.
-    pub fn as_ts_str(self) -> &'static str {
+    /// The provider-config wire name.
+    pub fn as_wire_str(self) -> &'static str {
         match self {
             Api::AnthropicMessages => "anthropic-messages",
             Api::OpenAiCompletions => "openai-completions",
@@ -59,8 +57,8 @@ impl Api {
         }
     }
 
-    /// Parse the TS wire name.
-    pub fn from_ts_str(s: &str) -> Option<Self> {
+    /// Parse the provider-config wire name.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
             "anthropic-messages" => Some(Api::AnthropicMessages),
             "openai-completions" => Some(Api::OpenAiCompletions),
@@ -70,7 +68,7 @@ impl Api {
     }
 }
 
-/// Per-million-token cost rates — the TS `Model.cost` shape.
+/// Per-million-token cost rates.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Cost {
     pub input: f64,
@@ -79,14 +77,14 @@ pub struct Cost {
     pub cache_write: f64,
 }
 
-/// An input modality a model accepts — the TS `("text" | "image")[]`.
+/// An input modality a model accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputModality {
     Text,
     Image,
 }
 
-/// One model in a provider registration — the TS `ProviderModelConfig`
+/// One model in a provider registration.
 /// (minus `thinkingLevelMap`/`headers`/`compat`, which the Rust providers
 /// do not consume yet).
 #[derive(Debug, Clone)]
@@ -116,7 +114,7 @@ pub struct ProviderModelConfig {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
-/// A declarative provider registration — the TS `ProviderConfig` (subset:
+/// A declarative provider registration (subset:
 /// no `streamSimple`/`refreshModels`/`oauth` yet).
 #[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
@@ -132,7 +130,7 @@ pub struct ProviderConfig {
     /// Extra headers merged into every request.
     pub headers: Option<HashMap<String, String>>,
     /// When true, `Authorization: Bearer <resolved key>` is added on top
-    /// of the protocol's native key header (TS `authHeader`).
+    /// of the protocol's native key header.
     pub auth_header: bool,
     /// The models to register; replaces any previous models of this
     /// provider on re-registration.
@@ -167,7 +165,7 @@ impl ProviderRegistry {
     }
 
     /// Register (or replace) a provider and expand its models into the
-    /// global index. Validation mirrors the TS composer: a provider that
+    /// global index. Validation: a provider that
     /// defines models needs a `base_url`, and every model must resolve a
     /// protocol from the provider or itself.
     pub fn register_provider(&self, name: &str, config: ProviderConfig) -> Result<(), String> {
@@ -248,7 +246,7 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Remove a provider and its models (TS `unregisterProvider`).
+    /// Remove a provider and its models.
     pub fn unregister_provider(&self, name: &str) {
         self.providers.lock().unwrap().remove(name);
         self.models.lock().unwrap().remove(name);
@@ -415,9 +413,8 @@ impl ModelCatalog for RegistryCatalog {
     }
 }
 
-/// Interpolate `$VAR` / `${VAR}` env references in a configured value —
-/// the TS `resolveTemplate`. Called per request so environment changes
-/// are tracked (TS resolves the api key uncached for the same reason).
+/// Interpolate `$VAR` / `${VAR}` env references in a configured value.
+/// Called per request so environment changes are tracked.
 pub fn interpolate_env(value: &str) -> Result<String, String> {
     interpolate_env_with(value, &|name| std::env::var(name).ok())
 }

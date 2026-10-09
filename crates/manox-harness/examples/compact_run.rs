@@ -6,7 +6,7 @@
 // so no API key is needed.
 //
 // Usage:
-//   cargo run -p pi --example compact_run
+//   cargo run -p manox-harness --example compact_run
 
 use std::sync::Arc;
 

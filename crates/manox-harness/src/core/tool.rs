@@ -132,7 +132,7 @@ pub trait ToolProgress: Send + Sync {
 
 /// The result of a tool execution.
 ///
-/// Mirrors the TS Pi `AgentToolResult`: `content` is what the model sees,
+/// `content` is what the model sees,
 /// `details` are structured UI/log data, `usage`/`added_tool_names` carry
 /// per-call token accounting when the provider reports it, and `terminate`
 /// signals the loop to stop after this turn.
@@ -617,9 +617,8 @@ async fn execute_parallel(
 /// sink is awaited, so reports travel an unbounded channel drained by a
 /// forwarding future running concurrently with execution. Awaiting the
 /// forwarder once execution settles — after closing the channel — emits
-/// every reported update before the call's `ToolExecutionEnd`, the same
-/// ordering TS Pi's settled `updateEvents` provide, while consumers watch
-/// progress in real time instead of after the fact.
+/// every reported update before the call's `ToolExecutionEnd`, so consumers
+/// watch progress in real time instead of after the fact.
 struct ChannelingProgress {
     tool_call_id: String,
     tool_name: String,
@@ -812,10 +811,10 @@ async fn execute_one(
         // Dropped tools owe drop-cleanup of live resources (process trees,
         // host round trips) — see the bash backends and `host_round_trip`.
         //
-        // Deliberate deviation from upstream TS Pi, which is cooperative-only
-        // (it checks `signal.aborted` around tool calls but never races tool
-        // execution): manox's GUI has host-round-trip tools TS lacks, with a
-        // hard requirement that a user cancel always settles the turn.
+        // Unlike a cooperative-only cancellation check (which would test
+        // `signal.aborted` only between tool calls), tool execution is raced:
+        // manox's GUI has host-round-trip tools, with a hard requirement that
+        // a user cancel always settles the turn.
         // Mechanism, not policy.
         let cancel = signal.clone();
         let execution =

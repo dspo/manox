@@ -35,7 +35,7 @@ pub trait ModelCatalog: Send + Sync {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model>;
 
     /// The thinking levels a model supports, when the catalog knows them
-    /// exactly (TS `thinkingLevelMap`). `None` falls back to the default
+    /// exactly. `None` falls back to the default
     /// derivation by provider/model id — custom catalogs should return
     /// `Some` for models whose level set differs from the defaults.
     fn supported_thinking_levels(&self, _model: &Model) -> Option<Vec<String>> {
@@ -71,8 +71,7 @@ impl ModelRuntime {
         self
     }
 
-    /// A runtime backed by a provider registry — the Rust counterpart of
-    /// the TS `registerProvider` seam. Streams resolve through the
+    /// A runtime backed by a provider registry. Streams resolve through the
     /// registry (registered provider → optional fallback), and the
     /// registry's model index serves as the restore catalog.
     pub fn with_provider_registry(
@@ -195,7 +194,7 @@ pub struct DefaultModelCatalog;
 
 impl ModelCatalog for DefaultModelCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        // Thinking capability mirrors the frozen TS baseline: Sonnet 4.6,
+        // Thinking capability by model: Sonnet 4.6,
         // Opus 4.8, and GPT-5 support reasoning; Haiku 4.5 and GPT-4o do not.
         let (api, context_window, max_tokens, thinking): (
             &str,
@@ -248,9 +247,9 @@ impl ModelCatalog for DefaultModelCatalog {
 }
 
 impl ModelRuntime {
-    /// A resolver whose provider streams carry a request observer (the TS
-    /// before-payload / after-response hooks). Only the env-backed registry
-    /// rebuilds its streams with the observer attached; custom runtimes
+    /// A resolver whose provider streams carry a request observer. Only the
+    /// env-backed registry rebuilds its streams with the observer attached;
+    /// custom runtimes
     /// (mock/custom providers) resolve their own streams, which do not fire
     /// wire hooks anyway.
     pub fn resolver_with_observer(
@@ -305,11 +304,11 @@ impl ModelRuntime {
     }
 }
 
-/// The TS thinking-level order.
+/// The thinking-level order.
 pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// The levels a model supports, mirroring TS `getSupportedThinkingLevels`
-/// for the default catalog: reasoning models support all levels except where
+/// The levels a model supports for the default catalog: reasoning models
+/// support all levels except where
 /// the level map excludes one (Sonnet 4.6 excludes `xhigh`); non-reasoning
 /// models support only `off`.
 pub fn supported_thinking_levels(provider: &str, model_id: &str) -> &'static [&'static str] {

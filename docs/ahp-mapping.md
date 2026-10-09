@@ -31,7 +31,7 @@ turn id 方案。结论如下，三条证据相互印证：
 
 - **直播路径必须与 replay 一致**：既然 replay 时一条 user `message` 条目就是「turn 的起点」，
   那么 mid-turn 的 steer 在直播路径上也必须**关闭当前 turn、开启后继 turn**，否则同一段对话
-  运行时是一种渲染、reload 之后是另一种（这正是 pi-ahp 踩过、计划要求照抄的判断）。
+  运行时是一种渲染、reload 之后是另一种（这正是计划要求防住的判断）。
 - **后继 turn id 采用计划建议的 `<rootTurnId>#<n>`**（`n` 为同一 root turn 下的后继序号）：
   与上面的事实相容，且不需要在条目里编码额外身份。
 - `TurnFinished{stranded_steer_ids}`（`crates/manox-session-core/src/translate.rs` 同族）是

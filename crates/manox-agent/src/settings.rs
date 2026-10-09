@@ -87,7 +87,7 @@ pub fn modify_mcp_disabled(f: impl FnOnce(Vec<String>) -> Vec<String>) -> Result
 /// partial file still yields a usable (defaulted) result.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Settings {
-    /// Default model for new pi-harness threads: a registry model id
+    /// Default model for new threads: a registry model id
     /// (`deepseek-v4-flash`) or a Claude/OpenAI alias (`sonnet`). Unset or
     /// unresolvable → the first registered model (sorted).
     #[serde(default)]
@@ -131,7 +131,7 @@ pub struct Settings {
 }
 
 /// Hashline Edit tool switches. `enforce_seen_lines` opts a host into the
-/// anti-blind-edit guard; it ships off (matching upstream oh-my-pi) because
+/// anti-blind-edit guard; it ships off because
 /// the guard trades edit-rejection round-trips for blind-anchor safety.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(default)]

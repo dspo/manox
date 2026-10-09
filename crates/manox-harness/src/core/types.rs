@@ -1,4 +1,4 @@
-// Core types for the Pi agent harness.
+// Core types for the agent harness.
 //
 // These types form the foundation of the agent loop, defining the message
 // structure, event system, context, and configuration that the loop operates on.
@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 /// A content block within a message sent to or received from an LLM.
 ///
-/// Mirrors the TS Pi content shapes: `text` carries `textSignature`, `image`
+/// `text` carries `textSignature`, `image`
 /// is flat with `mimeType`, `toolCall` carries `arguments` + `thoughtSignature`,
 /// and redacted reasoning is a `thinking` block with `redacted: true` (the
 /// opaque payload lives in `thinkingSignature`), not a separate type.
@@ -77,7 +77,7 @@ pub enum ContentBlock {
 
 /// A message in the agent conversation.
 ///
-/// Serialized in the TS Pi v3 message shape: roles `user` / `assistant` /
+/// Serialized message shape: roles `user` / `assistant` /
 /// `toolResult`, with camelCase fields (`toolCallId`, `toolName`, `isError`,
 /// `stopReason`, `responseId`, `responseModel`, `errorMessage`, `customType`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +105,7 @@ pub enum AgentMessage {
     Assistant {
         /// Content blocks of the turn. Accepts the same string-or-array wire
         /// shapes as user content; a null/missing content reads as empty,
-        /// matching how the TS session layer guards damaged entries.
+        /// tolerating damaged entries.
         #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         model: String,
@@ -130,7 +130,7 @@ pub enum AgentMessage {
         #[serde(default)]
         stop_reason: Option<StopReason>,
         /// The provider's raw stop-reason string, kept verbatim for
-        /// diagnostics and persistence (TS `rawStopReason`). Only providers
+        /// diagnostics and persistence. Only providers
         /// that report one set it — Anthropic's `stop_reason`, Completions'
         /// `finish_reason`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,7 +252,7 @@ impl AgentMessage {
 /// Why the assistant stopped generating, as reported by the provider or set
 /// locally on interruption.
 ///
-/// Mirrors the TS Pi `StopReason`: `Stop`/`Length`/`ToolUse` come from the
+/// Stop reasons: `Stop`/`Length`/`ToolUse` come from the
 /// provider's protocol stop reason; `Error` covers provider-reported failures
 /// (refusal, content filter, context-window overflow) and transport errors;
 /// `Aborted` covers user/system cancellation. An `Error`/`Aborted` message
@@ -273,7 +273,7 @@ pub enum StopReason {
 
 /// Token usage for a single assistant message.
 ///
-/// Serialized in the TS Pi v3 usage shape: `input` / `output` / `cacheRead` /
+/// Serialized usage shape: `input` / `output` / `cacheRead` /
 /// `cacheWrite` / `totalTokens`, with an optional `cacheWrite1h` split and a
 /// `cost` breakdown. Rust field names stay snake_case; serde renames map them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -338,9 +338,8 @@ fn default_usage() -> Box<Usage> {
 
 /// Deserialize message content, accepting either a plain string (wrapped in a
 /// single `text` block) or an array of content blocks — the two wire shapes
-/// TS Pi emits for user-typed and tool/image content. A null content (TS
-/// writes `{...message, content: []}` for damaged entries, and hand-edited
-/// files may carry null) reads as no blocks.
+/// for user-typed and tool/image content. A null content (hand-edited files
+/// may carry one) reads as no blocks.
 pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Vec<ContentBlock>, D::Error> {
@@ -365,7 +364,7 @@ pub(crate) fn deserialize_content_blocks<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Serde for `AgentMessage` timestamps as epoch milliseconds — the on-disk
-/// shape TS Pi v3 stores for a message's own timestamp (entry-level
+/// shape for a message's own timestamp (entry-level
 /// timestamps stay ISO strings). Used only for session storage; the wire
 /// formats build their own request structs and never touch this.
 mod ts_millis {
@@ -397,11 +396,11 @@ mod ts_millis {
 
 /// Incremental stream event attached to [`AgentEvent::MessageUpdate`].
 ///
-/// Mirrors the TS Pi `AssistantMessageEvent` variants that a `message_update`
+/// The update variants a `message_update`
 /// can carry: `content_index` addresses the block in the partial assistant
 /// message's content array, `delta` holds the just-arrived fragment, and the
-/// `*_end` variants carry the block's finalized content. The TS `start`,
-/// `done`, and `error` variants have no counterpart here — the Rust stream
+/// `*_end` variants carry the block's finalized content. Stream start and
+/// error have no counterpart here — the stream
 /// boundary delivers them as the message lifecycle (`MessageStart`) and the
 /// stream function's return value instead.
 #[derive(Debug, Clone)]
@@ -473,7 +472,7 @@ pub enum AgentEvent {
     },
     /// A tool call has finished executing. Carries the full result — content,
     /// details, per-call usage, added tool names, and the terminate signal —
-    /// alongside a top-level error flag, mirroring the TS Pi event so a
+    /// alongside a top-level error flag so a
     /// consumer can branch on success without unpacking the result.
     ToolExecutionEnd {
         tool_call_id: String,
@@ -514,7 +513,7 @@ pub enum AgentEvent {
 ///
 /// `emit` is async so a slow consumer backpressures the loop: the loop awaits
 /// each emission, so state reduction and subscribed listeners settle before
-/// the run advances — the same ordering TS Pi's awaited `emit` provides.
+/// the run advances.
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     /// Emit an event. An `Err` aborts the run: a persistence or subscriber
@@ -533,7 +532,7 @@ pub struct Model {
     /// The wire API shape this model speaks (e.g. "anthropic",
     /// "openai_completions", "openai_responses") — the discriminator a
     /// [`StreamResolver`](crate::agent_loop::StreamFn) uses to pick the
-    /// provider runtime, mirroring the TS `Model.api`.
+    /// provider runtime.
     pub api: String,
     /// Model identifier (e.g. "claude-sonnet-4-6").
     pub id: String,
@@ -635,7 +634,7 @@ impl std::fmt::Debug for AgentContext {
 /// Supplies queued messages to inject into the run.
 pub type MessageQueueFn = Box<dyn Fn() -> Vec<AgentMessage> + Send + Sync>;
 /// The refresh a `prepare_next_turn` returns for the next turn: the model
-/// and thinking level snapshot (TS `AgentLoopTurnUpdate`). The loop applies
+/// and thinking level snapshot. The loop applies
 /// it to its in-flight context before the next provider request.
 #[derive(Debug, Clone)]
 pub struct TurnUpdate {
@@ -650,7 +649,7 @@ pub struct TurnUpdate {
 }
 
 /// Refreshes the context/model before a turn; `None` keeps the current turn.
-/// Async so the refresh can flush durable writes (TS `prepareNextTurn`);
+/// Async so the refresh can flush durable writes;
 /// takes no context reference so the future is `'static`.
 pub type PrepareTurnFn = Box<
     dyn Fn() -> std::pin::Pin<
@@ -658,13 +657,12 @@ pub type PrepareTurnFn = Box<
         > + Send
         + Sync,
 >;
-/// Decides whether the run should stop after a turn (TS
-/// `shouldStopAfterTurn`), called after `turn_end` and `prepareNextTurn` and
+/// Decides whether the run should stop after a turn, called after
+/// `turn_end` and `prepareNextTurn` and
 /// before the next LLM call. Sync like the other decision hooks
-/// (`before_tool_call`/`after_tool_call`); the TS `Promise<boolean>` allowance
-/// is a superset not exercised by the graceful-stop contract.
+/// (`before_tool_call`/`after_tool_call`).
 ///
-/// Args mirror the TS `ShouldStopAfterTurnContext` fields, in order:
+/// Args, in order:
 /// `(message, tool_results, context, new_messages)`. Plain `&` params carry
 /// implicit higher-ranked lifetimes so callers can box a closure straight
 /// (a lifetime-parameterized context struct would defeat closure→`dyn` HRTB).
@@ -789,7 +787,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The TS Pi v3 on-disk shape: assistant with a `toolCall` block and a
+    /// The on-disk shape: assistant with a `toolCall` block and a
     /// `toolResult` message, plus a usage block carrying `cacheRead`/`cost`.
     /// Round-trips through serde with camelCase field names.
     #[test]
@@ -892,7 +890,7 @@ mod tests {
             "exitCode": 1,
             "cancelled": false,
             "truncated": true,
-            "fullOutputPath": "/tmp/pi-bash-1.log",
+            "fullOutputPath": "/tmp/bash-1.log",
             "excludeFromContext": true,
             "timestamp": 1_700_000_000_000i64
         });
@@ -913,7 +911,7 @@ mod tests {
                 assert_eq!(*exit_code, Some(1));
                 assert!(!cancelled);
                 assert!(truncated);
-                assert_eq!(full_output_path.as_deref(), Some("/tmp/pi-bash-1.log"));
+                assert_eq!(full_output_path.as_deref(), Some("/tmp/bash-1.log"));
                 assert_eq!(*exclude_from_context, Some(true));
             }
             other => panic!("expected BashExecution, got {other:?}"),
@@ -921,7 +919,7 @@ mod tests {
         let reround = serde_json::to_value(&msg).unwrap();
         assert_eq!(reround["role"], "bashExecution");
         assert_eq!(reround["exitCode"], 1);
-        assert_eq!(reround["fullOutputPath"], "/tmp/pi-bash-1.log");
+        assert_eq!(reround["fullOutputPath"], "/tmp/bash-1.log");
         assert_eq!(reround["excludeFromContext"], true);
         assert_eq!(reround["timestamp"], 1_700_000_000_000i64);
     }

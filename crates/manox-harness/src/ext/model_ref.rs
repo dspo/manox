@@ -1,4 +1,4 @@
-//! Model-reference resolution over the pi provider registry.
+//! Model-reference resolution over the provider registry.
 //!
 //! Agent/command frontmatter commonly pins `model: sonnet` (or `opus` /
 //! `haiku`), assuming a Claude Code runtime backed by Anthropic. The cx

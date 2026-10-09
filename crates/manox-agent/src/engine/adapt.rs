@@ -3,20 +3,20 @@ use crate::language_model::{
     LanguageModelToolResult, LanguageModelToolUse, StopReason as ManoxStopReason,
 };
 use crate::thread::ToolCallStatus;
-use manox_harness::types::StopReason as PiStopReason;
+use manox_harness::types::StopReason;
 
-/// Map one pi `AgentEvent` onto the `ThreadEvent`s the workspace renders.
+/// Map one kernel `AgentEvent` onto the `ThreadEvent`s the workspace renders.
 ///
 /// Events with no UI counterpart (run/turn lifecycle handled by the facade,
 /// message boundaries, block start/end markers) map to nothing.
 /// `ToolCallAuthorization` never comes from this mapping — the permission
-/// gate (`pi_approval`) emits it directly while parked on a user answer.
+/// gate (`approval`) emits it directly while parked on a user answer.
 /// `Plan*` and sub-agent events remain manox-only and are never produced.
 pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     match event {
         AgentEvent::AgentStart | AgentEvent::AgentEnd { .. } => Vec::new(),
         // `TurnStarted` is emitted once by the facade (matching `Thread`
-        // semantics); pi's per-round `TurnStart` must not duplicate it.
+        // semantics); the kernel's per-round `TurnStart` must not duplicate it.
         AgentEvent::TurnStart => Vec::new(),
         AgentEvent::MessageStart { .. } => Vec::new(),
         AgentEvent::MessageUpdate {
@@ -32,7 +32,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             _ => Vec::new(),
         },
         AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
-            Some(PiStopReason::Error) => {
+            Some(StopReason::Error) => {
                 vec![ThreadEvent::Error(anyhow::anyhow!(
                     "{}",
                     message_error_text(message)
@@ -60,7 +60,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
             partial_result,
             ..
         } => {
-            // The pi-extensions bash tool streams `{"output": chunk}`
+            // The the extension layer bash tool streams `{"output": chunk}`
             // partials; surface them as live tool output. Other partial
             // shapes carry no renderable text.
             match partial_result.get("output").and_then(|v| v.as_str()) {
@@ -116,7 +116,7 @@ pub fn agent_event_to_thread_events(event: &AgentEvent) -> Vec<ThreadEvent> {
     }
 }
 
-/// Restore mapping: pi harness history onto the `manox_agent::Message` history
+/// Restore mapping: harness history onto the `manox_agent::Message` history
 /// the rebuild path (`build_items`) renders. Blocks map one-to-one;
 /// terminal error/abort states surface as a trailing assistant text note
 /// so a reloaded session shows why the last run stopped.
@@ -149,13 +149,13 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
                         *text = crate::proposed_plan::strip_proposed_plan_blocks(text);
                     }
                 }
-                if matches!(stop_reason, Some(PiStopReason::Error)) {
+                if matches!(stop_reason, Some(StopReason::Error)) {
                     blocks.push(MessageContent::Text(format!(
                         "[turn failed: {}]",
                         error_message.as_deref().unwrap_or("unknown error")
                     )));
                 }
-                if matches!(stop_reason, Some(PiStopReason::Aborted)) {
+                if matches!(stop_reason, Some(StopReason::Aborted)) {
                     blocks.push(MessageContent::Text("[turn aborted]".to_string()));
                 }
                 out.push(Message::assistant(blocks));
@@ -253,7 +253,7 @@ pub fn entries_to_display(
     (display, notes)
 }
 
-/// One pi content block onto one manox content block.
+/// One content block onto one manox content block.
 fn content_block_to_message_content(block: &ContentBlock) -> MessageContent {
     match block {
         ContentBlock::Text { text, .. } => MessageContent::Text(text.clone()),
@@ -303,7 +303,7 @@ fn text_of_blocks(blocks: &[ContentBlock]) -> String {
     out
 }
 
-fn message_stop_reason(message: &AgentMessage) -> Option<PiStopReason> {
+fn message_stop_reason(message: &AgentMessage) -> Option<StopReason> {
     match message {
         AgentMessage::Assistant { stop_reason, .. } => *stop_reason,
         _ => None,
@@ -314,24 +314,24 @@ fn message_error_text(message: &AgentMessage) -> String {
     match message {
         AgentMessage::Assistant { error_message, .. } => error_message
             .clone()
-            .unwrap_or_else(|| "the pi session hit an error".to_string()),
-        _ => "the pi session hit an error".to_string(),
+            .unwrap_or_else(|| "the session hit an error".to_string()),
+        _ => "the session hit an error".to_string(),
     }
 }
 
-/// Map a pi stop reason onto the manox shape. `Error` never routes through
+/// Map a stop reason onto the manox shape. `Error` never routes through
 /// this helper: callers surface it as an `Error` event instead of a stop.
-fn manox_stop_reason_of(reason: &PiStopReason) -> ManoxStopReason {
+fn manox_stop_reason_of(reason: &StopReason) -> ManoxStopReason {
     match reason {
-        PiStopReason::Stop => ManoxStopReason::EndTurn,
-        PiStopReason::Length => ManoxStopReason::MaxTokens,
-        PiStopReason::ToolUse => ManoxStopReason::ToolUse,
-        PiStopReason::Aborted => ManoxStopReason::Cancelled,
-        PiStopReason::Error => ManoxStopReason::EndTurn,
+        StopReason::Stop => ManoxStopReason::EndTurn,
+        StopReason::Length => ManoxStopReason::MaxTokens,
+        StopReason::ToolUse => ManoxStopReason::ToolUse,
+        StopReason::Aborted => ManoxStopReason::Cancelled,
+        StopReason::Error => ManoxStopReason::EndTurn,
     }
 }
 
-/// Human-readable tool card title from the pi tool name + arguments. Each
+/// Human-readable tool card title from the tool name + arguments. Each
 /// arm surfaces the tool's decision-relevant target (path, url, command,
 /// agent address, …); browser tools (WebExplore* / ChromeUse*) carry their
 /// url, tab id, or element ref. Unrecognized tools fall back to their first
@@ -594,7 +594,7 @@ pub fn child_events_of(id: &str, event: &AgentEvent) -> Vec<ThreadEvent> {
         // mirrors the main thread's `MessageEnd` mapping; the message usage
         // rides along so the panel can stamp the just-finished reply.
         AgentEvent::MessageEnd { message } => match message_stop_reason(message) {
-            Some(PiStopReason::Error) => vec![ThreadEvent::SubagentChild {
+            Some(StopReason::Error) => vec![ThreadEvent::SubagentChild {
                 id: id.to_string(),
                 child: crate::thread::SubagentChildEvent::Error(message_error_text(message)),
             }],
@@ -700,7 +700,7 @@ mod tests {
     fn entries_to_display_counts_positions_over_projected_compaction_list() {
         // `sync_history` feeds the projected (post-compaction) entry list:
         // pre-boundary notes never reach this function (build_context_entries
-        // drops them — covered by the pi crate's projection tests). The
+        // drops them — covered by the kernel crate's projection tests). The
         // projection of `m1 [dropped] m2 [kept] c1(keeps m2) m3` is
         // [c1, m2, note-kept, m3]; positions count the summary + m2.
         let entries = vec![

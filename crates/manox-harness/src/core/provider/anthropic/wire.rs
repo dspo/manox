@@ -157,7 +157,7 @@ pub struct ToolParam {
 
 /// The `thinking` request field. Adaptive models take `display` + an effort
 /// tier in `output_config`; enabled (non-adaptive) models take a `budget_tokens`
-/// cap that controls reasoning depth, mirroring the TS Pi wire shape.
+/// cap that controls reasoning depth.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum ThinkingConfig {

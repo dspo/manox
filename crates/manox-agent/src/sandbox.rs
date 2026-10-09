@@ -1,11 +1,10 @@
-//! OS-level sandbox for the pi-path `bash` tool: macOS seatbelt
+//! OS-level sandbox for the kernel-path `bash` tool: macOS seatbelt
 //! (`sandbox-exec`) wrapping one-shot commands.
 //!
 //! The seatbelt renders a per-call file-effect profile from the effective
 //! `PermissionMode`: `read-only` denies all file writes (only required sinks
 //! like `/dev/null`); `workspace-write` allows the shared `writable_roots`;
 //! `danger-full-access` skips the seatbelt entirely (the unsandboxed backend).
-//! Mirrors `~/projects/github/deepseek-harness` `dsh-sandbox-local`.
 //!
 //! Network and `.git` protection are outside the mode vocabulary: the
 //! `(allow default)` base admits all network, and `workspace-write` allows any
@@ -37,8 +36,7 @@ pub use manox_harness::sandbox::canonicalize_best_effort;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Case-insensitive stderr substrings the macOS seatbelt emits when it denies
-/// a file-write effect — the deepseek `DENIAL_SIGNATURES.seatbelt` list
-/// (`packages/sandbox/sandbox-local/src/helpers.ts`). A non-zero exit whose
+/// a file-write effect. A non-zero exit whose
 /// stderr matches one of these is a policy refusal (marker + hint appended),
 /// not a command failure. Lifted to a const so a future runner (landlock /
 /// windows-acl) adds its own list without touching the consumer.
@@ -228,7 +226,7 @@ fn login_shell_path() -> String {
     .clone()
 }
 
-/// One-shot seatbelt-wrapped bash backend for the pi bash tool. The effective
+/// One-shot seatbelt-wrapped bash backend for the bash tool. The effective
 /// mode is resolved per call by the host-injected `mode_resolver` (the
 /// session mode, or an approved `sandbox_permissions` grant for one call) —
 /// the kernel `BashOperations` trait stays untouched, so the mode travels
@@ -320,10 +318,9 @@ impl BashOperations for SandboxedBashOperations {
             let mut result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
             // Classify a seatbelt file-write denial (EPERM) and surface the
-            // deepseek marker + escalation hint so the model recognizes a
+            // denial marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
-            // `sandbox_permissions` (the signatures mirror deepseek's
-            // `DENIAL_SIGNATURES.seatbelt`).
+            // `sandbox_permissions`.
             if result.exit_code != 0 && {
                 let stderr = result.stderr.to_ascii_lowercase();
                 SEATBELT_DENIAL_SIGNATURES
@@ -688,7 +685,7 @@ mod tests {
             return;
         }
         assert_ne!(res.exit_code, 0, "read-only denies the write");
-        // The seatbelt denial carries the deepseek marker + escalation hint
+        // The seatbelt denial carries the denial marker + escalation hint
         // so the model recognizes a policy refusal (not a command bug).
         assert!(
             res.stderr

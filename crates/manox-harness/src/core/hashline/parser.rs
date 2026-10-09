@@ -195,7 +195,7 @@ pub fn parse_patch(text: &str) -> Result<ParsedPatch, ParseError> {
             return Err(ParseError {
                 line: line_no,
                 message: format!(
-                    "{trimmed:?} is an apply_patch/Codex envelope; this is hashline grammar. \
+                    "{trimmed:?} is an apply_patch envelope; this is hashline grammar. \
                      Open each file with a `[path#TAG]` header (from your latest `read`) and \
                      edit with `SWAP N.=M:` / `DEL N.=M` / `INS.PRE N:`."
                 ),

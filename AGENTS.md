@@ -13,7 +13,7 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-agent/             # 核心 agent 逻辑（宿主层）
   manox-providers/         # LLM provider 配置与路由
   manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
-    src/core/              # TS Pi 内核移植（纯内核，无业务逻辑）
+    src/core/              # 通用 agent 内核（纯内核，无业务逻辑）
     src/ext/               # 经内核拓展点扩展的业务能力
   manox-journal/           # 会话磁盘格式（journal v4 条目词汇）的叶子 crate
   manox-ahp/               # AHP 宿主层（频道、JSON-RPC、传输、x-manox 扩展面）
@@ -81,11 +81,11 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 - LLM provider 配置：`~/.manox/cx.providers.config.yaml`（格式见 `crates/manox-providers`，Schema 见 `docs/cx/cx-config-schema.yaml`）；首启时会从旧根 `~/.config/cx/` 自动复制一次（旧文件保留）
 - SQLite：`~/.manox/threads.db`（WAL 模式；`threads.db-shm` / `threads.db-wal` 随行）
 - 线程 active-session 指针：`~/.manox/threads.registry.json`（thread → 当前驱动的 session 文件；Open/NewSession/恢复移动指针，侧栏按 thread 折叠其 sessions 为单行，`manox_agent::thread_registry`；跨进程 RMW 经 per-file flock 串行化）。工作目录随工具调用的 `cwd` 参数流动（sticky 继承 + `cwd_change` 条目持久化），无 worktree 会话 fork；多工作目录会话经 `CreateSession.workingDirectories` seed granted-root 围栏。
-- pi 会话（.jsonl）：`~/.manox/sessions/`
+- 会话（.jsonl）：`~/.manox/sessions/`
 - 子代理会话：`~/.manox/sessions/subagents/`（持久化、不进侧栏）
 - 外部会话：`~/.manox/external-sessions/`（外部 CLI 会话由 manox-app 侧的 cx 驱动，目录约定在本仓库文档维护）
 - 设置：`~/.manox/settings.toml`；主题：`~/.manox/themes/`
-- 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具，架构与 `~/projects/github/deepseek-harness` 的 subagent 服务同构：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
+- 子 agent：`~/.claude/agents/*.md`（frontmatter name/description/tools/model + 正文；每个定义装配为一个独立委派工具：`ext/subagent/` 的 SubagentRuntime/SubagentProvider/能力协商/descriptor）；MCP：`~/.manox/mcp.json`（Claude Code `mcpServers` schema，stdio 或 HTTP；项目级 `.mcp.json` 与插件 `.mcp.json` 同 schema，合并序 plugin < global < project）；插件：`~/.manox/plugins/` + `~/.manox/marketplaces/` + `enabled_plugins.txt` / `disabled_plugins.txt`
 - Plan 文件：`~/.manox/plans/`
 - WS 网关端点（`cx web`，CLI 在 manox-app）：`~/.manox/gateway-ws.json`（0600；启动时写入 loopback 端口 + per-boot token，进程外客户端读它连 `ws://127.0.0.1:<port>/ws?token=…`；每次启动覆盖，进程退出后过期）。网关每机单例：`ws::start` 以非阻塞 flock 持 `~/.manox/gateway.lock`，他进程已持锁时本次 start 不绑定不发布（loud no-op）。
 - ChromeUse profile：`~/.manox/chrome-profile/`（内置 Chrome 自动化引擎 `chrome_use` 的缺省 user-data-dir，登录态跨会话持久；可经 `settings.toml` 的 `[chrome]` 表改 executable / headless / user_data_dir / cdp_endpoint）
@@ -95,24 +95,24 @@ UI chrome 的本地化完全归下游 host（dspo/manox-app）所有，本仓库
 
 ## crates/manox-harness 接线开发纪律（harness 分层）
 
-manox 的 harness 已切换到 manox-harness 内核（`crates/manox-harness/src/core`，对标 `~/projects/github/pi` 的 TS Pi 上游；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
+manox 的 harness 是 manox-harness 内核（`crates/manox-harness/src/core`；老 manox harness 已退役并完全删除，代码存于 git 历史与 `origin/Manox` 备份分支）。接线开发遵循以下纪律：
 
 ### 分层与依赖链
 
 `manox-agent（宿主）→ manox-harness/ext（扩展）→ manox-harness/core（内核）`；`manox-providers` 不进扩展层（仅服务 provider 路由域/外部 CLI 会话）。
 
-- **crates/manox-harness/src/core 内核**：只对标 TS Pi 核心能力 + 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
+- **crates/manox-harness/src/core 内核**：只承载通用 agent 内核能力（循环、压缩、会话、内建工具）+ 提供拓展点与拓展机制；宿主/业务逻辑一律不进内核。
 - **crates/manox-harness/src/ext 扩展**：只经内核拓展点扩展业务能力（provider 自治注册、bash 编排、子代理、session sidecar、model_ref 等），不反向依赖宿主。
 - **manox-agent 宿主**：装配 + manox 原创能力（审批策略、标题生成、斜杆命令路由、MCP 桥、Plan 模式等）。manox-harness 是唯一 harness 后端（harness 选择 feature 已移除）。
 
 ### 能力定层判定（每条新能力开工前必做）
 
-先对照 `~/projects/github/pi`（TS 上游）与老 manox 实现（git 历史 / `origin/Manox` 分支）实证，再按三分法定层：
+按三分法定层：
 
-1. **TS pi 原生支持 → 照搬进 crates/manox-harness/src/core**（parity）：wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook；`HookPoint` 集即 TS extension 事件的镜像）。
-2. **TS 无、pi 拓展点可承载 → manox-harness/src/ext**。
-3. **TS 无、manox 原创 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
-4. **偏离 TS 必须显式注明理由**（写进 PR 的 Assumptions，例：省略 `streamingBehavior`、manox-harness 的 MCP 工具比老 manox 更保守地过审批门控）。
+1. **通用 agent 内核能力 → crates/manox-harness/src/core**：任何 agent harness 都需要的机制，wire 名/事件形状/serde 保真（例：compaction 事件、`prompt(text,{images})`、steer 带图、Input hook）。
+2. **经内核拓展点可承载的业务能力 → manox-harness/src/ext**（不反向依赖宿主）。
+3. **宿主原创能力 → 宿主层**（例：审批门控、MCP、标题生成、斜杆路由）；内核只留缝隙（如 `AgentTool::requires_approval`），不代行政策。
+4. **定层偏离既有惯例必须显式注明理由**（写进 PR 的 Assumptions；例：manox-harness 的 MCP 工具比老 manox 更保守地过审批门控）。
 
 ### 内核纪律红线
 
@@ -132,9 +132,9 @@ manox 的 harness 已切换到 manox-harness 内核（`crates/manox-harness/src/
 
 ### 工作流约定
 
-- 独立 git worktree（`/private/tmp/manox--<branch>`）+ `codex/` 分支 + 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
+- 独立 git worktree（`/private/tmp/manox--<branch>`）+ 常规分支命名（`feat/*` `fix/*` `hotfix/*` `release/*`，或个人前缀如 `dspo/*`）+ 正交 PR；发射点重叠时叠加 PR 并在 PR 中注明 base 关系与合入后 rebase 路径。
 - 每 PR 门禁：以 `script/gates.sh` 的输出为唯一权威（含 `--quick` 之外的完整四腿），不做手挑 `cargo test` 的假绿声明。
-- 已知沙箱环境性测试失败（pi 的 bind 类 provider 测试、IPC socket 测试）记录在案、不计回归；整机并发 timing flake 同样不计回归。**再记一条**（2026-09-28，CI ubuntu-latest 实测）：`manox_harness::core::session::jsonl::tests::test_message_entry_writes_camel_case_parent_id` 在 CI 全量跑中偶发 `Option::unwrap() on a None value`（`jsonl.rs` 的 `.find(...)` 找不到刚写的 `child` 行）。**实测样本**：同一 commit 三次 CI —— 一次绿、两次红，故是**非确定性**失败，不是稳定回归；同一 job 在本仓历史上也出现过别的并发类 flake（`concurrent_open_session_yields_one_entry_one_pump`、`concurrent_cold_appends_land_a_linear_chain`）。**本地无法复现**（macOS 上单独跑与全量跑各多次均恒过），故未定位到根因。已排查并排除的方向：该测试用独立 `tempfile::tempdir`，不共享状态；读路径持 shared `flock`、写路径持 exclusive `flock`，锁序正确；`#818` 对 `manox-harness` 的唯一改动是给 `PlanReview` 变体加两个 `#[serde(default)]` 字段（纯增量），而 `jsonl.rs` 根本不引用 `PlanReview`，**无因果通路**。判定：环境性/未定位，不计回归。**升级条件**：若它开始稳定失败（而非偶发），按真缺陷排查——优先怀疑「写完立刻从另一路径读回」的可见性窗口（`write_all` 后未 flush 即释放 fence 的 fd）。**再记一条**（2026-09-29，本机全量跑偶发、单跑与复跑恒过）：`manox_agent::engine::tests::journal_replay_is_consistent_across_disk_reload`——断言跨盘回读的 display 投影一致，时间戳为秒级精度，写入跨秒边界时两侧相差 1s 导致断言失败；与本 diff 无关，属测试自身的时钟边界脆性。**改一条**（2026-09-30）：旧条目 `manox_agent::monitor_bridge::monitor_spawn_bridges_snapshots`（整机并发 timing flake）未随 monitor_bridge 退场消失——该测试随宿主 TaskCenter 落地**改名为 `manox_agent::background_task::tests::host_observer_bridges_monitor_snapshots`**（测试体同形：真起 echo 命令监视器 + deadline 轮询通知），flake 记录对新名继续有效，观察勿从零重诊。**再记一条**（2026-09-30，本机全量 `cargo test --workspace --all-targets` 偶发、随后 16 轮 manox-agent lib 单跑 + 5 轮全量复跑恒过）：manox-agent lib 套件一次非确定性失败，测试名未能捕获（门禁日志经 tail 管道只留摘要）；发生在 PR codex/task-surface-pr3（HostTaskObserver 接线）门禁期间，同代码复跑不复现，暂记环境性/未定位，**升级条件**同上——若稳定失败按真缺陷排查，优先怀疑 observer 异步结算与同步 stop 终态推的 first-wins 竞争窗口。**流程补救**：门禁日志落盘（`> file`）而非管道 `| tail`，避免失败记录连测试名都留不下。
+- 已知沙箱环境性测试失败（harness 的 bind 类 provider 测试、IPC socket 测试）记录在案、不计回归；整机并发 timing flake 同样不计回归。**再记一条**（2026-09-28，CI ubuntu-latest 实测）：`manox_harness::core::session::jsonl::tests::test_message_entry_writes_camel_case_parent_id` 在 CI 全量跑中偶发 `Option::unwrap() on a None value`（`jsonl.rs` 的 `.find(...)` 找不到刚写的 `child` 行）。**实测样本**：同一 commit 三次 CI —— 一次绿、两次红，故是**非确定性**失败，不是稳定回归；同一 job 在本仓历史上也出现过别的并发类 flake（`concurrent_open_session_yields_one_entry_one_pump`、`concurrent_cold_appends_land_a_linear_chain`）。**本地无法复现**（macOS 上单独跑与全量跑各多次均恒过），故未定位到根因。已排查并排除的方向：该测试用独立 `tempfile::tempdir`，不共享状态；读路径持 shared `flock`、写路径持 exclusive `flock`，锁序正确；`#818` 对 `manox-harness` 的唯一改动是给 `PlanReview` 变体加两个 `#[serde(default)]` 字段（纯增量），而 `jsonl.rs` 根本不引用 `PlanReview`，**无因果通路**。判定：环境性/未定位，不计回归。**升级条件**：若它开始稳定失败（而非偶发），按真缺陷排查——优先怀疑「写完立刻从另一路径读回」的可见性窗口（`write_all` 后未 flush 即释放 fence 的 fd）。**再记一条**（2026-09-29，本机全量跑偶发、单跑与复跑恒过）：`manox_agent::engine::tests::journal_replay_is_consistent_across_disk_reload`——断言跨盘回读的 display 投影一致，时间戳为秒级精度，写入跨秒边界时两侧相差 1s 导致断言失败；与本 diff 无关，属测试自身的时钟边界脆性。**改一条**（2026-09-30）：旧条目 `manox_agent::monitor_bridge::monitor_spawn_bridges_snapshots`（整机并发 timing flake）未随 monitor_bridge 退场消失——该测试随宿主 TaskCenter 落地**改名为 `manox_agent::background_task::tests::host_observer_bridges_monitor_snapshots`**（测试体同形：真起 echo 命令监视器 + deadline 轮询通知），flake 记录对新名继续有效，观察勿从零重诊。**再记一条**（2026-09-30，本机全量 `cargo test --workspace --all-targets` 偶发、随后 16 轮 manox-agent lib 单跑 + 5 轮全量复跑恒过）：manox-agent lib 套件一次非确定性失败，测试名未能捕获（门禁日志经 tail 管道只留摘要）；发生在 PR codex/task-surface-pr3（HostTaskObserver 接线）门禁期间，同代码复跑不复现，暂记环境性/未定位，**升级条件**同上——若稳定失败按真缺陷排查，优先怀疑 observer 异步结算与同步 stop 终态推的 first-wins 竞争窗口。**流程补救**：门禁日志落盘（`> file`）而非管道 `| tail`，避免失败记录连测试名都留不下。**再记一条**（2026-10-08，gates 全量并发跑中一次非确定性失败、单跑与整包复跑恒过）：`manox_session_core::ahp_adapter_tests::dispatch::pending_message_set_parks_the_steer_under_its_id`——断言「steer 打进运行中的 turn 时回报 injected:true」实际拿到 `injected:false`（steer 到达早于 turn 真正开跑，测试自身的同步竞态），与 de-provenance diff 无因果通路（该 diff 未触碰 session-core 投递逻辑）；判定：满载 timing flake，不计回归，升级条件同上。
 - PR 写清 Test Plan 与 Assumptions；注释必须准确描述代码（注释错位即回归，单独修复）。
 
 ## 项目规则

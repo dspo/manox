@@ -398,8 +398,8 @@ impl Drop for TreeKillGuard {
 /// when the group is already gone.
 async fn kill_process_tree(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
-        // Negative pid signals the process group — the same tree kill the TS
-        // harness performs on abort/timeout.
+        // Negative pid signals the process group — the same tree kill as on
+        // abort/timeout.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
@@ -458,7 +458,7 @@ mod tests {
         let signal = token.clone();
         // The grandchild writes a marker after the shell and its direct child
         // have been killed; a tree kill prevents the write.
-        let dir = std::env::temp_dir().join(format!("pi-exec-tree-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("exec-tree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("grandchild-survived");
         let cmd = format!("sh -c 'sleep 2; touch {}' & sleep 30", marker.display());
@@ -489,7 +489,7 @@ mod tests {
         let signal = token.clone();
         // The grandchild writes a marker after the shell and its direct
         // child should have been killed; a tree kill prevents the write.
-        let dir = std::env::temp_dir().join(format!("pi-exec-drop-tree-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("exec-drop-tree-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("grandchild-survived");
         let cmd = format!("sh -c 'sleep 2; touch {}' & sleep 30", marker.display());

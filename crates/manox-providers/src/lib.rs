@@ -178,7 +178,7 @@ pub struct CxConfig {
     pub vscode_app: Option<VsCodeAppSettings>,
     /// Dedicated per-subagent models (top-level `subagents:` map,
     /// `subagent_type: "provider::model::effort"`). Consumed by the host's
-    /// subagent dispatch (`pi_extensions::provider`), never by cx itself;
+    /// subagent dispatch, never by cx itself;
     /// modeled here so every cx-side config save round-trips it losslessly.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subagents: BTreeMap<String, String>,

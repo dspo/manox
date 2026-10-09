@@ -1,8 +1,0 @@
-AgentStart
-TurnStart
-MessageStart(user)
-MessageEnd(user)
-MessageStart(assistant)
-MessageEnd(assistant)
-TurnEnd
-AgentEnd

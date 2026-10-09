@@ -105,12 +105,10 @@ pub struct TerminalSettings {
     pub env: Vec<(String, String)>,
     /// Keystrokes (gpui syntax) that skip the terminal and keep workbench
     /// precedence while the terminal is focused — the terminal's keystroke
-    /// interceptor owns every other key and translates it to the PTY. Same
-    /// positive semantics as VS Code's
-    /// `terminal.integrated.commandsToSkipShell`; Zed solves the same conflict
-    /// statically via per-key `Terminal`-context override bindings, here the
-    /// conflict set is configurable. Defaults preserve the app's global
-    /// shortcuts.
+    /// interceptor owns every other key and translates it to the PTY. The
+    /// conflict set is configurable (VS Code solves the same problem with its
+    /// `terminal.integrated.commandsToSkipShell`; here the list is a setting).
+    /// Defaults preserve the app's global shortcuts.
     #[serde(
         default = "default_commands_to_skip_shell",
         skip_serializing_if = "is_default_commands_to_skip_shell"

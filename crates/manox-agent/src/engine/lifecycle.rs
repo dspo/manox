@@ -16,7 +16,7 @@ pub(super) fn steer_message(id: String, text: String, images: Vec<ContentBlock>)
         text,
         signature: None,
     }];
-    // TS `createUserMessage(text, images)` parity: image blocks ride the
+    // Image blocks ride the
     // steered user message behind the text.
     content.extend(images);
     // S3 stable-id: carry the client `Steer` message id as the durable row
@@ -312,7 +312,7 @@ pub(super) fn session_builder(
     cwd: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    model: Option<&PiModel>,
+    model: Option<&HarnessModel>,
     gate: &Arc<ApprovalGate>,
     question_gate: &Arc<crate::questions::UserQuestionGate>,
     plan: &Arc<crate::plan_mode::PlanSessionState>,
@@ -397,11 +397,11 @@ pub(super) fn session_builder(
 /// scheduler all see the restored choice.
 pub(super) fn adopt_session_model(
     session: &AgentSession,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     state: &EngineState,
 ) {
     let restored = session.model().clone();
-    *pi_model = restored.clone();
+    *harness_model = restored.clone();
     *state.model.lock().unwrap() = Some(restored);
 }
 
@@ -435,7 +435,7 @@ pub(super) fn attach_plan_hooks(
 /// memory hierarchy (managed policy, `~/.claude/CLAUDE.md` + rules, the
 /// per-directory chain down to the session cwd) loaded through
 /// [`crate::claude_md`] and folded into the system prompt by the kernel
-/// every turn (TS project-instruction semantics). Skills/templates stay
+/// every turn. Skills/templates stay
 /// empty here — manox skills ride the `manox_agent::skill` registry instead.
 pub(super) fn instruction_resources(cwd: &Path) -> manox_harness::harness::HarnessResources {
     let set = crate::claude_md::load(cwd, &crate::settings::claude_md_load_context());
@@ -495,7 +495,7 @@ pub(super) async fn rebuild_session(
     path: &Path,
     sessions_dir: &Path,
     runtime: &ModelRuntime,
-    pi_model: &mut PiModel,
+    harness_model: &mut HarnessModel,
     state: &EngineState,
     fallback_cwd: &Path,
     notice_tx: &mpsc::UnboundedSender<BackendNotice>,
@@ -525,8 +525,8 @@ pub(super) async fn rebuild_session(
         })
         .unwrap_or_else(|| fallback_cwd.to_path_buf());
     // Like the startup restore, a session swap passes no model override so
-    // the opened session's own persisted model wins (TS `options.model >
-    // restored model`); the actor adopts it right after the open.
+    // the opened session's own persisted model wins; the actor adopts it
+    // right after the open.
     let (builder, orchestrators, read_only_subagent) = session_builder(
         &cwd,
         sessions_dir,
@@ -552,7 +552,7 @@ pub(super) async fn rebuild_session(
             // never attach (write confinement is now in ApprovalGatedTool).
             attach_plugin_hooks(&mut s, &cwd);
             attach_prefix_gate(&mut s, notice_tx, thread_id);
-            adopt_session_model(&s, pi_model, state);
+            adopt_session_model(&s, harness_model, state);
             *session = s;
             // The rebuilt session owns a new storage: its own journal relay.
             spawn_journal_relay(session, &state.journal_tx);
@@ -563,7 +563,7 @@ pub(super) async fn rebuild_session(
         Err(err) => {
             send_notice(
                 notice_tx,
-                BackendNotice::Fatal(anyhow::anyhow!("pi session open failed: {err}")),
+                BackendNotice::Fatal(anyhow::anyhow!("session open failed: {err}")),
                 "engine fatal",
             );
         }

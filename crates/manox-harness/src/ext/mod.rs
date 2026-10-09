@@ -1,6 +1,6 @@
-// In-process extensions for the pi harness core.
+// In-process extensions for the harness core.
 //
-// The core `crates/pi` defines the seams (`BashOperations`,
+// The kernel crate defines the seams (`BashOperations`,
 // `BackgroundTaskRegistry`); this crate implements them stack-internally —
 // no dynamic loading, no out-of-process runtime — and assembles the
 // product-level bash tool on top.

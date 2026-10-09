@@ -7,8 +7,7 @@
 //! tools (plan-file and temp-scratch writes excepted, ungated), admits Bash
 //! only for single read-only `git` commands (see [`git_read_only`]), and a
 //! `BeforeAgentStart` hook injects the plan-mode instructions every turn.
-//! All wiring rides the kernel's existing extension points; `crates/pi`
-//! stays untouched.
+//! All wiring rides the kernel's existing extension points.
 
 mod git_read_only;
 
@@ -89,8 +88,7 @@ impl PlanSessionState {
     ///
     /// Process-local by construction: a selection made mid-run and lost to a
     /// process death leaves the log folding `plan_mode_pending` true with
-    /// nothing to commit it, exactly like dsh's process-local pending intents.
-    /// Re-selecting the mode is the recovery.
+    /// nothing to commit it. Re-selecting the mode is the recovery.
     pub fn requested(&self) -> Option<bool> {
         self.inner.read().unwrap().requested
     }
@@ -149,7 +147,7 @@ pub fn plan_file_path(plans_dir: &Path, slug: &str) -> PathBuf {
 }
 
 /// Title resolution chain: supplied title → first markdown heading in the
-/// plan file → slug fallback (mirrors oh-my-pi's `resolveApprovedPlan`).
+/// plan file → slug fallback.
 pub fn resolve_plan_title(supplied: Option<&str>, content: &str, slug: &str) -> String {
     if let Some(title) = supplied.map(str::trim).filter(|t| !t.is_empty()) {
         return title.to_string();

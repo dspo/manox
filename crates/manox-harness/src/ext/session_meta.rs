@@ -1,6 +1,6 @@
-//! Per-session UI metadata stored beside the pi jsonl transcript.
+//! Per-session UI metadata stored beside the jsonl transcript.
 //!
-//! The pi core owns the conversation (jsonl session files); sidebar-only
+//! The kernel owns the conversation (jsonl session files); sidebar-only
 //! flags — pin, archive, unread, error, display title — have no home in the
 //! transcript schema, so they live in a small sidecar keyed by session id.
 //! Loading tolerates a missing file (a fresh session has no sidecar yet) but
@@ -74,7 +74,7 @@ pub struct SessionMeta {
     pub interacted_at: Option<i64>,
     /// Compact display forms for registry slash turns (`/name args`), keyed
     /// by the user message's ordinal (0-based among user-role prompt messages)
-    /// in the pi transcript. The transcript stores only the expanded
+    /// in the transcript. The transcript stores only the expanded
     /// macro/skill body, so the sidecar restores the send-time bubble on
     /// reload.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

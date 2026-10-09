@@ -1,19 +1,14 @@
 //! Subagent dispatch — the runtime seam that turns a delegation request
-//! into a running child agent, isomorphic to the dsh (`deepseek-harness`)
-//! subagent architecture:
+//! into a running child agent:
 //!
 //! - [`SubagentRuntime`] is the provider registry + capability-checked
-//!   one-shot start + live-run table + the `start`/`end` observation feed
-//!   (the dsh `ctx.subagents` service).
-//! - [`SubagentProvider`] is one registered transport (dsh interface of the
-//!   same name); [`spawn::SpawnProvider`] is the in-process fresh-session
-//!   backend (dsh `subagent-spawn-in-process`).
+//!   one-shot start + live-run table + the `start`/`end` observation feed.
+//! - [`SubagentProvider`] is one registered transport;
+//!   [`spawn::SpawnProvider`] is the in-process fresh-session backend.
 //! - [`descriptor::Descriptor`] is the versioned, model-invisible child
-//!   identity record persisted in the child session header (dsh
-//!   `subagent/descriptor`).
+//!   identity record persisted in the child session header.
 //! - [`provider::RunObserver`] is the host bridge for transcript/health
-//!   surfaces (dsh has no analog: manox's watchdog + rail are host
-//!   originals).
+//!   surfaces.
 //!
 //! Continuable children (durable multi-turn sessions with an inbox) are
 //! reserved on the seam — the trait predicates and the runtime's

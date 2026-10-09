@@ -593,7 +593,7 @@ fn tolerate_missing_active_client_tools(mut params: Value) -> Value {
 /// client disagree and we bridge the difference. The count exists so an upgrade
 /// cannot silently leave one behind: a test asserts the expected number and
 /// names each workaround, so when upstream closes a gap this fails and points at
-/// the function to delete (the "self-invalidating guard" pattern pi-ahp uses).
+/// the function to delete (the "self-invalidating guard" pattern).
 ///
 /// Current entries:
 /// 1. [`tolerate_missing_active_client_tools`] — `createSession` with an

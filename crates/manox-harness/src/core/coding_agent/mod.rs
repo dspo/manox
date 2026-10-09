@@ -1,7 +1,8 @@
-// pi-coding-agent non-UI facade: a minimal vertical path from a working
+// Coding-agent non-UI facade: a minimal vertical path from a working
 // directory to a live AgentSession — resources, model/credential resolution,
-// settings, session repository, and the harness — without duplicating loop /
-// compaction / session implementations.
+// the session repository, and the harness — without duplicating loop /
+// compaction / session implementations. The facade reads no configuration
+// from disk; consumers inject everything through the builder.
 
 pub mod agent_session;
 pub mod model_runtime;
