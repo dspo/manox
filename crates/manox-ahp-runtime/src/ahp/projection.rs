@@ -674,8 +674,10 @@ impl Translator {
     /// An empty result is a decision, not an oversight, and each case is named
     /// where it arises: a `tool` transcript row whose `ToolResult` already
     /// settled the call, a verdict for a turn that closed, an idle `stop` with
-    /// nothing running. The projection tests drive every vocabulary kind and
-    /// assert each one reaches a channel.
+    /// nothing running. The load-bearing semantics are gated by tests below:
+    /// `fold_semantics_tests` (steer vs queued, stop as metadata, ask
+    /// degradation) and `extension_gate_tests` (every extension row lands on
+    /// the channel its fold lives on).
     pub fn on_entry(
         &mut self,
         chat_id: &str,
@@ -1014,8 +1016,9 @@ impl Translator {
             }
             SessionTreeEntry::Label { label, .. } => out.push(Emitted::new(
                 &thread,
-                // A `None` label clears; the action payload names the string
-                // (empty = cleared), matching the extension fold's read.
+                // A `None` label rides as the empty string — the fold holds
+                // `Some("")`, the same shape the v2 wire row carried (parity,
+                // not a clear).
                 extension_action(
                     ext::actions::LABEL_CHANGED,
                     json!({"label": label.clone().unwrap_or_default()}),
@@ -1033,8 +1036,9 @@ impl Translator {
             )),
             SessionTreeEntry::Leaf { target_id, .. } => out.push(Emitted::new(
                 &thread,
-                // A `None` target resets the leaf to the root; the action
-                // payload names the target id (empty = root reset).
+                // A `None` target rides as the empty target id — the fold
+                // holds `Some("")`, the same shape the v2 wire row carried
+                // (parity, not a root reset).
                 extension_action(
                     ext::actions::LEAF_CHANGED,
                     json!({"targetId": target_id.clone().unwrap_or_default()}),
@@ -2581,27 +2585,28 @@ fn whole(count: u64) -> Option<i64> {
     i64::try_from(count).ok()
 }
 
+/// One kernel record from its JSON shape — the same rows the jsonl store
+/// persists, so the fixtures below speak the kernel vocabulary end to end.
+/// The base stamps (id / parent / timestamp) apply unless the fields object
+/// overrides them.
+#[cfg(test)]
+fn kernel(mut fields: Value) -> SessionTreeEntry {
+    let mut base = json!({
+        "id": "e-1",
+        "parentId": None::<String>,
+        "timestamp": "2026-09-27T00:00:00.000Z",
+    });
+    let object = base.as_object_mut().expect("base is an object");
+    if let Some(extra) = fields.as_object_mut() {
+        object.append(extra);
+    }
+    serde_json::from_value(base.clone())
+        .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One kernel record from its JSON shape — the same rows the jsonl store
-    /// persists, so these fixtures speak the kernel vocabulary end to end.
-    /// The base stamps (id / parent / timestamp) apply unless the fields
-    /// object overrides them.
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
-        let mut base = json!({
-            "id": "e-1",
-            "parentId": None::<String>,
-            "timestamp": "2026-09-27T00:00:00.000Z",
-        });
-        let object = base.as_object_mut().expect("base is an object");
-        if let Some(extra) = fields.as_object_mut() {
-            object.append(extra);
-        }
-        serde_json::from_value(base.clone())
-            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
-    }
 
     #[test]
     fn a_set_activity_edge_mirrors_onto_the_session_channel_twice() {
@@ -2861,6 +2866,82 @@ mod tests {
         assert_eq!(decoded.background_tasks, state.background_tasks);
     }
 
+    /// The full background-task projection chain, anchored at the real
+    /// producer shape: host `TaskSnapshot` → kernel row → projected action →
+    /// extension registry state. Lives here because this is the only crate
+    /// that may name both `manox_agent` (the shape's authority) and
+    /// `manox_ahp` (the fold) — the golden in `manox-agent` pins the
+    /// serialization, this test pins that everything downstream of it still
+    /// consumes that exact shape.
+    #[test]
+    fn background_task_snapshot_flows_from_host_shape_to_extension_state() {
+        use manox_agent::background_task::{TaskKind, TaskSnapshot, TaskStatus};
+
+        let snapshot = TaskSnapshot {
+            task_id: "mon_7".into(),
+            kind: TaskKind::MonitorCommand,
+            owner_thread_id: "t-1".into(),
+            description: "watch the build".into(),
+            status: TaskStatus::Completed,
+            created_at_ms: 1_000,
+            ended_at_ms: Some(2_000),
+            event_count: 42,
+            total_bytes: 4_096,
+            exit_code: Some(0),
+            failure_summary: Some("nope".into()),
+            anchor_message_id: Some("m1".into()),
+            output_tail: "last line".into(),
+        };
+        let wire = serde_json::to_value(&snapshot).expect("snapshot serializes");
+        let other = TaskSnapshot {
+            task_id: "bg_8".into(),
+            kind: TaskKind::BackgroundBash,
+            description: "run the suite".into(),
+            ..snapshot.clone()
+        };
+        let wire_other = serde_json::to_value(&other).expect("snapshot serializes");
+
+        // Fold kernel rows through the live projection into extension state —
+        // the exact path a reconnecting client's baseline takes: one
+        // projector across both rows, the fold consuming each emitted action.
+        let mut state = ext::XManoxState::default();
+        let mut translator = Translator::new();
+        for (seq, row) in [wire.clone(), wire_other].into_iter().enumerate() {
+            for emitted in translator.on_entry(
+                "c-1",
+                "s-1",
+                seq as u64,
+                &kernel(json!({"type": "background_task", "snapshot": row})),
+            ) {
+                if emitted.channel == "x-manox-work:/s-1" {
+                    let action = serde_json::to_value(&emitted.action).expect("action serializes");
+                    assert_eq!(
+                        ext::reducer::apply(&mut state, &action),
+                        ext::ExtOutcome::Applied
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            state.background_tasks.as_ref().and_then(|m| m.get("mon_7")),
+            Some(&wire),
+            "the host shape reaches the registry view verbatim, keyed by task id"
+        );
+
+        // The registry property the whole-field fold used to break: a second
+        // task's row joins the view instead of replacing it, so a
+        // reconnecting client's baseline carries every task the journal has
+        // rows for.
+        assert_eq!(
+            state
+                .background_tasks
+                .expect("registry view populated")
+                .len(),
+            2,
+            "each task keeps its own registry entry"
+        );
+    }
+
     /// The fold's determinism gate: the same records projected twice yield
     /// byte-identical action streams, and a projector seeded from the folded
     /// state (the restart path) continues the same run numbering.
@@ -2902,20 +2983,6 @@ mod tests {
 #[cfg(test)]
 mod turn_message_tests {
     use super::*;
-
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
-        let mut base = json!({
-            "id": "e-1",
-            "parentId": None::<String>,
-            "timestamp": "2026-09-29T00:00:00.000Z",
-        });
-        let object = base.as_object_mut().expect("base is an object");
-        if let Some(extra) = fields.as_object_mut() {
-            object.append(extra);
-        }
-        serde_json::from_value(base.clone())
-            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
-    }
 
     #[test]
     fn the_initiating_user_row_becomes_the_turns_opening_message() {
@@ -2979,34 +3046,336 @@ mod turn_message_tests {
     }
 }
 
+/// The transcript-semantics gates, ported from the retired
+/// `translation_convergence` suite when the wire vocabulary was deleted:
+/// the same `on_message` state machine, now driven by kernel records. Each
+/// one pins a misclassification a happy-path fold cannot catch — a steer
+/// queued instead of injected runs its text twice, a stop row closed
+/// mid-loop splits one turn per tool round, a textless ask strands the
+/// model waiting forever.
+#[cfg(test)]
+mod fold_semantics_tests {
+    use super::*;
+
+    /// A turn, a mid-run steer under the client's steer id, and the turn's
+    /// close — the rows a live steer produces on the kernel journal.
+    fn mid_run_steer_records() -> Vec<SessionTreeEntry> {
+        vec![
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "run the tests"}]},
+                "origin": "rpc-submit",
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-2", "delta": "Starting."})),
+            // The steer: a user row that arrives with the turn still open.
+            // The id is the client's steer id, which is also the id its
+            // `chat/pendingMessageSet{kind: steering}` echo carried.
+            kernel(json!({
+                "type": "message",
+                "id": "steer-1",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "use the fast suite"}]},
+                "origin": "steer-1",
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-4",
+                          "delta": "Using the fast suite."})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ]
+    }
+
+    /// A mid-run steer is `Steering`, not `Queued` — and it is not published
+    /// twice.
+    ///
+    /// A manox steer is injected into the *running* turn and journalled as
+    /// an ordinary user row; it does not close the turn and does not wait
+    /// for the next one. AHP draws that distinction in
+    /// `PendingMessageKind`: `Steering` lands in
+    /// `ChatState.steeringMessage` (consumed by the turn it interrupts),
+    /// `Queued` lands in `ChatState.queuedMessages` (carried into the
+    /// *next* turn). Projecting a steer as `Queued` therefore does not
+    /// merely mislabel it: the row is still sitting in the queue when the
+    /// next turn starts, so the same text is injected a second time.
+    #[test]
+    fn a_mid_run_steer_is_steering_not_queued() {
+        let mut translator = Translator::new();
+        let mut seen = Vec::new();
+        for (seq, entry) in mid_run_steer_records().into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                if let StateAction::ChatPendingMessageSet(set) = &emitted.action {
+                    seen.push((format!("{:?}", set.kind), set.id.clone()));
+                }
+            }
+        }
+        // Two pending messages, and that is correct: the opening submission
+        // is a genuine queue entry (the turn carries it as its first
+        // message), while the steer is not. What must never happen is the
+        // steer appearing as a *second* queued entry, or under a second id.
+        let kinds: Vec<&str> = seen.iter().map(|(kind, _)| kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            ["Queued", "Steering"],
+            "the submission queues; the mid-run steer is injected, not queued (got {seen:?})"
+        );
+        let (_, steer_id) = &seen[1];
+        assert_eq!(
+            steer_id, "steer-1",
+            "the pending id must be the client's steer id — the identity its echo \
+             and the host's `steer` intent both use; a projector-minted id can be \
+             retired by neither"
+        );
+        // The id is unique: a pending message the client cannot match against
+        // the one it already holds is what produced two entries for one steer.
+        let ids: Vec<&str> = seen.iter().map(|(_, id)| id.as_str()).collect();
+        assert_eq!(
+            ids.len(),
+            ids.iter().collect::<std::collections::HashSet<_>>().len(),
+            "pending ids must be distinct: {ids:?}"
+        );
+    }
+
+    /// The actions the projector emits for the mid-run steer scenario, reduced.
+    fn mid_run_steer_state() -> ahp_types::state::ChatState {
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        for (seq, entry) in mid_run_steer_records().into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn a_consumed_steer_leaves_no_queued_residue() {
+        let state = mid_run_steer_state();
+        let queued = state.queued_messages.unwrap_or_default();
+        assert!(
+            queued.is_empty(),
+            "the steer must not remain queued: a queued entry is re-injected as a \
+             fresh user message by the next `turnStarted`, running the same text \
+             twice (residue: {queued:?})"
+        );
+    }
+
+    /// A later turn does not inherit the steer.
+    ///
+    /// This is the consequence the kind fix exists for. The projector's
+    /// contract ends at "the steer is `Steering`, not `Queued`": it
+    /// publishes no removal, because the removal belongs to whoever observes
+    /// the injection. What the fold must show is that nothing carries the
+    /// text forward.
+    ///
+    /// The removal itself is asserted where it is emitted, on the host path
+    /// (the dispatch tests in `manox-session-core`), since this test drives
+    /// the projector alone and so never sees it.
+    #[test]
+    fn a_steer_is_not_replayed_by_a_later_turn() {
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        for (seq, entry) in mid_run_steer_records().into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+
+        // The steer reached the running turn, so the turn's opening message
+        // is still the original submission — not the steer.
+        let turn = state
+            .turns
+            .last()
+            .expect("the scripted records open a turn");
+        assert_eq!(
+            turn.message.text, "run the tests",
+            "the steer is injected into the running turn; it must not replace or \
+             reopen it"
+        );
+
+        // Now the next turn starts. Nothing may carry the steer forward.
+        let next = kernel(json!({"type": "turn_start", "id": "sentry-99"}));
+        for emitted in translator.on_entry("c-1", "s-1", 99, &next) {
+            ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+        }
+        let queued = state.queued_messages.clone().unwrap_or_default();
+        assert!(
+            !queued.iter().any(|m| m.id == "steer-1"),
+            "the next turn must not inherit the steer: {queued:?}"
+        );
+        // The steering slot itself is retired by the host's removal, not by
+        // the fold — see the dispatch tests. Assert it is still the CLIENT's
+        // id here, so that removal has something to match.
+        assert_eq!(
+            state.steering_message.as_ref().map(|m| m.id.as_str()),
+            Some("steer-1"),
+            "the pending steering entry keeps the client's id, which is what the \
+             host's removal matches on"
+        );
+    }
+
+    /// An agentic tool loop: every assistant message is followed by a `stop`
+    /// record carrying the model's stop reason, and the turn only really
+    /// ends at its `turn_finish`. The stops are per-message metadata — no
+    /// notice may surface and no turn may close until the finish arrives.
+    #[test]
+    fn a_stop_row_is_metadata_and_never_ends_the_turn() {
+        let records = [
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "look around"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-1", "delta": "Working."})),
+            kernel(json!({"type": "stop", "id": "sentry-2", "reason": "tool_use"})),
+            kernel(json!({"type": "agent_text_delta", "id": "sentry-3",
+                          "delta": "Still working."})),
+            kernel(json!({"type": "stop", "id": "sentry-4", "reason": "end_turn"})),
+            kernel(json!({"type": "turn_finish", "id": "sentry-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut stop_notes = 0usize;
+        for (seq, entry) in records.iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, entry) {
+                if let StateAction::ChatResponsePart(part) = &emitted.action
+                    && matches!(
+                        part.part,
+                        ahp_types::state::ResponsePart::SystemNotification(_)
+                    )
+                {
+                    stop_notes += 1;
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            stop_notes, 0,
+            "a stop row is the model's own metadata, not a notice for the user"
+        );
+        assert_eq!(
+            state.turns.len(),
+            1,
+            "the tool loop is one turn — the stops must not close it mid-round"
+        );
+        assert_eq!(
+            state.turns.last().map(|t| t.message.text.as_str()),
+            Some("look around"),
+            "the turn's opening message is the submission"
+        );
+        assert!(
+            state.active_turn.is_none(),
+            "the turnFinish closed the turn"
+        );
+    }
+
+    /// Records written by older engine builds state the AskUserQuestion
+    /// text in `header` alone — the `question` field is a later schema
+    /// addition (a device journal carries exactly this shape). The
+    /// elicitation must still carry the structured questions; an
+    /// unanswerable bare ask leaves the model waiting forever.
+    #[test]
+    fn an_older_build_ask_payload_folds_its_questions_through_the_header() {
+        let entry = kernel(json!({
+            "type": "question",
+            "id": "e7",
+            "kind": "request",
+            "authId": "call_00_LZg8",
+            "payload": {
+                "toolName": "AskUserQuestion",
+                "toolCallId": "call_00_LZg8",
+                "input": {"questions": [{
+                    "header": "交付方式",
+                    "multiSelect": false,
+                    "options": [
+                        {"label": "发到 PR 评论区", "description": "gh pr comment"},
+                        {"label": "贴回对话", "description": "直接回复"},
+                    ],
+                }]},
+            },
+        }));
+        let mut translator = Translator::new();
+        let actions: Vec<_> = translator
+            .on_entry("c-1", "s-1", 7, &entry)
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        let request = actions.iter().find_map(|a| match a {
+            StateAction::ChatInputRequested(r) => Some(&r.request),
+            _ => None,
+        });
+        let request = request.expect("the ask reaches the client as chat/inputRequested");
+        assert_eq!(request.id, "call_00_LZg8");
+        let questions = request.questions.as_ref().expect("structured questions");
+        assert_eq!(
+            questions.len(),
+            1,
+            "the v1 payload still yields its question"
+        );
+        let single = match &questions[0] {
+            ahp_types::state::ChatInputQuestion::SingleSelect(s) => s,
+            other => panic!("expected a single-select question, got {other:?}"),
+        };
+        assert_eq!(
+            single.message, "交付方式",
+            "the header IS the question text"
+        );
+        assert_eq!(single.options.len(), 2, "both options survive");
+    }
+
+    /// A question row carrying neither `question` nor `header` has nothing
+    /// to ask: the fold must degrade to the accepted bare ask
+    /// (`questions: None`), never to a silent textless card.
+    #[test]
+    fn an_ask_row_without_any_question_text_degrades_to_a_bare_ask() {
+        let entry = kernel(json!({
+            "type": "question",
+            "id": "e8",
+            "kind": "request",
+            "authId": "call_bare",
+            "payload": {
+                "toolName": "AskUserQuestion",
+                "input": {"questions": [{"multiSelect": false, "options": []}]},
+            },
+        }));
+        let mut translator = Translator::new();
+        let actions: Vec<_> = translator
+            .on_entry("c-1", "s-1", 8, &entry)
+            .into_iter()
+            .map(|e| e.action)
+            .collect();
+        let request = actions.iter().find_map(|a| match a {
+            StateAction::ChatInputRequested(r) => Some(&r.request),
+            _ => None,
+        });
+        let request = request.expect("the bare ask still reaches the client");
+        assert_eq!(
+            request.questions.as_ref(),
+            None,
+            "no text means no fabricated question card"
+        );
+    }
+}
+
 /// The extension-state reachability gate: every `XManoxState` field must be
 /// fillable through the real production path — a kernel record projected by
 /// [`Translator`], riding the exact extension channel its fold lives on.
 /// Ported from `manox_ahp::ext::reducer`'s tests when the translator moved
-/// here (the ext crate cannot name the runtime's projector); the compile-time
-/// half stays there — a new `XManoxState` field without a producer case here
-/// is a missing literal field below, so "declared but always empty" cannot
-/// come back.
+/// here (the ext crate cannot name the runtime's projector). The compile-time
+/// half is the struct literal at the bottom — no `..Default`, so a new
+/// `XManoxState` field without a producer case above is a missing literal
+/// field, and "declared but always empty" cannot come back.
 #[cfg(test)]
 mod extension_gate_tests {
     use super::*;
     use manox_ahp::ext::ExtOutcome;
     use manox_ahp::ext::XManoxState;
     use manox_ahp::ext::reducer as ext_reducer;
-
-    fn kernel(mut fields: Value) -> SessionTreeEntry {
-        let mut base = json!({
-            "id": "e-gate",
-            "parentId": None::<String>,
-            "timestamp": "2026-09-30T00:00:00.000Z",
-        });
-        let object = base.as_object_mut().expect("base is an object");
-        if let Some(extra) = fields.as_object_mut() {
-            object.append(extra);
-        }
-        serde_json::from_value(base.clone())
-            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
-    }
 
     #[test]
     fn every_extension_state_field_is_reachable_through_the_real_fold() {

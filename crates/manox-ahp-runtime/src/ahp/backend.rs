@@ -2228,13 +2228,6 @@ async fn seed_directories(session_id: &str) -> Option<Vec<std::path::PathBuf>> {
     )
 }
 
-/// The journal's own last-entry vocabulary marker, re-exported for the tests'
-/// scripted journals.
-#[allow(dead_code)]
-pub(crate) fn is_journal_event(event: &SessionTreeEntry) -> bool {
-    !matches!(event, SessionTreeEntry::Metrics { .. })
-}
-
 /// The runtime's working directory (kept for the root config once it lands).
 #[allow(dead_code)]
 pub(crate) fn cwd_of(backend: &RuntimeBackend) -> &std::path::Path {

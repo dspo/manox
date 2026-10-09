@@ -2535,3 +2535,51 @@ mod branch_query_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod turn_owner_tests {
+    use super::*;
+
+    #[test]
+    fn turn_start_round_trips_the_owner_and_reads_old_rows_as_none() {
+        let stamped = serde_json::to_value(TurnOwner { pid: 4242 }).unwrap();
+        assert_eq!(stamped["pid"], serde_json::json!(4242));
+        let back: TurnOwner = serde_json::from_value(stamped).unwrap();
+        assert_eq!(back, TurnOwner { pid: 4242 });
+
+        // Rows written before the stamp carry no owner: they parse with
+        // `None`, and a reader treats such a turn conservatively (never
+        // auto-cancelled).
+        let row: SessionTreeEntry = serde_json::from_value(serde_json::json!({
+            "type": "turn_start",
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-01-01T00:00:00Z",
+        }))
+        .expect("a pre-stamp row parses");
+        match row {
+            SessionTreeEntry::TurnStart { owner, .. } => {
+                assert_eq!(owner, None, "an old row reads as unstamped");
+            }
+            other => panic!("unexpected entry: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_current_process_reads_alive_and_a_reaped_one_dead() {
+        assert!(TurnOwner::for_current_process().is_alive());
+
+        // A child that has been waited on is reaped: its pid is genuinely
+        // gone (ESRCH), deterministically — no live-process race. A reused
+        // pid instead reads alive, the conservative side: the turn is left
+        // for a deliberate manual settle, never auto-cancelled.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("a trivial child spawns");
+        child.wait().expect("the child is reaped");
+        assert!(
+            !TurnOwner { pid: child.id() }.is_alive(),
+            "a reaped process reads as dead"
+        );
+    }
+}

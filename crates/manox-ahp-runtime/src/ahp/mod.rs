@@ -15,12 +15,12 @@
 //!   pointer as `defaultChat`.
 //!
 //! The journal read goes through the gateway's existing seams — no bespoke
-//! reader: [`crate::journal_query::cold_read`] (persisted-jsonl direct read,
-//! the same one `PageHistory` uses) plus
-//! [`crate::ahp::projection`] (kernel record → AHP action, no intermediate
-//! and thread metadata comes from `manox_agent::thread_store` (the sidebar
-//! mirror row) and `manox_agent::thread_registry` (the active-session
-//! pointer), the same sources `ListThreads` answers from.
+//! reader: [`crate::journal_query::cold_read`] (persisted-jsonl direct read)
+//! plus [`crate::ahp::projection`] (kernel record → AHP action, no
+//! intermediate vocabulary), and thread metadata comes from
+//! `manox_agent::thread_store` (the sidebar mirror row) and
+//! `manox_agent::thread_registry` (the active-session pointer), the same
+//! sources `ListThreads` answers from.
 //!
 //! # What is deliberately absent
 //!

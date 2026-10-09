@@ -395,13 +395,6 @@ mod tests {
         assert_eq!(state.subagents.as_ref().expect("still populated").len(), 2);
     }
 
-    /// The root-cause gate for the whole "hand-written key sets" class, in
-    /// its routing-aware form: every host-emitted extension action must (a)
-    /// be produced by the real translator, (b) ride an *extension* channel —
-    /// an action on a state-bearing channel is `StateAction::Unknown` to that
-    /// channel's reducer, so it is never folded and never baselined (the
-    /// session-channel thread rows drifted exactly this way) — and (c) leave
-    /// its state field populated. The final whole-struct comparison makes a
     /// The client-dispatched rows fold straight from the action the client
     /// sends (no journal producer exists; the runtime dispatch arms accept
     /// these directly). The producer-side reachability gate lives in

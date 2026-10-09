@@ -26,9 +26,9 @@
 //!
 //! - **The kernel session store stays the only durable store.** Channel state
 //!   here is a fold; a fresh [`Host`] seeds it through [`Backend`] and then
-//!   advances it with the same action stream clients receive, so host and
-//!   client reductions cannot drift (the replay-consistency gate in
-//!   `manox-ahp-runtime`).
+//!   advances it with the same action stream clients receive — both ends run
+//!   these same reducers, and the projection's deterministic-replay gate in
+//!   `manox-ahp-runtime` pins the stream they fold.
 //! - **One gateway per process.** A single [`Host`] owns the single `serverSeq`
 //!   domain; connections multiplex onto it.
 //!
