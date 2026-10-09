@@ -34,9 +34,25 @@ pub fn persisted_session_file(session_id: &str) -> Option<PathBuf> {
     let dir = manox_agent::thread_store::try_global()
         .map(|_| manox_agent::thread_store::global_sessions_dir())
         .or_else(|| manox_agent::paths::sessions_dir().ok())?;
-    Some(
-        dir.join(manox_harness::session::repository::session_file_name(
+    let file = dir.join(manox_harness::session::repository::session_file_name(
+        session_id,
+    ));
+    if file.exists() {
+        return Some(file);
+    }
+    // Subagent child sessions persist under the sessions dir's `subagents/`
+    // subtree (their ids are the run ids the parent's rows name). A child id
+    // resolves there once its file exists; an id with no file anywhere keeps
+    // the main-dir path, because the create flow (a brand-new session's
+    // journal not yet materialized) resolves the path it will write. The
+    // charset gate above applies to both legs — no escape hatch.
+    let child = dir
+        .join("subagents")
+        .join(manox_harness::session::repository::session_file_name(
             session_id,
-        )),
-    )
+        ));
+    if child.exists() {
+        return Some(child);
+    }
+    Some(file)
 }

@@ -100,7 +100,6 @@ pub mod actions {
     /// Active browser suites (host-emitted; clients set through `session/configChanged`).
     pub const WORK_BROWSER_SUITES: &str = "x-manox-work/browserSuitesChanged";
     /// Sub-agent tree / progress (host-emitted).
-    pub const WORK_SUBAGENTS: &str = "x-manox-work/subagentsChanged";
     /// The engine's active tool set (host-emitted; AHP's `session/serverToolsChanged`
     /// describes *advertised* tools, not the model's currently-visible subset).
     pub const WORK_ACTIVE_TOOLS: &str = "x-manox-work/activeToolsChanged";
@@ -135,7 +134,6 @@ pub mod actions {
         WORK_GOAL_CHANGED,
         WORK_BACKGROUND_TASKS,
         WORK_BROWSER_SUITES,
-        WORK_SUBAGENTS,
         WORK_ACTIVE_TOOLS,
         METRICS_CHANGED,
         WORKSPACES_BASELINE,

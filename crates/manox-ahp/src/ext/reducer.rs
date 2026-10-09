@@ -54,12 +54,6 @@ pub struct XManoxState {
     /// session's distinct task count).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_tasks: Option<BTreeMap<String, Value>>,
-    /// Sub-agent registry view: agent id → the agent's latest progress row
-    /// (envelope tag stripped). Progress rows carry one agent's tick each
-    /// (nesting is structurally off this iteration), so the fold upserts by
-    /// `agentId`; `None` means no row has been folded.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subagents: Option<BTreeMap<String, Value>>,
     /// Thread pinned flag — AHP has no pin bit, only read/archived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned: Option<bool>,
@@ -123,10 +117,7 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
     // registries are exempt — their rows carry up-to-8KiB output tails, so a
     // whole-bag clone per journal row is quadratic in session history — and
     // report their own change instead.
-    let keyed = matches!(
-        tag,
-        super::actions::WORK_BACKGROUND_TASKS | super::actions::WORK_SUBAGENTS
-    );
+    let keyed = matches!(tag, super::actions::WORK_BACKGROUND_TASKS);
     let before = (!keyed).then(|| state.clone());
     let mut registry_changed = false;
     match tag {
@@ -167,18 +158,6 @@ pub fn apply(state: &mut XManoxState, action: &Value) -> Outcome {
                 && let Some(task_id) = snapshot.get("task_id").and_then(Value::as_str)
             {
                 registry_changed = upsert_row(&mut state.background_tasks, task_id, snapshot);
-            }
-        }
-        super::actions::WORK_SUBAGENTS => {
-            // Same registry shape as background tasks: progress rows carry
-            // one agent's tick each, keyed upsert by `agentId`; a row
-            // without a string `agentId` cannot be keyed and is dropped.
-            if let Some(agent_id) = action.get("agentId").and_then(Value::as_str) {
-                let mut row = action.clone();
-                if let Some(fields) = row.as_object_mut() {
-                    fields.remove("type");
-                    registry_changed = upsert_row(&mut state.subagents, agent_id, &row);
-                }
             }
         }
         super::actions::WORK_ACTIVE_TOOLS => {
@@ -349,50 +328,6 @@ mod tests {
                 .len(),
             2
         );
-    }
-
-    #[test]
-    fn subagent_progress_rows_upsert_the_registry_view_by_agent_id() {
-        let row_for = |agent: &str, status: &str| {
-            json!({
-                "type": "x-manox-work/subagentsChanged",
-                "agentId": agent,
-                "agentType": "explore",
-                "status": status
-            })
-        };
-        let mut state = XManoxState::default();
-        assert_eq!(
-            apply(&mut state, &row_for("sub-0", "running")),
-            Outcome::Applied
-        );
-        assert_eq!(
-            apply(&mut state, &row_for("sub-1", "running")),
-            Outcome::Applied
-        );
-        assert_eq!(
-            apply(&mut state, &row_for("sub-0", "completed")),
-            Outcome::Applied
-        );
-        let registry = state.subagents.as_ref().expect("registry view populated");
-        assert_eq!(registry.len(), 2, "each agent keeps its own entry");
-        assert_eq!(registry["sub-0"]["status"], "completed");
-        assert_eq!(
-            registry["sub-0"].get("type"),
-            None,
-            "the envelope tag is stripped from stored rows"
-        );
-
-        // A row without an agent id cannot be keyed and does not disturb
-        // the view.
-        assert_eq!(
-            apply(
-                &mut state,
-                &json!({"type": "x-manox-work/subagentsChanged", "status": "running"})
-            ),
-            Outcome::NoOp
-        );
-        assert_eq!(state.subagents.as_ref().expect("still populated").len(), 2);
     }
 
     /// The client-dispatched rows fold straight from the action the client

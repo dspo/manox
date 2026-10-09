@@ -473,6 +473,10 @@ pub struct Translator {
     /// The open plan-review card's request id, so the `resolved` edge (which
     /// carries no proposal id) can close the very part the proposal opened.
     plan_review: Option<String>,
+    /// Subagent run ids currently listed in the parent chat's background
+    /// work, so a progress tick settles to exactly one Set edge per run and
+    /// exactly one Removed edge at its terminal status.
+    subagents: BTreeMap<String, ()>,
 }
 
 /// One transcript row's decoded fields.
@@ -802,6 +806,21 @@ impl Translator {
                 } else {
                     Outcome::Complete
                 };
+                // A cancelled turn kills its in-flight subagents (#812) —
+                // the AHP face reports the deaths as removals rather than
+                // leaving entries that never settle. A completed turn's runs
+                // settle through their own terminal rows.
+                if *cancelled {
+                    for id in self.subagents.keys().cloned().collect::<Vec<_>>() {
+                        self.subagents.remove(&id);
+                        out.push(Emitted::new(
+                            &chat,
+                            StateAction::ChatBackgroundWorkRemoved(
+                                ahp_types::actions::ChatBackgroundWorkRemovedAction { id },
+                            ),
+                        ));
+                    }
+                }
                 self.close_turn(&chat, &row, outcome, &mut out);
             }
             // A `stop` row is per-assistant-message metadata — the model's own
@@ -940,15 +959,64 @@ impl Translator {
                 latest_activity,
                 status,
                 ..
-            } => out.push(Emitted::new(
-                &at,
-                extension_action(
-                    ext::actions::WORK_SUBAGENTS,
-                    json!({"agentId": agent_id, "agentType": agent_type,
-                           "toolUses": tool_uses, "latestActivity": latest_activity,
-                           "status": status}),
-                ),
-            )),
+            } => {
+                // AHP 1.0's own answer for running subagents: the run is
+                // background work on the parent chat, and its `chat` names
+                // the child's own channel (the child session id IS the run
+                // id, pinned at spawn). The first running tick opens the
+                // entry; a terminal status closes it — the ticks between
+                // only refresh nothing (the entry's fields are set-once by
+                // design: label and start, not per-tick activity).
+                // Terminal judgment rides the producer's own vocabulary:
+                // the journal's status strings are `ToolCallStatus`'s
+                // kebab-case names (`pending-approval | running | success |
+                // continued | error | denied | cancelled`), the same set
+                // `status_phase` maps — so a run settles exactly when its
+                // producer (`on_settled` -> Success/Cancelled/Error) says so.
+                let running = !matches!(
+                    status_phase(status),
+                    Phase::Finished | Phase::Failed | Phase::Aborted
+                );
+                let listed = self.subagents.contains_key(agent_id);
+                if running && !listed {
+                    self.subagents.insert(agent_id.clone(), ());
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkSet(
+                            ahp_types::actions::ChatBackgroundWorkSetAction {
+                                work: ahp_types::state::BackgroundWork::Subagent(
+                                    ahp_types::state::BackgroundSubagentWork {
+                                        id: agent_id.clone(),
+                                        label: agent_type.clone(),
+                                        started_at: row.timestamp.clone(),
+                                        meta: Some(manox_meta(json!({
+                                            "agentType": agent_type,
+                                            "toolUses": tool_uses,
+                                            "latestActivity": latest_activity,
+                                        }))),
+                                        // Legacy rows (pre-#885 runs, whose child
+                                        // session ids were minted independently)
+                                        // name a channel no journal backs — the
+                                        // link is inert there, no regression:
+                                        // before this change no link existed.
+                                        chat: format!("ahp-chat:/{agent_id}"),
+                                    },
+                                ),
+                            },
+                        ),
+                    ));
+                } else if !running && listed {
+                    self.subagents.remove(agent_id);
+                    out.push(Emitted::new(
+                        &chat,
+                        StateAction::ChatBackgroundWorkRemoved(
+                            ahp_types::actions::ChatBackgroundWorkRemovedAction {
+                                id: agent_id.clone(),
+                            },
+                        ),
+                    ));
+                }
+            }
             SessionTreeEntry::ActiveToolsChange {
                 active_tool_names, ..
             } => out.push(Emitted::new(
@@ -3573,6 +3641,120 @@ mod preview_edits_tests {
     }
 }
 
+#[cfg(test)]
+mod subagent_face_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-09T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    fn progress(agent: &str, status: &str, seq: u64) -> SessionTreeEntry {
+        kernel(json!({
+            "type": "subagent_progress", "id": format!("e-{seq}"),
+            "agentId": agent, "agentType": "explore",
+            "toolUses": 3, "latestActivity": "grepping",
+            "status": status,
+        }))
+    }
+
+    /// The subagent face is AHP-native: a running tick opens background work
+    /// on the parent chat naming the child's own channel (the run id IS the
+    /// child session id), a terminal status closes it, and a cancelled turn
+    /// reports every still-listed run — the #812 silence lands as visible
+    /// removals, not as entries that never settle.
+    #[test]
+    fn subagent_runs_are_background_work_on_the_parent_chat() {
+        let mut t = Translator::new();
+        let mut out = Vec::new();
+        for (seq, entry) in [
+            (1, progress("sub-0", "running", 1)),
+            (2, progress("sub-0", "running", 2)),
+            (3, progress("sub-1", "running", 3)),
+        ] {
+            out.extend(t.on_entry("c-1", "s-1", seq, &entry));
+        }
+        let sets: Vec<_> = out
+            .iter()
+            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkSet(_)))
+            .collect();
+        assert_eq!(
+            sets.len(),
+            2,
+            "one Set per run, ticks between settle nothing: {out:?}"
+        );
+        let mut chat_state = manox_ahp::channels::chat::initial("c-1");
+        for e in &sets {
+            ahp::reducers::apply_action_to_chat(&mut chat_state, &e.action);
+        }
+        let work = chat_state
+            .background_work
+            .expect("the fold holds the entries");
+        assert_eq!(work.len(), 2);
+        match &work[0] {
+            ahp_types::state::BackgroundWork::Subagent(sub) => {
+                assert_eq!(sub.id, "sub-0");
+                assert_eq!(sub.chat, "ahp-chat:/sub-0", "the child channel is named");
+            }
+            other => panic!("the entry is a subagent: {other:?}"),
+        }
+
+        // A terminal status closes its run only — `success` is the word the
+        // producer actually writes (`on_settled` maps Completed to
+        // ToolCallStatus::Success, kebab-cased onto the row).
+        let mut out2 = Vec::new();
+        out2.extend(t.on_entry("c-1", "s-1", 4, &progress("sub-0", "success", 4)));
+        let removed: Vec<_> = out2
+            .iter()
+            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(_)))
+            .collect();
+        assert_eq!(removed.len(), 1, "only sub-0 closes: {out2:?}");
+
+        // `denied` settles too — the round-1 vocabulary gap was exactly
+        // success/denied never closing their runs.
+        let mut out_denied = Vec::new();
+        out_denied.extend(t.on_entry("c-1", "s-1", 6, &progress("sub-9", "running", 6)));
+        out_denied.extend(t.on_entry("c-1", "s-1", 7, &progress("sub-9", "denied", 7)));
+        assert_eq!(
+            out_denied
+                .iter()
+                .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(_)))
+                .count(),
+            1,
+            "a denied run settles: {out_denied:?}"
+        );
+
+        // A cancelled turn settles every still-listed run — the AHP face
+        // reports what #812 said happened silently.
+        let mut out3 = Vec::new();
+        out3.extend(t.on_entry(
+            "c-1",
+            "s-1",
+            5,
+            &kernel(json!({"type": "turn_finish", "id": "e-5",
+                          "cancelled": true, "failed": false, "strandedSteerIds": []})),
+        ));
+        let cancelled_removals = out3
+            .iter()
+            .filter(|e| matches!(&e.action, StateAction::ChatBackgroundWorkRemoved(r) if r.id == "sub-1"))
+            .count();
+        assert_eq!(
+            cancelled_removals, 1,
+            "the cancelled turn reports sub-1's death: {out3:?}"
+        );
+    }
+}
+
 /// The extension-state reachability gate: every `XManoxState` field must be
 /// fillable through the real production path — a kernel record projected by
 /// [`Translator`], riding the exact extension channel its fold lives on.
@@ -3625,13 +3807,6 @@ mod extension_gate_tests {
             (
                 kernel(json!({"type": "background_task", "snapshot": {"task_id": "mon_7"}})),
                 ext_actions::WORK_BACKGROUND_TASKS,
-                "x-manox-work:/s-1",
-            ),
-            (
-                kernel(json!({"type": "subagent_progress", "agentId": "sub-0",
-                              "agentType": "explore", "toolUses": 0,
-                              "latestActivity": null, "status": "running"})),
-                ext_actions::WORK_SUBAGENTS,
                 "x-manox-work:/s-1",
             ),
             (
@@ -3727,18 +3902,6 @@ mod extension_gate_tests {
                     [("mon_7".to_string(), json!({"task_id": "mon_7"}))]
                         .into_iter()
                         .collect()
-                ),
-                subagents: Some(
-                    [(
-                        "sub-0".to_string(),
-                        json!({
-                            "agentId": "sub-0", "agentType": "explore",
-                            "toolUses": 0, "latestActivity": null,
-                            "status": "running"
-                        }),
-                    )]
-                    .into_iter()
-                    .collect()
                 ),
                 pinned: Some(true),
                 label: Some("x".to_string()),

@@ -83,7 +83,7 @@ turn id 方案。结论如下，三条证据相互印证：
 | `PinnedArchived` | `session/isArchivedChanged`（原生位）+ `x-manox/pinnedChanged`（AHP 无 pin 位；行落在 `x-manox-thread:/<session>`，#842） | A + X |
 | `Leaf` | `createChat{source}` 的 fork 语义；游标本身 → `x-manox/leafChanged`（`x-manox-thread:/<session>`，#842） | A + X |
 | `SubagentChild` | `chat/responsePart{toolCall}` 指向子 `ahp-chat:/`（`ToolResultSubagentContent`） | A |
-| `SubagentProgress` | `x-manox-work/subagentsChanged` | X |
+| `SubagentProgress` | `chat/backgroundWorkSet{subagent}` + `chat/backgroundWorkRemoved`（1.0 原生面，`chat` 指向子通道；run id 即子会话 id，#874） | A |
 | `PlanModeChange` / `PlanModeRequest` / `PlanUpdate` / `PlanReview` | `x-manox-plan/planModeChanged`·`x-manox-plan/planChanged`·`x-manox-plan/verdictRequested`·`x-manox-plan/reviewSettled`（实施落定：评审生命周期拆为 verdictRequested/reviewSettled 两动作，#846） | X |
 | `Goal` | `x-manox-work/goalChanged` | X |
 | `BrowserSuites` | `x-manox-work/browserSuitesChanged` | X |

@@ -232,6 +232,11 @@ impl SubagentProvider for SpawnProvider {
         let mut builder = create_agent_session()
             .with_cwd(child_cwd.clone())
             .with_session_dir(session_dir)
+            // The child session id IS the run id: every parent-side row
+            // keyed by run id (progress ticks, tool-call correlation) then
+            // names the child's own chat channel (`ahp-chat:/<run_id>`)
+            // directly — the AHP face links parent and child by construction.
+            .with_session_id(run_id.clone())
             .with_system_prompt_builder(base_prompt_builder(
                 req.persona.clone().unwrap_or_default(),
                 child_cwd.clone(),
