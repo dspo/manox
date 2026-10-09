@@ -2376,9 +2376,10 @@ impl Translator {
 /// statically-known spans: `SWAP`/`DEL`/`INS`/`CUT` count exactly, the
 /// block ops count their inline bodies, and the directions whose resolution
 /// needs file content or engine clipboard state the projection never sees
-/// (block-deleted spans, pasted bodies) carry `None` — an unknown count, not
-/// a zero — so a client renders `+?`/`-?` instead of reading "no changes". Any other tool, a missing parameter, or an
-/// unparseable patch answers `None` — no preview is better than a wrong one.
+/// (block-deleted/replaced spans, pasted bodies) carry `None` — an unknown
+/// count, not a zero — so a client renders `+?`/`-?` instead of reading "no
+/// changes". Any other tool, a missing parameter, or an unparseable patch
+/// answers `None` — no preview is better than a wrong one.
 fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection> {
     use manox_harness::core::hashline::{FileOp, Op};
     let input = input?;
@@ -2405,7 +2406,10 @@ fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection
                     after,
                     diff: Some(FileEditDiffStats {
                         added: Some(added),
-                        removed: Some(0),
+                        // A Write may overwrite an existing file; whether it
+                        // removes lines, and how many, is file state the
+                        // projection never sees.
+                        removed: None,
                     }),
                 }],
             })
@@ -2413,38 +2417,36 @@ fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection
         "Edit" => {
             let patch = input.get("patch")?.as_str()?;
             let parsed = manox_harness::core::hashline::parse_patch(patch).ok()?;
+            // Sums into an optional count; `None` (an unknowable direction) is
+            // sticky — unknown plus known stays unknown.
+            fn bump(acc: &mut Option<i64>, n: i64) {
+                *acc = acc.map(|c| c + n);
+            }
             let items = parsed
                 .files
                 .iter()
                 .map(|file| {
                     let path = file.path.display().to_string();
-                    // Counts are Option from the ground up: a direction that
-                    // saw only statically-known ops stays a number, and any
-                    // block-deletion or paste — whose resolution needs file
-                    // content or clipboard state the projection never sees —
-                    // marks that DIRECTION unknown (`None`), never `0`. A `0`
-                    // would read as "no changes" on a card whose patch does
-                    // change lines the fold cannot count.
                     let mut added: Option<i64> = Some(0);
                     let mut removed: Option<i64> = Some(0);
                     for op in &file.ops {
                         match op {
                             Op::Swap { start, end, body } => {
-                                removed = removed.map(|n| n + (*end - *start + 1) as i64);
-                                added = added.map(|n| n + body.len() as i64);
+                                bump(&mut removed, (*end - *start + 1) as i64);
+                                bump(&mut added, body.len() as i64);
                             }
                             Op::Del { start, end } | Op::Cut { start, end } => {
-                                removed = removed.map(|n| n + (*end - *start + 1) as i64);
+                                bump(&mut removed, (*end - *start + 1) as i64);
                             }
                             // The block ops' inline bodies are known, so the
                             // insertion side still counts; the content-resolved
                             // span they replace or follow is not, so a
                             // `SwapBlk` marks the REMOVED direction unknown.
                             Op::Ins { body, .. } | Op::InsBlkPost { body, .. } => {
-                                added = added.map(|n| n + body.len() as i64);
+                                bump(&mut added, body.len() as i64);
                             }
                             Op::SwapBlk { body, .. } => {
-                                added = added.map(|n| n + body.len() as i64);
+                                bump(&mut added, body.len() as i64);
                                 removed = None;
                             }
                             // The deleted span of a block deletion and the
@@ -2462,7 +2464,13 @@ fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection
                     // sides on the source path — the destination is the
                     // engine's business until it lands.
                     let (before, after) = match file.file_op {
-                        Some(FileOp::Rem) => (side(&path), None),
+                        // A REM deletes the whole file; its line count is file
+                        // state the projection never sees, so the removed
+                        // direction stays unknown.
+                        Some(FileOp::Rem) => {
+                            removed = None;
+                            (side(&path), None)
+                        }
                         _ => (side(&path), side(&path)),
                     };
                     FileEdit {
@@ -3603,14 +3611,10 @@ mod preview_edits_tests {
             .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
     }
 
-    /// The approval gate opens with the preview face derived from the call's
-    /// own journaled parameters: an `Edit` patch becomes per-file edits with
-    /// statically-counted spans, a `Write` becomes a creation (after side
-    /// only), and the counts ride the diff stats.
-    /// Unknowable directions carry None, not zero: a patch whose only edit
-    /// is a clipboard paste adds an unknown number of lines — `Some(0)` would
-    /// render as "+0" (reads "no changes") on a card that does change lines
-    /// the fold cannot count. The app's ±? face keys off exactly this.
+    /// Unknowable directions carry None, not zero: a clipboard paste adds an
+    /// unknown number of lines — `Some(0)` would render as "+0" (reads "no
+    /// changes") on a card that does change lines the fold cannot count. The
+    /// app's ±? face keys off exactly this.
     #[test]
     fn unknowable_directions_carry_none_not_zero() {
         // A swap (both directions known) plus a paste (insertion unknown).
@@ -3639,8 +3643,31 @@ mod preview_edits_tests {
         let diff = preview.items[0].diff.as_ref().expect("stats present");
         assert_eq!(diff.removed, None, "the block span is unknown");
         assert_eq!(diff.added, Some(0), "nothing is inserted");
+
+        // A whole-file REM: the deleted file's line count is file state the
+        // fold never sees — same unknown as a block span, never a zero.
+        let preview = preview_edits(
+            "Edit",
+            Some(&json!({
+                "path": "/src/r.rs",
+                "patch": "[src/r.rs#1A2B3C]\nREM",
+            })),
+        )
+        .expect("the preview parses");
+        let edit = &preview.items[0];
+        assert!(
+            edit.before.is_some() && edit.after.is_none(),
+            "a REM is a deletion"
+        );
+        let diff = edit.diff.as_ref().expect("stats present");
+        assert_eq!(diff.removed, None, "the file's line count is unknown");
+        assert_eq!(diff.added, Some(0), "nothing is inserted");
     }
 
+    /// The approval gate opens with the preview face derived from the call's
+    /// own journaled parameters: an `Edit` patch becomes per-file edits with
+    /// statically-counted spans, a `Write` becomes a creation (after side
+    /// only), and the counts ride the diff stats.
     #[test]
     fn the_approval_gate_carries_the_edit_preview_face() {
         let mut t = Translator::new();
@@ -3711,6 +3738,10 @@ mod preview_edits_tests {
         );
         assert_eq!(edits["items"][0]["after"]["uri"], "file:///src/new.rs");
         assert_eq!(edits["items"][0]["diff"]["added"], 3);
+        assert!(
+            edits["items"][0]["diff"]["removed"].is_null(),
+            "a Write may overwrite an existing file; removed is unknowable"
+        );
 
         // A tool with no file face previews nothing — no preview beats a wrong
         // one.
