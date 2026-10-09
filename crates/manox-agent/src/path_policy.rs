@@ -2,8 +2,9 @@
 //!
 //! The read deny-list (`ReadPolicy`), the write-confinement `WritePolicy`,
 //! and their `ToolCall` hooks were manox-original hardening outside the
-//! deepseek mode vocabulary: reads are ungated in every mode, and bash + the
-//! fs write fence carry the file-effect policy. Removed for parity. The two
+//! approval-mode vocabulary: reads are ungated in every mode, and bash + the
+//! fs write fence carry the file-effect policy. Both policies were later
+//! removed. The two
 //! helpers still reached as `crate::path_policy::*` by host callers are
 //! re-exported from the extension-layer sandbox module.
 

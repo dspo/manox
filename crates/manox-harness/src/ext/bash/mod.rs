@@ -421,8 +421,8 @@ impl BashTool {
 ///
 /// The grant is per-call, not per-execution — if `resolve` succeeds but a
 /// later step panics before the backend runs, the `Drop` clears the stamp and
-/// the user-approved grant never executes. This matches deepseek (a grant is
-/// a same-turn retry signal, not a durable promise): the model re-issues the
+/// the user-approved grant never executes — a grant is
+/// a same-turn retry signal, not a durable promise: the model re-issues the
 /// call and re-escalates. Acceptable for the same-turn retry contract.
 struct EscalationGrant<'a> {
     cell: Option<&'a Arc<AtomicI64>>,

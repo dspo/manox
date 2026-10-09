@@ -153,7 +153,7 @@ where
                 Some(SessionCmd::Shutdown) => *shutdown_after_run = true,
                 Some(SessionCmd::SetModel(new_model)) => {
                     // Mid-run switch: the harness handle queues it for the
-                    // next turn boundary (the kernel's TS mid-run `setModel`
+                    // next turn boundary (the kernel's mid-run `set_model`
                     // path), where the model_change entry persists. The
                     // mirrors follow the handle's verdict, not the request: a
                     // model the fixed stream refuses leaves every mirror on

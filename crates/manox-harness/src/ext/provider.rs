@@ -60,7 +60,7 @@ struct CxProvider {
     #[serde(default)]
     models: BTreeMap<String, Option<CxModel>>,
     /// Process env for cx agents — parsed but intentionally not applied to
-    /// provider registrations (parity with the TS extension).
+    /// provider registrations.
     #[serde(default)]
     #[allow(dead_code)]
     env: BTreeMap<String, String>,
@@ -360,8 +360,8 @@ fn run_shell_once(cmd: &str) -> Result<String, String> {
 // ── model metadata ──
 
 /// Known-model metadata lookup — cx yaml does not carry contextWindow /
-/// maxTokens / reasoning / cost, so the extension supplies them (table
-/// ported from the TS cx-bridge extension).
+/// maxTokens / reasoning / cost, so the extension supplies them from a
+/// built-in known-models table.
 struct KnownModelMeta {
     context_window: u64,
     max_tokens: u64,
@@ -525,8 +525,8 @@ fn value_as_u64(value: &serde_yaml::Value) -> Option<u64> {
     }
 }
 
-/// Build one kernel model config. Context/max-tokens precedence (explicit
-/// deviation from the TS extension, which drops the yaml fields): yaml
+/// Build one kernel model config. Context/max-tokens precedence (the yaml
+/// fields are honored, not dropped): yaml
 /// field > `[Nm]` suffix hint > KNOWN_MODELS > defaults.
 fn build_model_config(
     config: &CxConfig,

@@ -105,7 +105,7 @@ pub enum AgentMessage {
     Assistant {
         /// Content blocks of the turn. Accepts the same string-or-array wire
         /// shapes as user content; a null/missing content reads as empty,
-        /// matching how the TS session layer guards damaged entries.
+        /// tolerating damaged entries.
         #[serde(default, deserialize_with = "deserialize_content_blocks")]
         content: Vec<ContentBlock>,
         model: String,

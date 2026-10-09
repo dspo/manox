@@ -160,8 +160,8 @@ pub enum SessionTreeEntry {
         parent_id: Option<String>,
         timestamp: DateTime<Utc>,
         target_id: String,
-        // TS types `label` as `string | undefined` and omits it when unset;
-        // skip-on-None keeps Rust output byte-identical to a TS-written entry.
+        // `label` is optional on the wire and omitted when unset;
+        // skip-on-None keeps Rust output byte-identical to external writers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
@@ -685,7 +685,7 @@ pub struct Session<S: SessionStorage> {
     storage: S,
     /// Serializes parent-selection + append so concurrent appends never read
     /// the same leaf and fork sibling branches — the linearized per-session
-    /// append queue of the TS storage (upstream 4488ad55c).
+    /// append queue.
     append_lock: tokio::sync::Mutex<()>,
     /// The RPC id a client pinned to THIS turn's first user message (the
     /// echo-retirement contract, §F.2): the host sets it when Submit carries
@@ -1283,7 +1283,7 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 
     let mut context_entries = vec![path[compaction_idx].clone()];
     // A `first_kept_entry_id` absent from the path keeps nothing — the same
-    // outcome an undefined id produces in a hand-edited TS session file.
+    // outcome an undefined id produces in a hand-edited session file.
     if retained_tail.is_none() {
         let mut found_first_kept = false;
         for entry in &path[..compaction_idx] {
@@ -1302,7 +1302,7 @@ fn build_context_entries(path: Vec<SessionTreeEntry>) -> Vec<SessionTreeEntry> {
 /// The settings the active path carries: the reasoning tier from the latest
 /// `thinking_level_change`, the model from the latest `model_change` (an
 /// assistant message's own identity is a fresher witness than an older
-/// `model_change`, matching the TS projection), the active tool subset from
+/// `model_change`), the active tool subset from
 /// the latest `active_tools_change`, and the effective working directory from
 /// the latest `cwd_change`.
 #[allow(clippy::type_complexity)]
@@ -2008,7 +2008,7 @@ pub struct SessionBranchQuery {
     pub limit: Option<usize>,
 }
 
-/// A branch-query failure carrying the TS error code.
+/// A branch-query failure carrying the stable error code.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BranchQueryError {
     /// The traversal start entry does not exist.
@@ -2020,8 +2020,8 @@ pub enum BranchQueryError {
 }
 
 impl<S: SessionStorage> Session<S> {
-    /// Find entries on the active branch under the given bounds — the
-    /// upstream `findEntriesOnBranch`. Mirrors the TS semantics exactly:
+    /// Find entries on the active branch under the given bounds. The walk
+    /// semantics exactly:
     /// walk from `start` toward the root (newest first) or from the root
     /// toward `start` (oldest first), stop after `stopAtType` / `stopAtId`
     /// (inclusive, computed after the traversal), filter by type / custom

@@ -6,7 +6,7 @@
 //! the path/truncation helpers they share, plus the default registry assembly.
 //!
 //! `requires_approval` marks the tools the permission gate applies to:
-//! mutating/remote calls are gated; reads stay open (see `pi_approval`).
+//! mutating/remote calls are gated; reads stay open (see `approval`).
 
 // ─── tool name constants ────────────────────────────────────────────────────
 //

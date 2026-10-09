@@ -172,8 +172,8 @@ impl StreamFn for AnthropicStreamFn {
 
         // A stream that began but never reached `message_stop` was cut short,
         // and a stream that never reported a stop reason is incomplete — both
-        // surface as failures rather than persisting a partial reply, mirroring
-        // the TS throws on a missing message_stop / a pending stop reason.
+        // surface as failures rather than persisting a partial reply — a
+        // missing message_stop / a pending stop reason fails the same way.
         if acc.started() && !acc.message_stop_seen() {
             return Err(ProviderError::MidStream(
                 "Anthropic stream ended before message_stop".into(),
@@ -914,7 +914,7 @@ mod tests {
         assert_eq!(error_message.as_deref(), Some("I cannot help with that."));
     }
 
-    /// A refusal without a provider explanation falls back to the TS wording.
+    /// A refusal without a provider explanation falls back to the default wording.
     #[tokio::test]
     async fn refusal_without_explanation_falls_back_to_default() {
         let (tx, _rx) = chan();

@@ -1,4 +1,4 @@
-//! Pi `AgentTool` adapter wrapping a remote MCP tool.
+//! `AgentTool` adapter wrapping a remote MCP tool.
 //!
 //! Each `McpTool` holds the server name, the rmcp `Tool` definition, and a
 //! clonable handle to the running rmcp client service. `execute` calls

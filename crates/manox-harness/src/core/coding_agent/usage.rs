@@ -41,8 +41,8 @@ pub fn add_usage_to_totals(totals: &mut UsageTotals, usage: &Usage) {
 
 /// Per-model attributable usage — the cost breakdown entry,
 /// carrying the full token-class totals so hosts can render per-model
-/// input/cache/output breakdowns (the TS shape exposes only the summed
-/// `tokens` + `cost`).
+/// input/cache/output breakdowns (the minimal wire shape exposes only the
+/// summed `tokens` + `cost`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelUsageBreakdown {
     /// `{provider}/{response_model or model}` for assistant usage; other

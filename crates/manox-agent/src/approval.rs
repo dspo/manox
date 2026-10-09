@@ -34,7 +34,7 @@ use crate::thread::{PermissionMode, ThreadEvent};
 use crate::thread_engine::{BackendNotice, send_notice};
 
 /// Model-facing denial marker (always English, never localized): read-only mode
-/// refuses every fs mutation. Matches deepseek's `[sandbox: …]` vocabulary.
+/// refuses every fs mutation.
 const DENY_READ_ONLY: &str = "[sandbox: file access denied under read-only mode]";
 /// Model-facing denial marker: workspace-write refuses a mutation whose
 /// target the policy cannot prove inside the writable roots.
@@ -459,7 +459,7 @@ impl ApprovalGatedTool {
 
     /// Validate the `sandbox_permissions`+`justification` pairing and, when
     /// present, resolve the wider mode through the host approver, returning
-    /// it as a per-call grant (no shared state — deepseek parity). `None`
+    /// it as a per-call grant (no shared state). `None`
     /// means no escalation was requested. A non-widening or unapproved
     /// request returns the verbatim error (fail-closed).
     async fn resolve_escalation(

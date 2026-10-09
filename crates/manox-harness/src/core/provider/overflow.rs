@@ -61,13 +61,12 @@ static OVERFLOW_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
 /// billing — checked first so a transient limit is never misrouted into the
 /// non-retryable overflow path.
 ///
-/// Deliberately broader than the TS set. TS anchors its Bedrock exclusion on
-/// `^Throttling error:`, prose its own `formatBedrockError` produces; this
-/// crate ships no Bedrock adapter and so sees the raw AWS body
+/// Deliberately unanchored: an `^Throttling error:` anchor only fits prose
+/// a normalizing layer itself produces. This crate ships no Bedrock adapter
+/// and so sees the raw AWS body
 /// `ThrottlingException: Too many tokens, please wait before trying again.`,
 /// which fails that anchor while matching `too many tokens`. Keeping the
-/// unanchored fragments is what stops the false positive the TS pattern set
-/// only avoids by virtue of its normalizing layer.
+/// unanchored fragments is what stops that false positive here.
 static EXCLUSION_PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     RegexSetBuilder::new([
         r"^(?:throttling error|service unavailable):",
@@ -278,7 +277,7 @@ mod tests {
     #[test]
     fn raw_bedrock_throttling_is_not_overflow() {
         // Without a Bedrock adapter the body arrives unnormalized, so the
-        // anchored `^Throttling error:` pattern TS relies on does not fire —
+        // anchored `^Throttling error:` pattern does not fire —
         // the unanchored fragments are what keep this out of the overflow
         // path. This is the case that pins the broader exclusion set.
         let body = "ThrottlingException: Too many tokens, please wait before trying again.";

@@ -222,11 +222,10 @@ enum PendingMutation {
     Message(AgentMessage),
 }
 
-/// Events a harness emits outside the agent run, mirroring the TS harness
-/// `queue_update` / `settled` / `model_update` surface. Listeners are sync
+/// Events a harness emits outside the agent run. Listeners are sync
 /// callbacks fired in registration order at the moment the state changes.
-/// Why a compaction ran. Wire values mirror the TS session events
-/// (`compaction_start` / `compaction_end` carry the same strings).
+/// Why a compaction ran. Wire values are stable strings
+/// (`compaction_start` / `compaction_end`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionReason {
@@ -352,8 +351,8 @@ impl HarnessControl {
     }
 }
 
-/// A decoupled handle for mid-run control of a harness, mirroring the TS
-/// session's abort/waitForIdle surface: it reaches the agent run, the retry
+/// A decoupled handle for mid-run control of a harness — the
+/// abort/wait-for-idle surface: it reaches the agent run, the retry
 /// backoff, and the full settle signal without holding `&mut self`, so a
 /// caller can cancel or await a harness while `prompt`/`continue_` are in
 /// flight.
@@ -440,7 +439,7 @@ impl HarnessHandle {
     /// Queue a model change for the next turn boundary of the in-flight run.
     /// The shared runtime snapshot updates immediately — the next provider
     /// request and the next run both see it — and the change is persisted
-    /// once the run settles (the TS mid-run `setModel`).
+    /// once the run settles.
     ///
     /// Whether the change was queued is the return value: a model outside the
     /// one api a fixed stream serves is refused and mutates nothing, so a
@@ -529,8 +528,8 @@ impl HarnessHandle {
         });
     }
 
-    /// Queue a user message for the next prompt batch — the TS mid-run
-    /// `nextTurn`. Unlike [`AgentHarness::next_turn`], this works while a
+    /// Queue a user message for the next prompt batch — the mid-run
+    /// queue. Unlike [`AgentHarness::next_turn`], this works while a
     /// run is in flight: the message lands in the shared queue and the next
     /// prompt prepends it before its own message.
     pub fn next_turn(&self, text: &str, images: Vec<ContentBlock>) {
@@ -617,10 +616,10 @@ pub struct InputHookTransform {
     pub images: Option<Vec<crate::types::ContentBlock>>,
 }
 
-/// The typed `before_agent_start` hook event, mirroring the TS
-/// `BeforeAgentStartEvent`. Serialized into [`HookContext::data`] so a handler
-/// receives the TS-shaped fields rather than an ad-hoc payload. TS also
-/// carries `images` and `resources`; neither exists on the Rust harness (no
+/// The typed `before_agent_start` hook event. Serialized into
+/// [`HookContext::data`] so a handler receives typed fields rather than an
+/// ad-hoc payload. It also carries `images` and `resources`; neither exists
+/// on the harness (no
 /// image prompt input, no resource registry), so the payload omits them.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -631,9 +630,9 @@ pub struct BeforeAgentStartEvent<'a> {
     pub system_prompt: &'a str,
 }
 
-/// A before-compact hook's full compaction result, mirroring the TS
-/// `CompactResult`. Persisted verbatim (`fromHook = true`) — the harness does
-/// not fall back to its own cut analysis on any field, so a TS hook returning
+/// A before-compact hook's full compaction result. Persisted verbatim
+/// (`fromHook = true`) — the harness does
+/// not fall back to its own cut analysis on any field, so a hook returning
 /// a `CompactResult` migrates without behavioral drift. `summary`,
 /// `tokens_before`, and `retained_tail` are required (the hook owns the full
 /// result); an empty summary is refused before persisting. A hook that wants
@@ -687,11 +686,10 @@ pub struct BranchSummaryHookOverride {
 /// resources.
 pub type SystemPromptBuilder = Arc<dyn Fn(&[String], &HarnessResources) -> String + Send + Sync>;
 
-/// The typed `session_before_tree` hook event, mirroring the TS
-/// `SessionBeforeTreeEvent`: the navigation preparation a handler can cancel
-/// or use to override the summarization instructions and label. The TS
-/// `signal: AbortSignal` has no Rust sync-hook equivalent — cancellation is
-/// expressed via the result's `cancel` field
+/// The typed `session_before_tree` hook event: the navigation preparation a
+/// handler can cancel or use to override the summarization instructions and
+/// label. Cancellation is expressed via the result's `cancel` field — there
+/// is no signal surface
 /// ([`HookContext::with_cancel_tree`]).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -923,8 +921,8 @@ pub struct AgentHarness<S: SessionStorage> {
     message_entry_ids: Vec<Option<String>>,
     /// The one-shot budget for overflow recovery: set when an overflow turn
     /// was compacted and retried, cleared by a new user prompt or any
-    /// non-error assistant message. Mirrors the TS
-    /// `_overflowRecoveryAttempted` flag — a context that stays oversized
+    /// non-error assistant message. After one compact-and-retry, a context
+    /// that stays oversized
     /// after one compact-and-retry surfaces its error instead of looping.
     overflow_recovery_attempted: bool,
     /// Auto-retry policy for transient provider failures.
@@ -1361,8 +1359,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             ) -> Option<serde_json::Value> {
                 // Handlers chain: each receives the previous handler's
                 // payload (the original when none has run yet), and its
-                // returned `payload` becomes the next input — TS
-                // before-payload composition.
+                // returned `payload` becomes the next input.
                 let mut current: Option<serde_json::Value> = None;
                 let ctx_base = HookContext::new(HookPoint::BeforeProviderPayload);
                 let list = self.0.lock().unwrap();
@@ -1482,7 +1479,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// Set the initial active tool subset in memory (no `active_tools_change`
-    /// entry) — used for the facade's TS default four tools.
+    /// entry) — used for the facade's default four tools.
     pub fn set_initial_active_tools(&mut self, names: Vec<String>) {
         self.active_tool_names = Some(names);
         self.apply_active_tools();
@@ -1954,14 +1951,14 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// Run all registered hooks for a given point.
-    /// Fire the TS-parity `Input` hook over a user prompt and return the
+    /// Fire the `Input` hook over a user prompt and return the
     /// handlers' verdict (transform / handled / continue).
     pub(crate) fn run_input_hook(
         &self,
         text: &str,
         images: &[crate::types::ContentBlock],
     ) -> HookContext {
-        // TS runner chains handlers: each one sees the accumulated transform
+        // Handlers chain: each one sees the accumulated transform
         // of all earlier handlers (`currentText`/`currentImages`), a
         // `handled` result short-circuits the rest of the chain, and a
         // transform without `images` keeps the current attachments.
@@ -2048,8 +2045,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         self.apply_turn_runtime();
 
         // An aborted turn skips the post-run threshold check, so the oversized
-        // context would otherwise wait for a real overflow to compact. TS
-        // checks again before the next prompt (`skipAbortedCheck: false`); a
+        // context would otherwise wait for a real overflow to compact. The
+        // harness checks again before the next prompt; a
         // failed maintenance compaction here never blocks the prompt.
         if matches!(
             self.agent.state().messages.last(),
@@ -2258,8 +2255,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 continue;
             }
             // An in-progress retry lifecycle closes out when the latest
-            // failure is not retryable or the budget is spent — TS emits
-            // `auto_retry_end` here, before the compaction path.
+            // failure is not retryable or the budget is spent — the harness
+            // emits `auto_retry_end` here, before the compaction path.
             if self.retry_attempt > 0
                 && let Some(AgentMessage::Assistant {
                     stop_reason: Some(StopReason::Error),
@@ -2487,7 +2484,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     /// Whether the transcript's last message is a context overflow from the
     /// current model, and whether the turn may be retried after compaction.
     ///
-    /// The guards mirror TS: an aborted message never triggers recovery, an
+    /// The guards: an aborted message never triggers recovery, an
     /// error attributed to a different model is not this model's overflow,
     /// and a message recorded at or before the latest compaction measured a
     /// context that no longer exists. A completed (`Stop`) answer compacts
@@ -2549,8 +2546,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
     }
 
     /// Move the session cursor to an earlier entry, rebuild the transcript
-    /// from the new path, and append a branch summary for it — the TS
-    /// `navigateTree` with default options (summarization off).
+    /// from the new path, and append a branch summary for it — default
+    /// options, summarization off.
     pub async fn navigate_tree(
         &mut self,
         target_id: &str,
@@ -2559,7 +2556,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .await
     }
 
-    /// [`AgentHarness::navigate_tree`] with the TS option surface. The branch
+    /// [`AgentHarness::navigate_tree`] with the full option surface. The branch
     /// summary is generated with the current model's runtime only when
     /// `summarize` is set and the abandoned branch is non-empty; a plain
     /// navigation moves the cursor and restores the transcript without a
@@ -2646,7 +2643,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             _ => None,
         };
 
-        // The before-tree hook sees the full TS-shaped preparation and may
+        // The before-tree hook sees the full preparation and may
         // cancel the navigation or override the summarization instructions
         // and label. The typed event rides in the context data.
         let mut custom_instructions = options.custom_instructions.clone();
@@ -2786,7 +2783,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                             });
                         }
                         if cancelled {
-                            // TS: an aborted summarization cancels the
+                            // An aborted summarization cancels the
                             // navigation — a result, not an error, and no
                             // cursor move or entry append.
                             if started {
@@ -2825,7 +2822,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
                 }
             };
             if result.aborted {
-                // TS: an aborted summarization cancels the navigation before
+                // An aborted summarization cancels the navigation before
                 // any cursor move or entry append.
                 return Ok(NavigateTreeResult {
                     cancelled: true,
@@ -2839,8 +2836,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             None
         };
 
-        // Move the cursor (a user/custom target focuses its parent, mirroring
-        // TS), then hang the summary on the new branch when one was produced.
+        // Move the cursor (a user/custom target focuses its parent), then
+        // hang the summary on the new branch when one was produced.
         let new_leaf = match &target_entry {
             SessionTreeEntry::Message {
                 message: AgentMessage::User { .. },
@@ -3035,10 +3032,9 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             .await
     }
 
-    /// `compact` with the TS event plumbing: emits `CompactionStart` once the
+    /// `compact` with the full event plumbing: emits `CompactionStart` once the
     /// cut analysis accepts the transcript (a `NothingToCompact` refusal stays
-    /// silent, matching TS where `prepareCompaction` returning `undefined`
-    /// ends the attempt before any event) and `CompactionEnd` on every
+    /// silent — the attempt ends before any event) and `CompactionEnd` on every
     /// outcome after that.
     async fn compact_internal(
         &mut self,
@@ -3055,8 +3051,8 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
             anyhow::bail!("Cannot compact an empty transcript");
         }
 
-        // The session branch the harness is compacting — the same entries TS
-        // exposes as `branchEntries` on the `session_before_compact` event:
+        // The session branch the harness is compacting — the same entries
+        // exposed as `branchEntries` on the `session_before_compact` event:
         // the full path to the root, across compaction boundaries.
         let branch_entries = self.session.get_branch().await?;
 
@@ -3118,7 +3114,7 @@ impl<S: SessionStorage + 'static> AgentHarness<S> {
         }
 
         // Resolve the compaction result. A hook override supplies a full
-        // TS-shaped `CompactResult`, persisted verbatim (`fromHook = true`) —
+        // hook-supplied `CompactResult`, persisted verbatim (`fromHook = true`) —
         // no field falls back to the harness's cut analysis. Otherwise the
         // harness summarizes the prefix itself, consuming the preparation
         // (previous summary folded into the prompt, file ops folded into the
@@ -3535,8 +3531,8 @@ pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&s
     }
 }
 
-/// Parse an argument string with shell-style single/double quotes — the TS
-/// `parseCommandArgs`. Whitespace splits unquoted tokens; quoted sections
+/// Parse an argument string with shell-style single/double quotes.
+/// Whitespace splits unquoted tokens; quoted sections
 /// keep their inner content.
 pub fn parse_command_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -3568,12 +3564,12 @@ pub fn parse_command_args(args: &str) -> Vec<String> {
     out
 }
 
-/// The TS coding-agent `substituteArgs`: one regex pass over the template
+/// The coding-agent `substitute_args`: one regex pass over the template
 /// string only, so argument and default values containing placeholder
 /// patterns are never re-substituted. Supports `$N`, `$@` / `$ARGUMENTS`,
 /// `${@:N}` / `${@:N:L}` slices, and `${N:-default}` / `${@:-default}` /
-/// `${ARGUMENTS:-default}` defaults. A bare `$0` yields nothing — TS indexes
-/// at -1, which reads as undefined.
+/// `${ARGUMENTS:-default}` defaults. A bare `$0` yields nothing — the -1
+/// index reads as undefined.
 pub fn substitute_args(content: &str, args: &[String]) -> String {
     let all = args.join(" ");
     let re = regex::Regex::new(
@@ -4483,7 +4479,7 @@ pub(crate) mod tests {
         assert_eq!(leaf, compaction_id);
     }
 
-    /// A manual compaction emits the TS-shaped start/end pair: start once
+    /// A manual compaction emits the start/end pair: start once
     /// the cut analysis accepts the transcript, end with the result.
     #[tokio::test]
     async fn test_compact_emits_start_and_end_events() {
@@ -4535,8 +4531,7 @@ pub(crate) mod tests {
     }
 
     /// A transcript that fits entirely in the keep-recent window refuses
-    /// with `NothingToCompact` before any event — the TS attempt ends at
-    /// `prepareCompaction` returning `undefined`, likewise silently.
+    /// with `NothingToCompact` before any event — likewise silently.
     #[tokio::test]
     async fn test_compact_nothing_to_compact_emits_nothing() {
         let storage = MemStorage::new();
@@ -4629,7 +4624,7 @@ pub(crate) mod tests {
 
     /// Compaction swaps the transcript but never the queues: steering and
     /// follow-up messages pending at compaction time stay deliverable, where
-    /// a full reset would silently drop them. TS pairs this with one
+    /// a full reset would silently drop them. One
     /// continuation after auto-compaction so the surviving queue drains.
     #[tokio::test]
     async fn test_compact_preserves_queued_messages() {
@@ -5569,7 +5564,7 @@ pub(crate) mod tests {
     }
 
     /// The retry lifecycle emits `auto_retry_start` then `auto_retry_end` on
-    /// success, mirroring the TS session events.
+    /// success.
     #[tokio::test]
     async fn test_auto_retry_emits_lifecycle_events() {
         let (stream_fn, _summaries) = ScriptedStreamFn::new(vec![
@@ -7210,7 +7205,7 @@ pub(crate) mod tests {
         assert!(result.retained_tail.is_empty());
     }
 
-    /// The before-compact hook receives the TS-shaped `preparation` and the
+    /// The before-compact hook receives the typed `preparation` and the
     /// session `branchEntries`, so it can decide on the specific content being
     /// compacted rather than blind.
     #[tokio::test]
@@ -7253,11 +7248,10 @@ pub(crate) mod tests {
         assert_eq!(
             data.get("type").and_then(|v| v.as_str()),
             Some("session_before_compact"),
-            "the typed event carries the TS discriminator: {data}"
+            "the typed event carries the expected discriminator: {data}"
         );
         // `customInstructions` is omitted (None) when compact() takes none —
-        // the field is part of the contract but absent on the wire, matching
-        // TS optionality.
+        // the field is part of the contract but absent on the wire.
         assert!(data.get("customInstructions").is_none());
 
         let preparation = data
@@ -8702,7 +8696,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// Plain navigation (the TS default, `summarize: false`) never calls the
+    /// Plain navigation (`summarize: false`) never calls the
     /// model and appends no branch summary — the cursor moves, the transcript
     /// rebuilds, and the result carries the target's editor text for user
     /// targets.

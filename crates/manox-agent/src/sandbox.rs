@@ -36,8 +36,7 @@ pub use manox_harness::sandbox::canonicalize_best_effort;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Case-insensitive stderr substrings the macOS seatbelt emits when it denies
-/// a file-write effect — the deepseek `DENIAL_SIGNATURES.seatbelt` list
-/// (`packages/sandbox/sandbox-local/src/helpers.ts`). A non-zero exit whose
+/// a file-write effect. A non-zero exit whose
 /// stderr matches one of these is a policy refusal (marker + hint appended),
 /// not a command failure. Lifted to a const so a future runner (landlock /
 /// windows-acl) adds its own list without touching the consumer.
@@ -319,10 +318,9 @@ impl BashOperations for SandboxedBashOperations {
             let mut result =
                 run_to_completion(child, request.on_data, timeout, &request.signal).await?;
             // Classify a seatbelt file-write denial (EPERM) and surface the
-            // deepseek marker + escalation hint so the model recognizes a
+            // denial marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
-            // `sandbox_permissions` (the signatures mirror deepseek's
-            // `DENIAL_SIGNATURES.seatbelt`).
+            // `sandbox_permissions`.
             if result.exit_code != 0 && {
                 let stderr = result.stderr.to_ascii_lowercase();
                 SEATBELT_DENIAL_SIGNATURES
@@ -687,7 +685,7 @@ mod tests {
             return;
         }
         assert_ne!(res.exit_code, 0, "read-only denies the write");
-        // The seatbelt denial carries the deepseek marker + escalation hint
+        // The seatbelt denial carries the denial marker + escalation hint
         // so the model recognizes a policy refusal (not a command bug).
         assert!(
             res.stderr

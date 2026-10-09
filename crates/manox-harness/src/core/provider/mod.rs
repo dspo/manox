@@ -15,15 +15,15 @@ pub mod retry;
 pub mod sse;
 pub mod transform;
 
-/// Observes each HTTP request attempt of a provider stream — the TS
-/// before-payload / after-response hooks. A consumer attaches one via the
+/// Observes each HTTP request attempt of a provider stream. A consumer
+/// attaches one via the
 /// provider builder (`with_request_observer`) to surface payload and status
 /// outside the provider; the harness maps it onto its
 /// `BeforeProviderPayload` / `AfterProviderResponse` hook points.
 pub trait RequestObserver: Send + Sync {
     /// The payload about to be sent for `model`, `attempt` 1-indexed.
     /// Returning `Some(replacement)` substitutes the payload for this
-    /// attempt (the TS before-payload mutation); `None` sends the original.
+    /// attempt; `None` sends the original.
     fn before_payload(
         &self,
         attempt: u32,

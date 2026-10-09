@@ -1,7 +1,7 @@
 //! Session-scoped extra writable roots derived from the per-call cwd.
 //!
 //! Two families enforce file-write containment — the fs fence
-//! (`pi_approval`'s workspace-write verdict) and the bash seatbelt
+//! (`approval`'s workspace-write verdict) and the bash seatbelt
 //! (`sandbox::SandboxPolicy`) — and both must admit the same roots, or a
 //! call one family passed the other denies. One derivation, shared:
 //!

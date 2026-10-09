@@ -5,7 +5,7 @@
 // in `list`.
 //
 // `list`/`info` are BOUNDED reads: the header line plus the first user
-// message, never the whole transcript. The TS upstream parses every entry —
+// message, never the whole transcript. Parsing every entry is
 // fine for a CLI's handful of sessions, O(entire store) for a long-lived
 // multi-host desktop state. The full parse stays available through `open`
 // (the transcript is the authority); only the list's bounded facts deviate.
@@ -32,7 +32,7 @@ const HEADER_READ_CAP: usize = 1024 * 1024;
 /// layer busy without burying the runtime in spawned reads.
 const SCAN_CONCURRENCY: usize = 12;
 
-/// A session summary as `list` reports it — the TS non-UI core `SessionInfo`,
+/// A session summary as `list` reports it,
 /// shrunk to the facts a list renders. The title's authority is the
 /// `.meta.json` sidecar; the transcript-derived display name and the joined
 /// `all_messages_text` had no consumers and are gone.

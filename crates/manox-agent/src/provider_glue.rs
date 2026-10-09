@@ -148,7 +148,7 @@ pub fn global() -> Arc<ProviderRegistry> {
     // snapshot, not cascade into every model-listing view.
     REGISTRY
         .get()
-        .expect("pi_providers not initialized; call manox_agent::init first")
+        .expect("provider registry not initialized; call manox_agent::init first")
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone()
@@ -179,7 +179,7 @@ pub fn reload() -> anyhow::Result<()> {
     tracing::info!("providers: reloaded {count} provider endpoints");
     let lock = REGISTRY
         .get()
-        .expect("pi_providers not initialized; call manox_agent::init first");
+        .expect("provider registry not initialized; call manox_agent::init first");
     *lock.write().unwrap_or_else(|e| e.into_inner()) = fresh;
     // Fire the listener OUTSIDE the registry write lock: the broadcast
     // re-reads the fresh snapshot through global().

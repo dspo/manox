@@ -172,8 +172,8 @@ impl StreamFn for CompletionsStreamFn {
 
         // A stream that ended without a `finish_reason` is truncated — even
         // one closed by `[DONE]` — and must not persist a partial message as
-        // if it were whole, mirroring the TS throw for a missing
-        // finish_reason under the default `supportsFinishReason: true`.
+        // if it were whole; a missing finish_reason under the default
+        // `supportsFinishReason: true` is an error.
         // Endpoints that never report it opt out via
         // [`CompletionsStreamFn::with_supports_finish_reason`].
         if !acc.has_finish_reason() && self.supports_finish_reason {
@@ -507,7 +507,7 @@ impl Accumulator {
         tx: &mpsc::Sender<AgentEvent>,
     ) -> Result<AgentMessage, anyhow::Error> {
         // A stream terminated by `[DONE]` alone carries no finish_reason;
-        // infer the completed stop reason the way TS does for endpoints
+        // infer the completed stop reason for endpoints
         // without finish_reason support.
         if self.stop_reason.is_none() {
             self.stop_reason = Some(

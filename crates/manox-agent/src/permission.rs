@@ -1,7 +1,7 @@
 //! Tool-call permissions.
 //!
 //! These types are the shared currency between the harness backends and the
-//! UI: the harness gates tools through them (see `pi_approval`), and the
+//! UI: the harness gates tools through them (see `approval`), and the
 //! workspace sends its `AskUserQuestion` answers back as
 //! [`ToolAuthorizationResponse`].
 

@@ -185,8 +185,7 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 /// Send the streaming POST with exponential-backoff retry, firing the
 /// request observer around every attempt: `before_payload` once the payload
 /// is known (before the HTTP send) and `after_response` with the status of
-/// each response, success and retryable alike — the TS before-payload /
-/// after-response hooks.
+/// each response, success and retryable alike.
 pub async fn send_with_retry<F>(
     build: F,
     observer: Option<&dyn RequestObserver>,
@@ -293,8 +292,8 @@ const NON_RETRYABLE_PATTERNS: &[&str] = &[
 ];
 
 /// Error patterns that classify as retryable — provider load, transient HTTP
-/// statuses, transport failures, and premature stream endings. Verbatim TS
-/// `RETRYABLE_PROVIDER_ERROR_PATTERN`: the `.?` separators match one optional
+/// statuses, transport failures, and premature stream endings. The `.?`
+/// separators match one optional
 /// character, so e.g. "rate.?limit" hits "rate limit", "ratelimit", and
 /// "rate-limit" alike.
 const RETRYABLE_PATTERNS: &[&str] = &[

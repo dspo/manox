@@ -1,13 +1,11 @@
-//! Provider registration — the Rust counterpart of the TS
-//! `ExtensionAPI.registerProvider` seam (`packages/coding-agent`
-//! `provider-composer`). Extensions describe a provider declaratively
+//! Provider registration. Extensions describe a provider declaratively
 //! (endpoint, credential, wire protocol, model catalog) and the registry
 //! turns that description into `StreamFn` runtimes plus a global model
 //! index the host can list and resolve.
 //!
 //! The registry is deliberately config-shape agnostic: parsing a concrete
 //! config format (e.g. the native cx providers yaml) is the extension's
-//! job (see `pi_extensions::provider`), mirroring how TS extensions own
+//! job (see `crate::ext::provider`), mirroring how extensions own
 //! their own config schemas and only hand the kernel a `ProviderConfig`.
 //!
 //! Live consumption (usage telemetry, budgets, etc.) builds on the event
@@ -40,8 +38,8 @@ pub enum Api {
 }
 
 impl Api {
-    /// The TS wire name used by `registerProvider` configs.
-    pub fn as_ts_str(self) -> &'static str {
+    /// The provider-config wire name.
+    pub fn as_wire_str(self) -> &'static str {
         match self {
             Api::AnthropicMessages => "anthropic-messages",
             Api::OpenAiCompletions => "openai-completions",
@@ -59,8 +57,8 @@ impl Api {
         }
     }
 
-    /// Parse the TS wire name.
-    pub fn from_ts_str(s: &str) -> Option<Self> {
+    /// Parse the provider-config wire name.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
         match s {
             "anthropic-messages" => Some(Api::AnthropicMessages),
             "openai-completions" => Some(Api::OpenAiCompletions),
@@ -167,7 +165,7 @@ impl ProviderRegistry {
     }
 
     /// Register (or replace) a provider and expand its models into the
-    /// global index. Validation mirrors the TS composer: a provider that
+    /// global index. Validation: a provider that
     /// defines models needs a `base_url`, and every model must resolve a
     /// protocol from the provider or itself.
     pub fn register_provider(&self, name: &str, config: ProviderConfig) -> Result<(), String> {

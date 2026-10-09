@@ -477,7 +477,7 @@ async fn stream_assistant_response(
     // events the stream never sent, so exactly one of each reaches the sink
     // per assistant message. The latest partial assistant snapshot is kept so
     // a provider failure is materialized from the text that already streamed
-    // rather than an empty shell — TS marks the same partial message as an
+    // rather than an empty shell — the partial message surfaces as an
     // error, preserving content and usage.
     let mut first = true;
     let mut saw_end = false;
@@ -2303,7 +2303,7 @@ mod tests {
     /// provider does when the connection drops after streaming some text.
     struct PartialThenFailStreamFn {
         /// The timestamp stamped on the partial; the terminal error must keep
-        /// it, like TS mutating the in-flight output in place.
+        /// it — the in-flight output is mutated in place.
         partial_timestamp: chrono::DateTime<chrono::Utc>,
     }
 

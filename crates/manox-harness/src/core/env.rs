@@ -398,8 +398,8 @@ impl Drop for TreeKillGuard {
 /// when the group is already gone.
 async fn kill_process_tree(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
-        // Negative pid signals the process group — the same tree kill the TS
-        // harness performs on abort/timeout.
+        // Negative pid signals the process group — the same tree kill as on
+        // abort/timeout.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }

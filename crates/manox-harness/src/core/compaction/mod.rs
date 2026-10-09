@@ -80,7 +80,7 @@ pub struct FileOperations {
 #[serde(rename_all = "camelCase")]
 pub struct CompactionPreparation {
     /// The first entry kept intact; `None` when the whole transcript is
-    /// summarized (the wire field is then omitted, matching TS optionality).
+    /// summarized (the wire field is then omitted).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub first_kept_entry_id: Option<String>,
     /// The messages replaced by the summary.
@@ -416,9 +416,8 @@ fn first_orphaned_result(
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 
 /// Truncate for summarization: keep the head and append a marker counting the
-/// dropped characters. The limit counts chars (Unicode scalar values — the
-/// Rust analogue of the TS string length, which counts UTF-16 code units),
-/// never bytes, so a multi-byte char is never split.
+/// dropped characters. The limit counts chars (Unicode scalar values, not
+/// UTF-16 code units), never bytes, so a multi-byte char is never split.
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     let Some((end, _)) = text.char_indices().nth(max_chars) else {
         return text.to_string();
@@ -633,8 +632,7 @@ pub fn build_compaction_prompt(
 }
 
 /// The instruction block for summarizing a split turn's prefix — the part of
-/// a turn the cut discarded while its suffix stays retained. Mirrors the TS
-/// `TURN_PREFIX_SUMMARIZATION_PROMPT`.
+/// a turn the cut discarded while its suffix stays retained.
 pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
 /// Build the summarization prompt for a split turn's prefix.
@@ -645,10 +643,10 @@ pub fn build_turn_prefix_prompt(prefix_messages: &[AgentMessage]) -> String {
     )
 }
 
-/// Build the TS-shaped [`CompactionPreparation`] for the before-compact hook.
+/// Build the [`CompactionPreparation`] for the before-compact hook.
 ///
-/// `branch` is the full session path to the root — the same entries TS
-/// exposes as `branchEntries`. `messages` is the flat transcript the harness
+/// `branch` is the full session path to the root — the same entries
+/// exposed as `branchEntries`. `messages` is the flat transcript the harness
 /// compacts; `cut_point` splits it into `messages_to_summarize` /
 /// `retained_tail`. The latest compaction on the path contributes
 /// `previous_summary`, and file operations are extracted from the summarized
@@ -735,8 +733,8 @@ impl std::fmt::Display for NothingToCompact {
 
 impl std::error::Error for NothingToCompact {}
 
-/// File paths touched by the compacted region, mirroring the TS
-/// `extractFileOperations`: assistant tool calls with a `path` argument are
+/// File paths touched by the compacted region: assistant tool calls with
+/// a `path` argument are
 /// classified as read / written / edited, and a previous (non-hook) compaction
 /// carrying `{readFiles, modifiedFiles}` details seeds the accumulator so file
 /// operations survive across repeated compactions.
@@ -817,8 +815,8 @@ pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String
     (read_files, modified_files)
 }
 
-/// Format the file lists as summary metadata tags, mirroring the TS
-/// `formatFileOperations`. Returns the empty string when there are no files,
+/// Format the file lists as summary metadata tags. Returns the empty string
+/// when there are no files,
 /// so the summary text is unchanged when no tool touched a file.
 pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections = Vec::new();

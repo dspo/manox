@@ -135,7 +135,7 @@ pub struct JsonlSessionStorage {
     pub metadata: JsonlSessionMetadata,
     /// The file has not been written yet: the header and buffered entries
     /// live in memory and the file materializes on the first assistant
-    /// message, matching the TS deferred-first-assistant contract. Until
+    /// message — the deferred-first-assistant contract. Until
     /// then the session is invisible to `list` and `open`.
     deferred: Mutex<bool>,
     /// The file's line order diverges from the chain order — a recoverable
@@ -209,7 +209,7 @@ impl JsonlSessionStorage {
     }
 
     /// Create a session whose file materializes on the first assistant
-    /// message — the TS deferred-first-assistant contract for new and
+    /// message — the deferred-first-assistant contract for new and
     /// branched sessions. The header is validated (so a later materialization
     /// never writes a file its own `open` would reject) but not written;
     /// appends buffer in memory until an assistant message arrives, at which
@@ -1076,8 +1076,8 @@ fn reparent_entry(
     Ok(serde_json::from_value(value)?)
 }
 
-/// Wire-level header checks on the raw JSON, mirroring the TS
-/// `parseHeaderLine`: type/version identity, non-empty id and cwd, and — the
+/// Wire-level header checks on the raw JSON: type/version identity,
+/// non-empty id and cwd, and — the
 /// distinction serde's `Option` cannot make — a present-but-null
 /// `parentSession` or `metadata` is rejected while an absent one is fine.
 /// Shared by `load` (rejecting damaged files) and `create` (never writing a
@@ -1309,8 +1309,8 @@ impl SessionStorage for JsonlSessionStorage {
         let target_id = match leaf_id {
             None => return Ok(Vec::new()),
             Some(id) if entries.iter().any(|e| e.id() == id) => id.to_string(),
-            // An explicit id unknown to storage is an error — the TS
-            // storage's `not_found`. Silently walking from another entry
+            // An explicit id unknown to storage is an error — `not_found`.
+            // Silently walking from another entry
             // would fabricate a path the caller never asked for.
             Some(id) => anyhow::bail!("entry {id} not found"),
         };
@@ -1322,8 +1322,8 @@ impl SessionStorage for JsonlSessionStorage {
         let mut current_id: Option<&str> = Some(&target_id);
         while let Some(id) = current_id {
             // `remove` doubles as cycle protection: each entry is visited at
-            // most once. A miss is either a parent id with no entry — the TS
-            // storage's `invalid_session` — or a parent-id cycle; both mean
+            // most once. A miss is either a parent id with no entry —
+            // `invalid_session` — or a parent-id cycle; both mean
             // the chain is broken, and a truncated path would silently drop
             // history, so this is an error, never a partial result.
             let entry = match index.remove(id) {
@@ -2524,8 +2524,7 @@ mod tests {
     /// A full branching lifecycle must stay consistent across disk round-trips:
     /// append → branch back via `set_leaf_id` → append again → reopen → walk.
     /// The later message parents onto the leaf's `targetId` (the cursor), and
-    /// the leaf entry never appears in the walked context — matching TS
-    /// `setLeafId` / `leafIdAfterEntry` / `buildSessionPath`.
+    /// the leaf entry never appears in the walked context.
     #[tokio::test]
     async fn test_branch_lifecycle_round_trips_consistently() {
         use crate::session::Session;
@@ -2619,7 +2618,7 @@ mod tests {
         assert_eq!(types, vec!["message", "leaf", "message"]);
     }
 
-    /// A TS-written session file carries no retained tail on its compaction
+    /// A legacy session file carries no retained tail on its compaction
     /// entries: the kept segment is reconstructed by walking the tree from
     /// `firstKeptEntryId`. Loading such a file must rebuild the full context —
     /// summary carrier, kept messages, and post-boundary messages — with each
@@ -2690,7 +2689,7 @@ mod tests {
         assert_eq!(context.model, None);
     }
 
-    /// A TS-written file may carry settings entries and damaged messages: a
+    /// A legacy file may carry settings entries and damaged messages: a
     /// null message content reads as empty, and the context surfaces the
     /// reasoning tier and the model the path carries.
     #[tokio::test]

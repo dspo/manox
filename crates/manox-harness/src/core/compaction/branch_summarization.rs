@@ -27,8 +27,7 @@ use crate::types::{
 /// Tokens reserved for the summarization prompt and the model's response.
 pub const RESERVE_TOKENS: usize = 16_384;
 
-/// Result of a branch summarization run, mirroring the TS
-/// `generateBranchSummary` result.
+/// Result of a branch summarization run.
 #[derive(Debug, Clone)]
 pub struct BranchSummaryResult {
     /// The full summary text — preamble, model prose, file-operation tail.
@@ -91,8 +90,8 @@ pub fn get_message_from_entry(entry: &SessionTreeEntry) -> Option<AgentMessage> 
     }
 }
 
-/// Prepare branch entries for summarization under a token budget — the TS
-/// `prepareBranchEntries`. Walks newest to oldest, keeping messages until the
+/// Prepare branch entries for summarization under a token budget.
+/// Walks newest to oldest, keeping messages until the
 /// budget is exhausted; a compaction/branch-summary carrier past the budget
 /// still fits while the accumulated total stays under 90% of it. Harness-
 /// authored branch summaries seed the read/modified file lists first so
@@ -160,8 +159,8 @@ pub const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this con
 /// The preamble prepended to every model-produced branch summary.
 pub const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
-/// Build the summarization prompt for a prepared branch — the TS
-/// `generateBranchSummary` prompt: the serialized conversation wrapped in
+/// Build the summarization prompt for a prepared branch: the serialized
+/// conversation wrapped in
 /// `<conversation>` tags followed by the instruction block.
 pub fn build_branch_summary_prompt(
     messages: &[AgentMessage],
@@ -527,7 +526,7 @@ mod tests {
         );
     }
 
-    /// The prompt is the TS shape: serialized conversation in `<conversation>`
+    /// The prompt shape: serialized conversation in `<conversation>`
     /// tags followed by the structured instruction block.
     #[test]
     fn build_prompt_matches_ts_shape() {

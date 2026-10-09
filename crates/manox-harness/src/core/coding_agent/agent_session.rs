@@ -73,7 +73,7 @@ pub struct AgentSession {
 }
 
 impl AgentSession {
-    /// Prompt the agent and return the produced messages. Expands the TS
+    /// Prompt the agent and return the produced messages. Expands the
     /// default prompt forms: `/skill:name args` becomes the skill invocation
     /// block (with `args` appended), and `/name args` expands a prompt
     /// template by name with `substituteArgs`.
@@ -96,9 +96,9 @@ impl AgentSession {
         text: &str,
         images: Vec<crate::types::ContentBlock>,
     ) -> Result<Vec<AgentMessage>, anyhow::Error> {
-        // TS extension `input` event parity: handlers may transform the
+        // The `input` hook: handlers may transform the
         // input or mark it fully handled (then no turn runs). Fires before
-        // skill/template expansion, exactly like the TS session.
+        // skill/template expansion.
         let hook_ctx = self.harness.run_input_hook(text, &images);
         if hook_ctx.input_handled {
             return Ok(Vec::new());
@@ -952,7 +952,7 @@ impl AgentSessionBuilder {
     }
 
     /// Pin the initial active tool subset the model sees. `None` (default)
-    /// falls through to the TS default four (when no custom tools are given)
+    /// falls through to the default four (when no custom tools are given)
     /// or the full mounted set (when custom tools are given).
     pub fn with_initial_active_tools(mut self, names: Vec<String>) -> Self {
         self.initial_active_tools = Some(names);
@@ -1011,7 +1011,7 @@ impl AgentSessionBuilder {
         } else {
             self.tools.clone()
         };
-        // The facade's initial active subset: the TS default four when no
+        // The facade's initial active subset: the default four when no
         // custom tool list is given. It drives BOTH the initial system
         // prompt and the in-memory harness state, and is the restore default
         // when a reopened path carries no `active_tools_change` entry.
@@ -1123,7 +1123,7 @@ impl AgentSessionBuilder {
             harness.set_snapshot_dir(snapshot_dir);
         }
         if let Some(names) = facade_initial_active {
-            // Initial active subset: the TS default four. In-memory only —
+            // Initial active subset: the default four. In-memory only —
             // no `active_tools_change` entry is written for the default; a
             // restore with no entry also falls back to these four.
             harness.set_initial_active_tools(names.clone());
@@ -2054,7 +2054,7 @@ mod tests {
     }
 
     /// All seven built-ins are registered; the initial ACTIVE subset is the
-    /// TS default four, survives reopen, and grep/find/ls stay enableable.
+    /// default four, survives reopen, and grep/find/ls stay enableable.
     #[tokio::test]
     async fn default_tool_registry_seven_active_four_across_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -2327,7 +2327,7 @@ mod tests {
         );
     }
 
-    /// A thinking-capable default model (Sonnet, per the frozen TS baseline)
+    /// A thinking-capable default model (Sonnet, the default)
     /// keeps the `medium` default instead of being clamped to off.
     #[tokio::test]
     async fn thinking_capable_model_keeps_medium_default() {
@@ -2669,8 +2669,8 @@ mod tests {
         assert_eq!(session.harness.agent().state().thinking_level, None);
 
         // Round trip through a non-thinking model: the off preference must
-        // not be overwritten (a non-thinking model clamps to off and TS does
-        // not store off for non-thinking models).
+        // not be overwritten (a non-thinking model clamps to off, and off is
+        // not stored for non-thinking models).
         session
             .set_model(Model {
                 thinking: crate::types::ThinkingKind::None,
@@ -3043,7 +3043,7 @@ mod tests {
 
     #[tokio::test]
     async fn input_hook_chains_transforms_and_short_circuits_on_handled() {
-        // TS runner parity: each handler sees the accumulated transform of
+        // Hook chaining: each handler sees the accumulated transform of
         // all earlier handlers, and a `handled` result stops the chain.
         let dir = tempfile::tempdir().unwrap();
         let mut session = input_hook_session(&dir).await;

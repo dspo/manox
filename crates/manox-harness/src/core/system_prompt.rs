@@ -9,8 +9,7 @@
 /// instruction context files (AGENTS.md / CLAUDE.md), and the mounted skills.
 /// This is the facade's single prompt builder — skills appear as an index so
 /// the model knows what is invocable.
-/// The default coding-agent base prompt, ported from the TS
-/// `buildSystemPrompt` non-UI core: the identity line and the always-present
+/// The default coding-agent base prompt: the identity line and the always-present
 /// guidelines. The UI documentation section and per-tool snippets are
 /// dynamic (added by [`build_harness_prompt`]).
 pub const DEFAULT_BASE_PROMPT: &str = "You are an expert coding assistant operating inside manox, a coding agent harness. \
@@ -60,7 +59,7 @@ pub fn build_harness_prompt(
                 prompt.push_str(&format!("- {name}: {snippet}\n"));
             }
         }
-        // TS dynamic guideline: with bash but no grep/find/ls.
+        // Dynamic guideline: with bash but no grep/find/ls.
         if active_tools.contains(&"Bash".to_string())
             && !["Grep", "Glob", "Ls"]
                 .iter()

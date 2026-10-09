@@ -3162,7 +3162,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// TS parity: images ride the prompt's own user message. `run_turn` must
+    /// Images ride the prompt's own user message. `run_turn` must
     /// hand the queued text AND the queued images to the engine in one turn,
     /// draining both queues.
     #[tokio::test]
@@ -3274,7 +3274,7 @@ pub(crate) mod tests {
 
     /// An image-only insert (no text) still starts a turn — the guard keys on
     /// BOTH queues being empty, so the engine receives an empty prompt plus
-    /// the image (kernel pushes the empty text block, TS parity).
+    /// the image (the kernel pushes the empty text block).
     #[tokio::test]
     async fn run_turn_image_only_insert_still_starts_turn() {
         let engine = Arc::new(FakeEngine {

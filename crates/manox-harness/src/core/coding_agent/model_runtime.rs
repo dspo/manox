@@ -194,7 +194,7 @@ pub struct DefaultModelCatalog;
 
 impl ModelCatalog for DefaultModelCatalog {
     fn resolve(&self, provider: &str, model_id: &str) -> Option<Model> {
-        // Thinking capability mirrors the frozen TS baseline: Sonnet 4.6,
+        // Thinking capability by model: Sonnet 4.6,
         // Opus 4.8, and GPT-5 support reasoning; Haiku 4.5 and GPT-4o do not.
         let (api, context_window, max_tokens, thinking): (
             &str,
@@ -247,9 +247,9 @@ impl ModelCatalog for DefaultModelCatalog {
 }
 
 impl ModelRuntime {
-    /// A resolver whose provider streams carry a request observer (the TS
-    /// before-payload / after-response hooks). Only the env-backed registry
-    /// rebuilds its streams with the observer attached; custom runtimes
+    /// A resolver whose provider streams carry a request observer. Only the
+    /// env-backed registry rebuilds its streams with the observer attached;
+    /// custom runtimes
     /// (mock/custom providers) resolve their own streams, which do not fire
     /// wire hooks anyway.
     pub fn resolver_with_observer(
@@ -304,7 +304,7 @@ impl ModelRuntime {
     }
 }
 
-/// The TS thinking-level order.
+/// The thinking-level order.
 pub const THINKING_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The levels a model supports for the default catalog: reasoning models
