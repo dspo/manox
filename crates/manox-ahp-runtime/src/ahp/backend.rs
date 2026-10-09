@@ -2053,6 +2053,53 @@ impl Backend for RuntimeBackend {
                     .archive_session(&origin.client_id, session_id, changed.is_archived);
                 DispatchOutcome::Accepted
             }
+            // AHP 1.0's annotations edges: the whole-annotation upsert and
+            // the removal are durable (they journal a kernel row through the
+            // store route, the same legs a rename takes); the partial edges
+            // are refused with the whole-annotation alternative, because
+            // merging them host-side would need state the journal fold — not
+            // the dispatch site — owns.
+            StateAction::AnnotationsSet(set) => {
+                let Some(channel_id) = manox_ahp::channels::annotations::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                let annotation = serde_json::to_value(&set.annotation)
+                    .expect("the annotation serializes (it deserialized off the wire)");
+                if self.server.set_annotation(channel_id, &annotation) {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!(
+                        "the session's journal is not writable from this process: {channel_id}"
+                    ))
+                }
+            }
+            StateAction::AnnotationsRemoved(removed) => {
+                let Some(channel_id) = manox_ahp::channels::annotations::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                if self
+                    .server
+                    .remove_annotation(channel_id, &removed.annotation_id)
+                {
+                    DispatchOutcome::Accepted
+                } else {
+                    DispatchOutcome::Rejected(format!(
+                        "the session's journal is not writable from this process: {channel_id}"
+                    ))
+                }
+            }
+            StateAction::AnnotationsUpdated(_) => DispatchOutcome::Rejected(
+                "partial annotation updates are not durable here; dispatch annotations/set \
+                 with the whole annotation"
+                    .to_string(),
+            ),
+            StateAction::AnnotationsEntrySet(_) | StateAction::AnnotationsEntryRemoved(_) => {
+                DispatchOutcome::Rejected(
+                    "partial annotation updates are not durable here; dispatch annotations/set \
+                     with the whole annotation"
+                        .to_string(),
+                )
+            }
             // Actions the acceptance table admits and the reducer folds, but
             // that describe client-side state the runtime does not own (draft
             // text, read flags, turn resumption, result confirmation). They are
@@ -2070,6 +2117,40 @@ impl Backend for RuntimeBackend {
                 "no runtime intent yet: {}",
                 manox_ahp::wire::action_tag(other)
             )),
+        }
+    }
+
+    /// The annotations channel's state, folded on first sight from the
+    /// journal's annotation rows through the same projection the bridge
+    /// runs — the fold and the live stream are one code path, so they
+    /// cannot drift (the wire face of #884: without this, subscribe and
+    /// dispatch both die at `ensure_annotations` with NotFound).
+    fn annotations_state(&self, session_id: &str) -> Option<ahp_types::state::AnnotationsState> {
+        let mut state = manox_ahp::channels::annotations::initial();
+        let mut translator = crate::ahp::projection::Translator::new();
+        let channel = manox_ahp::channels::annotations::uri(session_id);
+        let snapshot = block_on(crate::journal_query::cold_read(session_id));
+        match snapshot {
+            crate::journal_query::ColdRead::Data(snapshot) => {
+                for record in &snapshot.records {
+                    use ahp::reducers::apply_action_to_annotations;
+                    for emitted in
+                        translator.on_entry(session_id, session_id, record.seq, &record.entry)
+                    {
+                        if emitted.channel == channel {
+                            apply_action_to_annotations(&mut state, &emitted.action);
+                        }
+                    }
+                }
+                Some(state)
+            }
+            // A corrupt journal answers not-found for annotations like every
+            // other fold would — loud at the seam, absent on the wire.
+            crate::journal_query::ColdRead::Corrupt(error) => {
+                tracing::warn!(session_id, %error, "annotations fold: journal unreadable");
+                None
+            }
+            crate::journal_query::ColdRead::NotFound => None,
         }
     }
 
@@ -2713,6 +2794,12 @@ mod mcp_dispatch_tests {
         fn archive_session(&self, _owner: &str, _session_id: &str, _archived: bool) {}
         fn rename_session(&self, _session_id: &str, _title: &str) -> RenameOutcome {
             RenameOutcome::UnknownSession
+        }
+        fn set_annotation(&self, _session_id: &str, _annotation: &serde_json::Value) -> bool {
+            false
+        }
+        fn remove_annotation(&self, _session_id: &str, _annotation_id: &str) -> bool {
+            false
         }
         fn pin_session(&self, _session_id: &str, _pinned: bool) -> bool {
             false

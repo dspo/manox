@@ -222,6 +222,12 @@ pub trait SessionRuntime: Send + Sync + 'static {
 
     /// Rename the session to a user title.
     fn rename_session(&self, session_id: &str, title: &str) -> RenameOutcome;
+    /// Upsert one durable user annotation (the AHP `Annotation` JSON rides
+    /// the journal row verbatim). Answers whether the row landed — a session
+    /// this process cannot journal must be refused, not assumed.
+    fn set_annotation(&self, session_id: &str, annotation: &serde_json::Value) -> bool;
+    /// Remove one durable user annotation by id.
+    fn remove_annotation(&self, session_id: &str, annotation_id: &str) -> bool;
 
     /// Pin or unpin the session.
     fn pin_session(&self, session_id: &str, pinned: bool) -> bool;

@@ -619,6 +619,20 @@ impl Inner {
         Ok(())
     }
 
+    /// Make sure an annotations channel is loaded, computing it on first
+    /// sight from the backend's journal fold.
+    pub(crate) fn ensure_annotations(&self, id: &str) -> Result<(), HostError> {
+        if self.store.read().annotations(id).is_some() {
+            return Ok(());
+        }
+        let state = self
+            .backend
+            .annotations_state(id)
+            .ok_or_else(|| HostError::NotFound(crate::channels::annotations::uri(id)))?;
+        self.store.write().insert_annotations(id, state);
+        Ok(())
+    }
+
     /// Make sure a changeset view is loaded, computing it on first sight.
     pub(crate) fn ensure_changeset(&self, uri: &str) -> Result<(), HostError> {
         if self.store.read().changeset(uri).is_some() {

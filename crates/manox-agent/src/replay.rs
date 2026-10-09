@@ -33,6 +33,10 @@ pub struct ReplayedThreadState {
     pub pinned: Option<bool>,
     /// Archive flag from the last `pinned_archived` entry.
     pub archived: Option<bool>,
+    /// Durable user annotations from the `annotation_set` /
+    /// `annotation_removed` entries, latest-wins per annotation id (`None`
+    /// after a removal, so tombstones survive the pure fold).
+    pub annotations: std::collections::BTreeMap<String, Option<serde_json::Value>>,
     /// Project binding from the last `project_change` entry;
     /// `Some(None)` is an explicit unbind.
     pub project: Option<Option<String>>,
@@ -163,6 +167,18 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
             } => {
                 state.pinned = Some(*pinned);
                 state.archived = Some(*archived);
+            }
+            // Durable user annotations: latest-wins per annotation id on the
+            // replayed map — the same fold the notes cell renders from.
+            SessionTreeEntry::AnnotationSet { annotation, .. } => {
+                if let Some(id) = annotation.get("id").and_then(serde_json::Value::as_str) {
+                    state
+                        .annotations
+                        .insert(id.to_string(), Some(annotation.clone()));
+                }
+            }
+            SessionTreeEntry::AnnotationRemoved { annotation_id, .. } => {
+                state.annotations.insert(annotation_id.clone(), None);
             }
             SessionTreeEntry::ProjectChange { path, .. } => {
                 state.project = Some(path.clone());

@@ -157,6 +157,8 @@ pub(crate) enum Target {
     Work,
     /// `x-manox-metrics:/<chat-id>` — aggregated conversation metrics.
     Metrics,
+    /// `ahp-session:/<session-id>/annotations` — durable user annotations.
+    Annotations,
     /// `x-manox-thread:/<session-id>` — pin, label, session info, leaf cursor.
     ///
     /// These rows have no AHP-native slot and only fold on an extension
@@ -172,6 +174,7 @@ impl Target {
         match self {
             Self::Chat => manox_ahp::channels::chat::uri(chat_id),
             Self::Session => manox_ahp::channels::session::uri(session_id),
+            Self::Annotations => manox_ahp::channels::annotations::uri(session_id),
             Self::Plan => format!("{}{chat_id}", ext::channels::PLAN),
             Self::Work => format!("{}{session_id}", ext::channels::WORK),
             Self::Metrics => format!("{}{chat_id}", ext::channels::METRICS),
@@ -215,6 +218,7 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         // Thread rows: the extension face is their only face — on the session
         // channel no fold ever consumed them (see [`Target::Thread`]).
         E::Label { .. } | E::SessionInfo { .. } | E::Leaf { .. } => Target::Thread,
+        E::AnnotationSet { .. } | E::AnnotationRemoved { .. } => Target::Annotations,
         // ── plan ─────────────────────────────────────────────────────
         E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
         // ── extension work surface ───────────────────────────────────
@@ -1119,6 +1123,31 @@ impl Translator {
                     ext::actions::LEAF_CHANGED,
                     json!({"targetId": target_id.clone().unwrap_or_default()}),
                 ),
+            )),
+            // ── annotations ──────────────────────────────────────────────
+            SessionTreeEntry::AnnotationSet { annotation, .. } => {
+                // The row rides the AHP `Annotation` JSON verbatim; a row that
+                // does not parse as one is skipped loudly — the durable state
+                // stays as the last valid row left it.
+                match serde_json::from_value::<ahp_types::state::Annotation>(annotation.clone()) {
+                    Ok(annotation) => out.push(Emitted::new(
+                        &at,
+                        StateAction::AnnotationsSet(ahp_types::actions::AnnotationsSetAction {
+                            annotation,
+                        }),
+                    )),
+                    Err(error) => tracing::warn!(
+                        seq = row.seq,
+                        %error,
+                        "annotation row does not parse as an AHP annotation; skipped"
+                    ),
+                }
+            }
+            SessionTreeEntry::AnnotationRemoved { annotation_id, .. } => out.push(Emitted::new(
+                &at,
+                StateAction::AnnotationsRemoved(ahp_types::actions::AnnotationsRemovedAction {
+                    annotation_id: annotation_id.clone(),
+                }),
             )),
             // ── plan ─────────────────────────────────────────────────────
             SessionTreeEntry::PlanModeChange { enabled, .. } => out.push(Emitted::new(
@@ -3752,6 +3781,77 @@ mod subagent_face_tests {
             cancelled_removals, 1,
             "the cancelled turn reports sub-1's death: {out3:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod annotations_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-09T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    /// The journal's annotation rows project onto the annotations channel
+    /// and fold through the SDK reducer: latest-wins per id, removal
+    /// collapses, exactly the state a subscriber seeds from.
+    #[test]
+    fn annotation_rows_fold_into_the_annotations_channel() {
+        let annotation = json!({
+            "id": "note-1",
+            "origin": {"session": "ahp-session:/s-1"},
+            "resource": "file:///src/a.rs",
+            "resolved": false,
+            "entries": [
+                {"id": "en-1", "text": "check the anchor drift here"},
+                {"id": "en-2", "text": {"markdown": "**and** the guard"}},
+            ],
+        });
+        let mut t = Translator::new();
+        let mut state = manox_ahp::channels::annotations::initial();
+        let channel = manox_ahp::channels::annotations::uri("s-1");
+        for (seq, entry) in [
+            kernel(json!({"type": "annotation_set", "annotation": annotation.clone()})),
+            kernel(json!({"type": "annotation_removed", "id": "e-2", "annotationId": "note-1"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for emitted in t.on_entry("c-1", "s-1", seq as u64, &entry) {
+                assert_eq!(emitted.channel, channel, "annotations ride their channel");
+                ahp::reducers::apply_action_to_annotations(&mut state, &emitted.action);
+            }
+        }
+        assert!(
+            state.annotations.is_empty(),
+            "the removal collapsed the annotation: {:?}",
+            state.annotations
+        );
+
+        // Re-set without the removal: one annotation, two entries, verbatim.
+        let mut t = Translator::new();
+        let mut state = manox_ahp::channels::annotations::initial();
+        for emitted in t.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({"type": "annotation_set", "annotation": annotation.clone()})),
+        ) {
+            ahp::reducers::apply_action_to_annotations(&mut state, &emitted.action);
+        }
+        assert_eq!(state.annotations.len(), 1);
+        assert_eq!(state.annotations[0].id, "note-1");
+        assert_eq!(state.annotations[0].entries.len(), 2);
     }
 }
 

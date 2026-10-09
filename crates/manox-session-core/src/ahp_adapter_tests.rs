@@ -136,6 +136,16 @@ fn with_chain(id: &str, parent_id: Option<String>, event: E) -> E {
             id: i,
             parent_id: p,
             ..
+        }
+        | E::AnnotationSet {
+            id: i,
+            parent_id: p,
+            ..
+        }
+        | E::AnnotationRemoved {
+            id: i,
+            parent_id: p,
+            ..
         } => {
             *i = id.to_string();
             *p = parent_id;
@@ -776,6 +786,54 @@ mod dispatch {
             .expect("subscribes");
         assert!(result.snapshot.is_some(), "the fold answers a snapshot");
         (runtime, client, sub)
+    }
+
+    /// The annotations channel's WIRE face (#884 review round 1): a real
+    /// SDK client subscribes to `ahp-session:/<id>/annotations` (the exact
+    /// `ensure_annotations` → `Backend::annotations_state` path the first
+    /// review found dead) and receives the fold of the journal's annotation
+    /// rows; a dispatch writes a durable row and the fold answers it back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_annotations_channel_answers_on_the_wire() {
+        let _guards = install();
+        let annotation = serde_json::json!({
+            "id": "wire-1",
+            "origin": {"session": session::uri("s-wire")},
+            "resource": "file:///src/wire.rs",
+            "resolved": false,
+            "entries": [{"id": "e-1", "text": "wire-level note"}],
+        });
+        // The journal row shape the store route writes (kind + payload
+        // object), as a kernel record on the chain.
+        let (_runtime, client, _sub) = host_fixture(
+            "s-wire",
+            "s-wire",
+            vec![(
+                "a-1",
+                E::AnnotationSet {
+                    id: String::new(),
+                    parent_id: None,
+                    timestamp: stamp(),
+                    annotation: annotation.clone(),
+                },
+            )],
+        )
+        .await;
+
+        let (result, _annotation_sub) = client
+            .subscribe(manox_ahp::channels::annotations::uri("s-wire"))
+            .await
+            .expect("the annotations channel subscribes");
+        let snapshot = match result.snapshot.as_ref().map(|s| &s.state) {
+            Some(ahp_types::state::SnapshotState::Annotations(state)) => state.as_ref().clone(),
+            other => panic!("the fold answers an annotations snapshot: {other:?}"),
+        };
+        assert_eq!(snapshot.annotations.len(), 1);
+        assert_eq!(snapshot.annotations[0].id, "wire-1");
+        assert_eq!(
+            snapshot.annotations[0].entries[0].text,
+            ahp_types::common::StringOrMarkdown::Plain("wire-level note".to_string())
+        );
     }
 
     /// The markdown runs the host's chat holds for the open turn, by content.

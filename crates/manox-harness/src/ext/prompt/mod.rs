@@ -92,6 +92,12 @@ pub struct CaptainConfig {
     pub cwd: PathBuf,
     pub today: String,
     pub skills: Vec<SkillSummary>,
+    /// The session's rendered user-notes section (the annotations channel's
+    /// unresolved entries), maintained by the engine next to its journal
+    /// seam and read at every render — a note written mid-turn reaches the
+    /// very next request. `None` for sessions with no notes source (tests,
+    /// subagents).
+    pub user_notes: Option<std::sync::Arc<std::sync::RwLock<String>>>,
 }
 
 #[derive(Serialize)]
@@ -185,9 +191,21 @@ pub fn captain_prompt_builder(config: CaptainConfig) -> crate::core::harness::Sy
         },
     );
     let cwd = config.cwd;
+    let notes = config.user_notes;
     std::sync::Arc::new(
         move |active_tools: &[String], resources: &crate::core::harness::HarnessResources| {
-            render_assembly(&base, &cwd, active_tools, resources)
+            let mut assembly = render_assembly(&base, &cwd, active_tools, resources);
+            // The notes section is a read-time fact: the cell holds the
+            // journal's current annotations, so every render sees the notes
+            // the latest durable state carries.
+            if let Some(cell) = &notes
+                && let Ok(section) = cell.read()
+                && !section.is_empty()
+            {
+                assembly.push_str("\n\n# User notes\n\n");
+                assembly.push_str(&section);
+            }
+            assembly
         },
     )
 }
@@ -215,6 +233,7 @@ pub fn render_golden_fixture() -> String {
     let builder = captain_prompt_builder(CaptainConfig {
         cwd: PathBuf::from("/private/tmp/golden-proj"),
         today: "2026-08-25".to_string(),
+        user_notes: None,
         skills: vec![
             SkillSummary {
                 name: "gitwork:deliver".into(),

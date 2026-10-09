@@ -808,6 +808,50 @@ impl ThreadStore {
         )
     }
 
+    /// Upsert one durable user annotation (the AHP `Annotation` JSON rides the
+    /// row verbatim). The same durable legs as a rename: the known-check, the
+    /// journal row, and the prompt-notes cell so the next request's context
+    /// carries it. Answers whether the row could land at all.
+    pub fn set_annotation(&mut self, id: &str, annotation: &serde_json::Value) -> bool {
+        self.annotation_row(
+            id,
+            "annotation_set",
+            serde_json::json!({ "annotation": annotation }),
+        )
+    }
+
+    /// Remove one durable user annotation by id (same legs as the upsert).
+    pub fn remove_annotation(&mut self, id: &str, annotation_id: &str) -> bool {
+        self.annotation_row(
+            id,
+            "annotation_removed",
+            serde_json::json!({ "annotationId": annotation_id }),
+        )
+    }
+
+    /// The shared durable legs of an annotation row: a session this store
+    /// knows (by row or by path) with a materialized journal file takes the
+    /// row through the store route, and the prompt-notes cell follows the
+    /// durable state. Returns whether the row landed.
+    fn annotation_row(&self, id: &str, kind: &str, payload: serde_json::Value) -> bool {
+        let known =
+            self.summaries.iter().any(|row| row.id == id) || self.session_paths.contains_key(id);
+        if !known {
+            return false;
+        }
+        let Some(path) = self.session_paths.get(id).filter(|p| p.exists()) else {
+            return false;
+        };
+        crate::engine::dispatch_store_journal_row(
+            id.to_string(),
+            Some(path.clone()),
+            kind.to_string(),
+            payload,
+        );
+        crate::engine::refresh_notes_cell(id, Some(path));
+        true
+    }
+
     /// Persist the session's granted extra working directories (multi-
     /// root) so a cold restore re-widens the fence (multi-working-dirs).
     pub fn set_working_directories(&mut self, id: &str, dirs: Vec<String>) {

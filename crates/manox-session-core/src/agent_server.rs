@@ -2271,6 +2271,20 @@ impl AgentServerInner {
     ///
     /// A whitespace-only title is refused: it would blank the session's name
     /// while looking like it landed.
+    /// Upsert one durable user annotation (the annotations channel's write
+    /// leg): the store call journals the kernel row and refreshes the
+    /// prompt-notes cell — the bridge's fold of the row echoes the AHP
+    /// action back to every subscriber.
+    pub(crate) fn set_annotation(&self, session_id: &str, annotation: &Value) -> bool {
+        manox_agent::thread_store::global().with_mut(|s| s.set_annotation(session_id, annotation))
+    }
+
+    /// Remove one durable user annotation by id (same legs as the upsert).
+    pub(crate) fn remove_annotation(&self, session_id: &str, annotation_id: &str) -> bool {
+        manox_agent::thread_store::global()
+            .with_mut(|s| s.remove_annotation(session_id, annotation_id))
+    }
+
     pub(crate) fn rename_thread(
         &self,
         session_id: &str,
