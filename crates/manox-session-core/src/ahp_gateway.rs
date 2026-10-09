@@ -304,6 +304,18 @@ impl SessionRuntime for GatewayRuntime {
         }
     }
 
+    fn set_annotation(&self, session_id: &str, annotation: &serde_json::Value) -> bool {
+        self.server
+            .ahp_inner()
+            .set_annotation(session_id, annotation)
+    }
+
+    fn remove_annotation(&self, session_id: &str, annotation_id: &str) -> bool {
+        self.server
+            .ahp_inner()
+            .remove_annotation(session_id, annotation_id)
+    }
+
     fn pin_session(&self, session_id: &str, pinned: bool) -> bool {
         self.server.ahp_inner().pin_session(session_id, pinned)
     }

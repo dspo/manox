@@ -213,6 +213,12 @@ fn dispatch_action(inner: &Arc<Inner>, conn: &Arc<Conn>, params: DispatchActionP
                 return;
             }
         }
+        Channel::Annotations(id) => {
+            if let Err(err) = inner.ensure_annotations(id) {
+                inner.reject(uri, params.action, Some(origin), err.message());
+                return;
+            }
+        }
         Channel::Terminal(id) => {
             if let Err(err) = inner.ensure_terminal(id) {
                 inner.reject(uri, params.action, Some(origin), err.message());
@@ -345,6 +351,7 @@ fn subscribe_uri(
             inner.ensure_chat(id)?;
         }
         Channel::Terminal(id) => inner.ensure_terminal(id)?,
+        Channel::Annotations(id) => inner.ensure_annotations(id)?,
         Channel::Changeset(_) => inner.ensure_changeset(uri)?,
         // The side-channel is not subscribable — a client's MCP surface is
         // the customization's `channel` field, and its traffic is

@@ -40,6 +40,8 @@ use crate::thread_engine::{BackendNotice, ReadyInfo, SpawnedEngine, ThreadEngine
 // `use super::*`, and these globs bring the child items back into the
 // engine scope for the glue below (and for the tests).
 mod journal;
+
+pub(crate) use journal::{notes_cell, refresh_notes_cell};
 mod lifecycle;
 mod run;
 #[cfg(test)]

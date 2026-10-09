@@ -368,6 +368,21 @@ pub(super) fn session_builder(
                         description: s.description,
                     })
                     .collect(),
+                // The annotations channel's prompt half: seed the cell from
+                // the journal's durable rows so a reopened session's notes
+                // reach the first request, then keep it live via the append
+                // seam.
+                user_notes: {
+                    crate::engine::refresh_notes_cell(
+                        thread_id,
+                        sessions_dir
+                            .join(format!("{thread_id}.jsonl"))
+                            .exists()
+                            .then(|| sessions_dir.join(format!("{thread_id}.jsonl")))
+                            .as_deref(),
+                    );
+                    Some(crate::engine::notes_cell(thread_id))
+                },
             },
         ))
         .with_resources(instruction_resources(cwd))

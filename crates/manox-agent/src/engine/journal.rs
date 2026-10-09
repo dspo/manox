@@ -288,6 +288,116 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
 //   (on exit) removes the route — so a waiting cold append starts strictly
 //   after the live storage stopped writing. One writer at a time, no lost
 //   row.
+/// The per-thread rendered user-notes section: the annotations channel's
+/// unresolved entries, latest-wins per annotation id. Seeded at open from
+/// the journal's annotation rows, refreshed on every annotation append, and
+/// read by the Captain prompt builder at every render — so a note written
+/// mid-turn reaches the very next request's context without a restart.
+// Sizing note (review round 1): the map only grows — one `Arc<RwLock<String>>`
+// per thread the process ever annotates. A cell is a few hundred bytes and a
+// moved-out session's cell holds an empty string, so the growth is bounded by
+// thread count, not journal size; revisit only if sessions number in the
+// hundreds of thousands per process.
+pub(crate) fn notes_cell(thread_id: &str) -> std::sync::Arc<std::sync::RwLock<String>> {
+    static CELLS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<std::sync::RwLock<String>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    let cells = CELLS.get_or_init(Default::default);
+    let mut guard = cells.lock().expect("notes cells poisoned");
+    guard
+        .entry(thread_id.to_string())
+        .or_insert_with(|| std::sync::Arc::new(std::sync::RwLock::new(String::new())))
+        .clone()
+}
+
+/// Recompute one thread's notes cell from its journal file. A missing or
+/// unreadable file clears the section — the cell mirrors the durable rows
+/// and nothing else.
+// Cost note (review round 1): each refresh re-reads the whole journal file —
+// O(file size), synchronous, on the annotation-write path. Writes are rare
+// (human note-taking), so this trades a full read per note for zero state
+// plumbing; a long-journal concern should move to an incremental fold, the
+// same trade #880's list face made.
+pub(crate) fn refresh_notes_cell(thread_id: &str, journal_path: Option<&std::path::Path>) {
+    let cell = notes_cell(thread_id);
+    let rendered = journal_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| render_notes_section(&text))
+        .unwrap_or_default();
+    *cell.write().expect("notes cell poisoned") = rendered;
+}
+
+/// Fold the journal's annotation rows into the prompt section: latest-wins
+/// per annotation id, unresolved annotations only, each contributing its
+/// entries' texts as bullet lines.
+fn render_notes_section(journal_text: &str) -> String {
+    let mut annotations: std::collections::BTreeMap<String, Option<serde_json::Value>> =
+        Default::default();
+    for line in journal_text.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match row.get("type").and_then(serde_json::Value::as_str) {
+            Some("annotation_set") => {
+                // Key by the ANNOTATION's own id — the same key a removal
+                // names — so the latest-wins fold collapses correctly.
+                if let Some(annotation) = row.get("annotation")
+                    && let Some(id) = annotation.get("id").and_then(serde_json::Value::as_str)
+                {
+                    annotations.insert(id.to_string(), Some(annotation.clone()));
+                }
+            }
+            Some("annotation_removed") => {
+                if let Some(id) = row.get("annotationId").and_then(serde_json::Value::as_str) {
+                    annotations.insert(id.to_string(), None);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    for (_, annotation) in annotations {
+        let Some(annotation) = annotation else {
+            continue;
+        };
+        if annotation
+            .get("resolved")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            continue;
+        }
+        let Some(entries) = annotation
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for entry in entries {
+            // `text` is a bare string or `{ markdown: "…" }` — the plain
+            // string is the render here, markdown is stripped to its body.
+            let body = match entry.get("text") {
+                Some(serde_json::Value::String(text)) => Some(text.clone()),
+                Some(other) => other
+                    .get("markdown")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                None => None,
+            };
+            if let Some(body) = body {
+                for line in body.lines() {
+                    out.push_str("- ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(super) struct EngineRoute {
     tx: mpsc::UnboundedSender<SessionCmd>,
     /// Set (under the registry lock, together with the shutdown claim) when
@@ -567,4 +677,28 @@ pub(super) async fn cold_journal_append(
     };
     let session = manox_harness::session::Session::new(storage);
     append_row_fail_loud(&session, kind, payload).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The notes section is the journal's annotation rows rendered: entries
+    /// as bullet lines, latest-wins per id, resolved annotations and
+    /// removals dropped, markdown stripped to its body.
+    #[test]
+    fn notes_section_renders_the_durable_annotation_rows() {
+        let journal = [
+            r#"{"type":"annotation_set","id":"e-1","annotation":{"id":"n1","resolved":false,"entries":[{"id":"a","text":"first note"}]}}"#,
+            r#"{"type":"annotation_set","id":"e-2","annotation":{"id":"n2","resolved":true,"entries":[{"id":"b","text":"resolved, hidden"}]}}"#,
+            r#"{"type":"annotation_set","id":"e-3","annotation":{"id":"n3","resolved":false,"entries":[{"id":"c","text":{"markdown":"**bold** line"}}]}}"#,
+            r#"{"type":"annotation_removed","id":"e-4","annotationId":"n1"}"#,
+        ]
+        .join("\n");
+        assert_eq!(
+            render_notes_section(&journal),
+            "- **bold** line\n",
+            "removal collapsed n1, resolved n2 is hidden, markdown renders its body"
+        );
+    }
 }

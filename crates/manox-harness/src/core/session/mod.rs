@@ -480,6 +480,26 @@ pub enum SessionTreeEntry {
         auth_id: String,
         payload: JsonValue,
     },
+    /// A durable user annotation upserted through the annotations channel
+    /// (`ahp-session:/<id>/annotations`): the AHP `Annotation` JSON rides the
+    /// row verbatim — the kernel persists it without interpreting it, and the
+    /// prompt builder injects the unresolved entries' texts into the model
+    /// context (latest-wins per annotation id).
+    #[serde(rename = "annotation_set", rename_all = "camelCase")]
+    AnnotationSet {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        annotation: serde_json::Value,
+    },
+    /// A durable user annotation removal — the fold collapses the named id.
+    #[serde(rename = "annotation_removed", rename_all = "camelCase")]
+    AnnotationRemoved {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: DateTime<Utc>,
+        annotation_id: String,
+    },
     /// Pin / archive flags changed.
     #[serde(rename = "pinned_archived", rename_all = "camelCase")]
     PinnedArchived {
@@ -549,6 +569,8 @@ impl SessionTreeEntry {
             Label,
             SessionInfo,
             Leaf,
+            AnnotationSet,
+            AnnotationRemoved,
             UiNote,
             TurnStart,
             TurnFinish,
@@ -1936,6 +1958,8 @@ pub enum EntryType {
     Label,
     SessionInfo,
     Leaf,
+    AnnotationSet,
+    AnnotationRemoved,
     // ── v4 journal vocabulary (§C.2) ──────────────────────────────────────
     UiNote,
     TurnStart,
@@ -1983,6 +2007,8 @@ impl EntryType {
             EntryType::Label => "label",
             EntryType::SessionInfo => "session_info",
             EntryType::Leaf => "leaf",
+            EntryType::AnnotationSet => "annotation_set",
+            EntryType::AnnotationRemoved => "annotation_removed",
             EntryType::UiNote => "ui_note",
             EntryType::TurnStart => "turn_start",
             EntryType::TurnFinish => "turn_finish",
@@ -2186,6 +2212,8 @@ pub fn entry_kind(entry: &SessionTreeEntry) -> EntryType {
         SessionTreeEntry::Label { .. } => EntryType::Label,
         SessionTreeEntry::SessionInfo { .. } => EntryType::SessionInfo,
         SessionTreeEntry::Leaf { .. } => EntryType::Leaf,
+        SessionTreeEntry::AnnotationSet { .. } => EntryType::AnnotationSet,
+        SessionTreeEntry::AnnotationRemoved { .. } => EntryType::AnnotationRemoved,
         SessionTreeEntry::UiNote { .. } => EntryType::UiNote,
         SessionTreeEntry::TurnStart { .. } => EntryType::TurnStart,
         SessionTreeEntry::TurnFinish { .. } => EntryType::TurnFinish,

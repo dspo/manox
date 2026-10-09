@@ -154,6 +154,13 @@ pub trait Backend: Send + Sync + 'static {
         Err(HostError::Unimplemented("moveChat".to_string()))
     }
 
+    /// The annotations channel state of one session (`ahp-session:/<id>/
+    /// annotations`), folded on first sight from the journal's annotation
+    /// rows. `None` = not found.
+    fn annotations_state(&self, _session_id: &str) -> Option<ahp_types::state::AnnotationsState> {
+        None
+    }
+
     /// The changeset view of one `ahp-changeset:/…` channel, computed on
     /// first sight by the runtime's changeset engine. `None` = not found.
     fn changeset_state(&self, _channel: &str) -> Option<ahp_types::state::ChangesetState> {
