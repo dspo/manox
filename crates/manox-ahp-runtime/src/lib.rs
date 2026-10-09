@@ -16,11 +16,11 @@
 //! lets the adapter name no gateway type.
 
 pub mod ahp;
+pub mod base64_bytes;
 pub mod error;
 pub mod journal_query;
 pub mod paths;
 pub mod runtime_trait;
-pub mod translate;
 
 #[cfg(test)]
 pub(crate) mod test_support {

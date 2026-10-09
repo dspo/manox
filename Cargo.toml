@@ -5,7 +5,6 @@
 #                         sessions、tools + ext 扩展）
 #   - manox-agent:        host 层（Thread + LanguageModel + tools + SQLite 持久化
 #                         + MCP 接线）
-#   - manox-journal:      会话磁盘格式（journal v4 条目词汇）的叶子 crate
 #   - manox-ahp:          Agent Host Protocol 宿主层（频道、JSON-RPC、传输）
 #   - manox-ahp-runtime:  AHP 宿主背后的运行时半边（SessionRuntime 缝）
 #   - manox-session-core: 无上下文会话编排（会话存储 + AHP 运行时缝的实现）
@@ -29,7 +28,6 @@ members = [
 	"crates/manox-providers",
 	"crates/manox-session-core",
 	"crates/manox-napi",
-	"crates/manox-journal",
 	"crates/manox-ahp",
 	"crates/manox-ahp-runtime",
 	"crates/manox-terminal",
@@ -55,7 +53,6 @@ manox-agent = { path = "crates/manox-agent", default-features = false }
 supervisor = { path = "crates/supervisor" }
 manox-session-core = { path = "crates/manox-session-core", default-features = false } # see the manox-agent note above
 manox-workspace = { path = "crates/manox-workspace" }
-manox-journal = { path = "crates/manox-journal" }
 # manox-ahp —— AHP（Agent Host Protocol）宿主半边：JSON-RPC 路由、全局
 # serverSeq、通道注册与订阅、journal→AHP 动作翻译、x-manox 扩展声明面。
 # 前端（GPUI 桌面/远程客户端）一律经它对话；v2 面拆除后为唯一协议层。

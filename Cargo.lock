@@ -2415,7 +2415,6 @@ dependencies = [
  "libc",
  "manox-agent",
  "manox-harness",
- "manox-journal",
  "manox-providers",
  "parking_lot",
  "reqwest 0.12.28",
@@ -2452,7 +2451,6 @@ dependencies = [
  "axum",
  "chrono",
  "futures",
- "manox-journal",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2470,13 +2468,13 @@ dependencies = [
  "async-channel",
  "async-trait",
  "axum",
+ "base64",
  "chrono",
  "futures",
  "libc",
  "manox-agent",
  "manox-ahp",
  "manox-harness",
- "manox-journal",
  "manox-terminal",
  "parking_lot",
  "rmcp",
@@ -2525,16 +2523,6 @@ dependencies = [
  "tracing",
  "uuid",
  "xxhash-rust",
-]
-
-[[package]]
-name = "manox-journal"
-version = "0.1.0"
-dependencies = [
- "base64",
- "libc",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2601,7 +2589,6 @@ dependencies = [
  "manox-ahp",
  "manox-ahp-runtime",
  "manox-harness",
- "manox-journal",
  "manox-terminal",
  "manox-workspace",
  "parking_lot",

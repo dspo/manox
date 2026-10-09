@@ -1561,7 +1561,8 @@ async fn run_actor(
                     Ok(entry_id) => {
                         let mut request_id = state.plan_review_request_id.lock().unwrap();
                         if pending {
-                            *request_id = Some(manox_journal::plan_review_request_id(&entry_id));
+                            *request_id =
+                                Some(manox_harness::session::plan_review_request_id(&entry_id));
                         } else {
                             *request_id = None;
                         }

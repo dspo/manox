@@ -16,7 +16,6 @@ ahp-types.workspace = true
 # requires the same reducer code on both ends, and `ahp` is where the Rust port
 # lives. Client-facing SDK pieces of that crate are not used here.
 ahp.workspace = true
-manox-journal.workspace = true
 async-channel.workspace = true
 axum = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }

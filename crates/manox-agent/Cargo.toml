@@ -21,7 +21,6 @@ test-support = []
 
 [dependencies]
 manox-harness.workspace = true
-manox-journal.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait = "0.1"

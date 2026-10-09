@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+use crate::ahp::projection::Translator;
 use ahp_types::actions::{ActionOrigin, ChatPendingMessageRemovedAction, StateAction};
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
@@ -30,9 +31,8 @@ use manox_ahp::channels::terminal;
 use manox_ahp::channels::{chat, root, session};
 use manox_ahp::error::HostError;
 use manox_ahp::resource::ResourcePlane;
-use manox_ahp::translate::Translator;
-use manox_journal::JournalWireEntry;
-use manox_journal::JournalWireEvent;
+use manox_harness::session::SessionTreeEntry;
+use manox_harness::types::AgentMessage;
 use parking_lot::Mutex;
 use serde_json::Value;
 
@@ -144,14 +144,14 @@ impl Cursor {
 /// no other repair path), and both are lifecycle/state-transition rows, not
 /// per-chunk floods — dropping one leaves the task or agent frozen at its
 /// previous status for every live subscriber.
-fn is_state_bearing(event: &JournalWireEvent) -> bool {
+fn is_state_bearing(event: &SessionTreeEntry) -> bool {
     !matches!(
         event,
-        JournalWireEvent::AgentTextDelta { .. }
-            | JournalWireEvent::AgentThinkingDelta { .. }
-            | JournalWireEvent::ToolOutputChunk { .. }
-            | JournalWireEvent::Stop { .. }
-            | JournalWireEvent::SubagentChild { .. }
+        SessionTreeEntry::AgentTextDelta { .. }
+            | SessionTreeEntry::AgentThinkingDelta { .. }
+            | SessionTreeEntry::ToolOutputChunk { .. }
+            | SessionTreeEntry::Stop { .. }
+            | SessionTreeEntry::SubagentChild { .. }
     )
 }
 
@@ -510,11 +510,14 @@ impl RuntimeBackend {
                     if event.seq <= cursor.tail {
                         continue;
                     }
-                    let Some(entry) = crate::translate::wire_entry(event.seq, &event.entry) else {
-                        continue;
-                    };
-                    self.forward_entry(&host, &session_id, &mut translator, &entry)
-                        .await;
+                    self.forward_entry(
+                        &host,
+                        &session_id,
+                        &mut translator,
+                        event.seq,
+                        &event.entry,
+                    )
+                    .await;
                     cursor.accounted(event.seq);
                 }
                 Ok(manox_agent::engine::JournalFeed::Lagged(_)) => {
@@ -578,14 +581,10 @@ impl RuntimeBackend {
                     if record.seq < from {
                         continue;
                     }
-                    let Some(entry) = crate::translate::wire_entry(record.seq, &record.entry)
-                    else {
-                        continue;
-                    };
-                    if state_only && !is_state_bearing(&entry.event) {
+                    if state_only && !is_state_bearing(&record.entry) {
                         continue;
                     }
-                    self.forward_entry(host, session_id, translator, &entry)
+                    self.forward_entry(host, session_id, translator, record.seq, &record.entry)
                         .await;
                     cursor.accounted(record.seq);
                 }
@@ -608,7 +607,7 @@ impl RuntimeBackend {
         }
     }
 
-    /// Translate one journal row and publish everything it emits: lifecycle
+    /// Project one kernel record and publish everything it emits: lifecycle
     /// skips, the plan-review file ledger, the streamed parts, and the Q-face
     /// aggregate refresh after an assistant row.
     async fn forward_entry(
@@ -616,13 +615,14 @@ impl RuntimeBackend {
         host: &Arc<manox_ahp::Host>,
         session_id: &str,
         translator: &mut Translator,
-        entry: &JournalWireEntry,
+        seq: u64,
+        entry: &SessionTreeEntry,
     ) {
         // A finished turn is when the agent's file changes settle: recompute
         // the changeset so subscribers watch one stream instead of polling.
         // Detached — the scan is synchronous and cheap, but it must not stall
         // the journal pump.
-        if matches!(&entry.event, JournalWireEvent::TurnFinish { .. })
+        if matches!(entry, SessionTreeEntry::TurnFinish { .. })
             && let Some(backend) = self.me()
         {
             let session = session_id.to_string();
@@ -646,19 +646,24 @@ impl RuntimeBackend {
         // overwrites `active_turn` unconditionally, orphaning the streamed
         // parts. Skip both; the parts that follow address the client's turn
         // id.
-        if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "user")
-            || matches!(&entry.event, JournalWireEvent::TurnStart { .. })
+        if matches!(
+            entry,
+            SessionTreeEntry::Message {
+                message: AgentMessage::User { .. },
+                ..
+            }
+        ) || matches!(entry, SessionTreeEntry::TurnStart { .. })
         {
             return;
         }
         // Track the plan file behind each review card so the approve path
         // (which arrives as a bare `chat/inputCompleted`) can recover it
         // without re-reading the thread.
-        if let JournalWireEvent::PlanReview {
+        if let SessionTreeEntry::PlanReview {
             state, plan_file, ..
-        } = &entry.event
+        } = entry
         {
-            let request_id = manox_ahp::translate::plan_review_request_id(&entry.id);
+            let request_id = manox_harness::session::plan_review_request_id(entry.id());
             if state == "resolved" {
                 self.plan_reviews.lock().remove(&request_id);
             } else if let Some(plan_file) = plan_file {
@@ -681,11 +686,11 @@ impl RuntimeBackend {
             .get(session_id)
             .map(|seeded| seeded.thread_id.clone())
             .unwrap_or_else(|| session_id.to_string());
-        for emitted in translator.on_entry(session_id, &thread_id, entry) {
+        for emitted in translator.on_entry(session_id, &thread_id, seq, entry) {
             if matches!(&emitted.action, StateAction::ChatInputRequested(_)) {
                 tracing::info!(
                     session = %session_id,
-                    seq = entry.seq,
+                    seq,
                     "bridge: publishing chat/inputRequested"
                 );
             }
@@ -695,8 +700,13 @@ impl RuntimeBackend {
         // so the metrics channel stays a read model of the journal, not a
         // stream of per-call rows the client would have to re-aggregate (the
         // v2 `GetConversationInfo` contract, now push).
-        if matches!(&entry.event, JournalWireEvent::Message { role, .. } if role == "assistant")
-            && let Some(metrics) = self.server.conversation_metrics(session_id)
+        if matches!(
+            entry,
+            SessionTreeEntry::Message {
+                message: AgentMessage::Assistant { .. },
+                ..
+            }
+        ) && let Some(metrics) = self.server.conversation_metrics(session_id)
         {
             let channel = format!("{}{session_id}", manox_ahp::ext::channels::METRICS);
             host.publish(
@@ -2216,13 +2226,6 @@ async fn seed_directories(session_id: &str) -> Option<Vec<std::path::PathBuf>> {
             .map(std::path::PathBuf::from)
             .collect(),
     )
-}
-
-/// The journal's own last-entry vocabulary marker, re-exported for the tests'
-/// scripted journals.
-#[allow(dead_code)]
-pub(crate) fn is_journal_event(event: &JournalWireEvent) -> bool {
-    !matches!(event, JournalWireEvent::Metrics { .. })
 }
 
 /// The runtime's working directory (kept for the root config once it lands).

@@ -1,12 +1,11 @@
-//! Journal read services on the gateway: `PageHistory` (cold chain page,
-//! §D.2) and `GetConversationInfo` (the §E.3 Q-face fold), T4.
+//! Journal read services on the gateway: the §D.2 cold chain read and the
+//! `GetConversationInfo` §E.3 Q-face fold, T4.
 //!
 //! Both ride the kernel journal read seam (§C.3, `ThreadHandle::
 //! journal_snapshot`): a whole active-chain read answered by the engine
 //! actor. "Cold" here means the page fold never starts a provider turn and
 //! never touches the engine's live transcript mirror — it is a pure chain
-//! read (§D.2). `PageHistory` serves the §F.1 gap-repair and backwards
-//! paging pages; `GetConversationInfo` folds turns / messages / per-model
+//! read (§D.2); `GetConversationInfo` folds turns / messages / per-model
 //! usage (§E.3) and is cached by `(thread_id, cursor)` — recomputed only
 //! when the cursor advances.
 
@@ -14,10 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use manox_agent::thread::ThreadHandle;
-use manox_journal::{JournalWireEntry, ModelRef};
 use serde_json::{Value, json};
-
-use crate::translate::wire_entry;
 
 /// `(thread_id, cursor) → folded payload` (§E.3 cache).
 #[derive(Default)]
@@ -36,64 +32,6 @@ impl ConversationInfoCache {
         self.map.retain(|(t, _), _| t != thread_id);
         self.map.insert((thread_id.to_string(), cursor), value);
     }
-}
-
-/// One history page: `{records, has_more, cursor}`.
-///
-/// `through_seq` is the inclusive tail (`-1` = latest); `before_seq` is an
-/// exclusive upper bound for backwards paging; `max_messages` caps the page
-/// from the tail. The returned `records` are the §C.1 wire entries of the
-/// active chain slice — dense, oldest-first — and `cursor` is the tail seq
-/// of the page (the §F.1 repair contract: a non-empty page ends at its
-/// cursor). Kernel rows with no §C.2 wire vocabulary (`ActiveToolsChange`,
-/// `Custom`, `CustomMessage`) are skipped and do not open gaps (§F.1 rule 2
-/// tolerates unclaimed seqs).
-///
-/// GW6: the caller resolves the chain read — the live engine seam when it is
-/// materialized, [`cold_read`] (persisted-jsonl direct read — §D.2: the
-/// cold read does not materialize the engine) otherwise — and hands the
-/// resulting snapshot in; the page
-/// fold itself never touches the engine.
-pub fn page_history(
-    snapshot: manox_agent::engine::JournalSnapshotData,
-    through_seq: i64,
-    before_seq: Option<i64>,
-    max_messages: Option<u32>,
-) -> Result<Value, crate::error::RuntimeError> {
-    // Inclusive upper bound of the requested window.
-    let through = if through_seq < 0 {
-        snapshot.cursor
-    } else {
-        (through_seq as u64).min(snapshot.cursor)
-    };
-    let through = match before_seq {
-        Some(b) if b > 0 => through.min((b as u64).saturating_sub(1)),
-        // `before_seq <= 0` asks for entries strictly before the root / an
-        // inverted window: empty page, cursor pinned at the bound.
-        Some(_) => return Ok(json!({ "records": [], "has_more": false, "cursor": through })),
-        None => through,
-    };
-    let mut records: Vec<JournalWireEntry> = snapshot
-        .records
-        .iter()
-        .filter(|r| r.seq <= through)
-        .filter_map(|r| wire_entry(r.seq, &r.entry))
-        .collect();
-    let window = match max_messages {
-        Some(n) if (records.len() as u32) > n => {
-            let start = records.len() - n as usize;
-            records.split_off(start)
-        }
-        _ => std::mem::take(&mut records),
-    };
-    let has_more =
-        !window.is_empty() && (window.first().is_some_and(|r| r.seq > 0) || (!records.is_empty()));
-    let cursor = window.last().map(|r| r.seq).unwrap_or(through);
-    Ok(json!({
-        "records": window,
-        "has_more": has_more,
-        "cursor": cursor,
-    }))
 }
 
 /// GW6 (§D.2 cold read): the whole active chain straight off the persisted
@@ -235,7 +173,7 @@ fn fold_conversation_info(
             json!({
                 "provider": provider,
                 // Canonical wire identity (L8): `{provider}/{model}`.
-                "model": ModelRef::new(format!("{provider}/{model}")).0,
+                "model": format!("{provider}/{model}"),
                 "input": agg.input,
                 "output": agg.output,
                 "cacheRead": agg.cache_read,

@@ -11,18 +11,24 @@
 //! Layering (architecture doc `docs/ahp-v3-architecture.md`):
 //!
 //! ```text
-//! manox-journal (durable vocabulary)  ->  translate/ (entries -> AHP actions)
-//! manox-session-core (implements Backend: real sessions, side effects)
+//! manox-harness session jsonl (durable kernel records)
+//! manox-ahp-runtime (projects kernel records -> AHP actions, implements Backend)
 //! manox-ahp (this crate: protocol, channels, sequencer, transports)
 //! ```
+//!
+//! There is no intermediate wire vocabulary between the kernel's session
+//! records and the AHP action stream: the projection in
+//! `manox-ahp-runtime::ahp::projection` is the single mapping, and the
+//! reducers (host and client run the same code) fold its output.
 //!
 //! Invariants kept from the v2 protocol are listed in the architecture doc §C.
 //! Two of them shape this crate:
 //!
-//! - **The journal stays the only durable store.** Channel state here is a fold;
-//!   a fresh [`Host`] seeds it through [`Backend`] and then advances it with the
-//!   same action stream clients receive, so host and client reductions cannot
-//!   drift (the convergence gate in `tests/`).
+//! - **The kernel session store stays the only durable store.** Channel state
+//!   here is a fold; a fresh [`Host`] seeds it through [`Backend`] and then
+//!   advances it with the same action stream clients receive — both ends run
+//!   these same reducers, and the projection's deterministic-replay gate in
+//!   `manox-ahp-runtime` pins the stream they fold.
 //! - **One gateway per process.** A single [`Host`] owns the single `serverSeq`
 //!   domain; connections multiplex onto it.
 //!
@@ -39,7 +45,6 @@ pub mod jsonrpc;
 pub mod resource;
 pub mod router;
 pub mod sequencer;
-pub mod translate;
 pub mod transport;
 pub mod wire;
 
