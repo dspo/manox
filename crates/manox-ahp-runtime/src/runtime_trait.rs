@@ -18,7 +18,6 @@
 //! here is what lets the gateway be deleted without touching the adapter.
 
 use manox_ahp::error::HostError;
-use manox_journal::ModelRef;
 use serde_json::Value;
 
 use crate::error::RuntimeError;
@@ -66,7 +65,7 @@ pub struct SessionIntent {
     /// Project binding.
     pub project: Option<String>,
     /// Initial model, as the canonical `provider/model` reference (L8).
-    pub initial_model: Option<ModelRef>,
+    pub initial_model: Option<String>,
     /// Approval mode for the new session.
     pub approval_mode: Option<String>,
     /// Reasoning effort for the new session.
@@ -95,7 +94,7 @@ pub struct ForkIntent {
     /// Project binding for the fork.
     pub project: Option<String>,
     /// Initial model for the fork.
-    pub initial_model: Option<ModelRef>,
+    pub initial_model: Option<String>,
     /// Approval mode for the fork.
     pub approval_mode: Option<String>,
     /// Reasoning effort for the fork.

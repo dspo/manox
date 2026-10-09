@@ -37,7 +37,7 @@ pub(super) fn durable_journal_payload(ev: &ThreadEvent) -> Option<(String, serde
         // behalf without ever killing one another process is running.
         ThreadEvent::TurnStarted => (
             "turn_start".into(),
-            json!({ "owner": manox_journal::TurnOwner::for_current_process() }),
+            json!({ "owner": manox_harness::session::TurnOwner::for_current_process() }),
         ),
         ThreadEvent::TurnFinished {
             cancelled,

@@ -232,7 +232,7 @@ plan 模式与 plan 制品/评审；goal；compaction（journal 重写，AHP 无
 
 ### W2 域翻译与状态收敛（manox）
 
-- `translate/`：journal 条目 **38/38 全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/approval/browserSuite、compaction、分支/摘要）；projection 值 → 通道状态字段。
+- `projection.rs`（manox-ahp-runtime）：kernel 会话记录 **全射** → AHP 动作（消息、流式 delta 的 create-then-append、tool-call 生命周期、usage、lifecycle、title/activity、workingDirectories、config 承载 model/effort/approval/browserSuite、compaction、分支/摘要）；projection 值 → 通道状态字段。**2026-10-09 起无中间 wire 词汇**：`manox-journal`（§C.2 v2 遗产词汇 crate）已删除，投影输入即 kernel `SessionTreeEntry` 记录（#878）。
 - 审批面：`Approve` → `toolCallReady`(+`options[]`)/`toolCallConfirmed`（含 mid-execution 再确认、可编辑参数、result confirmation 三态的映射取舍）；`AskUserQuestion` → elicitation；`PlanVerdict` → x-manox-plan。
 - 副作用派发：`chat/turnStarted|pendingMessageSet|turnCancelled|toolCallConfirmed|inputCompleted|isArchivedChanged|workingDirectory*` 等 → 现有内核调用（原 27 个 note 的落点）。
 - x-manox 全线 + `resource*` 最小面（`resourceRead/Write/List/Delete` + ContentRef，落在会话工作目录围栏内，fail-closed）。

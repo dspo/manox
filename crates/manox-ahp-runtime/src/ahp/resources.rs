@@ -155,7 +155,7 @@ impl RuntimeResources {
         use ahp_types::commands::ContentEncoding;
         match encoding {
             ContentEncoding::Utf8 => Ok(data.as_bytes().to_vec()),
-            ContentEncoding::Base64 => manox_journal::base64_bytes::decode(data)
+            ContentEncoding::Base64 => crate::base64_bytes::decode(data)
                 .map_err(|error| HostError::InvalidParams(format!("bad base64: {error}"))),
         }
     }
@@ -191,7 +191,7 @@ impl ResourcePlane for RuntimeResources {
                 })
             }
             _ => Ok(ResourceReadResult {
-                data: manox_journal::base64_bytes::encode(&bytes),
+                data: crate::base64_bytes::encode(&bytes),
                 encoding: ahp_types::commands::ContentEncoding::Base64,
                 content_type: content_type(&path),
             }),

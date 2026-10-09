@@ -1,50 +1,50 @@
-//! Journal entries → AHP actions.
+//! Kernel session records → AHP actions.
 //!
-//! The durable journal is the only authority (§C, L3/L4); this module turns each
-//! accepted entry into the AHP actions that carry the same fact, paired with the
-//! channel they belong on. [`crate::translate::target_of`] fixes an entry's
-//! *primary* channel and is the compile-time totality gate; an arm here may add a
-//! follow-up action on a second channel when the protocol mirrors one fact in two
-//! places — a tool confirmation is a chat state machine *and* a session-level
-//! `inputNeeded` entry.
+//! The kernel's jsonl session store is the only durable authority (§C, L3/L4);
+//! this module is the single projection from its [`SessionTreeEntry`] records
+//! to the AHP actions that carry the same facts, paired with the channel they
+//! belong on. There is no intermediate wire vocabulary: the record's own
+//! fields drive every arm, so a new kernel variant fails to compile here —
+//! the moment the AHP mapping must state where it belongs.
 //!
 //! # Shape of the mapping
 //!
-//! - **Transcript rows** (`message`, `uiNote`, `custom`, `customMessage`) become
-//!   ordered response parts. A `user` row rides the next `chat/turnStarted` —
-//!   `_meta["x-manox"].originRpc` is what retires the client's optimistic echo
-//!   (L7) — and is visible as a queued pending message until then, so no durable
-//!   row is ever invisible.
-//! - **Streaming** follows AHP's create-then-append contract: the first delta of
-//!   a run emits `chat/responsePart` creating an empty markdown / reasoning part,
-//!   later deltas append with `chat/delta` / `chat/reasoning`. A run is
+//! - **Transcript rows** (`Message` / `UiNote` / `Custom` / `CustomMessage`)
+//!   become ordered response parts. A `user` row rides the next
+//!   `chat/turnStarted` — `_meta["x-manox"].originRpc` is what retires the
+//!   client's optimistic echo (L7) — and is visible as a queued pending
+//!   message until then, so no durable row is ever invisible.
+//! - **Streaming** follows AHP's create-then-append contract: the first delta
+//!   of a run emits `chat/responsePart` creating an empty markdown / reasoning
+//!   part, later deltas append with `chat/delta` / `chat/reasoning`. A run is
 //!   *contiguous* text (or thinking): the other stream, a tool call, a
 //!   notification or a turn boundary closes it, so the next delta opens a new
 //!   part. That state machine is why this type exists.
-//! - **Tool calls** map the journal's status strings onto AHP's lifecycle
+//! - **Tool calls** map the kernel's status strings onto AHP's lifecycle
 //!   ([`status_phase`]); approvals drive the `pending-confirmation ⇄ running /
-//!   cancelled` transitions. Fail-closed approval policy is the runtime's — this
-//!   is translation only.
+//!   cancelled` transitions. Fail-closed approval policy is the runtime's —
+//!   this is projection only.
 //! - **What AHP cannot represent** goes to the x-manox surface declared in
-//!   [`crate::ext`] (extension channels for plan / work / metrics, extension
-//!   actions on standard channels for session facts with no field — pin, label,
-//!   leaf cursor), or, when the fact belongs in the transcript's order, to a
-//!   `systemNotification` response part. Each arm names which route it takes.
+//!   [`manox_ahp::ext`] (extension channels for plan / work / metrics,
+//!   extension actions on standard channels for session facts with no field —
+//!   pin, label, leaf cursor), or, when the fact belongs in the transcript's
+//!   order, to a `systemNotification` response part. Each arm names which
+//!   route it takes.
 //!
 //! # Determinism
 //!
-//! Every identity minted here derives from a journal entry id: turns
+//! Every identity minted here derives from a kernel entry id: turns
 //! (`t-<turnStart id>`), parts (`p-<first delta of the run id>`), pending
-//! messages (`m-<row id>`). Replaying the same journal yields the same ids in the
-//! same order — L10's `snapshot == fold(replay)`, and why a restarted host can
-//! seed from one fold and keep advancing it.
+//! messages (`m-<row id>`). Replaying the same records yields the same ids in
+//! the same order — L10's `snapshot == fold(replay)`, and why a restarted host
+//! can seed from one fold and keep advancing it.
 //!
 //! # Duplicated facts
 //!
 //! Streaming deltas *and* the settled assistant row both carry the reply text;
-//! `ToolCall{success}` and the following `ToolResult` both end a call. The rule is
-//! first-writer-wins, the other silent, so the fold holds each fact once. The arms
-//! say which.
+//! `ToolCall{success}` and the following `ToolResult` both end a call. The rule
+//! is first-writer-wins, the other silent, so the fold holds each fact once.
+//! The arms say which.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -70,11 +70,11 @@ use ahp_types::state::{
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
     ToolCallResult, ToolCallState, ToolResultContent, ToolResultTextContent, UsageInfo,
 };
-use manox_journal::{JournalWireEntry, JournalWireEvent, UsagePayload, plan_review_request_id};
+use manox_harness::session::{SessionTreeEntry, plan_review_request_id};
+use manox_harness::types::{AgentMessage, ContentBlock};
 use serde_json::{Value, json};
 
-use crate::ext;
-use crate::translate::Target;
+use manox_ahp::ext;
 
 /// Session config value keys this translator writes.
 ///
@@ -93,6 +93,142 @@ pub mod config_keys {
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
     pub const WORKING_DIRECTORY: &str = "workingDirectory";
+}
+
+/// The journal-row facts the projection mints identities from: one kernel
+/// record's chain depth, entry id, and append timestamp. Built per record by
+/// [`Translator::on_entry`]; the action builders take it so their bodies stay
+/// about the protocol, not the record's column list.
+pub(crate) struct Envelope {
+    pub seq: u64,
+    pub id: String,
+    pub timestamp: String,
+}
+
+/// One assistant row's token usage, decoded from the kernel's usage stats.
+pub(crate) struct UsageRow {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub reasoning: u64,
+}
+
+/// Kernel content blocks serialize through the wire-opaque storage shape
+/// (§C.2); an unspecifiable block is dropped rather than failing the frame.
+fn content_blocks(blocks: &[ContentBlock]) -> Vec<Value> {
+    blocks
+        .iter()
+        .filter_map(|b| {
+            serde_json::to_value(b)
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "content block dropped (serialization failure)");
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// The full kernel JSON object of a non-transcript message (wire-opaque).
+fn message_value(message: &AgentMessage) -> Vec<Value> {
+    match serde_json::to_value(message) {
+        Ok(v) => vec![v],
+        Err(e) => {
+            tracing::error!(error = %e, "message serialization failed");
+            vec![serde_json::json!({
+                "type": "error",
+                "text": format!("message serialization failed: {e}"),
+            })]
+        }
+    }
+}
+
+/// The channel family a kernel record publishes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// `ahp-chat:/<id>` — transcript rows, streaming, tool calls, approvals.
+    Chat,
+    /// `ahp-session:/<id>` — title, working directories, config, catalog.
+    Session,
+    /// `x-manox-plan:/<chat-id>` — plan mode, plan document.
+    Plan,
+    /// `x-manox-work:/<session-id>` — goal, background work, sub-agents, suites.
+    Work,
+    /// `x-manox-metrics:/<chat-id>` — aggregated conversation metrics.
+    Metrics,
+    /// `x-manox-thread:/<session-id>` — pin, label, session info, leaf cursor.
+    ///
+    /// These rows have no AHP-native slot and only fold on an extension
+    /// channel: emitted on `ahp-session:/<id>` they are `StateAction::Unknown`
+    /// to the session reducer, land in the fold's session bucket, and are
+    /// unreachable from the extension state and its baselines.
+    Thread,
+}
+
+impl Target {
+    /// The channel URI this target resolves to, given the owning chat/session.
+    fn uri(self, chat_id: &str, session_id: &str) -> String {
+        match self {
+            Self::Chat => manox_ahp::channels::chat::uri(chat_id),
+            Self::Session => manox_ahp::channels::session::uri(session_id),
+            Self::Plan => format!("{}{chat_id}", ext::channels::PLAN),
+            Self::Work => format!("{}{session_id}", ext::channels::WORK),
+            Self::Metrics => format!("{}{chat_id}", ext::channels::METRICS),
+            Self::Thread => format!("{}{session_id}", ext::channels::THREAD),
+        }
+    }
+}
+
+/// Which channel a kernel record lands on — the compile-time totality gate:
+/// a kernel variant added without deciding where it lands is a compile error.
+pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
+    use SessionTreeEntry as E;
+    match entry {
+        // ── transcript ───────────────────────────────────────────────
+        E::Message { .. } | E::UiNote { .. } | E::Custom { .. } | E::CustomMessage { .. } => {
+            Target::Chat
+        }
+        // ── lifecycle ────────────────────────────────────────────────
+        E::TurnStart { .. } | E::TurnFinish { .. } | E::Stop { .. } | E::Retry { .. } => {
+            Target::Chat
+        }
+        E::ErrorEvent { .. } => Target::Chat,
+        // ── streaming / tool activity ────────────────────────────────
+        E::AgentTextDelta { .. }
+        | E::AgentThinkingDelta { .. }
+        | E::ToolCall { .. }
+        | E::ToolResult { .. }
+        | E::ToolOutputChunk { .. }
+        | E::SubagentChild { .. } => Target::Chat,
+        E::SubagentProgress { .. } => Target::Work,
+        // ── session state ────────────────────────────────────────────
+        E::ModelChange { .. }
+        | E::CwdChange { .. }
+        | E::ProjectChange { .. }
+        | E::PermissionModeChange { .. }
+        | E::ThinkingLevelChange { .. }
+        | E::Title { .. }
+        // `PinnedArchived` lands here for its native archived half; the
+        // extension pin half re-targets the thread channel at its emit site.
+        | E::PinnedArchived { .. } => Target::Session,
+        // Thread rows: the extension face is their only face — on the session
+        // channel no fold ever consumed them (see [`Target::Thread`]).
+        E::Label { .. } | E::SessionInfo { .. } | E::Leaf { .. } => Target::Thread,
+        // ── plan ─────────────────────────────────────────────────────
+        E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
+        // ── extension work surface ───────────────────────────────────
+        E::Goal { .. } | E::BrowserSuites { .. } | E::BackgroundTask { .. } => Target::Work,
+        E::ActiveToolsChange { .. } => Target::Work,
+        // ── approvals / questions / plan review ride the chat's tool-call +
+        //    input state (the plan-review card is a `chat/inputRequested`) ──
+        E::Approval { .. } | E::Question { .. } | E::PlanReview { .. } => Target::Chat,
+        // ── compaction and branch summaries surface in the transcript ──
+        E::Compaction { .. } | E::CompactionStarted { .. } | E::BranchSummary { .. } => {
+            Target::Chat
+        }
+        // ── metrics ──────────────────────────────────────────────────
+        E::Metrics { .. } => Target::Metrics,
+    }
 }
 
 /// One action plus the channel it must be published on.
@@ -117,7 +253,7 @@ impl Emitted {
     /// Derived rather than stored: the tag *is* what serialization emits, so a
     /// stored copy could only drift from the action it labels.
     pub fn tag(&self) -> String {
-        crate::wire::action_tag(&self.action)
+        manox_ahp::wire::action_tag(&self.action)
     }
 }
 
@@ -333,15 +469,69 @@ pub struct Translator {
 
 /// One transcript row's decoded fields.
 ///
-/// Grouped rather than passed positionally: the row vocabulary is the journal's,
+/// Grouped rather than passed positionally: the row vocabulary is the kernel's,
 /// and a struct keeps the action builder's signature about its job (build the
-/// actions for one row) instead of about the journal's column list.
+/// actions for one row) instead of about the kernel's column list.
 struct MessageRow<'a> {
     role: &'a str,
     content: &'a [Value],
-    usage: Option<&'a UsagePayload>,
+    usage: Option<&'a UsageRow>,
     origin_rpc: Option<&'a str>,
     display: Option<bool>,
+}
+
+/// One transcript row decoded from the kernel's [`AgentMessage`] shape —
+/// the wire-opaque content blocks serialized once, the usage flattened, the
+/// kernel-extension display flag surfaced.
+struct DecodedMessage {
+    role: String,
+    content: Vec<Value>,
+    usage: Option<UsageRow>,
+    origin_rpc: Option<String>,
+    display: Option<bool>,
+}
+
+fn decode_message(message: &AgentMessage, origin_rpc: Option<&str>) -> DecodedMessage {
+    match message {
+        AgentMessage::User { content, .. } => DecodedMessage {
+            role: "user".to_string(),
+            content: content_blocks(content),
+            usage: None,
+            origin_rpc: origin_rpc.map(str::to_string),
+            display: None,
+        },
+        AgentMessage::Assistant { content, usage, .. } => DecodedMessage {
+            role: "assistant".to_string(),
+            content: content_blocks(content),
+            usage: Some(UsageRow {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                cache_read: usage.cache_read_input_tokens,
+                cache_write: usage.cache_creation_input_tokens,
+                reasoning: usage.reasoning_tokens.unwrap_or(0),
+            }),
+            origin_rpc: None,
+            display: None,
+        },
+        AgentMessage::ToolResult { .. } | AgentMessage::BashExecution { .. } => DecodedMessage {
+            role: "tool".to_string(),
+            content: message_value(message),
+            usage: None,
+            origin_rpc: None,
+            display: None,
+        },
+        // Kernel-extension message roles ride the generic transcript row with
+        // the kernel JSON shape verbatim (wire-opaque); the kernel's
+        // UI-visibility flag rides along so clients can filter hidden rows
+        // (the model context is unaffected — the row is here either way).
+        AgentMessage::Custom { display, .. } => DecodedMessage {
+            role: "custom".to_string(),
+            content: message_value(message),
+            usage: None,
+            origin_rpc: None,
+            display: Some(*display),
+        },
+    }
 }
 
 /// One elicitation row's decoded fields (see [`MessageRow`]).
@@ -479,91 +669,109 @@ impl Translator {
         self.open = Some(turn);
     }
 
-    /// Translate one accepted journal entry into the actions it produces.
+    /// Project one accepted kernel record into the actions it produces.
     ///
     /// An empty result is a decision, not an oversight, and each case is named
-    /// where it arises: a `tool` transcript row whose `toolResult` already settled
-    /// the call, a verdict for a turn that closed, an idle `stop` with nothing
-    /// running. `tests/translation_convergence.rs` drives every vocabulary kind and
-    /// asserts each one reaches a channel.
+    /// where it arises: a `tool` transcript row whose `ToolResult` already
+    /// settled the call, a verdict for a turn that closed, an idle `stop` with
+    /// nothing running. The projection tests drive every vocabulary kind and
+    /// assert each one reaches a channel.
     pub fn on_entry(
         &mut self,
         chat_id: &str,
         session_id: &str,
-        entry: &JournalWireEntry,
+        seq: u64,
+        entry: &SessionTreeEntry,
     ) -> Vec<Emitted> {
-        let at = crate::translate::target_of(&entry.event).uri(chat_id, session_id);
+        let row = Envelope {
+            seq,
+            id: entry.id().to_string(),
+            timestamp: entry
+                .timestamp()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        };
+        let at = target_of(entry).uri(chat_id, session_id);
         let chat = Target::Chat.uri(chat_id, session_id);
         let session = Target::Session.uri(chat_id, session_id);
         let thread = Target::Thread.uri(chat_id, session_id);
         let plan = Target::Plan.uri(chat_id, session_id);
         let mut out = Vec::new();
-        match &entry.event {
+        match entry {
             // ── transcript ───────────────────────────────────────────────
-            JournalWireEvent::Message {
-                role,
-                content,
-                usage,
-                origin_rpc,
-                display,
-            } => self.on_message(
-                &chat,
-                entry,
-                MessageRow {
-                    role,
-                    content,
-                    usage: usage.as_ref(),
-                    origin_rpc: origin_rpc.as_deref(),
-                    display: *display,
-                },
-                &mut out,
-            ),
-            JournalWireEvent::UiNote { kind, data } => {
-                let text = note_text(data).unwrap_or_else(|| kind.clone());
-                self.push_note(
+            SessionTreeEntry::Message {
+                message, origin, ..
+            } => {
+                let decoded = decode_message(message, origin.as_deref());
+                self.on_message(
                     &chat,
-                    entry,
-                    text,
-                    json!({"uiNote": {"kind": kind, "data": data}}),
+                    &row,
+                    MessageRow {
+                        role: decoded.role.as_str(),
+                        content: &decoded.content,
+                        usage: decoded.usage.as_ref(),
+                        origin_rpc: decoded.origin_rpc.as_deref(),
+                        display: decoded.display,
+                    },
                     &mut out,
                 );
             }
-            JournalWireEvent::Custom { custom_type, data } => {
-                let text = note_text(data).unwrap_or_else(|| custom_type.clone());
+            SessionTreeEntry::UiNote { note, .. } => {
+                let kind = note
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("notice")
+                    .to_string();
+                let text = note_text(note).unwrap_or_else(|| kind.clone());
                 self.push_note(
                     &chat,
-                    entry,
+                    &row,
+                    text,
+                    json!({"uiNote": {"kind": kind, "data": note}}),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } => {
+                let data = data.clone().unwrap_or(Value::Null);
+                let text = note_text(&data).unwrap_or_else(|| custom_type.clone());
+                self.push_note(
+                    &chat,
+                    &row,
                     text,
                     json!({"custom": {"customType": custom_type, "data": data}}),
                     &mut out,
                 );
             }
-            JournalWireEvent::CustomMessage {
+            SessionTreeEntry::CustomMessage {
                 custom_type,
                 content,
                 display,
+                ..
             } => {
-                let text = blocks_text(content);
+                let blocks = content_blocks(content);
+                let text = blocks_text(&blocks);
                 let fallback = custom_type.clone();
                 let body = if text.is_empty() { fallback } else { text };
                 self.push_note(
                     &chat,
-                    entry,
+                    &row,
                     body,
                     json!({"customMessage": {
                         "customType": custom_type,
                         "display": display,
-                        "blocks": content,
+                        "blocks": blocks,
                     }}),
                     &mut out,
                 );
             }
             // ── turn lifecycle ───────────────────────────────────────────
-            JournalWireEvent::TurnStart { .. } => self.on_turn_start(&chat, entry, &mut out),
-            JournalWireEvent::TurnFinish {
+            SessionTreeEntry::TurnStart { .. } => self.on_turn_start(&chat, &row, &mut out),
+            SessionTreeEntry::TurnFinish {
                 cancelled,
                 failed,
                 stranded_steer_ids,
+                ..
             } => {
                 let outcome = if *failed {
                     Outcome::Failed(ErrorInfo {
@@ -584,20 +792,20 @@ impl Translator {
                 } else {
                     Outcome::Complete
                 };
-                self.close_turn(&chat, entry, outcome, &mut out);
+                self.close_turn(&chat, &row, outcome, &mut out);
             }
             // A `stop` row is per-assistant-message metadata — the model's own
             // stop reason (end_turn / tool_use / max_tokens / refusal /
             // cancelled) — never turn lifecycle: `tool_use` and `max_tokens`
             // are the loop's continue edges (the tool / continuation rows
-            // follow them), and a turn end always carries its `turnFinish`
+            // follow them), and a turn end always carries its `TurnFinish`
             // right behind the last stop. Closing the turn here split every
             // agentic turn per tool round and minted a "stopped: …" notice
             // per round.
-            JournalWireEvent::Stop { .. } => {}
-            JournalWireEvent::Error { message } => self.close_turn(
+            SessionTreeEntry::Stop { .. } => {}
+            SessionTreeEntry::ErrorEvent { message, .. } => self.close_turn(
                 &chat,
-                entry,
+                &row,
                 Outcome::Failed(ErrorInfo {
                     error_type: "agent_error".to_string(),
                     message: message.clone(),
@@ -606,18 +814,26 @@ impl Translator {
                 }),
                 &mut out,
             ),
-            JournalWireEvent::Retry {
+            SessionTreeEntry::Retry {
                 attempt,
                 max_attempts,
                 delay_secs,
                 reason,
+                detail,
+                ..
             } => {
                 // AHP has no retry concept: a provider retry is harness chatter
                 // inside a live turn, so it surfaces as a notification part in the
-                // transcript's order, with the counters in `_meta`.
+                // transcript's order, with the counters in `_meta`. The kernel's
+                // diagnostic `detail` folds into the reason; the note carries one
+                // string.
+                let reason = match detail {
+                    Some(d) if !d.is_empty() => format!("{reason}: {d}"),
+                    _ => reason.clone(),
+                };
                 self.push_note(
                     &chat,
-                    entry,
+                    &row,
                     format!("retrying ({attempt}/{max_attempts}) in {delay_secs}s: {reason}"),
                     json!({"retry": {
                         "attempt": attempt,
@@ -629,71 +845,77 @@ impl Translator {
                 );
             }
             // ── streaming ────────────────────────────────────────────────
-            JournalWireEvent::AgentTextDelta { s } => {
-                self.on_delta(&chat, entry, Run::Text, s, &mut out);
+            SessionTreeEntry::AgentTextDelta { delta, .. } => {
+                self.on_delta(&chat, &row, Run::Text, delta, &mut out);
             }
-            JournalWireEvent::AgentThinkingDelta { s } => {
-                self.on_delta(&chat, entry, Run::Thinking, s, &mut out);
+            SessionTreeEntry::AgentThinkingDelta { delta, .. } => {
+                self.on_delta(&chat, &row, Run::Thinking, delta, &mut out);
             }
             // ── tool activity ────────────────────────────────────────────
-            JournalWireEvent::ToolCall {
+            SessionTreeEntry::ToolCall {
                 call_id,
                 name,
                 title,
                 status,
                 input,
-            } => self.on_tool_call(&chat, entry, call_id, name, title, status, input, &mut out),
-            JournalWireEvent::ToolResult {
+                ..
+            } => {
+                let input = input.clone().unwrap_or(Value::Null);
+                self.on_tool_call(&chat, &row, call_id, name, title, status, &input, &mut out);
+            }
+            SessionTreeEntry::ToolResult {
                 call_id,
                 output,
                 is_error,
-            } => self.on_tool_result(&chat, entry, call_id, output, *is_error, &mut out),
-            JournalWireEvent::ToolOutputChunk { call_id, chunk } => {
-                self.on_tool_output(&chat, entry, call_id, chunk, &mut out);
+                ..
+            } => self.on_tool_result(&chat, &row, call_id, output, *is_error, &mut out),
+            SessionTreeEntry::ToolOutputChunk { call_id, chunk, .. } => {
+                self.on_tool_output(&chat, &row, call_id, chunk, &mut out);
             }
             // ── adjudications ────────────────────────────────────────────
-            JournalWireEvent::Approval {
+            SessionTreeEntry::Approval {
                 kind,
                 auth_id,
-                tool_name,
-                tool_call_id,
-                verdict,
-                reason,
-            } => self.on_approval(
-                &chat,
-                &session,
-                entry,
-                kind,
-                auth_id,
-                tool_name.as_deref(),
-                tool_call_id.as_deref(),
-                verdict.as_deref(),
-                reason.as_deref(),
-                &mut out,
-            ),
-            JournalWireEvent::Question {
-                kind,
-                auth_id,
-                tool_name,
-                verdict,
-                reason,
-                input,
+                payload,
                 ..
-            } => self.on_question(
-                &chat,
-                entry,
-                AskRow {
+            } => {
+                let field = |key: &str| payload.get(key).and_then(|v| v.as_str());
+                self.on_approval(
+                    &chat,
+                    &session,
+                    &row,
                     kind,
                     auth_id,
-                    tool_name: tool_name.as_deref(),
-                    verdict: verdict.as_deref(),
-                    reason: reason.as_deref(),
-                    input: input.as_ref(),
-                },
-                &mut out,
-            ),
+                    field("toolName"),
+                    field("toolCallId"),
+                    field("verdict"),
+                    field("reason"),
+                    &mut out,
+                );
+            }
+            SessionTreeEntry::Question {
+                kind,
+                auth_id,
+                payload,
+                ..
+            } => {
+                let field = |key: &str| payload.get(key).and_then(|v| v.as_str());
+                self.on_question(
+                    &chat,
+                    &row,
+                    AskRow {
+                        kind,
+                        auth_id,
+                        tool_name: field("toolName"),
+                        verdict: field("verdict"),
+                        reason: field("reason"),
+                        input: payload.get("input"),
+                    },
+                    &mut out,
+                );
+            }
             // ── sub-agent activity ───────────────────────────────────────
-            JournalWireEvent::SubagentChild { .. } => {
+            SessionTreeEntry::SubagentChild { .. } => {
                 // One child session's lifecycle event, in the parent
                 // transcript's order — and nothing to push for it: the
                 // sub-agent tree is `x-manox-work` state (the Progress rows
@@ -701,12 +923,13 @@ impl Translator {
                 // transcript with a card per spawn/exit the moment the bridge
                 // streamed again.
             }
-            JournalWireEvent::SubagentProgress {
+            SessionTreeEntry::SubagentProgress {
                 agent_id,
                 agent_type,
                 tool_uses,
                 latest_activity,
                 status,
+                ..
             } => out.push(Emitted::new(
                 &at,
                 extension_action(
@@ -716,22 +939,27 @@ impl Translator {
                            "status": status}),
                 ),
             )),
-            JournalWireEvent::ActiveToolsChange { tools } => out.push(Emitted::new(
+            SessionTreeEntry::ActiveToolsChange {
+                active_tool_names, ..
+            } => out.push(Emitted::new(
                 &at,
-                extension_action(ext::actions::WORK_ACTIVE_TOOLS, json!({"tools": tools})),
+                extension_action(
+                    ext::actions::WORK_ACTIVE_TOOLS,
+                    json!({"tools": active_tool_names}),
+                ),
             )),
             // ── session state ────────────────────────────────────────────
-            JournalWireEvent::Title { title } => out.push(Emitted::new(
+            SessionTreeEntry::Title { title, .. } => out.push(Emitted::new(
                 &session,
                 StateAction::SessionTitleChanged(SessionTitleChangedAction {
                     title: title.clone(),
                 }),
             )),
-            JournalWireEvent::CwdChange { path } => {
+            SessionTreeEntry::CwdChange { cwd, .. } => {
                 // AHP models working directories as a *granted set*; the effective
                 // directory is not a protocol field, so the grant rides the
                 // membership action and the effective value rides the config model.
-                let directory = file_uri(path);
+                let directory = file_uri(cwd);
                 let fresh = !self.granted.iter().any(|seen| seen == &directory);
                 if fresh {
                     self.granted.push(directory.clone());
@@ -744,26 +972,31 @@ impl Translator {
                 }
                 out.push(Emitted::new(
                     &session,
-                    config_changed(json!({config_keys::WORKING_DIRECTORY: path})),
+                    config_changed(json!({config_keys::WORKING_DIRECTORY: cwd})),
                 ));
             }
-            JournalWireEvent::ProjectChange { path } => out.push(Emitted::new(
+            SessionTreeEntry::ProjectChange { path, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::PROJECT: path})),
             )),
-            JournalWireEvent::ModelChange { to, .. } => out.push(Emitted::new(
+            SessionTreeEntry::ModelChange {
+                provider, model_id, ..
+            } => out.push(Emitted::new(
                 &session,
-                config_changed(json!({config_keys::MODEL: to.0.clone()})),
+                // Canonical `{provider}/{model}` on the wire (L8).
+                config_changed(json!({config_keys::MODEL: format!("{provider}/{model_id}")})),
             )),
-            JournalWireEvent::ReasoningEffortChange { effort } => out.push(Emitted::new(
+            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => out.push(Emitted::new(
                 &session,
-                config_changed(json!({config_keys::REASONING_EFFORT: effort})),
+                config_changed(json!({config_keys::REASONING_EFFORT: thinking_level})),
             )),
-            JournalWireEvent::PermissionModeChange { mode } => out.push(Emitted::new(
+            SessionTreeEntry::PermissionModeChange { mode, .. } => out.push(Emitted::new(
                 &session,
                 config_changed(json!({config_keys::APPROVAL_MODE: mode})),
             )),
-            JournalWireEvent::PinnedArchived { pinned, archived } => {
+            SessionTreeEntry::PinnedArchived {
+                pinned, archived, ..
+            } => {
                 out.push(Emitted::new(
                     &session,
                     StateAction::SessionIsArchivedChanged(SessionIsArchivedChangedAction {
@@ -779,46 +1012,60 @@ impl Translator {
                     extension_action(ext::actions::PINNED_CHANGED, json!({"pinned": pinned})),
                 ));
             }
-            JournalWireEvent::Label { label } => out.push(Emitted::new(
+            SessionTreeEntry::Label { label, .. } => out.push(Emitted::new(
                 &thread,
-                extension_action(ext::actions::LABEL_CHANGED, json!({"label": label})),
+                // A `None` label clears; the action payload names the string
+                // (empty = cleared), matching the extension fold's read.
+                extension_action(
+                    ext::actions::LABEL_CHANGED,
+                    json!({"label": label.clone().unwrap_or_default()}),
+                ),
             )),
-            JournalWireEvent::SessionInfo { data } => out.push(Emitted::new(
+            SessionTreeEntry::SessionInfo { name, .. } => out.push(Emitted::new(
                 &thread,
                 // The row rides nested under `data`: the fold reads that key,
                 // and a bare flatten would scatter the row's fields across the
                 // action envelope where no arm looks for them.
-                extension_action(ext::actions::SESSION_INFO_CHANGED, json!({"data": data})),
+                extension_action(
+                    ext::actions::SESSION_INFO_CHANGED,
+                    json!({"data": {"name": name}}),
+                ),
             )),
-            JournalWireEvent::Leaf { target_id } => out.push(Emitted::new(
+            SessionTreeEntry::Leaf { target_id, .. } => out.push(Emitted::new(
                 &thread,
-                extension_action(ext::actions::LEAF_CHANGED, json!({"targetId": target_id})),
+                // A `None` target resets the leaf to the root; the action
+                // payload names the target id (empty = root reset).
+                extension_action(
+                    ext::actions::LEAF_CHANGED,
+                    json!({"targetId": target_id.clone().unwrap_or_default()}),
+                ),
             )),
             // ── plan ─────────────────────────────────────────────────────
-            JournalWireEvent::PlanModeChange { enabled } => out.push(Emitted::new(
+            SessionTreeEntry::PlanModeChange { enabled, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(
                     ext::actions::PLAN_MODE_CHANGED,
                     json!({"enabled": enabled, "pending": false}),
                 ),
             )),
-            JournalWireEvent::PlanModeRequest { enabled } => out.push(Emitted::new(
+            SessionTreeEntry::PlanModeRequest { enabled, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(
                     ext::actions::PLAN_MODE_CHANGED,
                     json!({"enabled": enabled, "pending": true}),
                 ),
             )),
-            JournalWireEvent::PlanUpdate { snapshot } => out.push(Emitted::new(
+            SessionTreeEntry::PlanUpdate { snapshot, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::PLAN_CHANGED, json!({"snapshot": snapshot})),
             )),
-            JournalWireEvent::PlanReview {
+            SessionTreeEntry::PlanReview {
                 state,
                 plan_file,
                 title,
                 content,
                 request_id: row_request_id,
+                ..
             } => {
                 // The review's two edges: a verdict is owed, or one landed.
                 // The proposal opens VS Code's native plan-review card (a
@@ -829,9 +1076,9 @@ impl Translator {
                 // already archived the request.
                 if state == "resolved" {
                     // The settled edge is self-describing on rows the engine
-                    // wrote after the field existed; translator memory covers
+                    // wrote after the field existed; projector memory covers
                     // rows written before it (the proposal replayed in this
-                    // translator's own lifetime). A resolution neither names
+                    // projector's own lifetime). A resolution neither names
                     // nor is remembered for cannot name its request — skip
                     // rather than emit a verdict no client can correlate.
                     let request_id = row_request_id.clone().or_else(|| self.plan_review.take());
@@ -869,12 +1116,12 @@ impl Translator {
                         ));
                     } else {
                         tracing::debug!(
-                            seq = entry.seq,
+                            seq = row.seq,
                             "plan review resolved with no correlatable request id; no settlement emitted"
                         );
                     }
                 } else {
-                    let request_id = plan_review_request_id(&entry.id);
+                    let request_id = plan_review_request_id(&row.id);
                     self.plan_review = Some(request_id.clone());
                     // The plan block rides the `x-manox-plan` channel, which is
                     // the one place it can survive: AHP's `ChatInputRequest` has
@@ -906,15 +1153,15 @@ impl Translator {
                 }
             }
             // ── work ─────────────────────────────────────────────────────
-            JournalWireEvent::Goal { goal } => out.push(Emitted::new(
+            SessionTreeEntry::Goal { goal, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::WORK_GOAL_CHANGED, json!({"goal": goal})),
             )),
-            JournalWireEvent::BrowserSuites { suites } => out.push(Emitted::new(
+            SessionTreeEntry::BrowserSuites { suites, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(ext::actions::WORK_BROWSER_SUITES, json!({"suites": suites})),
             )),
-            JournalWireEvent::BackgroundTask { snapshot } => out.push(Emitted::new(
+            SessionTreeEntry::BackgroundTask { snapshot, .. } => out.push(Emitted::new(
                 &at,
                 extension_action(
                     ext::actions::WORK_BACKGROUND_TASKS,
@@ -922,25 +1169,33 @@ impl Translator {
                 ),
             )),
             // ── metrics ──────────────────────────────────────────────────
-            JournalWireEvent::Metrics { kind, data } => out.push(Emitted::new(
+            SessionTreeEntry::Metrics {
+                metric_type, data, ..
+            } => out.push(Emitted::new(
                 &at,
                 extension_action(
                     ext::actions::METRICS_CHANGED,
-                    json!({"kind": kind, "data": data}),
+                    json!({"kind": metric_type, "data": data}),
                 ),
             )),
             // ── compaction and branch summaries ──────────────────────────
-            JournalWireEvent::Compaction {
+            SessionTreeEntry::Compaction {
                 summary,
-                messages_compacted,
                 tokens_before,
                 retained_tail,
                 first_kept_entry_id,
+                ..
             } => {
                 // AHP has no "replace the transcript" action, so the fold keeps
                 // every pre-compaction turn and this row is the visible seam: the
                 // summary renders in order and `_meta` says where history was cut
                 // (§B.5's gap). The spinner edge clears here too.
+                //
+                // The kernel does not stamp the compacted message count as a
+                // separate field (the retained tail's absence carries the
+                // boundary), so the payload keeps the §C.2 best-effort 0.
+                let messages_compacted: u32 = 0;
+                let retained_tail_len = retained_tail.as_ref().map_or(0, Vec::len);
                 out.push(Emitted::new(
                     &chat,
                     StateAction::ChatActivityChanged(ChatActivityChangedAction { activity: None }),
@@ -948,18 +1203,18 @@ impl Translator {
                 mirror_activity(&chat, &session, None, &mut out);
                 self.push_note(
                     &chat,
-                    entry,
+                    &row,
                     summary.clone(),
                     json!({"compaction": {
                         "messagesCompacted": messages_compacted,
                         "tokensBefore": tokens_before,
-                        "retainedTail": retained_tail.len(),
+                        "retainedTail": retained_tail_len,
                         "firstKeptEntryId": first_kept_entry_id,
                     }}),
                     &mut out,
                 );
             }
-            JournalWireEvent::CompactionStarted { tokens_before } => {
+            SessionTreeEntry::CompactionStarted { tokens_before, .. } => {
                 // Activity, not transcript: a spinner edge carries no content.
                 let activity = format!("compacting ({tokens_before} tokens)");
                 out.push(Emitted::new(
@@ -970,11 +1225,11 @@ impl Translator {
                 ));
                 mirror_activity(&chat, &session, Some(activity), &mut out);
             }
-            JournalWireEvent::BranchSummary { text } => self.push_note(
+            SessionTreeEntry::BranchSummary { summary, .. } => self.push_note(
                 &chat,
-                entry,
-                text.clone(),
-                json!({"branchSummary": {"text": text}}),
+                &row,
+                summary.clone(),
+                json!({"branchSummary": {"text": summary}}),
                 &mut out,
             ),
         }
@@ -985,7 +1240,7 @@ impl Translator {
     fn on_message(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         row: MessageRow<'_>,
         out: &mut Vec<Emitted>,
     ) {
@@ -1176,7 +1431,7 @@ impl Translator {
     }
 
     /// `turnStart`: open the AHP turn, carrying the queued user row if one waits.
-    fn on_turn_start(&mut self, chat: &str, entry: &JournalWireEntry, out: &mut Vec<Emitted>) {
+    fn on_turn_start(&mut self, chat: &str, entry: &Envelope, out: &mut Vec<Emitted>) {
         if let Some(open) = self.open.take() {
             // A `turnStart` with a turn still open means the previous turn never
             // closed (a crash between rows). Close it first: AHP's reducer replaces
@@ -1206,7 +1461,7 @@ impl Translator {
     fn on_delta(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         run: Run,
         delta: &str,
         out: &mut Vec<Emitted>,
@@ -1282,7 +1537,7 @@ impl Translator {
     fn on_tool_call(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         call_id: &str,
         name: &str,
         title: &str,
@@ -1362,7 +1617,7 @@ impl Translator {
     fn on_tool_result(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         call_id: &str,
         output: &str,
         is_error: bool,
@@ -1389,7 +1644,7 @@ impl Translator {
     fn on_tool_output(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         call_id: &str,
         chunk: &str,
         out: &mut Vec<Emitted>,
@@ -1424,7 +1679,7 @@ impl Translator {
         &mut self,
         chat: &str,
         session: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         kind: &str,
         auth_id: &str,
         tool_name: Option<&str>,
@@ -1542,7 +1797,7 @@ impl Translator {
     fn on_question(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         ask: AskRow<'_>,
         out: &mut Vec<Emitted>,
     ) {
@@ -1620,7 +1875,7 @@ impl Translator {
     fn close_turn(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         outcome: Outcome,
         out: &mut Vec<Emitted>,
     ) {
@@ -1635,7 +1890,7 @@ impl Translator {
         open: &OpenTurn,
         chat: &str,
         outcome: Outcome,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         out: &mut Vec<Emitted>,
     ) {
         let duration = elapsed_ms(&open.started_at, &entry.timestamp);
@@ -1724,7 +1979,7 @@ impl Translator {
     fn push_note(
         &mut self,
         chat: &str,
-        entry: &JournalWireEntry,
+        entry: &Envelope,
         text: String,
         meta: Value,
         out: &mut Vec<Emitted>,
@@ -1752,7 +2007,7 @@ impl Translator {
     }
 
     /// Open a turn if none is open, publishing the synthetic `turnStarted`.
-    fn ensure_turn(&mut self, entry: &JournalWireEntry, chat: &str, out: &mut Vec<Emitted>) {
+    fn ensure_turn(&mut self, entry: &Envelope, chat: &str, out: &mut Vec<Emitted>) {
         if self.open.is_some() {
             return;
         }
@@ -2000,7 +2255,7 @@ impl Translator {
 ///
 /// Retries, auto-started turns and synthetic boundaries all look like this on the
 /// wire; `_meta` says which, so a client never renders a phantom prompt.
-fn no_user_row(entry: &JournalWireEntry) -> Message {
+fn no_user_row(entry: &Envelope) -> Message {
     Message {
         text: String::new(),
         origin: MessageOrigin {
@@ -2330,14 +2585,22 @@ fn whole(count: u64) -> Option<i64> {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, event: JournalWireEvent) -> JournalWireEntry {
-        JournalWireEntry {
-            seq: 0,
-            id: id.to_string(),
-            parent_id: None,
-            timestamp: "2026-09-27T00:00:00.000Z".to_string(),
-            event,
+    /// One kernel record from its JSON shape — the same rows the jsonl store
+    /// persists, so these fixtures speak the kernel vocabulary end to end.
+    /// The base stamps (id / parent / timestamp) apply unless the fields
+    /// object overrides them.
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-09-27T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
         }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
     }
 
     #[test]
@@ -2346,12 +2609,8 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-1",
-                JournalWireEvent::CompactionStarted {
-                    tokens_before: 4200,
-                },
-            ),
+            0,
+            &kernel(json!({"type": "compaction_started", "tokensBefore": 4200})),
         );
         let session: Vec<_> = emitted
             .iter()
@@ -2386,16 +2645,8 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-1",
-                JournalWireEvent::Compaction {
-                    summary: "done".into(),
-                    messages_compacted: 3,
-                    tokens_before: 10,
-                    retained_tail: vec![],
-                    first_kept_entry_id: None,
-                },
-            ),
+            0,
+            &kernel(json!({"type": "compaction", "summary": "done", "tokensBefore": 10})),
         );
         let session: Vec<_> = emitted
             .iter()
@@ -2421,16 +2672,14 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-1",
-                JournalWireEvent::PlanReview {
-                    state: "proposed".into(),
-                    plan_file: Some("/plans/demo-plan.md".into()),
-                    title: Some("Demo plan".into()),
-                    content: Some("# Demo\n\n- step one".into()),
-                    request_id: None,
-                },
-            ),
+            0,
+            &kernel(json!({
+                "type": "plan_review",
+                "state": "proposed",
+                "planFile": "/plans/demo-plan.md",
+                "title": "Demo plan",
+                "content": "# Demo\n\n- step one",
+            })),
         );
         assert_eq!(
             emitted.len(),
@@ -2484,30 +2733,20 @@ mod tests {
         translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-1",
-                JournalWireEvent::PlanReview {
-                    state: "proposed".into(),
-                    plan_file: Some("/p.md".into()),
-                    title: Some("T".into()),
-                    content: Some("# T".into()),
-                    request_id: None,
-                },
-            ),
+            0,
+            &kernel(json!({
+                "type": "plan_review",
+                "state": "proposed",
+                "planFile": "/p.md",
+                "title": "T",
+                "content": "# T",
+            })),
         );
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-2",
-                JournalWireEvent::PlanReview {
-                    state: "resolved".into(),
-                    plan_file: None,
-                    title: None,
-                    content: None,
-                    request_id: None,
-                },
-            ),
+            1,
+            &kernel(json!({"type": "plan_review", "id": "e-2", "state": "resolved"})),
         );
         assert_eq!(emitted.len(), 2);
         let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
@@ -2525,25 +2764,23 @@ mod tests {
     }
 
     /// The resolution is self-describing: a resolved row carrying its
-    /// request id settles in a translator that never saw the proposal (a
+    /// request id settles in a projector that never saw the proposal (a
     /// bridge resuming above it, after a host restart). The payload names
     /// the plan with the proposal edge's `planUri` encoding.
     #[test]
-    fn plan_review_resolution_survives_a_translator_restart() {
+    fn plan_review_resolution_survives_a_projector_restart() {
         let mut translator = Translator::new();
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-9",
-                JournalWireEvent::PlanReview {
-                    state: "resolved".into(),
-                    plan_file: Some("/p.md".into()),
-                    title: None,
-                    content: None,
-                    request_id: Some("plan-review:e-1".into()),
-                },
-            ),
+            0,
+            &kernel(json!({
+                "type": "plan_review",
+                "id": "e-9",
+                "state": "resolved",
+                "planFile": "/p.md",
+                "requestId": "plan-review:e-1",
+            })),
         );
         assert_eq!(emitted.len(), 2);
         let settled = serde_json::to_value(&emitted[0].action).expect("action serializes");
@@ -2563,16 +2800,8 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-9",
-                JournalWireEvent::PlanReview {
-                    state: "resolved".into(),
-                    plan_file: None,
-                    title: None,
-                    content: None,
-                    request_id: None,
-                },
-            ),
+            0,
+            &kernel(json!({"type": "plan_review", "id": "e-9", "state": "resolved"})),
         );
         assert!(emitted.is_empty());
     }
@@ -2591,12 +2820,8 @@ mod tests {
         let emitted = translator.on_entry(
             "c-1",
             "s-1",
-            &entry(
-                "e-1",
-                JournalWireEvent::BackgroundTask {
-                    snapshot: snapshot.clone(),
-                },
-            ),
+            0,
+            &kernel(json!({"type": "background_task", "snapshot": snapshot.clone()})),
         );
         let work: Vec<_> = emitted
             .iter()
@@ -2605,7 +2830,7 @@ mod tests {
         assert_eq!(
             work.len(),
             1,
-            "one journal row, one work-channel action: {emitted:?}"
+            "one kernel row, one work-channel action: {emitted:?}"
         );
         let action = serde_json::to_value(&work[0].action).expect("action serializes");
         assert_eq!(action["type"], "x-manox-work/backgroundTasksChanged");
@@ -2616,10 +2841,10 @@ mod tests {
 
         // The reference client fold: the row lands in the registry view
         // keyed by its task id.
-        let mut state = crate::ext::XManoxState::default();
+        let mut state = ext::XManoxState::default();
         assert_eq!(
-            crate::ext::reducer::apply(&mut state, &action),
-            crate::ext::ExtOutcome::Applied
+            ext::reducer::apply(&mut state, &action),
+            ext::ExtOutcome::Applied
         );
         assert_eq!(
             state.background_tasks,
@@ -2632,9 +2857,45 @@ mod tests {
         // …and the field survives a state round-trip for reconnecting clients.
         let encoded = serde_json::to_value(&state).expect("state serializes");
         assert_eq!(encoded["backgroundTasks"]["mon_7"], snapshot);
-        let decoded: crate::ext::XManoxState =
-            serde_json::from_value(encoded).expect("state round-trips");
+        let decoded: ext::XManoxState = serde_json::from_value(encoded).expect("state round-trips");
         assert_eq!(decoded.background_tasks, state.background_tasks);
+    }
+
+    /// The fold's determinism gate: the same records projected twice yield
+    /// byte-identical action streams, and a projector seeded from the folded
+    /// state (the restart path) continues the same run numbering.
+    #[test]
+    fn replaying_the_same_records_yields_identical_actions() {
+        let records = vec![
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "message",
+                "id": "e-2",
+                "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "e-3", "delta": "hi"})),
+            kernel(json!({"type": "tool_call", "id": "e-4", "callId": "t-1",
+                          "name": "bash", "title": "run", "status": "running", "input": {}})),
+            kernel(json!({"type": "turn_finish", "id": "e-5",
+                          "cancelled": false, "failed": false, "strandedSteerIds": []})),
+        ];
+        let project = |records: &[SessionTreeEntry]| {
+            let mut translator = Translator::new();
+            records
+                .iter()
+                .enumerate()
+                .flat_map(|(seq, entry)| translator.on_entry("c-1", "s-1", seq as u64, entry))
+                .map(|emitted| (emitted.channel.clone(), emitted.action.clone()))
+                .collect::<Vec<_>>()
+        };
+        let first = project(&records);
+        let second = project(&records);
+        assert_eq!(first, second, "replay is deterministic");
+        assert!(
+            first.iter().any(|(channel, _)| channel == "ahp-chat:/c-1"),
+            "the stream reaches the chat channel: {first:?}"
+        );
     }
 }
 
@@ -2642,32 +2903,38 @@ mod tests {
 mod turn_message_tests {
     use super::*;
 
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-09-29T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
     #[test]
     fn the_initiating_user_row_becomes_the_turns_opening_message() {
         let mut t = Translator::new();
-        let row = |seq: u64, event: JournalWireEvent| JournalWireEntry {
-            seq,
-            id: format!("e-{seq}"),
-            parent_id: None,
-            timestamp: "2026-09-29T00:00:00.000Z".into(),
-            event,
-        };
         let mut out = Vec::new();
-        for entry in [
-            row(1, JournalWireEvent::TurnStart { owner: None }),
-            row(
-                2,
-                JournalWireEvent::Message {
-                    role: "user".into(),
-                    content: vec![json!({"type": "text", "text": "hello"})],
-                    usage: None,
-                    origin_rpc: Some("rpc-1".into()),
-                    display: None,
-                },
-            ),
-            row(3, JournalWireEvent::AgentTextDelta { s: "hi".into() }),
-        ] {
-            out.extend(t.on_entry("c-1", "s-1", &entry));
+        for (seq, entry) in [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "message",
+                "id": "e-2",
+                "message": {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                "origin": "rpc-1",
+            })),
+            kernel(json!({"type": "agent_text_delta", "id": "e-3", "delta": "hi"})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.extend(t.on_entry("c-1", "s-1", seq as u64, &entry));
         }
         let started = out.iter().find(
             |e| matches!(&e.action, StateAction::ChatTurnStarted(a) if a.message.text == "hello"),
@@ -2690,23 +2957,12 @@ mod turn_message_tests {
         // an attach-time reader could not reach it there), so the meta stays
         // the plain entry id regardless of the row's owner stamp.
         let mut t = Translator::new();
-        let row = |seq: u64, event: JournalWireEvent| JournalWireEntry {
-            seq,
-            id: format!("e-{seq}"),
-            parent_id: None,
-            timestamp: "2026-09-29T00:00:00.000Z".into(),
-            event,
-        };
         let mut out = Vec::new();
         out.extend(t.on_entry(
             "c-1",
             "s-1",
-            &row(
-                1,
-                JournalWireEvent::TurnStart {
-                    owner: Some(manox_journal::TurnOwner { pid: 4242 }),
-                },
-            ),
+            0,
+            &kernel(json!({"type": "turn_start", "owner": {"pid": 4242}})),
         ));
         let meta = out
             .iter()
@@ -2719,6 +2975,199 @@ mod turn_message_tests {
         assert!(
             meta["x-manox"].get("turnOwner").is_none(),
             "the meta must not carry the owner: {meta:?}"
+        );
+    }
+}
+
+/// The extension-state reachability gate: every `XManoxState` field must be
+/// fillable through the real production path — a kernel record projected by
+/// [`Translator`], riding the exact extension channel its fold lives on.
+/// Ported from `manox_ahp::ext::reducer`'s tests when the translator moved
+/// here (the ext crate cannot name the runtime's projector); the compile-time
+/// half stays there — a new `XManoxState` field without a producer case here
+/// is a missing literal field below, so "declared but always empty" cannot
+/// come back.
+#[cfg(test)]
+mod extension_gate_tests {
+    use super::*;
+    use manox_ahp::ext::ExtOutcome;
+    use manox_ahp::ext::XManoxState;
+    use manox_ahp::ext::reducer as ext_reducer;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-gate",
+            "parentId": None::<String>,
+            "timestamp": "2026-09-30T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    #[test]
+    fn every_extension_state_field_is_reachable_through_the_real_fold() {
+        use manox_ahp::ext::actions as ext_actions;
+        // Host-emitted: kernel record → the tag it must produce and the exact
+        // channel it must ride (an action on the WRONG extension channel
+        // still folds — into the wrong bag — so `is_extension_channel` alone
+        // cannot catch it).
+        let host_cases: Vec<(SessionTreeEntry, &str, &str)> = vec![
+            (
+                kernel(json!({"type": "plan_mode_change", "enabled": true})),
+                ext_actions::PLAN_MODE_CHANGED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                kernel(json!({"type": "plan_update", "snapshot": {}})),
+                ext_actions::PLAN_CHANGED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                kernel(json!({"type": "plan_review", "state": "proposed",
+                              "requestId": "plan-review:e-gate"})),
+                ext_actions::PLAN_VERDICT_REQUESTED,
+                "x-manox-plan:/c-1",
+            ),
+            (
+                kernel(json!({"type": "goal", "goal": {"text": "ship"}})),
+                ext_actions::WORK_GOAL_CHANGED,
+                "x-manox-work:/s-1",
+            ),
+            (
+                kernel(json!({"type": "browser_suites", "suites": ["chrome"]})),
+                ext_actions::WORK_BROWSER_SUITES,
+                "x-manox-work:/s-1",
+            ),
+            (
+                kernel(json!({"type": "background_task", "snapshot": {"task_id": "mon_7"}})),
+                ext_actions::WORK_BACKGROUND_TASKS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                kernel(json!({"type": "subagent_progress", "agentId": "sub-0",
+                              "agentType": "explore", "toolUses": 0,
+                              "latestActivity": null, "status": "running"})),
+                ext_actions::WORK_SUBAGENTS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                kernel(json!({"type": "active_tools_change", "activeToolNames": ["bash"]})),
+                ext_actions::WORK_ACTIVE_TOOLS,
+                "x-manox-work:/s-1",
+            ),
+            (
+                kernel(json!({"type": "metrics", "metricType": "token_usage", "data": {}})),
+                ext_actions::METRICS_CHANGED,
+                "x-manox-metrics:/c-1",
+            ),
+            (
+                kernel(json!({"type": "pinned_archived", "pinned": true, "archived": false})),
+                ext_actions::PINNED_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                kernel(json!({"type": "label", "targetId": "e-gate", "label": "x"})),
+                ext_actions::LABEL_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                kernel(json!({"type": "session_info", "name": "agent"})),
+                ext_actions::SESSION_INFO_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+            (
+                kernel(json!({"type": "leaf", "targetId": "e-9"})),
+                ext_actions::LEAF_CHANGED,
+                "x-manox-thread:/s-1",
+            ),
+        ];
+        // Client-dispatched: the action as the client sends it (no journal
+        // producer exists; the runtime dispatch arms accept these directly).
+        let client_cases: Vec<(Value, &str)> = vec![(
+            json!({"type": ext_actions::ORDER_CHANGED, "order": {"s-1": 1}}),
+            ext_actions::ORDER_CHANGED,
+        )];
+        // Excluded, no fold arm to feed: BASELINE (host envelope),
+        // PLAN_REVIEW_SETTLED (folds with the host-emitted verdict-requested edge),
+        // the workspaces rows (declared, fold lives outside this bag).
+
+        let mut state = XManoxState::default();
+        let mut plan_review_action = None;
+        let mut translator = Translator::new();
+        for (entry, tag, expected_channel) in &host_cases {
+            assert!(ext_actions::ALL.contains(tag), "{tag} must stay declared");
+            let emitted = translator.on_entry("c-1", "s-1", 0, entry);
+            let hit = emitted
+                .iter()
+                .find(|e| serde_json::to_value(&e.action).unwrap()["type"] == *tag)
+                .unwrap_or_else(|| panic!("{tag} has no projector producer"));
+            let action = serde_json::to_value(&hit.action).unwrap();
+            assert!(
+                manox_ahp::ext::is_extension_channel(&hit.channel),
+                "{tag} must ride an extension channel; it was emitted on {} where no fold runs",
+                hit.channel
+            );
+            assert_eq!(
+                hit.channel, *expected_channel,
+                "{tag} was emitted on the wrong extension channel; its fold would land in \
+                 another channel's bag and the expected channel's baseline would stay empty"
+            );
+            assert_eq!(
+                ext_reducer::apply(&mut state, &action),
+                ExtOutcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+            if *tag == ext_actions::PLAN_VERDICT_REQUESTED {
+                plan_review_action = Some(action.clone());
+            }
+        }
+        for (action, tag) in &client_cases {
+            assert_eq!(
+                ext_reducer::apply(&mut state, action),
+                ExtOutcome::Applied,
+                "{tag} did not fold: {action}"
+            );
+        }
+
+        // Total coverage: every field of the bag, populated by the cases
+        // above. The struct literal has no `..Default` on purpose.
+        assert_eq!(
+            state,
+            XManoxState {
+                plan_mode: Some(true),
+                plan: Some(json!({})),
+                plan_review: plan_review_action,
+                goal: Some(json!({"text": "ship"})),
+                browser_suites: Some(vec!["chrome".to_string()]),
+                background_tasks: Some(
+                    [("mon_7".to_string(), json!({"task_id": "mon_7"}))]
+                        .into_iter()
+                        .collect()
+                ),
+                subagents: Some(
+                    [(
+                        "sub-0".to_string(),
+                        json!({
+                            "agentId": "sub-0", "agentType": "explore",
+                            "toolUses": 0, "latestActivity": null,
+                            "status": "running"
+                        }),
+                    )]
+                    .into_iter()
+                    .collect()
+                ),
+                pinned: Some(true),
+                label: Some("x".to_string()),
+                session_info: Some(json!({"name": "agent"})),
+                leaf: Some("e-9".to_string()),
+                active_tools: Some(vec!["bash".to_string()]),
+                order: Some(json!({"s-1": 1})),
+            },
+            "every extension-state field must be reachable from a live producer"
         );
     }
 }

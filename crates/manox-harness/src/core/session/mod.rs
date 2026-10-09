@@ -18,13 +18,52 @@ use serde_json::Value as JsonValue;
 /// Field names serialize as camelCase. A `leaf`
 /// entry records a cursor move to an older branch point: its `targetId` is the
 /// entry the cursor now points at, and the leaf entry itself is never walked
-/// The process that started a turn — the local wire mirror of the journal's
-/// `TurnOwner`. Readers of the shared journal use its liveness to settle a
-/// dead owner's turn without touching one another process is running.
+/// The process that started a turn, stamped on the `turn_start` row. The
+/// session file is shared across processes (desktop host, cx CLI), so a
+/// reader of an open turn needs this to tell a dead turn — owning process
+/// gone, safe to settle on its behalf — from one another process is
+/// executing right now (never auto-cancelled).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnOwner {
     pub pid: u32,
+}
+
+impl TurnOwner {
+    /// The stamp for a turn this process is starting.
+    pub fn for_current_process() -> Self {
+        Self {
+            pid: std::process::id(),
+        }
+    }
+
+    /// Whether the owning process is still alive. A reused pid reads as
+    /// alive — the conservative side: the turn is treated as live and left
+    /// for a deliberate manual settle, never auto-cancelled. An
+    /// out-of-range pid (`> i32::MAX`, only possible from a corrupt or
+    /// forged row) casts to a negative pid_t, where `kill` reads as a
+    /// process-group query; signal 0 is harmless there and the answer again
+    /// reads alive — the same conservative side.
+    pub fn is_alive(&self) -> bool {
+        let result = unsafe { libc::kill(self.pid as libc::pid_t, 0) };
+        if result == 0 {
+            true
+        } else {
+            // EPERM means the process exists but is owned by someone else —
+            // alive. Only ESRCH (no such process) reads as dead.
+            std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        }
+    }
+}
+
+/// The request id a plan-review proposal mints from its own entry id — the
+/// single key the client's card, the resolved row's `requestId`
+/// back-reference, and the settle action all correlate by. Every mint site
+/// (engine journal write, restore replay, the AHP projection) goes through
+/// this one definition; a drifting copy strands the card with no error
+/// anywhere.
+pub fn plan_review_request_id(entry_id: &str) -> String {
+    format!("plan-review:{entry_id}")
 }
 
 /// (the cursor is `targetId`, not the leaf entry's own id).

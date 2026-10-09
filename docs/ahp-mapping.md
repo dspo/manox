@@ -56,7 +56,7 @@ turn id 方案。结论如下，三条证据相互印证：
 > `requests::ALL` / `channels::ALL`）。本表引用的 `x-manox*` 名称由守卫测试
 > `crates/manox-ahp/tests/doc_declaration_guard.rs` 对照该声明面校验：凡**不在**
 > wire 上的名称（v2 设计期提案、已删除行），所在行必须带 `not-on-wire` 标记。
-> 扩展 action 的实际通道以 `translate/actions.rs` 的发射臂为准。
+> 扩展 action 的实际通道以 `manox-ahp-runtime/src/ahp/projection.rs` 的发射臂为准。
 
 ### §2.1 `JournalWireEvent`（40）
 

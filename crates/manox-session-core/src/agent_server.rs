@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use manox_ahp_runtime::base64_bytes;
 use manox_ahp_runtime::runtime_trait::{ClientToolSpec, ImageAttachment};
-use manox_journal::base64_bytes;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 
@@ -1033,12 +1033,12 @@ pub(crate) async fn fork_session(
         None => None,
         Some(m) => {
             let registry = manox_agent::provider_glue::global();
-            match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
+            match manox_harness::model_ref::resolve_model_ref(&registry, m) {
                 Some(model) => Some(model),
                 None => {
                     return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                         "unknown model: {}",
-                        m.0
+                        m
                     ))
                     .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                 }
@@ -1218,12 +1218,12 @@ impl AgentServerInner {
             None => None,
             Some(m) => {
                 let registry = manox_agent::provider_glue::global();
-                match manox_harness::model_ref::resolve_model_ref(&registry, &m.0) {
+                match manox_harness::model_ref::resolve_model_ref(&registry, m) {
                     Some(model) => Some(model),
                     None => {
                         return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
                             "unknown model: {}",
-                            m.0
+                            m
                         ))
                         .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
                     }
@@ -1928,8 +1928,7 @@ impl AgentServerInner {
         let pred = self.session_thread(pred_id).ok_or("unknown session")?;
         let (model, approval, effort) = pred.read(|t| {
             (
-                t.model()
-                    .map(|m| manox_journal::ModelRef::new(format!("{}/{}", m.provider, m.id))),
+                t.model().map(|m| format!("{}/{}", m.provider, m.id)),
                 t.permission_mode().wire().to_string(),
                 match t.reasoning_effort() {
                     manox_agent::language_model::ReasoningEffort::High => "high",

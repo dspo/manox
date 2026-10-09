@@ -15,7 +15,6 @@ crates/                    # Rust workspace 成员（全部 gpui-free）
   manox-harness/           # Trait agent 内核（core/ + ext/ 两子模块）
     src/core/              # 通用 agent 内核（纯内核，无业务逻辑）
     src/ext/               # 经内核拓展点扩展的业务能力
-  manox-journal/           # 会话磁盘格式（journal v4 条目词汇）的叶子 crate
   manox-ahp/               # AHP 宿主层（频道、JSON-RPC、传输、x-manox 扩展面）
   manox-ahp-runtime/       # AHP 宿主背后的运行时半边（SessionRuntime 缝 + 适配器）
   manox-session-core/      # 会话核心（会话存储 + SessionRuntime 缝的实现 + loopback ws）

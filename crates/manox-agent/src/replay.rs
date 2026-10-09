@@ -197,7 +197,7 @@ pub fn replay_thread_state(records: &[JournalRecord]) -> ReplayedThreadState {
                     Some(
                         request_id
                             .clone()
-                            .unwrap_or_else(|| manox_journal::plan_review_request_id(id)),
+                            .unwrap_or_else(|| manox_harness::session::plan_review_request_id(id)),
                     )
                 } else {
                     None

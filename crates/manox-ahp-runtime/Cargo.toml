@@ -8,7 +8,7 @@ publish = false
 manox-agent.workspace = true
 manox-harness.workspace = true
 manox-ahp.workspace = true
-manox-journal.workspace = true
+base64.workspace = true
 manox-terminal = { workspace = true, optional = true }
 # The mcp:// side-channel proxy: typed `Peer<RoleClient>` calls plus the
 # model types the wire round-trips. Only the client face is linked.

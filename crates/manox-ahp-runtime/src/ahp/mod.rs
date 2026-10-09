@@ -17,7 +17,7 @@
 //! The journal read goes through the gateway's existing seams — no bespoke
 //! reader: [`crate::journal_query::cold_read`] (persisted-jsonl direct read,
 //! the same one `PageHistory` uses) plus
-//! [`crate::translate::wire_entry`] (kernel entry → §C.2 wire vocabulary),
+//! [`crate::ahp::projection`] (kernel record → AHP action, no intermediate
 //! and thread metadata comes from `manox_agent::thread_store` (the sidebar
 //! mirror row) and `manox_agent::thread_registry` (the active-session
 //! pointer), the same sources `ListThreads` answers from.
@@ -52,6 +52,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use crate::ahp::projection::Translator;
 use ahp::reducers::{apply_action_to_chat, apply_action_to_session};
 use ahp_types::actions::StateAction;
 use ahp_types::common::JsonObject;
@@ -60,8 +61,7 @@ use ahp_types::state::{
     SessionState, SessionStatus,
 };
 use manox_ahp::channels::{chat, session};
-use manox_ahp::translate::Translator;
-use manox_journal::JournalWireEvent;
+use manox_harness::session::SessionTreeEntry;
 use serde_json::Value;
 
 pub(crate) mod baseline_cache;
@@ -242,16 +242,17 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
     let mut model_ref: Option<String> = None;
     let mut last_timestamp: Option<String> = None;
     for record in &snapshot.records {
-        let Some(entry) = crate::translate::wire_entry(record.seq, &record.entry) else {
-            continue;
-        };
-        // The canonical `provider/model` reference (L8): the wire event
-        // carries it as a config value, and the session fold reads the
-        // provider out of it when the store row has none.
-        if let JournalWireEvent::ModelChange { to, .. } = &entry.event {
-            model_ref = Some(to.0.clone());
+        // The canonical `provider/model` reference (L8): the kernel row
+        // carries provider and model id separately, and the session fold
+        // reads the provider out of the composed value when the store row
+        // has none.
+        if let SessionTreeEntry::ModelChange {
+            provider, model_id, ..
+        } = &record.entry
+        {
+            model_ref = Some(format!("{provider}/{model_id}"));
         }
-        for emitted in translator.on_entry(chat_id, thread_id, &entry) {
+        for emitted in translator.on_entry(chat_id, thread_id, record.seq, &record.entry) {
             if session::id(&emitted.channel).is_some() {
                 session_actions.push(emitted.action);
             } else if chat::id(&emitted.channel) == Some(chat_id) {
@@ -264,7 +265,12 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
                 extension_actions.push((emitted.channel, emitted.action));
             }
         }
-        last_timestamp = Some(entry.timestamp);
+        last_timestamp = Some(
+            record
+                .entry
+                .timestamp()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        );
     }
     // A pure fold must not observe wall-clock time: `chat::initial` stamps
     // "now", the journal's own last entry replaces it. A never-written
@@ -289,7 +295,7 @@ pub(crate) async fn fold_journal(chat_id: &str, thread_id: &str) -> Option<Journ
 /// not reach it there). Answers `None` for an unknown/unreadable journal and
 /// for a journal whose last turn closed; callers treat both as "no owner"
 /// and never auto-cancel on that account.
-pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_journal::TurnOwner> {
+pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_harness::session::TurnOwner> {
     let snapshot = match crate::journal_query::cold_read(chat_id).await {
         crate::journal_query::ColdRead::Data(snapshot) => snapshot,
         crate::journal_query::ColdRead::NotFound => return None,
@@ -302,11 +308,7 @@ pub(crate) async fn open_turn_owner(chat_id: &str) -> Option<manox_journal::Turn
     for record in &snapshot.records {
         match &record.entry {
             manox_harness::session::SessionTreeEntry::TurnStart { owner: stamped, .. } => {
-                // The single manual field mapping between the harness's
-                // local TurnOwner mirror and the journal's (the W4
-                // conversion point) — guarded in translate.rs tests by
-                // `the_legacy_turn_start_translation_carries_the_owner_pid`.
-                owner = stamped.map(|o| manox_journal::TurnOwner { pid: o.pid });
+                owner = *stamped;
             }
             manox_harness::session::SessionTreeEntry::TurnFinish { .. } => owner = None,
             _ => {}
@@ -611,6 +613,7 @@ pub(crate) async fn thread_of_session(session_id: &str) -> Option<String> {
 }
 
 pub mod backend;
+pub mod projection;
 mod resources;
 pub mod runtime;
 
