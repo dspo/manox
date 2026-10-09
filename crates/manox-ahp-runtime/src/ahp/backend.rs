@@ -331,9 +331,8 @@ impl RuntimeBackend {
         if let Some(seeded) = self.seeds.lock().get(session_id).cloned() {
             return Some(seeded);
         }
-        let thread_id = super::thread_of_session(session_id)
-            .await
-            .unwrap_or_else(|| session_id.to_string());
+        let own_thread = super::thread_of_session(session_id).await;
+        let thread_id = own_thread.clone().unwrap_or_else(|| session_id.to_string());
         // A session created moments ago has no journal line yet: it is an empty
         // chat, not an unknown one. Subscribing to a brand-new session must work,
         // and the bridge picks its entries up from seq 0 onward.
@@ -378,7 +377,13 @@ impl RuntimeBackend {
         if let Some(host) = self.host() {
             host.seed_session(&seeded.thread_id, seeded.session.clone());
             host.seed_chat(&seeded.thread_id, session_id, seeded.chat.clone());
-            self.ensure_bridge(session_id);
+            // A subagent child chat has a foldable journal but no thread of
+            // its own — no live feed to bridge. It is served snapshot-only:
+            // the fold above is the whole truth, and a re-subscribe refreshes
+            // it (a child's journal ends when its run ends).
+            if own_thread.is_some() {
+                self.ensure_bridge(session_id);
+            }
         }
         Some(seeded)
     }
