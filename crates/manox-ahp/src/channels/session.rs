@@ -8,7 +8,8 @@
 
 use ahp_types::common::Uri;
 use ahp_types::state::{
-    ProjectInfo, SessionConfigState, SessionLifecycle, SessionState, SessionSummary,
+    ProjectInfo, SessionChatSummary, SessionConfigState, SessionLifecycle, SessionState,
+    SessionSummary,
 };
 
 /// `ahp-session:/<id>`.
@@ -88,8 +89,24 @@ pub fn summary(
         modified_at: modified_at.to_string(),
         changes: None,
         meta: None,
-        chats: None,
-        default_chat: None,
+        // AHP 1.0's lightweight chat catalogue: the compact rows ride the
+        // summary so a list render needs no session subscription. Each row
+        // mirrors its catalog entry's status bits and footprint counts.
+        chats: Some(
+            state
+                .chats
+                .iter()
+                .map(|chat| SessionChatSummary {
+                    resource: chat.resource.clone(),
+                    title: chat.title.clone(),
+                    origin: chat.origin.clone(),
+                    interactivity: chat.interactivity,
+                    status: Some(chat.status),
+                    changes: chat.changes.clone(),
+                })
+                .collect(),
+        ),
+        default_chat: state.default_chat.clone(),
     }
 }
 
