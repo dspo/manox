@@ -1174,6 +1174,10 @@ pub(crate) fn summary_delta(
         project: summary.project.clone(),
         working_directories: summary.working_directories.clone(),
         annotations: summary.annotations.clone(),
+        // The compact chat catalogue replaces wholesale when carried — a list
+        // render tracks per-chat status bits through the same delta.
+        chats: summary.chats.clone(),
+        default_chat: summary.default_chat.clone(),
         ..Default::default()
     }
 }
@@ -1224,6 +1228,18 @@ fn summary_from_row(
         created_at: unix_to_rfc3339(row.created_at),
         modified_at: unix_to_rfc3339(row.updated_at),
         changes: None,
+        // The one-chat catalogue rides the row summary too (AHP 1.0): manox
+        // runs one journal per session, so the row names exactly one chat —
+        // the session's own status bits mirror onto it.
+        chats: Some(vec![ahp_types::state::SessionChatSummary {
+            resource: chat::uri(&row.id),
+            title: row.display_title().to_string(),
+            origin: None,
+            interactivity: None,
+            status: Some(status),
+            changes: None,
+        }]),
+        default_chat: Some(chat::uri(&row.id)),
         // The store row is the pin authority (pin_session journals through
         // it): ride the summary's `_meta` extension slot so a client's list
         // render sees the pin without subscribing the thread channel. Always
@@ -1236,8 +1252,6 @@ fn summary_from_row(
             meta.insert("x-manox".to_string(), serde_json::Value::Object(xmanox));
             meta
         }),
-        chats: None,
-        default_chat: None,
     }
 }
 
@@ -1892,6 +1906,18 @@ impl Backend for RuntimeBackend {
                     .archive_session(&origin.client_id, session_id, changed.is_archived);
                 DispatchOutcome::Accepted
             }
+            // AHP 1.0's per-chat edges. manox runs one journal per session,
+            // so the chat face is the session face: archived is the durable
+            // half (the same store write its session-level sibling makes);
+            // read is the client-owned observation state that sibling echoes.
+            StateAction::ChatIsArchivedChanged(changed) => {
+                let Some(session_id) = chat::id(channel) else {
+                    return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
+                };
+                self.server
+                    .archive_session(&origin.client_id, session_id, changed.is_archived);
+                DispatchOutcome::Accepted
+            }
             // Actions the acceptance table admits and the reducer folds, but
             // that describe client-side state the runtime does not own (draft
             // text, read flags, turn resumption, result confirmation). They are
@@ -1903,6 +1929,7 @@ impl Backend for RuntimeBackend {
             | StateAction::ChatInputAnswerChanged(_)
             | StateAction::ChatQueuedMessagesReordered(_)
             | StateAction::SessionIsReadChanged(_)
+            | StateAction::ChatIsReadChanged(_)
             | StateAction::SessionActiveClientRemoved(_) => DispatchOutcome::Ignored,
             other => DispatchOutcome::Rejected(format!(
                 "no runtime intent yet: {}",
@@ -2874,5 +2901,39 @@ mod mcp_dispatch_tests {
         };
         assert!(read_pin("s-pinned"), "the pinned row reads pinned");
         assert!(!read_pin("s-plain"), "the unpinned row reads unpinned");
+    }
+
+    /// AHP 1.0's lightweight catalogue rides the row summary: one journal per
+    /// session means the row names exactly one chat, mirroring the session's
+    /// own status bits, and names it the default chat.
+    #[test]
+    fn a_row_summary_carries_the_one_chat_catalogue() {
+        crate::test_support::init_globals();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = std::sync::Arc::new(
+            manox_agent::db::ThreadsDatabase::open(&dir.path().join("threads.db"))
+                .expect("open temp threads db"),
+        );
+        let store = manox_agent::thread_store::standalone_for_test(db);
+        store.with_mut(|st| {
+            st.insert_summary_for_test("s-cat", None);
+        });
+        store.read(|state| {
+            let row = state.summary_by_id("s-cat").expect("the seeded row exists");
+            let summary = summary_from_row(row, state, None);
+            let chats = summary.chats.expect("the catalogue is always present");
+            assert_eq!(chats.len(), 1, "one journal per session: {chats:?}");
+            assert_eq!(chats[0].resource, "ahp-chat:/s-cat");
+            assert_eq!(
+                chats[0].title, "s-cat",
+                "the title of record falls back to the row summary"
+            );
+            assert!(chats[0].status.is_some(), "the bits mirror the session's");
+            assert_eq!(
+                summary.default_chat.as_deref(),
+                Some("ahp-chat:/s-cat"),
+                "the one chat is the default chat"
+            );
+        });
     }
 }
