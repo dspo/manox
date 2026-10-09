@@ -500,7 +500,7 @@ tap 写 journal → `tap_tx` → `notice_rx` → facade）**之后**，所以注
 计划把「真客户端 smoke」当一条门禁。它应当拆成两条——④a 现在就能做，④b 需要单独立项：
 
 - **④a（已执行）**：用上游**官方 TypeScript client**（`@microsoft/agent-host-protocol@0.9.0`，
-  与本仓 pin 的 `ahp-types = "=0.9.0"` 同版本）经 WS 打真实网关。
+  执行时与本仓当时的 pin `ahp-types = "=0.9.0"` 同版本；pin 现为 `=1.0.0`）经 WS 打真实网关。
   工具：`script/ahp-client-smoke/smoke.mjs`（13 项断言全 PASS）。
 - **④b（未做，独立立项）**：真 VS Code Agents window 的方言税（R5 那五处）。hcode 的连接来源
   只有 ambient/ssh/wsl 三条，全是起 VS Code 自己的 agent host，端点不可插拔；指向 manox 的 `/ahp`

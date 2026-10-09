@@ -1254,6 +1254,75 @@ mod tests {
     }
 
     #[test]
+    fn a_dirs_move_rescans_under_recomputing_with_the_previous_files_intact() {
+        // A moved directory set on an existing entry is `Recomputing`, not a
+        // first `Computing`: while the moved-set scan runs, a state read
+        // reports the transient status and still serves the previous
+        // completed result, then settles `Ready` on the new set.
+        let scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scans_clone = Arc::clone(&scans);
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_clone = Arc::clone(&started);
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_clone = Arc::clone(&release);
+        let engine = Arc::new(script(move |args| {
+            match args.first().copied().unwrap_or("") {
+                "rev-parse" => {
+                    if scans_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        ok("/repo\n")
+                    } else {
+                        started_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+                        while !release_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        ok("/repo2\n")
+                    }
+                }
+                "status" => ok(" M f.rs\0"),
+                "diff" if args.contains(&"--numstat") => ok("1\t1\tf.rs\n"),
+                "diff" => ok("+x\n"),
+                _ => ok(""),
+            }
+        }));
+        engine.catalogue("s-1", vec![PathBuf::from("/repo")]);
+        assert_eq!(
+            engine.state("s-1", KEY).unwrap().status,
+            ChangesetStatus::Ready
+        );
+
+        let mover = Arc::clone(&engine);
+        let handle =
+            std::thread::spawn(move || mover.catalogue("s-1", vec![PathBuf::from("/repo2")]));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !started.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the moved-set scan never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mid = engine
+            .state("s-1", KEY)
+            .expect("the previous completed result still serves");
+        assert_eq!(mid.status, ChangesetStatus::Recomputing);
+        assert_eq!(
+            mid.files.len(),
+            1,
+            "the previous completed file list stays in place mid-rescan"
+        );
+        assert_eq!(mid.files[0].id, "file:///repo/f.rs");
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle
+            .join()
+            .unwrap()
+            .expect("the moved set holds a repository");
+        let settled = engine.state("s-1", KEY).unwrap();
+        assert_eq!(settled.status, ChangesetStatus::Ready);
+        assert_eq!(settled.files[0].id, "file:///repo2/f.rs");
+    }
+
+    #[test]
     fn a_monorepo_subdirectory_grant_never_lists_out_of_grant_files() {
         // Probe-D shape: the grant is /repo/sub but the repo also carries
         // /repo/other/secret.rs. git scans whole repos; the fence filters

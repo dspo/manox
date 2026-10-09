@@ -558,7 +558,7 @@ async fn create_session(
 
 /// Default `activeClient.tools` to an empty list when a client omits it.
 ///
-/// `SessionActiveClient.tools` is **required** by the pinned `ahp-types` 0.9.0
+/// `SessionActiveClient.tools` is **required** by the pinned `ahp-types` 1.0.0
 /// (no `#[serde(default)]`) and equally required by the specification's own
 /// TypeScript type (`state.d.ts`: `tools: ToolDefinition[]`) — but the
 /// specification's own TypeScript **client** does not send it when it
@@ -794,9 +794,9 @@ fn parse_params<T: DeserializeOwned>(value: Value) -> Result<T, HostError> {
 ///
 /// This is the client leg of the same declaration the host advertises in its
 /// `initialize` result. An `x-manox` key rather than a standard one because
-/// AHP's `ClientCapabilities` (0.9.0) declares `mcpApps` alone and has no field
-/// for a host-initiated request: there is no AHP-native neighbour to prefer, and
-/// this is the only channel the four names have.
+/// AHP's `ClientCapabilities` (through 1.0.0) declares `mcpApps` alone and has
+/// no field for a host-initiated request: there is no AHP-native neighbour to
+/// prefer, and this is the only channel the four names have.
 ///
 /// Unknown names are kept: the host only ever asks for methods it serves, and
 /// refusing an unknown name here would turn a newer client's forward
