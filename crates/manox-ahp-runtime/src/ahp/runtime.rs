@@ -313,6 +313,12 @@ mod accept_without_a_reactor_tests {
         fn rename_session(&self, _: &str, _: &str) -> crate::runtime_trait::RenameOutcome {
             crate::runtime_trait::RenameOutcome::UnknownSession
         }
+        fn set_annotation(&self, _session_id: &str, _annotation: &serde_json::Value) -> bool {
+            false
+        }
+        fn remove_annotation(&self, _session_id: &str, _annotation_id: &str) -> bool {
+            false
+        }
         fn pin_session(&self, _: &str, _: bool) -> bool {
             false
         }

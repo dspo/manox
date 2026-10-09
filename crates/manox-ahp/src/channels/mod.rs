@@ -11,6 +11,7 @@
 //! action envelopes and a subscriber's baseline is pushed right after
 //! `subscribe` (see `ext::actions`).
 
+pub mod annotations;
 pub mod changeset;
 pub mod chat;
 pub mod mcp;
@@ -42,6 +43,8 @@ pub enum Channel {
     /// Not state-bearing: its traffic is raw MCP JSON-RPC forwarded to the
     /// upstream server, not AHP reducer state.
     Mcp(String),
+    /// `ahp-session:/<id>/annotations` — one session's user annotations.
+    Annotations(String),
     /// `ahp-changeset:/<session-id>/<key>` — one changeset view. Reducer
     /// state lives here (`ahp::reducers::apply_action_to_changeset`), seeded
     /// from the runtime's changeset engine.
@@ -58,6 +61,7 @@ impl Channel {
             Self::Session(id) => session::uri(id),
             Self::Chat(id) => chat::uri(id),
             Self::Terminal(id) => terminal::uri(id),
+            Self::Annotations(id) => annotations::uri(id),
             Self::Mcp(key) => format!("mcp://{key}"),
             // Changeset channels carry their full URI verbatim (the parse
             // arm stored it) — `uri()` runs on the snapshot path, so a
@@ -80,6 +84,12 @@ impl Channel {
 pub fn parse(uri: &str) -> Option<Channel> {
     if uri == root::URI {
         return Some(Channel::Root);
+    }
+    // Annotations before the plain session channel: the URI is a session URI
+    // plus a `/annotations` suffix, and the session parser would otherwise
+    // swallow the suffix as part of its id.
+    if let Some(id) = annotations::id(uri) {
+        return Some(Channel::Annotations(id.to_string()));
     }
     if let Some(id) = session::id(uri) {
         return Some(Channel::Session(id.to_string()));
@@ -119,6 +129,9 @@ pub struct ChannelStore {
     /// Changeset views by channel URI, folded with the SDK's changeset
     /// reducer and seeded from the runtime's changeset engine.
     changesets: HashMap<String, ahp_types::state::ChangesetState>,
+    /// Annotation channels by session id, folded with the SDK's annotations
+    /// reducer and seeded from the journal's annotation rows.
+    annotations: HashMap<String, ahp_types::state::AnnotationsState>,
     /// `x-manox-*` channels: their state has no slot in AHP's `SnapshotState`
     /// (ten arms, no generic one), so it is folded here and delivered to
     /// subscribers as extension action envelopes.
@@ -135,6 +148,7 @@ impl ChannelStore {
             chat_owner: HashMap::new(),
             terminals: HashMap::new(),
             changesets: HashMap::new(),
+            annotations: HashMap::new(),
             extensions: HashMap::new(),
         }
     }
@@ -168,6 +182,10 @@ impl ChannelStore {
             // The MCP side-channel is a request/response proxy, not
             // reducer state: nothing to snapshot, nothing to subscribe to.
             Channel::Mcp(_) => None,
+            Channel::Annotations(id) => self
+                .annotations
+                .get(id)
+                .map(|state| SnapshotState::Annotations(Box::new(state.clone()))),
             Channel::Changeset(_) => self.changesets_snapshot(channel),
             Channel::Extension(_) => None,
         }
@@ -211,6 +229,10 @@ impl ChannelStore {
                 Some(state) => ahp::reducers::apply_action_to_changeset(state, action),
                 None => ReduceOutcome::OutOfScope,
             },
+            Channel::Annotations(id) => match self.annotations.get_mut(id) {
+                Some(state) => ahp::reducers::apply_action_to_annotations(state, action),
+                None => ReduceOutcome::OutOfScope,
+            },
         };
         if let Channel::Session(id) = channel {
             self.reindex_chats(id);
@@ -239,6 +261,16 @@ impl ChannelStore {
 
     pub fn insert_terminal(&mut self, id: &str, state: TerminalState) {
         self.terminals.insert(id.to_string(), state);
+    }
+
+    /// Seed (or replace) one annotations channel.
+    pub fn insert_annotations(&mut self, id: &str, state: ahp_types::state::AnnotationsState) {
+        self.annotations.insert(id.to_string(), state);
+    }
+
+    /// One annotations channel's state, when it has been ensured.
+    pub fn annotations(&self, id: &str) -> Option<&ahp_types::state::AnnotationsState> {
+        self.annotations.get(id)
     }
 
     /// Seed (or replace) one changeset view.
