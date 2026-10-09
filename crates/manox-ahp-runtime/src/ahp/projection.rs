@@ -2276,9 +2276,10 @@ impl Translator {
 /// lines); `Edit` is a hashline patch parsed for its per-file footprints —
 /// the sides name the file (a client fetches content through the
 /// `resourceRead` plane), and the counts come from the patch's own
-/// statically-known spans: `SWAP`/`DEL`/`INS`/`CUT` count exactly, while the
-/// bracket-block and clipboard ops resolve against file content or engine
-/// clipboard state the projection never sees, so those contribute 0 and the
+/// statically-known spans: `SWAP`/`DEL`/`INS`/`CUT` count exactly, the
+/// block-replace/insert ops count their inline bodies, and only the block
+/// deletions and clipboard pastes — whose resolution needs file content or
+/// engine clipboard state the projection never sees — contribute 0, so the
 /// stats read as a lower bound. Any other tool, a missing parameter, or an
 /// unparseable patch answers `None` — no preview is better than a wrong one.
 fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection> {
