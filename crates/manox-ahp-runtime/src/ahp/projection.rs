@@ -63,8 +63,9 @@ use ahp_types::common::{JsonObject, StringOrMarkdown, Uri};
 use ahp_types::state::{
     ChatInputMultiSelectQuestion, ChatInputOption, ChatInputQuestion, ChatInputRequest,
     ChatInputResponseKind, ChatInputSingleSelectQuestion, ChatInputTextQuestion, ChatState,
-    ConfirmationOption, ConfirmationOptionKind, ErrorInfo, ErrorResponsePart, MarkdownResponsePart,
-    Message, MessageAttachment, MessageEmbeddedResourceAttachment, MessageKind, MessageOrigin,
+    ConfirmationOption, ConfirmationOptionKind, ContentRef, ErrorInfo, ErrorResponsePart, FileEdit,
+    FileEditCollection, FileEditDiffStats, FileEditSide, MarkdownResponsePart, Message,
+    MessageAttachment, MessageEmbeddedResourceAttachment, MessageKind, MessageOrigin,
     PendingMessageKind, ReasoningResponsePart, ResponsePart, SessionInputRequest,
     SessionToolConfirmationRequest, SystemNotificationResponsePart, ToolCallCancellationReason,
     ToolCallConfirmationReason, ToolCallConfirmationState, ToolCallPendingConfirmationState,
@@ -331,6 +332,9 @@ pub fn status_phase(status: &str) -> Phase {
 struct CallBook {
     tool_name: String,
     title: String,
+    /// The call's journaled parameters (latest row wins) — the source the
+    /// edit-preview face is derived from when the approval gate opens.
+    input: Option<Value>,
     /// A `chat/toolCallStart` created the part.
     started: bool,
     /// The part sits in `pending-confirmation`.
@@ -349,6 +353,7 @@ impl CallBook {
         Self {
             tool_name: tool_name.to_string(),
             title: title.to_string(),
+            input: None,
             started: false,
             awaiting: false,
             working: false,
@@ -360,6 +365,9 @@ impl CallBook {
     /// Adopt the state a seeded (already folded) tool call shows.
     fn adopt(title: &str, state: &ToolCallState) -> Self {
         let mut book = Self::new("", title);
+        // A seeded call's parameters are not recoverable from the folded
+        // state, so the preview face is simply absent across a restart
+        // mid-gate — the next gate re-derives it from its own row.
         book.started = true;
         match state {
             ToolCallState::Streaming(_) => {}
@@ -1559,6 +1567,9 @@ impl Translator {
                 turn.calls
                     .insert(call_id.to_string(), CallBook::new(name, title));
             }
+            if let Some(book) = turn.calls.get_mut(call_id) {
+                book.input = Some(input.clone());
+            }
             fresh
         };
         if first {
@@ -2227,7 +2238,11 @@ impl Translator {
             tool_input: None,
             confirmation_title: None,
             risk_assessment: None,
-            edits: None,
+            // The AHP 1.0 edit-preview face: the call's journaled parameters
+            // become the edits a client renders before its verdict.
+            edits: self
+                .call(call_id)
+                .and_then(|call| preview_edits(&call.tool_name, call.input.as_ref())),
             editable: None,
             options: Some(approval_options()),
         }
@@ -2252,6 +2267,101 @@ impl Translator {
             .as_ref()
             .map(|turn| turn.id.clone())
             .unwrap_or_default()
+    }
+}
+
+/// The AHP 1.0 edit-preview face of one tool call's journaled parameters.
+///
+/// `Write` is a creation (an after side only, counted from the content's
+/// lines); `Edit` is a hashline patch parsed for its per-file footprints —
+/// the sides name the file (a client fetches content through the
+/// `resourceRead` plane), and the counts come from the patch's own
+/// statically-known spans: `SWAP`/`DEL`/`INS`/`CUT` count exactly, while the
+/// bracket-block and clipboard ops resolve against file content or engine
+/// clipboard state the projection never sees, so those contribute 0 and the
+/// stats read as a lower bound. Any other tool, a missing parameter, or an
+/// unparseable patch answers `None` — no preview is better than a wrong one.
+fn preview_edits(name: &str, input: Option<&Value>) -> Option<FileEditCollection> {
+    use manox_harness::core::hashline::{FileOp, Op};
+    let input = input?;
+    let side = |uri: &str| {
+        Some(FileEditSide {
+            uri: file_uri(uri),
+            content: ContentRef {
+                uri: file_uri(uri),
+                size_hint: None,
+                content_type: None,
+                nonce: None,
+            },
+        })
+    };
+    match name {
+        "Write" => {
+            let path = input.get("path")?.as_str()?;
+            let content = input.get("content").and_then(Value::as_str)?;
+            let added = content.lines().count() as i64;
+            let after = side(path);
+            Some(FileEditCollection {
+                items: vec![FileEdit {
+                    before: None,
+                    after,
+                    diff: Some(FileEditDiffStats {
+                        added: Some(added),
+                        removed: Some(0),
+                    }),
+                }],
+            })
+        }
+        "Edit" => {
+            let patch = input.get("patch")?.as_str()?;
+            let parsed = manox_harness::core::hashline::parse_patch(patch).ok()?;
+            let items = parsed
+                .files
+                .iter()
+                .map(|file| {
+                    let path = file.path.display().to_string();
+                    let mut added = 0i64;
+                    let mut removed = 0i64;
+                    for op in &file.ops {
+                        match op {
+                            Op::Swap { start, end, body } => {
+                                removed += (*end - *start + 1) as i64;
+                                added += body.len() as i64;
+                            }
+                            Op::Del { start, end } | Op::Cut { start, end } => {
+                                removed += (*end - *start + 1) as i64;
+                            }
+                            Op::Ins { body, .. }
+                            | Op::SwapBlk { body, .. }
+                            | Op::InsBlkPost { body, .. } => {
+                                added += body.len() as i64;
+                            }
+                            // Block deletions and pastes resolve against file
+                            // content or clipboard state the fold never sees:
+                            // they contribute 0 to the preview's lower bound.
+                            Op::DelBlk { .. } | Op::CutBlk { .. } | Op::Paste { .. } => {}
+                        }
+                    }
+                    // `REM` is a deletion (before only); a `MV` keeps both
+                    // sides on the source path — the destination is the
+                    // engine's business until it lands.
+                    let (before, after) = match file.file_op {
+                        Some(FileOp::Rem) => (side(&path), None),
+                        _ => (side(&path), side(&path)),
+                    };
+                    FileEdit {
+                        before,
+                        after,
+                        diff: Some(FileEditDiffStats {
+                            added: Some(added),
+                            removed: Some(removed),
+                        }),
+                    }
+                })
+                .collect();
+            Some(FileEditCollection { items })
+        }
+        _ => None,
     }
 }
 
@@ -3359,6 +3469,106 @@ mod fold_semantics_tests {
             None,
             "no text means no fabricated question card"
         );
+    }
+}
+
+#[cfg(test)]
+mod preview_edits_tests {
+    use super::*;
+
+    fn kernel(mut fields: Value) -> SessionTreeEntry {
+        let mut base = json!({
+            "id": "e-1",
+            "parentId": None::<String>,
+            "timestamp": "2026-10-09T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("kernel fixture failed: {e} — {base}"))
+    }
+
+    /// The approval gate opens with the preview face derived from the call's
+    /// own journaled parameters: an `Edit` patch becomes per-file edits with
+    /// statically-counted spans, a `Write` becomes a creation (after side
+    /// only), and the counts ride the diff stats.
+    #[test]
+    fn the_approval_gate_carries_the_edit_preview_face() {
+        let mut t = Translator::new();
+        let mut out = Vec::new();
+        for (seq, entry) in [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-1",
+                "name": "Edit", "title": "edit src", "status": "pending-approval",
+                "input": {"patch": "[src/a.rs#1A2B3C]\nSWAP 2.=3:\nfresh line"},
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-3", "kind": "request", "authId": "a-1",
+                "payload": {"toolName": "Edit", "toolCallId": "t-1"},
+            })),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.extend(t.on_entry("c-1", "s-1", seq as u64, &entry));
+        }
+        let edits = out
+            .iter()
+            .find_map(|e| {
+                let v = serde_json::to_value(&e.action).ok()?;
+                v.pointer("/request/toolCall/edits")
+                    .cloned()
+                    .filter(|edits| !edits.is_null())
+            })
+            .expect("the pending state carries the preview");
+        assert_eq!(edits["items"][0]["before"]["uri"], "file:///src/a.rs");
+        assert_eq!(edits["items"][0]["after"]["uri"], "file:///src/a.rs");
+        assert_eq!(edits["items"][0]["diff"]["added"], 1);
+        assert_eq!(edits["items"][0]["diff"]["removed"], 2);
+
+        // A creation is the after side alone.
+        let mut t = Translator::new();
+        let mut out = Vec::new();
+        for (seq, entry) in [
+            kernel(json!({"type": "turn_start"})),
+            kernel(json!({
+                "type": "tool_call", "id": "e-2", "callId": "t-2",
+                "name": "Write", "title": "write new", "status": "pending-approval",
+                "input": {"path": "/src/new.rs", "content": "one\ntwo\nthree"},
+            })),
+            kernel(json!({
+                "type": "approval", "id": "e-3", "kind": "request", "authId": "a-2",
+                "payload": {"toolName": "Write", "toolCallId": "t-2"},
+            })),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            out.extend(t.on_entry("c-1", "s-1", seq as u64, &entry));
+        }
+        let edits = out
+            .iter()
+            .find_map(|e| {
+                let v = serde_json::to_value(&e.action).ok()?;
+                v.pointer("/request/toolCall/edits")
+                    .cloned()
+                    .filter(|edits| !edits.is_null())
+            })
+            .expect("the write gate carries the preview");
+        assert!(
+            edits["items"][0]["before"].is_null(),
+            "a creation has no before side"
+        );
+        assert_eq!(edits["items"][0]["after"]["uri"], "file:///src/new.rs");
+        assert_eq!(edits["items"][0]["diff"]["added"], 3);
+
+        // A tool with no file face previews nothing — no preview beats a wrong
+        // one.
+        let preview = preview_edits("bash", Some(&json!({"command": "ls"})));
+        assert!(preview.is_none());
     }
 }
 
