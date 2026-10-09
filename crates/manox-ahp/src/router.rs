@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use ahp_types::actions::{
-    ActionEnvelope, ActionOrigin, SessionChatAddedAction, SessionReadyAction, StateAction,
+    ActionEnvelope, ActionOrigin, SessionChatAddedAction, SessionChatRemovedAction,
+    SessionReadyAction, StateAction,
 };
 use ahp_types::commands::{
     CompletionsParams, CompletionsResult, CreateChatParams, CreateSessionParams,
@@ -120,6 +121,7 @@ async fn dispatch_request(
         "createTerminal" => create_terminal(inner, params).await,
         "disposeTerminal" => dispose_terminal(inner, params),
         "createChat" => create_chat(inner, conn, params).await,
+        "moveChat" => move_chat(inner, conn, params).await,
         "disposeChat" => dispose_chat(inner, params),
         "fetchTurns" => fetch_turns(inner, params),
         "invokeChangesetOperation" => invoke_changeset_operation(inner, params).await,
@@ -654,6 +656,56 @@ fn dispose_terminal(inner: &Arc<Inner>, params: Value) -> Result<Value, HostErro
     inner.backend.dispose_terminal(&terminal_id)?;
     inner.store.write().remove_terminal(&terminal_id);
     Ok(Value::Null)
+}
+
+async fn move_chat(
+    inner: &Arc<Inner>,
+    _conn: &Arc<Conn>,
+    params: Value,
+) -> Result<Value, HostError> {
+    let params: ahp_types::commands::MoveChatParams = parse_params(params)?;
+    let source_chat_id = chat::id(&params.channel)
+        .ok_or_else(|| HostError::InvalidParams("moveChat channel".to_string()))?
+        .to_string();
+    // The owning session of the moved chat (manox: the chat IS the journal,
+    // and the catalog's chat_owner map knows its session).
+    let source_session = inner
+        .store
+        .read()
+        .chat_session(&source_chat_id)
+        .map(str::to_string);
+    let result = inner.backend.move_chat(&params)?;
+    // The catalog edges: the source session loses the chat, the destination
+    // session's catalog gains it (the re-home seeds the destination's state,
+    // so its summary reads from there). Sessions the store has not surfaced
+    // keep their snapshots as the recovery path — the move is durable in the
+    // journals either way.
+    if let Some(source_session) = source_session {
+        inner.publish(
+            &session::uri(&source_session),
+            StateAction::SessionChatRemoved(SessionChatRemovedAction {
+                chat: params.channel.clone(),
+            }),
+            None,
+        );
+    }
+    if let Some(new_session_id) = session::id(&result.session) {
+        let new_chat_id = new_session_id.to_string();
+        let state = inner.backend.chat_state(&new_chat_id);
+        if let Some(state) = state {
+            let summary = chat::summary(&state);
+            inner
+                .store
+                .write()
+                .insert_chat(new_session_id, &new_chat_id, state);
+            inner.publish(
+                &session::uri(new_session_id),
+                StateAction::SessionChatAdded(SessionChatAddedAction { summary }),
+                None,
+            );
+        }
+    }
+    serde_json::to_value(&result).map_err(|_| HostError::Backend("moveChat result".to_string()))
 }
 
 async fn create_chat(

@@ -1471,6 +1471,89 @@ impl Backend for RuntimeBackend {
         Ok(())
     }
 
+    fn move_chat(
+        &self,
+        params: &ahp_types::commands::MoveChatParams,
+    ) -> Result<ahp_types::commands::MoveChatResult, HostError> {
+        use ahp_types::commands::ChatMoveDestination;
+        // A manox chat *is* a journal and one session holds exactly one, so
+        // the chat is its session's default chat by construction. A move
+        // therefore cannot land inside another session (that would merge two
+        // journals); the `newSession` destination is the well-defined half —
+        // the journal re-homes wholesale, the source session retires.
+        let source_id = chat::id(&params.channel)
+            .ok_or_else(|| HostError::InvalidParams("moveChat channel".to_string()))?
+            .to_string();
+        let owner = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("x-manox"))
+            .and_then(|ext| ext.get("clientId"))
+            .and_then(Value::as_str)
+            .unwrap_or("ahp")
+            .to_string();
+        match &params.destination {
+            ChatMoveDestination::Session(_) => Err(HostError::Unimplemented(
+                "one journal is one session: a chat cannot merge into another session's journal; \
+                 use the newSession destination to re-home it"
+                    .to_string(),
+            )),
+            ChatMoveDestination::Unknown(kind) => {
+                Err(HostError::Unimplemented(format!("moveChat{{{kind}}}")))
+            }
+            ChatMoveDestination::NewSession(_) => {
+                // A running session is not movable: the source retires as
+                // part of the move, and retiring a live turn out from under
+                // its engine is exactly the kind of silent divergence the
+                // write-lease model exists to prevent.
+                if manox_agent::thread_store::global().with_mut(|s| s.is_running(&source_id)) {
+                    return Err(HostError::Conflict(format!(
+                        "session {source_id} has a live turn; move it after the turn settles"
+                    )));
+                }
+                // The whole chain moves: the through anchor is the source's
+                // last durable row.
+                let snapshot = block_on(crate::journal_query::cold_read(&source_id));
+                let last_entry = match snapshot {
+                    crate::journal_query::ColdRead::Data(snapshot) => snapshot
+                        .records
+                        .last()
+                        .map(|record| record.entry.id().to_string()),
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    HostError::InvalidParams(format!(
+                        "moveChat source {source_id} is empty — a session with no \
+                         journal rows has nothing to re-home; submit to it first"
+                    ))
+                })?;
+                let fresh = uuid::Uuid::new_v4().to_string();
+                let intent = crate::runtime_trait::ForkIntent {
+                    source_session_id: source_id.clone(),
+                    through_entry_id: last_entry,
+                    target_session_id: Some(fresh.clone()),
+                    cwd: None,
+                    project: None,
+                    initial_model: None,
+                    approval_mode: None,
+                    reasoning_effort: None,
+                };
+                self.server
+                    .fork_session(&owner, intent)
+                    .map_err(|error| HostError::Backend(error.message))?;
+                // The source session retires as moved: archived, so the list
+                // face stops offering it while the journal stays forensically
+                // present (a move is atomic at the copy boundary; the source
+                // is never deleted out from under a reader).
+                self.server.archive_session(&owner, &source_id, true);
+                let _ = block_on(self.seeded(&fresh));
+                Ok(ahp_types::commands::MoveChatResult {
+                    session: session::uri(&fresh),
+                })
+            }
+        }
+    }
+
     fn create_chat(
         &self,
         session_id: &str,

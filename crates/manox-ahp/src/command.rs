@@ -47,6 +47,7 @@ pub enum Command {
     DisposeSession,
     /// Create a chat inside a session.
     CreateChat,
+    MoveChat,
     /// Dispose a chat.
     DisposeChat,
     /// Page older turns into a chat's state.
@@ -115,7 +116,7 @@ impl Command {
     /// so a diff against upstream is a straight read. The count is asserted:
     /// 30 commands + 2 notifications.
     pub const ALL: &'static [(&'static str, Command)] = &[
-        // ── CommandMap (30) ────────────────────────────────────────────
+        // ── CommandMap (31) ────────────────────────────────────────────
         ("initialize", Command::Initialize),
         ("ping", Command::Ping),
         ("reconnect", Command::Reconnect),
@@ -123,6 +124,7 @@ impl Command {
         ("createSession", Command::CreateSession),
         ("disposeSession", Command::DisposeSession),
         ("createChat", Command::CreateChat),
+        ("moveChat", Command::MoveChat),
         ("disposeChat", Command::DisposeChat),
         ("createTerminal", Command::CreateTerminal),
         ("disposeTerminal", Command::DisposeTerminal),
@@ -164,7 +166,7 @@ impl Command {
     ///
     /// The remainder are the two client notifications, which this host routes
     /// through the same table but which upstream types separately.
-    pub const UPSTREAM_COMMAND_COUNT: usize = 30;
+    pub const UPSTREAM_COMMAND_COUNT: usize = 31;
 
     /// The command a wire method names, if this host knows the name at all.
     pub fn of_method(method: &str) -> Option<Self> {
@@ -190,6 +192,7 @@ impl Command {
             | Self::CreateSession
             | Self::DisposeSession
             | Self::CreateChat
+            | Self::MoveChat
             | Self::DisposeChat
             | Self::CreateTerminal
             | Self::DisposeTerminal
@@ -256,7 +259,7 @@ mod tests {
         assert_eq!(
             Command::ALL.len(),
             Command::UPSTREAM_COMMAND_COUNT + 2,
-            "CommandMap (30) plus the two ClientNotificationMap names"
+            "CommandMap (31) plus the two ClientNotificationMap names"
         );
         let upstream = Command::ALL
             .iter()

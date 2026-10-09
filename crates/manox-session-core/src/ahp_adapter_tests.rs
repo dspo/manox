@@ -1241,6 +1241,104 @@ mod dispatch {
         uninstall();
     }
 
+    /// `moveChat{newSession}` re-homes the journal wholesale (#876): the
+    /// whole chain lands on a fresh session id, the source session retires
+    /// as archived, and the result names the new home. A `session`
+    /// destination is refused with the one-journal-one-session reason.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_chat_rehomes_the_journal_to_a_new_session() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        // A richer source than the fork fixture's: a completed turn with its
+        // opening rows, so the re-homed fold holds a settled turn.
+        super::seed_session(
+            "s-move",
+            "s-move",
+            "/work/src",
+            vec![
+                ("m-start", super::turn_start()),
+                ("m-user", super::user("move me")),
+                ("m-finish", super::turn_finish()),
+            ],
+        )
+        .await;
+        manox_agent::thread_store::global().with_mut(|s| s.insert_summary_for_test("s-move", None));
+        let source = "s-move".to_string();
+
+        let result = backend
+            .move_chat(&ahp_types::commands::MoveChatParams {
+                channel: chat::uri(&source),
+                meta: None,
+                destination: ahp_types::commands::ChatMoveDestination::NewSession(
+                    ahp_types::commands::ChatMoveToNewSessionDestination {},
+                ),
+            })
+            .expect("the re-home lands");
+        let new_session = session::id(&result.session).expect("the result names a session");
+        assert_ne!(new_session, source, "the move mints a fresh session id");
+        let new_state = backend
+            .chat_state(new_session)
+            .expect("the re-homed chat is foldable on its new id");
+        assert!(
+            !new_state.turns.is_empty(),
+            "the whole chain moved with the chat"
+        );
+        let archived = manox_agent::thread_store::global().with_mut(|s| {
+            s.summary_by_id(&source)
+                .map(|row| row.archived)
+                .unwrap_or(false)
+        });
+        assert!(archived, "the source session retires as moved");
+
+        // A `session` destination is the merge manox cannot do: one journal
+        // is one session, and merging two journals is not a row-level
+        // operation. The refusal names the alternative.
+        let refused = backend.move_chat(&ahp_types::commands::MoveChatParams {
+            channel: chat::uri(new_session),
+            meta: None,
+            destination: ahp_types::commands::ChatMoveDestination::Session(
+                ahp_types::commands::ChatMoveToSessionDestination {
+                    session: session::uri("elsewhere"),
+                    after: None,
+                },
+            ),
+        });
+        assert!(
+            matches!(&refused, Err(e) if matches!(e, manox_ahp::error::HostError::Unimplemented(reason)
+                if reason.contains("one journal is one session"))),
+            "the merge destination is refused with the architecture reason: {refused:?}"
+        );
+        uninstall();
+    }
+
+    /// A session with a live turn is not movable (#887): the move retires
+    /// the source, and retiring a running engine's journal is the divergence
+    /// the write-lease model exists to prevent. The refusal is a Conflict
+    /// that names the condition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn move_chat_refuses_a_session_with_a_live_turn() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let source = seed_fork_source().await;
+        // A live turn is the store's `is_running` bit — the same fact the
+        // dispatch path consults.
+        manox_agent::thread_store::global().with_mut(|s| s.mark_running(&source));
+
+        let refused = backend.move_chat(&ahp_types::commands::MoveChatParams {
+            channel: chat::uri(&source),
+            meta: None,
+            destination: ahp_types::commands::ChatMoveDestination::NewSession(
+                ahp_types::commands::ChatMoveToNewSessionDestination {},
+            ),
+        });
+        assert!(
+            matches!(&refused, Err(manox_ahp::error::HostError::Conflict(reason))
+                if reason.contains("live turn")),
+            "a running session refuses the move as a Conflict: {refused:?}"
+        );
+        uninstall();
+    }
+
     /// A `sideChat` keeps its source out of the visible history — a policy the
     /// journal has no row for, so it is refused rather than faked as a fork.
     #[tokio::test(flavor = "multi_thread")]

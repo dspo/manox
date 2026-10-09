@@ -144,6 +144,16 @@ pub trait Backend: Send + Sync + 'static {
         None
     }
 
+    /// Atomically move a host-authorized chat (AHP 1.0 `moveChat`). The
+    /// default answers unimplemented; runtimes that own journals implement
+    /// the re-home.
+    fn move_chat(
+        &self,
+        _params: &ahp_types::commands::MoveChatParams,
+    ) -> Result<ahp_types::commands::MoveChatResult, HostError> {
+        Err(HostError::Unimplemented("moveChat".to_string()))
+    }
+
     /// The changeset view of one `ahp-changeset:/…` channel, computed on
     /// first sight by the runtime's changeset engine. `None` = not found.
     fn changeset_state(&self, _channel: &str) -> Option<ahp_types::state::ChangesetState> {
