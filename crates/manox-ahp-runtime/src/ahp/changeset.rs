@@ -26,9 +26,9 @@ use ahp_types::actions::{
 };
 use ahp_types::common::JsonObject;
 use ahp_types::state::{
-    Changeset, ChangesetCapabilities, ChangesetFile, ChangesetOperation, ChangesetOperationScope,
-    ChangesetOperationStatus, ChangesetState, ChangesetStatus, ContentRef, ErrorInfo, FileEdit,
-    FileEditDiffStats, FileEditSide,
+    ChangesSummary, Changeset, ChangesetCapabilities, ChangesetFile, ChangesetOperation,
+    ChangesetOperationScope, ChangesetOperationStatus, ChangesetState, ChangesetStatus, ContentRef,
+    ErrorInfo, FileEdit, FileEditDiffStats, FileEditSide,
 };
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -502,6 +502,34 @@ impl Engine {
             .and_then(|entry| entry.has_repo.then(|| catalogue_entry(session_id)))
     }
 
+    /// The chat face of the engine's current state: the catalogue plus the
+    /// aggregate line/file counts, for `ChatState.changesets` and
+    /// `ChatSummary.changes` (AHP 1.0's per-chat footprint, visible without
+    /// subscribing the changeset channel). Read-only over the last scan —
+    /// an unknown session or a directory set with no repository answers
+    /// `None`, the same "never advertised" shape as [`Engine::state`].
+    pub fn chat_face(&self, session_id: &str) -> Option<(Vec<Changeset>, ChangesSummary)> {
+        let sessions = self.sessions.lock();
+        let entry = sessions.get(session_id)?;
+        if !entry.has_repo {
+            return None;
+        }
+        let mut additions = 0i64;
+        let mut deletions = 0i64;
+        for file in &entry.files {
+            if let Some(diff) = &file.edit.diff {
+                additions += diff.added.unwrap_or(0);
+                deletions += diff.removed.unwrap_or(0);
+            }
+        }
+        let summary = ChangesSummary {
+            additions: Some(additions),
+            deletions: Some(deletions),
+            files: Some(entry.files.len() as i64),
+        };
+        Some((vec![catalogue_entry(session_id)], summary))
+    }
+
     /// Drop one session's cached changeset (its directories and full patch
     /// bodies) — the dispose path; without it the table only ever grows on a
     /// long-running host.
@@ -832,6 +860,24 @@ mod tests {
         assert_eq!(parse(&uri("s-1")), Some(("s-1".to_string(), KEY)));
         assert_eq!(parse("ahp-changeset:/s-1"), None);
         assert_eq!(parse("ahp-chat:/c-1"), None);
+    }
+
+    #[test]
+    fn chat_face_counts_the_footprint_over_the_last_scan() {
+        let engine = one_file_git();
+        engine
+            .catalogue("s-1", vec![PathBuf::from("/repo")])
+            .expect("repo present");
+        let (changesets, changes) = engine.chat_face("s-1").expect("the face follows the scan");
+        assert_eq!(changesets.len(), 1);
+        assert_eq!(changesets[0].label, "Uncommitted Changes");
+        assert_eq!(changes.additions, Some(3));
+        assert_eq!(changes.deletions, Some(1));
+        assert_eq!(changes.files, Some(1));
+        // A session the engine has never seen has no face (the never-advertised
+        // shape; the no-repo case is covered by
+        // `a_session_with_no_repository_advertises_nothing`).
+        assert!(engine.chat_face("s-unknown").is_none());
     }
 
     #[test]

@@ -19,7 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
-use ahp_types::actions::{ActionOrigin, ChatPendingMessageRemovedAction, StateAction};
+use ahp_types::actions::{
+    ActionOrigin, ChatChangesetsChangedAction, ChatPendingMessageRemovedAction, PartialChatSummary,
+    SessionChatUpdatedAction, StateAction,
+};
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
     AgentInfo, ChatState, RootState, SessionModelInfo, SessionState, SessionSummary, TerminalState,
@@ -334,7 +337,7 @@ impl RuntimeBackend {
         // A session created moments ago has no journal line yet: it is an empty
         // chat, not an unknown one. Subscribing to a brand-new session must work,
         // and the bridge picks its entries up from seq 0 onward.
-        let (chat, tail) = match fold_journal(session_id, &thread_id).await {
+        let (mut chat, tail) = match fold_journal(session_id, &thread_id).await {
             Some(fold) => (fold.chat, fold.tail),
             None => (chat::initial(session_id), 0),
         };
@@ -349,6 +352,20 @@ impl RuntimeBackend {
             Some(state) => state,
             None => session::initial_empty(&thread_id),
         };
+        // The changeset face rides the chat snapshot (AHP 1.0's per-chat
+        // catalogue + aggregate counts): the engine's first-sight scan seeds
+        // it, so a subscriber sees the session's footprint without also
+        // subscribing the changeset channel.
+        let dirs = seed_directories(session_id).await.unwrap_or_default();
+        if super::changeset::Engine::global()
+            .catalogue(session_id, dirs)
+            .is_some()
+            && let Some((changesets, changes)) =
+                super::changeset::Engine::global().chat_face(session_id)
+        {
+            chat.changesets = Some(changesets);
+            chat.changes = Some(changes);
+        }
         let seeded = Arc::new(Seeded {
             thread_id,
             session: session_state,
@@ -637,6 +654,36 @@ impl RuntimeBackend {
                     {
                         host.publish(&channel, action, None);
                     }
+                }
+                // The footprint's chat-face edges follow the same recompute:
+                // the catalogue replaces wholesale (`chat/changesetsChanged`)
+                // and the aggregate counts ride the session catalogue delta,
+                // so summary badges track the turn's changes without a
+                // resubscribe.
+                if let Some((changesets, changes)) =
+                    super::changeset::Engine::global().chat_face(&session)
+                    && let Some(host) = backend.host()
+                {
+                    let chat_channel = format!("ahp-chat:/{session}");
+                    host.publish(
+                        &chat_channel,
+                        StateAction::ChatChangesetsChanged(ChatChangesetsChangedAction {
+                            changesets: Some(changesets),
+                        }),
+                        None,
+                    );
+                    let session_channel = format!("ahp-session:/{session}");
+                    host.publish(
+                        &session_channel,
+                        StateAction::SessionChatUpdated(SessionChatUpdatedAction {
+                            chat: chat_channel,
+                            changes: PartialChatSummary {
+                                changes: Some(changes),
+                                ..PartialChatSummary::default()
+                            },
+                        }),
+                        None,
+                    );
                 }
             });
         }

@@ -89,7 +89,9 @@ pub fn summary(state: &ChatState) -> ChatSummary {
         status: state.status,
         activity: state.activity.clone(),
         modified_at: state.modified_at.clone(),
-        changes: None,
+        // The aggregate footprint rides the catalogue entry whenever the
+        // chat state carries it (seeded from the changeset engine).
+        changes: state.changes.clone(),
         origin: state.origin.clone(),
         movable: None,
         interactivity: state.interactivity,
