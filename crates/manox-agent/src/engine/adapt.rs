@@ -206,10 +206,10 @@ pub fn harness_messages_to_messages(input: &[AgentMessage]) -> Vec<Message> {
 
 /// Project the session entry list onto the display sequence the UI mirror
 /// and the conversation rebuild share: every projected context message
-/// becomes a `HistoryEntry::Message`, and `manox_ui_note` custom entries
-/// become `HistoryEntry::Note` at their persisted position. Returns the
-/// positioned notes alongside so live mirror refreshes can re-merge them
-/// (the live transcript carries no custom entries).
+/// becomes a `HistoryEntry::Message`, `manox_ui_note` custom entries and
+/// UI-note annotation cards become `HistoryEntry::Note` at their persisted
+/// position. Returns the positioned notes alongside so live mirror refreshes
+/// can re-merge them (the live transcript carries no custom entries).
 /// A compaction boundary carrying a materialized `retained_tail` also folds
 /// away notes inside the kept segment (the tail payload holds only
 /// messages) — the same loss as the summarized history itself.
@@ -219,38 +219,129 @@ pub fn entries_to_display(
     let mut display: Vec<HistoryEntry> = Vec::new();
     let mut notes: Vec<PositionedNote> = Vec::new();
     let mut message_count = 0usize;
+    // Folded annotation cards by annotation id, with each card's index in
+    // both output lists — an `annotation_removed` row (or a re-set of the
+    // same id) retracts the card that id last folded to.
+    let mut folded: Vec<(String, usize, usize)> = Vec::new();
     for entry in entries {
-        if let manox_harness::session::SessionTreeEntry::Custom {
-            custom_type, data, ..
-        } = entry
-        {
-            if custom_type == UI_NOTE_CUSTOM_TYPE {
-                match data
-                    .as_ref()
-                    .map(|d| serde_json::from_value::<UiNoteRecord>(d.clone()))
-                {
-                    Some(Ok(note)) => {
-                        notes.push(PositionedNote {
-                            note: note.clone(),
-                            after_message: message_count,
-                        });
-                        display.push(HistoryEntry::Note(note));
+        match entry {
+            manox_harness::session::SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } => {
+                if custom_type == UI_NOTE_CUSTOM_TYPE {
+                    match data
+                        .as_ref()
+                        .map(|d| serde_json::from_value::<UiNoteRecord>(d.clone()))
+                    {
+                        Some(Ok(note)) => {
+                            notes.push(PositionedNote {
+                                note: note.clone(),
+                                after_message: message_count,
+                            });
+                            display.push(HistoryEntry::Note(note));
+                        }
+                        Some(Err(err)) => {
+                            tracing::warn!(error = %err, "unparseable UI note entry skipped")
+                        }
+                        None => {}
                     }
-                    Some(Err(err)) => {
-                        tracing::warn!(error = %err, "unparseable UI note entry skipped")
-                    }
-                    None => {}
+                }
+                continue;
+            }
+            manox_harness::session::SessionTreeEntry::AnnotationSet { annotation, .. } => {
+                if let Some((id, note)) = annotation_ui_note(annotation) {
+                    retract_note(&mut folded, &id, &mut display, &mut notes);
+                    notes.push(PositionedNote {
+                        note: note.clone(),
+                        after_message: message_count,
+                    });
+                    display.push(HistoryEntry::Note(note));
+                    folded.push((id, display.len() - 1, notes.len() - 1));
                 }
             }
-            continue;
-        }
-        for message in manox_harness::session::session_entry_to_context_messages(entry) {
-            let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
-            message_count += mapped.len();
-            display.extend(mapped.into_iter().map(HistoryEntry::Message));
+            manox_harness::session::SessionTreeEntry::AnnotationRemoved {
+                annotation_id, ..
+            } => {
+                retract_note(&mut folded, annotation_id, &mut display, &mut notes);
+            }
+            _ => {
+                for message in manox_harness::session::session_entry_to_context_messages(entry) {
+                    let mapped = harness_messages_to_messages(std::slice::from_ref(&message));
+                    message_count += mapped.len();
+                    display.extend(mapped.into_iter().map(HistoryEntry::Message));
+                }
+            }
         }
     }
     (display, notes)
+}
+
+/// Drop a folded annotation card from both output lists, closing the gap so
+/// the cards folded after it keep valid recorded positions.
+fn retract_note(
+    folded: &mut Vec<(String, usize, usize)>,
+    annotation_id: &str,
+    display: &mut Vec<HistoryEntry>,
+    notes: &mut Vec<PositionedNote>,
+) {
+    let Some(ix) = folded.iter().position(|(id, _, _)| id == annotation_id) else {
+        return;
+    };
+    let (display_ix, note_ix) = (folded[ix].1, folded[ix].2);
+    folded.remove(ix);
+    display.remove(display_ix);
+    notes.remove(note_ix);
+    for (_, at_display, at_note) in folded.iter_mut() {
+        if *at_display > display_ix {
+            *at_display -= 1;
+        }
+        if *at_note > note_ix {
+            *at_note -= 1;
+        }
+    }
+}
+
+/// The UI note card an annotation row folds to. Only annotations stamped
+/// `_meta["x-manox"]["uiNoteKind"]` are note cards (the desktop app's write
+/// shape — the kind and the optional tool anchoring ride that slot, the text
+/// is the entries joined); plain review annotations have no card.
+fn annotation_ui_note(annotation: &serde_json::Value) -> Option<(String, UiNoteRecord)> {
+    let id = annotation.get("id")?.as_str()?.to_string();
+    let xmanox = annotation.get("_meta")?.get("x-manox")?;
+    let kind = match xmanox.get("uiNoteKind")?.as_str()? {
+        "error" => crate::db::UiNoteKind::Error,
+        "plan_review" => crate::db::UiNoteKind::PlanReview,
+        _ => crate::db::UiNoteKind::Notice,
+    };
+    let text = annotation
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .filter_map(annotation_entry_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut data = serde_json::Map::new();
+    data.insert("text".to_string(), serde_json::json!(text));
+    if let Some(tool_call_id) = xmanox.get("toolCallId").and_then(serde_json::Value::as_str) {
+        data.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
+    }
+    Some((
+        id,
+        UiNoteRecord {
+            kind,
+            data: serde_json::Value::Object(data),
+        },
+    ))
+}
+
+/// One annotation entry's text — a bare string or the `{ "markdown": ... }`
+/// object the wire form allows.
+fn annotation_entry_text(entry: &serde_json::Value) -> Option<String> {
+    match entry.get("text")? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(object) => object.get("markdown")?.as_str().map(str::to_string),
+        _ => None,
+    }
 }
 
 /// One content block onto one manox content block.
@@ -644,6 +735,7 @@ pub(crate) fn arg_hint(arguments: &serde_json::Value) -> Option<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::UiNoteKind;
     use manox_harness::session::SessionTreeEntry;
 
     fn message_entry(id: &str, text: &str) -> SessionTreeEntry {
@@ -733,6 +825,111 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["m", "m", "n", "m"]);
+    }
+
+    fn annotation_set_entry(id: &str, annotation: serde_json::Value) -> SessionTreeEntry {
+        SessionTreeEntry::AnnotationSet {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            annotation,
+        }
+    }
+
+    fn annotation_removed_entry(id: &str, annotation_id: &str) -> SessionTreeEntry {
+        SessionTreeEntry::AnnotationRemoved {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: chrono::Utc::now(),
+            annotation_id: annotation_id.to_string(),
+        }
+    }
+
+    /// The app's note-card write shape: kind and optional tool anchoring ride
+    /// `_meta["x-manox"]`, the text is the entries.
+    fn ui_note_annotation(id: &str, text: &str, tool_call_id: Option<&str>) -> serde_json::Value {
+        let mut xmanox = json!({ "uiNoteKind": "error" });
+        if let Some(tool) = tool_call_id {
+            xmanox["toolCallId"] = json!(tool);
+        }
+        json!({
+            "id": id,
+            "origin": {"session": "ahp-session:/s-1"},
+            "resource": "ahp-session:/s-1",
+            "resolved": false,
+            "entries": [{"id": format!("{id}-e1"), "text": text}],
+            "_meta": {"x-manox": xmanox},
+        })
+    }
+
+    #[test]
+    fn entries_to_display_folds_annotation_cards_with_kind_and_tool_anchor() {
+        let entries = vec![
+            message_entry("m1", "one"),
+            annotation_set_entry("a1", ui_note_annotation("note-1", "boom", Some("tu_1"))),
+            message_entry("m2", "two"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].after_message, 1);
+        let HistoryEntry::Note(note) = &display[1] else {
+            panic!("expected the annotation card folded in place: {display:?}");
+        };
+        assert_eq!(note.kind, UiNoteKind::Error);
+        assert_eq!(note.data["text"], "boom");
+        assert_eq!(note.data["tool_call_id"], "tu_1");
+    }
+
+    #[test]
+    fn entries_to_display_retracts_removed_annotations_latest_wins() {
+        let entries = vec![
+            message_entry("m1", "one"),
+            annotation_set_entry("a1", ui_note_annotation("note-1", "first", None)),
+            annotation_removed_entry("a2", "note-1"),
+            message_entry("m2", "two"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert!(notes.is_empty(), "the removal retracted the card");
+        assert_eq!(display.len(), 2, "only the messages remain");
+
+        // A re-set of the same id retracts the earlier fold: the card lands
+        // at the newest position carrying the newest payload.
+        let entries = vec![
+            message_entry("m1", "one"),
+            annotation_set_entry("a1", ui_note_annotation("note-1", "first", None)),
+            message_entry("m2", "two"),
+            message_entry("m3", "three"),
+            annotation_set_entry("a2", ui_note_annotation("note-1", "second", None)),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].after_message, 3);
+        assert_eq!(notes[0].note.data["text"], "second");
+        assert_eq!(
+            display
+                .iter()
+                .filter(|e| matches!(e, HistoryEntry::Note(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn entries_to_display_skips_plain_review_annotations() {
+        let plain = json!({
+            "id": "rev-1",
+            "origin": {"session": "ahp-session:/s-1"},
+            "resource": "file:///src/a.rs",
+            "resolved": false,
+            "entries": [{"id": "rev-1-e1", "text": "check the anchor drift"}],
+        });
+        let entries = vec![
+            annotation_set_entry("a1", plain),
+            message_entry("m1", "one"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert!(notes.is_empty(), "a plain annotation has no card");
+        assert_eq!(display.len(), 1);
     }
     use serde_json::json;
 
