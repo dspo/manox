@@ -218,6 +218,8 @@ pub(crate) fn target_of(entry: &SessionTreeEntry) -> Target {
         // Thread rows: the extension face is their only face — on the session
         // channel no fold ever consumed them (see [`Target::Thread`]).
         E::Label { .. } | E::SessionInfo { .. } | E::Leaf { .. } => Target::Thread,
+        // Annotation rows land here for the durable face; a UI note card's
+        // transcript half re-targets the chat channel at its emit site.
         E::AnnotationSet { .. } | E::AnnotationRemoved { .. } => Target::Annotations,
         // ── plan ─────────────────────────────────────────────────────
         E::PlanModeChange { .. } | E::PlanModeRequest { .. } | E::PlanUpdate { .. } => Target::Plan,
@@ -1130,12 +1132,23 @@ impl Translator {
                 // does not parse as one is skipped loudly — the durable state
                 // stays as the last valid row left it.
                 match serde_json::from_value::<ahp_types::state::Annotation>(annotation.clone()) {
-                    Ok(annotation) => out.push(Emitted::new(
-                        &at,
-                        StateAction::AnnotationsSet(ahp_types::actions::AnnotationsSetAction {
-                            annotation,
-                        }),
-                    )),
+                    Ok(annotation) => {
+                        out.push(Emitted::new(
+                            &at,
+                            StateAction::AnnotationsSet(ahp_types::actions::AnnotationsSetAction {
+                                annotation: annotation.clone(),
+                            }),
+                        ));
+                        // A UI note card (an annotation stamped with the
+                        // `x-manox` note payload) also rides the chat face, so
+                        // a replayed transcript interleaves it in journal order
+                        // instead of clients tail-appending it from the
+                        // annotations channel. Plain review annotations have no
+                        // transcript face.
+                        if let Some((text, payload)) = annotation_note_face(&annotation) {
+                            self.push_note(&chat, &row, text, payload, &mut out);
+                        }
+                    }
                     Err(error) => tracing::warn!(
                         seq = row.seq,
                         %error,
@@ -2732,6 +2745,37 @@ fn note_text(data: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The transcript face of a UI note card: an annotation stamped
+/// `_meta[ext::META_KEY]["uiNoteKind"]` is the desktop app's note card — its
+/// text is the entries joined, and the kind plus optional tool anchoring ride
+/// the same `x-manox` slot on the emitted part. Plain review annotations
+/// return `None`; they live on the annotations channel alone.
+fn annotation_note_face(annotation: &ahp_types::state::Annotation) -> Option<(String, Value)> {
+    let xmanox = annotation
+        .meta
+        .as_ref()?
+        .get(ext::META_KEY)?
+        .get("uiNoteKind")
+        .and_then(Value::as_str)?;
+    let text = annotation
+        .entries
+        .iter()
+        .map(|entry| entry.text.as_text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut payload = json!({ "annotationId": annotation.id, "uiNoteKind": xmanox });
+    if let Some(tool_call_id) = annotation
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get(ext::META_KEY))
+        .and_then(|meta| meta.get("toolCallId"))
+        .and_then(Value::as_str)
+    {
+        payload["toolCallId"] = json!(tool_call_id);
+    }
+    Some((text, payload))
+}
+
 fn text_blocks(text: &str) -> Vec<ToolResultContent> {
     vec![ToolResultContent::Text(ToolResultTextContent {
         text: text.to_string(),
@@ -3932,6 +3976,80 @@ mod annotations_tests {
         assert_eq!(state.annotations.len(), 1);
         assert_eq!(state.annotations[0].id, "note-1");
         assert_eq!(state.annotations[0].entries.len(), 2);
+    }
+
+    /// A UI note card (an annotation carrying the `x-manox` note payload)
+    /// also lands on the chat face as a `systemNotification` part so a
+    /// replayed transcript interleaves it in journal order; the kind and the
+    /// tool anchor ride the part's `x-manox` meta.
+    #[test]
+    fn ui_note_annotations_also_ride_the_chat_face() {
+        let annotation = json!({
+            "id": "note-1",
+            "origin": {"session": "ahp-session:/s-1"},
+            "resource": "ahp-session:/s-1",
+            "resolved": false,
+            "entries": [{"id": "en-1", "text": "boom"}],
+            "_meta": {"x-manox": {"uiNoteKind": "error", "toolCallId": "tu_1"}},
+        });
+        let mut t = Translator::new();
+        let out = t.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({"type": "annotation_set", "annotation": annotation})),
+        );
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        let at = manox_ahp::channels::annotations::uri("s-1");
+        let durable: Vec<_> = out.iter().filter(|e| e.channel == at).collect();
+        let transcript: Vec<_> = out.iter().filter(|e| e.channel == chat).collect();
+        assert_eq!(durable.len(), 1, "the annotations face keeps its action");
+        let parts: Vec<_> = transcript
+            .iter()
+            .filter_map(|e| match &e.action {
+                StateAction::ChatResponsePart(action) => Some(action),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            parts.len(),
+            1,
+            "one card part on the transcript: {transcript:?}"
+        );
+        let ResponsePart::SystemNotification(note) = &parts[0].part else {
+            panic!("expected a systemNotification part: {:?}", parts[0].part);
+        };
+        assert_eq!(note.content.as_text(), "boom");
+        let meta = note.meta.as_ref().expect("the card carries its payload");
+        let xmanox = &meta[ext::META_KEY];
+        assert_eq!(xmanox["uiNoteKind"], "error");
+        assert_eq!(xmanox["toolCallId"], "tu_1");
+        assert_eq!(xmanox["annotationId"], "note-1");
+    }
+
+    /// A plain review annotation has no transcript face — the annotations
+    /// channel stays its only landing.
+    #[test]
+    fn plain_review_annotations_stay_off_the_chat_face() {
+        let annotation = json!({
+            "id": "rev-1",
+            "origin": {"session": "ahp-session:/s-1"},
+            "resource": "file:///src/a.rs",
+            "resolved": false,
+            "entries": [{"id": "rev-1-e1", "text": "check the drift"}],
+        });
+        let mut t = Translator::new();
+        let out = t.on_entry(
+            "c-1",
+            "s-1",
+            0,
+            &kernel(json!({"type": "annotation_set", "annotation": annotation})),
+        );
+        let chat = manox_ahp::channels::chat::uri("c-1");
+        assert!(
+            out.iter().all(|e| e.channel != chat),
+            "no transcript emissions: {out:?}"
+        );
     }
 }
 
