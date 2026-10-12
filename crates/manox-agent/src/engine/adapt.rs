@@ -915,6 +915,33 @@ mod tests {
     }
 
     #[test]
+    fn entries_to_display_retract_keeps_later_cards_positions() {
+        // Retracting an earlier card shifts the recorded slots of the cards
+        // folded after it: the survivor keeps both its display position and
+        // its message-relative anchor.
+        let entries = vec![
+            message_entry("m1", "one"),
+            annotation_set_entry("a1", ui_note_annotation("note-1", "first", None)),
+            message_entry("m2", "two"),
+            annotation_set_entry("a2", ui_note_annotation("note-2", "second", None)),
+            message_entry("m3", "three"),
+            annotation_removed_entry("a3", "note-1"),
+        ];
+        let (display, notes) = entries_to_display(&entries);
+        assert_eq!(notes.len(), 1, "only note-2 survives");
+        assert_eq!(notes[0].after_message, 2, "note-2 still sits after m2");
+        assert_eq!(notes[0].note.data["text"], "second");
+        let kinds: Vec<&str> = display
+            .iter()
+            .map(|entry| match entry {
+                HistoryEntry::Message(_) => "m",
+                HistoryEntry::Note(_) => "n",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["m", "m", "n", "m"]);
+    }
+
+    #[test]
     fn entries_to_display_skips_plain_review_annotations() {
         let plain = json!({
             "id": "rev-1",
