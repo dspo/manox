@@ -408,6 +408,13 @@ struct OpenTurn {
     /// Tool calls by handle, in a sorted map so turn-boundary settlement is
     /// deterministic.
     calls: BTreeMap<String, CallBook>,
+    /// Elicitations requested on this turn and not yet decided, in journal
+    /// order (the auth id is the request id). The gate journals a
+    /// `cancelled` decision when a turn dies with a parked card, so the
+    /// normal replay settles the part before this list is consulted; the
+    /// remainder here is the crash-before-discard residue that
+    /// [`Translator::finish_turn`] settles at the boundary.
+    open_asks: Vec<String>,
 }
 
 impl OpenTurn {
@@ -421,6 +428,7 @@ impl OpenTurn {
             reasoning_part: None,
             streamed_text: false,
             calls: BTreeMap::new(),
+            open_asks: Vec::new(),
         }
     }
 
@@ -1940,6 +1948,9 @@ impl Translator {
                 let message = tool_name
                     .unwrap_or("the agent is asking a question")
                     .to_string();
+                if let Some(open) = self.open.as_mut() {
+                    open.open_asks.push(auth_id.to_string());
+                }
                 out.push(Emitted::new(
                     chat,
                     StateAction::ChatInputRequested(ChatInputRequestedAction {
@@ -1962,6 +1973,9 @@ impl Translator {
                 if self.open.is_none() {
                     tracing::debug!(auth_id, "question verdict after the turn closed");
                     return;
+                }
+                if let Some(open) = self.open.as_mut() {
+                    open.open_asks.retain(|id| id != auth_id);
                 }
                 let response = match verdict.unwrap_or_default() {
                     "answered" => ChatInputResponseKind::Accept,
@@ -2069,6 +2083,24 @@ impl Translator {
                         error: None,
                     },
                     requires_result_confirmation: None,
+                }),
+            ));
+        }
+        // Parked questions answer the same must-not-hang rule. The gate
+        // journals a `cancelled` decision when a turn dies with a card
+        // (`UserQuestionGate::discard`), so the normal replay settles the
+        // part one row earlier; a crash before that row lands leaves the
+        // decision missing, and an unanswered ask in an archived turn is
+        // unanswerable by construction — the ahp reducer settles input
+        // requests on the ACTIVE turn only. Emit the settlement here so the
+        // replayed fold never carries a dead card.
+        for request_id in &open.open_asks {
+            out.push(Emitted::new(
+                chat,
+                StateAction::ChatInputCompleted(ChatInputCompletedAction {
+                    request_id: request_id.clone(),
+                    response: ChatInputResponseKind::Cancel,
+                    answers: None,
                 }),
             ));
         }
@@ -3634,6 +3666,124 @@ mod fold_semantics_tests {
             None,
             "no text means no fabricated question card"
         );
+    }
+
+    /// A turn that dies with a parked question and NO journalled decision —
+    /// the crash-before-discard shape — must still replay to a settled card.
+    /// An unanswered ask in an archived turn is unanswerable by construction
+    /// (the ahp reducer settles input requests on the ACTIVE turn only), so
+    /// the boundary owes the settlement itself.
+    #[test]
+    fn a_turn_close_settles_a_question_the_journal_left_unanswered() {
+        let records = vec![
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the release"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-2",
+                "kind": "request",
+                "authId": "call_ask",
+                "payload": {
+                    "toolName": "AskUserQuestion",
+                    "input": {"questions": [{
+                        "question": "版本号怎么定？", "header": "版本号", "multiSelect": false,
+                        "options": [{"label": "v1.4.0", "description": "minor"}],
+                    }]},
+                },
+            })),
+            // No `question` decision row: the crash took it.
+            kernel(json!({"type": "turn_finish", "id": "sentry-3",
+                          "cancelled": true, "failed": false, "strandedSteerIds": []})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        for (seq, entry) in records.into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        let turn = state.turns.last().expect("the turn archived");
+        let ask = turn
+            .response_parts
+            .iter()
+            .find_map(|p| match p {
+                ahp_types::state::ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .expect("the ask part survives the archive");
+        assert_eq!(ask.request.id, "call_ask");
+        assert!(
+            ask.response.is_some(),
+            "the boundary settled the ask the journal never decided — an \
+             unanswered part in an archived turn strands every client fold"
+        );
+    }
+
+    /// A journalled decision retires the open ask, so the turn close must
+    /// NOT settle it a second time: one completion per ask, in journal order.
+    #[test]
+    fn a_journalled_decision_keeps_the_boundary_settlement_single() {
+        let records = vec![
+            kernel(json!({
+                "type": "message",
+                "id": "sentry-0",
+                "message": {"role": "user",
+                            "content": [{"type": "text", "text": "plan the release"}]},
+            })),
+            kernel(json!({"type": "turn_start", "id": "sentry-1"})),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-2",
+                "kind": "request",
+                "authId": "call_ask",
+                "payload": {
+                    "toolName": "AskUserQuestion",
+                    "input": {"questions": [{
+                        "question": "q", "header": "h", "multiSelect": false,
+                    }]},
+                },
+            })),
+            kernel(json!({
+                "type": "question",
+                "id": "sentry-3",
+                "kind": "decision",
+                "authId": "call_ask",
+                "payload": {"toolName": "AskUserQuestion", "verdict": "cancelled"},
+            })),
+            kernel(json!({"type": "turn_finish", "id": "sentry-4",
+                          "cancelled": true, "failed": false, "strandedSteerIds": []})),
+        ];
+        let mut translator = Translator::new();
+        let mut state = manox_ahp::channels::chat::initial("c-1");
+        let mut completions = Vec::new();
+        for (seq, entry) in records.into_iter().enumerate() {
+            for emitted in translator.on_entry("c-1", "s-1", seq as u64, &entry) {
+                if let StateAction::ChatInputCompleted(done) = &emitted.action {
+                    completions.push(done.request_id.clone());
+                }
+                ahp::reducers::apply_action_to_chat(&mut state, &emitted.action);
+            }
+        }
+        assert_eq!(
+            completions,
+            vec!["call_ask".to_string()],
+            "exactly one settlement: the decision row, not a second from the turn close"
+        );
+        let turn = state.turns.last().expect("the turn archived");
+        let ask = turn
+            .response_parts
+            .iter()
+            .find_map(|p| match p {
+                ahp_types::state::ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .expect("the ask part survives the archive");
+        assert!(ask.response.is_some(), "the decision settled the card");
     }
 }
 
