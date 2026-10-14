@@ -3290,9 +3290,7 @@ mod turn_cancel_ask_settlement_tests {
                         "message": {"role": "user",
                                     "content": [{"type": "text", "text": "plan the release"}]},
                     })),
-                    kernel_entry(
-                        serde_json::json!({"type": "turn_start", "id": "sentry-1"}),
-                    ),
+                    kernel_entry(serde_json::json!({"type": "turn_start", "id": "sentry-1"})),
                     kernel_entry(serde_json::json!({
                         "type": "question",
                         "id": "sentry-2",
@@ -3332,9 +3330,7 @@ mod turn_cancel_ask_settlement_tests {
                     .response_parts
                     .iter()
                     .find_map(|p| match p {
-                        ResponsePart::InputRequest(input) if input.response.is_none() => {
-                            Some(())
-                        }
+                        ResponsePart::InputRequest(input) if input.response.is_none() => Some(()),
                         _ => None,
                     })
                     .is_some();
@@ -3348,13 +3344,11 @@ mod turn_cancel_ask_settlement_tests {
             client
                 .dispatch(
                     "ahp-chat:/s-1".to_string(),
-                    StateAction::ChatTurnCancelled(
-                        ahp_types::actions::ChatTurnCancelledAction {
-                            turn_id: active_turn_id,
-                            duration: 0,
-                            meta: None,
-                        },
-                    ),
+                    StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                        turn_id: active_turn_id,
+                        duration: 0,
+                        meta: None,
+                    }),
                 )
                 .await
                 .expect("dispatch is fire-and-forget");
