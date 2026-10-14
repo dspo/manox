@@ -1798,6 +1798,14 @@ impl AgentServerInner {
     /// the AHP dispatch path has already folded the change into the state its
     /// subscribers reduce, so a swallowed failure would let every client
     /// converge on a model the session is not running.
+    ///
+    /// A resolved pick is additionally preflighted against the same stream
+    /// resolver the next prompt streams through: an echo without
+    /// `rejectionReason` must mean the switch will run (AHP — the host
+    /// applies the side effect before broadcasting it). The preflight is
+    /// in-process config resolution (endpoint, credential reference) — it
+    /// makes no network call, so a live-but-wrong key still surfaces the
+    /// honest way, on the first request under the new model.
     pub(crate) fn set_model(
         &self,
         session_id: &str,
@@ -1809,6 +1817,12 @@ impl AgentServerInner {
         let registry = manox_agent::provider_glue::global();
         match manox_harness::model_ref::resolve_model_ref(&registry, id) {
             Some(model) => {
+                if let Err(error) = (registry.stream_resolver())(&model) {
+                    return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
+                        "model {id} cannot be served: {error:#}"
+                    ))
+                    .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE));
+                }
                 // T10: the v1 `ThreadInfo` republish is gone — the engine
                 // journals the change and the P-face delta refreshes chips.
                 thread.with_mut(|t| t.set_model(model));

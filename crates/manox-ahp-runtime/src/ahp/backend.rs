@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
+use crate::ahp::projection::config_keys;
 use ahp_types::actions::{
     ActionOrigin, ChatChangesetsChangedAction, ChatInputCompletedAction,
     ChatPendingMessageRemovedAction, PartialChatSummary, SessionChatUpdatedAction, StateAction,
@@ -1077,14 +1078,16 @@ impl RuntimeBackend {
     /// Apply the model / effort / approval-mode / project selection a client
     /// merged into `SessionState.config`.
     ///
-    /// AHP config is an open bag, so a client may send any subset. Each known
-    /// key maps onto the runtime intent that owns it; an unknown key is not a
-    /// refusal (the reducer already folded it) — the runtime simply has no work
-    /// for it.
+    /// Config is an open bag on the wire, but this host honors only the keys
+    /// its declared schema marks `sessionMutable` (AHP: only session-mutable
+    /// properties may be changed). A key outside that set — a server-owned
+    /// field like `workingDirectory`, or a foreign extension's — is a
+    /// rejection, not a silent fold: the write-ahead client must learn its
+    /// optimistic value did not land.
     ///
-    /// A runtime refusal on a key the reducer DID fold is a rejection, not a
-    /// note: answering `Accepted` would leave the client's state on a model or
-    /// mode the session never adopted.
+    /// A runtime refusal on a key the reducer DID fold is likewise a
+    /// rejection, not a note: answering `Accepted` would leave the client's
+    /// state on a model or mode the session never adopted.
     fn apply_session_config(
         &self,
         channel: &str,
@@ -1093,17 +1096,25 @@ impl RuntimeBackend {
         let Some(session_id) = session::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
+        if let Some(key) = config
+            .keys()
+            .find(|key| !config_keys::MUTABLE.contains(&key.as_str()))
+        {
+            return DispatchOutcome::Rejected(format!(
+                "config key `{key}` is not session-mutable on this host"
+            ));
+        }
         let applied = [
             config
-                .get("model")
+                .get(config_keys::MODEL)
                 .and_then(Value::as_str)
                 .map(|model| self.server.set_model(session_id, model)),
             config
-                .get("reasoningEffort")
+                .get(config_keys::REASONING_EFFORT)
                 .and_then(Value::as_str)
                 .map(|effort| self.server.set_reasoning_effort(session_id, effort)),
             config
-                .get("approvalMode")
+                .get(config_keys::APPROVAL_MODE)
                 .and_then(Value::as_str)
                 .map(|mode| self.server.set_approval_mode(session_id, mode)),
         ];

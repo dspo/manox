@@ -122,6 +122,28 @@ pub fn install_for_test(registry: Arc<ProviderRegistry>) {
     }
 }
 
+/// [`install_for_test`] with an RAII restore: the guard's drop clears the
+/// freeze and reinstalls an empty registry. The swap is process-global, but
+/// a test binary's suites only serialize on the module-level globals lock —
+/// without the restore, one test's fixtures leak into every later test in
+/// the same binary. Hold the module's globals lock for the guard's whole
+/// lifetime (declare it before the guard, so it drops after).
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_for_test_scoped(registry: Arc<ProviderRegistry>) -> impl Drop {
+    install_for_test(registry);
+    struct RegistryRestore;
+    impl Drop for RegistryRestore {
+        fn drop(&mut self) {
+            TEST_FROZEN.store(false, Ordering::Release);
+            if let Some(slot) = REGISTRY.get() {
+                *slot.write().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(ProviderRegistry::new());
+            }
+        }
+    }
+    RegistryRestore
+}
+
 /// Wait for the one-shot initial registration to finish. Returns at once
 /// when it already completed, or when [`init`] was never called (nothing
 /// to wait for). Harness actors await this once at startup instead of

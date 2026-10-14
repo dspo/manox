@@ -1470,15 +1470,31 @@ async fn run_actor(
                 // endpoint + credential (the old bridge captured the
                 // initial model's credential for every later model).
                 //
-                // Every mirror follows the harness, never the request: a
-                // refused switch (credential preflight, non-idle phase)
-                // leaves the actor on the model the session still runs, and
+                // The switch must land one way or another — the dispatch was
+                // already echoed as accepted, so dropping it here would
+                // strand every client on a model the session never adopted.
+                // The durable path first (journaled now, effective at the
+                // next request); when it refuses — a transient non-idle
+                // phase, or a credential that vanished between the
+                // dispatch-time preflight and here — the same queueing
+                // semantics the mid-run arm uses: effective at the next
+                // request boundary, journaled by that boundary's flush.
+                //
+                // Every mirror follows the landing, never the request, and
                 // the model already in play never appends a second
                 // `model_change` entry.
                 if harness_model != new_model {
-                    if let Err(err) = session.set_model(new_model.clone()).await {
-                        tracing::warn!("set_model failed: {err}");
-                    } else {
+                    let landed = match session.set_model(new_model.clone()).await {
+                        Ok(()) => true,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "set_model: durable path refused, queueing for the next boundary"
+                            );
+                            session.handle().set_model(new_model.clone())
+                        }
+                    };
+                    if landed {
                         // Keep the actor's working model in sync: Open/NewSession
                         // below build sessions with it.
                         harness_model = new_model.clone();

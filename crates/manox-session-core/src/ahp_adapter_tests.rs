@@ -1170,6 +1170,145 @@ mod dispatch {
         uninstall();
     }
 
+    /// The deterministic registry the model-dispatch tests install: two
+    /// anthropic-wire providers, one with a literal key (resolves offline)
+    /// and one whose key references an env var the test never sets — so a
+    /// pick can be made to fail stream resolution without touching the
+    /// network, the keychain, or the developer's real provider config. The
+    /// scoped install restores the process global on exit, so the fixtures
+    /// never leak into the binary's other suites.
+    fn install_two_provider_registry() -> impl Drop {
+        let registry = Arc::new(manox_harness::ProviderRegistry::new());
+        let model = |id: &str| manox_harness::ProviderModelConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            reasoning: false,
+            input: vec![manox_harness::InputModality::Text],
+            context_window: 8192,
+            max_tokens: 1024,
+            cost: manox_harness::Cost::default(),
+            api: None,
+            base_url: None,
+            metadata: Default::default(),
+        };
+        for (name, key) in [
+            ("okreg-anthropic", "test-key-literal"),
+            (
+                "badkeyreg-anthropic",
+                "${MANOX_TEST_ABSENT_KEY_FOR_PREFLIGHT}",
+            ),
+        ] {
+            registry
+                .register_provider(
+                    name,
+                    manox_harness::ProviderConfig {
+                        name: None,
+                        base_url: Some(format!("https://{name}.invalid")),
+                        api_key: Some(key.to_string()),
+                        api: Some(manox_harness::Api::AnthropicMessages),
+                        headers: None,
+                        auth_header: false,
+                        models: vec![model(&format!("{name}-model"))],
+                    },
+                )
+                .expect("test provider registers");
+        }
+        manox_agent::provider_glue::install_for_test_scoped(registry)
+    }
+
+    /// A model pick the runtime cannot serve (its credential reference
+    /// resolves to nothing) is REJECTED with a reason naming it: an echo
+    /// without `rejectionReason` must mean the switch will run — the
+    /// write-ahead client rolls its optimistic chip back on the rejection
+    /// and never converges on a model the session is not running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_config_model_the_runtime_cannot_serve_is_rejected() {
+        let _guards = install();
+        let _registry = install_two_provider_registry();
+        let (_server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert(
+            "model".to_string(),
+            json!("badkeyreg-anthropic/badkeyreg-anthropic-model"),
+        );
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("cannot be served"),
+                    "the rejection names the failure: {reason}"
+                );
+            }
+            other => panic!("an unservable pick must be rejected, got {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// A servable pick is accepted and lands synchronously on the thread
+    /// mirror — the seat every later engine materialization reads back (an
+    /// engine-less session persists the pick when its engine spawns, a live
+    /// one journals it at the switch; both durable halves are pinned by the
+    /// harness suite's `set_model_reclamps_thinking_and_persists`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_servable_config_model_pick_lands_on_the_thread() {
+        let _guards = install();
+        let _registry = install_two_provider_registry();
+        let (server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert(
+            "model".to_string(),
+            json!("okreg-anthropic/okreg-anthropic-model"),
+        );
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        assert_eq!(
+            backend.dispatch(&session::uri("s-dispatch"), &action, &origin()),
+            DispatchOutcome::Accepted
+        );
+        let thread = server
+            .ahp_inner()
+            .session_thread("s-dispatch")
+            .expect("live session");
+        assert_eq!(
+            thread.read(|t| t.model().map(|m| m.id.clone())),
+            Some("okreg-anthropic-model".to_string()),
+            "the accepted echo must mean the switch landed on the thread"
+        );
+        uninstall();
+    }
+
+    /// A config key outside the declared session-mutable set is rejected:
+    /// the server-owned keys (`workingDirectory` rides its dedicated
+    /// `session/workingDirectorySet` action) are host→client facts, and an
+    /// undeclared key folding silently would advertise a contract the host
+    /// refuses to honor.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_undeclared_config_key_is_rejected() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert("workingDirectory".to_string(), json!("/nope"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("not session-mutable"),
+                    "the rejection names the key's status: {reason}"
+                );
+            }
+            other => panic!("an undeclared key must be rejected, got {other:?}"),
+        }
+        uninstall();
+    }
+
     /// A submit that lands mid-turn is parked and then drained into a
     /// follow-up turn when the turn settles.
     ///

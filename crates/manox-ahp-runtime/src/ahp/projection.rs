@@ -94,6 +94,14 @@ pub mod config_keys {
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
     pub const WORKING_DIRECTORY: &str = "workingDirectory";
+    /// The keys a client may change mid-session through
+    /// `session/configChanged` — exactly the set the declared schema marks
+    /// `sessionMutable: true` (AHP: only session-mutable properties may be
+    /// changed). The server-owned keys (`project`, `workingDirectory`)
+    /// travel this seat host→client only: `workingDirectory` writes ride
+    /// the dedicated `session/workingDirectorySet` action, so their arrival
+    /// through a config dispatch is a client bug, not a fold.
+    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, APPROVAL_MODE];
 }
 
 /// The journal-row facts the projection mints identities from: one kernel
