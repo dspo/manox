@@ -25,8 +25,8 @@ use ahp_types::actions::{
 };
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
-    AgentInfo, ChatInputResponseKind, ChatState, ResponsePart, RootState, SessionModelInfo,
-    SessionState, SessionSummary, TerminalState, Turn,
+    AgentInfo, ChatInputResponseKind, ChatState, RootState, SessionModelInfo, SessionState,
+    SessionSummary, TerminalState, Turn,
 };
 use manox_ahp::backend::{Backend, DispatchOutcome};
 #[cfg(feature = "terminal")]
@@ -1758,24 +1758,17 @@ impl Backend for RuntimeBackend {
                         // mode. Settle the open asks here, ahead of the
                         // turn-end echo, so clients fold [completed →
                         // cancelled] in that order.
-                        if let Some(host) = self.host()
-                            && let Some(state) = host.chat_state(session_id)
-                            && let Some(active) = &state.active_turn
-                        {
-                            for part in &active.response_parts {
-                                if let ResponsePart::InputRequest(input) = part
-                                    && input.response.is_none()
-                                {
-                                    host.publish(
-                                        channel,
-                                        StateAction::ChatInputCompleted(ChatInputCompletedAction {
-                                            request_id: input.request.id.clone(),
-                                            response: ChatInputResponseKind::Cancel,
-                                            answers: None,
-                                        }),
-                                        None,
-                                    );
-                                }
+                        if let Some(host) = self.host() {
+                            for request_id in host.open_ask_ids(session_id) {
+                                host.publish(
+                                    channel,
+                                    StateAction::ChatInputCompleted(ChatInputCompletedAction {
+                                        request_id,
+                                        response: ChatInputResponseKind::Cancel,
+                                        answers: None,
+                                    }),
+                                    None,
+                                );
                             }
                         }
                         DispatchOutcome::Accepted
@@ -3224,6 +3217,7 @@ mod mcp_dispatch_tests {
 mod turn_cancel_ask_settlement_tests {
     use super::mcp_dispatch_tests::McpOnlyRuntime;
     use super::*;
+    use ahp_types::state::ResponsePart;
 
     fn kernel_entry(mut fields: serde_json::Value) -> SessionTreeEntry {
         let mut base = serde_json::json!({
@@ -3338,6 +3332,9 @@ mod turn_cancel_ask_settlement_tests {
                     parked,
                     "the fixture parks an unanswered ask on the active turn"
                 );
+                // The cancel's own inventory reads the same park — the read
+                // the settlement loop is driven by.
+                assert_eq!(host.open_ask_ids("s-1"), vec!["call_ask".to_string()]);
                 active.id.clone()
             };
 
@@ -3379,6 +3376,9 @@ mod turn_cancel_ask_settlement_tests {
                 "the open ask settled before the turn archived — a completion after \
                  it would reduce to NoOp and strand the card"
             );
+            // The archived park is none of a later cancel's business: the
+            // inventory answers asks on the ACTIVE turn only.
+            assert!(host.open_ask_ids("s-1").is_empty());
         });
     }
 

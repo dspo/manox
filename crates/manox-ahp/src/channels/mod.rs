@@ -24,7 +24,9 @@ use std::collections::HashMap;
 use ahp::reducers::ReduceOutcome;
 use ahp_types::actions::StateAction;
 use ahp_types::common::Uri;
-use ahp_types::state::{ChatState, RootState, SessionState, SnapshotState, TerminalState};
+use ahp_types::state::{
+    ChatState, ResponsePart, RootState, SessionState, SnapshotState, TerminalState,
+};
 
 use crate::ext;
 
@@ -323,6 +325,51 @@ impl ChannelStore {
         self.chats.get(id)
     }
 
+    /// The unanswered input-request ids on `id`'s ACTIVE turn — the
+    /// turn-cancel settlement inventory. Archived turns are none of a
+    /// cancel's business: their asks die at the turn-end boundary.
+    pub fn open_asks_on_active_turn(&self, id: &str) -> Vec<String> {
+        self.chats
+            .get(id)
+            .into_iter()
+            .flat_map(|chat| chat.active_turn.iter())
+            .flat_map(|turn| turn.response_parts.iter())
+            .filter_map(|part| match part {
+                ResponsePart::InputRequest(input) if input.response.is_none() => {
+                    Some(input.request.id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `request_id` names an input request that already carries a
+    /// verdict, active or archived — the idempotent shape of a settle that
+    /// lands twice (the live cancel settles ahead of the archive; the
+    /// journalled decision then re-forwards onto the settled part). An open
+    /// part and an unknown id both answer false: the warn they feed is the
+    /// strand alarm.
+    pub fn chat_input_settled(&self, chat_id: &str, request_id: &str) -> bool {
+        self.chats
+            .get(chat_id)
+            .into_iter()
+            .flat_map(|chat| {
+                chat.active_turn
+                    .iter()
+                    .flat_map(|turn| turn.response_parts.iter())
+                    .chain(
+                        chat.turns
+                            .iter()
+                            .flat_map(|turn| turn.response_parts.iter()),
+                    )
+            })
+            .filter_map(|part| match part {
+                ResponsePart::InputRequest(input) => Some(input),
+                _ => None,
+            })
+            .any(|input| input.request.id == request_id && input.response.is_some())
+    }
+
     /// One terminal's state.
     pub fn terminal(&self, id: &str) -> Option<&TerminalState> {
         self.terminals.get(id)
@@ -425,5 +472,100 @@ mod tests {
         assert_eq!(store.chat_session("c-1"), Some("s-1"));
         store.remove_session("s-1");
         assert_eq!(store.chat_session("c-1"), None);
+    }
+
+    mod ask_reads {
+        use super::super::*;
+        use ahp_types::state::{
+            ActiveTurn, ChatInputRequest, InputRequestResponsePart, Message, MessageKind,
+            MessageOrigin, Turn, TurnState,
+        };
+
+        fn ask_part(id: &str, settled: bool) -> ResponsePart {
+            ResponsePart::InputRequest(InputRequestResponsePart {
+                request: ChatInputRequest {
+                    id: id.to_string(),
+                    message: None,
+                    url: None,
+                    questions: None,
+                    answers: None,
+                },
+                response: settled.then_some(ahp_types::state::ChatInputResponseKind::Cancel),
+            })
+        }
+
+        fn user_message() -> Message {
+            Message {
+                text: String::new(),
+                origin: MessageOrigin {
+                    kind: MessageKind::User,
+                },
+                attachments: None,
+                model: None,
+                agent: None,
+                meta: None,
+            }
+        }
+
+        /// A chat whose ACTIVE turn parks one open and one settled ask, and
+        /// whose archive carries the same pair — every read's answer is a
+        /// statement about WHICH turn class it consulted.
+        fn store_with_asks() -> ChannelStore {
+            let mut store = ChannelStore::new(root::empty());
+            let mut chat = chat::initial("c-1");
+            chat.active_turn = Some(ActiveTurn {
+                id: "t-live".to_string(),
+                started_at: String::new(),
+                message: user_message(),
+                response_parts: vec![ask_part("open-live", false), ask_part("done-live", true)],
+                usage: None,
+            });
+            chat.turns.push(Turn {
+                id: "t-old".to_string(),
+                started_at: None,
+                duration: None,
+                message: user_message(),
+                response_parts: vec![ask_part("open-old", false), ask_part("done-old", true)],
+                usage: None,
+                state: TurnState::Cancelled,
+            });
+            store.insert_chat("s-1", "c-1", chat);
+            store
+        }
+
+        #[test]
+        fn open_asks_read_the_active_turn_only() {
+            let store = store_with_asks();
+            assert_eq!(store.open_asks_on_active_turn("c-1"), vec!["open-live"]);
+            // A settled ask is not open even where it lives.
+            assert!(
+                !store
+                    .open_asks_on_active_turn("c-1")
+                    .contains(&"done-live".to_string())
+            );
+            // An archived open ask is none of the cancel's business.
+            assert!(
+                !store
+                    .open_asks_on_active_turn("c-1")
+                    .contains(&"open-old".to_string())
+            );
+            assert!(store.open_asks_on_active_turn("c-nope").is_empty());
+        }
+
+        #[test]
+        fn the_settlement_probe_spans_the_whole_chat() {
+            let store = store_with_asks();
+            // Settled anywhere — active or archived — is the idempotent shape
+            // (the live cancel settles ahead of the archive; the journalled
+            // decision then re-forwards onto the settled part).
+            assert!(store.chat_input_settled("c-1", "done-live"));
+            assert!(store.chat_input_settled("c-1", "done-old"));
+            // An open part — on the active turn or an archived one (the
+            // strand shape) — and an unknown id all answer false: the warn
+            // they feed is the strand alarm.
+            assert!(!store.chat_input_settled("c-1", "open-live"));
+            assert!(!store.chat_input_settled("c-1", "open-old"));
+            assert!(!store.chat_input_settled("c-1", "nope"));
+        }
     }
 }
