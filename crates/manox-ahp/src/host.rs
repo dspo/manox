@@ -171,6 +171,14 @@ impl Host {
         self.inner.store.read().chat(chat_id).cloned()
     }
 
+    /// The unanswered input-request ids parked on `chat_id`'s ACTIVE turn —
+    /// the turn-cancel settlement inventory. [`Host::chat_state`] answers the
+    /// same question only by cloning every archived turn into the bargain,
+    /// which a long session pays in full on each cancel.
+    pub fn open_ask_ids(&self, chat_id: &str) -> Vec<String> {
+        self.inner.store.read().open_asks_on_active_turn(chat_id)
+    }
+
     /// The host's authoritative session state. See [`Host::chat_state`].
     pub fn session_state(&self, session_id: &str) -> Option<ahp_types::state::SessionState> {
         self.inner.store.read().session(session_id).cloned()
@@ -403,35 +411,34 @@ impl Inner {
     /// client's card open forever, and the ask the fold holds — answered or not
     /// — is what decides that.
     fn ask_inventory(&self, uri: &str, request_id: &str) -> String {
-        crate::channels::chat::id(uri)
-            .and_then(|id| {
-                let store = self.store.read();
-                store.chat(id).cloned()
+        let Some(id) = crate::channels::chat::id(uri) else {
+            return "chat state absent".to_string();
+        };
+        let store = self.store.read();
+        let Some(chat) = store.chat(id) else {
+            return "chat state absent".to_string();
+        };
+        let open_asks: Vec<String> = chat
+            .active_turn
+            .iter()
+            .flat_map(|turn| turn.response_parts.iter())
+            .filter_map(|p| match p {
+                ahp_types::state::ResponsePart::InputRequest(input) => Some(format!(
+                    "{} answered={}",
+                    input.request.id,
+                    input.response.is_some()
+                )),
+                _ => None,
             })
-            .map(|chat| {
-                let open_asks: Vec<String> = chat
-                    .active_turn
-                    .iter()
-                    .flat_map(|turn| turn.response_parts.iter())
-                    .filter_map(|p| match p {
-                        ahp_types::state::ResponsePart::InputRequest(input) => Some(format!(
-                            "{} answered={}",
-                            input.request.id,
-                            input.response.is_some()
-                        )),
-                        _ => None,
-                    })
-                    .collect();
-                match &chat.active_turn {
-                    Some(turn) => format!(
-                        "active={} settled={} open_asks={open_asks:?} want={request_id}",
-                        turn.id,
-                        chat.turns.len()
-                    ),
-                    None => format!("active=None settled={} want={request_id}", chat.turns.len()),
-                }
-            })
-            .unwrap_or_else(|| "chat state absent".to_string())
+            .collect();
+        match &chat.active_turn {
+            Some(turn) => format!(
+                "active={} settled={} open_asks={open_asks:?} want={request_id}",
+                turn.id,
+                chat.turns.len()
+            ),
+            None => format!("active=None settled={} want={request_id}", chat.turns.len()),
+        }
     }
 
     /// Stamp and fold without broadcasting (the dispatch path answers the
@@ -449,18 +456,36 @@ impl Inner {
             let outcome = self.store.write().apply(&channel, &action);
             // Extension actions have no upstream reducer by construction, so a
             // no-op there is normal; a standard action that does not apply is a
-            // translation bug and must be loud.
+            // translation bug and must be loud. One standard no-op is not a
+            // bug: a settle re-landing on a part that already carries a
+            // verdict — the live cancel settles ahead of the archive and the
+            // journalled decision then re-forwards onto the settled part. An
+            // open part on an archived turn (the strand shape) and an unknown
+            // id stay loud.
+            let idempotent_settle = match &action {
+                StateAction::ChatInputCompleted(done) => crate::channels::chat::id(uri)
+                    .map(|id| self.store.read().chat_input_settled(id, &done.request_id))
+                    .unwrap_or(false),
+                _ => false,
+            };
             if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
-                let asks = match &action {
-                    StateAction::ChatInputCompleted(done) => {
-                        self.ask_inventory(uri, &done.request_id)
-                    }
-                    _ => String::new(),
-                };
-                tracing::warn!(
-                    channel = uri, action = %tag, asks = %asks,
-                    "host action reduced to {outcome:?}"
-                );
+                if idempotent_settle {
+                    tracing::debug!(
+                        channel = uri, action = %tag,
+                        "idempotent input settle — the part already carries a verdict"
+                    );
+                } else {
+                    let asks = match &action {
+                        StateAction::ChatInputCompleted(done) => {
+                            self.ask_inventory(uri, &done.request_id)
+                        }
+                        _ => String::new(),
+                    };
+                    tracing::warn!(
+                        channel = uri, action = %tag, asks = %asks,
+                        "host action reduced to {outcome:?}"
+                    );
+                }
             }
         } else {
             tracing::warn!(channel = uri, "host action on an unknown channel scheme");
