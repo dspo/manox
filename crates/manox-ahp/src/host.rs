@@ -462,13 +462,15 @@ impl Inner {
             // journalled decision then re-forwards onto the settled part. An
             // open part on an archived turn (the strand shape) and an unknown
             // id stay loud.
-            let idempotent_settle = match &action {
-                StateAction::ChatInputCompleted(done) => crate::channels::chat::id(uri)
-                    .map(|id| self.store.read().chat_input_settled(id, &done.request_id))
-                    .unwrap_or(false),
-                _ => false,
-            };
             if !is_extension && !matches!(outcome, ahp::reducers::ReduceOutcome::Applied) {
+                // Probed on the no-op path only: the applied path is the
+                // common one, and the probe walks every part of the chat.
+                let idempotent_settle = match &action {
+                    StateAction::ChatInputCompleted(done) => crate::channels::chat::id(uri)
+                        .map(|id| self.store.read().chat_input_settled(id, &done.request_id))
+                        .unwrap_or(false),
+                    _ => false,
+                };
                 if idempotent_settle {
                     tracing::debug!(
                         channel = uri, action = %tag,
