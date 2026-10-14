@@ -20,13 +20,13 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
 use ahp_types::actions::{
-    ActionOrigin, ChatChangesetsChangedAction, ChatPendingMessageRemovedAction, PartialChatSummary,
-    SessionChatUpdatedAction, StateAction,
+    ActionOrigin, ChatChangesetsChangedAction, ChatInputCompletedAction,
+    ChatPendingMessageRemovedAction, PartialChatSummary, SessionChatUpdatedAction, StateAction,
 };
 use ahp_types::commands::{CreateChatParams, CreateSessionParams};
 use ahp_types::state::{
-    AgentInfo, ChatState, RootState, SessionModelInfo, SessionState, SessionSummary, TerminalState,
-    Turn,
+    AgentInfo, ChatInputResponseKind, ChatState, ResponsePart, RootState, SessionModelInfo,
+    SessionState, SessionSummary, TerminalState, Turn,
 };
 use manox_ahp::backend::{Backend, DispatchOutcome};
 #[cfg(feature = "terminal")]
@@ -1745,7 +1745,41 @@ impl Backend for RuntimeBackend {
                     return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
                 };
                 match self.server.cancel_turn(session_id) {
-                    Ok(()) => DispatchOutcome::Accepted,
+                    Ok(()) => {
+                        // The router publishes this very turn-cancel action on
+                        // Accepted, and the fold archives the active turn with
+                        // it. An AskUserQuestion the model parked on dies with
+                        // the turn, but the gate journals its `cancelled`
+                        // decision only after the cancel lands — the replayed
+                        // completion would reach a store whose active turn is
+                        // already gone, and the ahp reducer settles input
+                        // requests on the ACTIVE turn only: the card strands
+                        // forever and every client's composer locks in ask
+                        // mode. Settle the open asks here, ahead of the
+                        // turn-end echo, so clients fold [completed →
+                        // cancelled] in that order.
+                        if let Some(host) = self.host()
+                            && let Some(state) = host.chat_state(session_id)
+                            && let Some(active) = &state.active_turn
+                        {
+                            for part in &active.response_parts {
+                                if let ResponsePart::InputRequest(input) = part
+                                    && input.response.is_none()
+                                {
+                                    host.publish(
+                                        channel,
+                                        StateAction::ChatInputCompleted(ChatInputCompletedAction {
+                                            request_id: input.request.id.clone(),
+                                            response: ChatInputResponseKind::Cancel,
+                                            answers: None,
+                                        }),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                        DispatchOutcome::Accepted
+                    }
                     Err(error) => DispatchOutcome::Rejected(error.message),
                 }
             }
@@ -2682,27 +2716,43 @@ mod mcp_dispatch_tests {
     };
 
     /// A runtime that answers only the MCP seam and records what it was asked;
-    /// every other method is unreachable from these tests.
-    struct McpOnlyRuntime {
-        served: bool,
+    /// every other method is unreachable from these tests. `cancel_ok` opts the
+    /// turn-cancel seam in for the ask-settlement tests.
+    pub(crate) struct McpOnlyRuntime {
+        pub(crate) served: bool,
+        pub(crate) cancel_ok: bool,
         started: Mutex<Vec<String>>,
         stopped: Mutex<Vec<String>>,
         enabled: Mutex<Vec<(String, bool)>>,
     }
 
     impl McpOnlyRuntime {
-        fn refusing() -> Arc<Self> {
+        pub(crate) fn refusing() -> Arc<Self> {
             Arc::new(Self {
                 served: false,
+                cancel_ok: false,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(Vec::new()),
                 enabled: Mutex::new(Vec::new()),
             })
         }
 
-        fn serving() -> Arc<Self> {
+        pub(crate) fn serving() -> Arc<Self> {
             Arc::new(Self {
                 served: true,
+                cancel_ok: false,
+                started: Mutex::new(Vec::new()),
+                stopped: Mutex::new(Vec::new()),
+                enabled: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// `serving` with the turn-cancel seam answering Ok — the
+        /// ask-settlement tests drive the cancel arm end to end.
+        pub(crate) fn serving_cancellable() -> Arc<Self> {
+            Arc::new(Self {
+                served: true,
+                cancel_ok: true,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(Vec::new()),
                 enabled: Mutex::new(Vec::new()),
@@ -2773,7 +2823,11 @@ mod mcp_dispatch_tests {
         }
         fn drop_queued(&self, _session_id: &str, _message_id: &str) {}
         fn cancel_turn(&self, _session_id: &str) -> Result<(), RuntimeError> {
-            Err(RuntimeError::new("unused"))
+            if self.cancel_ok {
+                Ok(())
+            } else {
+                Err(RuntimeError::new("unused"))
+            }
         }
         fn set_model(&self, _session_id: &str, _model: &str) -> Result<(), RuntimeError> {
             Err(RuntimeError::new("unused"))
@@ -3157,5 +3211,203 @@ mod mcp_dispatch_tests {
                 "the one chat is the default chat"
             );
         });
+    }
+}
+
+/// The turn-cancel contract at the store seam: the client's cancellation
+/// archives the active turn the moment it is published, so a question the
+/// model parked on must be settled BEFORE the archive — the ahp reducer
+/// settles input requests on the ACTIVE turn only, and a completion that
+/// arrives after the archive reduces to NoOp (the strand that locked a
+/// composer in ask mode until restart).
+#[cfg(test)]
+mod turn_cancel_ask_settlement_tests {
+    use super::mcp_dispatch_tests::McpOnlyRuntime;
+    use super::*;
+
+    fn kernel_entry(mut fields: serde_json::Value) -> SessionTreeEntry {
+        let mut base = serde_json::json!({
+            "id": "e-1",
+            "parentId": serde_json::Value::Null,
+            "timestamp": "2026-10-14T00:00:00.000Z",
+        });
+        let object = base.as_object_mut().expect("base is an object");
+        if let Some(extra) = fields.as_object_mut() {
+            object.append(extra);
+        }
+        serde_json::from_value(base.clone())
+            .unwrap_or_else(|e| panic!("journal fixture failed: {e} — {base}"))
+    }
+
+    fn wired_host() -> (Arc<RuntimeBackend>, Arc<manox_ahp::Host>) {
+        let backend = RuntimeBackend::new(
+            McpOnlyRuntime::serving_cancellable() as Arc<dyn SessionRuntime>,
+            std::env::temp_dir(),
+        );
+        let host = Arc::new(manox_ahp::Host::new(
+            backend.clone() as Arc<dyn manox_ahp::backend::Backend>
+        ));
+        backend.attach_host(&host);
+        (backend, host)
+    }
+
+    /// The full cancel contract over the wire: a client cancels a turn the
+    /// replayed fold parked on an unanswered question, and the store must
+    /// archive the turn with the ask SETTLED — the settlement rides ahead of
+    /// the cancellation echo, because a completion after the archive reduces
+    /// to NoOp and strands every client's card.
+    #[test]
+    fn a_turn_cancel_settles_the_open_ask_ahead_of_the_archive() {
+        let _g = crate::test_support::lock_globals();
+        crate::test_support::hermetic_home();
+        crate::test_support::init_globals();
+        manox_agent::runtime::handle().block_on(async {
+            // The sessions dir the cold seed resolves through.
+            let sessions = manox_agent::paths::sessions_dir().unwrap();
+            std::fs::create_dir_all(&sessions).unwrap();
+
+            // A journal whose turn sits parked on an unanswered question — no
+            // decision row, the shape the live cancel leaves mid-flight.
+            let storage = manox_harness::session::jsonl::JsonlSessionStorage::create(
+                &sessions.join("s-1.jsonl"),
+                manox_harness::session::jsonl::JsonlSessionMetadata {
+                    id: "s-1".to_string(),
+                    cwd: "/".to_string(),
+                    created_at: chrono::Utc::now(),
+                    parent_session_path: None,
+                    // The header's thread stamp is how the cold seed resolves
+                    // the chat's owning thread (`header_thread_id`).
+                    metadata: Some(serde_json::json!({ "thread": "s-1" })),
+                },
+            )
+            .await
+            .expect("create the journal");
+            storage
+                .append_entries(&[
+                    kernel_entry(serde_json::json!({
+                        "type": "message",
+                        "id": "sentry-0",
+                        "message": {"role": "user",
+                                    "content": [{"type": "text", "text": "plan the release"}]},
+                    })),
+                    kernel_entry(
+                        serde_json::json!({"type": "turn_start", "id": "sentry-1"}),
+                    ),
+                    kernel_entry(serde_json::json!({
+                        "type": "question",
+                        "id": "sentry-2",
+                        "kind": "request",
+                        "authId": "call_ask",
+                        "payload": {
+                            "toolName": "AskUserQuestion",
+                            "input": {"questions": [{
+                                "question": "q", "header": "h", "multiSelect": false,
+                            }]},
+                        },
+                    })),
+                ])
+                .await
+                .expect("append the ask rows");
+            drop(storage);
+
+            let (_backend, host) = wired_host();
+            let (host_side, client_side) = manox_ahp::transport::inproc::pair();
+            host.accept(host_side);
+            let client = ahp::Client::connect(client_side, ahp::ClientConfig::default())
+                .await
+                .expect("connect");
+            client
+                .initialize(
+                    "desktop".to_string(),
+                    vec![ahp_types::version::PROTOCOL_VERSION.to_string()],
+                    vec!["ahp-chat:/s-1".to_string()],
+                )
+                .await
+                .expect("initialize subscribes and cold-seeds the chat");
+
+            let active_turn_id = {
+                let before = host.chat_state("s-1").expect("the cold seed ran");
+                let active = before.active_turn.as_ref().expect("the turn is open");
+                let parked = active
+                    .response_parts
+                    .iter()
+                    .find_map(|p| match p {
+                        ResponsePart::InputRequest(input) if input.response.is_none() => {
+                            Some(())
+                        }
+                        _ => None,
+                    })
+                    .is_some();
+                assert!(
+                    parked,
+                    "the fixture parks an unanswered ask on the active turn"
+                );
+                active.id.clone()
+            };
+
+            client
+                .dispatch(
+                    "ahp-chat:/s-1".to_string(),
+                    StateAction::ChatTurnCancelled(
+                        ahp_types::actions::ChatTurnCancelledAction {
+                            turn_id: active_turn_id,
+                            duration: 0,
+                            meta: None,
+                        },
+                    ),
+                )
+                .await
+                .expect("dispatch is fire-and-forget");
+
+            // The dispatch rides a notification; poll until the host folded it.
+            let mut state = None;
+            for _ in 0..60 {
+                if let Some(current) = host.chat_state("s-1")
+                    && current.active_turn.is_none()
+                {
+                    state = Some(current);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            let state = state.expect("the cancellation archived the turn");
+            let turn = state.turns.last().expect("the turn is archived");
+            let ask = turn
+                .response_parts
+                .iter()
+                .find_map(|p| match p {
+                    ResponsePart::InputRequest(input) => Some(input),
+                    _ => None,
+                })
+                .expect("the ask part survives the archive");
+            assert!(
+                ask.response.is_some(),
+                "the open ask settled before the turn archived — a completion after \
+                 it would reduce to NoOp and strand the card"
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancel_without_an_open_ask_stays_a_plain_accept() {
+        crate::test_support::init_globals();
+        let (backend, host) = wired_host();
+        let outcome = backend.dispatch(
+            "ahp-chat:/s-1",
+            &StateAction::ChatTurnCancelled(ahp_types::actions::ChatTurnCancelledAction {
+                turn_id: "t-none".to_string(),
+                duration: 0,
+                meta: None,
+            }),
+            &ActionOrigin {
+                client_id: "client-1".to_string(),
+                client_seq: 1,
+            },
+        );
+        assert_eq!(outcome, DispatchOutcome::Accepted);
+        assert!(
+            host.chat_state("s-1")
+                .is_none_or(|s| s.active_turn.is_none())
+        );
     }
 }
