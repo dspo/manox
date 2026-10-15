@@ -2166,6 +2166,20 @@ impl Thread {
         self.pinned = pinned;
     }
 
+    /// Whether THIS thread's next request can serve `model`: the engine's
+    /// own registry snapshot when one is materialized (see
+    /// [`crate::engine::EngineState::model_registry`]), else the process
+    /// global — the registry a future engine will capture. Pure
+    /// config/credential resolution; no HTTP client is built.
+    pub fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        match &self.engine {
+            Some(engine) => engine.preflight_model(model),
+            None => crate::provider_glue::global()
+                .preflight_stream(model)
+                .map_err(|err| format!("{err:#}")),
+        }
+    }
+
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.

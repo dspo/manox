@@ -68,9 +68,11 @@ run_leg "fmt" cargo fmt --all -- --check
 # enablement — cfg-gated items whose consumers are all gated are
 # dead_code HERE, exactly the unit CI compiles (the a6df124e TEST_HOME
 # lesson: the local --all-targets unification can mask it).
+# (`manox-journal` was folded back into manox-harness; the stray -p made
+# this leg fail on every checkout that never had the crate.)
 run_leg "prod-libs" cargo check \
     -p manox-agent -p manox-session-core -p manox-ahp -p manox-ahp-runtime \
-    -p manox-journal -p manox-harness -p manox-napi --lib
+    -p manox-harness -p manox-napi --lib
 # The lean napi edge: the #[cfg(not(feature = "terminal"))] production arms
 # (and every other gated-off path) never compile under the full-configuration
 # legs above — this leg is their compile gate (review #790).

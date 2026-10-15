@@ -991,6 +991,41 @@ fn unresolvable_model(id: &str) -> manox_ahp_runtime::error::RuntimeError {
         .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
 }
 
+/// A resolved model the session's own runtime cannot serve (missing
+/// endpoint, unresolvable credential reference, unwired api).
+fn unservable_model(id: &str, reason: &str) -> manox_ahp_runtime::error::RuntimeError {
+    manox_ahp_runtime::error::RuntimeError::new(format!("model {id} cannot be served: {reason}"))
+        .with_code(manox_ahp_runtime::error::codes::MODEL_UNRESOLVABLE)
+}
+
+/// Parse strictly: an unparseable mode must not settle on the default
+/// (a silent no-op beats a chip bounce-back on a projected mutation).
+/// Shared by the dispatch gate's validate-first pass and the applying
+/// setter so the two can never disagree.
+pub(crate) fn parse_approval_mode(
+    mode: &str,
+) -> Result<PermissionMode, manox_ahp_runtime::error::RuntimeError> {
+    serde_json::from_value::<PermissionMode>(Value::String(mode.to_string())).map_err(|_| {
+        manox_ahp_runtime::error::RuntimeError::new(format!("unknown approval mode: {mode}"))
+            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)
+    })
+}
+
+/// The writable effort vocabulary, shared by the dispatch gate's
+/// validate-first pass and the applying setter.
+pub(crate) fn parse_reasoning_effort(
+    effort: &str,
+) -> Result<ReasoningEffort, manox_ahp_runtime::error::RuntimeError> {
+    match effort {
+        "high" => Ok(ReasoningEffort::High),
+        "max" => Ok(ReasoningEffort::Max),
+        _ => Err(manox_ahp_runtime::error::RuntimeError::new(
+            "set_reasoning_effort requires effort: high|max",
+        )
+        .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST)),
+    }
+}
+
 /// Publish a fresh agent catalogue to the root channel's subscribers.
 fn publish_root_agents(host: &Arc<manox_ahp::Host>, agents: Vec<ahp_types::state::AgentInfo>) {
     host.publish(
@@ -1792,29 +1827,102 @@ impl AgentServerInner {
         }
     }
 
+    /// Validate a model pick WITHOUT landing it: resolve the id, then check
+    /// the endpoint against the session's own registry snapshot (the
+    /// resolver its next request actually uses — see
+    /// `Thread::preflight_model`).
+    pub(crate) fn preflight_model(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+        match self.resolve_session_model(session_id, id) {
+            Ok((thread, model)) => thread
+                .read(|t| t.preflight_model(&model))
+                .map_err(|reason| unservable_model(id, &reason)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Validate a whole config change WITHOUT landing any of it: the model
+    /// endpoint against the session's own registry, the effort and mode
+    /// through their strict parsers. The dispatch gate runs this over
+    /// every key before applying any — a partial landing answered with a
+    /// rejection would strand the landed keys under a client-wide
+    /// rollback.
+    pub(crate) fn preflight_config(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
+        if let Some(model) = model {
+            self.preflight_model(session_id, model)?;
+        }
+        if let Some(effort) = effort {
+            parse_reasoning_effort(effort)?;
+        }
+        if let Some(mode) = mode {
+            parse_approval_mode(mode)?;
+        }
+        Ok(())
+    }
+
+    /// Resolve a model id to its full form against the registry and hand
+    /// back the owning thread handle — the shared half of preflight and
+    /// apply.
+    fn resolve_session_model(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> Result<
+        (
+            manox_agent::thread::ThreadHandle,
+            manox_harness::types::Model,
+        ),
+        manox_ahp_runtime::error::RuntimeError,
+    > {
+        let Some(thread) = self.session_thread(session_id) else {
+            return Err(unknown_session(session_id));
+        };
+        let registry = manox_agent::provider_glue::global();
+        match manox_harness::model_ref::resolve_model_ref(&registry, id) {
+            Some(model) => Ok((thread, model)),
+            None => Err(unresolvable_model(id)),
+        }
+    }
+
     /// Select the session's model.
     ///
     /// The refusal is reported to the caller, not only noted to the v2 clients:
     /// the AHP dispatch path has already folded the change into the state its
     /// subscribers reduce, so a swallowed failure would let every client
     /// converge on a model the session is not running.
+    ///
+    /// A resolved pick is additionally preflighted against the session's own
+    /// registry snapshot: an echo without `rejectionReason` must mean the
+    /// switch will run (AHP — the host applies the side effect before
+    /// broadcasting it). The preflight is in-process config resolution
+    /// (endpoint, credential reference) and builds no HTTP client, so a
+    /// live-but-wrong key still surfaces the honest way, on the first
+    /// request under the new model.
     pub(crate) fn set_model(
         &self,
         session_id: &str,
         id: &str,
     ) -> Result<(), manox_ahp_runtime::error::RuntimeError> {
-        let Some(thread) = self.session_thread(session_id) else {
-            return Err(unknown_session(session_id));
-        };
-        let registry = manox_agent::provider_glue::global();
-        match manox_harness::model_ref::resolve_model_ref(&registry, id) {
-            Some(model) => {
+        match self.resolve_session_model(session_id, id) {
+            Ok((thread, model)) => {
+                if let Err(reason) = thread.read(|t| t.preflight_model(&model)) {
+                    return Err(unservable_model(id, &reason));
+                }
                 // T10: the v1 `ThreadInfo` republish is gone — the engine
                 // journals the change and the P-face delta refreshes chips.
                 thread.with_mut(|t| t.set_model(model));
                 Ok(())
             }
-            None => Err(unresolvable_model(id)),
+            Err(error) => Err(error),
         }
     }
 
@@ -1826,16 +1934,7 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
-        let effort = match effort {
-            "high" => ReasoningEffort::High,
-            "max" => ReasoningEffort::Max,
-            _ => {
-                return Err(manox_ahp_runtime::error::RuntimeError::new(
-                    "set_reasoning_effort requires effort: high|max",
-                )
-                .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
-            }
-        };
+        let effort = parse_reasoning_effort(effort)?;
         thread.with_mut(|t| t.set_reasoning_effort(effort));
         Ok(())
     }
@@ -1848,15 +1947,7 @@ impl AgentServerInner {
         let Some(thread) = self.session_thread(session_id) else {
             return Err(unknown_session(session_id));
         };
-        // Parse strictly: an unparseable mode must not settle on the default
-        // (a silent no-op beats a chip bounce-back on a projected mutation).
-        let Ok(mode) = serde_json::from_value::<PermissionMode>(Value::String(mode.to_string()))
-        else {
-            return Err(manox_ahp_runtime::error::RuntimeError::new(format!(
-                "unknown approval mode: {mode}"
-            ))
-            .with_code(manox_ahp_runtime::error::codes::GATEWAY_BAD_REQUEST));
-        };
+        let mode = parse_approval_mode(mode)?;
         thread.with_mut(|t| t.set_permission_mode(mode));
         Ok(())
     }
