@@ -300,6 +300,15 @@ mod accept_without_a_reactor_tests {
         fn set_model(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }
+        fn preflight_config(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<(), crate::error::RuntimeError> {
+            Ok(())
+        }
         fn set_reasoning_effort(&self, _: &str, _: &str) -> Result<(), crate::error::RuntimeError> {
             Ok(())
         }

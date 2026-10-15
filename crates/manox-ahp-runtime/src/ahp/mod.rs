@@ -53,14 +53,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::ahp::projection::Translator;
+use crate::ahp::projection::config_keys;
 use ahp::reducers::{apply_action_to_chat, apply_action_to_session};
 use ahp_types::actions::StateAction;
 use ahp_types::common::JsonObject;
 use ahp_types::state::{
-    ChatState, ProjectInfo, SessionConfigSchema, SessionConfigState, SessionLifecycle,
-    SessionState, SessionStatus,
+    ChatState, ProjectInfo, SessionConfigPropertySchema, SessionConfigSchema, SessionConfigState,
+    SessionLifecycle, SessionState, SessionStatus,
 };
 use manox_ahp::channels::{chat, session};
+use manox_harness::sandbox::PermissionMode;
 use manox_harness::session::SessionTreeEntry;
 use serde_json::Value;
 
@@ -514,18 +516,100 @@ async fn seed_working_directories(session_id: &str) -> Option<Vec<String>> {
     (!dirs.is_empty()).then_some(dirs)
 }
 
-/// A values-only config container: the fold has no live `ConfigSchema` to
-/// advertise (host-runtime truth), but the reducer merges
-/// `session/configChanged` values only into an existing container, so the
-/// journal-carried values need this seat to land in.
+/// A config container with this host's declared schema and no values yet:
+/// the reducer merges `session/configChanged` values only into an existing
+/// container, so the journal-carried values need this seat to land in — and
+/// the schema is the `sessionMutable` contract a compliant client reads
+/// before offering a mid-session change.
 fn empty_config() -> SessionConfigState {
     SessionConfigState {
-        schema: SessionConfigSchema {
-            r#type: "object".to_string(),
-            properties: HashMap::new(),
-            required: None,
-        },
+        schema: session_config_schema(),
         values: JsonObject::new(),
+    }
+}
+
+/// The session config schema this host declares on every session: the three
+/// selection keys the runtime owns. The property set MUST stay identical to
+/// [`config_keys::MUTABLE`] — the dispatch gate accepts exactly the
+/// session-mutable keys, so the two sources drifting would advertise a
+/// contract the host refuses to honor (pinned by test).
+fn session_config_schema() -> SessionConfigSchema {
+    fn prop(
+        title: &str,
+        description: Option<&str>,
+        values: Option<&[&str]>,
+        default: Option<&str>,
+    ) -> SessionConfigPropertySchema {
+        SessionConfigPropertySchema {
+            r#type: "string".to_string(),
+            title: title.to_string(),
+            description: description.map(str::to_string),
+            default: default.map(|value| Value::String(value.to_string())),
+            // The enum values are the protocol's wire vocabulary; labels
+            // stay unset — display naming is the client's (localized)
+            // business, and a wire-string label would only look like one.
+            r#enum: values.map(|values| {
+                values
+                    .iter()
+                    .map(|value| Value::String(value.to_string()))
+                    .collect()
+            }),
+            enum_labels: None,
+            enum_descriptions: None,
+            read_only: None,
+            items: None,
+            min_items: None,
+            max_items: None,
+            properties: None,
+            required: None,
+            additional_properties: None,
+            enum_dynamic: None,
+            session_mutable: Some(true),
+        }
+    }
+    let mut properties = HashMap::new();
+    properties.insert(
+        config_keys::MODEL.to_string(),
+        prop(
+            "Model",
+            Some("Canonical `provider/model` reference"),
+            None,
+            None,
+        ),
+    );
+    properties.insert(
+        config_keys::APPROVAL_MODE.to_string(),
+        // The wire vocabulary is `PermissionMode`'s kebab form; the default
+        // is the host's own (`PermissionMode::default()`). Parity is pinned
+        // by test, not trusted.
+        prop(
+            "Approval mode",
+            None,
+            Some(&[
+                PermissionMode::ReadOnly.wire(),
+                PermissionMode::WorkspaceWrite.wire(),
+                PermissionMode::DangerFullAccess.wire(),
+            ]),
+            Some(PermissionMode::default().wire()),
+        ),
+    );
+    properties.insert(
+        config_keys::REASONING_EFFORT.to_string(),
+        // The enum is the WRITABLE subset (`set_reasoning_effort` accepts
+        // high|max); the seated value may carry creation-time wire levels
+        // outside it, so a client must treat out-of-enum values as
+        // displayable-but-not-selectable, not as invalid.
+        prop(
+            "Reasoning effort",
+            Some("Writable subset; the current value may carry a host-default level outside this set"),
+            Some(&["high", "max"]),
+            None,
+        ),
+    );
+    SessionConfigSchema {
+        r#type: "object".to_string(),
+        properties,
+        required: None,
     }
 }
 
@@ -1117,5 +1201,62 @@ mod baseline_tests {
             let _ = std::fs::remove_file(sessions.join("flip_b.jsonl"));
             let _ = std::fs::remove_file(&registry);
         })
+    }
+}
+
+#[cfg(test)]
+mod config_schema_tests {
+    use super::*;
+
+    /// The declared schema and the dispatch gate must name the same keys:
+    /// `config_keys::MUTABLE` is what `apply_session_config` accepts, the
+    /// schema is what a compliant client reads, and a drift between them
+    /// would advertise a contract the host refuses to honor.
+    #[test]
+    fn the_schema_names_exactly_the_session_mutable_keys() {
+        let schema = session_config_schema();
+        let mut declared: Vec<&str> = schema.properties.keys().map(String::as_str).collect();
+        declared.sort_unstable();
+        let mut gate: Vec<&str> = config_keys::MUTABLE.to_vec();
+        gate.sort_unstable();
+        assert_eq!(declared, gate);
+        for (key, prop) in &schema.properties {
+            assert_eq!(
+                prop.session_mutable,
+                Some(true),
+                "config key {key} must declare sessionMutable"
+            );
+        }
+    }
+
+    /// The approval-mode vocabulary is `PermissionMode`'s own wire set with
+    /// the host's default — the enum is not a hand-maintained look-alike.
+    #[test]
+    fn the_approval_mode_enum_is_the_permission_mode_wire_vocabulary() {
+        let schema = session_config_schema();
+        let prop = schema
+            .properties
+            .get(config_keys::APPROVAL_MODE)
+            .expect("approvalMode declared");
+        let values: Vec<&str> = prop
+            .r#enum
+            .as_ref()
+            .expect("approvalMode enumerates its values")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                PermissionMode::ReadOnly.wire(),
+                PermissionMode::WorkspaceWrite.wire(),
+                PermissionMode::DangerFullAccess.wire(),
+            ]
+        );
+        assert_eq!(
+            prop.default.as_ref().and_then(Value::as_str),
+            Some(PermissionMode::default().wire()),
+            "the declared default is the host's own default mode"
+        );
     }
 }
