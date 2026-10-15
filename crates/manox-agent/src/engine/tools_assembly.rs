@@ -392,7 +392,16 @@ pub(super) fn build_tools(
         let wrap_ops = Arc::clone(&ops);
         let wrap: manox_harness::bash::background::SandboxCommandBuilder =
             Arc::new(move |command, cwd| wrap_ops.wrap_background(command, cwd));
-        background = Arc::new(BackgroundRegistry::new().with_sandbox(wrap));
+        // Escalated tasks run in the unsandboxed backend's own shell and
+        // env, so `danger-full-access` behaves the same whether the command
+        // runs in the foreground or the background.
+        let unconfined: manox_harness::bash::background::SandboxCommandBuilder =
+            Arc::new(crate::sandbox::UnsandboxedBashOperations::command);
+        background = Arc::new(
+            BackgroundRegistry::new()
+                .with_sandbox(wrap)
+                .with_unconfined(unconfined),
+        );
         ops
     } else {
         Arc::new(PersistentShellOperations::new(cwd))

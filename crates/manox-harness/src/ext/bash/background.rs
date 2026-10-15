@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::core::BackgroundTaskRegistry;
 use crate::core::tool::{AgentTool, AgentToolResult, ToolError};
 use serde_json::Value as JsonValue;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 /// Per-line stdout callback for line-event observers (the background bash
@@ -53,6 +53,30 @@ struct TaskEntry {
     /// that read's result already carries the terminal state, so the
     /// completion summary stands down.
     exit_collected: AtomicBool,
+    /// Per-line stdout taps. Installed at spawn for line-event observers,
+    /// or attached later when a foreground command is promoted to a
+    /// background task and its output starts feeding the host card. The
+    /// drain task holds the only writer; `add_line_tap` is the only
+    /// installer.
+    line_taps: Mutex<Vec<LineEventCallback>>,
+    /// While a foreground call owns the task, every chunk is also forwarded
+    /// here — under the buffer lock, so the forwarded stream and the ring
+    /// agree at the instant the call releases the task.
+    foreground: Mutex<Option<mpsc::UnboundedSender<OutputChunk>>>,
+}
+
+/// Which pipe an output chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+/// One raw read from a task's pipes, as a foreground call receives it.
+#[derive(Debug)]
+pub struct OutputChunk {
+    pub stream: OutputStream,
+    pub bytes: Vec<u8>,
 }
 
 impl TaskEntry {
@@ -69,6 +93,16 @@ impl TaskEntry {
             last_activity: Mutex::new(Instant::now()),
             collectors: AtomicUsize::new(0),
             exit_collected: AtomicBool::new(false),
+            line_taps: Mutex::new(Vec::new()),
+            foreground: Mutex::new(None),
+        }
+    }
+
+    /// Emit one framed line to every installed tap.
+    fn tap_line(&self, id: &crate::core::TaskId, line: String) {
+        let taps = self.line_taps.lock().expect("taps lock poisoned");
+        for tap in taps.iter() {
+            tap(id, line.clone());
         }
     }
 
@@ -82,8 +116,19 @@ impl TaskEntry {
         self.touch();
     }
 
-    fn push(&self, data: &[u8]) {
+    fn push(&self, stream: OutputStream, data: &[u8]) {
         let mut buf = self.buffer.lock().expect("buffer lock poisoned");
+        if let Some(tx) = self
+            .foreground
+            .lock()
+            .expect("foreground lock poisoned")
+            .as_ref()
+        {
+            let _ = tx.send(OutputChunk {
+                stream,
+                bytes: data.to_vec(),
+            });
+        }
         buf.extend_from_slice(data);
         let overflow = buf.len().saturating_sub(MAX_BUFFER_BYTES);
         if overflow > 0 {
@@ -106,17 +151,25 @@ impl TaskEntry {
 /// pipes).
 pub type SandboxCommandBuilder = Arc<dyn Fn(&str, &Path) -> tokio::process::Command + Send + Sync>;
 
+/// Receiving half of a foreground call's output: every chunk the task
+/// produces until the call releases it ([`BackgroundRegistry::release_foreground`]).
+pub type ForegroundOutput = mpsc::UnboundedReceiver<OutputChunk>;
+
 /// Default `BackgroundTaskRegistry`: `sh -c` processes with ring-buffered
 /// output, per-task read cursors, and best-effort process-group kill.
 ///
 /// A host may inject a sandbox wrapper (`with_sandbox`): then
 /// `spawn_sandboxed` / `spawn_with_line_events` wrap the command in the
-/// seatbelt while the trait `spawn` stays bare — escalation is the caller's
-/// choice (an escalated background task runs without confinement).
+/// seatbelt while the trait `spawn` stays unconfined — escalation is the
+/// caller's choice. A host may also inject the unconfined builder
+/// (`with_unconfined`) so an escalated task runs in the same shell and
+/// environment as the host's unconfined foreground backend.
 pub struct BackgroundRegistry {
     tasks: Mutex<std::collections::HashMap<String, Arc<TaskEntry>>>,
     /// Optional seatbelt wrapper for sandboxed background tasks.
     sandbox: Option<SandboxCommandBuilder>,
+    /// Optional builder for unconfined tasks; absent, a bare `sh -c`.
+    unconfined: Option<SandboxCommandBuilder>,
 }
 
 impl BackgroundRegistry {
@@ -124,6 +177,24 @@ impl BackgroundRegistry {
         BackgroundRegistry {
             tasks: Mutex::new(std::collections::HashMap::new()),
             sandbox: None,
+            unconfined: None,
+        }
+    }
+
+    /// Inject the unconfined command builder (escalated tasks).
+    pub fn with_unconfined(mut self, build: SandboxCommandBuilder) -> Self {
+        self.unconfined = Some(build);
+        self
+    }
+
+    fn unconfined_command(&self, command: &str, cwd: &Path) -> tokio::process::Command {
+        match &self.unconfined {
+            Some(build) => build(command, cwd),
+            None => {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(command).current_dir(cwd);
+                c
+            }
         }
     }
 
@@ -171,7 +242,7 @@ impl BackgroundRegistry {
         cwd: &Path,
         on_output: LineEventCallback,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
-        self.spawn_line_events_impl(command, cwd, true, on_output)
+        self.spawn_tracked(command, cwd, true, Some(on_output))
     }
 
     /// Line-event variant of the escalated (unconfined) `spawn` path.
@@ -181,23 +252,60 @@ impl BackgroundRegistry {
         cwd: &Path,
         on_output: LineEventCallback,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
-        self.spawn_line_events_impl(command, cwd, false, on_output)
+        self.spawn_tracked(command, cwd, false, Some(on_output))
     }
 
-    fn spawn_line_events_impl(
+    /// Attach a per-line stdout tap to an already-spawned task. Only lines
+    /// produced after the install reach the tap (the ring buffer and read
+    /// cursor are unaffected), so a caller that promotes a foreground
+    /// command to a background task seeds the card with the retained tail
+    /// and taps from there.
+    pub fn add_line_tap(
+        &self,
+        id: &crate::core::TaskId,
+        tap: LineEventCallback,
+    ) -> Result<(), crate::core::TaskError> {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .get(&id.0)
+            .cloned()
+            .ok_or_else(|| crate::core::TaskError::NotFound(id.0.clone()))?;
+        entry
+            .line_taps
+            .lock()
+            .expect("taps lock poisoned")
+            .push(tap);
+        Ok(())
+    }
+
+    /// Shared spawn core: build the child (sandboxed or bare), register the
+    /// task, install the optional initial line tap, and drain its output
+    /// into the ring buffer.
+    fn spawn_tracked(
         &self,
         command: &str,
         cwd: &Path,
         sandboxed: bool,
-        on_output: LineEventCallback,
+        initial_tap: Option<LineEventCallback>,
+    ) -> Result<crate::core::TaskId, crate::core::TaskError> {
+        self.spawn_entry(command, cwd, sandboxed, initial_tap, None)
+    }
+
+    fn spawn_entry(
+        &self,
+        command: &str,
+        cwd: &Path,
+        sandboxed: bool,
+        initial_tap: Option<LineEventCallback>,
+        foreground: Option<mpsc::UnboundedSender<OutputChunk>>,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
         self.gc();
         let mut child = if sandboxed {
             self.sandboxed_command(command, cwd)
         } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(command).current_dir(cwd);
-            c
+            self.unconfined_command(command, cwd)
         };
         child
             .process_group(0)
@@ -213,17 +321,19 @@ impl BackgroundRegistry {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
         let entry = Arc::new(TaskEntry::new(child, pid));
+        *entry.foreground.lock().expect("foreground lock poisoned") = foreground;
+        if let Some(tap) = initial_tap {
+            entry
+                .line_taps
+                .lock()
+                .expect("taps lock poisoned")
+                .push(tap);
+        }
         self.tasks
             .lock()
             .expect("tasks lock poisoned")
             .insert(id.0.clone(), Arc::clone(&entry));
-        tokio::spawn(drain_task_with_line_events(
-            stdout,
-            stderr,
-            entry,
-            id.clone(),
-            on_output,
-        ));
+        tokio::spawn(drain_task(stdout, stderr, entry, id.clone()));
         Ok(id)
     }
 
@@ -376,26 +486,50 @@ impl Drop for CollectorGuard<'_> {
     }
 }
 
-/// Drain a task's pipes into its ring buffer, then record the exit code.
+/// Drain a task's pipes into its ring buffer, emitting each stdout line to
+/// the entry's installed taps, then record the exit code.
+///
+/// stdout is read in raw chunks so the ring buffer keeps the exact byte
+/// stream — `poll()` accounting stays identical. Lines are split out of the
+/// chunk stream separately for the taps: a partial line carries across
+/// chunk boundaries, a trailing line without a final newline is emitted at
+/// EOF, and a trailing `\r` from CRLF input is stripped from the emitted
+/// line text only (the raw bytes in the ring buffer are untouched). stderr
+/// is never tapped — observers follow the command's own narration.
 async fn drain_task(
     mut stdout: tokio::process::ChildStdout,
     mut stderr: tokio::process::ChildStderr,
     entry: Arc<TaskEntry>,
+    id: crate::core::TaskId,
 ) {
     use tokio::io::AsyncReadExt;
     let mut out_chunk = [0u8; 8192];
     let mut err_chunk = [0u8; 8192];
     let mut out_done = false;
     let mut err_done = false;
+    let mut carry: Vec<u8> = Vec::new();
+    let tap = |id: &crate::core::TaskId, line: String| entry.tap_line(id, line);
     while !(out_done && err_done) {
         tokio::select! {
             n = stdout.read(&mut out_chunk), if !out_done => match n {
-                Ok(0) | Err(_) => out_done = true,
-                Ok(n) => entry.push(&out_chunk[..n]),
+                Ok(0) | Err(_) => {
+                    // EOF: emit a trailing partial line (no final newline).
+                    if !carry.is_empty() {
+                        let tail = String::from_utf8_lossy(&carry).into_owned();
+                        carry.clear();
+                        tap(&id, tail);
+                    }
+                    out_done = true;
+                }
+                Ok(n) => {
+                    let data = &out_chunk[..n];
+                    entry.push(OutputStream::Stdout, data);
+                    emit_lines(&id, data, &mut carry, &tap);
+                }
             },
             n = stderr.read(&mut err_chunk), if !err_done => match n {
                 Ok(0) | Err(_) => err_done = true,
-                Ok(n) => entry.push(&err_chunk[..n]),
+                Ok(n) => entry.push(OutputStream::Stderr, &err_chunk[..n]),
             },
         }
     }
@@ -409,61 +543,6 @@ async fn drain_task(
     .flatten();
     // Wake any waiter the moment the exit is recorded; a watcher awaiting
     // `wait_exit` resumes without polling.
-    entry.record_exit(code);
-}
-
-/// Drain a task's pipes into its ring buffer, calling `on_output` for each
-/// stdout line.
-///
-/// stdout is read in raw chunks (like `drain_task`) so the ring buffer keeps
-/// the exact byte stream — `poll()` accounting stays identical. Lines are
-/// split out of the chunk stream separately: a partial line carries across
-/// chunk boundaries, a trailing line without a final newline is emitted at
-/// EOF, and a trailing `\r` from CRLF input is stripped from the emitted
-/// line text only (the raw bytes in the ring buffer are untouched).
-async fn drain_task_with_line_events(
-    mut stdout: tokio::process::ChildStdout,
-    mut stderr: tokio::process::ChildStderr,
-    entry: Arc<TaskEntry>,
-    id: crate::core::TaskId,
-    on_output: LineEventCallback,
-) {
-    use tokio::io::AsyncReadExt;
-    let mut out_chunk = [0u8; 8192];
-    let mut err_chunk = [0u8; 8192];
-    let mut out_done = false;
-    let mut err_done = false;
-    let mut carry: Vec<u8> = Vec::new();
-    while !(out_done && err_done) {
-        tokio::select! {
-            n = stdout.read(&mut out_chunk), if !out_done => match n {
-                Ok(0) | Err(_) => {
-                    // EOF: emit a trailing partial line (no final newline).
-                    if !carry.is_empty() {
-                        let tail = String::from_utf8_lossy(&carry).into_owned();
-                        carry.clear();
-                        on_output(&id, tail);
-                    }
-                    out_done = true;
-                }
-                Ok(n) => {
-                    let data = &out_chunk[..n];
-                    entry.push(data);
-                    emit_lines(&id, data, &mut carry, &*on_output);
-                }
-            },
-            n = stderr.read(&mut err_chunk), if !err_done => match n {
-                Ok(0) | Err(_) => err_done = true,
-                Ok(n) => entry.push(&err_chunk[..n]),
-            },
-        }
-    }
-    let mut child = entry.child.lock().expect("child lock poisoned").take();
-    let code = match child.as_mut() {
-        Some(c) => c.wait().await.ok().map(|s| s.code()),
-        None => None,
-    }
-    .flatten();
     entry.record_exit(code);
 }
 
@@ -541,42 +620,68 @@ impl BackgroundRegistry {
         self.spawn_impl(command, cwd, true)
     }
 
-    /// Shared spawn core: build the child (sandboxed or bare), register the
-    /// task, and drain its output into the ring buffer.
+    /// Spawn a task a foreground call owns: besides the ring, every chunk
+    /// reaches the returned receiver (stdout/stderr kept apart) until the
+    /// call either forgets the finished task or releases it to the
+    /// background.
+    pub fn spawn_foreground(
+        &self,
+        command: &str,
+        cwd: &Path,
+        sandboxed: bool,
+    ) -> Result<(crate::core::TaskId, ForegroundOutput), crate::core::TaskError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = self.spawn_entry(command, cwd, sandboxed, None, Some(tx))?;
+        Ok((id, rx))
+    }
+
+    /// End a foreground call's ownership: chunk forwarding stops and the read
+    /// cursor moves past everything forwarded so far, so the next `poll`
+    /// starts exactly where the call's output ends. The receiver then yields
+    /// the chunks still queued and closes.
+    pub fn release_foreground(
+        &self,
+        id: &crate::core::TaskId,
+    ) -> Result<(), crate::core::TaskError> {
+        let entry = self.entry(id)?;
+        let buf = entry.buffer.lock().expect("buffer lock poisoned");
+        entry
+            .foreground
+            .lock()
+            .expect("foreground lock poisoned")
+            .take();
+        *entry.read_cursor.lock().expect("cursor lock poisoned") =
+            entry.total_drained.load(Ordering::Relaxed) + buf.len() as u64;
+        Ok(())
+    }
+
+    /// Drop a task's record. A foreground call that kept its task in the
+    /// foreground to the end forgets it: the model never saw the id.
+    pub fn forget(&self, id: &crate::core::TaskId) {
+        self.tasks
+            .lock()
+            .expect("tasks lock poisoned")
+            .remove(&id.0);
+    }
+
+    /// The recorded exit: `None` while running, `Some(None)` for a signal
+    /// death, `Some(Some(code))` otherwise.
+    pub fn exit_status(
+        &self,
+        id: &crate::core::TaskId,
+    ) -> Result<Option<Option<i32>>, crate::core::TaskError> {
+        let entry = self.entry(id)?;
+        Ok(*entry.exit_code.lock().expect("exit lock poisoned"))
+    }
+
+    /// Spawn core for the no-tap paths: a plain ring-buffered task.
     fn spawn_impl(
         &self,
         command: &str,
         cwd: &Path,
         sandboxed: bool,
     ) -> Result<crate::core::TaskId, crate::core::TaskError> {
-        self.gc();
-        let mut child = if sandboxed {
-            self.sandboxed_command(command, cwd)
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.arg("-c").arg(command).current_dir(cwd);
-            c
-        };
-        child
-            .process_group(0)
-            .kill_on_drop(true)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = child
-            .spawn()
-            .map_err(|e| crate::core::TaskError::Spawn(format!("{e}")))?;
-        let pid = child.id().map(|p| p as i32).unwrap_or(-1);
-        let id = crate::core::TaskId(format!("bg_{}", crate::ext::next_task_ordinal()));
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
-        let entry = Arc::new(TaskEntry::new(child, pid));
-        self.tasks
-            .lock()
-            .expect("tasks lock poisoned")
-            .insert(id.0.clone(), Arc::clone(&entry));
-        tokio::spawn(drain_task(stdout, stderr, entry));
-        Ok(id)
+        self.spawn_tracked(command, cwd, sandboxed, None)
     }
 }
 
@@ -914,6 +1019,55 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(saw_tail, "output after overflow is still observable");
+    }
+}
+
+#[cfg(test)]
+mod line_tap_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A tap installed after spawn sees only the lines produced from the
+    /// install onward; the ring buffer and read cursor are unaffected.
+    #[tokio::test]
+    async fn add_line_tap_sees_only_post_install_lines() {
+        let registry = BackgroundRegistry::new();
+        let id = registry
+            .spawn("echo before; sleep 0.3; echo after", Path::new("/tmp"))
+            .unwrap();
+        // Wait until the pre-install line is in the ring: line framing
+        // happens in the same drain step as the push, so `before` is fully
+        // framed before the tap exists.
+        let mut saw_before = false;
+        for _ in 0..100 {
+            let poll = registry.poll(&id).await.unwrap();
+            if poll.new_output.contains("before") {
+                saw_before = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_before, "pre-install line observed");
+
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        registry
+            .add_line_tap(
+                &id,
+                Box::new(move |_id, line| sink.lock().unwrap().push(line)),
+            )
+            .unwrap();
+        registry.wait_exit(&id).await.unwrap();
+
+        let got = lines.lock().unwrap().clone();
+        assert!(
+            got.iter().any(|l| l.contains("after")),
+            "post-install line reached the tap: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|l| l.contains("before")),
+            "pre-install line must not reach a later tap: {got:?}"
+        );
     }
 }
 
