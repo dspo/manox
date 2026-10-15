@@ -1282,6 +1282,104 @@ mod dispatch {
         uninstall();
     }
 
+    /// A multi-key write whose model key cannot be served is rejected
+    /// WHOLE: the approvalMode half must not land under the rejection —
+    /// the write-ahead client rolls back every key of the action, so a
+    /// half-applied write would strand the session on a mode its own chip
+    /// no longer shows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rejected_multi_key_config_write_lands_nothing() {
+        let _guards = install();
+        let _registry = install_two_provider_registry();
+        let (server, backend) = fixture().await;
+        let thread = server
+            .ahp_inner()
+            .session_thread("s-dispatch")
+            .expect("live session");
+        let before = (
+            thread.read(|t| t.model().map(|m| m.id.clone())),
+            thread.read(|t| t.permission_mode()),
+        );
+        let mut config = JsonObject::new();
+        config.insert(
+            "model".to_string(),
+            json!("badkeyreg-anthropic/badkeyreg-anthropic-model"),
+        );
+        config.insert("approvalMode".to_string(), json!("read-only"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("cannot be served"),
+                    "the rejection names the failing key: {reason}"
+                );
+            }
+            other => panic!("an unservable pick must be rejected, got {other:?}"),
+        }
+        assert_eq!(
+            (
+                thread.read(|t| t.model().map(|m| m.id.clone())),
+                thread.read(|t| t.permission_mode())
+            ),
+            before,
+            "the rejected multi-key write landed nothing (neither half)"
+        );
+        uninstall();
+    }
+
+    /// `replace: true` is refused: the runtime has no replacement half, and
+    /// an accepted replace would wipe the server-owned keys out of every
+    /// client's fold (the reducer swaps the whole values bag).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_config_replacement_is_refused() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert("approvalMode".to_string(), json!("read-only"));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: Some(true),
+        });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("replacement is not supported"),
+                    "the refusal names the unsupported semantics: {reason}"
+                );
+            }
+            other => panic!("a full replacement must be refused, got {other:?}"),
+        }
+        uninstall();
+    }
+
+    /// A non-string value for a declared key is rejected (the schema types
+    /// every mutable key as a string); silently ignoring it would answer
+    /// Accepted for a no-op.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_string_config_value_is_rejected() {
+        let _guards = install();
+        let (_server, backend) = fixture().await;
+        let mut config = JsonObject::new();
+        config.insert("model".to_string(), json!(3));
+        let action = StateAction::SessionConfigChanged(SessionConfigChangedAction {
+            config,
+            replace: None,
+        });
+        match backend.dispatch(&session::uri("s-dispatch"), &action, &origin()) {
+            DispatchOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("must be a string"),
+                    "the refusal names the type violation: {reason}"
+                );
+            }
+            other => panic!("a non-string value must be rejected, got {other:?}"),
+        }
+        uninstall();
+    }
+
     /// A config key outside the declared session-mutable set is rejected:
     /// the server-owned keys (`workingDirectory` rides its dedicated
     /// `session/workingDirectorySet` action) are host→client facts, and an

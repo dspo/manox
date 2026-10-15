@@ -536,22 +536,25 @@ fn empty_config() -> SessionConfigState {
 fn session_config_schema() -> SessionConfigSchema {
     fn prop(
         title: &str,
+        description: Option<&str>,
         values: Option<&[&str]>,
         default: Option<&str>,
     ) -> SessionConfigPropertySchema {
         SessionConfigPropertySchema {
             r#type: "string".to_string(),
             title: title.to_string(),
-            description: None,
+            description: description.map(str::to_string),
             default: default.map(|value| Value::String(value.to_string())),
+            // The enum values are the protocol's wire vocabulary; labels
+            // stay unset — display naming is the client's (localized)
+            // business, and a wire-string label would only look like one.
             r#enum: values.map(|values| {
                 values
                     .iter()
                     .map(|value| Value::String(value.to_string()))
                     .collect()
             }),
-            enum_labels: values
-                .map(|values| values.iter().map(|value| value.to_string()).collect()),
+            enum_labels: None,
             enum_descriptions: None,
             read_only: None,
             items: None,
@@ -565,7 +568,15 @@ fn session_config_schema() -> SessionConfigSchema {
         }
     }
     let mut properties = HashMap::new();
-    properties.insert(config_keys::MODEL.to_string(), prop("Model", None, None));
+    properties.insert(
+        config_keys::MODEL.to_string(),
+        prop(
+            "Model",
+            Some("Canonical `provider/model` reference"),
+            None,
+            None,
+        ),
+    );
     properties.insert(
         config_keys::APPROVAL_MODE.to_string(),
         // The wire vocabulary is `PermissionMode`'s kebab form; the default
@@ -573,6 +584,7 @@ fn session_config_schema() -> SessionConfigSchema {
         // by test, not trusted.
         prop(
             "Approval mode",
+            None,
             Some(&[
                 PermissionMode::ReadOnly.wire(),
                 PermissionMode::WorkspaceWrite.wire(),
@@ -583,9 +595,16 @@ fn session_config_schema() -> SessionConfigSchema {
     );
     properties.insert(
         config_keys::REASONING_EFFORT.to_string(),
-        // The effort vocabulary `set_reasoning_effort` accepts (high|max);
-        // other wire levels exist host-side only as creation-time defaults.
-        prop("Reasoning effort", Some(&["high", "max"]), None),
+        // The enum is the WRITABLE subset (`set_reasoning_effort` accepts
+        // high|max); the seated value may carry creation-time wire levels
+        // outside it, so a client must treat out-of-enum values as
+        // displayable-but-not-selectable, not as invalid.
+        prop(
+            "Reasoning effort",
+            Some("Writable subset; the current value may carry a host-default level outside this set"),
+            Some(&["high", "max"]),
+            None,
+        ),
     );
     SessionConfigSchema {
         r#type: "object".to_string(),

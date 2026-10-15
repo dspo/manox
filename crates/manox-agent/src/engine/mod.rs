@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::subagent::SubagentRunObserver;
 use manox_harness::bash::BashTool;
@@ -275,6 +275,17 @@ struct EngineState {
     /// The actor's working model; `SetModel` mirrors here so session
     /// builds always read the latest choice.
     model: Arc<Mutex<Option<HarnessModel>>>,
+    /// The registry snapshot THIS session's requests resolve through, set
+    /// by the actor right after `wait_ready` (the same Arc its
+    /// `ModelRuntime` captures). A dispatch-time model preflight must
+    /// judge the pick by this snapshot, not the process global — a
+    /// settings reload swaps the global without refreshing live
+    /// sessions, and preflighting by the global would both false-reject
+    /// picks the session can still serve and accept picks whose next
+    /// request dies on the session's own stale resolver. `None` before
+    /// the actor's first poll: the global registry is then the best
+    /// prediction (it is what a future engine will capture).
+    model_registry: OnceLock<Arc<manox_harness::ProviderRegistry>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
@@ -376,6 +387,22 @@ impl Engine {
     pub fn granted_working_directories(&self) -> Vec<PathBuf> {
         self.state.granted_roots.approved_roots()
     }
+
+    /// Whether THIS engine's runtime can serve `model` — the registry
+    /// snapshot the actor captured (see `EngineState::model_registry`),
+    /// falling back to the process global before the actor's first poll.
+    /// Pure config/credential resolution: no HTTP client is built.
+    pub(crate) fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        let registry = self
+            .state
+            .model_registry
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::provider_glue::global);
+        registry
+            .preflight_stream(model)
+            .map_err(|err| format!("{err:#}"))
+    }
 }
 
 /// Spawn the harness actor and return the engine handle plus its notice receiver.
@@ -465,6 +492,7 @@ pub fn spawn_engine(
         cumulative_cost: Mutex::new(0.0),
         per_model_cost: Mutex::new(HashMap::new()),
         model: model_slot,
+        model_registry: OnceLock::new(),
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
         pending_browser_suite: Mutex::new(None),
@@ -601,6 +629,9 @@ impl ThreadEngine for Engine {
     }
     fn granted_working_directories(&self) -> Vec<PathBuf> {
         Engine::granted_working_directories(self)
+    }
+    fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        Engine::preflight_model(self, model)
     }
     fn run_with_origin(
         &self,
@@ -848,6 +879,56 @@ impl ThreadEngine for Engine {
 
 // ── The harness actor ───────────────────────────────────────────────────────────
 
+/// The idle `SetModel` landing (split from the actor loop so its total
+/// semantics are testable without driving the whole actor).
+///
+/// Streams dispatch by `model.provider` through the shared registry, so a
+/// cross-provider switch reaches the right endpoint + credential (the old
+/// bridge captured the initial model's credential for every later model).
+///
+/// The switch must land one way or another — the dispatch was already
+/// echoed as accepted, so dropping it here would strand every client on a
+/// model the session never adopted. The durable path first (journaled
+/// now, effective at the next request); when it refuses — a transient
+/// non-idle phase, or a credential that vanished between the
+/// dispatch-time preflight and here — the same queueing semantics the
+/// mid-run arm uses: effective at the next request boundary, journaled
+/// by that boundary's flush.
+///
+/// Every mirror follows the landing, never the request, and the model
+/// already in play never appends a second `model_change` entry. A queued
+/// switch outliving its session (an Open/NewSession swaps the harness,
+/// dropping the old control with its pending queue) is NOT lost truth:
+/// the mirrors carry the pick, and every session build below reads them —
+/// the replacement session seeds its own initial model rows from the same
+/// choice.
+async fn land_set_model(
+    session: &mut AgentSession,
+    harness_model: &mut HarnessModel,
+    state: &Arc<EngineState>,
+    new_model: HarnessModel,
+) {
+    if *harness_model == new_model {
+        return;
+    }
+    let landed = match session.set_model(new_model.clone()).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "set_model: durable path refused, queueing for the next boundary"
+            );
+            session.handle().set_model(new_model.clone())
+        }
+    };
+    if landed {
+        // Keep the actor's working model in sync: Open/NewSession below
+        // build sessions with it.
+        *harness_model = new_model.clone();
+        *state.model.lock().unwrap() = Some(new_model);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -872,6 +953,10 @@ async fn run_actor(
     // swaps it once registration completes — an early handle stays empty.
     crate::provider_glue::wait_ready().await;
     let registry = crate::provider_glue::global();
+    // Publish the snapshot for the facade's dispatch-time preflight (see
+    // `EngineState::model_registry`): first setter wins, and only the
+    // actor writes it.
+    let _ = state.model_registry.set(Arc::clone(&registry));
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::provider_glue::LegacyAliasCatalog::new(registry.clone()),
     ));
@@ -1465,42 +1550,7 @@ async fn run_actor(
                 session.abort();
             }
             SessionCmd::SetModel(new_model) => {
-                // Streams dispatch by `model.provider` through the shared
-                // registry, so a cross-provider switch reaches the right
-                // endpoint + credential (the old bridge captured the
-                // initial model's credential for every later model).
-                //
-                // The switch must land one way or another — the dispatch was
-                // already echoed as accepted, so dropping it here would
-                // strand every client on a model the session never adopted.
-                // The durable path first (journaled now, effective at the
-                // next request); when it refuses — a transient non-idle
-                // phase, or a credential that vanished between the
-                // dispatch-time preflight and here — the same queueing
-                // semantics the mid-run arm uses: effective at the next
-                // request boundary, journaled by that boundary's flush.
-                //
-                // Every mirror follows the landing, never the request, and
-                // the model already in play never appends a second
-                // `model_change` entry.
-                if harness_model != new_model {
-                    let landed = match session.set_model(new_model.clone()).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                "set_model: durable path refused, queueing for the next boundary"
-                            );
-                            session.handle().set_model(new_model.clone())
-                        }
-                    };
-                    if landed {
-                        // Keep the actor's working model in sync: Open/NewSession
-                        // below build sessions with it.
-                        harness_model = new_model.clone();
-                        *state.model.lock().unwrap() = Some(new_model);
-                    }
-                }
+                land_set_model(&mut session, &mut harness_model, &state, new_model).await;
             }
             SessionCmd::SetPermissionMode(mode) => {
                 apply_permission_mode(&state, &sessions_dir, session.path(), mode, &notice_tx)

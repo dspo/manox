@@ -133,6 +133,15 @@ pub trait ThreadEngine: Send + Sync {
     /// Hot-swap the model for the next provider request.
     fn set_model(&self, model: HarnessModel);
 
+    /// Whether this engine's runtime can serve `model` — the registry
+    /// snapshot the engine's own requests resolve through, so a
+    /// dispatch-time preflight judges the pick by the resolver that will
+    /// actually run it. Engines without a registry-backed runtime answer
+    /// `Ok(())` (their resolver is custom by construction).
+    fn preflight_model(&self, _model: &HarnessModel) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Map the reasoning effort onto the backend's thinking level.
     fn set_thinking_level(&self, level: Option<String>);
 

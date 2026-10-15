@@ -138,7 +138,7 @@ turn id 方案。结论如下，三条证据相互印证：
 `DropQueued`→`chat/pendingMessageRemoved{kind:"queued"}`；`CancelTurn`→`chat/turnCancelled`；
 `SetModel`/`SetReasoningEffort`/`SetApprovalMode`→`session/configChanged`；`SetCwd`→`session/workingDirectory*`；
 `SetPlanMode`→`x-manox-plan/planModeChanged`（客户端可派发的 action）；`PlanSeedExecution`→`x-manox/planExecute`（命令）；
-`SetBrowserSuite`→`session/configChanged`（状态行由 `x-manox-work/browserSuitesChanged` 承载）；
+`SetBrowserSuite`→无 `session/configChanged` 落点（宿主只认 schema 声明的 session-mutable 三键，浏览器套件不是其中之一；状态行由 `x-manox-work/browserSuitesChanged` 承载）；
 `Compact`→`x-manox/compact`（命令）；`Goal`→`x-manox/goal`（命令；状态落 `x-manox-work/goalChanged`）；
 `StopBackgroundTask`→无落点（曾声明的 `x-manox-work/backgroundTaskStopped` 从未接派发臂、宿主从不发，已随声明面 v5 删除；`not-on-wire`）；
 `ArchiveThread`→`session/isArchivedChanged`；

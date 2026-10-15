@@ -77,6 +77,16 @@ pub struct Cost {
     pub cache_write: f64,
 }
 
+/// A resolved request endpoint: the registry's config answer for one
+/// model, before any stream client is constructed. The validation half of
+/// `ProviderRegistry::resolve_stream`, shared with `preflight_stream`.
+struct StreamEndpoint {
+    api: String,
+    base_url: String,
+    api_key: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
 /// An input modality a model accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputModality {
@@ -298,11 +308,84 @@ impl ProviderRegistry {
     /// matching provider stream. Unknown providers delegate to the
     /// fallback resolver when one is set.
     pub fn resolve_stream(&self, model: &Model) -> Result<Arc<dyn StreamFn>, anyhow::Error> {
+        if self
+            .providers
+            .lock()
+            .unwrap()
+            .get(&model.provider)
+            .is_none()
+            && let Some(fallback) = self.fallback.lock().unwrap().clone()
+        {
+            return fallback(model);
+        }
+        let endpoint = self.resolve_stream_endpoint(model)?;
+        let options = StreamOptions {
+            headers: endpoint.headers,
+            ..Default::default()
+        };
+        let key = endpoint.api_key.unwrap_or_default();
+        let stream: Arc<dyn StreamFn> = match endpoint.api.as_str() {
+            "anthropic" => Arc::new(
+                AnthropicStreamFn::new(key)
+                    .with_base_url(endpoint.base_url)
+                    .with_options(options),
+            ),
+            "openai_completions" => Arc::new(
+                CompletionsStreamFn::new(key)
+                    .with_base_url(endpoint.base_url)
+                    .with_options(options),
+            ),
+            "openai_responses" => Arc::new(
+                ResponsesStreamFn::new(key)
+                    .with_base_url(endpoint.base_url)
+                    .with_options(options),
+            ),
+            other => {
+                return Err(anyhow::anyhow!(
+                    "no provider runtime for api {other:?} (wired: anthropic, openai_completions, openai_responses)"
+                ));
+            }
+        };
+        Ok(stream)
+    }
+
+    /// Validate that this registry can serve `model` — the provider is
+    /// registered, the endpoint resolvable, the credential reference
+    /// interpolatable, the api one the runtime wires — WITHOUT building
+    /// the HTTP client a live stream constructs. The dispatch preflight
+    /// answers "will the next request run" and must stay cheap enough to
+    /// sit in the synchronous dispatch gate.
+    pub fn preflight_stream(&self, model: &Model) -> Result<(), anyhow::Error> {
+        if self
+            .providers
+            .lock()
+            .unwrap()
+            .get(&model.provider)
+            .is_none()
+            && let Some(fallback) = self.fallback.lock().unwrap().clone()
+        {
+            // The fallback owns its own validation; preflighting through
+            // an opaque resolver means building (and dropping) its client —
+            // correctness over the saved construction.
+            let _ = fallback(model)?;
+            return Ok(());
+        }
+        let endpoint = self.resolve_stream_endpoint(model)?;
+        match endpoint.api.as_str() {
+            "anthropic" | "openai_completions" | "openai_responses" => Ok(()),
+            other => Err(anyhow::anyhow!(
+                "no provider runtime for api {other:?} (wired: anthropic, openai_completions, openai_responses)"
+            )),
+        }
+    }
+
+    /// Everything a request needs from the registry except the stream
+    /// client itself: the resolved api, base URL, interpolated credential,
+    /// and merged headers. The config half of [`Self::resolve_stream`],
+    /// shared with [`Self::preflight_stream`].
+    fn resolve_stream_endpoint(&self, model: &Model) -> Result<StreamEndpoint, anyhow::Error> {
         let config = self.providers.lock().unwrap().get(&model.provider).cloned();
         let Some(config) = config else {
-            if let Some(fallback) = self.fallback.lock().unwrap().clone() {
-                return fallback(model);
-            }
             return Err(anyhow::anyhow!(
                 "no provider registered for {:?} (and no fallback resolver)",
                 model.provider
@@ -313,8 +396,8 @@ impl ProviderRegistry {
         let api = model_cfg
             .and_then(|m| m.api)
             .or(config.api)
-            .map(|api| api.as_model_api())
-            .unwrap_or(model.api.as_str());
+            .map(|api| api.as_model_api().to_string())
+            .unwrap_or_else(|| model.api.as_str().to_string());
         let base_url = model_cfg
             .and_then(|m| m.base_url.clone())
             .or_else(|| config.base_url.clone())
@@ -340,35 +423,12 @@ impl ProviderRegistry {
         {
             headers.push(("Authorization".to_string(), format!("Bearer {key}")));
         }
-        let options = StreamOptions {
+        Ok(StreamEndpoint {
+            api,
+            base_url,
+            api_key,
             headers,
-            ..Default::default()
-        };
-
-        let key = api_key.unwrap_or_default();
-        let stream: Arc<dyn StreamFn> = match api {
-            "anthropic" => Arc::new(
-                AnthropicStreamFn::new(key)
-                    .with_base_url(base_url)
-                    .with_options(options),
-            ),
-            "openai_completions" => Arc::new(
-                CompletionsStreamFn::new(key)
-                    .with_base_url(base_url)
-                    .with_options(options),
-            ),
-            "openai_responses" => Arc::new(
-                ResponsesStreamFn::new(key)
-                    .with_base_url(base_url)
-                    .with_options(options),
-            ),
-            other => {
-                return Err(anyhow::anyhow!(
-                    "no provider runtime for api {other:?} (wired: anthropic, openai_completions, openai_responses)"
-                ));
-            }
-        };
-        Ok(stream)
+        })
     }
 
     /// A `StreamResolver` view over this registry — the seam
