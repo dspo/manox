@@ -1254,6 +1254,7 @@ fn test_engine_state() -> Arc<EngineState> {
     ));
     let question_gate = Arc::new(crate::questions::UserQuestionGate::new(notice_tx.clone()));
     Arc::new(EngineState {
+        model_registry: OnceLock::new(),
         running: AtomicBool::new(false),
         session_start_fired: AtomicBool::new(false),
         history: Mutex::new(Vec::new()),
@@ -5047,4 +5048,132 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     );
 
     crate::embedder_tools::drop_provider_for_test();
+}
+
+/// Every `model_change` row's model id, in chain order — the durable view
+/// of the model history, deferred file included.
+async fn session_model_changes(session: &AgentSession) -> Vec<String> {
+    session
+        .journal_appender()
+        .storage()
+        .journal_range(0, u64::MAX)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| match &r.entry {
+            manox_harness::session::SessionTreeEntry::ModelChange { model_id, .. } => {
+                Some(model_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The idle `SetModel` landing's durable half: a servable pick appends
+/// its `model_change` row synchronously — the exact link the silent-switch
+/// bug broke (an accepted echo with no journal row meant every reopen
+/// snapped back to the old model).
+#[tokio::test]
+async fn an_idle_set_model_appends_its_journal_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    let resolver: manox_harness::agent_loop::StreamResolver = Arc::new(
+        |_m: &HarnessModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
+            // Construction-time resolution must succeed; no request ever
+            // runs in this test.
+            Ok(Arc::new(manox_harness::AnthropicStreamFn::new("test-key")))
+        },
+    );
+    let runtime = ModelRuntime::new(resolver);
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(runtime)
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+
+    let state = test_engine_state();
+    let mut harness_model = test_model();
+    let switched = test_model_switched();
+    land_set_model(&mut session, &mut harness_model, &state, switched.clone()).await;
+
+    assert_eq!(harness_model.id, "new", "the mirrors follow the landing");
+    assert_eq!(
+        state.model.lock().unwrap().as_ref().map(|m| m.id.clone()),
+        Some("new".to_string())
+    );
+    let landed = session_model_changes(&session).await;
+    assert_eq!(
+        landed.last().map(String::as_str),
+        Some("new"),
+        "the durable half landed with the echo (chain view, deferred file and all)"
+    );
+}
+
+/// The idle `SetModel` landing's fallback: when the durable path refuses
+/// (here: the session's resolver cannot serve the pick), the queueing
+/// semantics of the mid-run arm take over — the mirrors land, effective at
+/// the next request boundary, journaled by that boundary's flush — instead
+/// of the switch dying after the dispatch was already echoed as accepted.
+#[tokio::test]
+async fn an_idle_set_model_refused_by_the_durable_path_lands_via_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("proj");
+    tokio::fs::create_dir_all(&cwd).await.unwrap();
+
+    // The resolver serves the construction model and refuses the switch
+    // target — the credential-vanished shape between the dispatch-time
+    // preflight and the actor.
+    let resolver: manox_harness::agent_loop::StreamResolver =
+        Arc::new(move |m: &HarnessModel| -> Result<Arc<dyn manox_harness::agent_loop::StreamFn>, anyhow::Error> {
+            if m.id == "new" {
+                Err(anyhow::anyhow!("credential gone"))
+            } else {
+                Ok(Arc::new(manox_harness::AnthropicStreamFn::new("test-key")))
+            }
+        });
+    let runtime = ModelRuntime::new(resolver);
+    let mut session = create_agent_session()
+        .with_cwd(&cwd)
+        .with_session_dir(dir.path().join("sessions"))
+        .with_model_runtime(runtime)
+        .with_model(test_model())
+        .with_system_prompt("You are a test assistant.")
+        .build()
+        .await
+        .unwrap();
+
+    let state = test_engine_state();
+    let mut harness_model = test_model();
+    land_set_model(
+        &mut session,
+        &mut harness_model,
+        &state,
+        test_model_switched(),
+    )
+    .await;
+
+    assert_eq!(
+        harness_model.id, "new",
+        "a refused durable path falls back to the queued switch"
+    );
+    assert_eq!(
+        state.model.lock().unwrap().as_ref().map(|m| m.id.clone()),
+        Some("new".to_string())
+    );
+    let landed = session_model_changes(&session).await;
+    assert!(
+        !landed.iter().any(|id| id == "new"),
+        "the queued switch journals at the next boundary flush, not now: {landed:?}"
+    );
+    assert_eq!(
+        landed.last().map(String::as_str),
+        Some("test"),
+        "the construction model's initial row is untouched"
+    );
 }

@@ -158,10 +158,21 @@ where
                     // mirrors follow the handle's verdict, not the request: a
                     // model the fixed stream refuses leaves every mirror on
                     // the model the run still serves, and the model already in
-                    // play is never re-queued.
-                    if *harness_model != new_model && handle.set_model(new_model.clone()) {
-                        *state.model.lock().unwrap() = Some(new_model.clone());
-                        *harness_model = new_model;
+                    // play is never re-queued. A refusal is loud — the
+                    // dispatch was echoed as accepted, so a silent drop here
+                    // would strand the client's chip on a model that never
+                    // landed (unreachable with the registry resolver
+                    // installed; the belt is for the fixed-stream shape).
+                    if *harness_model != new_model {
+                        if handle.set_model(new_model.clone()) {
+                            *state.model.lock().unwrap() = Some(new_model.clone());
+                            *harness_model = new_model;
+                        } else {
+                            tracing::warn!(
+                                model = %new_model.id,
+                                "mid-run set_model refused; the run keeps the current model"
+                            );
+                        }
                     }
                 }
                 Some(SessionCmd::SetThinkingLevel(level)) => {

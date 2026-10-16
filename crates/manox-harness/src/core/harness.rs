@@ -454,7 +454,16 @@ impl HarnessHandle {
         {
             return false;
         }
-        self.control.turn_runtime.lock().unwrap().model = model.clone();
+        {
+            let mut runtime = self.control.turn_runtime.lock().unwrap();
+            // Idempotent by target: a re-pick of the model this call site
+            // already queued (or the run already adopted) must not stack a
+            // second durable entry — the queue target IS this snapshot.
+            if runtime.model == model {
+                return true;
+            }
+            runtime.model = model.clone();
+        }
         self.control.emit_harness(HarnessEvent::ModelUpdate {
             model: model.clone(),
         });
