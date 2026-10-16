@@ -60,6 +60,8 @@ http.workspace = true
 tera.workspace = true
 rustwright_core = { workspace = true, optional = true }
 html2text = "0.17.1"
+encoding_rs = "0.8"
+url = "2"
 tempfile = "3"
 
 [dev-dependencies]
