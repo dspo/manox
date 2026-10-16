@@ -58,7 +58,6 @@ supervisor.workspace = true
 toml.workspace = true
 http.workspace = true
 tera.workspace = true
-tokio-tungstenite = { workspace = true }
 rustwright_core = { workspace = true, optional = true }
 html2text = "0.17.1"
 tempfile = "3"

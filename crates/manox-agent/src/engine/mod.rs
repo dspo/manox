@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::subagent::SubagentRunObserver;
 use manox_harness::bash::BashTool;
@@ -18,7 +18,6 @@ use manox_harness::bash::orchestration::BackgroundManager;
 use manox_harness::bash::persistent::PersistentShellOperations;
 use manox_harness::coding_agent::{AgentSession, ModelRuntime, create_agent_session};
 use manox_harness::ext_point_agent::AgentRegistry;
-use manox_harness::monitor::{MonitorManager, MonitorTool};
 use manox_harness::subagent::spawn::register_defaults;
 use manox_harness::subagent::{DelegationToolConfig, SpawnProvider, SubagentRuntime};
 use manox_harness::tool::AgentTool as HarnessAgentTool;
@@ -311,6 +310,17 @@ struct EngineState {
     /// The actor's working model; `SetModel` mirrors here so session
     /// builds always read the latest choice.
     model: Arc<Mutex<Option<HarnessModel>>>,
+    /// The registry snapshot THIS session's requests resolve through, set
+    /// by the actor right after `wait_ready` (the same Arc its
+    /// `ModelRuntime` captures). A dispatch-time model preflight must
+    /// judge the pick by this snapshot, not the process global — a
+    /// settings reload swaps the global without refreshing live
+    /// sessions, and preflighting by the global would both false-reject
+    /// picks the session can still serve and accept picks whose next
+    /// request dies on the session's own stale resolver. `None` before
+    /// the actor's first poll: the global registry is then the best
+    /// prediction (it is what a future engine will capture).
+    model_registry: OnceLock<Arc<manox_harness::ProviderRegistry>>,
     sessions: Mutex<Vec<ThreadSummary>>,
     active_path: Mutex<Option<PathBuf>>,
     /// A browser-suite toggle that arrived mid-run; the running turn owns the
@@ -428,6 +438,22 @@ impl Engine {
     pub fn granted_working_directories(&self) -> Vec<PathBuf> {
         self.state.granted_roots.approved_roots()
     }
+
+    /// Whether THIS engine's runtime can serve `model` — the registry
+    /// snapshot the actor captured (see `EngineState::model_registry`),
+    /// falling back to the process global before the actor's first poll.
+    /// Pure config/credential resolution: no HTTP client is built.
+    pub(crate) fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        let registry = self
+            .state
+            .model_registry
+            .get()
+            .cloned()
+            .unwrap_or_else(crate::provider_glue::global);
+        registry
+            .preflight_stream(model)
+            .map_err(|err| format!("{err:#}"))
+    }
 }
 
 /// Spawn the harness actor and return the engine handle plus its notice receiver.
@@ -517,6 +543,7 @@ pub fn spawn_engine(
         cumulative_cost: Mutex::new(0.0),
         per_model_cost: Mutex::new(HashMap::new()),
         model: model_slot,
+        model_registry: OnceLock::new(),
         sessions: Mutex::new(Vec::new()),
         active_path: Mutex::new(initial_path.clone()),
         pending_browser_suite: Mutex::new(None),
@@ -657,6 +684,9 @@ impl ThreadEngine for Engine {
     }
     fn granted_working_directories(&self) -> Vec<PathBuf> {
         Engine::granted_working_directories(self)
+    }
+    fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        Engine::preflight_model(self, model)
     }
     fn run_with_origin(
         &self,
@@ -910,6 +940,56 @@ impl ThreadEngine for Engine {
 
 // ── The harness actor ───────────────────────────────────────────────────────────
 
+/// The idle `SetModel` landing (split from the actor loop so its total
+/// semantics are testable without driving the whole actor).
+///
+/// Streams dispatch by `model.provider` through the shared registry, so a
+/// cross-provider switch reaches the right endpoint + credential (the old
+/// bridge captured the initial model's credential for every later model).
+///
+/// The switch must land one way or another — the dispatch was already
+/// echoed as accepted, so dropping it here would strand every client on a
+/// model the session never adopted. The durable path first (journaled
+/// now, effective at the next request); when it refuses — a transient
+/// non-idle phase, or a credential that vanished between the
+/// dispatch-time preflight and here — the same queueing semantics the
+/// mid-run arm uses: effective at the next request boundary, journaled
+/// by that boundary's flush.
+///
+/// Every mirror follows the landing, never the request, and the model
+/// already in play never appends a second `model_change` entry. A queued
+/// switch outliving its session (an Open/NewSession swaps the harness,
+/// dropping the old control with its pending queue) is NOT lost truth:
+/// the mirrors carry the pick, and every session build below reads them —
+/// the replacement session seeds its own initial model rows from the same
+/// choice.
+async fn land_set_model(
+    session: &mut AgentSession,
+    harness_model: &mut HarnessModel,
+    state: &Arc<EngineState>,
+    new_model: HarnessModel,
+) {
+    if *harness_model == new_model {
+        return;
+    }
+    let landed = match session.set_model(new_model.clone()).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "set_model: durable path refused, queueing for the next boundary"
+            );
+            session.handle().set_model(new_model.clone())
+        }
+    };
+    if landed {
+        // Keep the actor's working model in sync: Open/NewSession below
+        // build sessions with it.
+        *harness_model = new_model.clone();
+        *state.model.lock().unwrap() = Some(new_model);
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // actor entry: startup options stay explicit
 async fn run_actor(
     cwd: PathBuf,
@@ -934,6 +1014,10 @@ async fn run_actor(
     // swaps it once registration completes — an early handle stays empty.
     crate::provider_glue::wait_ready().await;
     let registry = crate::provider_glue::global();
+    // Publish the snapshot for the facade's dispatch-time preflight (see
+    // `EngineState::model_registry`): first setter wins, and only the
+    // actor writes it.
+    let _ = state.model_registry.set(Arc::clone(&registry));
     let runtime = ModelRuntime::with_provider_registry(registry.clone()).with_catalog(Arc::new(
         crate::provider_glue::LegacyAliasCatalog::new(registry.clone()),
     ));
@@ -1024,7 +1108,7 @@ async fn run_actor(
         // projects the session's own model only when the builder carries
         // none, and the actor adopts
         // it right after the open below.
-        let (builder, orchestrators) = session_builder(
+        let (builder, background) = session_builder(
             &tool_cwd,
             &sessions_dir,
             &runtime,
@@ -1041,7 +1125,7 @@ async fn run_actor(
         );
         match builder.open(session_path).await {
             Ok(mut s) => {
-                attach_orchestrators(&mut s, &orchestrators);
+                attach_orchestrators(&mut s, &background);
                 attach_plan_hooks(&mut s, &state.plan);
                 attach_plugin_hooks(&mut s, &tool_cwd);
                 attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -1059,7 +1143,7 @@ async fn run_actor(
     let mut session = match session {
         Some(s) => s,
         None => {
-            let (builder, orchestrators) = session_builder(
+            let (builder, background) = session_builder(
                 &cwd,
                 &sessions_dir,
                 &runtime,
@@ -1079,7 +1163,7 @@ async fn run_actor(
             // share one identity.
             match builder.with_session_id(thread_id.clone()).build().await {
                 Ok(mut s) => {
-                    attach_orchestrators(&mut s, &orchestrators);
+                    attach_orchestrators(&mut s, &background);
                     attach_plan_hooks(&mut s, &state.plan);
                     attach_plugin_hooks(&mut s, &cwd);
                     attach_prefix_gate(&mut s, &notice_tx, &thread_id);
@@ -1128,7 +1212,8 @@ async fn run_actor(
     }
     spawn_session_list_refresh(&sessions_dir, &state);
 
-    // Idle-wakeup channel: the harness listener signals when monitor events
+    // Idle-wakeup channel: the harness listener signals when steered events
+    // (a background task's completion summary, a subagent's finish note)
     // land in the steering queue; the actor resumes an idle session below.
     let (wakeup_tx, mut wakeup_rx) = mpsc::unbounded_channel::<()>();
 
@@ -1323,18 +1408,18 @@ async fn run_actor(
         for cmd in parked_cmds {
             let _ = cmd_tx.send(cmd);
         }
-        // Between runs the actor wakes on either a facade command or a
-        // monitor idle-wakeup (steered events queued while the session was
-        // idle). Mid-run wakeups simply accumulate and are re-checked after
-        // settlement.
+        // Between runs the actor wakes on either a facade command or an
+        // idle-wakeup (steered events queued while the session was idle —
+        // a background task completion, a subagent finish). Mid-run
+        // wakeups simply accumulate and are re-checked after settlement.
         let cmd = tokio::select! {
             // None = facade dropped: shut down.
             cmd = cmd_rx.recv() => cmd,
             _ = wakeup_rx.recv() => {
                 // Collapse wakeups queued while the actor was busy; the
                 // steering-queue check inside the helper decides whether a
-                // run is owed. A monitor steered events while the session was
-                // idle — resume now (S1 via the shared helper).
+                // run is owed. A producer steered events while the session
+                // was idle — resume now (S1 via the shared helper).
                 while wakeup_rx.try_recv().is_ok() {}
                 resume_steering_queue(
                     &mut session,
@@ -1630,26 +1715,7 @@ async fn run_actor(
                 }
             }
             SessionCmd::SetModel(new_model) => {
-                // Streams dispatch by `model.provider` through the shared
-                // registry, so a cross-provider switch reaches the right
-                // endpoint + credential (the old bridge captured the
-                // initial model's credential for every later model).
-                //
-                // Every mirror follows the harness, never the request: a
-                // refused switch (credential preflight, non-idle phase)
-                // leaves the actor on the model the session still runs, and
-                // the model already in play never appends a second
-                // `model_change` entry.
-                if harness_model != new_model {
-                    if let Err(err) = session.set_model(new_model.clone()).await {
-                        tracing::warn!("set_model failed: {err}");
-                    } else {
-                        // Keep the actor's working model in sync: Open/NewSession
-                        // below build sessions with it.
-                        harness_model = new_model.clone();
-                        *state.model.lock().unwrap() = Some(new_model);
-                    }
-                }
+                land_set_model(&mut session, &mut harness_model, &state, new_model).await;
             }
             SessionCmd::SetPermissionMode(mode) => {
                 apply_permission_mode(&state, &sessions_dir, session.path(), mode, &notice_tx)

@@ -41,11 +41,6 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 /// not a command failure. Lifted to a const so a future runner (landlock /
 /// windows-acl) adds its own list without touching the consumer.
 // The signatures are only classified in the macOS `exec` body; on other
-// platforms the seatbelt backend is a compiled stub (`is_available()` false),
-// so the const would otherwise read as dead code there.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
-
 /// Confinement policy for one sandboxed invocation: the workspace root whose
 /// `writable_roots()` the `workspace-write` profile allows, plus extra
 /// granted roots (a same-repo worktree of the call's cwd admits itself;
@@ -321,17 +316,10 @@ impl BashOperations for SandboxedBashOperations {
             // denial marker + escalation hint so the model recognizes a
             // policy refusal (not a command bug) and can retry with
             // `sandbox_permissions`.
-            if result.exit_code != 0 && {
-                let stderr = result.stderr.to_ascii_lowercase();
-                SEATBELT_DENIAL_SIGNATURES
-                    .iter()
-                    .any(|sig| stderr.contains(sig))
-            } {
-                result.stderr.push_str(&format!(
-                    "\n{}\n{}",
-                    manox_harness::sandbox::sandbox_denial_marker(mode),
-                    manox_harness::sandbox::escalation_hint_marker("command"),
-                ));
+            if let Some(note) =
+                manox_harness::sandbox::seatbelt_denial_note(&result.stderr, result.exit_code, mode)
+            {
+                result.stderr.push_str(&note);
             }
             Ok(result)
         }
@@ -425,6 +413,20 @@ impl UnsandboxedBashOperations {
             base_cwd: base_cwd.into(),
         }
     }
+
+    /// The unconfined invocation for a command: `bash -c` with the login
+    /// PATH and the non-interactive editor/pager env. Shared by this
+    /// backend's `exec` and the background registry's escalated tasks, so an
+    /// escalated command runs in the same shell and environment however it
+    /// is launched.
+    pub fn command(command: &str, cwd: &Path) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c").arg(command).current_dir(cwd);
+        #[cfg(target_os = "macos")]
+        cmd.env("PATH", login_shell_path());
+        inject_noninteractive_env(&mut cmd);
+        cmd
+    }
 }
 
 #[async_trait::async_trait]
@@ -434,16 +436,10 @@ impl BashOperations for UnsandboxedBashOperations {
             .cwd
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.base_cwd.clone());
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c")
-            .arg(request.command)
-            .current_dir(&cwd)
-            .stdout(std::process::Stdio::piped())
+        let mut cmd = Self::command(request.command, &cwd);
+        cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(target_os = "macos")]
-        cmd.env("PATH", login_shell_path());
-        inject_noninteractive_env(&mut cmd);
         let child = cmd
             .spawn()
             .map_err(|e| ExecutionError::Spawn(e.to_string()))?;

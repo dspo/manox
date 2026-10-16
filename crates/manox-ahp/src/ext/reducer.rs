@@ -296,7 +296,7 @@ mod tests {
 
         // A second task joins; a later tick of the first task replaces only
         // its own entry. The view is a registry, not last-writer-wins.
-        let other = json!({"task_id": "mon_4", "status": "Running"});
+        let other = json!({"task_id": "bg_4", "status": "Running"});
         assert_eq!(apply(&mut state, &action_for(other)), Outcome::Applied);
         let tick = json!({"task_id": "bg_3", "status": "Completed"});
         assert_eq!(apply(&mut state, &action_for(tick)), Outcome::Applied);

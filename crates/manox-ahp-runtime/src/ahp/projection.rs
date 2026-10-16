@@ -94,6 +94,14 @@ pub mod config_keys {
     pub const PROJECT: &str = "project";
     /// Effective working directory of this journal.
     pub const WORKING_DIRECTORY: &str = "workingDirectory";
+    /// The keys a client may change mid-session through
+    /// `session/configChanged` — exactly the set the declared schema marks
+    /// `sessionMutable: true` (AHP: only session-mutable properties may be
+    /// changed). The server-owned keys (`project`, `workingDirectory`)
+    /// travel this seat host→client only: `workingDirectory` writes ride
+    /// the dedicated `session/workingDirectorySet` action, so their arrival
+    /// through a config dispatch is a client bug, not a fold.
+    pub const MUTABLE: &[&str] = &[MODEL, REASONING_EFFORT, APPROVAL_MODE];
 }
 
 /// The journal-row facts the projection mints identities from: one kernel
@@ -3127,7 +3135,7 @@ mod tests {
         // (`task_snapshot_serialization_is_wire_stable`), and the chain from
         // that real shape runs in manox-ahp-runtime's
         // `background_task_snapshot_flows_from_host_shape_to_extension_state`.
-        let snapshot = json!({"task_id": "mon_7"});
+        let snapshot = json!({"task_id": "bg_7"});
         let mut translator = Translator::new();
         let emitted = translator.on_entry(
             "c-1",
@@ -3161,14 +3169,14 @@ mod tests {
         assert_eq!(
             state.background_tasks,
             Some(
-                [("mon_7".to_string(), snapshot.clone())]
+                [("bg_7".to_string(), snapshot.clone())]
                     .into_iter()
                     .collect()
             )
         );
         // …and the field survives a state round-trip for reconnecting clients.
         let encoded = serde_json::to_value(&state).expect("state serializes");
-        assert_eq!(encoded["backgroundTasks"]["mon_7"], snapshot);
+        assert_eq!(encoded["backgroundTasks"]["bg_7"], snapshot);
         let decoded: ext::XManoxState = serde_json::from_value(encoded).expect("state round-trips");
         assert_eq!(decoded.background_tasks, state.background_tasks);
     }
@@ -3185,10 +3193,10 @@ mod tests {
         use manox_agent::background_task::{TaskKind, TaskSnapshot, TaskStatus};
 
         let snapshot = TaskSnapshot {
-            task_id: "mon_7".into(),
-            kind: TaskKind::MonitorCommand,
+            task_id: "bg_7".into(),
+            kind: TaskKind::BackgroundBash,
             owner_thread_id: "t-1".into(),
-            description: "watch the build".into(),
+            description: "cargo build".into(),
             status: TaskStatus::Completed,
             created_at_ms: 1_000,
             ended_at_ms: Some(2_000),
@@ -3230,7 +3238,7 @@ mod tests {
             }
         }
         assert_eq!(
-            state.background_tasks.as_ref().and_then(|m| m.get("mon_7")),
+            state.background_tasks.as_ref().and_then(|m| m.get("bg_7")),
             Some(&wire),
             "the host shape reaches the registry view verbatim, keyed by task id"
         );
@@ -4253,7 +4261,7 @@ mod extension_gate_tests {
                 "x-manox-work:/s-1",
             ),
             (
-                kernel(json!({"type": "background_task", "snapshot": {"task_id": "mon_7"}})),
+                kernel(json!({"type": "background_task", "snapshot": {"task_id": "bg_7"}})),
                 ext_actions::WORK_BACKGROUND_TASKS,
                 "x-manox-work:/s-1",
             ),
@@ -4347,7 +4355,7 @@ mod extension_gate_tests {
                 goal: Some(json!({"text": "ship"})),
                 browser_suites: Some(vec!["chrome".to_string()]),
                 background_tasks: Some(
-                    [("mon_7".to_string(), json!({"task_id": "mon_7"}))]
+                    [("bg_7".to_string(), json!({"task_id": "bg_7"}))]
                         .into_iter()
                         .collect()
                 ),

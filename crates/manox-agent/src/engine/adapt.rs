@@ -457,30 +457,19 @@ pub fn tool_title(name: &str, args: &serde_json::Value) -> String {
             Some(command) => format!("$ {command}"),
             None => "Bash".to_string(),
         },
-        "BashOutput" => match arg("shell_id") {
-            Some(shell_id) => format!("BashOutput {shell_id}"),
-            None => "BashOutput".to_string(),
-        },
+        "BashOutput" => {
+            // A waiting read can hold the turn for minutes; the title says so.
+            let waits = args.get("wait").and_then(|w| w.as_bool()) == Some(true);
+            match (arg("shell_id"), waits) {
+                (Some(shell_id), true) => format!("BashOutput {shell_id} (wait)"),
+                (Some(shell_id), false) => format!("BashOutput {shell_id}"),
+                (None, _) => "BashOutput".to_string(),
+            }
+        }
         "TaskStop" => match arg("task_id") {
             Some(task_id) => format!("TaskStop {task_id}"),
             None => "TaskStop".to_string(),
         },
-        "Monitor" => {
-            let ws_url = || {
-                args.get("ws")
-                    .and_then(|w| w.get("url"))
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            };
-            match arg("command")
-                .or_else(ws_url)
-                .or_else(|| arg("description"))
-            {
-                Some(target) => format!("Monitor {target}"),
-                None => "Monitor".to_string(),
-            }
-        }
         "WebFetch" => match arg("url") {
             Some(url) => format!("WebFetch {url}"),
             None => "WebFetch".to_string(),
@@ -1072,26 +1061,16 @@ mod tests {
             "WebFetch https://example.com/doc"
         );
         assert_eq!(
-            tool_title(
-                "Monitor",
-                &json!({"description": "watch", "command": "cargo build"})
-            ),
-            "Monitor cargo build"
-        );
-        assert_eq!(
-            tool_title(
-                "Monitor",
-                &json!({"description": "watch", "ws": {"url": "wss://x/ws"}})
-            ),
-            "Monitor wss://x/ws"
-        );
-        assert_eq!(
             tool_title("BashOutput", &json!({"shell_id": "sh_3"})),
             "BashOutput sh_3"
         );
         assert_eq!(
-            tool_title("TaskStop", &json!({"task_id": "mon_2"})),
-            "TaskStop mon_2"
+            tool_title("BashOutput", &json!({"shell_id": "bg_3", "wait": true})),
+            "BashOutput bg_3 (wait)"
+        );
+        assert_eq!(
+            tool_title("TaskStop", &json!({"task_id": "bg_2"})),
+            "TaskStop bg_2"
         );
     }
 

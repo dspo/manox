@@ -269,6 +269,18 @@ impl SessionRuntime for GatewayRuntime {
         self.server.ahp_inner().set_model(session_id, model)
     }
 
+    fn preflight_config(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<(), RuntimeError> {
+        self.server
+            .ahp_inner()
+            .preflight_config(session_id, model, effort, mode)
+    }
+
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError> {
         self.server
             .ahp_inner()

@@ -38,7 +38,6 @@ pub use core::types;
 // remain reachable without the `ext::` prefix.
 pub use ext::bash;
 pub use ext::model_ref;
-pub use ext::monitor;
 pub use ext::path_selector;
 pub use ext::prompt;
 pub use ext::read;
@@ -83,4 +82,3 @@ pub use core::types::{AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, A
 // Re-export ext's top-level `pub use` items.
 pub use ext::bash::background::{BackgroundRegistry, BashOutputTool, TaskStopTool};
 pub use ext::bash::persistent::PersistentShellOperations;
-pub use ext::monitor::MonitorTool;

@@ -1,6 +1,6 @@
-//! Process-global registry of background tasks — command Monitor, WebSocket
-//! Monitor, background Bash (proxied from the kernel-side registries), and
-//! asynchronously-dispatched subagents — each with an owner thread, status,
+//! Process-global registry of background tasks — background Bash (proxied
+//! from the kernel-side registry) and asynchronously-dispatched subagents —
+//! each with an owner thread, status,
 //! stop routing, and a bounded output ring.
 //!
 //! This is the host's single source of truth for task cards: the session
@@ -63,8 +63,6 @@ impl std::fmt::Display for TaskId {
 /// What kind of background task this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskKind {
-    MonitorCommand,
-    MonitorWebSocket,
     BackgroundBash,
     /// An asynchronously-dispatched subagent coroutine running in a background
     /// session. Completion is delivered to the Captain as a
@@ -110,7 +108,7 @@ impl TaskStatus {
 /// lines and the terminal record; UI consumers match on the kind.
 #[derive(Debug, Clone)]
 pub enum TaskEventKind {
-    /// A line of stdout (command) or a text frame (WebSocket).
+    /// A line of stdout.
     Output(String),
     /// The task reached a terminal state.
     Terminal {
@@ -163,7 +161,7 @@ struct TaskState {
     exited_at: Option<Instant>,
     exited_at_ms: Option<u64>,
     /// The hook that actually stops the underlying kernel-side work. Registered
-    /// by whoever proxies the task (monitor manager / background manager).
+    /// by whoever proxies the task (the background manager).
     on_stop: Option<OnStopHook>,
     /// Notice sink for snapshots this registry pushes itself (the stop
     /// path's synchronous terminal status). Producer-driven changes emit
@@ -551,7 +549,7 @@ fn registry() -> &'static std::sync::Mutex<Registry> {
 /// Allocate a unique id for a directly-registered task. Direct registration
 /// is subagent-only (kernel-path tasks enter through `register_with_id` under
 /// their harness-issued ids), so the prefix namespace never overlaps the
-/// harness registries' `mon_`/`bg_`/`ws_`.
+/// harness registry's `bg_`.
 fn next_id() -> TaskId {
     let mut reg = registry().lock().expect("registry poisoned");
     let n = reg.next_id;
@@ -661,8 +659,8 @@ pub(crate) fn apply_settlement(
 /// Output lines collected before a task's snapshot re-emits to the UI.
 const OUTPUT_EMIT_THRESHOLD: u32 = 5;
 
-/// The host's [`TaskObserver`]: binds the session producers (monitors,
-/// background bash) to this registry. Each `Spawned` registers a proxy task
+/// The host's [`TaskObserver`]: binds the session producers (background
+/// bash) to this registry. Each `Spawned` registers a proxy task
 /// under the kernel task id (one id space for `stop` and the UI cards, with an
 /// on_stop hook back into the producer), each `Output` lands in the proxy's
 /// bounded ring (snapshots throttled), and each `Settled` records the
@@ -740,8 +738,6 @@ impl HostTaskObserver {
 
 fn map_kind(family: manox_harness::tasks::TaskFamily) -> TaskKind {
     match family {
-        manox_harness::tasks::TaskFamily::MonitorCommand => TaskKind::MonitorCommand,
-        manox_harness::tasks::TaskFamily::MonitorWebSocket => TaskKind::MonitorWebSocket,
         manox_harness::tasks::TaskFamily::BackgroundBash => TaskKind::BackgroundBash,
         manox_harness::tasks::TaskFamily::Subagent => TaskKind::Subagent,
     }
@@ -749,9 +745,8 @@ fn map_kind(family: manox_harness::tasks::TaskFamily) -> TaskKind {
 
 /// Bind the session's producers to the host observer. Called next to
 /// `attach_orchestrators` at session build/restore; the observer lives as
-/// long as the managers hold it.
+/// long as the manager holds it.
 pub fn attach(
-    monitor: Arc<manox_harness::monitor::MonitorManager>,
     background: Arc<manox_harness::bash::orchestration::BackgroundManager>,
     notice_tx: mpsc::UnboundedSender<BackendNotice>,
     owner_thread_id: String,
@@ -761,7 +756,6 @@ pub fn attach(
         owner_thread_id,
         output_since_emit: Mutex::new(HashMap::new()),
     });
-    monitor.set_observer(Arc::clone(&observer) as Arc<dyn manox_harness::tasks::TaskObserver>);
     background.set_observer(observer);
 }
 
@@ -824,8 +818,6 @@ fn list_stoppable_under_lock(reg: &Registry) -> String {
         let s = task.state.lock().expect("task state poisoned");
         if !s.status.is_terminal() {
             let kind_str = match s.kind {
-                TaskKind::MonitorCommand => "monitor (command)",
-                TaskKind::MonitorWebSocket => "monitor (WebSocket)",
                 TaskKind::BackgroundBash => "background bash",
                 TaskKind::Subagent => "Subagent",
             };
@@ -855,6 +847,65 @@ pub fn gc() {
             None => true,
         }
     });
+}
+
+/// Snapshot every task owned by a thread, oldest first — the model-facing
+/// `TaskList` inventory: running tasks plus finished ones not yet reaped.
+pub fn snapshots_for_thread(thread_id: &str) -> Vec<TaskSnapshot> {
+    let reg = registry().lock().expect("registry poisoned");
+    let mut snaps: Vec<TaskSnapshot> = reg
+        .tasks
+        .iter()
+        .filter(|(_, task)| task.owner_thread_id() == thread_id)
+        .map(|(id, task)| task.snapshot(&TaskId(id.clone())))
+        .collect();
+    drop(reg);
+    snaps.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.task_id.cmp(&b.task_id))
+    });
+    snaps
+}
+
+/// Render the model-facing `TaskList` body: one line per task —
+/// `id  [bash|subagent]  [running|exit N|status]  label` — or a single
+/// empty-state line. The kind tells the model which read applies: only a
+/// bash task has a `BashOutput` stream.
+pub fn render_task_list(thread_id: &str) -> String {
+    let snaps = snapshots_for_thread(thread_id);
+    if snaps.is_empty() {
+        return "No background tasks.".to_string();
+    }
+    let mut out = String::new();
+    for snap in snaps {
+        let status = if matches!(snap.status, TaskStatus::Running | TaskStatus::Stopping) {
+            "running".to_string()
+        } else if let Some(code) = snap.exit_code {
+            format!("exit {code}")
+        } else {
+            snap.status.as_str().to_lowercase()
+        };
+        let command = snap
+            .description
+            .strip_prefix(manox_harness::bash::orchestration::BASH_TASK_LABEL_PREFIX)
+            .unwrap_or(&snap.description);
+        let command = command.lines().next().unwrap_or("");
+        let command = if command.len() > 100 {
+            format!("{}…", &command[..command.floor_char_boundary(100)])
+        } else {
+            command.to_string()
+        };
+        let kind = match snap.kind {
+            TaskKind::BackgroundBash => "bash",
+            TaskKind::Subagent => "subagent",
+        };
+        out.push_str(&format!(
+            "{}  [{}]  [{}]  {}\n",
+            snap.task_id, kind, status, command
+        ));
+    }
+    out
 }
 
 /// Whether a thread has any running (non-terminal) tasks.
@@ -945,10 +996,10 @@ mod tests {
     #[test]
     fn task_snapshot_serialization_is_wire_stable() {
         let snapshot = TaskSnapshot {
-            task_id: "mon_7".into(),
-            kind: TaskKind::MonitorCommand,
+            task_id: "bg_7".into(),
+            kind: TaskKind::BackgroundBash,
             owner_thread_id: "t-golden".into(),
-            description: "watch the build".into(),
+            description: "cargo build".into(),
             status: TaskStatus::Completed,
             created_at_ms: 1_000,
             ended_at_ms: Some(2_000),
@@ -962,8 +1013,8 @@ mod tests {
         let json = serde_json::to_string(&snapshot).unwrap();
         assert_eq!(
             json,
-            "{\"task_id\":\"mon_7\",\"kind\":\"MonitorCommand\",\
-             \"owner_thread_id\":\"t-golden\",\"description\":\"watch the build\",\
+            "{\"task_id\":\"bg_7\",\"kind\":\"BackgroundBash\",\
+             \"owner_thread_id\":\"t-golden\",\"description\":\"cargo build\",\
              \"status\":\"Completed\",\"created_at_ms\":1000,\"ended_at_ms\":2000,\
              \"event_count\":42,\"total_bytes\":4096,\"exit_code\":0,\
              \"failure_summary\":\"nope\",\"anchor_message_id\":\"m1\",\
@@ -994,7 +1045,7 @@ mod tests {
         let id = TaskId("map_1".into());
         let teardown = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "t-map".into(),
             "map".into(),
             CancellationToken::new(),
@@ -1010,7 +1061,7 @@ mod tests {
         let id = TaskId("map_2".into());
         let user_stop = register_with_id(
             id.clone(),
-            TaskKind::MonitorWebSocket,
+            TaskKind::Subagent,
             "t-map".into(),
             "map".into(),
             CancellationToken::new(),
@@ -1024,38 +1075,30 @@ mod tests {
         remove(&id);
     }
 
-    /// The host observer bridges a real command monitor end-to-end: the
+    /// The host observer bridges a real background bash task end-to-end: the
     /// proxy registers under the kernel task id, snapshots flow as
     /// `BackgroundTaskUpdated` notices (running → completed with output),
-    /// and a user stop routes through the on_stop hook into the monitor
+    /// and a user stop routes through the on_stop hook into the background
     /// manager.
     #[tokio::test]
-    async fn host_observer_bridges_monitor_snapshots() {
+    async fn host_observer_bridges_background_bash_snapshots() {
+        use manox_harness::bash::orchestration::OutputShape;
         use std::path::PathBuf;
 
-        let monitor = manox_harness::monitor::MonitorManager::new(Arc::new(
-            manox_harness::BackgroundRegistry::new(),
-        ));
         let background = manox_harness::bash::orchestration::BackgroundManager::new(Arc::new(
             manox_harness::BackgroundRegistry::new(),
         ));
         let (notice_tx, mut notice_rx) = mpsc::unbounded_channel::<BackendNotice>();
-        attach(
-            Arc::clone(&monitor),
-            Arc::clone(&background),
-            notice_tx,
-            "t1".into(),
-        );
+        attach(Arc::clone(&background), notice_tx, "t1".into());
 
-        let tid = monitor
-            .spawn_command(
-                "bridge watcher".into(),
-                "echo bridge-line".into(),
+        let tid = background
+            .spawn(
+                "echo bridge-line",
                 &PathBuf::from("/tmp"),
-                Duration::from_secs(30),
-                false,
+                OutputShape::default(),
             )
-            .unwrap();
+            .unwrap()
+            .0;
 
         let mut saw_running = false;
         let mut saw_completed = false;
@@ -1089,17 +1132,16 @@ mod tests {
         remove(&TaskId(tid.clone()));
 
         // A user stop routes through the proxy's on_stop hook into the
-        // monitor manager, and the stop path's settlement records Stopped.
-        // (A long-running monitor: the echo task above is already terminal.)
-        let tid = monitor
-            .spawn_command(
-                "long watcher".into(),
-                "sleep 30".into(),
+        // background manager, and the stop path's settlement records Stopped.
+        // (A long-running task: the echo task above is already terminal.)
+        let tid = background
+            .spawn(
+                "sleep 30",
                 &std::path::PathBuf::from("/tmp"),
-                Duration::from_secs(60),
-                false,
+                OutputShape::default(),
             )
-            .unwrap();
+            .unwrap()
+            .0;
         let proxy = get_by_str(&tid).expect("proxy registered");
         assert_eq!(proxy.owner_thread_id(), "t1");
         stop(&tid).await.ok();
@@ -1116,7 +1158,7 @@ mod tests {
         let id = TaskId("notified_stop".into());
         let proxy = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "t-notify".into(),
             "watch".into(),
             CancellationToken::new(),
@@ -1159,7 +1201,7 @@ mod tests {
         let id = TaskId("dup_stop".into());
         let proxy = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "t-dup".into(),
             "watch".into(),
             CancellationToken::new(),
@@ -1202,6 +1244,95 @@ mod tests {
             "the stop fallback must not duplicate the producer's snapshot"
         );
         remove(&id);
+    }
+
+    /// `render_task_list`: one line per owned task — running and
+    /// finished-not-yet-reaped alike — with the bash label stripped back to
+    /// the command, and other threads' tasks excluded.
+    #[test]
+    fn task_list_renders_owned_tasks_one_per_line() {
+        const LABEL: &str = manox_harness::bash::orchestration::BASH_TASK_LABEL_PREFIX;
+        let running_id = TaskId("bg_list_1".into());
+        register_with_id(
+            running_id.clone(),
+            TaskKind::BackgroundBash,
+            "t-list".into(),
+            format!("{LABEL}cargo test --workspace"),
+            CancellationToken::new(),
+        );
+        let finished_id = TaskId("bg_list_2".into());
+        let finished = register_with_id(
+            finished_id.clone(),
+            TaskKind::BackgroundBash,
+            "t-list".into(),
+            format!("{LABEL}gh run watch 123\nsecond line ignored"),
+            CancellationToken::new(),
+        );
+        finished.set_exit_code(Some(0));
+        finished.push_terminal(&finished_id, TaskStatus::Completed);
+        // Outside the real id namespaces (`subagent_N` is minted from the
+        // process-global counter shared with every other test in this
+        // binary — a fixed `subagent_9` here would collide and get removed
+        // by whichever test minted the same id).
+        let subagent_id = TaskId("tasklist_probe_sub".into());
+        register_with_id(
+            subagent_id.clone(),
+            TaskKind::Subagent,
+            "t-list".into(),
+            "explore the tree".into(),
+            CancellationToken::new(),
+        );
+        // A foreign thread's task stays out of this session's list.
+        register_with_id(
+            TaskId("bg_foreign".into()),
+            TaskKind::BackgroundBash,
+            "t-other".into(),
+            format!("{LABEL}make all"),
+            CancellationToken::new(),
+        );
+
+        let listing = render_task_list("t-list");
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines.len(), 3, "three owned tasks listed: {listing}");
+        assert!(
+            lines.contains(
+                &format!("{running_id}  [bash]  [running]  cargo test --workspace").as_str()
+            ),
+            "running line: {listing}"
+        );
+        assert!(
+            lines.contains(&format!("{finished_id}  [bash]  [exit 0]  gh run watch 123").as_str()),
+            "finished line: {listing}"
+        );
+        assert!(
+            lines.iter().any(
+                |l| l.starts_with("tasklist_probe_sub  [subagent]  [running]")
+                    && l.contains("explore the tree")
+            ),
+            "subagent line: {listing}"
+        );
+        assert!(
+            !listing.contains("bg_foreign"),
+            "foreign thread excluded: {listing}"
+        );
+
+        // A reaped (removed) task drops out of the next listing.
+        remove(&running_id);
+        let listing = render_task_list("t-list");
+        assert!(
+            !listing.contains("bg_list_1"),
+            "reaped task gone: {listing}"
+        );
+
+        remove(&finished_id);
+        remove(&subagent_id);
+    }
+
+    /// An owner with no tasks sees the explicit empty state, not a blank
+    /// body.
+    #[test]
+    fn task_list_empty_state() {
+        assert_eq!(render_task_list("t-empty"), "No background tasks.");
     }
 
     #[test]
@@ -1294,8 +1425,8 @@ mod tests {
     #[test]
     fn restore_normalizes_live_snapshot_to_session_ended() {
         let snapshot = TaskSnapshot {
-            task_id: "monitor_old".into(),
-            kind: TaskKind::MonitorCommand,
+            task_id: "bg_old".into(),
+            kind: TaskKind::BackgroundBash,
             owner_thread_id: "thread-old".into(),
             description: "old task".into(),
             status: TaskStatus::Running,
@@ -1319,14 +1450,14 @@ mod tests {
         let id = TaskId("custom_42".into());
         let a = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "thread-id".into(),
             "custom".into(),
             CancellationToken::new(),
         );
         let b = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "thread-id".into(),
             "custom".into(),
             CancellationToken::new(),
@@ -1343,7 +1474,7 @@ mod tests {
         let id = TaskId("hook_task".into());
         let proxy = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "thread-hook".into(),
             "hook".into(),
             CancellationToken::new(),
@@ -1366,7 +1497,7 @@ mod tests {
         let id = TaskId("utf8_tail".into());
         let proxy = register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "thread-utf8".into(),
             "utf8".into(),
             CancellationToken::new(),
@@ -1388,7 +1519,7 @@ mod tests {
         let id = TaskId("cleanup_42".into());
         register_with_id(
             id.clone(),
-            TaskKind::MonitorCommand,
+            TaskKind::BackgroundBash,
             "t-cleanup".into(),
             "cleanup watcher".into(),
             CancellationToken::new(),

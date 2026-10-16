@@ -136,6 +136,36 @@ pub fn sandbox_denial_marker(mode: PermissionMode) -> String {
     format!("[sandbox: file access denied under {} mode]", mode.wire())
 }
 
+/// Substrings a seatbelt file-write denial leaves in the process output
+/// stream (EPERM surfaces as "operation not permitted"). Shared by the
+/// sandboxed exec backend (stderr of a finished child) and the
+/// registry-executed foreground path (combined output after the exit is
+/// recorded).
+pub const SEATBELT_DENIAL_SIGNATURES: &[&str] = &["operation not permitted"];
+
+/// Post-exit denial classification: when a nonzero-exit command's output
+/// carries a seatbelt denial signature, the marker + same-turn escalation
+/// hint is returned so the model recognizes a policy refusal (not a command
+/// bug) and can retry with `sandbox_permissions`.
+pub fn seatbelt_denial_note(output: &str, exit_code: i32, mode: PermissionMode) -> Option<String> {
+    if exit_code == 0 {
+        return None;
+    }
+    let lower = output.to_ascii_lowercase();
+    if SEATBELT_DENIAL_SIGNATURES
+        .iter()
+        .any(|sig| lower.contains(sig))
+    {
+        Some(format!(
+            "\n{}\n{}",
+            sandbox_denial_marker(mode),
+            escalation_hint_marker("command")
+        ))
+    } else {
+        None
+    }
+}
+
 /// The same-turn escalation hint that rides a denial: the nudge lives at the
 /// decision point so the sanctioned retry does not depend on the model
 /// recalling the tool description. `subject` is the family's noun for the

@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use crate::ahp::projection::Translator;
+use crate::ahp::projection::config_keys;
+use crate::error::RuntimeError;
 use ahp_types::actions::{
     ActionOrigin, ChatChangesetsChangedAction, ChatInputCompletedAction,
     ChatPendingMessageRemovedAction, PartialChatSummary, SessionChatUpdatedAction, StateAction,
@@ -1079,42 +1081,100 @@ impl RuntimeBackend {
         }
     }
 
-    /// Apply the model / effort / approval-mode / project selection a client
-    /// merged into `SessionState.config`.
+    /// Apply the model / effort / approval-mode selection a client merged
+    /// into `SessionState.config`.
     ///
-    /// AHP config is an open bag, so a client may send any subset. Each known
-    /// key maps onto the runtime intent that owns it; an unknown key is not a
-    /// refusal (the reducer already folded it) — the runtime simply has no work
-    /// for it.
+    /// Config is an open bag on the wire, but this host honors only the keys
+    /// its declared schema marks `sessionMutable` (AHP: only session-mutable
+    /// properties may be changed). A key outside that set — a server-owned
+    /// field like `workingDirectory`, or a foreign extension's — is a
+    /// rejection, not a silent fold: the write-ahead client must learn its
+    /// optimistic value did not land. `replace: true` is refused for the
+    /// same reason: the reducer would swap every client's whole values bag
+    /// (wiping the server-owned keys the runtime cannot re-emit), a
+    /// replacement this host has no runtime half for.
     ///
-    /// A runtime refusal on a key the reducer DID fold is a rejection, not a
-    /// note: answering `Accepted` would leave the client's state on a model or
-    /// mode the session never adopted.
+    /// A runtime refusal is likewise a rejection, not a note: answering
+    /// `Accepted` would broadcast a switch that never ran — the host's
+    /// store and every client fold carry only what the router published,
+    /// so the divergence a swallowed refusal creates is between the echo
+    /// and the runtime (and its journal), not inside the fold. Validation
+    /// therefore runs over EVERY key before ANY side effect lands: a
+    /// multi-key write rejected on its second key must not leave the
+    /// first key applied — the client rolls back the whole action, and a
+    /// half-landed write would strand the session on state its own chip
+    /// no longer shows.
     fn apply_session_config(
         &self,
         channel: &str,
         config: &ahp_types::common::JsonObject,
+        replace: Option<bool>,
     ) -> DispatchOutcome {
         let Some(session_id) = session::id(channel) else {
             return DispatchOutcome::Rejected(format!("no runtime intent for {channel}"));
         };
+        if let Some(key) = config
+            .keys()
+            .find(|key| !config_keys::MUTABLE.contains(&key.as_str()))
+        {
+            return DispatchOutcome::Rejected(format!(
+                "config key `{key}` is not session-mutable on this host"
+            ));
+        }
+        if replace == Some(true) {
+            return DispatchOutcome::Rejected(
+                "full config replacement is not supported: merge the session-mutable keys instead"
+                    .to_string(),
+            );
+        }
+        // The declared schema types every mutable key as a string; a
+        // non-string value is a client bug the client must learn about
+        // (silently ignoring it would answer Accepted for a no-op).
+        for key in config_keys::MUTABLE {
+            if let Some(value) = config.get(*key)
+                && !value.is_string()
+            {
+                return DispatchOutcome::Rejected(format!(
+                    "config key `{key}` must be a string, got {value}"
+                ));
+            }
+        }
+        // Validate everything, land nothing — then apply everything. The
+        // refusal text carries the runtime error's code so clients can
+        // branch on it without string-matching the message.
+        let refusal = |error: RuntimeError| match &error.code {
+            Some(code) => format!("{} [{code}]", error.message),
+            None => error.message,
+        };
+        if let Err(error) = self.server.preflight_config(
+            session_id,
+            config.get(config_keys::MODEL).and_then(Value::as_str),
+            config
+                .get(config_keys::REASONING_EFFORT)
+                .and_then(Value::as_str),
+            config
+                .get(config_keys::APPROVAL_MODE)
+                .and_then(Value::as_str),
+        ) {
+            return DispatchOutcome::Rejected(refusal(error));
+        }
         let applied = [
             config
-                .get("model")
+                .get(config_keys::MODEL)
                 .and_then(Value::as_str)
                 .map(|model| self.server.set_model(session_id, model)),
             config
-                .get("reasoningEffort")
+                .get(config_keys::REASONING_EFFORT)
                 .and_then(Value::as_str)
                 .map(|effort| self.server.set_reasoning_effort(session_id, effort)),
             config
-                .get("approvalMode")
+                .get(config_keys::APPROVAL_MODE)
                 .and_then(Value::as_str)
                 .map(|mode| self.server.set_approval_mode(session_id, mode)),
         ];
         for outcome in applied.into_iter().flatten() {
             if let Err(error) = outcome {
-                return DispatchOutcome::Rejected(error.message);
+                return DispatchOutcome::Rejected(refusal(error));
             }
         }
         DispatchOutcome::Accepted
@@ -1826,7 +1886,7 @@ impl Backend for RuntimeBackend {
             }
             // ── session actions ────────────────────────────────────────────
             StateAction::SessionConfigChanged(changed) => {
-                self.apply_session_config(channel, &changed.config)
+                self.apply_session_config(channel, &changed.config, changed.replace)
             }
             StateAction::SessionWorkingDirectorySet(set) => {
                 let Some(session_id) = session::id(channel) else {
@@ -2766,6 +2826,15 @@ mod mcp_dispatch_tests {
     }
 
     impl SessionRuntime for McpOnlyRuntime {
+        fn preflight_config(
+            &self,
+            _session_id: &str,
+            _model: Option<&str>,
+            _effort: Option<&str>,
+            _mode: Option<&str>,
+        ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
         fn terminal_state(&self, _terminal_id: &str) -> Option<TerminalSnapshot> {
             None
         }

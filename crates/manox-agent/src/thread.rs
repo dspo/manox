@@ -1040,7 +1040,7 @@ impl Thread {
                         );
                     }
                 }
-                // Runs the actor starts on its own (monitor idle-wakeups,
+                // Runs the actor starts on its own (idle-wakeups,
                 // plan-approval seeds) announce themselves with `TurnStarted`;
                 // mirror them onto the running flag so a switch-away parks the
                 // thread instead of dropping it mid-run. Idempotent with the
@@ -2180,6 +2180,20 @@ impl Thread {
         self.pinned = pinned;
     }
 
+    /// Whether THIS thread's next request can serve `model`: the engine's
+    /// own registry snapshot when one is materialized (see
+    /// [`crate::engine::EngineState::model_registry`]), else the process
+    /// global — the registry a future engine will capture. Pure
+    /// config/credential resolution; no HTTP client is built.
+    pub fn preflight_model(&self, model: &HarnessModel) -> Result<(), String> {
+        match &self.engine {
+            Some(engine) => engine.preflight_model(model),
+            None => crate::provider_glue::global()
+                .preflight_stream(model)
+                .map_err(|err| format!("{err:#}")),
+        }
+    }
+
     /// Pick the model this thread runs on. The pick always reaches the engine
     /// — even one still assembling, where it lands as a queued switch — and
     /// sticks: no later `Ready` projection overwrites it.
@@ -2934,7 +2948,7 @@ pub(crate) mod tests {
 
     /// `LiveHistory` re-mirrors the engine's live transcript into `messages`
     /// (the switch-back rebuild reads the mirror) without emitting a UI
-    /// event; an actor-initiated `TurnStarted` (monitor wakeup, plan-approval
+    /// event; an actor-initiated `TurnStarted` (idle wakeup, plan-approval
     /// seed) flips the running flag so a switch-away parks the thread instead
     /// of dropping it mid-run, and `Settled` clears it.
     #[tokio::test]

@@ -7,8 +7,9 @@
 //   1. task → model: a completed task steers a summary into the agent's
 //      context at the next tool-call boundary, shaped by the task's head/tail
 //      line preference (the model can still fetch the full output via
-//      `BashOutput`, whose read cursor is untouched); every stdout line is
-//      emitted to the observer as an `Output` lifecycle event.
+//      `BashOutput`, whose read cursor is untouched). A completion a blocked
+//      `BashOutput` read already collected is not announced again. Every
+//      stdout line is emitted to the observer as an `Output` lifecycle event.
 //   2. run → task: an aborted run kills this manager's tasks with cause
 //      `RunAbort`; a settled run keeps them so a long task survives across
 //      turns. Session teardown goes through the host task center, whose stop
@@ -33,6 +34,11 @@ use super::background::{BackgroundRegistry, TaskStatusInfo};
 /// How a completion summary reaches the bound session (`HarnessHandle::steer`).
 type Steerer = Arc<dyn Fn(AgentMessage) + Send + Sync>;
 
+/// Label prefix the `Spawned` lifecycle emission stamps on a background bash
+/// task's description; the host's `TaskList` strips it back off to recover
+/// the command line.
+pub const BASH_TASK_LABEL_PREFIX: &str = "background bash: ";
+
 /// Tail size of a task's output included in the completion summary.
 const SUMMARY_TAIL_BYTES: usize = 2 * 1024;
 
@@ -47,7 +53,7 @@ pub struct OutputShape {
 impl OutputShape {
     /// Apply the line preference to a text window; no preference returns the
     /// window unchanged.
-    fn apply(self, text: &str) -> String {
+    pub fn apply(self, text: &str) -> String {
         super::select_lines(text, self.head_lines, self.tail_lines)
     }
 }
@@ -188,35 +194,76 @@ impl BackgroundManager {
             .lock()
             .expect("observer lock poisoned")
             .clone();
+        let on_output: super::background::LineEventCallback = Box::new({
+            let observer = observer.clone();
+            move |id: &crate::core::TaskId, line: String| {
+                if let Some(obs) = &observer {
+                    obs.on_output(&id.0, line);
+                }
+            }
+        });
         let id = if sandboxed {
-            self.registry.spawn_with_line_events(
-                command,
-                cwd,
-                Box::new({
-                    let observer = observer.clone();
-                    move |id, line| {
-                        if let Some(obs) = &observer {
-                            obs.on_output(&id.0, line);
-                        }
-                    }
-                }),
-                Box::new(|_, _| {}),
-            )?
+            self.registry
+                .spawn_with_line_events(command, cwd, on_output)?
         } else {
-            self.registry.spawn_escalated_with_line_events(
-                command,
-                cwd,
-                Box::new({
-                    let observer = observer.clone();
-                    move |id, line| {
-                        if let Some(obs) = &observer {
-                            obs.on_output(&id.0, line);
-                        }
-                    }
-                }),
-                Box::new(|_, _| {}),
-            )?
+            self.registry
+                .spawn_escalated_with_line_events(command, cwd, on_output)?
         };
+        self.register_with_observer(&id, command, shape, observer);
+        Ok(id)
+    }
+
+    /// Promote an already-running registry task to a managed background
+    /// task: register it with this run, emit the `Spawned` lifecycle (the
+    /// card appears at promotion, not at the foreground call's start), seed
+    /// the card with the output retained so far, tap future lines into the
+    /// observer, and watch it to completion like a native background task.
+    ///
+    /// The foreground path uses this when a command outlives its timeout:
+    /// the process keeps running, and from here on it is indistinguishable
+    /// from `run_in_background: true` (completion summary steer, TaskStop,
+    /// BashOutput, TaskList).
+    pub fn adopt(
+        &self,
+        id: &crate::core::TaskId,
+        command: &str,
+        shape: OutputShape,
+    ) -> Result<(), crate::core::TaskError> {
+        let observer = self
+            .observer
+            .lock()
+            .expect("observer lock poisoned")
+            .clone();
+        self.register_with_observer(id, command, shape, observer.clone());
+        if let Some(obs) = &observer {
+            // Seed the card with what the foreground window already
+            // produced: the tap only sees lines from here on.
+            let tail = self
+                .registry
+                .status(id, SUMMARY_TAIL_BYTES)
+                .map(|status| status.output_tail)
+                .unwrap_or_default();
+            for line in tail.lines() {
+                if !line.is_empty() {
+                    obs.on_output(&id.0, line.to_string());
+                }
+            }
+            let obs2 = Arc::clone(obs);
+            self.registry
+                .add_line_tap(id, Box::new(move |tid, line| obs2.on_output(&tid.0, line)))?;
+        }
+        Ok(())
+    }
+
+    /// Track a spawned-or-adopted task: enter it into the settlement table,
+    /// announce it to the observer, and start the completion watcher.
+    fn register_with_observer(
+        &self,
+        id: &crate::core::TaskId,
+        command: &str,
+        shape: OutputShape,
+        observer: Option<Arc<dyn TaskObserver>>,
+    ) {
         self.tasks
             .lock()
             .expect("tasks lock poisoned")
@@ -225,7 +272,7 @@ impl BackgroundManager {
             obs.on_spawned(
                 &id.0,
                 TaskFamily::BackgroundBash,
-                &format!("background bash: {command}"),
+                &format!("{BASH_TASK_LABEL_PREFIX}{command}"),
                 self.stop_handle(&id.0),
             );
         }
@@ -270,14 +317,18 @@ impl BackgroundManager {
             let steerer = steerer.lock().expect("steerer lock poisoned").clone();
             let settlement = Settlement::new(SettlementKind::Completed, SettlementCause::Natural)
                 .with_exit_code(status.exit_code.flatten());
-            if let Some(steer) = steerer {
+            // A blocked `BashOutput` read that the exit released already
+            // handed the model the terminal state; the summary would only
+            // repeat it. The card still settles either way.
+            if let Some(steer) = steerer
+                && !registry.exit_collected(&tid)
+            {
                 steer(AgentMessage::user(format_summary(&tid, &status, shape)));
             }
             if let Some(obs) = &observer {
                 obs.on_settled(&tid.0, &settlement);
             }
         });
-        Ok(id)
     }
 
     /// Cancel every task this manager owns with an explicit cause. Each
@@ -590,6 +641,64 @@ mod tests {
         );
     }
 
+    /// `adopt` hands an already-running registry task the full background
+    /// lifecycle: the `Spawned` emission lands at adoption (not spawn), the
+    /// card is seeded with the retained output, and completion settles +
+    /// steers exactly like a native background task.
+    #[tokio::test]
+    async fn adopt_gives_a_running_task_the_full_background_lifecycle() {
+        let manager = new_manager();
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
+        let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
+
+        let command = "echo seeded; sleep 0.3; echo post";
+        let id = manager.registry.spawn(command, Path::new("/tmp")).unwrap();
+        // Let the pre-adoption line land in the ring first.
+        let mut saw_seeded = false;
+        for _ in 0..100 {
+            let poll = manager.registry.poll(&id).await.unwrap();
+            if poll.new_output.contains("seeded") {
+                saw_seeded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_seeded, "pre-adoption output observed");
+
+        manager
+            .adopt(&id, command, OutputShape::default())
+            .expect("adopt succeeds");
+        assert!(
+            observer.events.lock().unwrap().iter().any(|ev| matches!(
+                ev,
+                TaskLifecycle::Spawned { id: sid, .. } if sid == &id.0
+            )),
+            "adoption emits the Spawned lifecycle"
+        );
+
+        let summary = crate::bash::test_helpers::wait_for_steered(&seen, 1).await;
+        assert!(summary.contains(&id.0), "summary names the task: {summary}");
+        let settled: Vec<_> = observer
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match ev {
+                TaskLifecycle::Settled {
+                    id: sid,
+                    settlement,
+                } if sid == &id.0 => Some(settlement.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 1, "exactly one settlement: {settled:?}");
+        assert!(matches!(settled[0].kind, SettlementKind::Completed));
+        assert_eq!(settled[0].exit_code, Some(0));
+    }
+
     #[tokio::test]
     async fn status_is_non_consuming() {
         let registry = BackgroundRegistry::new();
@@ -745,5 +854,105 @@ mod tests {
             .lines()
             .take_while(|l| !l.trim().is_empty())
             .collect()
+    }
+    fn bash_output(manager: &BackgroundManager) -> crate::ext::bash::background::BashOutputTool {
+        crate::ext::bash::background::BashOutputTool::new(
+            Arc::clone(&manager.registry) as Arc<dyn BackgroundTaskRegistry>
+        )
+    }
+
+    fn tool_ctx() -> crate::core::tool::LocalToolContext {
+        crate::core::tool::LocalToolContext::new(
+            Arc::new(crate::core::env::TokioExecutionEnv::new(
+                std::env::temp_dir(),
+            )),
+            std::env::temp_dir(),
+            Arc::new(crate::core::tool::ToolState::new()),
+        )
+    }
+
+    /// A completion a blocked `BashOutput` read collected is not announced
+    /// again: the read's result is the delivery, while the card still
+    /// settles `Completed`.
+    #[tokio::test]
+    async fn a_collected_completion_is_not_re_announced() {
+        use crate::core::tool::AgentTool;
+        let manager = new_manager();
+        let observer = crate::ext::tasks::tests::RecordingObserver::new();
+        manager.set_test_observer(Arc::clone(&observer) as Arc<dyn TaskObserver>);
+        let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
+        let id = manager
+            .spawn(
+                "sleep 0.3; echo ci-green",
+                Path::new("/tmp"),
+                OutputShape::default(),
+            )
+            .unwrap();
+        let result = bash_output(&manager)
+            .execute(
+                "c1",
+                serde_json::json!({"shell_id": id.0, "wait": true, "timeout_ms": 10_000}),
+                tokio_util::sync::CancellationToken::new(),
+                &tool_ctx(),
+            )
+            .await
+            .unwrap();
+        let ContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("text result expected");
+        };
+        assert!(text.contains("ci-green") && text.contains("[exited with code 0]"));
+        let mut settled = false;
+        for _ in 0..100 {
+            settled = observer
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|ev| matches!(ev, TaskLifecycle::Settled { id: sid, .. } if sid == &id.0));
+            if settled {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(settled, "the card still settles");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a collected completion must not steer a summary"
+        );
+    }
+
+    /// A wait that expired before the exit collected nothing: the later
+    /// completion is announced as usual.
+    #[tokio::test]
+    async fn an_expired_wait_leaves_the_completion_announced() {
+        use crate::core::tool::AgentTool;
+        let manager = new_manager();
+        let seen: Arc<Mutex<Vec<AgentMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        manager.set_test_steerer(move |m| seen2.lock().unwrap().push(m));
+        let id = manager
+            .spawn(
+                "sleep 0.5; echo late",
+                Path::new("/tmp"),
+                OutputShape::default(),
+            )
+            .unwrap();
+        let result = bash_output(&manager)
+            .execute(
+                "c1",
+                serde_json::json!({"shell_id": id.0, "wait": true, "timeout_ms": 50}),
+                tokio_util::sync::CancellationToken::new(),
+                &tool_ctx(),
+            )
+            .await
+            .unwrap();
+        let ContentBlock::Text { text, .. } = &result.content[0] else {
+            panic!("text result expected");
+        };
+        assert!(text.contains("still running"), "wait expired: {text}");
+        let summary = wait_for_steered(&seen, 1).await;
+        assert!(summary.contains(&id.0), "completion announced: {summary}");
     }
 }

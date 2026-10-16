@@ -222,6 +222,17 @@ pub trait SessionRuntime: Send + Sync + 'static {
     /// is not running.
     fn set_model(&self, session_id: &str, model: &str) -> Result<(), RuntimeError>;
 
+    /// Validate a config change WITHOUT landing any of it. The dispatch
+    /// gate runs this over every key before applying any, so a multi-key
+    /// write never lands half of itself under a rejection.
+    fn preflight_config(
+        &self,
+        session_id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<(), RuntimeError>;
+
     /// Select the session's reasoning effort.
     fn set_reasoning_effort(&self, session_id: &str, effort: &str) -> Result<(), RuntimeError>;
 

@@ -34,6 +34,125 @@ const DEFAULT_MAX_LINES: usize = 2000;
 /// Wall-clock limit before a hung command is killed.
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 
+/// The shared tail of both description variants: background execution,
+/// output shaping, and the sandbox-escalation contract.
+macro_rules! description_tail {
+    () => {
+        "`run_in_background: true` starts the command in a fresh shell (no \
+         persistent state) at the session cwd — a completion summary with the \
+         output tail arrives automatically and **wakes the idle session** so you \
+         can act on it immediately. Never use `sleep` or poll loops to wait for \
+         a background task — it will wake you when done; to block on one, call \
+         `BashOutput` with `wait: true`. Use `BashOutput` \
+         (shell_id) for the full output; `TaskStop` stops the task. Bash \
+         commands within one batch run serially. \
+         \
+         Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
+         piping through `head`/`tail`. Commands run under a file sandbox; a blocked file operation \
+         is reported as `[sandbox: file access denied under <mode> mode]` — a policy denial, not a \
+         bug. When a command is denied and a wider mode would let it succeed, retry the exact same \
+         command once with `sandbox_permissions` (the narrowest wider mode that suffices) plus a \
+         one-sentence `justification`; the approval prompt asks the user. Never escalate \
+         speculatively — ground the request in a real denial."
+    };
+}
+
+/// Description where foreground commands run one-shot through the task
+/// registry (a seatbelt backend plus a background manager): no shell state
+/// carries across calls, and a timeout promotes instead of killing.
+const DESCRIPTION_ONE_SHOT: &str = concat!(
+    "Execute a shell command. Each call runs in a fresh shell at its `cwd`; \
+     no shell state carries across calls. \
+     \
+     **Concurrency model**: foreground calls block this turn; at their timeout \
+     a still-running command moves to the background (the result names its task \
+     id) instead of being killed. ",
+    description_tail!()
+);
+
+/// Description where foreground commands run in the persistent shell (or
+/// without a background manager): state persists, and a timeout kills.
+const DESCRIPTION_PERSISTENT: &str = concat!(
+    "Execute a shell command. Exported vars and functions persist across calls; \
+     each call runs at its `cwd`. \
+     \
+     **Concurrency model**: foreground calls block this turn and are killed at \
+     their timeout. ",
+    description_tail!()
+);
+
+/// A foreground command's raw output, kept per stream and decoded once at
+/// the end so a multi-byte character split across reads stays whole.
+#[derive(Default)]
+struct CapturedOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl CapturedOutput {
+    fn take(
+        &mut self,
+        chunk: background::OutputChunk,
+        on_data: Option<crate::core::tools::bash::BashDataCallback<'_>>,
+    ) {
+        if let Some(on_data) = on_data {
+            on_data(&chunk.bytes);
+        }
+        match chunk.stream {
+            background::OutputStream::Stdout => self.stdout.extend_from_slice(&chunk.bytes),
+            background::OutputStream::Stderr => self.stderr.extend_from_slice(&chunk.bytes),
+        }
+    }
+
+    fn into_result(self, exit_code: i32) -> CommandResult {
+        CommandResult {
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            exit_code,
+        }
+    }
+}
+
+/// A registry task a foreground call owns. Unless the call finishes it or
+/// releases it to the background, dropping the owner (cancellation, or the
+/// call's future being dropped mid-wait) kills the process group and drops
+/// the record — a foreground command never outlives its call unowned.
+struct ForegroundTask {
+    registry: Arc<background::BackgroundRegistry>,
+    id: crate::core::TaskId,
+    owned: bool,
+}
+
+impl ForegroundTask {
+    fn new(registry: Arc<background::BackgroundRegistry>, id: crate::core::TaskId) -> Self {
+        ForegroundTask {
+            registry,
+            id,
+            owned: true,
+        }
+    }
+
+    /// The command finished inside the call: its record goes with it.
+    fn finish(&mut self) {
+        self.owned = false;
+        self.registry.forget(&self.id);
+    }
+
+    /// The command now belongs to the background manager.
+    fn release(&mut self) {
+        self.owned = false;
+    }
+}
+
+impl Drop for ForegroundTask {
+    fn drop(&mut self) {
+        if self.owned {
+            let _ = self.registry.kill_sync(&self.id);
+            self.registry.forget(&self.id);
+        }
+    }
+}
+
 /// The bash tool with the manox product surface: array-form `cwd`,
 /// background execution via the registry, head/tail line filters, and a
 /// `sandbox_permissions` escalation slot. The per-call effective mode
@@ -158,26 +277,11 @@ impl AgentTool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command. \
-         Exported vars and functions persist across calls; each call runs at \
-         its `cwd`. \
-         \
-         **Concurrency model**: foreground calls block this turn; \
-         `run_in_background: true` starts the command in a fresh shell (no \
-         persistent state) at the session cwd — a completion summary with the \
-         output tail arrives automatically and **wakes the idle session** so you \
-         can act on it immediately. Never use `sleep` or poll loops to wait for \
-         a background task — it will wake you when done. Use `BashOutput` \
-         (shell_id) for the full output; `TaskStop` stops the task. Persistent \
-         shell commands within one batch run serially (shared state). \
-         \
-         Use `head_lines`/`tail_lines` to keep a selection of the output instead of \
-         piping through `head`/`tail`. Commands run under a file sandbox; a blocked file operation \
-         is reported as `[sandbox: file access denied under <mode> mode]` — a policy denial, not a \
-         bug. When a command is denied and a wider mode would let it succeed, retry the exact same \
-         command once with `sandbox_permissions` (the narrowest wider mode that suffices) plus a \
-         one-sentence `justification`; the approval prompt asks the user. Never escalate \
-         speculatively — ground the request in a real denial."
+        if self.promotes_on_timeout() {
+            DESCRIPTION_ONE_SHOT
+        } else {
+            DESCRIPTION_PERSISTENT
+        }
     }
 
     /// `false`: bash mutates (it is not a read-only tool). Note this is the
@@ -222,7 +326,11 @@ impl AgentTool for BashTool {
         );
         properties.insert(
             "timeout".into(),
-            serde_json::json!({"type": "integer", "description": "Timeout in milliseconds (default: 120000)"}),
+            serde_json::json!({"type": "integer", "description": if self.promotes_on_timeout() {
+                "Timeout in milliseconds (default: 120000). On expiry the command moves to the background instead of being killed."
+            } else {
+                "Timeout in milliseconds (default: 120000). On expiry the command is killed."
+            }}),
         );
         properties.insert(
             "cwd".into(),
@@ -364,6 +472,21 @@ impl BashTool {
             )));
         }
 
+        // Foreground with a manager and a one-shot backend: run the command
+        // as a real registry task so an expired timeout can hand it to the
+        // background instead of killing it. The persistent-shell platforms
+        // (no seatbelt backend) keep the exec path — their foreground
+        // commands hold shell state a fresh `sh -c` cannot carry — and the
+        // harness-standalone shape (no manager) keeps the deadline kill.
+        if let Some(manager) = self.manager.as_ref().filter(|_| self.promotes_on_timeout()) {
+            return self
+                .run_foreground_tracked(
+                    manager, &command, &run_cwd, timeout_ms, head_lines, tail_lines, effective,
+                    signal, on_data, ctx,
+                )
+                .await;
+        }
+
         let backend = if effective == PermissionMode::DangerFullAccess {
             self.unsandboxed_operations
                 .as_deref()
@@ -394,6 +517,122 @@ impl BashTool {
         }
 
         Ok(AgentToolResult::text(output))
+    }
+
+    /// Foreground execution as a registry task the call owns: the result is
+    /// assembled from the process's own stdout/stderr (complete, split, and
+    /// decoded once at the end, exactly like the backend path), streamed to
+    /// `on_data` chunk by chunk as it arrives. At the timeout a still-running
+    /// command is released to the background instead of being killed —
+    /// `adopt` hands it the full background-task lifecycle — and the result
+    /// carries its id plus the output so far. A call that ends any other way
+    /// (finished, cancelled, or dropped) takes its process with it.
+    #[allow(clippy::too_many_arguments)] // one distinct session input per parameter
+    async fn run_foreground_tracked(
+        &self,
+        manager: &Arc<BackgroundManager>,
+        command: &str,
+        cwd: &std::path::Path,
+        timeout_ms: u64,
+        head_lines: Option<usize>,
+        tail_lines: Option<usize>,
+        effective: PermissionMode,
+        signal: CancellationToken,
+        on_data: Option<crate::core::tools::bash::BashDataCallback<'_>>,
+        ctx: &dyn ToolContext,
+    ) -> Result<AgentToolResult, ToolError> {
+        // Same confinement decision as the backend dispatch: an escalated
+        // call runs unconfined, everything else through the seatbelt.
+        let sandboxed = effective != PermissionMode::DangerFullAccess;
+        let registry = &manager.registry;
+        let (id, mut chunks) = registry
+            .spawn_foreground(command, cwd, sandboxed)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let mut owned = ForegroundTask::new(Arc::clone(registry), id.clone());
+
+        let mut output = CapturedOutput::default();
+        let deadline = tokio::time::sleep(Duration::from_millis(timeout_ms.max(1)));
+        tokio::pin!(deadline);
+        let expired = loop {
+            tokio::select! {
+                biased;
+                () = signal.cancelled() => {
+                    return Err(ToolError::ExecutionFailed(
+                        "command aborted before completion; the process was stopped".into(),
+                    ));
+                }
+                Some(chunk) = chunks.recv() => output.take(chunk, on_data),
+                _ = registry.wait_exit(&id) => break false,
+                () = &mut deadline => break true,
+            }
+        };
+
+        // An exit that lands in the same instant as the deadline reports as
+        // finished, not as promoted.
+        let exit = registry
+            .exit_status(&id)
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        if expired && exit.is_none() {
+            registry
+                .release_foreground(&id)
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            owned.release();
+            while let Ok(chunk) = chunks.try_recv() {
+                output.take(chunk, on_data);
+            }
+            let shape = OutputShape {
+                head_lines,
+                tail_lines,
+            };
+            manager
+                .adopt(&id, command, shape)
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            let mut out = format!(
+                "Timed out after {}s; moved to background as `{id}`. Use BashOutput (wait: true) to keep waiting; TaskStop to stop.",
+                Duration::from_millis(timeout_ms).as_secs(),
+            );
+            let so_far = assemble_output(output.into_result(0), head_lines, tail_lines);
+            let so_far = so_far.trim_end();
+            if !so_far.is_empty() {
+                out.push_str("\n\nOutput so far:\n");
+                out.push_str(so_far);
+            }
+            out.push_str(&nudge_tool_preference(command, ctx));
+            out.push_str(&nudge_sleep_loop(command, ctx));
+            out.push_str(&nudge_cd_preference(command, ctx));
+            return Ok(AgentToolResult::text(out));
+        }
+
+        // Every chunk is forwarded before the exit is recorded, so the queue
+        // holds the rest of the output now.
+        while let Ok(chunk) = chunks.try_recv() {
+            output.take(chunk, on_data);
+        }
+        owned.finish();
+        let signaled = exit == Some(None);
+        let code = exit.flatten().unwrap_or(0);
+        let mut result = output.into_result(code);
+        if sandboxed
+            && let Some(note) =
+                crate::sandbox::seatbelt_denial_note(&result.stderr, code, effective)
+        {
+            result.stderr.push_str(&note);
+        }
+        let mut out = assemble_output(result, head_lines, tail_lines);
+        if signaled {
+            out.push_str("\n\n[terminated by signal]");
+        }
+        out.push_str(&nudge_tool_preference(command, ctx));
+        out.push_str(&nudge_sleep_loop(command, ctx));
+        out.push_str(&nudge_cd_preference(command, ctx));
+        Ok(AgentToolResult::text(out))
+    }
+
+    /// Whether a foreground command outlives its timeout as a background
+    /// task: it needs a manager to adopt it and a one-shot backend (the
+    /// persistent shell's state cannot move into a fresh process).
+    fn promotes_on_timeout(&self) -> bool {
+        self.manager.is_some() && self.sandbox_available
     }
 
     /// The standing session mode (absent any per-call grant).
@@ -593,8 +832,9 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
         if secs >= 10
             && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::SLEEP_BACKGROUND)
         {
-            return "\n\n[tip: long wait detected — use `run_in_background: true` and the completion \
-                    summary will wake you automatically when done]".to_string();
+            return "\n\n[tip: long wait detected — use `run_in_background: true`; the completion \
+                    summary wakes you automatically, or block on it with `BashOutput` (`wait: true`)]"
+                .to_string();
         }
     }
 
@@ -605,8 +845,8 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
         && trimmed.contains("sleep")
         && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::POLL_LOOP)
     {
-        return "\n\n[tip: poll loop detected — use `run_in_background: true` with completion \
-                wake-up, or `Monitor` for streaming observation]"
+        return "\n\n[tip: poll loop detected — use `run_in_background: true` and `BashOutput` \
+                (`wait: true`) to block on it, or let the completion wake-up fire]"
             .to_string();
     }
 
@@ -614,8 +854,8 @@ fn nudge_sleep_loop(command: &str, ctx: &dyn ToolContext) -> String {
     if (trimmed.contains("gh run watch") || trimmed.contains("gh pr checks --watch"))
         && !crate::core::tool::nudge::mark(nf, crate::core::tool::nudge::GH_WATCH)
     {
-        return "\n\n[tip: CI wait detected — use `run_in_background: true` and the completion \
-                summary will wake you when the CI finishes]"
+        return "\n\n[tip: CI wait detected — use `run_in_background: true` and `BashOutput` \
+                (`wait: true`) to block until the CI finishes, or let the completion wake-up fire]"
             .to_string();
     }
 
@@ -696,6 +936,12 @@ mod tests {
             })
         }
         async fn kill(&self, _id: &crate::core::TaskId) -> Result<(), crate::core::TaskError> {
+            Ok(())
+        }
+        async fn collect_exit(
+            &self,
+            _id: &crate::core::TaskId,
+        ) -> Result<(), crate::core::TaskError> {
             Ok(())
         }
     }
@@ -882,6 +1128,401 @@ mod tests {
             text.contains("bg_test"),
             "returns the background id: {text}"
         );
+    }
+
+    // ── foreground timeout promotion ─────────────────────────────────────
+
+    /// A manager + a one-shot backend put foreground commands through the
+    /// registry so a timeout promotes instead of killing.
+    fn tracked_tool() -> (
+        BashTool,
+        Arc<orchestration::BackgroundManager>,
+        Arc<background::BackgroundRegistry>,
+    ) {
+        let registry = Arc::new(background::BackgroundRegistry::new());
+        let manager = orchestration::BackgroundManager::new(Arc::clone(&registry));
+        let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry))
+            .with_manager(Arc::clone(&manager))
+            .with_sandbox_available(true);
+        (tool, manager, registry)
+    }
+
+    fn result_text(result: crate::core::tool::AgentToolResult) -> String {
+        match result.content.into_iter().next() {
+            Some(crate::core::types::ContentBlock::Text { text, .. }) => text,
+            other => panic!("expected text content, got {other:?}"),
+        }
+    }
+
+    /// Extract the `bg_N` id a promotion message names.
+    fn promoted_id(text: &str) -> crate::core::TaskId {
+        let start = text.find('`').expect("promotion names its id") + 1;
+        let end = text[start..].find('`').expect("id closes") + start;
+        crate::core::TaskId(text[start..end].to_string())
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_moves_the_task_to_the_background() {
+        let (tool, _manager, registry) = tracked_tool();
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "command": "echo pre; sleep 30",
+                    "cwd": [""],
+                    "timeout": 1500,
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = result_text(result);
+        assert!(
+            text.contains("Timed out after 1s; moved to background as `bg_"),
+            "promotion message: {text}"
+        );
+        assert!(
+            text.contains("BashOutput (wait: true)"),
+            "follow-up guidance: {text}"
+        );
+        assert!(
+            text.contains("Output so far") && text.contains("pre"),
+            "carries the output produced so far: {text}"
+        );
+        let id = promoted_id(&text);
+        assert!(
+            registry.status(&id, 0).unwrap().is_running,
+            "the task must survive the expired timeout"
+        );
+        registry.kill(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_finished_within_budget_assembles_like_the_backend() {
+        let (tool, _manager, _registry) = tracked_tool();
+        let (ctx, _dir) = ctx();
+        let result = tool
+            .execute(
+                "c1",
+                serde_json::json!({
+                    "command": "echo hello",
+                    "cwd": [""],
+                    "timeout": 10_000,
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = result_text(result);
+        assert!(text.contains("hello"), "output observed: {text}");
+        assert!(!text.contains("Timed out"), "finished in budget: {text}");
+        assert!(
+            !text.contains("exit code"),
+            "zero exit stays unannotated: {text}"
+        );
+
+        let result = tool
+            .execute(
+                "c2",
+                serde_json::json!({
+                    "command": "echo oops >&2; exit 3",
+                    "cwd": [""],
+                    "timeout": 10_000,
+                }),
+                CancellationToken::new(),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = result_text(result);
+        assert!(
+            text.contains("[stderr]\noops"),
+            "stderr keeps its own section: {text}"
+        );
+        assert!(text.contains("[exit code: 3]"), "exit annotated: {text}");
+    }
+
+    /// While the foreground wait runs, ring increments stream to the
+    /// caller's progress callback — the host terminal stays live.
+    #[tokio::test]
+    async fn foreground_wait_streams_increments_to_progress() {
+        struct RecordingProgress {
+            chunks: Mutex<String>,
+        }
+        impl crate::core::tool::ToolProgress for RecordingProgress {
+            fn emit(&self, partial: serde_json::Value) {
+                if let Some(text) = partial.get("output").and_then(|v| v.as_str()) {
+                    self.chunks.lock().unwrap().push_str(text);
+                }
+            }
+        }
+        let (tool, _manager, _registry) = tracked_tool();
+        let (ctx, _dir) = ctx();
+        let progress = Arc::new(RecordingProgress {
+            chunks: Mutex::new(String::new()),
+        });
+        let result = tool
+            .execute_with_progress(
+                "c1",
+                serde_json::json!({
+                    "command": "echo one; sleep 1; echo two",
+                    "cwd": [""],
+                    "timeout": 10_000,
+                }),
+                CancellationToken::new(),
+                &ctx,
+                progress.as_ref(),
+            )
+            .await
+            .unwrap();
+        let text = result_text(result);
+        assert!(
+            text.contains("one") && text.contains("two"),
+            "final output: {text}"
+        );
+        let streamed = progress.chunks.lock().unwrap().clone();
+        assert!(
+            streamed.contains("one"),
+            "the wait streamed early output to progress: {streamed}"
+        );
+    }
+
+    /// Degradation: without a manager the foreground path keeps the backend
+    /// exec (the harness-standalone shape).
+    #[tokio::test]
+    async fn foreground_without_a_manager_keeps_the_backend_exec() {
+        let ops = Arc::new(RecordingOps {
+            calls: Mutex::new(Vec::new()),
+        });
+        let tool = BashTool::new(ops.clone(), Arc::new(NoopRegistry)).with_sandbox_available(true);
+        let (ctx, _dir) = ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({"command": "echo hi", "cwd": [""]}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ops.calls.lock().unwrap().is_empty(),
+            "the backend exec path ran"
+        );
+    }
+
+    /// Degradation: a persistent-shell platform (no seatbelt backend) keeps
+    /// the backend exec even with a manager mounted — foreground state lives
+    /// in the shell there, and a fresh `sh -c` cannot carry it.
+    #[tokio::test]
+    async fn foreground_on_persistent_shell_platforms_keeps_the_backend_exec() {
+        let ops = Arc::new(RecordingOps {
+            calls: Mutex::new(Vec::new()),
+        });
+        let registry = Arc::new(background::BackgroundRegistry::new());
+        let manager = orchestration::BackgroundManager::new(Arc::clone(&registry));
+        let tool =
+            BashTool::new(ops.clone(), Arc::new(NoopRegistry)).with_manager(Arc::clone(&manager));
+        let (ctx, _dir) = ctx();
+        tool.execute(
+            "c1",
+            serde_json::json!({"command": "echo hi", "cwd": [""]}),
+            CancellationToken::new(),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !ops.calls.lock().unwrap().is_empty(),
+            "the backend exec path ran"
+        );
+    }
+
+    async fn run_tracked(tool: &BashTool, params: serde_json::Value) -> String {
+        let (ctx, _dir) = ctx();
+        result_text(
+            tool.execute("c1", params, CancellationToken::new(), &ctx)
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// A multi-byte character split across two writes arrives whole.
+    #[tokio::test]
+    async fn foreground_keeps_a_split_utf8_character_whole() {
+        let (tool, _manager, _registry) = tracked_tool();
+        let text = run_tracked(
+            &tool,
+            serde_json::json!({
+                "command": r"printf '\344\270'; sleep 0.3; printf '\255\346\226\207\n'",
+                "cwd": [""],
+                "timeout": 10_000,
+            }),
+        )
+        .await;
+        assert!(
+            text.contains("中文"),
+            "split character kept whole: {text:?}"
+        );
+    }
+
+    /// Output far larger than the background ring keeps its head: the
+    /// result is built from the process's own stream, not from the ring.
+    #[tokio::test]
+    async fn foreground_fast_output_keeps_its_head() {
+        let (tool, _manager, _registry) = tracked_tool();
+        let text = run_tracked(
+            &tool,
+            serde_json::json!({
+                "command": "seq 1 1000000",
+                "cwd": [""],
+                "timeout": 60_000,
+                "head_lines": 3,
+            }),
+        )
+        .await;
+        assert!(
+            text.starts_with("1\n2\n3"),
+            "head kept: {:?}",
+            &text[..text.len().min(80)]
+        );
+    }
+
+    /// The output carried by a promotion is bounded like any foreground
+    /// result, and a later `BashOutput` continues exactly where it stops.
+    #[tokio::test]
+    async fn promotion_bounds_the_output_so_far_and_hands_off_the_cursor() {
+        let (tool, _manager, registry) = tracked_tool();
+        let text = run_tracked(
+            &tool,
+            serde_json::json!({
+                "command": "seq 1 300000; sleep 1; echo after-promotion; sleep 30",
+                "cwd": [""],
+                "timeout": 500,
+            }),
+        )
+        .await;
+        assert!(
+            text.len() <= DEFAULT_MAX_BYTES + 4096,
+            "promotion output bounded: {} bytes",
+            text.len()
+        );
+        assert!(text.contains("[output truncated:"), "truncation marked");
+        let id = promoted_id(&text);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let poll = registry.poll(&id).await.unwrap();
+        assert_eq!(
+            poll.new_output, "after-promotion\n",
+            "the next read starts where the promotion's output ended"
+        );
+        registry.kill(&id).await.unwrap();
+    }
+
+    /// An escalated foreground command runs through the registry's
+    /// unconfined builder (the host's own shell and env), not a bare `sh`.
+    #[tokio::test]
+    async fn escalated_foreground_uses_the_unconfined_builder() {
+        let build: background::SandboxCommandBuilder = Arc::new(|command, cwd| {
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.arg("-c")
+                .arg(command)
+                .current_dir(cwd)
+                .env("UNCONFINED_MARK", "host-env");
+            cmd
+        });
+        let registry = Arc::new(background::BackgroundRegistry::new().with_unconfined(build));
+        let manager = orchestration::BackgroundManager::new(Arc::clone(&registry));
+        let tool = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry))
+            .with_manager(manager)
+            .with_sandbox_available(true)
+            .with_mode_resolver(Arc::new(|| PermissionMode::DangerFullAccess));
+        let text = run_tracked(
+            &tool,
+            serde_json::json!({
+                "command": "echo \"mark=${UNCONFINED_MARK:-unset}\"; cat <(echo procsub)",
+                "cwd": [""],
+                "timeout": 10_000,
+            }),
+        )
+        .await;
+        assert!(text.contains("mark=host-env"), "host env applied: {text}");
+        assert!(text.contains("procsub"), "bash, not sh: {text}");
+    }
+
+    /// A foreground call that ends without finishing — its future dropped
+    /// mid-wait — takes its process with it.
+    #[tokio::test]
+    async fn dropped_foreground_call_kills_its_process() {
+        let (tool, _manager, _registry) = tracked_tool();
+        let (ctx, _dir) = ctx();
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        std::fs::remove_file(&marker).unwrap();
+        let command = format!("sleep 1; touch '{}'", marker.display());
+        let call = tool.execute(
+            "c1",
+            serde_json::json!({"command": command, "cwd": [""], "timeout": 60_000}),
+            CancellationToken::new(),
+            &ctx,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), call)
+                .await
+                .is_err(),
+            "the call is dropped mid-wait"
+        );
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(!marker.exists(), "the dropped call's process was killed");
+    }
+
+    /// A cancelled foreground call reports the abort and stops its process.
+    #[tokio::test]
+    async fn cancelled_foreground_call_stops_its_process() {
+        let (tool, _manager, _registry) = tracked_tool();
+        let (ctx, _dir) = ctx();
+        let marker = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        std::fs::remove_file(&marker).unwrap();
+        let command = format!("sleep 1; touch '{}'", marker.display());
+        let signal = CancellationToken::new();
+        let canceller = signal.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            canceller.cancel();
+        });
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::json!({"command": command, "cwd": [""], "timeout": 60_000}),
+                signal,
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("aborted"), "got: {err}");
+        tokio::time::sleep(Duration::from_millis(1800)).await;
+        assert!(!marker.exists(), "the cancelled call's process was stopped");
+    }
+
+    /// The description and the `timeout` schema promise promotion only
+    /// where it happens.
+    #[test]
+    fn descriptions_promise_promotion_only_where_it_happens() {
+        let (promoting, _manager, _registry) = tracked_tool();
+        assert!(promoting.description().contains("moves to the background"));
+        let timeout = &promoting.parameters_schema()["properties"]["timeout"]["description"];
+        assert!(
+            timeout
+                .as_str()
+                .unwrap()
+                .contains("moves to the background")
+        );
+
+        let persistent = BashTool::new(Arc::new(EchoOps), Arc::new(NoopRegistry));
+        assert!(!persistent.description().contains("moves to the background"));
+        assert!(persistent.description().contains("persist across calls"));
+        let timeout = &persistent.parameters_schema()["properties"]["timeout"]["description"];
+        assert!(timeout.as_str().unwrap().contains("is killed"));
     }
 
     /// A `cd` inside a command moves only the shell's directory for that

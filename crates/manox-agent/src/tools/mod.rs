@@ -2,7 +2,7 @@
 //!
 //! Per-tool implementations live in sibling files (`read_file.rs`, `write_file.rs`,
 //! `edit_file.rs`, `list_directory.rs`, `grep.rs`, `glob.rs`, `bash.rs`,
-//! `ask_user.rs`, `monitor.rs`, `self_info.rs`, `skill.rs`). This module holds
+//! `ask_user.rs`, `self_info.rs`, `skill.rs`). This module holds
 //! the path/truncation helpers they share, plus the default registry assembly.
 //!
 //! `requires_approval` marks the tools the permission gate applies to:
@@ -24,7 +24,6 @@ pub const GLOB: &str = "Glob";
 pub const GREP: &str = "Grep";
 pub const GET_GOAL: &str = "GetGoal";
 pub const CREATE_GOAL: &str = "CreateGoal";
-pub const MONITOR: &str = "Monitor";
 pub const READ: &str = "Read";
 pub const SKILL: &str = "Skill";
 pub const UPDATE_PLAN: &str = "UpdatePlan";
