@@ -357,6 +357,10 @@ struct EngineState {
     /// ACTIVE turn): the settle path parks its turn-finish here, and the
     /// settling cmd closes it. `None` whenever no run is held.
     held_settle: Mutex<Option<run::HeldSettle>>,
+    /// Ask cards re-parked at restore: their turn predates this process, so
+    /// they never hold a turn or seed a run — a settle of theirs is a
+    /// journal-only decision row.
+    stale_questions: Mutex<std::collections::HashSet<String>>,
     /// A held turn is open awaiting answers. Guards the idle arms (prompt
     /// dismisses the cards, abort cancels them, steering never resumes into
     /// an open turn) and arms the settle path's hold.
@@ -522,6 +526,7 @@ pub fn spawn_engine(
         gate,
         question_gate,
         held_settle: Mutex::new(None),
+        stale_questions: Mutex::new(std::collections::HashSet::new()),
         awaiting_answers: AtomicBool::new(false),
         awaiting_abort: AtomicBool::new(false),
         plan: crate::plan_mode::PlanSessionState::new(),
@@ -1367,7 +1372,15 @@ async fn run_actor(
                     held_seeds.clear();
                     let appender = session.journal_appender();
                     for (id, meta) in state.question_gate.withdraw_all() {
-                        run::journal_ask_decision(&appender, &id, &meta, "dismissed").await;
+                        run::journal_ask_decision(
+                            &appender,
+                            &id,
+                            &meta,
+                            "dismissed",
+                            &state,
+                            &notice_tx,
+                        )
+                        .await;
                     }
                     close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), false).await;
                 }
@@ -1517,6 +1530,8 @@ async fn run_actor(
                     &id,
                     &meta,
                     crate::questions::ask_verdict(&outcome),
+                    &state,
+                    &notice_tx,
                 )
                 .await;
                 let seed = match outcome {
@@ -1536,7 +1551,7 @@ async fn run_actor(
                 if let Some(seed) = seed {
                     held_seeds.push(seed);
                 }
-                if state.question_gate.pending_entries().is_empty() {
+                if !run::live_ask_pending(&state) {
                     let cancelled = state.awaiting_abort.swap(false, Ordering::Relaxed);
                     close_held_turn(
                         &session,
@@ -1594,7 +1609,20 @@ async fn run_actor(
                     held_seeds.clear();
                     let appender = session.journal_appender();
                     for (id, meta) in state.question_gate.withdraw_all() {
-                        run::journal_ask_decision(&appender, &id, &meta, "cancelled").await;
+                        run::journal_ask_decision(
+                            &appender,
+                            &id,
+                            &meta,
+                            "cancelled",
+                            &state,
+                            &notice_tx,
+                        )
+                        .await;
+                    }
+                    // S4: a steer queued while the turn was held is discarded,
+                    // never poured into a later run (the abort cancels it).
+                    for id in std::mem::take(&mut run_steers) {
+                        session.cancel_steer(&id);
                     }
                     close_held_turn(&session, &state, &cwd, &notice_tx, Vec::new(), true).await;
                 } else {
@@ -2619,6 +2647,13 @@ fn repark_unsettled(state: &Arc<EngineState>, restored: &RestoredThreadState) {
                 input: park.input.clone(),
             },
         ) {
+            // The card's turn predates this process: mark it stale so no
+            // run of ours ever holds a turn on it.
+            state
+                .stale_questions
+                .lock()
+                .unwrap()
+                .insert(park.auth_id.clone());
             tracing::info!(auth_id = %park.auth_id, tool = %park.tool_name,
                 "restore re-parked an unsettled question");
         }

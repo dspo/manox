@@ -1278,6 +1278,7 @@ fn test_engine_state() -> Arc<EngineState> {
         gate,
         question_gate,
         held_settle: std::sync::Mutex::new(None),
+        stale_questions: std::sync::Mutex::new(std::collections::HashSet::new()),
         awaiting_answers: std::sync::atomic::AtomicBool::new(false),
         awaiting_abort: std::sync::atomic::AtomicBool::new(false),
         plan: crate::plan_mode::PlanSessionState::new(),
@@ -5050,4 +5051,37 @@ async fn late_registration_lands_in_the_active_selection_of_a_narrowed_session()
     );
 
     crate::embedder_tools::drop_provider_for_test();
+}
+
+/// A stale (restore-reparked) ask card never holds a turn: only cards a
+/// run of this process delivered count toward the hold, so a restart with
+/// an open card cannot wedge the next clean run's settle.
+#[test]
+fn stale_reparked_ask_never_holds_a_turn() {
+    let state = test_engine_state();
+    // The stale card: registered by restore AND marked stale.
+    {
+        let mut stale = state.stale_questions.lock().unwrap();
+        stale.insert("stale-1".into());
+    }
+    let meta = crate::permission::PendingAuthMeta {
+        tool_name: crate::tools::ASK_USER_QUESTION.to_string(),
+        summary: "t".into(),
+        input: serde_json::json!({}),
+    };
+    assert!(
+        state
+            .question_gate
+            .register_if_absent("stale-1", meta.clone())
+    );
+    assert!(
+        !run::live_ask_pending(&state),
+        "a lone stale card must not hold"
+    );
+    // A live card (delivered by a run of this process) holds.
+    assert!(state.question_gate.register_if_absent("live-1", meta));
+    assert!(
+        run::live_ask_pending(&state),
+        "a live card holds even beside stale ones"
+    );
 }
